@@ -15,6 +15,9 @@ import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
 import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
+/** The graph a launch names: these loaders hold one without describing their obsp. */
+const GRAPH_DEFAULT = Object.freeze({ defaults: { knn: 'connectivities' } });
+
 const INVALIDATED_REQUEST =
   /(dataset|adapter|cache|request).*(changed|cleared|closed|invalidated|superseded)|superseded|no longer active/i;
 
@@ -250,7 +253,7 @@ function createColdCoalescingScenario(kind) {
     },
   };
 
-  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader), GRAPH_DEFAULT);
   installPrivateCoordinateResolution(adapter, { ...UMAP_WITH_VELOCITY, nVars: 1 });
   adapter._obsFieldsMetadata = [{
     key: 'score',
@@ -347,7 +350,7 @@ function createScenario(kind, SourceClass = AnnDataFileSource) {
     },
   };
 
-  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader), GRAPH_DEFAULT);
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
   adapter._obsFieldsMetadata = [{
     key: 'score',
@@ -408,7 +411,7 @@ async function createWarmCacheScenario(kind) {
       return denseConnectivity(0, 2);
     },
   };
-  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader), GRAPH_DEFAULT);
   installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
 
   const invoke = () => {
@@ -907,13 +910,12 @@ test('a coordinate result is the only thing the page retains of a read', async (
   assert.equal(scenario.adapter._embeddingInFlight.size, 0);
 });
 
-test('initialize rejects non-finite embedding components before anything is cached', async () => {
+test('initialize rejects an embedding that places no cell before anything is cached', async () => {
   let reads = 0;
   const loader = {
     nObs: 2,
     nVars: 0,
     obsKeys: [],
-    varNames: [],
     async getDatasetMetadata() {
       return {
         stats: {
@@ -928,7 +930,8 @@ test('initialize rejects non-finite embedding components before anything is cach
     },
     async readObsmColumns(key, columns) {
       reads++;
-      return selectColumns([0, Number.NaN, 1, 1], 2, columns);
+      // Each cell's row holds a NaN or an infinity: no cell is placed.
+      return selectColumns([0, Number.NaN, Infinity, 1], 2, columns);
     },
     close() {}
   };
@@ -938,7 +941,7 @@ test('initialize rejects non-finite embedding components before anything is cach
   await assert.rejects(
     adapter.initialize(),
     error => error.name === 'EmbeddingLoadError' &&
-      /Embedding 'X_umap_2d' cannot be plotted: NaN at cell 0\./.test(error.message)
+      /Embedding 'X_umap_2d' cannot be plotted: every cell's coordinates are missing \(NaN or infinite\)\./.test(error.message)
   );
   assert.equal(reads, 1);
   assert.equal(adapter._embeddingCache.size, 0);
@@ -946,11 +949,33 @@ test('initialize rejects non-finite embedding components before anything is cach
   assert.equal(adapter._metadata, null);
 });
 
-test('public coordinate reads reject every non-finite component before copy or cache and leave later callers independent', async t => {
+test('public coordinate reads leave a non-finite row\'s cell unplaced, and reject a value past float32 before copy or cache, leaving later callers independent', async t => {
+  for (const [name, nonFinite] of [
+    ['NaN', Number.NaN],
+    ['positive infinity', Number.POSITIVE_INFINITY],
+    ['negative infinity', Number.NEGATIVE_INFINITY],
+  ]) {
+    await t.test(`${name}: the cell is unplaced`, async () => {
+      const loader = {
+        nObs: 3,
+        async readObsmColumns(key, columns) {
+          return selectColumns(key === 'X_umap_2d' ? [0, nonFinite, 0, 0, 2, 2] : [1, 1, nonFinite, 0, 2, 2], 2, columns);
+        },
+        close() {}
+      };
+      const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+      installPrivateCoordinateResolution(adapter, UMAP_WITH_VELOCITY);
+      const embedding = await adapter.getEmbeddingForRef(UMAP_REF);
+      assert.ok(Number.isNaN(embedding[0]) && Number.isNaN(embedding[1]), 'every axis of the unplaced cell is NaN');
+      assert.deepEqual(Array.from(embedding.subarray(2)), [-1, -1, 1, 1]);
+      const info = [...adapter._embeddingInfo.values()][0];
+      assert.equal(info.unplacedCount, 1);
+      assert.deepEqual(info.unplacedNames, ['cell0']);
+      const vector = await readVector(adapter, 'velocity_umap_2d');
+      assert.ok(Number.isNaN(vector[2]) && Number.isNaN(vector[3]), 'a cell without a vector');
+    });
+  }
   for (const [name, nonFinite, defect] of [
-    ['NaN', Number.NaN, 'NaN'],
-    ['positive infinity', Number.POSITIVE_INFINITY, 'Infinity'],
-    ['negative infinity', Number.NEGATIVE_INFINITY, '-Infinity'],
     ['beyond float32', 1e300, 'not representable as float32']
   ]) {
     await t.test(name, async () => {
@@ -1101,6 +1126,8 @@ test('coordinate cache accounting counts aliased backing buffers once', async ()
         positions: key === 'X_one' ? new Float32Array(sharedBuffer, 0, 10) : new Float32Array(sharedBuffer),
         transform: { center: [0, 0, 0], scale: 1 },
         bounds: null,
+        unplacedCount: 0,
+        unplacedNames: [],
       };
     },
   };
@@ -1298,7 +1325,7 @@ test('a read nobody waits for any more is cancelled in the loader; one still wan
       return { index: ['GeneA'], values: ['GeneA'] };
     },
   };
-  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader), GRAPH_DEFAULT);
   installPrivateCoordinateResolution(adapter, { ...UMAP_WITH_VELOCITY, nVars: 1 });
   adapter._obsFieldsMetadata = [{ key: 'score', kind: 'continuous' }];
   const settle = () => new Promise(resolve => setImmediate(resolve));

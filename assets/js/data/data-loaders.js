@@ -28,13 +28,14 @@ import {
 import { parseMappingLatentPath } from './data-mapping-candidates.js';
 import {
   getMetadataLoadSignal,
-  throwIfMetadataAborted,
 } from './metadata-load-contract.js';
 import { requirePriority } from './fetch-scheduler.js';
-import { onAbort } from '../formats/io/abort.js';
+import { onAbort, throwIfAborted, awaitWithSignal } from '../utils/abort.js';
 import {
   isAnnDataUrl,
+  anndataCellOrderDigest,
   anndataLoadPoints,
+  anndataLoadRows,
   anndataGetObsFields,
   anndataGetGeneList,
   anndataLoadObsField,
@@ -48,13 +49,20 @@ import {
   anndataDeliverGeneColumns,
   anndataDeliverGeneCellSubset,
   anndataLinkMeasurement,
+  anndataGeneReadPlan,
+  anndataGeneSample,
+  anndataGeneSampleOf,
+  anndataGeneSampleCost,
+  anndataGrowGeneSample,
   anndataLoadMarkedGenes,
   anndataDescribeOutlierQuantiles,
   anndataLoadOutlierQuantiles,
   anndataLoadConnectivity,
+  anndataLoadConnectivityRows,
   anndataGetConnectivitySummary,
   anndataGetDatasetIdentity,
   anndataGetMappingCandidates,
+  anndataCompleteMappingCandidates,
 } from './anndata-provider.js';
 import { isObjectRecord, requireExactObjectKeys, requireObjectKeys } from '../utils/exact-record.js';
 import { formatCountOf } from '../utils/format-units.js';
@@ -124,63 +132,6 @@ function getLoadOwner(options, label) {
   return { candidateAnnDataBinding, signal };
 }
 
-function createAbortError() {
-  const error = new Error('Loading was cancelled.');
-  error.name = 'AbortError';
-  return error;
-}
-
-function throwIfAborted(signal) {
-  if (signal?.aborted) {
-    throw createAbortError();
-  }
-}
-
-/**
- * Observe a promise while allowing its consumer to stop waiting on abort.
- *
- * Both settlement handlers remain attached so a late resolve/reject cannot
- * become stale application work or an unhandled rejection.
- *
- * @template T
- * @param {Promise<T>|T} promise
- * @param {AbortSignal|null} signal
- * @returns {Promise<T>}
- */
-function waitForAbort(promise, signal) {
-  if (!signal) {
-    return Promise.resolve(promise);
-  }
-  throwIfAborted(signal);
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let cleanup = () => {};
-    const abort = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(createAbortError());
-    };
-
-    cleanup = onAbort(signal, abort);
-    Promise.resolve(promise).then(
-      value => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(value);
-      },
-      error => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(error);
-      }
-    );
-  });
-}
-
 /** The dataset base of a URL: `anndata://<id>/`. */
 function baseOf(url) {
   const start = url.indexOf('://') + 3;
@@ -223,12 +174,43 @@ export async function loadPointsBinary(url, options) {
   // The caller's layout descriptor states the dimension; a route
   // never does. The caller's signal cancels the read in the reader worker;
   // the wait ends at once either way.
-  const payload = await waitForAbort(
+  const payload = await awaitWithSignal(
     anndataLoadPoints(url, dimension, { signal }, candidateAnnDataBinding),
     signal
   );
   throwIfAborted(signal);
   return payload;
+}
+
+/**
+ * The cell-order digest of one embedding over the open cells, by its route
+ * under the dataset base (`obsm/{i}/{cols}`): its stored values, each cell
+ * named by its original position, summed in the reader worker as they were
+ * read (`cell-order-digest.js`).
+ *
+ * @param {string} url
+ * @param {{candidateAnnDataBinding?: Object|null, signal?: AbortSignal|null}} [options]
+ * @returns {Promise<string>}
+ */
+export async function loadCellOrderDigest(url, { candidateAnnDataBinding = null, signal = null } = {}) {
+  requireAnnDataUrl(url, 'Cell-order digest loader');
+  throwIfAborted(signal);
+  return awaitWithSignal(anndataCellOrderDigest(url, { signal }, candidateAnnDataBinding), signal);
+}
+
+/**
+ * Rows `[start, end)` of the open cells of one embedding or vector field, by
+ * its route under the dataset base (`anndataLoadRows`): an opening grown in
+ * place reads only the cells it adds, in the frame its cells are shown in.
+ *
+ * @param {'embedding'|'vectors'} kind
+ * @param {string} url
+ * @param {{dimension: 1|2|3, rows: [number, number], signal?: AbortSignal|null}} options
+ */
+export async function loadCoordinateRows(kind, url, { dimension, rows, signal = null }) {
+  requireAnnDataUrl(url, 'Cell position rows loader');
+  throwIfAborted(signal);
+  return awaitWithSignal(anndataLoadRows(kind, url, rows, { signal, dimension }), signal);
 }
 
 // ============================================================================
@@ -382,15 +364,17 @@ function validateFieldName(name, { names, label }) {
 /**
  * Validate what making a gene list's names unique changed (`geneNames`) and
  * resolve its complete name list: the list's `fields` names, its `source`
- * the var column they came from (null for the var index).
+ * the var column they came from (null for the var index), and for names
+ * from a column the var index name of each gene (`ids`), searched beside
+ * the names.
  *
  * @param {unknown} geneNames
  * @param {string[]} names - The `fields` names, in field order.
  * @returns {{source: string|null, names: string[], filledFromIndex: number,
- *   renamed: [string, string][]}}
+ *   renamed: [string, string][], ids: string[]|null}}
  */
 function resolveGeneNames(geneNames, names) {
-  requireExactObjectKeys(geneNames, ['source', 'filledFromIndex', 'renamed'], 'gene list geneNames');
+  requireExactObjectKeys(geneNames, ['source', 'filledFromIndex', 'renamed', 'ids'], 'gene list geneNames');
   if (geneNames.source !== null && (typeof geneNames.source !== 'string' || geneNames.source.length === 0)) {
     throw new Error('Invalid gene list: geneNames.source must be null or a non-empty string');
   }
@@ -415,11 +399,24 @@ function resolveGeneNames(geneNames, names) {
   ) {
     throw new Error('Invalid gene list: geneNames.renamed must list [from, to] name pairs');
   }
+  if (
+    geneNames.ids !== null &&
+    (geneNames.source === null ||
+      !Array.isArray(geneNames.ids) ||
+      geneNames.ids.length !== names.length ||
+      geneNames.ids.some(id => typeof id !== 'string'))
+  ) {
+    throw new Error(
+      'Invalid gene list: geneNames.ids must be null, or (for names from a var column) ' +
+      'the var index name of every gene'
+    );
+  }
   return Object.freeze({
     source: geneNames.source,
     names: Object.freeze([...names]),
     filledFromIndex: geneNames.filledFromIndex,
     renamed: Object.freeze(geneNames.renamed.map(pair => Object.freeze([...pair]))),
+    ids: geneNames.ids === null ? null : Object.freeze([...geneNames.ids]),
   });
 }
 
@@ -505,8 +502,11 @@ function requireCategoryPalette(palette, categories, key) {
  * (`BaseAnnDataAdapter.getObsFields`). A continuous field is `{key, kind:
  * 'continuous', fieldIndex, outlierQuantilesPath: null}`; a categorical
  * field is `{key, kind: 'category', fieldIndex, categories, codesDtype,
- * codesMissingValue, palette, outlierQuantilesPath}`, its categories (and code
- * width) null when they are found on first load, its palette the RGB colour
+ * codesMissingValue, palette, discovered, outlierQuantilesPath}`, its
+ * categories (and code width) null when they are found on first load,
+ * `discovered` whether they are the labels its open cells hold (a text or
+ * boolean column, `discovered-categories.js`) rather than a stored
+ * dictionary, its palette the RGB colour
  * (0..1 channels) of each category the file stores one for (Scanpy's
  * `uns['<key>_colors']`) or null, and its outlier route null when the dataset
  * opens with no latent space. Centroids are computed in the browser, never
@@ -559,6 +559,7 @@ export function checkObsFields(list) {
       'codesDtype',
       'codesMissingValue',
       'palette',
+      'discovered',
       'outlierQuantilesPath',
     ], 'categorical obs field');
     if (field.kind !== 'category') {
@@ -566,9 +567,12 @@ export function checkObsFields(list) {
     }
     const key = validateFieldName(field.key, { names, label: 'obs field list' });
     const fieldIndex = requireFieldIndex(field.fieldIndex, `obs field "${key}"`);
-    const { categories, codesDtype, codesMissingValue, palette, outlierQuantilesPath } = field;
+    const { categories, codesDtype, codesMissingValue, palette, discovered, outlierQuantilesPath } = field;
     const storage = { categories, dtype: codesDtype, missingValue: codesMissingValue, fieldKey: key };
     if (!categoriesFoundOnLoad(storage)) validateCategoricalStorage(storage);
+    if (typeof discovered !== 'boolean') {
+      throw new Error(`Invalid obs field "${key}": discovered must be a boolean`);
+    }
     requireCategoryPalette(palette, categories, key);
     // Outlier quantiles (float32) are computed in the dataset's latent
     // space, when it has one: their route names it and this field.
@@ -587,6 +591,7 @@ export function checkObsFields(list) {
       codesDtype,
       codesMissingValue,
       palette,
+      discovered,
       outlierQuantilesPath,
     });
   }
@@ -642,9 +647,9 @@ function requireGeneDescriptor(field, label) {
 export async function loadObsFields(url, options = {}) {
   const { candidateAnnDataBinding, signal } = getLoadOwner(options, 'Obs field list loader');
   requireAnnDataUrl(url, 'Obs field list loader');
-  throwIfMetadataAborted(signal, 'Obs field list loading');
+  throwIfAborted(signal);
   const list = anndataGetObsFields(url, { signal }, candidateAnnDataBinding);
-  throwIfMetadataAborted(signal, 'Obs field list loading');
+  throwIfAborted(signal);
   return checkObsFields(list);
 }
 
@@ -659,9 +664,9 @@ export async function loadObsFields(url, options = {}) {
 export async function loadGeneList(url, options = {}) {
   const { candidateAnnDataBinding, signal } = getLoadOwner(options, 'Gene list loader');
   requireAnnDataUrl(url, 'Gene list loader');
-  throwIfMetadataAborted(signal, 'Gene list loading');
+  throwIfAborted(signal);
   const list = await anndataGetGeneList(url, { signal }, candidateAnnDataBinding);
-  throwIfMetadataAborted(signal, 'Gene list loading');
+  throwIfAborted(signal);
   return checkGeneList(list);
 }
 
@@ -677,9 +682,9 @@ export async function loadGeneList(url, options = {}) {
 export async function loadConnectivitySummary(url, options = {}) {
   const { candidateAnnDataBinding, signal } = getLoadOwner(options, 'Connectivity summary loader');
   requireAnnDataUrl(url, 'Connectivity summary loader');
-  throwIfMetadataAborted(signal, 'Connectivity summary loading');
+  throwIfAborted(signal);
   const summary = await anndataGetConnectivitySummary(url, { signal }, candidateAnnDataBinding);
-  throwIfMetadataAborted(signal, 'Connectivity summary loading');
+  throwIfAborted(signal);
   return validateConnectivitySummary(summary);
 }
 
@@ -693,9 +698,9 @@ export async function loadConnectivitySummary(url, options = {}) {
 export async function loadDatasetIdentity(baseUrl, options = {}) {
   const { candidateAnnDataBinding, signal } = getLoadOwner(options, 'Dataset identity loader');
   requireAnnDataUrl(baseUrl, 'Dataset identity loader');
-  throwIfMetadataAborted(signal, 'Dataset identity loading');
+  throwIfAborted(signal);
   const identity = anndataGetDatasetIdentity(baseUrl, { signal }, candidateAnnDataBinding);
-  throwIfMetadataAborted(signal, 'Dataset identity loading');
+  throwIfAborted(signal);
   return identity;
 }
 
@@ -711,8 +716,21 @@ export async function loadDatasetIdentity(baseUrl, options = {}) {
 export async function loadMappingCandidates(url, options = {}) {
   const { candidateAnnDataBinding, signal } = getLoadOwner(options, 'Data-mapping catalog loader');
   requireAnnDataUrl(url, 'Data-mapping catalog loader');
-  throwIfMetadataAborted(signal, 'Data-mapping catalog loading');
+  throwIfAborted(signal);
   return anndataGetMappingCandidates(url, { signal }, candidateAnnDataBinding);
+}
+
+/**
+ * The data-mapping candidate catalog of one dataset completed with what its
+ * matrices' values tell (whether each holds counts): read after the first
+ * view, which never waits for a matrix value.
+ *
+ * @param {string} url - The catalog route (`<base>candidates`)
+ * @returns {Promise<Object>}
+ */
+export async function loadCompleteMappingCandidates(url) {
+  requireAnnDataUrl(url, 'Data-mapping catalog loader');
+  return anndataCompleteMappingCandidates(url, null);
 }
 
 /**
@@ -729,12 +747,16 @@ export function getEmbeddingsMetadata(identity) {
 
 /**
  * Load the metadata of one dataset generation at once -- its identity, obs
- * and var field descriptors and graph summary -- and check that they describe
- * the same cells: the generation DataState adopts.
+ * field descriptors and graph summary -- and check that they describe the
+ * same cells: the generation DataState adopts. Its gene list is not part of
+ * it: no gene name is read before the first view. The identity counts the
+ * genes from metadata (`stats.n_genes`), and the list itself (`loadGeneList`
+ * at `<base>var`) is read after the first view and checked against that
+ * count (`app/main.js`).
  *
  * @param {string} baseUrl - `anndata://<id>/`
  * @param {{candidateAnnDataBinding?: Object|null, expectedIdentityId: string, signal: AbortSignal}} options
- * @returns {Promise<{identity: Object, obsFields: Object, geneList: Object|null, connectivitySummary: Object|null}>}
+ * @returns {Promise<{identity: Object, obsFields: Object, connectivitySummary: Object|null}>}
  */
 export async function loadDatasetGeneration(baseUrl, { candidateAnnDataBinding = null, expectedIdentityId, signal }) {
   requireAnnDataUrl(baseUrl, 'Dataset generation loader');
@@ -745,18 +767,16 @@ export async function loadDatasetGeneration(baseUrl, { candidateAnnDataBinding =
       `The dataset opened as "${identity.id}", but "${expectedIdentityId}" was selected.`
     );
   }
-  const [obsFields, geneList, connectivitySummary] = await Promise.all([
+  const [obsFields, connectivitySummary] = await Promise.all([
     loadObsFields(`${baseUrl}obs`, owner),
-    identity.stats.n_genes > 0 ? loadGeneList(`${baseUrl}var`, owner) : null,
     identity.stats.has_connectivity
       ? loadConnectivitySummary(`${baseUrl}obsp`, owner)
       : null,
   ]);
-  throwIfMetadataAborted(signal, 'Dataset generation loading');
+  throwIfAborted(signal);
   const nCells = identity.stats.n_cells;
   if (
     obsFields.n_points !== nCells ||
-    (geneList !== null && (geneList.n_points !== nCells || geneList.fields.length !== identity.stats.n_genes)) ||
     (connectivitySummary !== null && connectivitySummary.n_cells !== nCells) ||
     (identity.stats.has_connectivity && connectivitySummary === null)
   ) {
@@ -764,7 +784,7 @@ export async function loadDatasetGeneration(baseUrl, { candidateAnnDataBinding =
       `The dataset's identity, fields and graph do not describe the same ${formatCountOf(nCells, 'cell')}.`
     );
   }
-  return { identity, obsFields, geneList, connectivitySummary };
+  return { identity, obsFields, connectivitySummary };
 }
 
 // ============================================================================
@@ -852,10 +872,12 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
   const outputs = { loaded: true };
 
   if (!isCategorical && data.kind === 'continuous') {
-    if (!(data.data instanceof ArrayBuffer)) {
+    if (!(data.data instanceof ArrayBuffer) || (data.dtype !== 'float32' && data.dtype !== 'float64')) {
       throw new Error(`Invalid continuous payload for field "${field.key}"`);
     }
-    outputs.values = new Float32Array(data.data);
+    // float64 for an integer column float32 cannot hold exactly (`continuous-values.js`).
+    const ArrayType = data.dtype === 'float64' ? Float64Array : Float32Array;
+    outputs.values = new ArrayType(data.data);
   } else if (isCategorical && data.kind === 'category') {
     const codesDtype = validateCategoricalCodesDtype(data.dtype, field.key);
     validateCategoricalStorage({
@@ -876,6 +898,16 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
       requireCategoryPalette(palette, data.categories, field.key);
       outputs.categories = data.categories;
       outputs.palette = palette;
+      // A categorical with more categories than open cells is coded by the
+      // ones its open cells hold: `storedCategoryCount` is how many its file
+      // stores (field/loading.js shows it, and treats a saved category it
+      // lacks as one no open cell holds).
+      if (data.storedCategoryCount !== undefined) {
+        if (!Number.isSafeInteger(data.storedCategoryCount) || data.storedCategoryCount < data.categories.length) {
+          throw new Error(`Invalid categorical payload for field "${field.key}": storedCategoryCount must be a whole number of at least its categories`);
+        }
+        outputs.storedCategoryCount = data.storedCategoryCount;
+      }
     } else if (
       codesDtype !== field.codesDtype ||
       data.missingValue !== field.codesMissingValue ||
@@ -926,17 +958,19 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
  */
 export async function loadVarFieldData(geneListUrl, field, options = {}) {
   if (!field) throw new Error('No field metadata provided for var field fetch.');
-  const { signal = null, priority = 'normal', owner = null, key = null } = options;
+  const { signal = null, priority = 'normal', owner = null, key = null, onPartial = null } = options;
   requirePriority(priority);
   requireAnnDataUrl(geneListUrl, 'Var field loader');
   requireGeneDescriptor(field, `var field "${field.key}"`);
   throwIfAborted(signal);
-  const values = await anndataLoadGeneValues(
-    `${baseOf(geneListUrl)}${field.path}`,
-    { signal, owner, key }
-  );
+  const url = `${baseOf(geneListUrl)}${field.path}`;
+  const values = await anndataLoadGeneValues(url, { signal, owner, key, onPartial });
   throwIfAborted(signal);
-  return { loaded: true, values };
+  // The open cells its values were read for (`subsample-plan.js`, `genes`):
+  // the first `cells`; NaN on the others means not read, not a value.
+  const sample = await anndataGeneSampleOf(url);
+  throwIfAborted(signal);
+  return { loaded: true, values, geneSample: sample };
 }
 
 /**
@@ -974,6 +1008,8 @@ function mergeFieldLoaderOptions(baseOptions, runtimeOptions) {
     owner: runtimeOptions?.owner ?? null,
     // The shared load it is, which a job joining later adopts.
     key: runtimeOptions?.key ?? null,
+    // A gene shown on more cells as they are read (`loadVarFieldData`).
+    onPartial: runtimeOptions?.onPartial ?? null,
   };
 }
 
@@ -1008,6 +1044,17 @@ export function createObsFieldLoader(obsUrl, options = {}) {
   loader.outlierMinPoints = options.outlierMinPoints;
   /** The latent space the file stores outlier quantiles for, or null. */
   loader.storedOutlierLatentKey = options.storedOutlierLatentKey ?? null;
+  /**
+   * Rows `[start, end)` of one loaded field's values (`anndataLoadRows`,
+   * `obs`): a categorical one coded under `categories`, the ones it was
+   * loaded with; a text column whose rows hold another label answers its
+   * grown categories and their colours too (`getObsFieldRows`).
+   */
+  loader.readRows = (field, rows, { signal = null, categories = null } = {}) => (
+    anndataLoadRows('obs', obsUrl, rows, { signal, key: field.key, categories })
+  );
+  /** The same loader for `n` open cells (the open cells grown or cut in place). */
+  loader.resized = n => createObsFieldLoader(obsUrl, { ...options, pointCount: n });
   return loader;
 }
 
@@ -1061,13 +1108,19 @@ function requireVarLoaderMapping(mapping) {
  * A gene loader with shared options. It also has
  * `readSparseColumn(field, {signal})`: one gene's non-zero entries
  * (`{length, indices, values}`), owned by the caller;
- * `readCellSubset(fields, cells, {signal})`: some genes in some cells, read
- * by cell or by gene, whichever costs less; the same two delivered to
+ * `readCellSubset(fields, cells, {signal, owner, runGenes})`: some genes in
+ * some cells, read by cell or by gene, whichever costs the run less
+ * (`runGenes`: the genes the run has still to read of those cells); the same two delivered to
  * analysis workers over a gene route instead of returned
  * (`deliverSparseColumns(fields, delivery, {signal, owner})`,
- * `deliverCellSubset(fields, cells, delivery, {signal, owner})`, with
+ * `deliverCellSubset(fields, cells, delivery, {signal, owner, runGenes})`, with
  * `openGeneRoute`, `replaceGeneRoutePort`, `closeGeneRoute` and
- * `deliversGenes()`: `data/gene-delivery.js`); and, as the data mapping says
+ * `deliversGenes()`: `data/gene-delivery.js`); `readPlan(field)`: what
+ * reading the gene costs now, before it is read (`geneReadPlan`); the gene
+ * sample (`geneSample()`, `geneSampleOf(field)`, `geneSampleCost(field,
+ * target)`, `growGeneSample(field, target, {signal, onStep})`: the open
+ * cells genes are read for, `subsample-plan.js` `genes`); and, as
+ * the data mapping says
  * (`options.mapping`):
  *
  * - `log1p({matrix})`: `{base}` (null for e) when the data mapping says the
@@ -1108,14 +1161,24 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
     return highlyVariable;
   };
   const base = baseOf(geneListUrl);
+  /**
+   * Rows `[start, end)` of one gene (`anndataLoadRows`, `gene`): what those
+   * cells need is read, and nothing else where the layout allows.
+   */
+  loader.readRows = (field, rows, { signal = null, owner = null } = {}) => {
+    requireGeneDescriptor(field, `var field "${field.key}"`);
+    return anndataLoadRows('gene', `${base}${field.path}`, rows, { signal, owner });
+  };
+  /** The same loader for `n` open cells (the open cells grown or cut in place). */
+  loader.resized = n => createVarFieldLoader(geneListUrl, { ...options, pointCount: n });
   // An analysis's reads: `owner` is the job they are for.
   loader.readSparseColumn = (field, { signal = null, owner = null } = {}) => {
     requireGeneDescriptor(field, `var field "${field.key}"`);
     return anndataLoadGeneSparse(`${base}${field.path}`, { signal, owner });
   };
-  loader.readCellSubset = (fields, cells, { signal = null, owner = null } = {}) => {
+  loader.readCellSubset = (fields, cells, { signal = null, owner = null, runGenes = null } = {}) => {
     for (const field of fields) requireGeneDescriptor(field, `var field "${field.key}"`);
-    return anndataLoadGeneCellSubset(fields.map(field => `${base}${field.path}`), cells, { signal, owner });
+    return anndataLoadGeneCellSubset(fields.map(field => `${base}${field.path}`), cells, { signal, owner, runGenes });
   };
   // Gene routes (`gene-delivery.js`): the genes an analysis computes in its
   // workers go from the reader worker to them, never through the page.
@@ -1128,13 +1191,33 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
     for (const field of fields) requireGeneDescriptor(field, `var field "${field.key}"`);
     return anndataDeliverGeneColumns(fields.map(field => `${base}${field.path}`), delivery, { signal, owner });
   };
-  loader.deliverCellSubset = (fields, cells, delivery, { signal = null, owner = null } = {}) => {
+  loader.deliverCellSubset = (fields, cells, delivery, { signal = null, owner = null, runGenes = null } = {}) => {
     for (const field of fields) requireGeneDescriptor(field, `var field "${field.key}"`);
-    return anndataDeliverGeneCellSubset(fields.map(field => `${base}${field.path}`), cells, delivery, { signal, owner });
+    return anndataDeliverGeneCellSubset(fields.map(field => `${base}${field.path}`), cells, delivery, { signal, owner, runGenes });
   };
   // The link the genes are read over, as last measured, or null (work that
   // tunes itself to the link reads it here).
   loader.linkMeasurement = () => anndataLinkMeasurement(geneListUrl);
+  // What reading one gene costs now, before it is read (`geneReadPlan`).
+  loader.readPlan = field => {
+    requireGeneDescriptor(field, `var field "${field.key}"`);
+    return anndataGeneReadPlan(`${base}${field.path}`);
+  };
+  // The gene sample (`subsample-plan.js`, `genes`): the open cells genes are
+  // read for, what reading a matrix for more of them costs, and reading it.
+  loader.geneSample = () => anndataGeneSample(geneListUrl);
+  loader.geneSampleOf = field => {
+    requireGeneDescriptor(field, `var field "${field.key}"`);
+    return anndataGeneSampleOf(`${base}${field.path}`);
+  };
+  loader.geneSampleCost = (field, target, options = {}) => {
+    requireGeneDescriptor(field, `var field "${field.key}"`);
+    return anndataGeneSampleCost(`${base}${field.path}`, target, options);
+  };
+  loader.growGeneSample = (field, target, { signal = null, onStep = null, topUp = false } = {}) => {
+    requireGeneDescriptor(field, `var field "${field.key}"`);
+    return anndataGrowGeneSample(`${base}${field.path}`, target, { signal, onStep, topUp });
+  };
   return loader;
 }
 
@@ -1160,7 +1243,7 @@ export async function loadEdges(graphUrl, summary, options) {
     throw new TypeError('Connectivity edge loader options.signal is required');
   }
   requireAnnDataUrl(graphUrl, 'Connectivity edge loader');
-  throwIfMetadataAborted(signal, 'Connectivity edge loading');
+  throwIfAborted(signal);
   const validated = validateConnectivitySummary(summary);
   if (validated === null) {
     throw new Error('This dataset has no neighbour graph to load.');
@@ -1170,6 +1253,32 @@ export async function loadEdges(graphUrl, summary, options) {
     throw new Error('The neighbour graph is absent despite its summary.');
   }
   validateConnectivityEdgeData(edgeData, validated);
-  throwIfMetadataAborted(signal, 'Connectivity edge loading');
+  throwIfAborted(signal);
   return edgeData;
+}
+
+/**
+ * Some open cells' neighbours in the graph at `graphUrl`, read from its file
+ * by row (`anndataLoadConnectivityRows`): what the k-NN tool expands through.
+ *
+ * @param {string} graphUrl - The graph's route (as `loadEdges`)
+ * @param {Uint32Array} cells - Distinct open cells
+ * @param {{signal: AbortSignal}} options
+ * @returns {Promise<{offsets: Uint32Array, neighbors: Uint32Array}>}
+ */
+export async function loadConnectivityRows(graphUrl, cells, options) {
+  const signal = getMetadataLoadSignal(options, 'Connectivity row loader');
+  if (signal === null) {
+    throw new TypeError('Connectivity row loader options.signal is required');
+  }
+  requireAnnDataUrl(graphUrl, 'Connectivity row loader');
+  const rows = await anndataLoadConnectivityRows(graphUrl, cells, { signal });
+  if (
+    rows === null || typeof rows !== 'object' ||
+    !(rows.offsets instanceof Uint32Array) || rows.offsets.length !== cells.length + 1 ||
+    !(rows.neighbors instanceof Uint32Array) || rows.offsets[cells.length] !== rows.neighbors.length
+  ) {
+    throw new TypeError('Connectivity rows must be Uint32 offsets (one a cell, plus one) over Uint32 neighbours.');
+  }
+  return rows;
 }

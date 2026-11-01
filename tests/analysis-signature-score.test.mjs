@@ -135,6 +135,8 @@ test('signature scoring without a caller ownership predicate reads its columns',
     }],
     obsData: { fields: [] },
     varData: { fields: [{ key: 'A', kind: 'continuous', loaded: true, values: Float32Array.of(1, 5, 3) }] },
+    // Genes are read for every open cell (no gene sample).
+    refreshGeneSample: async () => null,
   }, { enableNotifications: false, enablePrefetch: false });
   try {
     const analysis = Object.create(MultiVariableAnalysis.prototype);
@@ -147,6 +149,37 @@ test('signature scoring without a caller ownership predicate reads its columns',
     });
     assert.deepEqual(Array.from(page.scores), [1, 3]);
     assert.deepEqual(Array.from(page.cellIndices), [0, 2]);
+  } finally {
+    layer.destroy();
+  }
+});
+
+test('a signature whose pages have no cell genes are read for says so plainly, and scores a page that has some', async () => {
+  const { DataLayer } = await import('../assets/js/app/analysis/data/data-layer.js');
+  const { MultiVariableAnalysis } = await import('../assets/js/app/analysis/stats/multi-variable-analysis.js');
+  // Genes are read for the first 2 of 6 open cells (HLCA core: 1,678 of 584,944).
+  const pages = [
+    { id: 'far', name: 'Far', highlightedGroups: [{ id: 'g1', type: 'lasso', label: 'g1', enabled: true, cellIndices: [3, 4, 5], cellCount: 3 }] },
+    { id: 'near', name: 'Near', highlightedGroups: [{ id: 'g2', type: 'lasso', label: 'g2', enabled: true, cellIndices: [1, 4], cellCount: 2 }] },
+  ];
+  const layer = new DataLayer({
+    pointCount: 6,
+    getHighlightPages: () => pages,
+    obsData: { fields: [] },
+    varData: { fields: [{ key: 'A', kind: 'continuous', loaded: true, values: Float32Array.of(1, 5, NaN, NaN, NaN, NaN) }] },
+    refreshGeneSample: async () => ({ cells: 2, of: 6 }),
+  }, { enableNotifications: false, enablePrefetch: false });
+  try {
+    const analysis = Object.create(MultiVariableAnalysis.prototype);
+    analysis.dataLayer = layer;
+    analysis._computeManager = null;
+    await assert.rejects(
+      analysis.computeSignatureScore({ geneSets: [{ name: 'S', genes: ['A'] }], pageIds: ['far'], method: 'mean' }),
+      /needs cells with gene values: Far has 0 of its 3 cells among the first 2 open cells.*Session › Subsampling: Genes read for/,
+    );
+    const { sets: [{ pages: scored }], geneSample } = await analysis.computeSignatureScore({ geneSets: [{ name: 'S', genes: ['A'] }], pageIds: ['far', 'near'], method: 'mean' });
+    assert.deepEqual(scored.map(page => Array.from(page.scores)), [[], [5]]);
+    assert.deepEqual(geneSample.groups.map(group => [group.name, group.used, group.of]), [['Far', 0, 3], ['Near', 1, 2]]);
   } finally {
     layer.destroy();
   }

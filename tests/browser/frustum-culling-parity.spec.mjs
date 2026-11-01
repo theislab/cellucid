@@ -53,7 +53,8 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
       viewer.setAdaptiveLOD(false);
       viewer.setFrustumCulling(culling);
       viewer.setPointSize(6);
-      await frames(4);
+      // Each change asks for its frame: the scene is not settled until the
+      // frames showing them are drawn.
       await settled();
       const width = gl.drawingBufferWidth;
       const height = gl.drawingBufferHeight;
@@ -71,15 +72,19 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
     // built in a worker, so it lands whenever it lands: a frame drawn before
     // the store adopted its order overlaps translucent points in another
     // order, and comparing it with one drawn after measures the adoption,
-    // not culling. Culling runs only on an adopted order, so wait for it.
+    // not culling. Culling runs only on an adopted order, so wait for it
+    // (the store asks for its own frames once the tree lands), by the clock:
+    // a slow runner draws few frames while the worker builds.
     await capture(true);
-    for (let attempt = 0; attempt < 600; attempt += 1) {
-      if (viewer.getHPRenderer().getStats('live').frustumCulled === true) break;
+    const adopted = () => viewer.getHPRenderer().getStats('live').frustumCulled === true
+      && viewer.isPresentedGeometrySettled();
+    for (const deadline = performance.now() + 120_000; !adopted();) {
+      if (performance.now() > deadline) {
+        throw new Error(`The live store never adopted its tree order: ${JSON.stringify(viewer.getHPRenderer().getStats('live'))}`);
+      }
       await frames(1);
     }
-    if (viewer.getHPRenderer().getStats('live').frustumCulled !== true) {
-      throw new Error('The live store never adopted its tree order.');
-    }
+    await settled();
     const unculled = await capture(false);
     const culled = await capture(true);
     let mismatched = 0;

@@ -9,7 +9,8 @@
  * @module ui/modules/figure-export/components/axes-builder
  */
 
-import { niceNumbers, formatTick } from '../utils/tick-calculator.js';
+import { niceNumbers } from '../utils/tick-calculator.js';
+import { formatSignificant, tickFigures } from '../../../../../utils/format-units.js';
 import { escapeXml } from '../../../../utils/dom-utils.js';
 
 /**
@@ -29,6 +30,20 @@ import { escapeXml } from '../../../../utils/dom-utils.js';
  */
 
 /**
+ * An axis's tick labels: the one number format (`formatSignificant`), with
+ * as many significant figures as tell its ticks apart.
+ *
+ * @param {{ticks: number[], step: number}} axis - `niceNumbers`' answer
+ * @returns {string[]}
+ */
+export function tickLabels({ ticks, step }) {
+  let largest = 0;
+  for (const tick of ticks) largest = Math.max(largest, Math.abs(tick));
+  const figures = tickFigures(largest, step);
+  return ticks.map(tick => formatSignificant(tick, figures));
+}
+
+/**
  * @param {AxisBounds} bounds
  * @param {number} [targetTicks=5]
  */
@@ -38,6 +53,8 @@ function buildAxesModel(bounds, targetTicks = 5) {
   return {
     xTicks: x.ticks,
     yTicks: y.ticks,
+    xLabels: tickLabels(x),
+    yLabels: tickLabels(y),
     xNice: { min: x.niceMin, max: x.niceMax },
     yNice: { min: y.niceMin, max: y.niceMax },
   };
@@ -97,24 +114,24 @@ export function renderSvgAxes({
   parts.push(`<line x1="${axisX}" y1="${y0}" x2="${axisX}" y2="${y1}"/>`);
 
   const spanX = model.xNice.max - model.xNice.min || 1;
-  for (const t of model.xTicks) {
+  model.xTicks.forEach((t, index) => {
     const frac = (t - model.xNice.min) / spanX;
     const x = x0 + frac * plotRect.width;
     parts.push(`<line x1="${x}" y1="${axisY}" x2="${x}" y2="${axisY + tickLen}"/>`);
     parts.push(
-      `<text x="${x}" y="${axisY + tickLen + tickTextOffset}" text-anchor="middle" stroke="none">${formatTick(t)}</text>`
+      `<text x="${x}" y="${axisY + tickLen + tickTextOffset}" text-anchor="middle" stroke="none">${model.xLabels[index]}</text>`
     );
-  }
+  });
 
   const spanY = model.yNice.max - model.yNice.min || 1;
-  for (const t of model.yTicks) {
+  model.yTicks.forEach((t, index) => {
     const frac = (t - model.yNice.min) / spanY;
     const y = y1 - frac * plotRect.height;
     parts.push(`<line x1="${axisX}" y1="${y}" x2="${axisX - tickLen}" y2="${y}"/>`);
     parts.push(
-      `<text x="${axisX - tickLen - tickTextOffset}" y="${y + 4}" text-anchor="end" stroke="none">${formatTick(t)}</text>`
+      `<text x="${axisX - tickLen - tickTextOffset}" y="${y + 4}" text-anchor="end" stroke="none">${model.yLabels[index]}</text>`
     );
-  }
+  });
 
   // Axis labels.
   if (xLabelText) {
@@ -194,30 +211,28 @@ export function drawCanvasAxes({
   ctx.stroke();
 
   const spanX = model.xNice.max - model.xNice.min || 1;
-  for (const t of model.xTicks) {
+  model.xTicks.forEach((t, index) => {
     const frac = (t - model.xNice.min) / spanX;
     const x = x0 + frac * plotRect.width;
     ctx.beginPath();
     ctx.moveTo(x, axisY);
     ctx.lineTo(x, axisY + tickLen);
     ctx.stroke();
-    const label = formatTick(t);
     ctx.textAlign = 'center';
-    ctx.fillText(label, x, axisY + tickLen + tickTextOffset);
-  }
+    ctx.fillText(model.xLabels[index], x, axisY + tickLen + tickTextOffset);
+  });
 
   const spanY = model.yNice.max - model.yNice.min || 1;
-  for (const t of model.yTicks) {
+  model.yTicks.forEach((t, index) => {
     const frac = (t - model.yNice.min) / spanY;
     const y = y1 - frac * plotRect.height;
     ctx.beginPath();
     ctx.moveTo(axisX, y);
     ctx.lineTo(axisX - tickLen, y);
     ctx.stroke();
-    const label = formatTick(t);
     ctx.textAlign = 'right';
-    ctx.fillText(label, axisX - tickLen - 2, y + 4);
-  }
+    ctx.fillText(model.yLabels[index], axisX - tickLen - 2, y + 4);
+  });
 
   // Axis labels.
   if (xLabelText || yLabelText) {

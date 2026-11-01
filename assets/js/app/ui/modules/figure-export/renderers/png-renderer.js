@@ -93,6 +93,7 @@ import {
 } from '../utils/figure-provenance.js';
 import { panelLetter } from '../utils/panel-label.js';
 import { scalePointDiameterToRaster } from '../utils/point-size.js';
+import { figurePointLayersOf } from '../utils/lod-membership.js';
 import {
   buildSelectionBadge,
   countHighlightedVisiblePoints,
@@ -548,7 +549,8 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         : null,
       highlightArray,
       emphasizeSelection,
-      selectionMutedOpacity
+      selectionMutedOpacity,
+      pointLayers: figurePointLayersOf(colors, view.scientificState.pointLayers, renderStateForPoints.bgColor),
     }));
     frames.push(raster);
     throwIfFigureExportAborted(signal);

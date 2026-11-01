@@ -118,6 +118,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
         lodMembership: null,
         drawOrder: null,
         lodSizeMultiplier: 1,
+        pointLayers: { readScale: 1, readEveryLevel: true },
         normTransform: {
           center: [0, 0, 0],
           scale: 1,

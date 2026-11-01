@@ -46,7 +46,7 @@ const TIPS = {
     title: 'Dataset',
     body: [
       'The dataset that is open: its name, cells and genes, where it is read from (format and host) and its description. Details lists its source, citation, file, size, obs fields, embeddings, layers, raw, neighbour graph, latent space and vector fields.',
-      'Data read in place from a host shows how much has been read so far. Nothing is saved to disk: what was read stays in memory and is released when the dataset closes. A read that has to be made again is said in a notification.',
+      'Data read in place from a host shows how much has been read so far, and a read made again is said in a notification. This tab holds what was read. For the next visit, this browser keeps the downloaded parts, the gene index and any converted copy, but only when the source names the file\'s version, and never for data served from this computer or a notebook. Stored lists them; Manage… removes them.',
       'Sessions and community annotations are tied to this dataset’s identity, so they only restore onto the same dataset.',
     ],
     links: [
@@ -60,6 +60,7 @@ const TIPS = {
       'Which stored arrays this dataset is drawn from: the embeddings views can show -- any number, of any mix of 1D, 2D and 3D -- the neighbour graph, the gene names and expression matrix, the latent space of outlier filters and the vector fields.',
       'A dataset (an `.h5ad` or Zarr store opened in the browser, from a link or the samples, served by `cellucid serve`, or shown from a notebook) can use any of its `obsm` arrays (at any 1 to 3 of their columns), `obsp` graphs and expression matrices.',
       'A file without a UMAP opens on a best guess, marked guessed. Sessions record the mapping and restore it.',
+      'Collapsed, its header says what is mapped in one line (the embeddings on and each dimension\'s default); click it to change the mapping. Whether it is open is remembered in this browser.',
     ],
     links: [
       doc('Data mapping', 'b_data_loading/13_data_mapping', 'at-a-glance'),
@@ -124,6 +125,23 @@ const TIPS = {
       doc('KNN drag', 'f_highlighting_selection/02_selection_tools_document_each_tool', 'tool-4-knn-drag-alt-click-drag-degree'),
     ],
   },
+  subsampling: {
+    title: 'Subsampling',
+    body: [
+      'How much of the dataset is read, in two steps:',
+      {
+        list: [
+          'Cells to open: which of the dataset\'s cells are on the map (every one, or a subsample).',
+          'Genes read for: of the cells open, how many each gene is read for. It shows only for a file stored cell by cell, where a gene is first read for a sample of the open cells.',
+        ],
+      },
+      'Collapsed, its header says both in one line ("100 % cells · genes 6 %"); click it to change them. Whether it is open is remembered in this browser, never in a session or the address. The legend of a gene and an analysis\'s gene sample line open it at Genes read for.',
+    ],
+    links: [
+      doc('Subsampled loading', 'b_data_loading/21_subsampled_loading', 'cells-to-open'),
+      doc('Genes read for', 'b_data_loading/21_subsampled_loading', 'genes-read-for'),
+    ],
+  },
   'open-data': {
     title: 'Open data',
     body: [
@@ -135,11 +153,44 @@ const TIPS = {
           'Link or server: a link or an id of published data, or the address of a `cellucid serve` server.',
         ],
       },
-      'Every format is read as AnnData. For large datasets, an AnnData file written by `cellucid prepare` reads fastest.',
+      'Every format is read as AnnData. For large datasets, an AnnData file written by `cellucid.prepare()` (Python) or `cellucid_prepare()` (R) reads fastest.',
     ],
     links: [
       doc('Loading options', 'b_data_loading/01_loading_options_overview', 'at-a-glance'),
       doc('Choose a workflow', 'b_data_loading/01_loading_options_overview', 'fast-path-choose-a-workflow-decision-tree'),
+    ],
+  },
+  subsample: {
+    title: 'Cells to open',
+    body: [
+      'How much of a dataset is read. At 100 % every cell is; below it, a share of the cells, chosen by a seed, and everything (the view, filters, analyses, genes, exports) works on those cells alone. Over a network, less is downloaded: only the parts of the file that hold the chosen cells.',
+      {
+        list: [
+          'File default: on a file Cellucid wrote, Uniform with the file\'s own seed; on any other file, Blocks. Either way only about the chosen share of the file is read.',
+          'Blocks: whole runs of neighbouring cells, aligned to how the file stores them, so parts holding only left-out cells are never read. Cells stored next to each other (often of one sample) come together; Details says how far its categories are from every cell\'s.',
+          'Uniform: every cell equally likely. Except on a file Cellucid wrote, with its own seed, it reads more of the file, and Details says how much. A smaller share keeps a subset of the cells a larger one keeps, with the same seed (as Blocks does).',
+          'Stratified: every category of a field in proportion, or the same count of each (Same count per category).',
+          'Spatial: on a grid over an embedding, dense regions are thinned and sparse ones kept.',
+        ],
+      },
+      'Apply of a larger or smaller share with the same method and seed changes the open cells in place: raising reads only the added cells, lowering reads nothing, and the camera, fields, filters, highlights and labels stay (analysis results are marked Stale). Another method or seed reads the dataset again. Datasets opened next in this tab take the same share. A session saved now opens these same cells. At least 2 cells open: one has no coordinate variation to draw.',
+      'A dataset too large for this device opens with as many cells as fit (with the file\'s default), and says so; Open all cells reads every cell anyway. A link can name a subsample (cells=10%&sample=blocks&seed=0); Copy link copies one that opens exactly these cells.',
+      'A file stored cell by cell (sparse CSR, or dense in blocks of whole cells) opens every cell the device holds on the map, and a gene is read for a sample of them, as many as one gene reads in about 20 seconds on this connection (or as its gene index fits memory). Genes read for, below, says how many and reads genes for more of them.',
+      'One line under the settings says how the open cells were chosen; Details lists the facts behind it: the cells open, method and seed, why this many (the memory needed and what the device has), the cells genes are read for and why, what a gene costs on how the file is stored, the cell set\'s digest and how well a field\'s categories are kept.',
+    ],
+    links: [
+      doc('Subsampled loading', 'b_data_loading/21_subsampled_loading', 'cells-to-open'),
+      doc('How the cells are chosen', 'b_data_loading/21_subsampled_loading', 'how-the-cells-are-chosen'),
+    ],
+  },
+  'kept-stores': {
+    title: 'Stored',
+    body: [
+      'What this browser keeps so datasets open again faster (converted files, downloads, downloaded parts, gene indexes, unsaved highlight drafts and host speeds), in this site\'s private storage in your browser profile and never uploaded; Manage… shows where and how much, and removes what you choose.',
+    ],
+    links: [
+      doc('Stored in this browser', 'b_data_loading/01_loading_options_overview', 'stored-in-this-browser'),
+      doc('Privacy', 'o_accessibility_privacy_security/02_privacy_model', 'origin-private-file-system-dataset-derived-kept-across-visits'),
     ],
   },
   'local-files': {
@@ -173,7 +224,7 @@ const TIPS = {
           'Any other web address: a server when one answers there, otherwise a folder of datasets.',
         ],
       },
-      'What is connected is shown under the bar, with Disconnect. Linked data is read in place, only what each view needs, and kept in memory only; its host must allow other sites to read it (CORS).',
+      'What is connected is shown under the bar, with Disconnect. Linked data is read in place, only what each view needs; its host must allow other sites to read it (CORS). The parts read, any copy read whole and the gene index are kept in this browser for the next visit when the host names the file\'s version (Stored lists them).',
     ],
     links: [
       doc('The address bar', 'b_data_loading/14_open_from_link', 'the-address-bar'),
@@ -257,7 +308,8 @@ const TIPS = {
     body: [
       'Level of detail draws a reduced set of points when the camera is far away and the full set as you zoom in. Force LOD level pins one level, to check what a level looks like.',
       'Frustum culling skips points outside the view, which helps when you are zoomed in on part of a large dataset.',
-      'Both build a spatial index the first time they are turned on, which takes a moment on large data. They help most with millions of cells and with several views open.',
+      'Both turn on by themselves when a frame of every cell is measured slower than 33 ms on this device (30 frames a second, what keeps moving the view smooth), and stay on only if frames are then measured faster with them; otherwise they go off again until the view moves. They stay off when every cell is fast enough, as it is for small datasets. Each dataset is measured when it opens; turning either off yourself is a choice that stands.',
+      'They build a spatial index in the background, which takes a moment on large data. They help most with millions of cells and with several views open.',
     ],
     links: [
       doc('Large datasets', 'n_benchmarking_performance/03_large_dataset_best_practices', 'fast-path-large-dataset-survival-checklist-copy-paste-mental-defaults'),
@@ -504,7 +556,7 @@ const TIPS = {
           't-test, overestimated variance: scanpy’s conservative variant, the reference’s variance divided by the group’s size.',
         ],
       },
-      'Fold change from: Automatic undoes log1p when the file says its matrix is log-transformed (scanpy’s logfoldchanges), else uses the values as stored.',
+      'Fold change from: Automatic undoes log1p when the data mapping reads the matrix as log-transformed (scanpy’s logfoldchanges: from uns[\'log1p\'], unless the stored values could not be log1p), else uses the values as stored.',
     ],
     links: [
       doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
@@ -514,7 +566,7 @@ const TIPS = {
   'analysis-wilcoxon-p': {
     title: 'Wilcoxon p-values',
     body: [
-      'Exact or continuity-corrected (the default) matches R’s wilcox.test and SciPy: exact when both sides have under 50 cells and no ties, else the normal approximation with tie and continuity correction.',
+      'Exact or continuity-corrected (the default) is R’s wilcox.test: exact when both sides have under 50 cells and no ties, else the normal approximation with tie and continuity correction (SciPy’s mannwhitneyu with method=\'exact\' below 50; its \'auto\' is exact only up to 8 values).',
       'Normal approximation is scanpy’s rank_genes_groups default (no tie correction, no continuity correction); Normal, tie-corrected is scanpy with tie_correct=True.',
     ],
     links: [
@@ -534,7 +586,7 @@ const TIPS = {
   'analysis-fold-change': {
     title: 'Fold change',
     body: [
-      'Automatic: when the file records log1p (uns[\'log1p\']), the means are taken back from log1p, log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9)) as scanpy computes logfoldchanges; otherwise log2 of the means as stored, with a small pseudocount and a shift for negative values.',
+      'Automatic: when the data mapping reads the matrix as log1p (Values; from uns[\'log1p\'], unless its stored values could not be log1p), the means are taken back from log1p, log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9)) as scanpy computes logfoldchanges; otherwise log2 of the means as stored, with a small pseudocount and a shift for negative values.',
     ],
     links: [
       doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
@@ -740,7 +792,7 @@ const TIPS = {
     body: [
       'Shows a card for the cell under the pointer: its value of the field the view is coloured by and, for a continuous field, where that value sits on the colour scale. For a categorical field it counts the cells of that category visible in the view, which are exactly the cells selecting the category would pick. It works in every view of a grid.',
       'On a touch screen, press and hold a cell. The card stays until the next touch.',
-      'It is on by default. It never loads a field and never redraws the plot, and it waits while the camera moves. On a view of 250,000 cells or more the lookup walks a spatial index, built once in a worker while the page is idle: until it is ready, the card does not show on that view.',
+      'It is on by default. It never loads a field and never redraws the plot, and it waits while the camera moves. On a view of 250,000 cells or more the lookup walks a spatial index, built once in a worker (the first hover starts it): until it is ready the card says it is preparing the lookup, and names the cell as soon as it is.',
     ],
     links: [
       doc('Cell info', 'd_fields_coloring_legends/08_cell_info', 'what-the-card-shows'),
@@ -755,6 +807,42 @@ const TIPS = {
     ],
     links: [
       doc('Cell info', 'd_fields_coloring_legends/08_cell_info', 'what-the-card-shows'),
+    ],
+  },
+  'gene-sample': {
+    title: 'Gene read for a sample of the cells',
+    body: [
+      'This file stores expression cell by cell (sparse CSR, or dense in blocks of whole cells), so a gene\'s values are spread over every cell\'s row: reading one gene for every cell reads the whole matrix once. The map shows every open cell; a gene is read for the first of them in a fixed order, a sample sized so the first gene takes about 20 seconds on this connection (or so its gene index fits memory). Every later gene is read for the same cells, from the index the first one built.',
+      'The other cells have no value for the gene: they are drawn faded, close to the background, beneath the cells read; the cells read are drawn larger so the pattern shows. Filters on the gene keep the cells not read; analyses use the cells read and say how many.',
+      `Click the line to change how many: ${placePath(PLACES.session, PLACES.subsampling)}, Genes read for.`,
+    ],
+    links: [
+      doc('Genes on a sample of the cells', 'b_data_loading/21_subsampled_loading', 'genes-on-a-sample-of-the-cells'),
+      doc('Genes read for', 'b_data_loading/21_subsampled_loading', 'genes-read-for'),
+    ],
+  },
+  'gene-read': {
+    title: 'Genes read for',
+    body: [
+      'How many of the open cells a gene is read for, as a share of them. It is not Cells to open: that chooses which cells are on the map; this, among the cells open, how many each gene has a value for. 100 % is every open cell, however few Cells to open opened.',
+      'It shows only for a file stored cell by cell (sparse CSR, or dense in blocks of whole cells), where one gene of every cell reads the whole matrix: a gene is first read for a sample of the open cells, sized so the first gene takes about 20 seconds on this connection.',
+      'The slider stops at the share read now, then 1, 5, 10, 25, 50 and 100 % above it (up to the most cells whose gene index fits this device). The line under it says the cells and what reading them downloads and takes, at the connection\'s speed as measured now. Read reads genes for them: the cells read are kept and only the added ones are read, in steps that double; Stop keeps what is read.',
+      'It applies to every gene: the colouring, analyses (their results are then marked Stale) and exports. A session saved after it reads the same cells again when it opens.',
+    ],
+    links: [
+      doc('Genes read for', 'b_data_loading/21_subsampled_loading', 'genes-read-for'),
+      doc('Genes on a sample of the cells', 'b_data_loading/21_subsampled_loading', 'genes-on-a-sample-of-the-cells'),
+    ],
+  },
+  'zero-gray': {
+    title: 'Gray for zero',
+    body: [
+      'Off (the default): a gene\'s 0 is a value like any other, drawn in the colour scale\'s lowest colour.',
+      'On: the cells where the gene is 0 are drawn in a gray made from the background (a step darker than a light one, a step lighter than a dark one), beneath the cells that express it, so the colours show only where it is expressed.',
+      'For genes with no negative value (scaled data has none of this). On a log scale 0 has no logarithm and is gray either way. It is saved with the session, and figures, kept views and the cell card draw what the view draws.',
+    ],
+    links: [
+      doc('Gray for zero', 'd_fields_coloring_legends/04_legend_behavior', 'gray-for-zero'),
     ],
   },
   'log-color-scale': {
@@ -976,7 +1064,7 @@ const TIPS = {
     title: 'GitHub sync',
     body: [
       'Votes and suggestions are saved in this browser first; publishing them to GitHub is optional. Pull before you work to see everyone else’s votes.',
-      'Repository authors choose which columns can be annotated. Your sign-in token is kept only for this tab, and the GitHub App reaches only the repositories you enable.',
+      'Repository authors choose which columns can be annotated. Your GitHub sign-in is kept for this tab and expires after 8 hours; Sign out revokes it. The GitHub App reaches only the repositories you enable.',
     ],
     links: [
       doc('Pull latest', 'j_community_annotation/01_annotator_guide', 'pull-latest-what-it-does-and-why-it-matters'),
@@ -1191,8 +1279,8 @@ const TIPS = {
     body: [
       'What Cellucid gets: access to the files you choose for it in Google’s file picker, which opens already showing this file. Google words it as “see, edit, create and delete” because that permission has no read-only form; Cellucid only reads.',
       'Where the data goes: your browser reads the file straight from Google. The file and the sign-in never pass through a Cellucid server.',
-      'What is kept: the sign-in, in this tab only, until it is closed. It is never put in a link, a session file or a figure. It lasts about an hour; then one click renews it.',
-      'To revoke it: myaccount.google.com/permissions.',
+      'What is kept: the sign-in, for this tab, until it expires (about an hour; one click renews it), the tab closes or you sign out; never in a link, a session file or a figure. The parts of the file read are kept in this browser under its version (Stored).',
+      'To revoke it: Sign out, or myaccount.google.com/permissions.',
     ],
     links: [
       doc('Google Drive', 'b_data_loading/16_private_drive_onedrive', 'google-drive'),
@@ -1205,7 +1293,7 @@ const TIPS = {
     body: [
       'OneDrive serves no file without a sign-in, even one shared with anyone. What Cellucid gets: permission to read your files and the files shared with you, used only for the file you open.',
       'A work or school account opening a colleague’s file needs one more permission, which many organisations let only an administrator approve, once for everyone.',
-      'Where the data goes: your browser reads the file straight from Microsoft; the file and the sign-in never pass through a Cellucid server. What is kept: the sign-in, in this tab only, until it is closed; it renews itself for 24 hours. To revoke it: account.live.com/consent/Manage, or myapps.microsoft.com for a work account.',
+      'Where the data goes: your browser reads the file straight from Microsoft; the file and the sign-in never pass through a Cellucid server. What is kept: the sign-in, for this tab, about an hour; it renews itself for up to 24 hours until a reload, then one click signs in again. Microsoft cannot revoke it: Sign out forgets it; to remove Cellucid\'s access, account.live.com/consent/Manage or myapps.microsoft.com.',
     ],
     links: [
       doc('OneDrive', 'b_data_loading/16_private_drive_onedrive', 'onedrive-and-sharepoint'),

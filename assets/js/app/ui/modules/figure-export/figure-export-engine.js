@@ -20,8 +20,8 @@ import { downloadBlob } from '../../../utils/download.js';
 import { createFigureExportZip } from './utils/zip-archive.js';
 import { cloneCameraState } from '../../../../rendering/camera-state-contract.js';
 import {
-  assertLodMembership,
   matchesLodMembershipPresentation,
+  ownedLodMembership,
 } from './utils/lod-membership.js';
 import {
   assertFigureExportBatchRequest,
@@ -34,6 +34,9 @@ import {
   throwIfFigureExportAborted,
 } from './figure-export-contract.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { describeSubsampleMethod } from '../../../../data/subsample.js';
+import { allocateLargeArray } from '../../../../utils/large-arrays.js';
+import { failureText } from '../../../../utils/errors.js';
 
 const LIVE_VIEW_ID = 'live';
 const userNotifiedFailures = new WeakSet();
@@ -57,7 +60,7 @@ export function reportFigureExportFailure(
     center.failCalculation(calculationId, error.message);
   }
   center.error(
-    `Export failed: ${error.message}`,
+    `Export failed: ${failureText(error)}`,
     { category: 'render', duration: 6000 }
   );
   return error;
@@ -83,6 +86,8 @@ function cloneOwnedLegendValue(value, context, seen = new Map()) {
   if (seen.has(value)) {
     throw new TypeError(`${context} must not contain cyclic state.`);
   }
+  // A categorical's colours and visibility are bytes (`utils/category-state.js`).
+  if (value instanceof Uint8Array) return value.slice();
   seen.set(value, true);
   if (Array.isArray(value)) {
     const ownKeys = Reflect.ownKeys(value);
@@ -193,26 +198,11 @@ function cloneRenderState(renderState, antialias, context) {
   };
 }
 
-function cloneLodMembership(membership, pointCount, dimensionLevel, context) {
-  const exact = assertLodMembership(membership, {
-    pointCount,
-    dimensionLevel,
-    label: context,
-  });
-  if (exact === null) return null;
-  return Object.freeze({
-    dimensionLevel: exact.dimensionLevel,
-    generationToken: Object.freeze({}),
-    indices: new Uint32Array(exact.indices),
-    lodLevel: exact.lodLevel,
-    pointCount: exact.pointCount,
-  });
-}
-
 function cloneTypedOwner(owner, cache, Type) {
   const existing = cache.get(owner);
   if (existing !== undefined) return existing;
-  const clone = new Type(owner);
+  const clone = allocateLargeArray(Type, owner.length);
+  clone.set(owner);
   cache.set(owner, clone);
   return clone;
 }
@@ -278,7 +268,8 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    *   datasetSourceName: string|null,
    *   datasetSourceUrl: string|null,
    *   datasetSourceCitation: string|null,
-   *   datasetUserPath: string|null
+   *   datasetUserPath: string|null,
+   *   datasetCells: {open: number, of: number, method: string, digest: string}|null
    * }}
   */
   function getDatasetIdentity() {
@@ -309,6 +300,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetSourceUrl: null,
         datasetSourceCitation: null,
         datasetUserPath: null,
+        datasetCells: openCellsOf(null, null),
       };
     }
     for (const methodName of [
@@ -344,6 +336,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const datasetSourceUrl = meta?.source?.url ?? null;
     const datasetSourceCitation = meta?.source?.citation ?? null;
     const datasetUserPath = dataSourceSnapshot.userPath ?? null;
+    const datasetCells = openCellsOf(sourceType, datasetId);
 
     return {
       datasetName,
@@ -354,6 +347,25 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetSourceUrl,
       datasetSourceCitation,
       datasetUserPath,
+      datasetCells,
+    };
+  }
+
+  /**
+   * The open cells when they are a subsample (`readProvenanceCells`): their
+   * count, the dataset's, how they were chosen and their cell-set digest;
+   * null when every cell is open.
+   */
+  function openCellsOf(sourceType, datasetId) {
+    const identity = state.cellIdentity;
+    if (!identity?.isSubset) return null;
+    const annData = sourceType === null ? null : dataSourceManager?.getSource?.(sourceType)?.getAnnDataSource?.(datasetId) ?? null;
+    const spec = typeof annData?.getCellSubset === 'function' ? annData.getCellSubset()?.spec ?? null : null;
+    return {
+      open: identity.n,
+      of: identity.nOriginal,
+      method: spec === null ? 'subsample' : describeSubsampleMethod(spec),
+      digest: identity.digest,
     };
   }
 
@@ -581,22 +593,27 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       const drawOrder = borrowed.drawOrder === null
         ? null
         : cloneTypedOwner(borrowed.drawOrder, ownedCopies.drawOrder, Uint32Array);
+      // The level's cells in the pane's draw order, copied once per level
+      // and draw order (views sharing both share the copy).
       let lodMembership = null;
       if (borrowed.lodMembership !== null) {
-        lodMembership = ownedCopies.lodMembership.get(
-          borrowed.lodMembership
-        );
-        if (lodMembership === undefined) {
-          lodMembership = cloneLodMembership(
+        const kept = ownedCopies.lodMembership.get(borrowed.lodMembership);
+        if (kept !== undefined && kept.drawOrder === borrowed.drawOrder) {
+          lodMembership = kept.owned;
+        } else {
+          lodMembership = ownedLodMembership(
             borrowed.lodMembership,
-            pointCount,
-            stateDimensionLevel,
-            `Figure export LOD membership for "${vid}"`
+            borrowed.drawOrder,
+            {
+              pointCount,
+              dimensionLevel: stateDimensionLevel,
+              label: `Figure export LOD membership for "${vid}"`,
+            }
           );
-          ownedCopies.lodMembership.set(
-            borrowed.lodMembership,
-            lodMembership
-          );
+          ownedCopies.lodMembership.set(borrowed.lodMembership, {
+            drawOrder: borrowed.drawOrder,
+            owned: lodMembership,
+          });
         }
       }
       return {
@@ -640,6 +657,13 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           normTransform: {
             center: [...normTransform.center],
             scale: normTransform.scale,
+          },
+          // The cells read: their size over the others' and whether the
+          // pane drew them at every level (`rendering/read-cell-layer.js`).
+          pointLayers: {
+            // Never below the others' size (both are of the last frame drawn).
+            readScale: Math.max(1, presented.pointLayers.readSizeMultiplier / presented.lodSizeMultiplier),
+            readEveryLevel: presented.pointLayers.readEveryLevel,
           },
         },
       };
@@ -721,6 +745,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetSourceUrl,
       datasetSourceCitation,
       datasetUserPath,
+      datasetCells,
     } = getDatasetIdentity();
     throwIfFigureExportAborted(signal);
     const activeViewId = state.getActiveViewId();
@@ -910,6 +935,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetSourceUrl,
         datasetSourceCitation,
         datasetUserPath,
+        datasetCells,
         views: provenanceViews,
       },
       selection: {

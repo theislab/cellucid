@@ -46,6 +46,8 @@ import {
 } from './r-values.js';
 import { assembleColumns, cellsByFeatures, describeMatrix } from './r-matrices.js';
 import { RObjectRefusal } from './refusals.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
+import { StringIndex } from '../../../utils/string-index.js';
 
 /** Slots passed over while the file streams: never read, never kept. */
 export const SEURAT_DROPPED_SLOTS = Object.freeze([
@@ -231,7 +233,7 @@ function refuseMoved(name, root) {
 async function placedRows(matrix, cellIndex, nObs, context) {
   const values = await vectorValues(matrix.values, context);
   const [rows, columns] = [matrix.nrow, matrix.ncol];
-  const out = new Float64Array(nObs * columns).fill(NaN);
+  const out = allocateTypedArray(Float64Array, nObs * columns, 'A reduction placed by cell name').fill(NaN);
   const names = matrix.rownames;
   for (let r = 0; r < rows; r++) {
     const at = cellIndex.get(names[r]);
@@ -274,7 +276,9 @@ export async function seuratModel(root, context) {
     ? meta.rowNames
     : assays[0].cells;
   const nObs = obsNames.length;
-  const cellIndex = new Map(obsNames.map((name, index) => [name, index]));
+  // Names to cells without a Map (refused past 2^24 entries): a Seurat
+  // object of tens of millions of cells places its rows by name too.
+  const cellIndex = StringIndex.of(obsNames);
 
   const obsColumns = (meta?.columns ?? []).filter(column => column.name !== '');
   const ident = attribute(root, 'active.ident');
@@ -350,7 +354,7 @@ export async function seuratModel(root, context) {
 async function spatialOf(root, cellIndex, nObs, context, notes) {
   const images = namedItems(attribute(root, 'images'));
   if (images.length === 0) return null;
-  const out = new Float64Array(nObs * 2).fill(NaN);
+  const out = allocateTypedArray(Float64Array, nObs * 2, 'Image spot positions').fill(NaN);
   let found = false;
   for (const { name, value } of images) {
     const coordinates = await dataFrameOf(attribute(value, 'coordinates'), context);

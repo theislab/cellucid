@@ -31,6 +31,8 @@ async function installBlendBoundaryAudit(page) {
     };
     const classify = (gl, kind, mode, count, instanceCount) => {
       if (!activeAudit || gl !== activeAudit.gl) return null;
+      // A transform-feedback pass draws no fragment: no blend to own.
+      if (gl.isEnabled(gl.RASTERIZER_DISCARD)) return null;
       if (
         kind === 'drawArrays' &&
         mode === gl.TRIANGLES &&
@@ -47,7 +49,13 @@ async function installBlendBoundaryAudit(page) {
         return 'connectivity';
       }
       if (mode !== gl.POINTS) return null;
-      if (count === activeAudit.pointCount) return 'scatter';
+      // A scatter draw is one of the point programs'. The GPU gather of a
+      // tree's draw order (`high-perf/gpu-permute.js`, once level of detail
+      // or culling is on: a slow GPU's automatic choice) draws as many
+      // points into its own target, with blending off, and is no scatter.
+      if (count === activeAudit.pointCount) {
+        return activeAudit.scatterPrograms.has(gl.getParameter(gl.CURRENT_PROGRAM)) ? 'scatter' : null;
+      }
       if (count === activeAudit.highlightCount) return 'highlight';
       if (count === activeAudit.centroidCount) return 'centroid';
       return null;
@@ -133,6 +141,7 @@ async function installBlendBoundaryAudit(page) {
             edgeCount: config.edgeCount,
             gl,
             highlightCount: config.highlightCount,
+            scatterPrograms: new Set(config.scatterPrograms),
             pointCount: config.pointCount,
             records: [],
           };
@@ -253,6 +262,7 @@ test('grid multiview scatter, highlight, connectivity, and centroid draws own ex
       gl: viewer.getGLContext(),
       highlightCount: highlightIndices.length,
       pointCount,
+      scatterPrograms: Object.values(viewer.getHPRenderer().programs),
     });
     viewer.resume();
     return {
@@ -575,11 +585,14 @@ test('figure-export canvas and PNG preserve translucent color during compositing
     ]);
     const session = client.openFigureExportWorkerSession();
     try {
+      // A cell's colour carries no opacity (its alpha byte is its layer), so
+      // the translucent colour is a centroid's, drawn by the same program
+      // over a hidden cell.
       const frame = await session.request('rasterizePoints', client.pointRasterArgs(session, {
         positions: Float32Array.from([0, 0, 0]),
         dimension: 3,
-        colors: Uint8Array.from([255, 0, 0, 128]),
-        transparency: null,
+        colors: Uint8Array.from([255, 0, 0, 255]),
+        transparency: Uint8Array.from([0]),
         lodMembership: null,
         drawOrder: null,
         renderState: {
@@ -606,7 +619,11 @@ test('figure-export canvas and PNG preserve translucent color during compositing
         outputHeightPx: 16,
         viewRect01: null,
         pointSizePx: 16,
-        overlayPoints: null,
+        overlayPoints: {
+          positions: Float32Array.from([0, 0, 0]),
+          colors: Uint8Array.from([255, 0, 0, 128]),
+          pointSizePx: 16,
+        },
         highlightArray: null,
         emphasizeSelection: false,
         selectionMutedOpacity: 0.15,

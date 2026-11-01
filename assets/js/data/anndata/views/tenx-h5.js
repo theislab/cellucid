@@ -42,7 +42,7 @@
 import { isArrayNode, isGroup } from '../../../formats/store.js';
 import { defaultModality } from '../../data-mapping.js';
 import { attributeValue } from '../elements.js';
-import { LayoutRefusal, noEmbeddingRefusal } from './refusal.js';
+import { LayoutRefusal, noEmbeddingRefusal, tenxEmbeddingHint } from './refusal.js';
 import { modalityList } from './modalities.js';
 import { columnWindowMatrix, encodingAttrs, joinPath, rowWindowArray, viewArray, viewGroup } from './view-nodes.js';
 
@@ -163,35 +163,12 @@ async function featureTypeWindows(features, nFeatures, name, options) {
   return windows;
 }
 
-/**
- * Where an embedding of a 10x matrix is, for the refusal of one without, by
- * what was opened: Cell Ranger's `outs/` folder holds UMAP and t-SNE
- * projections beside the matrix. A file on this computer is beside its
- * folder; a link opens one file, never a folder, so its folder is opened
- * from this computer once downloaded (no provider shares a folder, and an
- * archive of one is not a format Cellucid reads); an `outs/` folder opened
- * without projections was run without its secondary analysis.
- *
- * @param {'file'|'folder'} opened
- * @param {boolean} fromLink
- */
-function outsHint(opened, fromLink) {
-  if (opened === 'folder') {
-    return 'Its analysis/ folder holds no UMAP or t-SNE projection (Cell Ranger was run with --nosecondary).';
-  }
-  return fromLink
-    ? 'Cell Ranger writes UMAP and t-SNE projections beside it, in the outs/ folder, which a link to one file cannot ' +
-      'bring along: download the whole outs/ folder and open it from this computer (Open… › Folder…).'
-    : 'Cell Ranger writes UMAP and t-SNE projections beside it: open the whole outs/ folder (Open… › Folder…), ' +
-      'which holds this file and analysis/.';
-}
-
 /** obs and obsm from the analysis of an `outs/` folder, merged into the view's. */
 function analysisChildren(analysis, name, fromLink) {
   const obsColumns = analysis?.obs ?? new Map();
   const obsm = analysis?.obsm ?? new Map();
   if (obsm.size === 0) {
-    throw noEmbeddingRefusal(`${name} is a 10x Cell Ranger count matrix that`, outsHint(analysis === null ? 'file' : 'folder', fromLink));
+    throw noEmbeddingRefusal(`${name} is a 10x Cell Ranger count matrix that`, tenxEmbeddingHint(analysis === null ? 'file' : 'folder', fromLink));
   }
   return { obsColumns, obsm };
 }
@@ -282,7 +259,7 @@ export async function tenxView(root, { name, analysis = null, signal = null, fro
       path: '/',
       attrs: encodingAttrs('anndata'),
       children: new Map([...common, ['X', () => only.X], ['var', () => only.var]]),
-      close: () => root.close?.(),
+      close: reason => root.close?.(reason),
     });
   }
   const names = entries.map(entry => entry.name);
@@ -313,7 +290,7 @@ export async function tenxView(root, { name, analysis = null, signal = null, fro
         children: new Map(entries.map(entry => [entry.name, () => modalityGroup(entry)])),
       })],
     ]),
-    close: () => root.close?.(),
+    close: reason => root.close?.(reason),
     extra: {
       modalities: modalityList(entries.map(entry => ({ name: entry.name, obsmap: null, nCells }))),
       defaultModality: chosen,
@@ -321,5 +298,32 @@ export async function tenxView(root, { name, analysis = null, signal = null, fro
   });
 }
 
+/**
+ * What the 10x view reads of a file before presenting it: all of it (the
+ * matrix's arrays and its feature list, all read to present it; a Cell
+ * Ranger 2 file's genome groups likewise).
+ */
+export const TENX_OPENING_PATHS = Object.freeze(['']);
+
+/**
+ * Whether a store root is a 10x Cell Ranger HDF5 file, loading what that
+ * takes: nothing for a root that declares an AnnData encoding (never a 10x
+ * file), else its groups' children (`isTenxRoot` looks one level below the
+ * root).
+ */
+export async function recognizeTenxRoot(root, options = {}) {
+  if (!isGroup(root) || attributeValue(root, 'encoding-type') !== undefined) return false;
+  await root.load([{ path: '', depth: 2 }], options);
+  return isTenxRoot(root);
+}
+
 /** The 10x `.h5` entry of `LAYOUT_VIEWS`. */
-export const TENX_H5_VIEW = Object.freeze({ recognize: isTenxRoot, view: tenxView, readerFormat: TENX_H5_FORMAT });
+export const TENX_H5_VIEW = Object.freeze({
+  recognize: recognizeTenxRoot,
+  openingPaths: TENX_OPENING_PATHS,
+  view: async (root, context) => {
+    await root.load(TENX_OPENING_PATHS, { signal: context.signal ?? null, activity: context.activity ?? null });
+    return tenxView(root, context);
+  },
+  readerFormat: TENX_H5_FORMAT,
+});

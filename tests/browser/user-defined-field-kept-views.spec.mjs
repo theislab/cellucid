@@ -66,7 +66,9 @@ function observeErrors(page) {
 /**
  * The dataset opens on its 3D layout; its 1D and 2D layouts are read when a
  * view first shows them. The field is coloured with its labels shown, and a
- * view is kept: the kept view is selected.
+ * view is kept: the kept view is selected, and shows its labels too (a view's
+ * labels are its own setting, and a label is made only while its view shows
+ * labels).
  */
 async function openWithKeptView(page) {
   await serveSyntheticCatalog(page, ROOT, {
@@ -114,7 +116,14 @@ async function openWithKeptView(page) {
   await expect(page.locator('.split-badge')).toHaveCount(2);
   const keptId = await page.evaluate(() => window._cellucidState.activeViewId);
   expect(keptId).not.toBe('live');
+  await showLabels(page);
   return keptId;
+}
+
+/** Show the selected view's centroids and their labels. */
+async function showLabels(page) {
+  await page.locator('#toggle-centroid-points').check();
+  await page.locator('#toggle-centroid-labels').check();
 }
 
 async function selectView(page, number) {
@@ -186,6 +195,9 @@ function readViews(page) {
         if (count > 0) means.push({ category, position: sum.slice(0, dimension).map(total => total / count) });
       });
       const colors = viewId === 'live' && focused === 'live' ? state.colorsArray : view.colorsArray;
+      // The view's category colours and visibility as the state gives them
+      // (`getLegendModel`, `getColorForCategory`).
+      const model = state.getLegendModel(copy);
       views[viewId] = {
         shown,
         layoutKey,
@@ -204,18 +216,18 @@ function readViews(page) {
             && c.position.every((value, axis) => Math.abs(value - means[i].position[axis]) < 1e-6)
         ),
         labels,
-        visible: copy.categories.map((_, index) => copy._categoryVisible?.[index] ?? true),
+        visible: copy.categories.map((_, index) => model.visible[index] === 1),
         // The colour each shown category is drawn in, from the view's own
         // colour buffer, at the first cell of each category with cells.
         drawnColors: Object.fromEntries(copy.categories.flatMap((category, index) => {
           const cell = copy.codes.indexOf(index);
-          return cell < 0 || copy._categoryVisible?.[index] === false
+          return cell < 0 || model.visible[index] === 0
             ? []
             : [[category, Array.from(colors.subarray(cell * 4, cell * 4 + 3))]];
         })),
         ownColors: Object.fromEntries(copy.categories.map((category, index) => [
           category,
-          copy._categoryColors[index].map(channel => Math.round(channel * 255)),
+          state.getColorForCategory(copy, index).map(channel => Math.round(channel * 255)),
         ])),
       };
     }
@@ -359,6 +371,7 @@ test('a consensus column rebuilt in place reaches every view that shows it', asy
   await page.locator('#split-keep-view-btn').click();
   await expect(page.locator('.split-badge')).toHaveCount(2);
   const keptId = await page.evaluate(() => window._cellucidState.activeViewId);
+  await showLabels(page);
 
   await selectView(page, 1);
   await upsert([0, 1, 1, 0, 2, 2, 1, 2, 0, 0, 2, 1]);

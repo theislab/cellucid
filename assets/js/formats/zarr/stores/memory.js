@@ -6,6 +6,7 @@
  */
 
 import { normalizeKey } from './common.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 
 /**
  * @param {Map<string, Uint8Array>|Record<string, Uint8Array>} entries
@@ -19,7 +20,7 @@ export function memoryStore(entries, { name = 'memory' } = {}) {
   }
   const stats = { requests: 0, bytes: 0 };
   const get = async (key, { signal = null, activity = null } = {}) => {
-    if (signal?.aborted) throw signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
+    throwIfAborted(signal);
     const bytes = map.get(key) ?? null;
     if (bytes !== null) {
       stats.requests++;

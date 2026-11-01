@@ -193,7 +193,7 @@ test('background downloads run no more at once than requests a browser keeps ope
 });
 
 test('one waiting signal shared by thousands of downloads carries one abort listener, and still cancels each at once', async () => {
-  const { abortListenerCount, abortWaiterCount } = await import('../assets/js/formats/io/abort.js');
+  const { abortListenerCount, abortWaiterCount } = await import('../assets/js/utils/abort.js');
   const scheduler = new FetchScheduler();
   const { start } = manual();
   const controller = new AbortController();

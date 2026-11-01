@@ -1,8 +1,8 @@
 /**
  * AnnData sparse matrices (`csr_matrix` / `csc_matrix` 0.1.0 groups of
- * `data`, `indices` and `indptr`): their contract, and reading one whole (a
- * neighbour graph). Expression matrices are read a column at a time instead
- * (`matrix-access.js`).
+ * `data`, `indices` and `indptr`): their contract and pointers. Expression
+ * matrices are read a column at a time (`matrix-access.js`), neighbour
+ * graphs line by line (`graph-lines.js`).
  *
  * @module data/anndata/sparse
  */
@@ -17,7 +17,6 @@ import {
   validateOneDimensional,
   valueKind,
 } from './elements.js';
-import { readConvertedRange, readFloat32, readStored } from './values.js';
 
 /**
  * A sparse matrix's arrays and shape, checked; no value is read.
@@ -81,47 +80,3 @@ export function checkPointers(pointers, nnz, label) {
   }
   return pointers;
 }
-
-/**
- * Read a whole sparse matrix: `data` exactly as stored (`dataMode: 'exact'`)
- * or as float32, `indices` as int32 within the index axis, `indptr` as exact
- * numbers. The three arrays are fetched together.
- */
-export async function readSparseMatrix(group, format, label, dataMode, options = {}) {
-  if (dataMode !== 'float32' && dataMode !== 'exact') {
-    throw new TypeError(`${label} data mode must be exactly "float32" or "exact"`);
-  }
-  const contract = sparseContract(group, format, label);
-  const { dataArray, dataLength, indicesArray, indptrArray, shape } = contract;
-  const indexAxis = contract.format === 'csr' ? shape[1] : shape[0];
-  // Pointers are exact integers up to 2^53; Int32 holds them while the
-  // non-zero count fits, Float64 beyond.
-  const PointerArray = dataLength <= 0x7fffffff ? Int32Array : Float64Array;
-  const [data, indices, indptr] = await Promise.all([
-    dataMode === 'exact'
-      ? readStored(dataArray, 0, dataLength, `${label} data`, options)
-      : readFloat32(dataArray, 0, dataLength, `${label} data`, options),
-    readConvertedRange(indicesArray, 0, dataLength, Int32Array, `${label} index`, (values, output, offset) => {
-      for (let i = 0; i < values.length; i++) {
-        const raw = values[i];
-        const index = typeof raw === 'bigint' ? Number(raw) : raw;
-        if (!(index >= 0 && index < indexAxis) || !Number.isInteger(index)) {
-          throw new Error(`${label} index ${String(raw)} is outside axis bounds [0, ${indexAxis})`);
-        }
-        output[offset + i] = index;
-      }
-    }, options),
-    readConvertedRange(indptrArray, 0, Number(indptrArray.shape[0]), PointerArray, `${label} indptr`, (values, output, offset) => {
-      for (let i = 0; i < values.length; i++) {
-        const value = Number(values[i]);
-        if (!Number.isSafeInteger(value) || value < 0 || value > dataLength) {
-          throw new Error(`${label} indptr ${String(values[i])} is outside [0, ${dataLength}]`);
-        }
-        output[offset + i] = value;
-      }
-    }, options),
-  ]);
-  checkPointers(indptr, data.length, label);
-  return { cscData: null, data, format: contract.format, indices, indptr, shape };
-}
-

@@ -145,6 +145,8 @@ test('smoke density source retains dataset arrays without an O(n) position copy'
   assert.strictEqual(source.colors, colors);
   assert.strictEqual(source.outlierQuantiles, outlierQuantiles);
   assert.equal(source.outlierThreshold, 0.75);
+  // With how many times each was handed out for writing (none here).
+  assert.deepEqual(source.writes, { colors: 0, alpha: 0 });
 });
 
 test('smoke density reads a 2D or 1D source in its own layout, with zero for the missing axes', () => {
@@ -291,7 +293,7 @@ test('smoke preparation admits exactly the transparency bytes that encode to vis
   );
   assert.match(
     source,
-    /if \(alpha\[pointIndex\] < POINT_VISIBILITY_THRESHOLD\) continue;/,
+    /if \(alpha !== null && alpha\[pointIndex\] < POINT_VISIBILITY_THRESHOLD\) continue;/,
   );
 });
 
@@ -936,35 +938,48 @@ test('smoke never samples a float32 texture through filtering', async () => {
   assert.match(atlas, /TEXTURE_MAG_FILTER, gl\.NEAREST/);
 });
 
-test('a rebuild for inputs identical to the shown volume does no work; any changed byte rebuilds', async () => {
+test('a rebuild for the same arrays at the same write counts does no work; it keeps no copy of them', async () => {
   const positions = new Float32Array([-0.5, 0, 0.5, 0.5, 0, -0.5]);
-  const options = () => ({
-    colors: colorsFor(2),
+  const colors = colorsFor(2);
+  const alpha = new Uint8Array([1, 0]);
+  const outlierQuantiles = new Float32Array([0.2, 0.9]);
+  const options = (writes = { colors: 3, alpha: 5 }) => ({
+    colors,
     dimension: 3,
     gridSize: 8,
     gamma: 0.7,
-    visibility: { alpha: new Uint8Array([1, 0]), outlierQuantiles: new Float32Array([0.2, 0.9]), outlierThreshold: 0.5 },
+    visibility: { alpha, outlierQuantiles, outlierThreshold: 0.5 },
+    writes,
   });
-  const source = options();
-  const built = captureSmokeInputs(positions, source, null, { empty: true, gridSize: 8 });
-  // The capture is a copy: rewriting the caller's arrays in place is seen.
+  const built = captureSmokeInputs(positions, options(), null, { empty: true, gridSize: 8 });
+  // Nothing per cell is kept: the arrays by weak reference, their writes by count.
+  for (const value of Object.values(built)) {
+    assert.ok(!ArrayBuffer.isView(value), 'no per-cell copy');
+  }
   assert.equal(sameSmokeInputs(built, positions, options()), true);
-  source.colors[5] = 7;
-  assert.equal(sameSmokeInputs(built, positions, source), false);
   for (const change of [
-    o => { o.colors[0] = 1; },
-    o => { o.visibility.alpha[1] = 1; },
-    o => { o.visibility.outlierQuantiles[0] = 0.25; },
+    o => { o.writes = { colors: 4, alpha: 5 }; },
+    o => { o.writes = { colors: 3, alpha: 6 }; },
+    o => { o.colors = colors.slice(); },
+    o => { o.visibility.alpha = alpha.slice(); },
+    o => { o.visibility.outlierQuantiles = outlierQuantiles.slice(); },
     o => { o.visibility.outlierThreshold = 0.6; },
     o => { o.gridSize = 16; },
     o => { o.gamma = 0.75; },
     o => { o.visibility = null; },
+    o => { delete o.writes; },
   ]) {
     const changed = options();
+    changed.visibility = { ...changed.visibility };
     change(changed);
     assert.equal(sameSmokeInputs(built, positions, changed), false, change.toString());
   }
   assert.equal(sameSmokeInputs(built, positions.slice(), options()), false, 'other positions');
+  // A caller that names no writes is never answered from the last build.
+  const unnamed = { ...options() };
+  delete unnamed.writes;
+  assert.equal(sameSmokeInputs(captureSmokeInputs(positions, unnamed, null, null), positions, unnamed), false);
+  assert.throws(() => sameSmokeInputs(built, positions, options({ colors: 1 })), /count the colours and the visibility/);
   // The build answers an identical request before any GPU work, and only
   // while the volume it built is still the one shown.
   const rendererSource = await readFile(

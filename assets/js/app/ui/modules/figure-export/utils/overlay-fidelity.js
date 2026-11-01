@@ -22,6 +22,8 @@ import { PLACES } from '../../../place-names.js';
 
 /** Element id of the control that owns the velocity overlay. */
 export const VELOCITY_OVERLAY_CONTROL_ID = 'velocity-overlay-enabled';
+/** Element id of the control that shows the connectivity edges. */
+const CONNECTIVITY_CONTROL_ID = 'toggle-connectivity';
 
 /**
  * Read whether the velocity vector-field overlay is currently rendering.
@@ -79,6 +81,8 @@ export function buildOverlayFidelityWarnings({
         + 'renders the point layer only, so the exported figure would omit the '
         + 'edges the active view shows. Turn "Show connectivity edges" off '
         + 'before exporting.',
+      // One step: the dialog turns it off and exports (`confirmExportFidelityWarnings`).
+      fix: { label: 'edges', controlId: CONNECTIVITY_CONTROL_ID },
     });
   }
 
@@ -99,6 +103,7 @@ export function buildOverlayFidelityWarnings({
         + 'renders the point layer only, so the exported figure would omit the '
         + 'flow the active view shows. Turn "Show overlay" off under '
         + `${PLACES.vectorField.name} before exporting.`,
+      fix: { label: 'vector field', controlId: VELOCITY_OVERLAY_CONTROL_ID },
     });
   }
 

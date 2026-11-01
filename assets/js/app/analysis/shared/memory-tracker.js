@@ -1,31 +1,27 @@
 /**
  * Memory Tracker (debug-only)
  *
- * Provides cheap, structured memory snapshots around expensive operations.
- * Intended to help diagnose regressions without adding production overhead.
+ * Structured memory notes around expensive operations, from the memory
+ * model's own count (`data/memory-budget.js` `memoryReport`): what every
+ * cache keeps, in every thread, and the working set, at the start and at
+ * the end of a scope. The JavaScript heap is not read: it counts no
+ * `ArrayBuffer`, where every per-cell array lives.
  *
  * @module shared/memory-tracker
  */
 
 import { debug, isDebugMode } from './debug-utils.js';
-import { getHeapMemoryUsage, measureUserAgentSpecificMemory } from './memory-utils.js';
+import { memoryReport } from '../../../data/memory-budget.js';
 
-/**
- * @typedef {Object} MemorySnapshot
- * @property {import('./memory-utils.js').HeapMemoryUsage|null} heap
- * @property {import('./memory-utils.js').UserAgentMemoryUsage|null} userAgent
- * @property {number|null} timestamp
- */
+const MiB = 1024 * 1024;
 
-function formatMB(value) {
-  return Number.isFinite(value) ? `${value.toFixed(1)}MB` : 'N/A';
+function formatMB(bytes) {
+  return `${(bytes / MiB).toFixed(1)}MB`;
 }
 
 function formatDelta(before, after) {
-  if (!Number.isFinite(before) || !Number.isFinite(after)) return 'N/A';
-  const delta = after - before;
-  const sign = delta >= 0 ? '+' : '';
-  return `${sign}${delta.toFixed(1)}MB`;
+  const delta = (after - before) / MiB;
+  return `${delta >= 0 ? '+' : ''}${delta.toFixed(1)}MB`;
 }
 
 /**
@@ -33,66 +29,24 @@ function formatDelta(before, after) {
  *
  * @param {string} category - Debug category
  * @param {string} label - Scope label
- * @param {Object} [options]
- * @param {boolean} [options.includeUserAgent=false] - Also sample `measureUserAgentSpecificMemory()` (async; Chromium-only)
- * @returns {{ end: (extra?: any) => void, snapshot: () => MemorySnapshot }}
+ * @returns {{ end: (extra?: any) => void }}
  */
-export function startMemoryTracking(category, label, options = {}) {
-  const { includeUserAgent = false } = options;
-  const enabled = isDebugMode();
-
-  /** @type {MemorySnapshot} */
-  const start = {
-    heap: enabled ? getHeapMemoryUsage() : null,
-    userAgent: null,
-    timestamp: enabled && typeof performance !== 'undefined' && performance.now ? performance.now() : null
-  };
-
-  if (enabled && includeUserAgent) {
-    void measureUserAgentSpecificMemory().then((ua) => {
-      start.userAgent = ua;
-    });
-  }
-
-  const snapshot = () => ({ ...start });
-
-  const end = (extra) => {
-    if (!enabled) return;
-
-    const endHeap = getHeapMemoryUsage();
-    const endTime = typeof performance !== 'undefined' && performance.now ? performance.now() : null;
-
-    const heapDelta = (start.heap?.usedMB != null && endHeap.usedMB != null)
-      ? formatDelta(start.heap.usedMB, endHeap.usedMB)
-      : 'N/A';
-
-    const base = {
-      heapStart: formatMB(start.heap?.usedMB),
-      heapEnd: formatMB(endHeap.usedMB),
-      heapDelta,
-      heapPercentEnd: endHeap.percentUsed != null ? `${endHeap.percentUsed.toFixed(1)}%` : 'N/A',
-      elapsedMs: (start.timestamp != null && endTime != null) ? Math.round(endTime - start.timestamp) : null
-    };
-
-    // UA memory is async; sample once more if requested and available.
-    if (!includeUserAgent) {
-      debug(category, `Memory scope: ${label}`, { ...base, ...extra });
-      return;
-    }
-
-    void measureUserAgentSpecificMemory().then((uaEnd) => {
-      const uaStartMB = start.userAgent?.megabytes;
-      const uaEndMB = uaEnd?.megabytes;
+export function startMemoryTracking(category, label) {
+  if (!isDebugMode()) return { end: () => {} };
+  const start = memoryReport();
+  const startedAt = performance.now();
+  return {
+    end(extra) {
+      const now = memoryReport();
       debug(category, `Memory scope: ${label}`, {
-        ...base,
-        uaStart: formatMB(uaStartMB),
-        uaEnd: formatMB(uaEndMB),
-        uaDelta: formatDelta(uaStartMB, uaEndMB),
-        uaError: uaEnd?.error || start.userAgent?.error || null,
-        ...extra
+        heldStart: formatMB(start.heldBytes),
+        heldEnd: formatMB(now.heldBytes),
+        heldDelta: formatDelta(start.heldBytes, now.heldBytes),
+        workingSet: formatMB(now.workingSetBytes),
+        allowance: formatMB(now.allowanceBytes),
+        elapsedMs: Math.round(performance.now() - startedAt),
+        ...extra,
       });
-    });
+    },
   };
-
-  return { end, snapshot };
 }

@@ -156,6 +156,8 @@ test('form-based modal exports fail when no exact modal plot exists', async () =
   globalThis.HTMLElement = class HTMLElement {};
   const ui = Object.create(FormBasedAnalysisUI.prototype);
   ui._modal = null;
+  ui._lastResult = null;
+  ui._resultInputs = null;
 
   try {
     await assert.rejects(

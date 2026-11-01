@@ -6,6 +6,7 @@
  * served with `HEAD` and `Range` as the server serves it, and for a host its
  * protocol and viewer channel (a WebSocket at `_cellucid/ws`).
  */
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fulfillFile } from './anndata-zarr-zip.mjs';
@@ -40,7 +41,8 @@ function servedDataset({ id, name, file, cells, genes }) {
       id,
       name,
       anndata: {
-        file: { url: route, kind: h5ad ? 'h5ad' : 'zarr', layout: h5ad ? 'file' : 'zip', size: bytes.length },
+        // The file's version, as a server states the validator it answers with.
+        file: { url: route, kind: h5ad ? 'h5ad' : 'zarr', layout: h5ad ? 'file' : 'zip', size: bytes.length, etag: `"${createHash('sha256').update(bytes).digest('hex').slice(0, 32)}"` },
         defaults: {},
       },
     }),
@@ -65,7 +67,7 @@ export async function serveAnnDataServer(
   page,
   origin,
   dataset,
-  { version = '0.9.5', info = null, viewerHost = false, holdDatasets = null } = {},
+  { version = '0.9.6', info = null, viewerHost = false, holdDatasets = null } = {},
 ) {
   const served = servedDataset(dataset);
   const summary = { format: served.format, ...served.summary };

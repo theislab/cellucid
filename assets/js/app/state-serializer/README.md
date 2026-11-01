@@ -7,10 +7,12 @@ It is **not** the save/load orchestrator:
 - Features persist state via small **contributors** under `cellucid/assets/js/app/session/contributors/`
 
 Current constraints:
-- Only the one current state document is accepted: session format 2, whose
-  version is part of the file signature (`CELLUCID_SESSION/2\n`, see
-  `session/bundle/format.js`). Any file without that signature is refused
-  with `NOT_A_SESSION_FILE_MESSAGE`.
+- Only the one current state document is accepted: session format 3, whose
+  version is part of the file signature (`CELLUCID_SESSION/3\n`, see
+  `session/bundle/format.js`). A session of another format version is
+  refused naming it (`sessionSignatureRefusal()`: a format-2 file's cell-order
+  digest was taken over drawn coordinates, which no later version can check);
+  any other file with `NOT_A_SESSION_FILE_MESSAGE`.
 - The reader implements one exact current document shape and rejects every
   other shape; restoration is always all-or-nothing.
 - Sessions are treated as **untrusted input** with exact profiles, bounds,
@@ -221,43 +223,51 @@ that are on (`embeddings.enabled`, any number of each dimension), the default
 of each dimension (`embeddings.defaults`), the vector bindings, the neighbour
 graph, gene names, expression matrix and latent space. It is resolved
 once per load by `data/dataset-mapping.js` (from the AnnData candidate catalog
-of the `.h5ad` or Zarr file opened in the browser, or of the object a Python
-server serves) and changed in the
-Session › Data mapping panel (`state/managers/mapping-manager.js`). The panel
-changes only the embeddings (which are on, and each dimension's default); the
-other groups are fixed for the session.
+of the file opened in the browser, or of the file a Python or R server
+serves) and changed in the Session › Data mapping panel
+(`state/managers/mapping-manager.js`, `mapping-groups.js`). A dataset is
+shown before its gene list is read (`state/managers/var-axis.js`), and capture
+and restore wait for it (`whenGenesListed`), so `varCount` is always that of
+the installed gene list.
 
 `cellOrder.embedding` names the layout the live view shows: an AnnData `obsm`
 key with its 0-based columns. `cellOrder.dimension` is that layout's dimension, exactly 1, 2, or 3.
-`cellOrder.digest` is 16 lowercase hex characters produced by
-`digestCellOrder(state.positionsArray, dimension)` in
-`cellucid/assets/js/app/session/session-context.js`. The digest is defined over
-XYZ triples: the live positions hold only the embedding's own components per
-cell, and the axes a 1D or 2D embedding does not have are folded in as zero
-words, so the digest does not depend on the in-memory layout.
+`cellOrder.digest` is 16 lowercase hex characters: the cell-order digest of
+`data/cell-order-digest.js` over the stored values of that embedding's columns
+(rounded to float32), each open cell named by its original position: per
+cell, two MurmurHash3 lanes of (original position, x, y, z words; the zero
+word for an axis a 1D or 2D embedding lacks), summed over the cells, then
+finalised with the cell count. `getDatasetFingerprint()` asks
+`dimensionManager.getCellOrderDigest(layoutKey)`, which the reader worker
+answers from the sums it made as it read the embedding
+(`EmbeddingPayloads.cellOrderDigest`).
 
-Why the coordinates:
+Why the stored values, by original position:
 - The scalars all survive a row permutation. Re-export a dataset at the
   same id from re-sorted input and every one of them is unchanged, while every
-  stored row index now denotes a different cell.
+  stored position now denotes a different cell.
 - Observation and variable names are also invariant under a row permutation, so
   they cannot detect the change either.
-- Positions are the only per-cell payload the viewer always holds in memory, and
-  a re-ordered export permutes them.
+- Display coordinates are centred and scaled by the bounds of the cells an
+  embedding was first read for, a frame an opening grown or cut in place
+  keeps: they depend on how the cells were opened. The stored values do not,
+  so the same cells digest alike whole, grown, after **Apply**, cut in place
+  to a session's share, in priority order or as given.
 
 Why the embedding travels with the digest:
-- Every embedding is a separate payload, normalized on its own, so a digest is
-  comparable only within one of them.
-- A restore verifies the digest against the very layout the session names,
-  loading it (pinned, without touching any view) whichever layout is on screen,
-  so a session saved in 2D opens while 3D is shown.
+- A digest is comparable only within one embedding's columns.
+- A restore verifies the digest of the very embedding the session names, over
+  the cells it names (opened first), whichever layout is on screen and without
+  loading it for display, so a session saved in 2D opens while 3D is shown.
 
-Cost and memoization:
-- 4.3 ms for the digest and 5.6 ms for the complete fingerprint on 842k cells
-  (9.64 MiB of Float32 coordinates).
-- Memoized in a `WeakMap` keyed by the coordinate array. That array is replaced,
-  never rewritten, on every dataset and dimension change, so the per-contributor
-  re-derivations during one capture cost 0.06 ms in total.
+Cost:
+- The worker sums an embedding as it reads it, in blocks of 4,096 open rows: a
+  growth step adds the rows it reads, a cut keeps the whole blocks and reads
+  under 4,096 rows when asked, the same cells reordered keep the total. Saving
+  folds nothing on the page.
+- A capture runs with the open cells in use (`useOpenCells`): growth and
+  **Apply** wait for it. Between contributors it re-checks every fingerprint
+  field but the digest (`datasetFingerprintStillCurrent()`).
 
 Restore is verify-then-apply (`verifySessionFingerprint()`): every check below
 runs before any chunk touches state, and each refusal has its own message,
@@ -265,7 +275,8 @@ surfaced verbatim by the session controls:
 
 | Cause | Where it is raised | What the user is told |
 |---|---|---|
-| A file without the format-2 signature | the signature, `bundle/reader.js` | `NOT_A_SESSION_FILE_MESSAGE` |
+| A session of another format version | the signature, `bundle/reader.js` | `otherSessionFormatMessage()`: saved by an earlier (or a newer) Cellucid, naming its format |
+| A file without a session signature | the signature, `bundle/reader.js` | `NOT_A_SESSION_FILE_MESSAGE` |
 | The id or a count differs | `verifySessionFingerprint()` | it is a different dataset, with both saved and current cell/gene counts, or both identities, named |
 | `dataMapping` differs in a group the viewer cannot change (graph, gene names, expression, latent space, vector fields), or turns on an embedding this dataset cannot show | `verifySessionFingerprint()` | the group or the embedding is named, by its embedding id or `obsm` key |
 | `cellOrder.embedding` names no layout of this dataset | `verifySessionFingerprint()` | the embedding is named |
@@ -417,6 +428,26 @@ control "velocity-field"`); applied earlier, the saved field was overwritten
 when the embedding changed under it. `embeddingDependentControlIds()` lists
 them.
 
+A slider marked `data-session-preference` saves a **preference its owner
+keeps**, not the value it shows. `#connectivity-limit` (Max edges) is the one in
+the interface today: its range follows the visible edges of the graph, which is
+read only when edges are switched on, so a value saved against a 2.4M-edge graph
+was above the 1,000,000 the markup starts with on a page that had not read it
+yet, and the restore refused the session (`Session UI control
+"connectivity-limit" value is above its current maximum`). The owner writes the
+preference into the attribute whenever it changes (`setUserEdgeLimit` in
+`main.js`); capture saves the attribute; validation checks the record in full
+before any current value — a positive whole number, a count a person can choose
+(the slider's smallest stop is one edge or more), never a value inside the
+current range; restore writes the attribute and dispatches
+`session-preference`, and the owner shows what the graph allows of it once the
+graph is read. An owner that does not take the preference leaves the attribute
+different and fails the restore, as for every other control. Saves taken before
+the preference was recorded hold the value the slider showed, `0` while no
+graph was read, which restored would switch edges on with none drawn; they are
+refused, and `tests/session-preset-control-inventory-contract.test.mjs` asks
+the loader about each published preset's preference records.
+
 Explicit exclusions:
 - Any control whose id was minted on the page by `createDomId`
   (`ui/components/dom-id.js`, `isGeneratedDomId`) is ignored. Such an id is
@@ -483,6 +514,10 @@ Continuous fields:
 - filter enabled/disabled (`_filterEnabled`)
 - log scale (`_useLogScale`)
 - color-range follows filter (`_useFilterColorRange`)
+- gray for zero (`_zeroGray`): the entry's one optional key, `zeroGray`.
+  Always written (`true`, or `null` while off); an entry without it (a
+  session written by 0.9.6) restores it off, the default; any value that is
+  not a boolean or `null` is refused
 - colormap override (`_colormapId`)
 
 Restore behavior:

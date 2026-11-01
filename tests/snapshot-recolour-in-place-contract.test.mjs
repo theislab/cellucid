@@ -15,7 +15,7 @@ const source = readFileSync(new URL('../assets/js/rendering/high-perf-renderer.j
 test('a sole-owner recolour in the drawn order is gathered in place, anything else is replaced', () => {
   const start = source.indexOf('\n  updateSnapshotColors(id, colors) {');
   const body = source.slice(start, source.indexOf('\n  }\n', start));
-  assert.match(body, /owner\.refCount === 1 &&\n\s*\(owner\.order \?\? null\) === \(orderRecord\?\.drawOrder \?\? null\)/);
+  assert.match(body, /owner\.refCount === 1 &&\n\s*\(owner\.order \?\? null\) === \(orderRecord \?\? null\)/);
   assert.match(body, /this\._writeOrderedColors\(owner\.buffer, colors, orderRecord, label\);\n\s*snapshot\.colors = colors;\n(\s*\/\/.*\n)*\s*this\._clearKeptColorStores\(snapshot\.colorCache\);\n\s*return true;/);
   assert.match(body, /return this\._replaceSnapshotResources\(/);
 });

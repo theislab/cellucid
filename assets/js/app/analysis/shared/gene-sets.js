@@ -9,6 +9,8 @@
  * @module analysis/shared/gene-sets
  */
 
+import { ensemblStableId } from '../../utils/gene-lookup.js';
+
 /** Separators between gene names in typed or pasted text. */
 const GENE_SEPARATOR = /[\s,;]+/;
 
@@ -34,8 +36,11 @@ export function parseGeneText(text) {
 
 /**
  * Gene sets of a GMT file: one set per line, `name<TAB>description<TAB>gene…`
- * (MSigDB). Blank lines are skipped; a line with a name and no genes is a set
- * with no genes.
+ * (MSigDB). One rule with cellucid-python's `read_gmt` and cellucid-r's
+ * `cellucid_read_gmt`: cells are tab-separated and trimmed; blank lines are
+ * skipped; a line without a name is `Set <n>` (its place among the sets); a
+ * name used again is `name (2)`, `name (3)`… (`uniqueGeneSetName`); each
+ * gene is kept once; a line with a name and no genes is a set with no genes.
  *
  * @param {string} text
  * @returns {Array<{name: string, description: string, genes: string[]}>}
@@ -47,14 +52,49 @@ export function parseGmt(text) {
   for (const line of text.split(/\r?\n/)) {
     if (line.trim().length === 0) continue;
     const cells = line.split('\t');
-    const name = uniqueName(cells[0].trim() || `Set ${sets.length + 1}`, names);
+    const name = uniqueGeneSetName(cells[0].trim() || `Set ${sets.length + 1}`, names);
     const description = (cells[1] ?? '').trim();
-    sets.push({ name, description, genes: parseGeneText(cells.slice(2).join('\t')) });
+    const genes = [...new Set(cells.slice(2).map(cell => cell.trim()).filter(gene => gene.length > 0))];
+    sets.push({ name, description, genes });
   }
   return sets;
 }
 
-function uniqueName(name, names) {
+/**
+ * Gene sets as a GMT file (MSigDB): one set per line, `name<TAB>description
+ * <TAB>gene…`, each run of tabs and line breaks inside a name, description
+ * or gene written as one space, a name that then reads as an earlier one's
+ * written `name (2)` (as `parseGmt` names a repeated name), each gene once,
+ * and the file ending with a new line. What `parseGmt` reads back, and what
+ * cellucid-python's `write_gmt`/`read_gmt` and cellucid-r's
+ * `cellucid_write_gmt`/`cellucid_read_gmt` write and read.
+ *
+ * @param {Array<{name: string, description?: string, genes: string[]}>} sets
+ * @returns {string}
+ */
+export function formatGmt(sets) {
+  if (!Array.isArray(sets)) throw new TypeError('GMT gene sets must be a list');
+  const clean = value => String(value).replace(/[\t\r\n]+/g, ' ').trim();
+  const names = new Set();
+  const lines = sets.map(set => {
+    const name = clean(set.name);
+    if (name.length === 0) throw new TypeError('A GMT gene set needs a name');
+    const genes = [...new Set(set.genes.map(clean).filter(gene => gene.length > 0))];
+    return [uniqueGeneSetName(name, names), clean(set.description ?? ''), ...genes].join('\t');
+  });
+  return lines.length === 0 ? '' : `${lines.join('\n')}\n`;
+}
+
+/**
+ * `name`, or `name (2)`, `name (3)`… -- the first not in `names` -- added to
+ * `names`: the one rule for a gene set name used twice, in the web app,
+ * cellucid-python and cellucid-r alike.
+ *
+ * @param {string} name
+ * @param {Set<string>} names
+ * @returns {string}
+ */
+export function uniqueGeneSetName(name, names) {
   let candidate = name;
   for (let n = 2; names.has(candidate); n++) candidate = `${name} (${n})`;
   names.add(candidate);
@@ -133,7 +173,7 @@ export function parseGeneTable(text, { name = 'Imported genes' } = {}) {
   const names = new Set();
   const sets = [];
   for (let column = 0; column < width; column++) {
-    const setName = uniqueName((header[column] ?? '').trim() || `Set ${column + 1}`, names);
+    const setName = uniqueGeneSetName((header[column] ?? '').trim() || `Set ${column + 1}`, names);
     const genes = parseGeneText(rows.slice(1).map(row => row[column] ?? '').join('\n'));
     if (genes.length > 0) sets.push({ name: setName, genes });
   }
@@ -141,17 +181,63 @@ export function parseGeneTable(text, { name = 'Imported genes' } = {}) {
 }
 
 /**
- * A lookup of a dataset's gene names: exact, and by case for the names whose
- * lower case is shared by no other gene; with the names in file order and
- * their lower case, for search boxes (`utils/text-match.js`).
+ * How the genes of the gene list in use are identified across a boundary
+ * (the viewer protocol, GMT files, CSV tables, a notebook): by their var
+ * index name, the identifier. That is the name shown, unless the data
+ * mapping names the genes by a var column (`geneNames.ids` then holds the
+ * index beside the names). `idOf(name)` is a gene's identifier (a name of no
+ * gene of the list stays as it is); `ids` maps each identifier to its shown
+ * name. Made once per gene list.
  *
- * @param {string[]} available - The dataset's gene names
- * @returns {{exact: Set<string>, byLower: Map<string, string[]>, names: string[], lowered: string[], size: number}}
+ * @param {{fields?: Array<Object>, geneNames?: {ids?: string[]|null}}|null} varData
+ * @returns {{idOf: (name: string) => string, ids: Map<string, string>}}
  */
-export function createGeneIndex(available) {
+export function geneIdentities(varData) {
+  if (varData === null || varData === undefined) return EMPTY_IDENTITIES;
+  const known = identities.get(varData);
+  if (known !== undefined) return known;
+  const list = varData.geneNames?.ids ?? null;
+  const ids = new Map();
+  const byName = new Map();
+  for (const field of varData.fields ?? []) {
+    if (field?._isUserDefined === true || typeof field?.path !== 'string') continue;
+    const match = /\/(0|[1-9][0-9]*)$/.exec(field.path);
+    const id = list === null || match === null ? field.key : (list[Number(match[1])] ?? field.key);
+    ids.set(id, field.key);
+    byName.set(field.key, id);
+  }
+  const result = Object.freeze({ idOf: name => byName.get(name) ?? name, ids });
+  identities.set(varData, result);
+  return result;
+}
+
+const identities = new WeakMap();
+const EMPTY_IDENTITIES = Object.freeze({ idOf: name => name, ids: new Map() });
+
+/**
+ * Index a dataset's gene names for matching: each name, each name lower-cased
+ * (`byLower`), and, with `identities` (`geneIdentities`), each gene's
+ * identifier where it differs from its name (a var column names the genes),
+ * so a gene set that crossed a boundary by identifier finds its genes.
+ *
+ * @param {string[]} available
+ * @param {ReturnType<typeof geneIdentities>|null} [identities]
+ * @returns {{exact: Set<string>, byLower: Map<string, string[]>, ids: Map<string, string>, idsByLower: Map<string, string[]>, names: string[], lowered: string[], size: number}}
+ */
+export function createGeneIndex(available, identities = null) {
   if (!Array.isArray(available)) throw new TypeError('Available genes must be an array');
   const exact = new Set(available);
   const byLower = new Map();
+  // Genes by the stable id of the Ensembl accession naming or identifying
+  // them, whatever its version (`utils/gene-lookup.js`).
+  const byStableId = new Map();
+  const addStable = (accession, gene) => {
+    const stable = ensemblStableId(accession);
+    if (stable === null) return;
+    const list = byStableId.get(stable);
+    if (list === undefined) byStableId.set(stable, [gene]);
+    else if (!list.includes(gene)) list.push(gene);
+  };
   const lowered = new Array(available.length);
   for (let index = 0; index < available.length; index++) {
     const gene = available[index];
@@ -160,13 +246,30 @@ export function createGeneIndex(available) {
     const list = byLower.get(lower);
     if (list === undefined) byLower.set(lower, [gene]);
     else list.push(gene);
+    addStable(gene, gene);
   }
-  return { exact, byLower, names: available, lowered, size: available.length };
+  // Identifiers of the genes listed here, when they differ from the names.
+  const ids = new Map();
+  const idsByLower = new Map();
+  for (const [id, name] of identities?.ids ?? []) {
+    if (id === name || !exact.has(name)) continue;
+    ids.set(id, name);
+    const lower = id.toLowerCase();
+    const list = idsByLower.get(lower);
+    if (list === undefined) idsByLower.set(lower, [name]);
+    else if (!list.includes(name)) list.push(name);
+    addStable(id, name);
+  }
+  return { exact, byLower, byStableId, ids, idsByLower, names: available, lowered, size: available.length };
 }
 
 /**
- * Match requested gene names to a dataset's genes: the exact name, else the
- * one gene that matches ignoring case. Never throws.
+ * Match requested genes to a dataset's genes, each request by the gene's
+ * identifier or its name (ids first): the exact identifier, else the exact
+ * name, else the one gene whose identifier or name matches ignoring case,
+ * else, for an Ensembl accession, the one gene with the same stable id under
+ * another version or none (`ENSG00000141510.17` finds `ENSG00000141510`). A
+ * request two genes answer is reported, never guessed. Never throws.
  *
  * @param {string[]} requested
  * @param {string[]|ReturnType<typeof createGeneIndex>} available
@@ -180,6 +283,8 @@ export function createGeneIndex(available) {
  */
 export function resolveGenes(requested, available) {
   const index = Array.isArray(available) ? createGeneIndex(available) : available;
+  const ids = index.ids ?? new Map();
+  const idsByLower = index.idsByLower ?? new Map();
   const resolved = [];
   const seen = new Set();
   const unmatched = [];
@@ -188,15 +293,21 @@ export function resolveGenes(requested, available) {
   for (const name of Array.isArray(requested) ? requested : []) {
     if (typeof name !== 'string' || name.length === 0) continue;
     let gene = null;
-    if (index.exact.has(name)) {
+    if (ids.has(name)) {
+      gene = ids.get(name);
+    } else if (index.exact.has(name)) {
       gene = name;
     } else {
-      const candidates = index.byLower.get(name.toLowerCase()) ?? [];
+      const lower = name.toLowerCase();
+      let candidates = [...new Set([...(idsByLower.get(lower) ?? []), ...(index.byLower.get(lower) ?? [])])];
+      // An Ensembl accession of another version names the same gene.
+      const stable = candidates.length === 0 ? ensemblStableId(name) : null;
+      if (stable !== null) candidates = index.byStableId?.get(stable) ?? [];
       if (candidates.length === 1) {
         gene = candidates[0];
         renamed.push({ requested: name, gene });
       } else if (candidates.length > 1) {
-        ambiguous.push({ requested: name, candidates: [...candidates] });
+        ambiguous.push({ requested: name, candidates });
         continue;
       }
     }
@@ -288,4 +399,18 @@ export function filterGenes(genes, { exclude, pattern, only }) {
     !families.some(family => family.test(gene)) &&
     (regex === null || !regex.test(gene))
   );
+}
+
+/**
+ * The gene sets a notebook pushed to the viewer (`registries/derived-results.js`),
+ * as the gene set editor's "From notebook" adds them; null when there is none.
+ *
+ * @param {{getDerivedResults: () => import('../../registries/derived-results.js').DerivedResultsRegistry}} state
+ * @returns {Array<{name: string, genes: string[]}>|null}
+ */
+export function notebookGeneSets(state) {
+  const sets = state.getDerivedResults().getGeneSets()
+    .filter(entry => entry.owner === 'notebook')
+    .map(entry => ({ name: entry.set.name, genes: [...entry.set.genes] }));
+  return sets.length > 0 ? sets : null;
 }

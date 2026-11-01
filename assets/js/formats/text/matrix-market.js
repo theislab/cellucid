@@ -20,6 +20,7 @@ import { lineText } from './lines.js';
 import { MatrixMarketError, scanEntryBlock } from './matrix-market-entries.js';
 import { matrixMarketEntriesScript } from '../../../workers/scripts.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { abortReason } from '../../utils/abort.js';
 
 const ENTRIES_MODULE = matrixMarketEntriesScript().href;
 
@@ -72,7 +73,7 @@ export async function readMatrixMarket(pieces, { onSize, onEntries, valueType = 
   let read = 0;
   let pattern = false;
 
-  const aborted = () => signal?.reason ?? new DOMException('The read was aborted.', 'AbortError');
+  const aborted = () => abortReason(signal);
 
   /** One header line; true once the size line has been read. */
   function headerLine(bytes, start, end) {

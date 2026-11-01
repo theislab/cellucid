@@ -2,319 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  initGeneExpressionSelector,
-} from '../assets/js/app/ui/modules/field-selector-gene-expression.js';
-import { FieldSource } from '../assets/js/app/utils/field-constants.js';
-
-/* ---------------------------------------------------------------------------
-   Minimal exact DOM stand-in.
-
-   The gene selector validates every node against the constructors published by
-   its own window, so the fake window publishes the same constructor names.
-   --------------------------------------------------------------------------- */
-
-class FakeClassList {
-  constructor(values = []) {
-    this.values = new Set(values);
-  }
-
-  add(value) {
-    this.values.add(value);
-  }
-
-  remove(value) {
-    this.values.delete(value);
-  }
-
-  contains(value) {
-    return this.values.has(value);
-  }
-
-  toggle(value, force) {
-    if (force === true) this.add(value);
-    else if (force === false) this.remove(value);
-    else if (this.values.has(value)) this.remove(value);
-    else this.add(value);
-    return this.values.has(value);
-  }
-}
-
-class FakeNode {
-  constructor(ownerDocument) {
-    this.ownerDocument = ownerDocument;
-    this.children = [];
-    this.parentNode = null;
-  }
-
-  appendChild(child) {
-    if (child instanceof FakeFragment) {
-      for (const fragmentChild of [...child.children]) {
-        this.appendChild(fragmentChild);
-      }
-      child.children = [];
-      return child;
-    }
-    child.parentNode = this;
-    this.children.push(child);
-    return child;
-  }
-
-  append(...nodes) {
-    for (const node of nodes) this.appendChild(node);
-  }
-
-  insertBefore(child, reference) {
-    const index = this.children.indexOf(reference);
-    if (index === -1) throw new Error('reference node is not a child');
-    const nodes = child instanceof FakeFragment ? [...child.children] : [child];
-    if (child instanceof FakeFragment) child.children = [];
-    for (const node of nodes) node.parentNode = this;
-    this.children.splice(index, 0, ...nodes);
-    return child;
-  }
-
-  replaceChildren(...nodes) {
-    for (const child of this.children) child.parentNode = null;
-    this.children = [];
-    for (const node of nodes) this.appendChild(node);
-  }
-
-  remove() {
-    if (this.parentNode === null) return;
-    const index = this.parentNode.children.indexOf(this);
-    if (index === -1) throw new Error('node is not mounted on its parent');
-    this.parentNode.children.splice(index, 1);
-    this.parentNode = null;
-  }
-
-  contains(node) {
-    if (node === this) return true;
-    return this.children.some(child => child.contains?.(node) === true);
-  }
-
-  querySelector(selector) {
-    const className = selector.replace(/^\./, '');
-    for (const child of this.children) {
-      if (child.classList?.contains(className) === true) return child;
-      const nested = child.querySelector?.(selector);
-      if (nested !== null && nested !== undefined) return nested;
-    }
-    return null;
-  }
-
-  /** Every text node reachable from this node, in document order. */
-  collectText() {
-    const own = this.textContent === '' ? [] : [this.textContent];
-    return [
-      ...own,
-      ...this.children.flatMap(child => child.collectText()),
-    ];
-  }
-
-  /** The rendered copy, whitespace-normalized the way a reader sees it. */
-  readText() {
-    return this.collectText().join(' ').replace(/\s+/g, ' ').trim();
-  }
-}
-
-class FakeFragment extends FakeNode {}
-
-class FakeElement extends FakeNode {
-  constructor(ownerDocument, tagName) {
-    super(ownerDocument);
-    this.nodeType = 1;
-    this.tagName = tagName.toUpperCase();
-    this.classList = new FakeClassList();
-    this.dataset = {};
-    this.attributes = new Map();
-    this.style = {};
-    this.textContent = '';
-    this.title = '';
-    this.listeners = new Map();
-  }
-
-  /** The real DOM keeps `className` and `classList` in step; so does this. */
-  get className() {
-    return [...this.classList.values].join(' ');
-  }
-
-  set className(value) {
-    this.classList = new FakeClassList(
-      String(value).split(/\s+/).filter(token => token !== '')
-    );
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-  }
-
-  getAttribute(name) {
-    return this.attributes.has(name) ? this.attributes.get(name) : null;
-  }
-
-  removeAttribute(name) {
-    this.attributes.delete(name);
-  }
-
-  addEventListener(type, listener) {
-    const existing = this.listeners.get(type) ?? [];
-    existing.push(listener);
-    this.listeners.set(type, existing);
-  }
-
-  dispatch(type, event = {}) {
-    for (const listener of this.listeners.get(type) ?? []) listener(event);
-  }
-}
-
-class FakeInputElement extends FakeElement {
-  constructor(ownerDocument) {
-    super(ownerDocument, 'input');
-    this.value = '';
-  }
-
-  select() {}
-
-  blur() {}
-}
-
-class FakeButtonElement extends FakeElement {
-  constructor(ownerDocument) {
-    super(ownerDocument, 'button');
-    this.disabled = false;
-  }
-}
-
-class FakeSelectElement extends FakeElement {
-  constructor(ownerDocument) {
-    super(ownerDocument, 'select');
-    this.value = '';
-  }
-}
-
-function createFakeDocument() {
-  const ownerDocument = {
-    addEventListener() {},
-    createDocumentFragment() {
-      return new FakeFragment(ownerDocument);
-    },
-    createElement(tagName) {
-      if (tagName === 'input') return new FakeInputElement(ownerDocument);
-      if (tagName === 'button') return new FakeButtonElement(ownerDocument);
-      if (tagName === 'select') return new FakeSelectElement(ownerDocument);
-      return new FakeElement(ownerDocument, tagName);
-    },
-  };
-  ownerDocument.defaultView = {
-    AbortController,
-    HTMLElement: FakeElement,
-    HTMLInputElement: FakeInputElement,
-    HTMLButtonElement: FakeButtonElement,
-    HTMLSelectElement: FakeSelectElement,
-    Node: FakeNode,
-  };
-  return ownerDocument;
-}
-
-/** Build a var inventory whose entries mimic exported genes. */
-function exportedGenes(...keys) {
-  return keys.map(key => ({ key, kind: 'continuous' }));
-}
-
-function userDefinedGene(key) {
-  return {
-    key,
-    kind: 'continuous',
-    _isUserDefined: true,
-    _fieldSource: FieldSource.VAR,
-    _userDefinedId: `user:${key}`,
-  };
-}
-
-function mountGeneSelector(varFields, { onLoad = null } = {}) {
-  const ownerDocument = createFakeDocument();
-  const dom = {
-    geneContainer: ownerDocument.createElement('div'),
-    geneSearch: ownerDocument.createElement('input'),
-    geneDropdown: ownerDocument.createElement('div'),
-    geneCopyBtn: ownerDocument.createElement('button'),
-    geneRenameBtn: ownerDocument.createElement('button'),
-    geneDeleteBtn: ownerDocument.createElement('button'),
-    geneClearBtn: ownerDocument.createElement('button'),
-  };
-  const obsDom = {
-    categoricalSelect: ownerDocument.createElement('select'),
-    continuousSelect: ownerDocument.createElement('select'),
-  };
-  const state = {
-    activeFieldSource: null,
-    activeVarFieldIndex: -1,
-    duplicateField() {
-      throw new Error('not exercised');
-    },
-    ensureVarFieldLoaded(index, options) {
-      if (onLoad === null) throw new Error('not exercised');
-      onLoad(index, options);
-      // Held pending: the test asserts which gene was chosen, not the load.
-      return new Promise(() => {});
-    },
-    getDatasetGeneration: () => 1,
-    getVarFields: () => varFields,
-    getVisibleFields: source => {
-      assert.equal(source, FieldSource.VAR);
-      return varFields
-        .map((field, index) => ({ field, index }))
-        .filter(({ field }) => field._isDeleted !== true);
-    },
-    setActiveVarField() {
-      throw new Error('not exercised');
-    },
-  };
-  const interactionOwner = {
-    assertCurrent() {},
-    isCurrent: () => true,
-    isSuspended: () => false,
-    run: worker => worker({ signal: new AbortController().signal }),
-    track() {},
-  };
-  const api = initGeneExpressionSelector({
-    state,
-    interactionOwner,
-    dom,
-    obsDom,
-    noneFieldValue: '-1',
-    callbacks: {
-      onActiveFieldChanged() {},
-      onStartFieldRename() {},
-      onStartFieldDelete() {},
-      onBusyChanged() {},
-      onActivateField: async () => null,
-    },
-  });
-  api.initGeneExpressionDropdown();
-  return { api, dom, obsDom };
-}
-
-function search(dom, query) {
-  dom.geneSearch.value = query;
-  dom.geneSearch.dispatch('input');
-}
-
-/** The one empty-state node the dropdown publishes, or null. */
-function emptyState(dom) {
-  return dom.geneDropdown.querySelector('.dropdown-no-results');
-}
-
-/** The persistent status region the selector owns, or null. */
-function statusRegion(dom) {
-  for (const child of dom.geneContainer.children) {
-    if (child.getAttribute('role') === 'status') return child;
-  }
-  return null;
-}
+  emptyState,
+  exportedGenes,
+  mountGeneSelector,
+  search,
+  settleTurn,
+  statusRegion,
+  userDefinedGene,
+} from './helpers/gene-selector-harness.mjs';
 
 test('a gene search with no match explains the dataset gene panel', () => {
-  const { dom } = mountGeneSelector(
+  const { dom, chooseGeneNames } = mountGeneSelector(
     exportedGenes('GAPDH', 'ACTB', 'CD3E', 'MS4A1', 'NKG7', 'LYZ')
   );
 
@@ -330,16 +28,19 @@ test('a gene search with no match explains the dataset gene panel', () => {
   const echo = state.querySelector('.truncate');
   assert.notEqual(echo, null, 'the echoed query must be truncatable');
   assert.equal(echo.textContent, '“EGFR”.');
-  // It states, exactly, how many gene names this dataset publishes.
+  // It states, exactly, which list it searched: how many genes, named by what.
   assert.match(
     text,
-    new RegExp(`This dataset publishes ${(6).toLocaleString()} gene names`)
+    new RegExp(`Searched the ${(6).toLocaleString()} genes of this dataset, named by its var index;`)
   );
-  // It says the panel is decided upstream, at preparation time.
-  assert.match(text, /chosen when its file was written/);
-  assert.match(text, /possibly a subset of the source data/);
-  // It offers the other cause it cannot rule out, and claims neither.
-  assert.match(text, /Check for typos too\./);
+  // It says where other names are chosen, naming no column it would guess.
+  assert.match(text, /; another var column of the file \(symbols\) can name them instead\./);
+  // And offers that choice in one step.
+  const choose = state.querySelector('.btn-compact');
+  assert.notEqual(choose, null);
+  assert.equal(choose.textContent, 'Choose gene names…');
+  choose.dispatch('click');
+  assert.equal(chooseGeneNames.count, 1, 'the action opens Data mapping at its gene names');
 
   // It points at the documentation that carries the full explanation.
   const link = dom.geneDropdown.querySelector('.text-link');
@@ -390,7 +91,7 @@ test('the published gene count counts exported genes only', () => {
   const text = emptyState(dom).readText();
   assert.match(
     text,
-    new RegExp(`This dataset publishes ${(3).toLocaleString()} gene names`)
+    new RegExp(`Searched the ${(3).toLocaleString()} genes of this dataset`)
   );
 });
 
@@ -408,7 +109,7 @@ test('a matching gene search publishes results and no empty state', () => {
   assert.equal(items.length, 1);
   assert.equal(items[0].textContent, 'CD3E');
   assert.equal(
-    dom.geneDropdown.readText().includes('This dataset publishes'),
+    dom.geneDropdown.readText().includes('Searched the'),
     false,
     'the gene panel note must not follow the reader into a matching search'
   );
@@ -432,7 +133,7 @@ test('the empty state is announced through one persistent status region', () => 
   assert.match(region.textContent, /No gene matches your search/);
   assert.match(
     region.textContent,
-    new RegExp(`This dataset publishes ${(6).toLocaleString()} gene names`)
+    new RegExp(`Searched the ${(6).toLocaleString()} genes of this dataset`)
   );
 
   // The announcement is query-independent, so extending a no-match query does
@@ -510,8 +211,10 @@ test('gene results are a keyboard-navigable listbox whose Enter picks the active
   );
   keydown('ArrowUp');
 
-  // Enter must choose the active row (CD4), not the first one.
+  // Enter must choose the active row (CD4), not the first one. The choice
+  // is read once it holds the open cells (`useOpenCells`): a turn later.
   assert.equal(keydown('Enter'), true);
+  await settleTurn();
   assert.deepEqual(loaded, [1]);
   assert.equal(dom.geneSearch.value, 'CD4');
   assert.equal(dom.geneSearch.getAttribute('aria-expanded'), 'false');
@@ -549,13 +252,14 @@ test('a gene kept active for a moment is prefetched, and moving on cancels it', 
 
   // Choosing the prefetched gene shares its load rather than cancelling it.
   keydown('Enter');
+  await settleTurn();
   assert.equal(loads[1].signal.aborted, false);
   assert.deepEqual(loads.map(load => load.index), [1, 2, 2]);
   api.destroy();
   assert.equal(loads[1].signal.aborted, true, 'destroying the selector cancels its prefetch');
 });
 
-test('a long gene list builds only the options near the active one', () => {
+test('a long gene list builds only the options near the active one', async () => {
   const loaded = [];
   const keys = Array.from({ length: 8192 }, (_, index) => `G${index}`);
   const { dom } = mountGeneSelector(
@@ -604,6 +308,61 @@ test('a long gene list builds only the options near the active one', () => {
 
   // Enter chooses the active match.
   keydown('Enter');
+  await settleTurn();
   assert.deepEqual(loaded, [150]);
   assert.equal(dom.geneSearch.value, 'G150');
+});
+
+/** Genes of the dataset's own gene list, each at its route `var/{g}`. */
+function listedGenes(...keys) {
+  return keys.map((key, gene) => ({ key, kind: 'continuous', path: `var/${gene}` }));
+}
+
+test('the search finds genes by the names shown, even when a var column names them beside identifiers', () => {
+  const ids = ['ENSG00000168484', 'ENSG00000119888', 'ENSG00000234690'];
+  const { dom } = mountGeneSelector(listedGenes('SFTPC', 'EPCAM', 'EPCAM-DT'), {
+    geneNames: { source: 'feature_name', filledFromIndex: 0, renamed: [], ids },
+  });
+  const shown = () => dom.geneDropdown.children
+    .filter(child => child.classList.contains('dropdown-item'))
+    .map(option => option.readText());
+  search(dom, 'epcam');
+  assert.deepEqual(shown(), ['EPCAM', 'EPCAM-DT']);
+  // The identifiers are not names of the list: Data mapping names the genes.
+  search(dom, 'ENSG00000168484');
+  assert.deepEqual(shown(), []);
+  // The note names the list searched: the names column Data mapping chose.
+  assert.match(emptyState(dom).readText(), /Searched the 3 genes of this dataset, named by var\['feature_name'\];/);
+});
+
+test('while the gene names are read after the first view, the search says so and is not searchable', () => {
+  const listing = { pending: true, failure: null };
+  const { api, dom } = mountGeneSelector([], { listing });
+  // Shown, waiting: never hidden as if the dataset had no genes.
+  assert.equal(dom.geneContainer.hidden, false);
+  assert.equal(dom.geneSearch.disabled, true);
+  assert.equal(dom.geneSearch.placeholder, 'Reading gene names…');
+  assert.equal(dom.geneContainer.getAttribute('aria-busy'), 'true');
+  // A list that could not be read says why.
+  listing.pending = false;
+  listing.failure = new Error('the var index could not be read');
+  api.initGeneExpressionDropdown();
+  assert.equal(dom.geneContainer.hidden, false);
+  assert.equal(dom.geneSearch.disabled, true);
+  assert.equal(dom.geneSearch.placeholder, 'Gene names could not be read');
+  assert.equal(dom.geneSearch.title, 'the var index could not be read');
+});
+
+test('once the gene names are listed, the search lists them', () => {
+  const listing = { pending: true, failure: null };
+  const fields = exportedGenes('CD3E', 'MS4A1');
+  const mounted = mountGeneSelector([], { listing });
+  assert.equal(mounted.dom.geneSearch.disabled, true);
+  // The refresh after `genes:listed` re-reads the inventory.
+  const listed = mountGeneSelector(fields, { listing: { pending: false, failure: null } });
+  assert.equal(listed.dom.geneContainer.hidden, false);
+  assert.equal(listed.dom.geneSearch.disabled, false);
+  assert.equal(listed.dom.geneSearch.placeholder, 'Search genes…');
+  search(listed.dom, 'cd3');
+  assert.equal(emptyState(listed.dom), null);
 });

@@ -53,7 +53,7 @@ test('removed fallback parser is absent from the current utility surface', () =>
   assert.equal(Object.hasOwn(numberUtils, 'parseNumberOr'), false);
 });
 
-test('figure export requires exact muted opacity instead of substituting 0.15', async () => {
+test('figure export reads the muted opacity its decimal box holds, never substituting 0.15', async () => {
   const source = await readFile(
     new URL(
       '../assets/js/app/ui/modules/figure-export/figure-export-ui.js',
@@ -61,9 +61,9 @@ test('figure export requires exact muted opacity instead of substituting 0.15', 
     ),
     'utf8',
   );
-  assert.match(
-    source,
-    /parseFiniteNumberInRange\(\s*selectionMutedOpacityInput\.value,\s*0,\s*1,\s*'Non-selected opacity'/,
-  );
+  // A decimal box (`createDecimalInput`), read by its one rule, a point or a
+  // comma (`readDecimalInput`), and refused outside 0..1.
+  assert.match(source, /const selectionMutedOpacityInput = createDecimalInput\(/);
+  assert.match(source, /const mutedAlpha = readDecimalInput\(selectionMutedOpacityInput\);/);
   assert.doesNotMatch(source, /parseNumberOr|selectionMutedOpacityInput\.value,\s*0\.15/);
 });

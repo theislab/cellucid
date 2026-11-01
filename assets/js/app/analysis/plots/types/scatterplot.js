@@ -495,6 +495,21 @@ const scatterPlotDefinition = {
           ],
           compact: `R² = ${rSquared.toFixed(3)}${significance}`
         });
+      } else if (showR2 && pageResult.constant) {
+        // A variable constant in the page: no correlation, said so.
+        const constantName = pageResult.constant === 'both'
+          ? 'Both variables'
+          : (pageResult.constant === 'x' ? pageResult.xVariable : pageResult.yVariable) ?? (pageResult.constant === 'x' ? 'X' : 'Y');
+        stats.push({
+          color,
+          lines: [
+            { text: safePageName, bold: true },
+            { text: 'r undefined' },
+            { text: `${escapeHtml(String(constantName))} ${pageResult.constant === 'both' ? 'are' : 'is'} constant here` },
+            { text: `n = ${xData.length}` }
+          ],
+          compact: 'r undefined'
+        });
       }
     }
 

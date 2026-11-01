@@ -107,11 +107,10 @@ export function validateConnectivityEdgeData(edgeData, summary) {
   requireExactKeys(
     edgeData,
     [
-      'records',
-      'maxWeight',
-      'neighborOffsets',
-      'neighbors',
       'forwardOffsets',
+      'partners',
+      'strengths',
+      'maxWeight',
       'nCells',
       'nEdges',
       'maxNeighbors',
@@ -119,13 +118,12 @@ export function validateConnectivityEdgeData(edgeData, summary) {
     'connectivity edge payload'
   );
   if (
-    !(edgeData.records instanceof Uint32Array) ||
-    !(edgeData.neighborOffsets instanceof Uint32Array) ||
-    !(edgeData.neighbors instanceof Uint32Array) ||
-    !(edgeData.forwardOffsets instanceof Uint32Array)
+    !(edgeData.forwardOffsets instanceof Uint32Array) ||
+    !(edgeData.partners instanceof Uint32Array) ||
+    !(edgeData.strengths instanceof Float32Array)
   ) {
     throw new TypeError(
-      'Invalid connectivity edge payload: records, offsets and neighbours must be Uint32Array values'
+      'Invalid connectivity edge payload: offsets and partners must be Uint32Array values, strengths a Float32Array'
     );
   }
   // A deferred summary is the payload's own: the counts are checked against
@@ -150,16 +148,16 @@ export function validateConnectivityEdgeData(edgeData, summary) {
       'Invalid connectivity edge payload: its counts must exactly match the graph summary'
     );
   }
+  // Partners and strengths are sized by the stored entries before the walk
+  // (`ConnectivityEdges`): at least one an edge.
   if (
-    edgeData.records.length !== 3 * nEdges ||
-    edgeData.neighbors.length !== 2 * nEdges ||
+    edgeData.partners.length < nEdges ||
+    edgeData.strengths.length < nEdges ||
     edgeData.forwardOffsets.length !== summary.n_cells + 1 ||
-    edgeData.neighborOffsets.length !== summary.n_cells + 1 ||
-    edgeData.forwardOffsets[summary.n_cells] !== nEdges ||
-    edgeData.neighborOffsets[summary.n_cells] !== 2 * nEdges
+    edgeData.forwardOffsets[summary.n_cells] !== nEdges
   ) {
     throw new Error(
-      'Invalid connectivity edge payload: array lengths must exactly match n_edges (three record words and two neighbours an edge) and n_cells + 1'
+      'Invalid connectivity edge payload: array lengths must match n_edges (a partner and a strength an edge) and n_cells + 1'
     );
   }
   return edgeData;

@@ -91,8 +91,10 @@ import {
   pointRasterArgs,
   requestPngDataUrl,
   requestVisibleBounds,
+  shareLodMembership,
 } from '../utils/figure-export-worker-client.js';
 import { scalePointDiameterToRaster } from '../utils/point-size.js';
+import { figurePointLayersOf } from '../utils/lod-membership.js';
 import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
 import { resolveFigureInk } from '../utils/figure-ink.js';
 import { computeLetterboxedRect } from '../utils/letterbox.js';
@@ -198,6 +200,7 @@ async function rasterizePointsToDataUrl(session, {
   overlayPositions = null,
   overlayColors = null,
   overlayPointDiameterViewportPx = null,
+  pointLayers = null,
   signal = null
 }) {
   throwIfFigureExportAborted(signal);
@@ -320,7 +323,8 @@ async function rasterizePointsToDataUrl(session, {
       : null,
     highlightArray,
     emphasizeSelection,
-    selectionMutedOpacity
+    selectionMutedOpacity,
+    pointLayers,
   });
   // The PNG is stretched over the whole plot rectangle (pxW x pxH is the
   // plot at rasterScale), so a crop's raster sits at its letterboxed place
@@ -368,14 +372,7 @@ function requestSvgPointMarkup(session, {
     positions: session.share(positions),
     colors: session.share(colors),
     transparency: session.share(transparency),
-    lodMembership: lodMembership === null
-      ? null
-      : {
-        dimensionLevel: lodMembership.dimensionLevel,
-        indices: session.share(lodMembership.indices),
-        lodLevel: lodMembership.lodLevel,
-        pointCount: lodMembership.pointCount,
-      },
+    lodMembership: shareLodMembership(session, lodMembership),
     drawOrder: session.share(drawOrder),
     highlightArray: session.share(highlightArray),
     renderState: pointPassRenderState(renderState),
@@ -713,6 +710,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         overlayPositions: includeCentroidPoints && hasCentroidPoints ? centroidPositions : null,
         overlayColors: includeCentroidPoints && hasCentroidPoints ? centroidColors : null,
         overlayPointDiameterViewportPx: includeCentroidPoints && hasCentroidPoints ? centroidDiameterViewportPx : null,
+        pointLayers: figurePointLayersOf(colors, view.scientificState.pointLayers, renderStateForPoints.bgColor),
         signal,
       });
       throwIfFigureExportAborted(signal);
@@ -733,6 +731,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
         renderState,
         // A sculpted point fogs toward the fog colour: here, the paper.
         fogRenderState: applyExportBackgroundToRenderState(renderState, background, backgroundColor),
+        pointLayers: figurePointLayersOf(colors, view.scientificState.pointLayers, applyExportBackgroundToRenderState(renderState, background, backgroundColor).bgColor),
         highlightArray,
         emphasizeSelection,
         selectionMutedOpacity,
@@ -1034,6 +1033,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
           overlayPositions: includeCentroidPoints && hasCentroidPoints ? centroidPositions : null,
           overlayColors: includeCentroidPoints && hasCentroidPoints ? centroidColors : null,
           overlayPointDiameterViewportPx: includeCentroidPoints && hasCentroidPoints ? centroidDiameterViewportPx : null,
+          pointLayers: figurePointLayersOf(colors, view.scientificState.pointLayers, renderStateForPoints.bgColor),
           signal,
         });
         throwIfFigureExportAborted(signal);
@@ -1055,6 +1055,7 @@ export async function renderFigureToSvgBlob({ payload, signal = null }) {
           renderState,
           // A sculpted point fogs toward the fog colour: here, the paper.
           fogRenderState: applyExportBackgroundToRenderState(renderState, background, backgroundColor),
+          pointLayers: figurePointLayersOf(colors, view.scientificState.pointLayers, applyExportBackgroundToRenderState(renderState, background, backgroundColor).bgColor),
           highlightArray,
           emphasizeSelection,
           selectionMutedOpacity,

@@ -3,14 +3,12 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { DATA_LOAD_METHODS } from '../assets/js/app/data-load-methods.js';
-import {
-  createDatasetReloadSupersededError
-} from '../assets/js/app/dataset-reload-outcome.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { recordOpenings } from './helpers/opening-events.mjs';
 import { prepareUrlForDataSource } from '../assets/js/app/url-state.js';
 import { initDatasetConnections } from '../assets/js/app/ui/modules/dataset-connections.js';
 import { createTestDatasetIntents } from './helpers/dataset-intents.mjs';
+import { cancelled } from '../assets/js/utils/abort.js';
 
 function createButton() {
   const listeners = new Map();
@@ -235,6 +233,10 @@ function createConnectionSource(type, datasets, connectionValue) {
             inputPath: this.connected ? connectionValue : null,
           };
     },
+    // The link field holds the link as it is read (`getAddressLocator`).
+    getAddressLocator() {
+      return this.getConnectionInfo().inputPath;
+    },
     getType() {
       return type;
     },
@@ -259,6 +261,10 @@ function createConnectionSource(type, datasets, connectionValue) {
       return type === 'remote'
         ? { status: 'disconnected', url: null }
         : { connected: false, inputPath: null };
+    },
+    // The link field holds the link as it is read (`getAddressLocator`).
+    getAddressLocator() {
+      return this.getConnectionInfo().inputPath;
     },
     getType() {
       return type;
@@ -364,6 +370,10 @@ function createLifecycleSourceFactory(
               inputPath: this.connected ? connectionValue : null,
             };
       },
+      // The link field holds the link as it is read (`getAddressLocator`).
+      getAddressLocator() {
+        return this.getConnectionInfo().inputPath;
+      },
       getType() {
         return type;
       },
@@ -403,6 +413,10 @@ function createLifecycleSourceFactory(
       return type === 'remote'
         ? { status: 'disconnected', url: null }
         : { connected: false, inputPath: null };
+    },
+    // The link field holds the link as it is read (`getAddressLocator`).
+    getAddressLocator() {
+      return this.getConnectionInfo().inputPath;
     },
     getType() {
       return type;
@@ -1128,7 +1142,7 @@ test('superseded one-dataset connections cannot revoke the newer candidate', asy
       assert.equal(harness.manager.getSource(type), newer);
 
       firstActivation.reject(
-        createDatasetReloadSupersededError('newer connection won')
+        cancelled('superseded', 'newer connection won')
       );
       await firstConnect;
 

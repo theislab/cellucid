@@ -66,7 +66,6 @@ import {
   getDatasetFingerprint,
 } from '../assets/js/app/session/session-context.js';
 import {
-  isSessionRestoreCanceledError,
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
@@ -96,6 +95,8 @@ import {
   restoreMultiview,
 } from '../assets/js/app/state-serializer/multiview.js';
 import { untilEntered } from './helpers/entered.mjs';
+import { cellOrderDigest } from '../assets/js/data/cell-order-digest.js';
+import { cancellationKind } from '../assets/js/utils/abort.js';
 
 const dockableSource = await readFile(
   new URL('../assets/js/app/session/contributors/dockable-layout.js', import.meta.url),
@@ -808,7 +809,7 @@ test('generic Blob cancellation dismisses exactly once', async () => {
       restore,
       error => (
         error?.name === 'AbortError'
-        && isSessionRestoreCanceledError(error)
+        && cancellationKind(error) === 'user'
       ),
     );
     await untilEntered(blobEntered, restore, 'the contributor restore');
@@ -886,6 +887,9 @@ test('session controls treat exact cancel and supersession as silent no-ops', as
         whenSettled: async () => {},
       },
       currentDatasetIdentityId: () => null,
+      localFiles: { kept: async () => null, reopen: async () => false },
+      currentCellIdentity: () => null,
+      reopenDataset: async () => ({ shown: false, inPlace: false }),
       openDatasetSource: async () => false,
       sessionSerializer: serializer,
       onAfterLoad() {
@@ -1183,7 +1187,7 @@ test('highlight restore commits once after exact lazy cells and preserves old st
   }
 });
 
-test('dataset fingerprints are complete exact identities, never partial matches', () => {
+test('dataset fingerprints are complete exact identities, never partial matches', async () => {
   const manager = {
     getCurrentIdentityId() {
       return 'dataset-a';
@@ -1194,7 +1198,7 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     -0.5, -0.25, -0.125,
     0.75, 0.375, 0.1875,
   ]);
-  const fingerprint = getDatasetFingerprint({
+  const fingerprint = await getDatasetFingerprint({
     dataSourceManager: manager,
     state: {
       getViewDimensionLevel: () => 3,
@@ -1212,11 +1216,11 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     cellOrder: {
       embedding: { key: 'X_umap', columns: [0, 1, 2] },
       dimension: 3,
-      digest: fingerprint.cellOrder.digest,
+      // An in-memory layout: the digest of the coordinates it holds.
+      digest: cellOrderDigest(positionsArray, 3),
     },
     dataMapping: IN_MEMORY_3D_MAPPING,
   });
-  assert.match(fingerprint.cellOrder.digest, /^[0-9a-f]{16}$/);
   assert.equal(datasetFingerprintMatches(fingerprint, { ...fingerprint }), true);
 
   for (const incomplete of [
@@ -1266,7 +1270,7 @@ test('dataset fingerprints are complete exact identities, never partial matches'
     assert.equal(datasetFingerprintMatches(fingerprint, different), false);
   }
 
-  // A record carrying only the four scalars is not a format-2 fingerprint.
+  // A record carrying only the four scalars is not a fingerprint.
   assert.throws(
     () => datasetFingerprintMatches(
       {
@@ -1495,6 +1499,7 @@ test('filter restore cancels every deferred preload before batch mutation', asyn
         colorRange: null,
         useLogScale: null,
         useFilterColorRange: null,
+        zeroGray: null,
         colormapId: null,
       },
       'var:GAPDH': {
@@ -1504,6 +1509,7 @@ test('filter restore cancels every deferred preload before batch mutation', asyn
         colorRange: null,
         useLogScale: null,
         useFilterColorRange: null,
+        zeroGray: null,
         colormapId: null,
       },
     },
@@ -1572,6 +1578,7 @@ test('filter restore retires and drains sibling preloads after one exact failure
       colorRange: null,
       useLogScale: null,
       useFilterColorRange: null,
+      zeroGray: null,
       colormapId: null,
     },
     'var:GAPDH': {
@@ -1581,6 +1588,7 @@ test('filter restore retires and drains sibling preloads after one exact failure
       colorRange: null,
       useLogScale: null,
       useFilterColorRange: null,
+      zeroGray: null,
       colormapId: null,
     },
   });
@@ -3332,11 +3340,12 @@ test('main wires all required session owners directly without optional probes or
   );
   assert.match(
     mainSource,
-    /const analysisWindowManager = comparisonModule\.getAnalysisWindowManager\(\);/,
+    /const analysisWindowManager = comparisonModule\.getAnalysisWindowManager\(\);\s*return \{ comparisonModule, analysisWindowManager \};/,
   );
+  // The analysis module is imported on demand; sessions wait for it.
   assert.match(
     mainSource,
-    /sessionSerializer\.setAnalysisRefs\(\{\s*comparisonModule,\s*analysisWindowManager\s*\}\);/s,
+    /sessionSerializer\.setAnalysisRefs\(analysisCode\.then\(/,
   );
 });
 

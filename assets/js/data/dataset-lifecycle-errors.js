@@ -1,48 +1,25 @@
 /**
- * Sole current identity for cancellation caused by a newer dataset selection.
+ * Failures of a dataset's lifecycle (opening, reloading, switching) and their
+ * cleanup. A newer selection stops an older one with a `superseded`
+ * cancellation (`utils/abort.js`), never a failure.
  *
- * Kept in the neutral data layer so source-selection and application reload
- * transactions use one protocol without importing each other.
+ * @module data/dataset-lifecycle-errors
  */
-export const DATASET_RELOAD_SUPERSEDED_CODE =
-  'CELLUCID_DATASET_RELOAD_SUPERSEDED';
 
-/**
- * @param {string} message
- * @returns {Error}
- */
-export function createDatasetReloadSupersededError(message) {
-  if (typeof message !== 'string' || message.length === 0) {
-    throw new TypeError(
-      'Dataset reload supersession message must be a non-empty string.'
-    );
-  }
-  const error = new Error(message);
-  error.name = 'AbortError';
-  error.code = DATASET_RELOAD_SUPERSEDED_CODE;
-  return error;
-}
-
-/**
- * @param {unknown} error
- * @returns {boolean}
- */
-export function isDatasetReloadSupersededError(error) {
-  return error?.code === DATASET_RELOAD_SUPERSEDED_CODE;
-}
+import { isCancellation } from '../utils/abort.js';
 
 /**
  * Combine an operation's failure with a failure in its cleanup or reporting.
  *
- * A superseded operation is returned unchanged: its caller discards the result
- * by recognising the supersession code, which an aggregate would hide, turning
- * a cancelled open into a reported failure. The secondary failure is logged
- * instead.
+ * A cancelled operation (a newer selection superseded it) is returned
+ * unchanged: its caller discards the result by recognising the cancellation,
+ * which an aggregate would hide, turning a cancelled open into a reported
+ * failure. The secondary failure is logged instead.
  *
  * @param {Error} primaryFailure
  * @param {unknown} secondaryFailure
  * @param {string} message
- * @returns {Error} The superseded primary failure, or an AggregateError
+ * @returns {Error} The cancelled primary failure, or an AggregateError
  */
 export function combineDatasetLifecycleFailures(
   primaryFailure,
@@ -65,7 +42,7 @@ export function combineDatasetLifecycleFailures(
         'The secondary dataset lifecycle failure was not an Error.',
         { cause: secondaryFailure }
       );
-  if (isDatasetReloadSupersededError(primaryFailure)) {
+  if (isCancellation(primaryFailure)) {
     console.error(`[Cellucid] ${message}`, secondaryError);
     return primaryFailure;
   }

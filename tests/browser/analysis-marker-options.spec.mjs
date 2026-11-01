@@ -224,8 +224,9 @@ test.describe('on a phone', () => {
     await page.goto(`/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET}`, { waitUntil: 'domcontentloaded' });
     await dismissWelcome(page);
     await page.waitForFunction(count => window._comparisonModule?.state?.pointCount === count, CELLS);
+    // Closed: on a phone the panel waits as its peek bar, elsewhere behind its toggle.
     if (await page.locator('#sidebar').evaluate(sidebar => sidebar.classList.contains('hidden'))) {
-      await page.locator('#sidebar-toggle').click();
+      await page.locator((await page.locator('#phone-sheet-bar').isVisible()) ? '#phone-sheet-bar' : '#sidebar-toggle').click();
     }
     await page.evaluate(() => { document.getElementById('page-analysis-section').open = true; });
     const header = page.locator('#analysis-header-genesPanel');

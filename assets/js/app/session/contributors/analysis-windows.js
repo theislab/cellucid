@@ -64,6 +64,10 @@ function requireRestorePayload(payload) {
  * @returns {import('../session-serializer.js').SessionChunk[]}
  */
 export function capture(ctx) {
+  // The analysis module never started (its code could not load): no window
+  // was ever open, so there is nothing to keep (session-serializer
+  // `setAnalysisRefs`).
+  if (ctx?.analysisWindowManager === null) return [];
   const mgr = requireManager(ctx, ['exportSessionWindows', 'exportViewSizes']);
   const exportedWindows = mgr.exportSessionWindows();
   if (!Array.isArray(exportedWindows)) {

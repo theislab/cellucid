@@ -4,7 +4,9 @@
  * Marker runs kept in memory, least recently used first, held to a quarter
  * of the analysis memory budget as it stands at each store
  * (`data/memory-budget.js` `residencyBudgetBytes('analysis')`, which halves
- * after a refused allocation), and emptied on memory pressure. An entry is
+ * after a refused allocation). The memory model counts them in the analysis
+ * share and trims them, oldest first, when it shrinks or the page is hidden
+ * (`registerResidentHolder`). An entry is
  * the full statistics of a run (`MarkerStatistics`), keyed by everything that
  * changes them: the field, the grouping of its cells, the cell scope, the
  * groups tested, the reference, the rest, the small-group policy and minimum,
@@ -18,7 +20,7 @@
  * @module genes-panel/marker-cache
  */
 
-import { residencyBudgetBytes } from '../../../data/memory-budget.js';
+import { registerResidentHolder, residencyBudgetBytes } from '../../../data/memory-budget.js';
 
 /** Share of the analysis budget cached runs may hold. */
 const CACHE_SHARE = 1 / 4;
@@ -67,6 +69,11 @@ export class MarkerCache {
     /** @type {Map<string, {value: Object, bytes: number}>} least recently used first */
     this._entries = new Map();
     this._bytes = 0;
+    this._unregister = registerResidentHolder('analysis', {
+      label: 'marker results',
+      bytes: () => this._bytes,
+      trim: budget => this._trimTo(budget),
+    });
   }
 
   /** Adopt another load: entries of the previous one are dropped. */
@@ -112,13 +119,16 @@ export class MarkerCache {
     this._bytes += bytes;
   }
 
-  /** Memory pressure: keep only the most recent entry. */
-  trim() {
-    while (this._entries.size > 1) {
+  /** Let runs go, oldest first, until the kept ones hold no more than `budget` bytes. @private */
+  _trimTo(budget) {
+    let released = 0;
+    while (this._entries.size > 0 && this._bytes > budget) {
       const [oldestKey, oldest] = this._entries.entries().next().value;
       this._entries.delete(oldestKey);
       this._bytes -= oldest.bytes;
+      released++;
     }
+    return released === 0 ? null : `${released === 1 ? 'a kept marker run' : `${released} kept marker runs`}`;
   }
 
   clear() {
@@ -132,5 +142,6 @@ export class MarkerCache {
 
   close() {
     this.clear();
+    this._unregister();
   }
 }

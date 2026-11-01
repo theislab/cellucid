@@ -10,20 +10,29 @@
  * Each view is
  *
  *     {
- *       recognize(root): boolean,          // from the root's keys and attributes only
- *       view(root, context): Object|Promise<Object>,   // the AnnData store root (view-nodes.js)
+ *       recognize(root, options): Promise<boolean>,   // from the root's keys and attributes, loading what it looks at
+ *       openingPaths: Array,               // what `view` reads of the root (`Group.load` paths)
+ *       view(root, context): Promise<Object>,   // the AnnData store root (view-nodes.js)
  *       readerFormat: {storage, file},     // how the AnnData reader names it in messages
  *       matrixFile?(files): {path, file, base}|null,   // a folder format: the file it opens
  *     }
  *
- * `context` is `{name, layout, signal}`, and for a folder format also
+ * `options` and `context` carry the opening's `signal` and `activity`;
+ * `context` is also `{name, layout}`, and for a folder format
  * `{files, base}` (the folder's files, and the folder of the file it
- * opened). `recognize` reads no value; `view` reads none of the arrays it
- * presents, only the few small ones some layouts are told by (which feature
- * of a 10x matrix is of which type; an `outs/` folder's analysis CSVs). The
- * view's root closes the real one: `viewGroup({path: '/', …, close: () =>
- * root.close?.()})` (`view-nodes.js`). A multimodal store's root carries
- * `modalities` and `defaultModality` (`modalities.js`).
+ * opened). The root is opened with its own children known (`openHdf5`,
+ * `formats/store.js`); `recognize` loads anything deeper it looks at, and
+ * `view` loads `openingPaths` before it builds the view (`open.js` also
+ * names them to `openHdf5`, so they load with the root). `recognize` reads
+ * no value; `view` reads none of the arrays it presents, only the few
+ * small ones some layouts are told by (which feature of a 10x matrix is of
+ * which type; an `outs/` folder's analysis CSVs). A view node made from a
+ * real group lists that group among its `sources` and lists its children
+ * only once it is loaded, so loading the view loads the real groups
+ * (`viewGroup`). The view's root closes the real one, with the reason its
+ * reads still under way stop with: `viewGroup({path: '/', …, close: reason
+ * => root.close?.(reason)})` (`view-nodes.js`). A multimodal
+ * store's root carries `modalities` and `defaultModality` (`modalities.js`).
  *
  * @module data/anndata/views
  */

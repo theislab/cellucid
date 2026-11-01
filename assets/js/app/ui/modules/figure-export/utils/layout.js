@@ -242,12 +242,16 @@ function computeExpandedDimensions({
   const axisTop = includeAxes ? AXIS_TOP_SPACE : NO_AXIS_PADDING;
   const axisBottom = includeAxes ? AXIS_BOTTOM_SPACE : NO_AXIS_PADDING;
 
-  // Legend space allocation (added OUTSIDE the plot, not subtracted from it)
+  // Legend space allocation (added OUTSIDE the plot, not subtracted from it),
+  // never more than the plot itself, as a panel's legend never takes more
+  // than its share (`PANEL_LEGEND_MAX_SHARE`): a field of a million
+  // categories asked for a legend millions of pixels wide, and the figure
+  // never came.
   const legendWidth = includeLegend && legendPosition === 'right'
-    ? estimateLegendWidthRight({ model: legendModel, fontSizePx: legendFontPx, plotHeight })
+    ? Math.min(plotWidth, estimateLegendWidthRight({ model: legendModel, fontSizePx: legendFontPx, plotHeight }))
     : 0;
   const legendHeight = includeLegend && legendPosition === 'bottom'
-    ? estimateLegendHeightBottom({ model: legendModel, fontSizePx: legendFontPx, plotWidth })
+    ? Math.min(plotHeight, estimateLegendHeightBottom({ model: legendModel, fontSizePx: legendFontPx, plotWidth }))
     : 0;
   const legendGapH = legendWidth > 0 ? LEGEND_GAP : 0;
   const legendGapV = legendHeight > 0 ? LEGEND_GAP : 0;

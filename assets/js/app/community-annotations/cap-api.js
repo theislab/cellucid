@@ -14,9 +14,10 @@ import { getGitHubWorkerOrigin } from './github-auth.js';
 import { parseExactJson } from './wire-contract.js';
 import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { cancelled, isCancellation, onAbort } from '../../utils/abort.js';
 
 const CAP_DEFAULT_TIMEOUT_MS = 12_000;
-const CAP_WORKER_CONTRACT_VERSION = 1;
+const CAP_WORKER_CONTRACT_VERSION = 2;
 const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
 const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
 /**
@@ -129,17 +130,9 @@ function assertTimeoutMs(timeoutMs) {
   return timeoutMs;
 }
 
-function createAbortError(message, cause = undefined) {
-  const error = new Error(message);
-  error.name = 'AbortError';
-  error.code = 'CAP_REQUEST_ABORTED';
-  if (cause !== undefined) error.cause = cause;
-  return error;
-}
-
 function ownerAbortReason(signal, defaultCause = undefined) {
-  if (signal?.reason instanceof Error) return signal.reason;
-  return createAbortError('CAP request was cancelled', defaultCause);
+  if (signal?.reason instanceof Error || isCancellation(signal?.reason)) return signal.reason;
+  return cancelled('user', 'CAP request was cancelled.', defaultCause);
 }
 
 function createRequestAbortScope(signal, timeoutMs) {
@@ -155,21 +148,17 @@ function createRequestAbortScope(signal, timeoutMs) {
     abortCause = cause;
     controller.abort(reason);
   };
-  const abortFromOwner = () => abort('owner', ownerSignal?.reason);
-  if (ownerSignal !== null) {
-    if (ownerSignal.aborted) abortFromOwner();
-    else ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
-  }
+  const stopOwner = onAbort(ownerSignal, () => abort('owner', ownerSignal.reason));
 
   /** @type {ReturnType<typeof setTimeout>|null} */
   let timeout = null;
   if (ms > 0) {
     try {
       timeout = setTimeout(() => {
-        abort('timeout', createAbortError(`CAP request timed out after ${ms}ms`));
+        abort('timeout', new DOMException(`CAP request timed out after ${ms}ms`, 'TimeoutError'));
       }, ms);
     } catch (error) {
-      ownerSignal?.removeEventListener('abort', abortFromOwner);
+      stopOwner();
       throw error;
     }
   }
@@ -184,16 +173,12 @@ function createRequestAbortScope(signal, timeoutMs) {
       } catch {
         // Request cleanup cannot replace its primary outcome.
       }
-      try {
-        ownerSignal?.removeEventListener('abort', abortFromOwner);
-      } catch {
-        // Request cleanup cannot replace its primary outcome.
-      }
+      stopOwner();
     },
   };
 }
 
-function throwIfAborted(scope, cause = undefined) {
+function throwIfRequestEnded(scope, cause = undefined) {
   const abortCause = scope.abortCause();
   if (abortCause === 'owner') {
     throw ownerAbortReason(scope.ownerSignal, cause);
@@ -365,7 +350,7 @@ async function executeLookupProxy(body, {
   requireExactObjectKeys(body, ['kind', 'term', 'limit'], 'CAP proxy request body');
   const scope = createRequestAbortScope(signal, timeoutMs);
   try {
-    throwIfAborted(scope);
+    throwIfRequestEnded(scope);
     const requestBody = JSON.stringify(body);
     if (
       new TextEncoder().encode(requestBody).byteLength >
@@ -386,10 +371,10 @@ async function executeLookupProxy(body, {
       body: requestBody,
       signal: scope.controller.signal,
     });
-    throwIfAborted(scope);
+    throwIfRequestEnded(scope);
 
     const text = await readBoundedResponseText(response);
-    throwIfAborted(scope);
+    throwIfRequestEnded(scope);
 
     if (!response.ok) {
       if (response.status === 404) {
@@ -433,11 +418,11 @@ async function executeLookupProxy(body, {
       `CAP proxy ${CAP_LOOKUP_PATH} response`
     );
   } catch (error) {
-    throwIfAborted(scope, error);
-    if (error?.name === 'AbortError') {
+    throwIfRequestEnded(scope, error);
+    if (isCancellation(error)) {
       throw createCapError(
         'CAP proxy request was independently aborted by fetch',
-        'CAP_FETCH_ABORTED',
+        'CAP_FETCH_INTERRUPTED',
         error
       );
     }

@@ -278,8 +278,14 @@ test('automatic categorical inference keeps chi-square only when expected counts
     { pageName: 'First', values: [...Array(15).fill('A'), ...Array(5).fill('B')] },
     { pageName: 'Second', values: [...Array(5).fill('A'), ...Array(15).fill('B')] }
   ], 'categorical_obs')[0];
-  assert.equal(dense.testName, 'Chi-squared test');
-  assertClose(dense.pValue, 0.001565402258002548);
+  // A 2 x 2 table takes Yates's correction, as SciPy chi2_contingency and R
+  // chisq.test do and Composition does (audit NS-5): 8.1, p 0.004426525857919832.
+  assert.equal(dense.testName, "Chi-squared test (Yates's correction)");
+  assertClose(dense.statistic, 8.1);
+  assertClose(dense.pValue, 0.004426525857919832);
+  assert.equal(dense.df, 1);
+  // Cramér's V stays on the uncorrected statistic (10).
+  assertClose(dense.effectSize, Math.sqrt(10 / 40));
 
   const non2x2 = runStatisticalTests([
     { pageName: 'First', values: [...Array(5).fill('A'), ...Array(5).fill('B'), ...Array(5).fill('C')] },

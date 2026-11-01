@@ -32,13 +32,12 @@ import {
   servedStoreKey
 } from './served-anndata.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
+import { abortReason, isCancellation, cancel, cancelled, throwIfAborted } from '../utils/abort.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
-const DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
-const MAX_CONNECTION_TIMEOUT_MS = 120000;
 
 function requireExactText(value, label, { allowWhitespace = false } = {}) {
   if (
@@ -92,27 +91,15 @@ function requireCanonicalPathSegments(pathname, label) {
   }
 }
 
+/**
+ * A connection's configuration: its server address. A connection has no
+ * deadline of its own: a server busy with a large dataset answers late, not
+ * never, so it is waited for until it answers, fails, or the person stops it
+ * (`disconnect`, a newer connection, startup's own silence bound).
+ */
 function requireConnectionConfig(config) {
-  requireKeys(
-    config,
-    ['url'],
-    ['timeout'],
-    'Remote connection configuration'
-  );
-  const url = validateRemoteServerUrl(config.url);
-  const timeout = Object.hasOwn(config, 'timeout')
-    ? config.timeout
-    : DEFAULT_CONNECTION_TIMEOUT_MS;
-  if (
-    !Number.isInteger(timeout) ||
-    timeout < 1 ||
-    timeout > MAX_CONNECTION_TIMEOUT_MS
-  ) {
-    throw new TypeError(
-      `Remote connection timeout must be an integer from 1 through ${MAX_CONNECTION_TIMEOUT_MS}`
-    );
-  }
-  return Object.freeze({ url, timeout });
+  requireKeys(config, ['url'], [], 'Remote connection configuration');
+  return Object.freeze({ url: validateRemoteServerUrl(config.url) });
 }
 
 export function validateRemoteServerUrl(value) {
@@ -250,33 +237,30 @@ function requireDatasetCatalogPayload(payload) {
 
 /**
  * Whether a Cellucid server answers at one base address: its health endpoint
- * replies with a valid health document within the connection deadline. The
- * address bar asks this of a web address that names no file, so a server and
- * a dataset folder on a web host are told apart by what answers, not by how
- * the address looks. Any failure (nothing there, not a server, no reply in
- * time) is a plain no.
+ * replies with a valid health document. The address bar asks this of a web
+ * address that names no file, so a server and a dataset folder on a web host
+ * are told apart by what answers, not by how the address looks. Any failure
+ * (nothing there, not a server) is a plain no. There is no deadline: a busy
+ * server answers late, not never, and is not mistaken for a folder because
+ * it was slow; the probe waits under its opening, whose Cancel stops it and
+ * whose progress says how long nothing has answered.
  *
  * @param {string} url - A base URL `validateRemoteServerUrl` accepts
- * @param {{signal?: AbortSignal|null}} [options]
+ * @param {{signal: AbortSignal}} options - The opening's signal
  * @returns {Promise<boolean>}
  */
-export async function probeRemoteServer(url, { signal = null } = {}) {
+export async function probeRemoteServer(url, { signal }) {
   validateRemoteServerUrl(url);
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_CONNECTION_TIMEOUT_MS);
-  const abort = () => controller.abort();
-  signal?.addEventListener('abort', abort, { once: true });
+  if (!(signal instanceof AbortSignal)) throw new TypeError('A server probe runs under its opening\'s signal.');
   try {
     requireRemoteHealthPayload(
-      await requestJson(`${url}/_cellucid/health`, controller.signal, 'Remote health')
+      await requestJson(`${url}/_cellucid/health`, signal, 'Remote health')
     );
     return true;
-  } catch {
-    if (signal?.aborted) throw signal.reason;
+  } catch (error) {
+    throwIfAborted(signal);
+    if (isCancellation(error)) throw error;
     return false;
-  } finally {
-    clearTimeout(timeoutId);
-    signal?.removeEventListener('abort', abort);
   }
 }
 
@@ -368,7 +352,7 @@ async function requestJson(url, signal, label) {
   try {
     return await readBoundedJson(response, { label, signal });
   } catch (error) {
-    if (signal.aborted || error?.name === 'AbortError') {
+    if (signal.aborted || isCancellation(error)) {
       throw error;
     }
     if (error instanceof DataSourceError) {
@@ -416,7 +400,12 @@ export class RemoteDataSource {
     this.datasetId = null;
     /** @type {Map<string, Object>} Catalog entries by dataset id */
     this._datasetEntries = new Map();
-    /** @type {Map<string, DatasetMetadata>} */
+    /**
+     * The metadata of each dataset opened on this connection, with the
+     * store it was read from (`servedStoreKey`): it stands only while the
+     * server's listing, asked at each opening, names that store.
+     * @type {Map<string, {key: string, metadata: DatasetMetadata}>}
+     */
     this._datasetCache = new Map();
     /**
      * What the dataset list shows of each served store, by store
@@ -432,6 +421,13 @@ export class RemoteDataSource {
     this._operationId = 0;
     /** @type {AbortController|null} */
     this._pendingController = null;
+    /**
+     * Stops what belongs to the connection, not to one listing (the listing
+     * an opening reads to name its store): a newer connection or a
+     * disconnect ends it.
+     * @type {AbortController|null}
+     */
+    this._connectionController = null;
     this._catalogRevision = 0;
     /** @type {AbortController|null} */
     this._catalogController = null;
@@ -486,11 +482,7 @@ export class RemoteDataSource {
       this._serverUrl !== serverUrl
     ) {
       opened.release();
-      throw new DataSourceError(
-        'Remote connection changed before the AnnData store was adopted',
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type
-      );
+      throw cancelled('superseded', 'Remote connection changed before the AnnData store was adopted.');
     }
     this._releaseAnnData();
     this._annData = { key, datasetId: dataset.id, ...opened };
@@ -527,7 +519,7 @@ export class RemoteDataSource {
     const controller = new AbortController();
     this._catalogController = controller;
     const revision = ++this._catalogRevision;
-    previousController?.abort(new Error(reason));
+    cancel(previousController, 'superseded', reason);
     return { controller, revision };
   }
 
@@ -536,13 +528,13 @@ export class RemoteDataSource {
     this._catalogController = null;
     this._catalogRevision += 1;
     this._metadataInFlight = new Map();
-    previousController?.abort(new Error(reason));
+    cancel(previousController, 'closed', reason);
   }
 
   /**
    * Establish one exact remote connection.
    *
-   * @param {{url: string, timeout?: number}} config
+   * @param {{url: string}} config
    * @returns {Promise<Object>}
    */
   async connect(config) {
@@ -559,14 +551,7 @@ export class RemoteDataSource {
     const operationId = ++this._operationId;
     const controller = new AbortController();
     this._pendingController = controller;
-    let deadlineExpired = false;
-    const timeoutId = setTimeout(
-      () => {
-        deadlineExpired = true;
-        controller.abort();
-      },
-      exactConfig.timeout
-    );
+    let adopted = false;
 
     try {
       const healthPayload = await requestHealth(exactConfig.url, controller.signal);
@@ -584,11 +569,7 @@ export class RemoteDataSource {
       );
 
       if (operationId !== this._operationId || controller.signal.aborted) {
-        throw new DataSourceError(
-          'Remote connection was cancelled before adoption',
-          DataSourceErrorCode.NETWORK_ERROR,
-          this.type
-        );
+        throw cancelled('superseded', 'Remote connection was cancelled before adoption.');
       }
 
       this._releaseAnnData();
@@ -599,26 +580,22 @@ export class RemoteDataSource {
       this._datasetCache = new Map();
       this._summaries = new Map();
       this._connected = true;
+      cancel(this._connectionController, 'superseded', 'A newer remote connection replaced this one.');
+      this._connectionController = new AbortController();
       this._beginCatalogGeneration(
         'Remote catalog was replaced by a new connection'
       );
+      adopted = true;
       return serverInfo;
     } catch (error) {
-      if (controller.signal.aborted) {
-        throw new DataSourceError(
-          deadlineExpired
-            ? `Remote connection timed out after ${exactConfig.timeout}ms`
-            : 'Remote connection was cancelled',
-          DataSourceErrorCode.NETWORK_ERROR,
-          this.type,
-          { url: exactConfig.url, timeout: exactConfig.timeout }
-        );
-      }
+      // Stopped (a disconnect, a newer connection): a cancellation, never
+      // a failure of the server.
+      if (controller.signal.aborted) throw abortReason(controller.signal);
       // A cancellation that did not come from this connection's own controller
       // — a body stream cancelled by the transport, for instance — is still a
       // cancellation. Relabelling it as a contract validation failure blames the
       // server for a request that was never allowed to finish.
-      if (error?.name === 'AbortError') throw error;
+      if (isCancellation(error)) throw error;
       if (error instanceof DataSourceError) throw error;
       throw new DataSourceError(
         `Remote server contract validation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -627,7 +604,10 @@ export class RemoteDataSource {
         { url: exactConfig.url }
       );
     } finally {
-      clearTimeout(timeoutId);
+      // A failed connection stops every request it started that is still
+      // under way (the store descriptions it asked for at once): nothing
+      // waits for them any more.
+      if (!adopted) cancel(controller, 'superseded', 'The remote connection failed: nothing waits for its other requests.');
       if (this._pendingController === controller) {
         this._pendingController = null;
       }
@@ -638,10 +618,10 @@ export class RemoteDataSource {
   disconnect() {
     this._operationId += 1;
     if (this._pendingController) {
-      this._pendingController.abort(
-        new Error('Remote connection cancelled by disconnect')
-      );
+      cancel(this._pendingController, 'closed', 'The remote connection was closed by disconnect.');
     }
+    cancel(this._connectionController, 'closed', 'The remote connection was closed by disconnect.');
+    this._connectionController = null;
     this._connected = false;
     this._releaseAnnData();
     this._serverUrl = null;
@@ -703,11 +683,7 @@ export class RemoteDataSource {
       this._catalogController !== catalogOwner.controller ||
       catalogOwner.controller.signal.aborted
     ) {
-      throw new DataSourceError(
-        'Remote connection changed before dataset listing adoption',
-        DataSourceErrorCode.NETWORK_ERROR,
-        this.type
-      );
+      throw cancelled('superseded', 'Remote connection changed before dataset listing adoption.');
     }
     this._beginCatalogGeneration(
       'Remote catalog metadata was adopted'
@@ -723,6 +699,35 @@ export class RemoteDataSource {
       'Remote dataset id',
       { allowWhitespace: true }
     );
+  }
+
+  /**
+   * One dataset as the server's listing names it now (one request, past
+   * the HTTP cache), adopted as the connection's entry for it.
+   * @private
+   */
+  async _declaredNow(id) {
+    const operationId = this._operationId;
+    const serverUrl = this._serverUrl;
+    // Under the connection, not the listing: a newer listing does not stop
+    // an opening, a disconnect does.
+    const connection = this._connectionController;
+    if (connection === null) throw cancelled('closed', 'The remote connection was closed before metadata loading.');
+    const catalog = await this._requestDatasetCatalog(serverUrl, connection.signal);
+    if (!this._connected || this._operationId !== operationId || this._serverUrl !== serverUrl) {
+      throw cancelled('superseded', 'Remote connection changed before metadata loading.');
+    }
+    const dataset = catalog.find(entry => entry.id === id);
+    if (dataset === undefined) {
+      throw new DataSourceError(
+        `Remote dataset ${JSON.stringify(id)} is not declared by the current listing`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { datasetId: id }
+      );
+    }
+    this._datasetEntries.set(id, dataset);
+    return dataset;
   }
 
   _requireDeclaredDataset(datasetId) {
@@ -761,8 +766,10 @@ export class RemoteDataSource {
       );
     }
     const id = this._requireDatasetId(datasetId);
-    if (this._datasetCache.has(id)) return this._datasetCache.get(id);
-    const dataset = this._requireDeclaredDataset(id);
+    // The store the server names now, asked at each opening: a file
+    // rewritten since an earlier listing has another ETag, so it opens as
+    // its new version, never as the one that listing named.
+    const dataset = await this._declaredNow(id);
     // Opening the store belongs to the connection, not to one listing: the
     // dataset list is read again while a dataset opens, and that must not
     // cancel the open. It stands while the connection lasts and the dataset
@@ -770,6 +777,8 @@ export class RemoteDataSource {
     const operationId = this._operationId;
     const serverUrl = this._serverUrl;
     const key = servedStoreKey(serverUrl, dataset);
+    const opened = this._datasetCache.get(id);
+    if (opened?.key === key) return opened.metadata;
     const existing = this._metadataInFlight.get(key);
     if (existing?.operationId === operationId && existing.serverUrl === serverUrl) {
       return existing.promise;
@@ -787,13 +796,9 @@ export class RemoteDataSource {
           declared === undefined ||
           servedStoreKey(serverUrl, declared) !== key
         ) {
-          throw new DataSourceError(
-            'Remote connection changed before metadata adoption',
-            DataSourceErrorCode.NETWORK_ERROR,
-            this.type
-          );
+          throw cancelled('superseded', 'Remote connection changed before metadata adoption.');
         }
-        this._datasetCache.set(id, metadata);
+        this._datasetCache.set(id, { key, metadata });
         return metadata;
       } finally {
         if (this._metadataInFlight.get(key) === inFlight) {

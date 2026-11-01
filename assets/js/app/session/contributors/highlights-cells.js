@@ -19,6 +19,7 @@ import {
   HIGHLIGHT_RESTORE_TRANSACTION_ID
 } from './highlights-meta.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { mapCells, mapValues, sessionCellOrder } from '../session-cell-order.js';
 
 export const id = 'highlights-cells';
 const CHUNK_PREFIX = 'highlights/cells/';
@@ -122,6 +123,11 @@ function categoryReference(state, group, cache) {
   return members[group.categoryIndex] ?? null;
 }
 
+/** A reference cell list in session order, or null without one. */
+function mapCellsOrNull(cells, map) {
+  return cells === null ? null : mapCells(cells, map);
+}
+
 function requireStagedHighlightState(value, state) {
   requirePlainRecord(value, 'Staged highlight restore state');
   requireExactKeys(
@@ -181,6 +187,8 @@ export function capture(ctx) {
   const groupIds = new Set();
   const chunks = [];
   const referenceCache = new Map();
+  // Cells by original position (`session-cell-order.js`).
+  const toSession = sessionCellOrder(state.cellIdentity)?.toSession ?? null;
 
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
     const page = pages[pageIndex];
@@ -230,9 +238,9 @@ export function capture(ctx) {
         codec: 'gzip',
         label: `Highlight cells: ${label}`,
         datasetDependent: true,
-        payload: encodeCellSet(indices, {
+        payload: encodeCellSet(mapCells(indices, toSession), {
           cellCount: pointCount,
-          reference: categoryReference(state, group, referenceCache)
+          reference: mapCellsOrNull(categoryReference(state, group, referenceCache), toSession)
         })
       });
     }
@@ -373,11 +381,13 @@ export async function restore(ctx, chunkMeta, payload) {
       );
     }
   }
-  const decoded = await decodeCellSet(payload, {
+  // Stored by original position (`session-cell-order.js`), held in open order.
+  const order = sessionCellOrder(state.cellIdentity);
+  const decoded = mapCells(await decodeCellSet(payload, {
     cellCount: pointCount,
-    reference,
+    reference: mapCellsOrNull(reference, order?.toSession ?? null),
     signal
-  });
+  }), order?.toOpen ?? null);
   if (decoded.length !== expectedCellCount) {
     throw new RangeError(
       `Highlight group "${groupId}" decoded cell count does not match metadata.`

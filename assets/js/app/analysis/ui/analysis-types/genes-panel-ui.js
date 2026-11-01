@@ -22,14 +22,14 @@ import { HoverContext } from '../components/hover-context.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
 import { downloadBlob } from '../../../utils/download.js';
-import { toCSVCell } from '../../compute/csv-export.js';
+import { geneNameColumns, toCSVCell } from '../../compute/csv-export.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { DEFAULTS } from '../../genes-panel/constants.js';
 import { MARKER_OPTIONS } from '../../options/marker-options.js';
 import { defineOptions } from '../../options/option-schema.js';
 import { renderOptionsForm } from '../../options/render-options-form.js';
-import { countGeneFamilies } from '../../shared/gene-sets.js';
+import { countGeneFamilies, formatGmt, geneIdentities } from '../../shared/gene-sets.js';
 import { createSegmented } from '../../../ui/components/controls.js';
 import {
   createResultEnvelope,
@@ -37,10 +37,16 @@ import {
   requireDatasetGenes,
   requireDatasetVariable
 } from '../../shared/analysis-result-session.js';
-import { formatDuration, formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { formatBytes, formatDuration, formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { MARKER_RESULT_BYTES_PER_GROUP_GENE } from '../../genes-panel/marker-discovery-engine.js';
+import { residencyBudgetBytes } from '../../../../data/memory-budget.js';
+import { failureText } from '../../../../utils/errors.js';
+import { GENES_READ_PLACE } from '../../../../data/gene-read-plan.js';
 
 /** A marker group in a session: its category, by value. */
 const GROUP_KEY_PREFIX = 'category:';
+/** The description of a marker gene set, in a GMT file and to a notebook. */
+const MARKER_GENE_SET_DESCRIPTION = 'Cellucid marker genes';
 
 /** The Wilcoxon p-value conventions as the form names them. */
 const P_CONVENTION_NAMES = Object.freeze(Object.fromEntries(
@@ -63,6 +69,41 @@ const DISPLAY_OPTIONS = defineOptions({
     .filter(entry => MARKER_DISPLAY_KEYS.includes(entry.key))
     .map(entry => ({ ...entry, group: 'essentials' }))
 });
+
+/**
+ * The groups a marker run skipped, as its chip and notification say them:
+ * null when none was. A group is skipped for having fewer cells than the
+ * minimum; when genes are read for a sample of the open cells
+ * (`metadata.geneSample`), its cells are those among the sample, and a group
+ * the minimum would test on every open cell is said to be skipped for too
+ * few sampled cells, with Genes read for (Session › Open data) as the way to
+ * test it.
+ *
+ * @param {{skippedGroups: ReadonlyArray<{name: string, cells: number}>, geneSample?: {cells: number, of: number, groups?: ReadonlyArray<{name: string, used: number, of: number}>}|null}} metadata
+ * @param {number} minCells
+ * @returns {{text: string, title: string}|null}
+ */
+export function describeSkippedGroups(metadata, minCells) {
+  const skipped = metadata.skippedGroups;
+  if (skipped.length === 0) return null;
+  const sample = metadata.geneSample ?? null;
+  const whole = new Map((sample?.groups ?? []).map(group => [group.name, group.of]));
+  const bySample = skipped.filter(group => (whole.get(group.name) ?? 0) >= minCells).length;
+  const count = formatCount(skipped.length);
+  const text = bySample === 0
+    ? `${count} skipped`
+    : bySample === skipped.length
+      ? `${count} skipped: too few sampled cells`
+      : `${count} skipped (${formatCount(bySample)} for too few sampled cells)`;
+  const listed = skipped.map(group => (whole.has(group.name)
+    ? `${group.name} (${formatCount(group.cells)} of ${formatCount(whole.get(group.name))})`
+    : `${group.name} (${formatCount(group.cells)})`)).join(', ');
+  const title = sample === null
+    ? `Fewer than ${formatCountOf(minCells, 'cell')}, not tested (kept in the rest): ${listed}`
+    : `Fewer than ${formatCountOf(minCells, 'cell')} among the ${formatCount(sample.cells)} of ${formatCountOf(sample.of, 'open cell')} that genes are read for, not tested (kept in the rest): ${listed}. ` +
+      `Read genes for more cells (${GENES_READ_PLACE}), then run again to test them on more cells.`;
+  return { text, title };
+}
 
 export class GenesPanelUI extends FormBasedAnalysisUI {
   static getRequirements() {
@@ -108,10 +149,10 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _getSuccessMessage(result) {
     const meta = result?.metadata;
     if (!meta) return 'Marker genes complete';
-    const skipped = meta.skippedGroups.length;
-    return skipped === 0
+    const skipped = describeSkippedGroups(meta, this._options?.minCells ?? meta.minCellsPerSide);
+    return skipped === null
       ? `Marker genes: ${formatCountOf(meta.testedCount, 'group')} tested`
-      : `Marker genes: ${formatCountOf(meta.testedCount, 'group')} tested, ${formatCount(skipped)} skipped ` +
+      : `Marker genes: ${formatCountOf(meta.testedCount, 'group')} tested, ${skipped.text} ` +
         `(${meta.skippedGroups.map(group => group.name).join(', ')})`;
   }
 
@@ -200,7 +241,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       .catch(error => {
         if (this._isDestroyed || this._groupState.pending !== key) return;
         this._groupState = { key, described: null, pending: null, error };
-        this._notifications.error(`Marker genes groups: ${error.message}`, { category: 'analysis' });
+        this._notifications.error(`Marker genes groups: ${failureText(error)}`, { category: 'analysis' });
         this._refreshOptionsContext();
       });
   }
@@ -228,6 +269,30 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return this._ensureController().plan(options, described).blocker;
   }
 
+  /**
+   * The memory a run's result holds, said before Run when it exceeds this
+   * device's share for analyses: one value of each statistic per tested
+   * group and gene, so a high-cardinality field can be narrowed to fewer
+   * groups. No limit: the run goes ahead if asked. @override
+   */
+  _getRunNotice(options) {
+    const current = this._groupState.key === this._groupKey(options);
+    const described = current ? this._groupState.described : null;
+    if (described === null) return null;
+    const { testedCount } = this._ensureController().plan(options, described);
+    const geneCount = this.dataLayer.state?.varData?.fields?.length ?? 0;
+    const bytes = testedCount * geneCount * MARKER_RESULT_BYTES_PER_GROUP_GENE;
+    const share = residencyBudgetBytes('analysis');
+    if (bytes <= share) return null;
+    return `${formatCountOf(testedCount, 'group')} × ${formatCountOf(geneCount, 'gene')} hold about ${formatBytes(bytes)} of results, ` +
+      `more than this device keeps for analyses (${formatBytes(share)}). Test fewer groups or genes to need less.`;
+  }
+
+  /** Another set of open cells: the groups are described again on them. @override */
+  _onOpenCellsChanged() {
+    this._groupState = { key: null, described: null, pending: null };
+  }
+
   onHighlightChanged() {
     super.onHighlightChanged();
     if (this._options !== null && this._options.cells !== 'all') this._loadGroups(this._options);
@@ -244,9 +309,19 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return this._controller;
   }
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  /** Its genes: a run reads every gene it tests (about the matrix's). @override */
+  _getRunUnits() {
+    return Math.max(1, this.dataLayer.state?.varData?.fields?.length ?? 1);
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     const controller = this._ensureController();
-    const run = await controller.runAnalysis({ options, job });
+    const run = await controller.runAnalysis({ options, job, sample });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
     return this._buildResult(run.stats, run.metadata, options, job?.signal ?? null);
   }
@@ -385,14 +460,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       chips.appendChild(element);
       return element;
     };
-    if (metadata.skippedGroups.length > 0) {
-      chip(
-        `${formatCount(metadata.skippedGroups.length)} skipped`,
-        `Fewer than ${formatCountOf(this._options?.minCells ?? metadata.minCellsPerSide, 'cell')}, not tested (kept in the rest): ` +
-          metadata.skippedGroups.map(group => `${group.name} (${formatCount(group.cells)})`).join(', '),
-        'warning'
-      );
-    }
+    const skipped = describeSkippedGroups(metadata, this._options?.minCells ?? metadata.minCellsPerSide);
+    if (skipped !== null) chip(skipped.text, skipped.title, 'warning');
     if (metadata.pooledGroups.length > 0) {
       chip(`${formatCount(metadata.pooledGroups.length)} pooled`,
         `Tested together as one group: ${metadata.pooledGroups.map(group => group.name).join(', ')}`, 'info');
@@ -736,13 +805,18 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _exportModalCSV() {
     const result = this._lastResult;
     if (!result?.selection) return;
-    const lines = ['group,rank,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group'];
+    // Genes by identifier, the shown name beside it (`geneNameColumns`).
+    const { idOf } = geneIdentities(this.dataLayer.state?.varData);
+    const shown = result.selection.groups.flatMap(({ markers }) => markers.map(marker => marker.gene));
+    const columns = geneNameColumns(shown, shown.map(gene => idOf(gene)));
+    const lines = [`group,rank,${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group`];
+    let at = 0;
     for (const { group, markers } of result.selection.groups) {
       for (const marker of markers) {
         lines.push([
           toCSVCell(String(group.groupName)),
           marker.rank,
-          toCSVCell(marker.gene),
+          columns.cells(at++),
           toCSVCell(marker.score),
           toCSVCell(marker.log2FoldChange),
           toCSVCell(marker.pValue),
@@ -759,42 +833,70 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** Every gene of every group (long), written by the analysis workers. */
   async _exportAllGenesCSV() {
+    if (this._refuseStaleExport('CSV')) return;
     const stats = this._lastResult?.stats;
     if (!stats) return;
     try {
+      // The lanes move to the worker as copies; the groups not tested share
+      // one lane of each statistic, copied once.
+      const copies = new Map();
+      const copied = lanes => lanes.map(lane => {
+        if (!copies.has(lane)) copies.set(lane, lane.slice());
+        return copies.get(lane);
+      });
       const { rows } = await getComputeManager().execute(
         OperationType.COMPUTE_CSV_EXPORT,
         {
           layout: 'marker-statistics',
           markers: {
             genes: stats.genes,
+            ids: stats.genes.map(gene => geneIdentities(this.dataLayer.state?.varData).idOf(gene)),
             groups: stats.groups.map(group => ({ name: String(group.groupName), tested: group.tested, small: group.small })),
-            scores: stats.scoresByGroup.map(lane => lane.slice()),
-            logfoldchanges: stats.log2FoldChangeByGroup.map(lane => lane.slice()),
-            pvals: stats.pValuesByGroup.map(lane => lane.slice()),
-            pvalsAdj: stats.adjustedPValuesByGroup.map(lane => lane.slice()),
-            pctIn: stats.pctInByGroup.map(lane => lane.slice()),
-            pctRef: stats.pctRefByGroup.map(lane => lane.slice()),
-            auroc: stats.aurocByGroup.map(lane => lane.slice())
+            scores: copied(stats.scoresByGroup),
+            logfoldchanges: copied(stats.log2FoldChangeByGroup),
+            pvals: copied(stats.pValuesByGroup),
+            pvalsAdj: copied(stats.adjustedPValuesByGroup),
+            pctIn: copied(stats.pctInByGroup),
+            pctRef: copied(stats.pctRefByGroup),
+            auroc: copied(stats.aurocByGroup)
           }
         },
         { transfer: true }
       );
       downloadCSV(rows, 'marker_genes_all', this._notifications);
     } catch (error) {
-      this._notifications.error(`CSV export failed: ${error.message}`, { category: 'download' });
+      this._notifications.error(`CSV export failed: ${failureText(error)}`, { category: 'download' });
     }
   }
 
   /** The shown markers of each group as a GMT file. */
   _exportGMT() {
+    if (this._refuseStaleExport('GMT')) return;
     const sets = this.getMarkerGeneSets();
-    const text = sets.map(set => [set.name.replace(/\t/g, ' '), 'Cellucid marker genes', ...set.genes].join('\t')).join('\n');
+    // Genes leave by their identifier (the var index), as every boundary names them.
+    const { idOf } = geneIdentities(this.dataLayer.state?.varData);
     try {
-      downloadBlob(new Blob([`${text}\n`], { type: 'text/plain' }), 'marker_genes.gmt');
+      downloadBlob(
+        new Blob([formatGmt(sets.map(set => ({
+          ...set,
+          genes: set.genes.map(gene => idOf(gene)),
+          description: MARKER_GENE_SET_DESCRIPTION,
+        })))], { type: 'text/plain' }),
+        'marker_genes.gmt'
+      );
     } catch (error) {
-      this._notifications.error(`GMT export failed: ${error.message}`, { category: 'download' });
+      this._notifications.error(`GMT export failed: ${failureText(error)}`, { category: 'download' });
     }
+  }
+
+  /** The shown markers reach the dataset's derived results (and a notebook) as gene sets. */
+  _publishDerivedResults(result) {
+    const state = this.dataLayer?.state;
+    if (state === null || state === undefined) return;
+    const geneSets = result === null
+      ? []
+      : this.getMarkerGeneSets().map(set => ({ ...set, description: MARKER_GENE_SET_DESCRIPTION }));
+    state.getDerivedResults().replaceOwned('markers', { geneSets });
   }
 
   /**
@@ -902,7 +1004,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
    * columns), its groups named by category value, and its metadata. The
    * shown markers, heatmap and clustering are rebuilt from them.
    */
-  exportResult() {
+  _exportResult() {
     const result = this._lastResult;
     if (!result?.stats) return null;
     const { stats, metadata } = result;

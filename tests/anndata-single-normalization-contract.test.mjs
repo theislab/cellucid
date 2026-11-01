@@ -174,7 +174,8 @@ for (const testCase of CASES) {
     const loads = [];
     for (let load = 0; load < 3; load++) {
       if (load > 0) {
-        assert.deepEqual(direct.evictUnpinned(), [LAYOUT]);
+        direct.trimUnshown(0);
+        assert.equal(direct.normalizedPositionCache.has(LAYOUT), false);
       }
       const readsBefore = embeddingReads;
       const result = await shown(direct);
@@ -206,7 +207,7 @@ for (const testCase of CASES) {
     const directVectors = vectorManagerFor(baseUrl, direct, vectorRoute.path);
     const firstField = await directVectors.loadField('velocity_umap', LAYOUT);
     assert.deepEqual(bitsOf(firstField.vectors), bitsOf(expectedVectors));
-    direct.evictUnpinned();
+    direct.trimUnshown(0);
     const reloadedField = await directVectors.loadField('velocity_umap', LAYOUT);
     assert.deepEqual(bitsOf(reloadedField.vectors), bitsOf(expectedVectors));
     assert.deepEqual(direct.getNormTransform(LAYOUT), expectedTransform);
@@ -223,7 +224,6 @@ function mockAdapter(arrays) {
     nObs: 3,
     reads: 0,
     obsKeys: [],
-    varNames: [],
     hasExpressionMatrix: false,
     async getDatasetMetadata() {
       return loaderMetadata({ nObs: 3, obsm: widths });

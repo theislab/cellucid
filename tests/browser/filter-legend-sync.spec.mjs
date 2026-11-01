@@ -37,7 +37,7 @@ test('removing a range filter from Active filters resets the legend sliders it d
   await page.locator('#continuous-field').selectOption({ label: 'score' });
   const sliders = page.locator('#legend .slider-row input[type="range"]');
   await expect(sliders).toHaveCount(2);
-  await sliders.nth(1).fill('50');
+  await sliders.nth(1).fill('500');
   await expect(page.locator('#active-filters')).toContainText('score:');
   const narrowed = await activeContinuousFilter(page);
 
@@ -45,10 +45,10 @@ test('removing a range filter from Active filters resets the legend sliders it d
   await expect(page.locator('#active-filters')).toHaveText('No filters active.');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
   await expect(sliders.nth(0)).toHaveValue('0');
-  await expect(sliders.nth(1)).toHaveValue('100');
+  await expect(sliders.nth(1)).toHaveValue('1000');
 
   // Nudging Min must not resurrect the removed Max bound.
-  await sliders.nth(0).fill('1');
+  await sliders.nth(0).fill('10');
   const nudged = await activeContinuousFilter(page);
   const stats = await page.evaluate(() => {
     const field = window._cellucidState.getActiveField();
@@ -57,6 +57,37 @@ test('removing a range filter from Active filters resets the legend sliders it d
   expect(nudged.max).toBe(stats.max);
   expect(nudged.max).not.toBe(narrowed.max);
 
+  expect(productErrors).toEqual([]);
+});
+
+test('Filter is offered only while Live filtering is off, and applies the range once', async ({ page }) => {
+  // With Live filtering on every slider step applies the range, so a Filter
+  // button beside the switch (it used to be a greyed-out one) has nothing to do.
+  const productErrors = observeProductErrors(page);
+  await openPreparedFixture(page);
+
+  await page.locator('#continuous-field').selectOption({ label: 'score' });
+  const block = page.locator('#legend .legend-filter');
+  const live = block.getByRole('switch', { name: 'Live filtering' });
+  const filter = block.getByRole('button', { name: 'Filter', exact: true });
+  const sliders = block.locator('.slider-row input[type="range"]');
+  await expect(live).toHaveAttribute('aria-checked', 'true');
+  await expect(filter).toBeHidden();
+  await expect(block.getByRole('button', { name: 'Reset', exact: true })).toBeVisible();
+
+  await live.click();
+  await expect(live).toHaveAttribute('aria-checked', 'false');
+  await expect(filter).toBeVisible();
+  await expect(filter).toBeEnabled();
+  await sliders.nth(1).fill('500');
+  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
+  await filter.click();
+  await expect(page.locator('#active-filters')).toContainText('score:');
+  await expect(page.locator('#filter-count')).not.toHaveText('Showing all 120 cells');
+
+  await live.click();
+  await expect(live).toHaveAttribute('aria-checked', 'true');
+  await expect(filter).toBeHidden();
   expect(productErrors).toEqual([]);
 });
 
@@ -86,7 +117,7 @@ test('toggling or removing a filter from the keyboard keeps the focus in the lis
     has: page.locator('.legend-label-main', { hasText: /^alpha$/ }),
   }).locator('.legend-checkbox').uncheck();
   await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await page.locator('#legend .slider-row input[type="range"]').nth(1).fill('50');
+  await page.locator('#legend .slider-row input[type="range"]').nth(1).fill('500');
   const rows = page.locator('#active-filters .list-item');
   await expect(rows).toHaveCount(2);
   const focusedIn = () => page.evaluate(() => {

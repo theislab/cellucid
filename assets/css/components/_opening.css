@@ -61,6 +61,15 @@
   overflow-wrap: anywhere;
 }
 
+/* How the opening reads its data, said up front (a file that cannot be read
+   in parts): one quiet paragraph under the progress. */
+.opening-note {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
 .opening-cancel {
   align-self: flex-end;
 }
@@ -71,6 +80,7 @@
 .opening-overlay[data-state="running"] .opening-actions,
 .opening-overlay[data-state="failed"] .opening-bar,
 .opening-overlay[data-state="failed"] .opening-detail,
+.opening-overlay[data-state="failed"] .opening-note,
 .opening-overlay[data-state="failed"] .opening-cancel {
   display: none;
 }

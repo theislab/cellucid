@@ -6,22 +6,26 @@
 
 import { createIntentPrefetcher } from '../../utils/intent-prefetch.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { isCancellation, cancelled, cancellationKind } from '../../../utils/abort.js';
 import {
   explainContinuousPayloadFailure,
 } from '../../../data/continuous-payload-diagnosis.js';
 import { FieldSource } from '../../utils/field-constants.js';
-import { formatCount } from '../../../utils/format-units.js';
+import { formatCountOf } from '../../../utils/format-units.js';
 import { createWindowedListbox } from '../components/windowed-listbox.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import {
-  createDatasetFieldLoadSupersededError,
-  isDatasetFieldLoadSupersededError
-} from '../../state/managers/field/loading.js';
-import {
-  isFieldInteractionSupersededError
-} from './field-interaction-owner.js';
-import { rankedMatchIndices } from '../../utils/text-match.js';
+  GeneUnavailableError,
+  describeUnavailableGene,
+  rankGeneMatches,
+  resolveExactGene,
+  resolveTypedGene,
+} from '../../utils/gene-lookup.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { isReported } from '../../../utils/errors.js';
+import { useOpenCells } from '../../../data/open-cells-work.js';
+import { PLACES, placePath } from '../place-names.js';
+import { describeUnshownField, unshownChoiceReason } from './field-interaction-owner.js';
 
 const INIT_KEYS = new Set([
   'state',
@@ -49,7 +53,9 @@ const CALLBACK_KEYS = new Set([
   'onStartFieldRename',
   'onStartFieldDelete',
   'onBusyChanged',
-  'onActivateField'
+  'onActivateField',
+  'onAdoptDatasetGeneration',
+  'onChooseGeneNames'
 ]);
 const RETURN_KEYS = new Set([
   'clearGeneSelection',
@@ -162,14 +168,19 @@ function countPublishedGenes(inventory) {
 }
 
 /**
+ * What a gene search that finds nothing says: which list it searched (the
+ * gene names of the file's var index, as many as the file holds, or the
+ * column Data mapping names them by), and where another names column is
+ * chosen. Nothing is guessed: no column is named but the one in use.
+ *
  * @param {number} publishedGeneCount
+ * @param {string|null} namesColumn - The var column naming the genes, null for the var index
  * @returns {string}
  */
-function formatGenePanelNote(publishedGeneCount) {
-  const noun = publishedGeneCount === 1 ? 'gene name' : 'gene names';
-  return `This dataset publishes ${formatCount(publishedGeneCount)} ${noun}, `
-    + 'chosen when its file was written and possibly a subset of the source data. '
-    + 'Check for typos too.';
+function formatGenePanelNote(publishedGeneCount, namesColumn) {
+  const source = namesColumn === null ? 'its var index' : `var['${namesColumn}']`;
+  return `Searched the ${formatCountOf(publishedGeneCount, 'gene')} of this dataset, named by ${source}; `
+    + 'another var column of the file (symbols) can name them instead.';
 }
 
 // The state's var inventory is checked field by field when it is published
@@ -289,6 +300,7 @@ export function initGeneExpressionSelector(options) {
     'getDatasetGeneration',
     'getVarFields',
     'getVisibleFields',
+    'locateVarField',
     'setActiveVarField'
   ]) {
     requireMethod(state, methodName, 'Gene expression selector state');
@@ -297,7 +309,9 @@ export function initGeneExpressionSelector(options) {
     'assertCurrent',
     'isCurrent',
     'isSuspended',
+    'retirementOf',
     'run',
+    'suspensionReason',
     'track'
   ]) {
     requireMethod(
@@ -366,6 +380,10 @@ export function initGeneExpressionSelector(options) {
   let geneSearchKeys = [];
   let publishedGeneCount = 0;
   let selectedGeneOriginalIdx = -1;
+  // The gene being chosen (`selectGene`), with its choice's token: while it
+  // is the latest choice, a refresh of the selector (the gene list
+  // republished, another field's change) names it, not what is shown.
+  let choosing = null;
   let forceDisabled = false;
 
   /* The dropdown is rebuilt on every keystroke, so it cannot host the live
@@ -430,10 +448,7 @@ export function initGeneExpressionSelector(options) {
     }
     interactionOwner.track(task);
     task.catch((error) => {
-      if (
-        isFieldInteractionSupersededError(error)
-        || isDatasetFieldLoadSupersededError(error)
-      ) {
+      if (isCancellation(error)) {
         return;
       }
       const exactError = requireError(error, 'Gene selector UI task');
@@ -471,10 +486,9 @@ export function initGeneExpressionSelector(options) {
     }
     interactionOwner.track(task);
     task.catch((error) => {
-      if (
-        isFieldInteractionSupersededError(error)
-        || isDatasetFieldLoadSupersededError(error)
-      ) {
+      // A cancellation is no failure; a failure the gene's own loading card
+      // already said (`announceLoadFailure`) is not said twice.
+      if (isCancellation(error) || isReported(error)) {
         return;
       }
       const exactError = requireError(error, 'Gene selector UI task');
@@ -527,7 +541,17 @@ export function initGeneExpressionSelector(options) {
     publishedGeneCount = countPublishedGenes(inventory);
     geneSearchKeys = geneFieldList.map(({ field }) => searchKeyOf(field));
     hasGeneExpressionFields = geneFieldList.length > 0;
-    geneContainer.hidden = !hasGeneExpressionFields;
+    // A dataset just shown lists its genes after its first view: the search
+    // says they are loading (or why they could not be read) until then.
+    const pending = state.areGenesPending();
+    const failure = hasGeneExpressionFields ? null : state.getGeneListFailure();
+    geneContainer.hidden = !hasGeneExpressionFields && !pending && failure === null;
+    geneContainer.setAttribute('aria-busy', String(pending));
+    geneSearch.disabled = pending || failure !== null;
+    geneSearch.placeholder = pending
+      ? 'Reading gene names…'
+      : failure !== null ? 'Gene names could not be read' : 'Search genes…';
+    geneSearch.title = failure === null ? '' : failure.message;
     if (
       selectedGeneOriginalIdx >= 0
       && !geneFieldList.some(
@@ -565,7 +589,7 @@ export function initGeneExpressionSelector(options) {
     // Best match first: Enter with no option active takes the first one.
     const filtered = normalizedQuery.length === 0
       ? geneFieldList
-      : rankedMatchIndices(geneSearchKeys, normalizedQuery).map(index => geneFieldList[index]);
+      : rankGeneMatches(geneSearchKeys, normalizedQuery).map(index => geneFieldList[index]);
     geneResults = filtered;
 
     if (filtered.length === 0) {
@@ -588,14 +612,24 @@ export function initGeneExpressionSelector(options) {
         headline.appendChild(echo);
         const note = ownerDocument.createElement('div');
         note.className = 'mt-1';
-        note.textContent = formatGenePanelNote(publishedGeneCount);
+        note.textContent = formatGenePanelNote(publishedGeneCount, state.varData?.geneNames?.source ?? null);
+        const choose = ownerDocument.createElement('button');
+        choose.type = 'button';
+        choose.className = 'btn btn-compact';
+        choose.textContent = 'Choose gene names…';
+        choose.addEventListener('click', () => callbacks.onChooseGeneNames());
         const help = ownerDocument.createElement('a');
-        help.className = 'text-link d-inline-block mt-1';
+        help.className = 'text-link';
         help.href = GENE_PANEL_HELP_URL;
         help.target = '_blank';
         help.rel = 'noopener noreferrer';
         help.textContent = GENE_PANEL_HELP_LABEL;
-        noResults.append(headline, note, help);
+        // The action and the explanation share one line, wrapping only
+        // where the sidebar is too narrow for both.
+        const actions = ownerDocument.createElement('div');
+        actions.className = 'd-flex flex-wrap items-center gap-2 mt-1';
+        actions.append(choose, help);
+        noResults.append(headline, note, actions);
         /* Announced without the query, so extending a query that still finds
            nothing does not repeat the whole explanation on every keystroke. */
         geneSearchStatus.textContent = (
@@ -650,10 +684,19 @@ export function initGeneExpressionSelector(options) {
       state.activeVarFieldIndex,
       'Active var field index'
     );
-    if (source === FieldSource.VAR) {
-      if (varIdx < 0) {
-        throw new Error('Active var source requires one active var index');
-      }
+    const chosenAt = choiceUnderWay();
+    if (source === FieldSource.VAR && varIdx < 0) {
+      throw new Error('Active var source requires one active var index');
+    }
+    if (source !== FieldSource.VAR && varIdx !== -1) {
+      throw new Error(
+        'Inactive var source requires active var field index -1'
+      );
+    }
+    if (chosenAt >= 0) {
+      selectedGeneOriginalIdx = chosenAt;
+      geneSearch.value = readVarInventory()[chosenAt].key;
+    } else if (source === FieldSource.VAR) {
       const inventory = readVarInventory();
       if (varIdx >= inventory.length) {
         throw new RangeError(
@@ -663,61 +706,159 @@ export function initGeneExpressionSelector(options) {
       selectedGeneOriginalIdx = varIdx;
       geneSearch.value = inventory[varIdx].key;
     } else {
-      if (varIdx !== -1) {
-        throw new Error(
-          'Inactive var source requires active var field index -1'
-        );
-      }
       selectedGeneOriginalIdx = -1;
       geneSearch.value = '';
     }
     updateGeneActionButtons();
   }
 
+  /**
+   * Where the gene being chosen is on the gene list in use, while its choice
+   * is the latest; -1 otherwise.
+   * @returns {number}
+   */
+  function choiceUnderWay() {
+    if (choosing === null || !interactionOwner.isCurrent(choosing.token)) return -1;
+    return state.locateVarField(choosing.field);
+  }
+
+  /**
+   * Notify that a gene chosen is not shown, and why.
+   * @param {string} message
+   */
+  function sayUnshown(message) {
+    geneSearchStatus.textContent = message;
+    getNotificationCenter().info(message, { category: 'data' });
+  }
+
+  /**
+   * Colour the cells by the gene at `originalIdx` of the gene list.
+   *
+   * The choice is work on the open cells (`data/open-cells-work.js`): one
+   * made while a progressive opening's step or Apply changes them starts on
+   * the cells after it, and no change commits under it. (It used to take the
+   * dataset generation when it was made, then wait for the step under way
+   * and find the generation the step advanced: the gene was read and never
+   * shown, with nothing said.) Whatever keeps it from being shown is said,
+   * except a newer choice, Cancel or another dataset.
+   *
+   * @param {number} originalIdx
+   * @returns {Promise<Object|null>} The activation, or null when not shown
+   */
   function selectGene(originalIdx) {
     assertAlive();
+    const chosen = findGeneEntry(originalIdx);
     if (interactionOwner.isSuspended()) {
+      sayUnshown(describeUnshownField(chosen.field.key, interactionOwner.suspensionReason()));
       return Promise.resolve(null);
     }
-    const datasetGeneration = readDatasetGeneration();
     return interactionOwner.run(async token => {
-      const { field, originalIdx: index } = findGeneEntry(originalIdx);
+      let { field, originalIdx: index } = chosen;
       // A prefetch of this gene is shared by the load below; one of another
       // gene is no longer wanted.
       if (genePrefetch.current() !== index) cancelGenePrefetch();
+      // The choice shows at once, while the cells it is read on settle.
       hideGeneDropdown();
+      geneSearchStatus.textContent = '';
       selectedGeneOriginalIdx = index;
       categoricalSelect.value = noneFieldValue;
       continuousSelect.value = noneFieldValue;
       geneSearch.value = field.key;
       updateGeneActionButtons();
       callbacks.onBusyChanged(true);
+      choosing = { token, field };
+      let datasetGeneration = null;
+      // The gene list in use came to have no such gene.
+      let gone = false;
+      const chosenKey = field.key;
+      // A gene of a subsample's cell-major matrix shows on more cells as
+      // they are read (`showPartialVarField`); the colours of the field
+      // shown come back if it is not shown in the end.
+      let partial = false;
       try {
-        await state.ensureVarFieldLoaded(index, {
-          signal: token.signal,
-          priority: 'high'
-        });
-        interactionOwner.assertCurrent(token);
-        if (
-          readDatasetGeneration() !== datasetGeneration
-          || readVarInventory()[index] !== field
-        ) {
-          throw createDatasetFieldLoadSupersededError();
-        }
-        const info = requireFieldInfo(
-          state.setActiveVarField(index),
-          field
-        );
-        callbacks.onActiveFieldChanged(info);
-        return info;
+        return await useOpenCells(async () => {
+          datasetGeneration = callbacks.onAdoptDatasetGeneration();
+          // The gene list may be replaced before or while the gene is read
+          // (Data mapping, applied by a person or because the values refuted
+          // a default): the choice follows its gene to the list in use
+          // (`DataState.locateVarField`) and reads it there.
+          for (;;) {
+            const at = state.locateVarField(field);
+            if (at < 0) {
+              gone = true;
+              throw cancelled('superseded', 'The gene list in use has no such gene.');
+            }
+            if (at !== index || readVarInventory()[at] !== field) {
+              index = at;
+              field = readVarInventory()[at];
+              choosing = { token, field };
+              selectedGeneOriginalIdx = index;
+              geneSearch.value = field.key;
+            }
+            try {
+              await state.ensureVarFieldLoaded(index, {
+                signal: token.signal,
+                priority: 'high',
+                onPartial: column => {
+                  if (interactionOwner.isCurrent(token) && readDatasetGeneration() === datasetGeneration) {
+                    partial = state.showPartialVarField(index, column) || partial;
+                  }
+                }
+              });
+            } catch (error) {
+              // A load the list's replacement superseded: read the gene again
+              // on the list in use. Anything else ends the choice.
+              if (
+                !isCancellation(error)
+                || cancellationKind(error) === 'user'
+                || !interactionOwner.isCurrent(token)
+                || readDatasetGeneration() !== datasetGeneration
+                || readVarInventory()[index] === field
+              ) {
+                throw error;
+              }
+              continue;
+            }
+            interactionOwner.assertCurrent(token);
+            if (readDatasetGeneration() !== datasetGeneration) {
+              throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
+            }
+            if (readVarInventory()[index] === field) break;
+          }
+          const info = requireFieldInfo(
+            state.setActiveVarField(index),
+            field
+          );
+          callbacks.onActiveFieldChanged(info);
+          return info;
+        }, token.signal);
       } catch (error) {
-        if (
-          interactionOwner.isCurrent(token) === false
-          || isFieldInteractionSupersededError(error)
-          || isDatasetFieldLoadSupersededError(error)
-        ) {
+        // Ended: a refresh names what is shown again.
+        if (choosing?.token === token) choosing = null;
+        const sameDataset = datasetGeneration === null || readDatasetGeneration() === datasetGeneration;
+        if (partial && sameDataset && !isCancellation(error)) {
+          state.restoreActiveFieldColors();
+        }
+        if (isCancellation(error)) {
+          const reason = unshownChoiceReason(
+            interactionOwner,
+            token,
+            error,
+            sameDataset ? 'the gene list changed while it was read' : null
+          );
+          // Still the latest choice: the search names what is shown again.
+          if (interactionOwner.isCurrent(token)) {
+            selectedGeneOriginalIdx = -1;
+            syncFromState();
+          }
+          if (gone && interactionOwner.isCurrent(token)) {
+            sayUnshown(`${chosenKey} is not shown: the gene list changed while it was read (${placePath(PLACES.session, PLACES.dataMapping)}) and no longer has it.`);
+          } else if (reason !== null) {
+            sayUnshown(describeUnshownField(chosenKey, reason));
+          }
           return null;
         }
+        if (!interactionOwner.isCurrent(token)) return null;
         const selectionError = requireError(error, 'Gene selection');
         try {
           syncFromState();
@@ -732,6 +873,7 @@ export function initGeneExpressionSelector(options) {
         }
         throw selectionError;
       } finally {
+        if (choosing?.token === token) choosing = null;
         if (interactionOwner.isCurrent(token)) {
           callbacks.onBusyChanged(false);
           updateGeneActionButtons(false);
@@ -740,10 +882,20 @@ export function initGeneExpressionSelector(options) {
     });
   }
 
+  /** The gene list as the lookup reads it (`utils/gene-lookup.js`). */
+  function geneListForLookup() {
+    return {
+      pending: state.areGenesPending(),
+      failure: state.getGeneListFailure(),
+    };
+  }
+
   /**
    * Colour the cells by the gene named `geneKey`, exactly as choosing it in
    * this list does: how a gene picked elsewhere (an analysis result) is
-   * shown, so the search box always names the gene the cells show.
+   * shown, so the search box always names the gene the cells show. A name
+   * the list cannot choose (still being read, or not a gene of it) rejects
+   * with a `GeneUnavailableError` that says why.
    *
    * @param {string} geneKey
    * @returns {Promise<Object|null>} As `selectGene`
@@ -753,11 +905,15 @@ export function initGeneExpressionSelector(options) {
     if (typeof geneKey !== 'string' || geneKey.length === 0) {
       throw new TypeError('Gene to colour by must be its exact key');
     }
-    const entry = geneFieldList.find(candidate => candidate.field.key === geneKey);
-    if (entry === undefined) {
-      throw new RangeError(`"${geneKey}" is not a gene of the expression matrix shown`);
+    const list = geneListForLookup();
+    const outcome = resolveExactGene(geneKey, {
+      keys: geneFieldList.map(entry => entry.field.key),
+      ...list,
+    });
+    if (outcome.kind !== 'match') {
+      return Promise.reject(new GeneUnavailableError(geneKey, outcome, list.failure));
     }
-    return selectGene(entry.originalIdx);
+    return selectGene(geneFieldList[outcome.position].originalIdx);
   }
 
   async function clearGeneSelection() {
@@ -786,6 +942,8 @@ export function initGeneExpressionSelector(options) {
 
   function clearLocalSelectionUI() {
     assertAlive();
+    // A gene being chosen stays named until its choice ends.
+    if (choiceUnderWay() >= 0) return;
     selectedGeneOriginalIdx = -1;
     geneSearch.value = '';
     updateGeneActionButtons();
@@ -812,13 +970,11 @@ export function initGeneExpressionSelector(options) {
       await selectGene(result.newFieldIndex);
       notifications.complete(
         notificationId,
-        `Created "${result.newKey}"`
+        `Created "${result.newKey}"`,
+        { announce: true }
       );
     } catch (error) {
-      if (
-        isDatasetFieldLoadSupersededError(error)
-        || isFieldInteractionSupersededError(error)
-      ) {
+      if (isCancellation(error)) {
         notifications.dismiss(notificationId);
         return;
       }
@@ -901,17 +1057,28 @@ export function initGeneExpressionSelector(options) {
       return;
     }
     if (event.key !== 'Enter') return;
-    // Enter chooses the active option; with none active it chooses the best
-    // match for what was typed, which the list puts first
-    // (`rankedMatchIndices`: the gene itself, then names starting with it).
-    // The match itself, built or not (the list may be scrolled away from it).
-    const chosen = geneResults[Math.max(0, geneList.getActiveIndex())] ?? null;
-    if (chosen === null) return;
     event.preventDefault?.();
-    reportGeneSelectionFailure(
-      selectGene(chosen.originalIdx),
-      chosen.field.key
-    );
+    // Enter chooses the active option; with none active, the best match for
+    // what is typed (`rankGeneMatches`: the gene itself, then names starting
+    // with it), read from the box itself, so a paste or a value set without
+    // a keystroke chooses what it says. A name that chooses nothing is said.
+    const active = geneList.getActiveIndex();
+    if (active >= 0 && geneResults[active] !== undefined) {
+      const entry = geneResults[active];
+      reportGeneSelectionFailure(selectGene(entry.originalIdx), entry.field.key);
+      return;
+    }
+    const query = geneSearch.value;
+    const list = geneListForLookup();
+    const outcome = resolveTypedGene(query, { loweredKeys: geneSearchKeys, ...list });
+    if (outcome.kind === 'empty') return;
+    if (outcome.kind !== 'match') {
+      if (geneDropdown.hidden) showGeneDropdown();
+      geneSearchStatus.textContent = describeUnavailableGene(query, outcome, list.failure);
+      return;
+    }
+    const entry = geneFieldList[outcome.position];
+    reportGeneSelectionFailure(selectGene(entry.originalIdx), entry.field.key);
   }, { signal: lifecycle.signal });
   geneSearch.addEventListener('blur', () => {
     if (selectedGeneOriginalIdx < 0 || geneSearch.value.length > 0) return;

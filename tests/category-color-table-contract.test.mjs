@@ -4,6 +4,7 @@ import test from 'node:test';
 import { DataStateColorMethods } from '../assets/js/app/state/managers/color-manager.js';
 import { requireCategoryCodesInInventory } from '../assets/js/app/state/managers/category-codes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../assets/js/app/state/core/constants.js';
+import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
 test('category codes are proven per array and category count', () => {
   const codes = Uint8Array.from([0, 2, 255, 1]);
@@ -22,23 +23,24 @@ test('category codes are proven per array and category count', () => {
   );
 });
 
+// Every color is opaque: a hidden category is hidden by the transparency
+// (`computeGlobalVisibility`), never by the colors.
 function referenceColors(field, n, missingCode) {
   const colors = new Uint8Array(n * 4);
   for (let i = 0; i < n; i++) {
     const code = field.codes[i];
     let rgb;
-    let alpha;
+    let layer = 255;
     if (code === missingCode) {
       rgb = [NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8];
-      alpha = 1;
-    } else if (!field._categoryVisible[code]) {
+      // A missing value's grey is drawn beneath the categorized cells.
+      layer = 254;
+    } else if (field._categoryVisible[code] === 0) {
       rgb = [128, 128, 128];
-      alpha = 0;
     } else {
-      rgb = field._categoryColors[code].map(c => Math.round(c * 255));
-      alpha = 1;
+      rgb = Array.from(field._categoryColors.subarray(code * 3, code * 3 + 3));
     }
-    colors.set([...rgb, Math.round(alpha * 255)], i * 4);
+    colors.set([...rgb, layer], i * 4);
   }
   return { colors };
 }
@@ -56,10 +58,10 @@ for (const [Codes, missingCode] of [
       kind: 'category',
       categories: ['a', 'b', 'c', 'd', 'e'],
       codes,
-      _categoryColors: [
+      _categoryColors: colorsOf([
         [0.1, 0.2, 0.3], [0.9, 0.05, 0.5], [0.333, 0.666, 0.999], [0, 0, 0], [1, 1, 1],
-      ],
-      _categoryVisible: [true, false, true, true, false],
+      ]),
+      _categoryVisible: visibleOf([true, false, true, true, false]),
     };
     const buffer = new ArrayBuffer(n * 4 + 1);
     const state = {

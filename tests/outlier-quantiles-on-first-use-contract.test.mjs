@@ -28,6 +28,7 @@ function categorical(key, fieldIndex, path) {
     codesDtype: 'uint8',
     codesMissingValue: 255,
     palette: null,
+    discovered: false,
     outlierQuantilesPath: path,
   };
 }

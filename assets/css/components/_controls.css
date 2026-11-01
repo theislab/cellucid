@@ -372,14 +372,17 @@ input[type="checkbox"]:disabled,
 
 /* An option row reaches a fingertip like a boxed control: drawn
    --control-row-min tall, with the same --control-hit-extend above and below
-   (the boxed controls' rule is in _buttons.css). */
+   (the boxed controls' rule is in _buttons.css). The line linking to Genes
+   read for is one too. */
 .checkbox-inline,
-.switch {
+.switch,
+.gene-read-link {
   position: relative;
 }
 
 .checkbox-inline::after,
-.switch::after {
+.switch::after,
+.gene-read-link::after {
   content: '';
   position: absolute;
   inset: calc(-1 * var(--control-hit-extend)) 0;
@@ -591,6 +594,59 @@ input[type="checkbox"]:disabled,
   font-variant-numeric: tabular-nums;
   text-align: right;
   color: var(--color-text-secondary);
+}
+
+/* A readout the user can also type (an exact share): a narrow text box with
+   a decimal keyboard in place of the text readout (a decimal point or comma,
+   as the person writes it: `parseDecimalText`), and an optional unit after it. */
+.slider-row > .slider-number {
+  flex: none;
+  width: calc(7ch + 2 * var(--control-padding-x));
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.slider-unit {
+  flex: none;
+  font-size: var(--type-readout);
+  color: var(--color-text-secondary);
+}
+
+/* A line naming the cells genes are read for, as a link to Session › Open
+   data: Genes read for (`gene-read-control.js` `createGeneReadNote`): the
+   gene's legend and an analysis's result. One line, never wrapped; its (i)
+   holds the exact numbers. */
+.gene-read-note[hidden] {
+  display: none;
+}
+
+.gene-read-note-row {
+  min-width: 0;
+}
+
+.gene-read-link {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  /* An option row's height and hit area (below), so a finger reaches it. */
+  min-height: var(--control-row-min);
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-sans);
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-link);
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 2px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.gene-read-link:hover {
+  text-decoration-color: currentColor;
 }
 
 /* ------------------------------------------------------------------------
@@ -856,6 +912,143 @@ input[type="checkbox"]:disabled,
   padding: var(--space-1) 0 0;
   background: transparent;
   border-top: 0;
+}
+
+/* Details: the facts behind a short summary (the Dataset box, Cells to
+   open), folded under a quiet "Details" header ruled off from the summary,
+   in a compact table of label and value (`renderFactList`). */
+.details-disclosure {
+  margin-top: var(--space-0-5);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.details-disclosure > .disclosure-header {
+  padding-block: var(--space-1);
+}
+
+.details-disclosure > .disclosure-header > .disclosure-title {
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+/* Label and value side by side; a long value (a citation, an address)
+   wraps under itself. */
+.fact-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+  margin: 0;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+}
+
+.fact-list > dt {
+  color: var(--color-text-tertiary);
+}
+
+.fact-list > dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* A value with more behind it (its tooltip) is marked as such. */
+.fact-list > dd[title] {
+  text-decoration: underline dotted var(--color-border-default);
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+/* A value of several facts (what was not read) takes the whole width under
+   its label, each fact on its own line. */
+.fact-list > .fact-list-wide {
+  grid-column: 1 / -1;
+}
+
+.fact-list > dd > div + div {
+  margin-top: var(--space-0-5);
+}
+
+.fact-list a {
+  color: var(--color-text-link);
+  text-decoration: none;
+}
+
+.fact-list a:hover {
+  color: var(--color-text-link-hover);
+  text-decoration: underline;
+}
+
+/* A row of a list box chosen for an action (Remove selected): checkbox,
+   name with a figure at the right, and a line of facts under the name. */
+.select-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-height: max(var(--control-list-row-height), var(--control-target-min));
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.select-item:hover {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.select-item:has(> input:disabled) {
+  cursor: default;
+  background: var(--color-surface-tertiary);
+}
+
+.select-item > input[type="checkbox"] {
+  flex: none;
+  margin: var(--space-0-5) 0 0;
+}
+
+.select-item-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  flex: 1;
+  min-width: 0;
+}
+
+.select-item-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.select-item-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-control);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.select-item-size {
+  flex: none;
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+}
+
+.select-item-meta {
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
 }
 
 /* ------------------------------------------------------------------------

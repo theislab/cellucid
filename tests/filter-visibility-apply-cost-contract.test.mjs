@@ -14,6 +14,7 @@ import {
 import {
   DataStateViewMethods,
 } from '../assets/js/app/state/managers/view-manager.js';
+import { visibleOf } from './helpers/category-state.mjs';
 
 /**
  * Cost contract for `computeGlobalVisibility`.
@@ -71,7 +72,6 @@ function continuousState({ mask, values, filter }) {
     categoryTransparency: new Uint8Array(pointCount).fill(1),
     cellVisibilityMask: Uint8Array.from(mask),
     colorsArray: new Uint8Array(pointCount * 4).fill(255),
-    _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     ensureContinuousMetadata:
       DataStateColorMethods.prototype.ensureContinuousMetadata,
     isOutlierFilterEnabledForActiveField: () => false,
@@ -132,7 +132,7 @@ function countingUint8(values) {
   return { counter, proxy };
 }
 
-test('the unfiltered publication is one pass: visibility, packed alpha and the shown count', () => {
+test('the unfiltered publication is one pass: visibility and the shown count, the colors untouched', () => {
   const mask = [1, 0, 1, 1, 0, 1, 1, 1];
   const pointCount = mask.length;
   const counted = countingUint8(mask);
@@ -190,7 +190,8 @@ test('the unfiltered publication is one pass: visibility, packed alpha and the s
   assert.deepEqual(Array.from(state.categoryTransparency), mask);
   assert.deepEqual(
     Array.from(state.colorsArray).filter((_, i) => i % 4 === 3),
-    mask.map(entry => entry * 255),
+    mask.map(() => 255),
+    'a filter never writes the colors: visibility is the transparency alone',
   );
   const shown = mask.filter(entry => entry === 1).length;
   assert.deepEqual(state.filteredCount, { shown, total: pointCount });
@@ -235,11 +236,9 @@ test('every mask and filter shape produces the identical published generation', 
         expected,
         `${maskName}/${filterName} transparency`,
       );
-      const expectedAlpha = expected.map(entry => entry * 255);
-      assert.deepEqual(
-        Array.from(state.colorsArray).filter((_, i) => i % 4 === 3),
-        expectedAlpha,
-        `${maskName}/${filterName} packed alpha`,
+      assert.ok(
+        Array.from(state.colorsArray).filter((_, i) => i % 4 === 3).every(alpha => alpha === 255),
+        `${maskName}/${filterName}: the colors carry no visibility`,
       );
     }
   }
@@ -290,10 +289,9 @@ function categoryFilterState(pointCount, codes, hidden) {
     kind: 'category',
     categories: ['a', 'b', 'c'],
     codes: Uint8Array.from(codes),
-    _categoryVisible: [true, true, true],
+    _categoryVisible: visibleOf([0, 1, 2].map(index => !hidden.includes(index))),
     _categoryFilterEnabled: true,
   };
-  for (const index of hidden) field._categoryVisible[index] = false;
   const state = Object.assign(Object.create(DataStateFilterMethods.prototype), {
     pointCount,
     obsData: { fields: [field] },
@@ -337,18 +335,17 @@ test('a view with the same filters as a kept view adopts its visibility instead 
 
   // The same filters reached by another route (a session view's replay
   // rebuilds the per-code tables): adopted from the kept view, by copy.
-  field._categoryVisible = [true, false, true];
+  const colorsBefore = state.colorsArray;
+  field._categoryVisible = visibleOf([true, false, true]);
   state.computeGlobalVisibility();
   assert.notEqual(state.categoryTransparency, kept);
   assert.deepEqual(Array.from(state.categoryTransparency), expected);
-  assert.deepEqual(
-    Array.from(state.colorsArray).filter((_, i) => i % 4 === 3),
-    expected.map(entry => entry * 255),
-  );
+  assert.equal(state.colorsArray, colorsBefore, 'the colors are neither copied nor written');
+  assert.ok(Array.from(state.colorsArray).every(byte => byte === 255));
   assert.deepEqual(state.filteredCount, { shown: 5, total: pointCount });
 
   // Different filters compute, and leave the kept view's array untouched.
-  field._categoryVisible = [false, true, true];
+  field._categoryVisible = visibleOf([false, true, true]);
   state.computeGlobalVisibility();
   assert.deepEqual(Array.from(state.categoryTransparency), [0, 1, 1, 0, 1, 1, 0, 1]);
   assert.deepEqual(Array.from(kept), expected);
@@ -365,7 +362,7 @@ test('a result is not adopted once its array was written again', () => {
   writableTransparencyOf(state);
   state.computeGlobalVisibility();
   assert.deepEqual(Array.from(state.categoryTransparency), [0, 1, 1, 0]);
-  assert.equal(field._categoryVisible[0], false);
+  assert.equal(field._categoryVisible[0], 0);
 });
 
 test('inside a batch the visibility pass runs once, at its end', () => {
@@ -382,7 +379,8 @@ test('inside a batch the visibility pass runs once, at its end', () => {
   });
   state.beginBatch();
   state.computeGlobalVisibility();
-  field._categoryVisible[2] = false;
+  // A change makes a new visibility array (`utils/category-state.js`).
+  field._categoryVisible = visibleOf([true, true, false]);
   state.computeGlobalVisibility();
   assert.equal(passes, 0);
   state.endBatch();

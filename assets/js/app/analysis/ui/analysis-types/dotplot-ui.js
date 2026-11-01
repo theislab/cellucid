@@ -16,7 +16,7 @@
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { dotplotOptions, DOTPLOT_DISPLAY_OPTIONS } from '../../options/dotplot-options.js';
-import { createGeneIndex, resolveGenes } from '../../shared/gene-sets.js';
+import { createGeneIndex, geneIdentities, notebookGeneSets, resolveGenes } from '../../shared/gene-sets.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { groupSummaryValues, scaleByGene } from '../../compute/group-expression-summary.js';
@@ -35,8 +35,34 @@ import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { createFieldGroups } from './field-groups.js';
 import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 import { dotplotMinimumWidth } from '../../plots/types/dotplot.js';
+import { maskReadFor } from '../../shared/gene-sample-cells.js';
+import { failureText } from '../../../../utils/errors.js';
 
 let groupSummaryRun = 0;
+
+/**
+ * The cells of a dot plot's groups that hold no value of a gene (a modality
+ * that did not measure them: NaN), left out of its means, shares and
+ * violins: how many genes have any, and the most cells one gene lacks.
+ *
+ * @param {{genes: string[], sizes: number[], measured: Uint32Array}} summary
+ * @returns {{genes: number, cells: number}}
+ */
+function unmeasuredCells(summary) {
+  const groupCount = summary.sizes.length;
+  const cells = summary.sizes.reduce((total, size) => total + size, 0);
+  let genes = 0;
+  let most = 0;
+  for (let gene = 0; gene < summary.genes.length; gene++) {
+    let measured = 0;
+    for (let group = 0; group < groupCount; group++) measured += summary.measured[gene * groupCount + group];
+    if (measured < cells) {
+      genes += 1;
+      most = Math.max(most, cells - measured);
+    }
+  }
+  return { genes, cells: most };
+}
 
 /**
  * Bins of each gene's distribution per group, for the stacked violin: as
@@ -54,6 +80,7 @@ function geneSummaryOf(summary, k) {
     sum: summary.sum.subarray(k * groupCount, (k + 1) * groupCount),
     expressing: summary.expressing.subarray(k * groupCount, (k + 1) * groupCount),
     sumExpressing: summary.sumExpressing.subarray(k * groupCount, (k + 1) * groupCount),
+    measured: summary.measured.subarray(k * groupCount, (k + 1) * groupCount),
     range: summary.range.subarray(2 * k, 2 * k + 2),
     histogram: summary.histogram.subarray(k * groupCount * bins, (k + 1) * groupCount * bins)
   };
@@ -96,25 +123,24 @@ export function dotplotGroupOrder(order, sizes, means, geneCount) {
  * @param {number} cellSizePx
  */
 export function dotplotPlotData(summary, display, cellSizePx) {
-  const { genes, geneSets, groups, sizes, sum, expressing, sumExpressing } = summary;
+  const { genes, geneSets, groups, sizes, sum, expressing, sumExpressing, measured } = summary;
   const geneCount = genes.length;
   const groupCount = groups.length;
-  const values = groupSummaryValues({
-    sum, expressing, sumExpressing, sizes: Uint32Array.from(sizes), geneCount, groupCount
-  });
+  const values = groupSummaryValues({ sum, expressing, sumExpressing, measured, geneCount, groupCount });
   const source = display.meanOnlyExpressing ? values.meanExpressing : values.mean;
   const color = scaleByGene(source, geneCount, groupCount, display.scale);
   const order = dotplotGroupOrder(display.groupOrder, sizes, values.mean, geneCount);
   // Each gene's distribution per group, in plot order, as fractions of the
-  // group's cells per bin.
+  // group's measured cells per bin.
   const bins = summary.bins;
   const density = new Float64Array(geneCount * groupCount * bins);
   for (let gene = 0; gene < geneCount; gene++) {
     order.forEach((group, position) => {
       const from = (gene * groupCount + group) * bins;
       const to = (gene * groupCount + position) * bins;
+      const n = measured[gene * groupCount + group];
       for (let bin = 0; bin < bins; bin++) {
-        density[to + bin] = sizes[group] > 0 ? summary.histogram[from + bin] / sizes[group] : 0;
+        density[to + bin] = n > 0 ? summary.histogram[from + bin] / n : 0;
       }
     });
   }
@@ -132,6 +158,7 @@ export function dotplotPlotData(summary, display, cellSizePx) {
     geneSets,
     groups: order.map(index => groups[index]),
     cellCounts: order.map(index => sizes[index]),
+    measured: reorder(measured),
     color: reorder(color),
     fraction: reorder(values.fraction),
     mean: reorder(source),
@@ -169,8 +196,13 @@ export class DotplotUI extends FormBasedAnalysisUI {
     this._fieldGroups = createFieldGroups({
       dataLayer: this.dataLayer,
       onReady: () => this._refreshOptionsContext(),
-      onError: error => this._notifications.error(`Dot plot groups: ${error.message}`, { category: 'analysis' })
+      onError: error => this._notifications.error(`Dot plot groups: ${failureText(error)}`, { category: 'analysis' })
     });
+  }
+
+  /** Another set of open cells: the categories' counts are counted again on them. @override */
+  _onOpenCellsChanged() {
+    this._fieldGroups.reset();
   }
 
   _getTitle() {
@@ -219,7 +251,9 @@ export class DotplotUI extends FormBasedAnalysisUI {
       pages: this.dataLayer.getPages().map(page => ({ id: page.id, name: page.name })),
       groupsFor: (_entry, record) => this._fieldGroups.groups(record.groupBy),
       getGenes: () => this._geneNames(),
+      getGeneIdentities: () => geneIdentities(this.dataLayer.state?.varData),
       getMarkerSets: () => this.comparisonModule.getUI('genesPanel').getMarkerGeneSets(),
+      getNotebookSets: () => notebookGeneSets(this.dataLayer.state),
       expressionMatrices: this.dataLayer.getExpressionMatrices()
     };
   }
@@ -228,7 +262,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
     if (options.groupBy === '') return 'Choose the field to group the cells by';
     const requested = options.geneSets.flatMap(set => set.genes);
     if (requested.length === 0) return 'Add the genes to plot';
-    this._geneIndex ??= createGeneIndex(this._geneNames());
+    this._geneIndex ??= createGeneIndex(this._geneNames(), geneIdentities(this.dataLayer.state?.varData));
     // Another matrix's genes are read when it runs: its "not found" chip
     // names those it lacks.
     if (options.matrix === 'mapped' && resolveGenes(requested, this._geneIndex).resolved.length === 0) {
@@ -271,19 +305,32 @@ export class DotplotUI extends FormBasedAnalysisUI {
   }
 
   _scopeMask(cells, cellCount) {
-    if (cells === 'all') return null;
-    if (cells === 'visible') return this.dataLayer.getVisibleCellMask();
+    // Genes are read for a sample of the open cells (`genes`): the scope is
+    // its cells among them (`shared/gene-sample-cells.js`).
+    const sample = this.dataLayer.state?.getGeneSample?.() ?? null;
+    if (cells === 'all') {
+      if (sample === null) return null;
+      const mask = new Uint8Array(cellCount);
+      mask.fill(1, 0, sample.cells);
+      return mask;
+    }
+    if (cells === 'visible') return maskReadFor(this.dataLayer.getVisibleCellMask(), sample);
     if (!cells.startsWith('page:')) throw new RangeError(`Unknown cell scope "${cells}"`);
     const mask = new Uint8Array(cellCount);
     for (const index of this.dataLayer.getCellIndicesForPage(cells.slice('page:'.length))) mask[index] = 1;
-    return mask;
+    return maskReadFor(mask, sample);
   }
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     const signal = job.signal;
     // Genes: each set's genes as the dataset names them, in order; a gene in
     // two sets is a column in each, as in scanpy.
-    this._geneIndex ??= createGeneIndex(this._geneNames());
+    this._geneIndex ??= createGeneIndex(this._geneNames(), geneIdentities(this.dataLayer.state?.varData));
     // Another matrix's genes, named on its own axis (raw has its own).
     const geneIndex = options.matrix === 'mapped'
       ? this._geneIndex
@@ -294,10 +341,13 @@ export class DotplotUI extends FormBasedAnalysisUI {
     const unmatched = [];
     for (const set of options.geneSets) {
       const resolution = resolveGenes(set.genes, geneIndex);
-      unmatched.push(...resolution.unmatched, ...resolution.ambiguous.map(entry => entry.requested));
+      // Appended one at a time: a pasted gene set as long as a genome's
+      // gene list, spread as arguments, would exceed the call stack.
+      for (const gene of resolution.unmatched) unmatched.push(gene);
+      for (const entry of resolution.ambiguous) unmatched.push(entry.requested);
       if (resolution.resolved.length === 0) continue;
       geneSets.push({ name: set.name, start: genes.length, end: genes.length + resolution.resolved.length });
-      genes.push(...resolution.resolved);
+      for (const gene of resolution.resolved) genes.push(gene);
     }
     const uniqueGenes = [...new Set(genes)];
     if (uniqueGenes.length === 0) {
@@ -318,7 +368,8 @@ export class DotplotUI extends FormBasedAnalysisUI {
       groups.push(name);
     });
     const cellCount = field.codes.length;
-    const scope = this._scopeMask(options.cells, cellCount);
+    // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
+    const scope = sample === null ? this._scopeMask(options.cells, cellCount) : sample.mask(this._scopeMask(options.cells, cellCount));
     const cellGroup = groups.length <= 0x7fff ? new Int16Array(cellCount) : new Int32Array(cellCount);
     const missing = missingCategoryCode(field.codes);
     for (let cell = 0; cell < cellCount; cell++) {
@@ -342,7 +393,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
       await computeManager.broadcast(
         OperationType.GROUP_SUMMARY_SET_CONTEXT,
         () => ({ contextId, cellGroup: cellGroup.slice(), groupCount: groups.length }),
-        { timeout: 120000, signal, retainAs: contextId }
+        { signal, retainAs: contextId }
       );
       job.step('Reading genes');
       const backend = computeManager.selectBackend(OperationType.GROUP_SUMMARY_COMPUTE_GENES);
@@ -367,7 +418,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
         dispatch: (task, onTiming) => computeManager.execute(
           OperationType.GROUP_SUMMARY_COMPUTE_GENES,
           { contextId, ...taskGenes(task), cutoff: options.cutoff, bins: VIOLIN_BINS },
-          { ...(task.worker === null ? { backend } : { backend, worker: task.worker }), transfer: true, signal, timeout: 120000, onTiming }
+          { ...(task.worker === null ? { backend } : { backend, worker: task.worker }), transfer: true, signal, onTiming }
         ),
         onResult: (task, summary) => {
           task.genes.forEach((gene, k) => geneSums.set(gene, geneSummaryOf(summary, k)));
@@ -392,11 +443,13 @@ export class DotplotUI extends FormBasedAnalysisUI {
     const sum = new Float64Array(genes.length * groupCount);
     const expressing = new Uint32Array(genes.length * groupCount);
     const sumExpressing = new Float64Array(genes.length * groupCount);
+    const measured = new Uint32Array(genes.length * groupCount);
     genes.forEach((gene, row) => {
       const part = geneSums.get(gene);
       sum.set(part.sum, row * groupCount);
       expressing.set(part.expressing, row * groupCount);
       sumExpressing.set(part.sumExpressing, row * groupCount);
+      measured.set(part.measured, row * groupCount);
     });
     // Leave out the groups with no cells in scope.
     const keep = groups.map((_, index) => index).filter(index => sizes[index] > 0);
@@ -435,6 +488,9 @@ export class DotplotUI extends FormBasedAnalysisUI {
       sum: pick(sum, Float64Array),
       expressing: pick(expressing, Uint32Array),
       sumExpressing: pick(sumExpressing, Float64Array),
+      // Each gene's cells with a value per group: a cell a modality did not
+      // measure (NaN) is out of the gene's mean, share and violin.
+      measured: pick(measured, Uint32Array),
       unmatched: [...new Set(unmatched)]
     };
     return {
@@ -480,14 +536,24 @@ export class DotplotUI extends FormBasedAnalysisUI {
       `${formatCountOf(summary.sizes.reduce((total, size) => total + size, 0), 'cell')}`
     ].join(' · ');
     header.appendChild(line);
-    if (summary.unmatched.length > 0) {
+    const unmeasured = unmeasuredCells(summary);
+    if (summary.unmatched.length > 0 || unmeasured.genes > 0) {
       const row = document.createElement('div');
       row.className = 'analysis-chip-row';
-      const chip = document.createElement('span');
-      chip.className = 'analysis-chip analysis-chip-warning';
-      chip.textContent = `${formatCount(summary.unmatched.length)} not found`;
-      chip.title = `Not in this dataset, left out: ${summary.unmatched.join(', ')}`;
-      row.appendChild(chip);
+      if (summary.unmatched.length > 0) {
+        const chip = document.createElement('span');
+        chip.className = 'analysis-chip analysis-chip-warning';
+        chip.textContent = `${formatCount(summary.unmatched.length)} not found`;
+        chip.title = `Not in this dataset, left out: ${summary.unmatched.join(', ')}`;
+        row.appendChild(chip);
+      }
+      if (unmeasured.genes > 0) {
+        const chip = document.createElement('span');
+        chip.className = 'analysis-chip analysis-chip-info';
+        chip.textContent = 'cells without a value left out';
+        chip.title = `Cells without a value (not measured) of ${formatCountOf(unmeasured.genes, 'gene')}, up to ${formatCountOf(unmeasured.cells, 'cell')} a gene: they are left out of the means, the shares expressing and the violins, as differential expression leaves them out. Hover a dot for its group's cells with a value.`;
+        row.appendChild(chip);
+      }
       header.appendChild(row);
     }
     container.prepend(header);
@@ -521,6 +587,10 @@ export class DotplotUI extends FormBasedAnalysisUI {
       ['Cells', formatCount(summary.sizes.reduce((total, size) => total + size, 0))],
       ['Expressed above', String(summary.cutoff)]
     ];
+    const unmeasured = unmeasuredCells(summary);
+    if (unmeasured.genes > 0) {
+      rows.push(['Cells without a value (left out)', `${formatCountOf(unmeasured.genes, 'gene')}, up to ${formatCountOf(unmeasured.cells, 'cell')} each`]);
+    }
     if (summary.unmatched.length > 0) rows.push(['Not found', summary.unmatched.join(', ')]);
     container.innerHTML = `<table class="analysis-stats-table">${rows.map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td><strong>${escapeHtml(value)}</strong></td></tr>`).join('')}</table>`;
   }
@@ -567,7 +637,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
 
   // ---------------------------------------------------------------- Sessions
 
-  exportResult() {
+  _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('dotplot', this._lastResult);
   }
@@ -585,6 +655,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
       summary === null || typeof summary !== 'object' ||
       !(summary.sum instanceof Float64Array) ||
       !(summary.expressing instanceof Uint32Array) ||
+      !(summary.measured instanceof Uint32Array) || summary.measured.length !== summary.expressing.length ||
       !(summary.histogram instanceof Uint32Array) ||
       !Array.isArray(summary.genes) ||
       typeof summary.matrix !== 'string' || typeof summary.matrixLabel !== 'string'

@@ -64,6 +64,7 @@ const contentTypes = new Map([
   ['.png', 'image/png'],
   ['.svg', 'image/svg+xml'],
   ['.txt', 'text/plain; charset=utf-8'],
+  ['.wasm', 'application/wasm'],
   ['.webmanifest', 'application/manifest+json; charset=utf-8'],
   ['.webp', 'image/webp'],
   ['.woff', 'font/woff'],

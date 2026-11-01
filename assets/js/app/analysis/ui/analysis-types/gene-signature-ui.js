@@ -29,8 +29,10 @@ import {
   requireDatasetPages
 } from '../../shared/analysis-result-session.js';
 import { SIGNATURE_DISPLAY_KEYS, SIGNATURE_OPTIONS } from '../../options/signature-options.js';
-import { createGeneIndex, resolveGenes } from '../../shared/gene-sets.js';
+import { createGeneIndex, geneIdentities, notebookGeneSets, resolveGenes } from '../../shared/gene-sets.js';
 import { writePerCellCSV } from '../base-analysis-ui.js';
+import { cellsReadFor } from '../../shared/gene-sample-cells.js';
+import { failureText } from '../../../../utils/errors.js';
 
 const METHOD_LABELS = Object.freeze({
   mean: 'mean',
@@ -88,10 +90,12 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   _getOptionsContext() {
     return {
       getGenes: () => this._geneNames(),
+      getGeneIdentities: () => geneIdentities(this.dataLayer.state?.varData),
       getMarkerSets: () => {
         const sets = this.comparisonModule?.getUIManager?.()?.getUI?.('genesPanel')?.getMarkerGeneSets?.() ?? [];
         return sets.length > 0 ? sets : null;
-      }
+      },
+      getNotebookSets: () => notebookGeneSets(this.dataLayer.state)
     };
   }
 
@@ -105,7 +109,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     if (this._geneIndexOf !== variables) {
       this._geneIndexOf = variables;
       this._names = variables.map(variable => variable.key);
-      this._geneIndex = createGeneIndex(this._names);
+      this._geneIndex = createGeneIndex(this._names, geneIdentities(this.dataLayer.state?.varData));
     }
     return this._names;
   }
@@ -160,8 +164,14 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   // Run
   // ===========================================================================
 
-  async _runAnalysisImpl(options, requestId, job) {
-    const pageIds = [...this._selectedPages];
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
+    // A first pass scores each page's cells in the sample.
+    const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
     const resolution = this._resolveSets(options.geneSets);
     const scored = resolution.filter(set => set.resolved.length > 0);
     const result = await this.multiVariableAnalysis.computeSignatureScore({
@@ -187,7 +197,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         constantGenes: set.constantGenes,
         unmatched: [...resolved.unmatched, ...resolved.ambiguous.map(entry => entry.requested)],
         pages: set.pages.map(page => ({
-          pageId: page.pageId,
+          pageId: sample === null ? page.pageId : sample.basePageId(page.pageId),
           pageName: page.pageName,
           scores: page.scores,
           cellIndices: page.cellIndices
@@ -198,7 +208,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     const unscored = resolution
       .filter(set => set.resolved.length === 0)
       .map(set => ({ name: set.name, unmatched: [...set.unmatched, ...set.ambiguous.map(entry => entry.requested)] }));
-    const built = await this._buildResult({ sets, unscored, method: options.method }, options);
+    // Genes read for a sample of the open cells: each page was scored on its
+    // cells among them (`cellIndices`), and the result keeps which.
+    const built = await this._buildResult({ sets, unscored, method: options.method, geneSample: result.geneSample ?? null }, options);
     return this._isCurrentAnalysisRequest(requestId) ? built : null;
   }
 
@@ -233,6 +245,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       plotType,
       data,
       raw,
+      geneSample: raw.geneSample ?? null,
       options: { showPoints: 'outliers', showMean: true },
       title: 'Gene signature',
       subtitle: raw.sets.length === 1
@@ -381,10 +394,10 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         values: page.scores,
         cellIndices: page.cellIndices
       })));
-      const csv = await writePerCellCSV('signature-scores', pages);
+      const csv = await writePerCellCSV('signature-scores', pages, undefined, this.dataLayer.state.cellIdentity);
       downloadCSV(csv, 'gene_signature_scores', this._notifications);
     } catch (err) {
-      this._notifications.error(`CSV export failed: ${err.message}`, { category: 'download' });
+      this._notifications.error(`CSV export failed: ${failureText(err)}`, { category: 'download' });
     }
   }
 
@@ -423,11 +436,54 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   }
 
   /**
+   * The shown result's scores and sets reach the dataset's derived results
+   * (and from there a notebook): one score per set over every scored cell
+   * (a cell in two pages has one score), and each set's genes as scored.
+   */
+  _publishDerivedResults(result) {
+    const state = this.dataLayer?.state;
+    if (state === null || state === undefined) return;
+    const registry = state.getDerivedResults();
+    const raw = result?.raw;
+    if (!raw) {
+      registry.replaceOwned('signature', {});
+      return;
+    }
+    const pointCount = state.pointCount;
+    const scores = raw.sets.map(set => {
+      const byCell = new Float32Array(pointCount).fill(NaN);
+      const scored = new Uint8Array(pointCount);
+      let count = 0;
+      for (const page of set.pages) {
+        for (let index = 0; index < page.cellIndices.length; index++) {
+          const cell = page.cellIndices[index];
+          if (scored[cell] === 1) continue;
+          scored[cell] = 1;
+          byCell[cell] = page.scores[index];
+          count++;
+        }
+      }
+      const cells = new Uint32Array(count);
+      const values = new Float32Array(count);
+      let at = 0;
+      for (let cell = 0; cell < pointCount; cell++) {
+        if (scored[cell] === 1) {
+          cells[at] = cell;
+          values[at++] = byCell[cell];
+        }
+      }
+      return { key: `${set.name} score`, cells, values };
+    });
+    const geneSets = raw.sets.map(set => ({ name: set.name, description: 'Gene signature', genes: [...set.genes] }));
+    registry.replaceOwned('signature', { geneSets, scores });
+  }
+
+  /**
    * The shown result for a session: every set's raw scores per page (typed
    * columns), its genes, controls and genes not found.
    * @returns {null|{kind: 'signature', version: number, payload: unknown}}
    */
-  exportResult() {
+  _exportResult() {
     const raw = this._lastResult?.raw;
     if (!raw) return null;
     return createResultEnvelope('signature', raw);
@@ -442,19 +498,35 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     if (!Array.isArray(raw?.sets) || !Array.isArray(raw.unscored) || typeof raw.method !== 'string') {
       throw new TypeError('A gene signature result must hold its sets');
     }
+    // The gene sample the pages were scored on (`computeSignatureScore`):
+    // each page's cells among the first `cells` open cells; null when every
+    // open cell's genes were read.
+    const geneSample = raw.geneSample ?? null;
+    if (geneSample !== null && (typeof geneSample !== 'object' || !Number.isSafeInteger(geneSample.cells) || geneSample.cells < 1
+      || !Number.isSafeInteger(geneSample.of) || geneSample.of < geneSample.cells || !Array.isArray(geneSample.groups))) {
+      throw new TypeError('A gene signature result\'s gene sample must name its cells, of how many, and its groups');
+    }
     for (const set of raw.sets) {
       await requireDatasetGenes(this.dataLayer, [...set.genes, ...set.controlGenes], 'The gene signature result');
       requireDatasetPages(this.dataLayer, set.pages.map(page => page?.pageId), 'The gene signature result');
       for (const page of set.pages) {
-        if (!ArrayBuffer.isView(page.scores)) {
-          throw new TypeError(`Gene signature scores of "${page.pageId}" must be a typed array`);
+        if (!ArrayBuffer.isView(page.scores) || !ArrayBuffer.isView(page.cellIndices)) {
+          throw new TypeError(`Gene signature scores of "${page.pageId}" and their cells must be typed arrays`);
         }
-        const cellCount = this.dataLayer.getCellCountForPageId(page.pageId);
-        if (page.scores.length !== cellCount) {
+        // The cells it was scored on: the page's, or those of them genes were read for.
+        const [asked] = this.dataLayer.getPageCells([page.pageId]);
+        const cells = cellsReadFor(asked.cellIndices, geneSample);
+        const among = geneSample === null ? '' : ` among the first ${formatCountOf(geneSample.cells, 'open cell')}, those genes were read for`;
+        if (page.scores.length !== cells.length || page.cellIndices.length !== cells.length) {
           throw new RangeError(
             `Gene signature result holds ${page.scores.length} scores for cell group ` +
-            `"${page.pageId}", which now has ${formatCountOf(cellCount, 'cell')}`
+            `"${page.pageId}", which now has ${formatCountOf(cells.length, 'cell')}${among}`
           );
+        }
+        for (let index = 0; index < cells.length; index++) {
+          if (page.cellIndices[index] !== cells[index]) {
+            throw new RangeError(`Gene signature result scored other cells of cell group "${page.pageId}" than it holds now${among}`);
+          }
         }
       }
     }

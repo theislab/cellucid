@@ -13,6 +13,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openPhoneSheet } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -24,6 +25,10 @@ async function openDataset(page) {
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
+  // A phone starts with the plot and the panel's peek bar: these specs
+  // measure the panel open, then closed, then open again.
+  await openPhoneSheet(page);
+  await sidebarSettled(page);
 }
 
 /** Wait until the sidebar's open or close slide has finished. */
@@ -33,8 +38,18 @@ async function sidebarSettled(page) {
   )).toBe(0);
 }
 
+/**
+ * The control that opens or closes the panel now: on a phone with the panel
+ * closed, its peek bar at the foot of the screen; else the sidebar toggle.
+ */
+async function panelControl(page) {
+  return (await page.locator('#phone-sheet-bar').isVisible())
+    ? page.locator('#phone-sheet-bar')
+    : page.locator('#sidebar-toggle');
+}
+
 async function toggleSidebar(page, { hidden }) {
-  await page.locator('#sidebar-toggle').tap();
+  await (await panelControl(page)).tap();
   const sidebar = page.locator('#sidebar');
   if (hidden) await expect(sidebar).toHaveClass(/\bhidden\b/);
   else await expect(sidebar).not.toHaveClass(/\bhidden\b/);
@@ -58,7 +73,11 @@ function measure(page) {
     };
     const canvas = document.getElementById('glcanvas');
     const sidebar = document.getElementById('sidebar');
-    const toggle = document.getElementById('sidebar-toggle');
+    // The control that reopens a closed panel on a phone is its peek bar.
+    const bar = document.getElementById('phone-sheet-bar');
+    const toggle = bar !== null && getComputedStyle(bar).display !== 'none'
+      ? bar
+      : document.getElementById('sidebar-toggle');
     const scroll = sidebar.querySelector('.sidebar-scroll');
     const toggleBox = toggle.getBoundingClientRect();
     const hit = document.elementFromPoint(
@@ -170,7 +189,12 @@ for (const phone of [
           expect(geometry.sidebar.right, 'the closed sheet is off screen')
             .toBeLessThanOrEqual(0);
           expect(geometry.plotAtCentre).toBe(true);
-          expect(geometry.toggle).toMatchObject({ left: 0, top: 0 });
+          // Closed, the sheet is its peek bar along the foot of the screen.
+          expect(geometry.toggle).toMatchObject({
+            left: 0,
+            right: geometry.viewport.width,
+            bottom: geometry.viewport.height,
+          });
           continue;
         }
 

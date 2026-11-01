@@ -22,6 +22,7 @@
 
 import { crc32 } from '../zip/crc32.js';
 import { RdsFormatError, RdsUnsupportedError } from './errors.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 function damaged(message) {
   return new RdsFormatError(`The xz stream is damaged: ${message}.`);
@@ -421,7 +422,7 @@ async function* decodeLzma2(input, lzma, signal) {
   const out = [];
   const emit = bytes => out.push(bytes);
   for (;;) {
-    if (signal?.aborted) throw signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
+    throwIfAborted(signal);
     await input.ensure(1);
     const control = input.byte();
     if (control === 0x00) return;

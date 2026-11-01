@@ -17,7 +17,6 @@ import { BasePlot } from '../assets/js/app/analysis/plots/plot-base.js';
 import { LayoutEngine } from '../assets/js/app/analysis/plots/layout-engine.js';
 import geneHeatmapDefinition from '../assets/js/app/analysis/plots/types/gene-heatmap.js';
 import { waitForAvailableSlot } from '../assets/js/app/analysis/shared/concurrency-utils.js';
-import { MemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
 import { cleanupAnalysisResources } from '../assets/js/app/analysis/shared/resource-cleanup.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import { createRunTuner } from '../assets/js/app/analysis/shared/run-tuner.js';
@@ -47,7 +46,6 @@ test('analysis fallback, retry, coercion, and compatibility shims are absent fro
     'shared/concurrency-utils.js',
     'shared/dom-utils.js',
     'shared/gene-stream-runner.js',
-    'shared/memory-monitor.js',
     'shared/plot-theme.js',
     'shared/resource-cleanup.js',
     'ui/analysis-types/de-analysis-ui.js',
@@ -362,18 +360,6 @@ test('marker caches require one exact dataset identity', () => {
   }
 });
 
-test('unsupported heap measurement stays explicitly unavailable without guessed decisions', () => {
-  const monitor = new MemoryMonitor();
-  const usage = monitor.getMemoryUsage();
-  if (!usage.available) {
-    assert.equal(usage.usedJSHeapSize, null);
-    assert.equal(usage.totalJSHeapSize, null);
-    assert.equal(usage.jsHeapSizeLimit, null);
-  }
-  assert.equal(typeof monitor.checkBatchFeasibility, 'undefined');
-  assert.equal(typeof monitor.suggestBatchSize, 'undefined');
-});
-
 test('streaming gene loads and analysis cleanup preserve exact failures', async () => {
   const loadFailure = new Error('exact streamed gene load failure');
   await assert.rejects(
@@ -401,7 +387,6 @@ test('streaming gene loads and analysis cleanup preserve exact failures', async 
           throw cleanupFailure;
         }
       },
-      clearSourceCaches: false,
       dataLayerCleanup: 'expired',
     }),
     error => error === cleanupFailure,
@@ -447,6 +432,8 @@ test('gene signature median computes the exact per-cell median', async () => {
     async readGeneColumns(genes) {
       return genes.map(gene => columns[gene]);
     },
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({ pageId, pageName: 'Exact page', cellIndices }));
     },
@@ -491,6 +478,8 @@ test('gene signature scoring preserves prototype-named gene and page cross-produ
     async readGeneColumns(genes) {
       return genes.map(gene => columns.get(gene));
     },
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({
         pageId,
@@ -543,6 +532,8 @@ test('differential expression requires exact dataset and gene identities', async
   analysis.dataLayer = {
     state: { pointCount: 4 },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return [{ key: 'KNOWN_GENE', name: 'Known gene' }];

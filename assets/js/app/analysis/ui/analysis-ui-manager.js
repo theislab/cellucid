@@ -460,6 +460,16 @@ export class AnalysisUIManager {
     this._notifyInputChange('cell-visibility', ui => ui.onCellVisibilityChanged?.());
   }
 
+  /**
+   * The gene list was read after the first view: every built UI lists the
+   * genes it showed loading (`BaseAnalysisUI.onGenesListed`).
+   */
+  onGenesListed() {
+    for (const entry of this._uis.values()) {
+      entry.ui?.onGenesListed();
+    }
+  }
+
   /** @private */
   _notifyInputChange(kind, notifyActive) {
     for (const [id, entry] of this._uis) {

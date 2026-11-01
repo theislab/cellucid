@@ -34,8 +34,14 @@
  * @module workers/worker-script
  */
 
-/** Host names of this machine, as `URL.hostname` spells them. */
-const THIS_MACHINE = new Set(['localhost', '127.0.0.1', '[::1]']);
+/**
+ * Host names of this machine, as `URL.hostname` spells them. The page's own
+ * code follows the same rule (index.html's boot script, written from this set
+ * by `scripts/generate-web-asset-inventory.mjs`): sources here, the page
+ * bundle (`assets/page/`) anywhere else.
+ */
+export const THIS_MACHINE_HOSTS = Object.freeze(['localhost', '127.0.0.1', '[::1]']);
+const THIS_MACHINE = new Set(THIS_MACHINE_HOSTS);
 
 /**
  * Whether workers start from their bundles here: anywhere but this machine.

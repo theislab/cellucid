@@ -133,6 +133,7 @@ function fieldList(field) {
       codesDtype: 'uint8',
       codesMissingValue: 255,
       palette: null,
+      discovered: false,
       outlierQuantilesPath: null,
       ...field,
     }],

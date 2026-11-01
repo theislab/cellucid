@@ -2,24 +2,24 @@
  * Code-load failure watch (classic script, runs before the module graph).
  *
  * The application is one ES-module graph rooted at `main.js`, and every
- * startup failure surface lives inside that graph. The browser abandons the
- * whole graph when one of its modules fails to download (a dropped
- * connection, a proxy refusal) and fires `error` on the module script
- * element. It also abandons it when one fails to parse, to link (an import of
- * an export its dependency does not have: the shape of files from two deploys
- * meeting in one page) or throws while it is evaluated; that is reported as
- * an uncaught error on the window, and nothing of the graph runs. Without
- * this watch the page shows its "Starting Cellucid" status forever in both.
+ * startup failure surface lives inside that graph. The page's boot script
+ * (index.html, CELLUCID_PAGE_BOOT) imports the graph's entry once the
+ * document is parsed: the sources on this machine, the page bundle anywhere
+ * else. The import fails when one of the graph's files fails to download (a
+ * dropped connection, a proxy refusal), to parse, to link (an import of an
+ * export its dependency does not have: the shape of files from two deploys
+ * meeting in one page), or when one throws while it is evaluated; nothing of
+ * the graph runs then. The boot script hands that failure here as a
+ * `cellucid-code-load-failed` event. Without this watch the page shows its
+ * "Starting Cellucid" status forever.
  *
  * This file is loaded directly from `index.html` (not bundled) and has no
- * dependencies, so it cannot share the failure of the graph it watches.
- * `error` on a script element does not bubble, so the listener captures it on
- * the window; it reports only module scripts of this origin. A module script
- * runs before DOMContentLoaded (none of the graph awaits at its top level),
- * and `main.js` marks the root `data-code-started` as its first statement: an
- * uncaught error while that mark is missing at DOMContentLoaded is the graph
- * failing to run. Errors of cross-origin scripts carry no error object and are
- * not counted.
+ * dependencies, so it cannot share the failure of the graph it watches. A
+ * file that did not download is told apart from code that could not run by
+ * the error the import rejects with: each engine rejects a failed fetch of a
+ * module with a TypeError whose message says the module did not load
+ * (`FETCH_FAILURE`); a parse or link failure is a SyntaxError, and any other
+ * error is the graph's own.
  *
  * It says so in the Open data status line and on the startup failure screen,
  * then asks the server which build it serves now: when that is not this
@@ -72,11 +72,12 @@
     },
   };
 
-  let failed = false;
-  let parsed = document.readyState !== 'loading';
-  let pendingRunFailure = null;
+  // Chromium: "Failed to fetch dynamically imported module: <url>"; Firefox:
+  // "error loading dynamically imported module: <url>"; WebKit: "Importing a
+  // module script failed."
+  const FETCH_FAILURE = /dynamically imported module|importing a module script failed/i;
 
-  const codeStarted = () => root.dataset.codeStarted === 'true';
+  let failed = false;
 
   function fail(kind, detail) {
     if (failed || root.dataset.codeLoadFailed === 'true') return;
@@ -126,31 +127,14 @@
     showFailureScreen(kind, message, detail);
   }
 
-  window.addEventListener('error', event => {
-    const target = event.target;
-    if (target instanceof HTMLScriptElement) {
-      if (
-        target.type === 'module' &&
-        new URL(target.src, document.baseURI).origin === location.origin
-      ) {
-        fail('download', `${target.src} did not download.`);
-      }
-      return;
+  window.addEventListener('cellucid-code-load-failed', event => {
+    const { entry, error } = event.detail ?? {};
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    if (error instanceof TypeError && FETCH_FAILURE.test(error.message)) {
+      fail('download', `A file of Cellucid's code (${entry} or one it imports) did not download. ${message}`);
+    } else {
+      fail('run', message);
     }
-    if (!(event instanceof ErrorEvent) || !(event.error instanceof Error)) return;
-    if (codeStarted()) return;
-    pendingRunFailure ??= [event.error.name, event.error.message].join(': ') +
-      (event.filename ? ` (${event.filename})` : '');
-    if (parsed) settleRunFailure();
-  }, true);
-
-  function settleRunFailure() {
-    if (pendingRunFailure !== null && !codeStarted()) fail('run', pendingRunFailure);
-  }
-
-  document.addEventListener('DOMContentLoaded', () => {
-    parsed = true;
-    settleRunFailure();
   });
 
   // The startup failure screen of app/startup-failure.js, which never loaded:

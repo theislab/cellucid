@@ -52,6 +52,7 @@ import {
   countHighlightedVisiblePoints,
 } from '../assets/js/app/ui/modules/figure-export/utils/selection-badge.js';
 import './helpers/figure-export-worker-in-process.mjs';
+import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
 const figureExportRoot = new URL(
   '../assets/js/app/ui/modules/figure-export/',
@@ -124,9 +125,9 @@ function categoryModel(overrides = {}) {
   return {
     kind: 'category',
     categories: ['B cell', 'T cell', 'Macrophage'],
-    colors: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    colors: colorsOf([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
     // `_categoryVisible` is a plain index->boolean map, not an array.
-    visible: { 0: true, 1: false, 2: true },
+    visible: visibleOf({ 0: true, 1: false, 2: true }),
     picker: [],
     counts: null,
     ...overrides,
@@ -293,7 +294,7 @@ test('a checked category that other filters leave without cells is marked hidden
   // On screen this row is disabled ("No cells available in this category
   // after other filters"): the figure draws none of its points either.
   const model = categoryModel({
-    visible: { 0: true, 1: true, 2: true },
+    visible: visibleOf({ 0: true, 1: true, 2: true }),
     counts: {
       available: [4, 0, 2],
       availableTotal: 6,
@@ -361,8 +362,8 @@ test('SVG and Canvas legends publish identical category text', () => {
 test('a narrow legend truncates the name, never the hidden marker', () => {
   const model = categoryModel({
     categories: ['Plasmacytoid dendritic cell', 'Erythroid progenitor'],
-    colors: [[1, 0, 0], [0, 1, 0]],
-    visible: { 0: true, 1: false },
+    colors: colorsOf([[1, 0, 0], [0, 1, 0]]),
+    visible: visibleOf({ 0: true, 1: false }),
   });
   const narrow = { x: 0, y: 0, width: 96, height: 200 };
 
@@ -437,7 +438,7 @@ test('a log colorbar whose domain is unusable still declares the scale', () => {
 
 test('legend sizing reserves room for the hidden marker', () => {
   const categories = ['Erythroid progenitor', 'B cell'];
-  const colors = [[1, 0, 0], [0, 1, 0]];
+  const colors = colorsOf([[1, 0, 0], [0, 1, 0]]);
   const dimensions = (visible) => computeSingleViewLayout({
     width: 800,
     height: 600,
@@ -450,9 +451,29 @@ test('legend sizing reserves room for the hidden marker', () => {
   }).legendRect.width;
 
   assert.ok(
-    dimensions({ 0: false, 1: true }) > dimensions({ 0: true, 1: true }),
+    dimensions(visibleOf([false, true])) > dimensions(visibleOf([true, true])),
     'a marked entry needs more width than the bare name'
   );
+});
+
+test('a legend of a million categories is never larger than the plot it describes', () => {
+  const categories = Array.from({ length: 1_000_000 }, (_, i) => `bg ${i}`);
+  const colors = Array.from({ length: categories.length }, () => [0.2, 0.4, 0.6]);
+  const layout = position => computeSingleViewLayout({
+    width: 800,
+    height: 600,
+    title: '',
+    includeAxes: false,
+    includeLegend: true,
+    legendPosition: position,
+    legendModel: { kind: 'category', categories, colors },
+    legendFontSizePx: 12,
+  });
+  const right = layout('right');
+  assert.ok(right.legendRect.width <= right.plotRect.width, `legend ${right.legendRect.width} px wide`);
+  assert.ok(right.totalWidth <= 2 * right.plotRect.width + 200, `figure ${right.totalWidth} px wide`);
+  const bottom = layout('bottom');
+  assert.ok(bottom.legendRect.height <= bottom.plotRect.height, `legend ${bottom.legendRect.height} px tall`);
 });
 
 // ---------------------------------------------------------------------------
@@ -550,6 +571,7 @@ function gridView({ id, label, fieldKey, fieldKind, legendModel, filters = [] })
       lodMembership: null,
       drawOrder: null,
       lodSizeMultiplier: 1,
+      pointLayers: { readScale: 1, readEveryLevel: true },
       normTransform: { center: [0, 0, 0], scale: 1 },
     },
   };
@@ -613,8 +635,8 @@ function clusterModel() {
   return {
     kind: 'category',
     categories: ['T cell', 'B cell'],
-    colors: [[1, 0, 0], [0, 0, 1]],
-    visible: { 0: true, 1: true },
+    colors: colorsOf([[1, 0, 0], [0, 0, 1]]),
+    visible: visibleOf({ 0: true, 1: true }),
     picker: [],
     counts: null,
   };
@@ -624,8 +646,8 @@ function sampleModel() {
   return {
     kind: 'category',
     categories: ['Donor 1', 'Donor 2'],
-    colors: [[0, 1, 1], [1, 1, 0]],
-    visible: { 0: true, 1: true },
+    colors: colorsOf([[0, 1, 1], [1, 1, 0]]),
+    visible: visibleOf({ 0: true, 1: true }),
     picker: [],
     counts: null,
   };
@@ -768,7 +790,7 @@ test('a grid whose panels agree is still explained once, not four times', async 
     model: views[0].scientificState.legendModel,
   });
   const filtered = clusterModel();
-  filtered.visible = { 0: true, 1: false };
+  filtered.visible = visibleOf([true, false]);
   views[1].scientificState.legendModel = filtered;
   assert.equal(resolveSharedGridLegend(views), null);
 
@@ -1076,7 +1098,7 @@ test('SVG text from the data cannot carry characters XML forbids', async () => {
     fieldKey: 'cell\u0007type',
     model: categoryModel({
       categories: ['B\u0001cell <1>', 'T cell\uD800', 'Macro\u001Fphage'],
-      visible: { 0: true, 1: true, 2: true },
+      visible: visibleOf({ 0: true, 1: true, 2: true }),
     }),
   });
   const xmlForbidden =
@@ -1101,4 +1123,48 @@ test('SVG text from the data cannot carry characters XML forbids', async () => {
     assert.doesNotMatch(source, /escapeHtml/, file);
     assert.match(source, /escapeXml\(/, file);
   }
+});
+
+test('a figure of a subsample says so: its cells, the dataset\'s, how they were chosen', async () => {
+  const views = [
+    gridView({
+      id: 'live',
+      label: 'Live',
+      fieldKey: 'leiden',
+      fieldKind: 'category',
+      legendModel: clusterModel(),
+      filters: ['No filters active'],
+    }),
+  ];
+  const payload = gridPayload(views);
+  payload.meta.datasetCells = { open: 228245, of: 2282447, method: 'uniform, seed 0', digest: '3f2a00c1d2e3f405' };
+  const svg = await (await renderFigureToSvgBlob({ payload })).text();
+  assert.equal(
+    svgDescription(svg),
+    'Views: Live (Field: leiden; Filters: none) • Cells: a subsample, 228,245 of 2,282,447 '
+      + '(uniform, seed 0; cell set 3f2a00c1d2e3f405) • Source: /data/suo'
+  );
+  assert.deepEqual(svgProvenanceJson(svg).dataset.cells,
+    { open: 228245, of: 2282447, method: 'uniform, seed 0', digest: '3f2a00c1d2e3f405' });
+  // Every cell open: no claim, and the record says null.
+  delete payload.meta.datasetCells;
+  const whole = await (await renderFigureToSvgBlob({ payload })).text();
+  assert.equal(svgProvenanceJson(whole).dataset.cells, null);
+  assert.doesNotMatch(svgDescription(whole), /Cells:/);
+  payload.meta.datasetCells = { open: 5, of: 5, method: 'uniform, seed 0', digest: 'x' };
+  await assert.rejects(renderFigureToSvgBlob({ payload }), /describe a subsample/);
+});
+
+test('a colour bar of the colormaps\' bare stops is drawn, and a gene sample\'s note wraps within the bar', () => {
+  // `getCssStopsForColormap` gives bare colours (no positions), spaces inside.
+  const model = { ...geneModel(['rgb(68, 1, 84)', 'rgb(33, 145, 140)', 'rgb(253, 231, 37)']), geneSample: { cells: 1_759, of: 2_282_447 }, zeroGray: { enabled: true, applies: true, drawn: true } };
+  const narrow = { x: 0, y: 0, width: 220, height: 160 };
+  const { svg, defs } = renderSvgLegend({ legendRect: narrow, fieldKey: 'G', model });
+  assert.deepEqual(
+    [...defs.matchAll(/<stop offset="([^"]+)" stop-color="([^"]+)"\/>/g)].map(match => [match[1], match[2]]),
+    [['0%', 'rgb(68, 1, 84)'], ['50%', 'rgb(33, 145, 140)'], ['100%', 'rgb(253, 231, 37)']],
+  );
+  const lines = svgTexts(svg).slice(3);
+  assert.ok(lines.length > 1, 'the note wraps');
+  assert.equal(lines.join(' '), 'Gene read for 1,759 of 2,282,447 cells. Faded: not read · gray: 0', 'and nothing of it is cut');
 });

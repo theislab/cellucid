@@ -397,10 +397,13 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
     viewer.setFrustumCulling(true);
     viewer.setForceLOD(0);
     // The trees with their levels are built off the main thread; until they
-    // land each pane draws full detail.
-    for (let frame = 0; frame < 600; frame++) {
+    // land each pane draws full detail, and each store then takes its tree's
+    // order a band at a time. Waited for by the clock: a slow runner draws
+    // few frames while the workers build.
+    for (const deadline = performance.now() + 120_000; ;) {
       await frames(1);
-      if (viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(id) >= 0) break;
+      if (viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(id) >= 0 && viewer.isPresentedGeometrySettled()) break;
+      if (performance.now() > deadline) throw new Error(`The trees never landed: ${JSON.stringify(viewer.debugRendererStatus())}`);
     }
     await frames(2);
     const lodLevels = {
@@ -408,11 +411,13 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
       snapshot: viewer.getCurrentLODLevel(id),
     };
     // The live store holds its 3D positions (12 bytes a cell) in the
-    // draw order of its tree; LOD keeps no second copy.
-    const liveTree = renderer.spatialIndices.get(3);
+    // draw order of its tree, whole (every presented view draws from its
+    // final geometry: the renderer compares the store's order with its
+    // tree's); LOD keeps no second copy.
     const compactBytesMatchLayout =
       renderer._positionGpuByteLength === viewer.getPointCount() * 3 * 4 &&
-      renderer._liveOrder?.drawOrder === liveTree.drawOrder;
+      viewer.debugRendererStatus().drawOrderComplete === true &&
+      viewer.isPresentedGeometrySettled();
     viewer.setForceLOD(-1);
     viewer.setAdaptiveLOD(false);
     await frames(3);

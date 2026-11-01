@@ -19,6 +19,13 @@ import {
 } from '../assets/js/data/data-loaders.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 import { narrowCategoricalCodes } from '../assets/js/data/categorical-storage-contract.js';
+import { codeDiscoveredColumn } from '../assets/js/data/discovered-categories.js';
+
+/** A text or boolean column as a loader answers it: coded by the reader (`AnnDataReader.getObsField`). */
+function discoveredPayload(values, categories = null) {
+  const coded = codeDiscoveredColumn(values, categories, 'Observation field');
+  return { dtype: 'categorical', discovered: true, codes: coded.codes, categories: coded.categories, ordered: false };
+}
 
 function datasetMetadata(nObs) {
   // The private adapter-construction descriptor a loader returns; the public
@@ -144,10 +151,7 @@ test('primitive boolean discovery and code conversion preserve boolean identity'
   const loader = metadataOnlyLoader(
     ['flag'],
     async () => ({ dtype: 'bool' }),
-    async () => ({
-      dtype: 'bool',
-      values: [false, true, false, null]
-    })
+    async (key, { categories = null } = {}) => discoveredPayload([false, true, false, null], categories)
   );
   loader.nObs = 4;
   const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
@@ -179,9 +183,9 @@ test('category dictionaries of every field load with no cumulative ceiling', asy
 
 test('primitive category discovery keeps every distinct label past 65,535', () => {
   const values = Array.from({ length: 70_000 }, (_, index) => `category-${index}`);
-  const adapter = new BaseAnnDataAdapter(metadataOnlyLoader(['label'], async () => ({ dtype: 'string' })));
-  const categories = adapter._discoverPrimitiveCategories(values, 'label');
+  const { categories, codes } = codeDiscoveredColumn(values, null, 'label');
   assert.equal(categories.length, 70_000);
+  assert.ok(codes instanceof Uint32Array);
 });
 
 test('a string column is read only when it is loaded: its categories are found then, and its payload released', async () => {
@@ -190,9 +194,9 @@ test('a string column is read only when it is loaded: its categories are found t
   const loader = metadataOnlyLoader(
     ['label'],
     async () => ({ dtype: 'string' }),
-    async () => {
+    async (key, { categories = null } = {}) => {
       reads++;
-      return { dtype: 'string', values: ['b', 'a', null] };
+      return discoveredPayload(['b', 'a', null], categories);
     }
   );
   loader.nObs = 3;
@@ -212,6 +216,8 @@ test('a string column is read only when it is loaded: its categories are found t
       codesDtype: null,
       codesMissingValue: null,
       palette: null,
+      // A text column: its categories are the labels its open cells hold.
+      discovered: true,
       outlierQuantilesPath: null,
     }],
     'its categories and code width are found when it is loaded'
@@ -228,7 +234,7 @@ test('a string column is read only when it is loaded: its categories are found t
   assert.deepEqual(again.categories, ['a', 'b']);
 });
 
-test('lazy observation payloads are evicted by the cache budget, never refused', async () => {
+test('lazy observation payloads are evicted by the cache budget, never refused; a continuous one handed over is kept only by its caller', async () => {
   const valuesByKey = {
     first: new Float32Array(40),
     second: new Float32Array(40)
@@ -246,10 +252,18 @@ test('lazy observation payloads are evicted by the cache budget, never refused',
   await adapter.initialize();
   adapter._cacheBudgetBytes = 200n;
 
-  await adapter.getObsFieldData('first');
-  await adapter.getObsFieldData('second');
+  // Read for the adapter's own use (not handed over), each is cached within
+  // the budget, the least recently used going first.
+  await adapter._getOrLoadFieldData('first');
+  await adapter._getOrLoadFieldData('second');
   assert.equal(adapter._obsFieldDataCache.size, 1);
   assert.ok(adapter._obsFieldDataCacheBytes <= 200n);
+
+  // Handed over, a continuous column has one owner: its caller (the field
+  // state, under its own budget), never the adapter's cache as well.
+  const handed = await adapter.getObsFieldData('first');
+  assert.equal(handed.kind, 'continuous');
+  assert.equal(adapter._obsFieldDataCache.has('first'), false);
 
   // A payload larger than the whole budget is still returned.
   adapter._cacheBudgetBytes = 1n;
@@ -263,39 +277,41 @@ test('lazy observation payloads are evicted by the cache budget, never refused',
   assert.equal(adapter._obsFieldsMetadata, null);
 });
 
-test('primitive code maps build without a full categories.map temporary', async () => {
-  const categories = new Proxy(
-    ['a', 'b'],
-    {
-      get(target, property, receiver) {
-        if (property === 'map') {
-          throw new Error('categories.map temporary sentinel');
-        }
-        return Reflect.get(target, property, receiver);
-      }
+test('a text column is coded by the reader under the categories found before; labels it had not shown grow them, each keeping its colour', async () => {
+  const asked = [];
+  let values = ['b', 'a', null];
+  const loader = metadataOnlyLoader(
+    ['label'],
+    async () => ({ dtype: 'string' }),
+    async (key, { categories = null, rows = null } = {}) => {
+      asked.push(categories === null ? null : [...categories]);
+      const shown = rows === null ? values : values.slice(rows[0], rows[1]);
+      return discoveredPayload(shown, categories);
     }
   );
-  const loader = {
-    nObs: 3,
-    async getObsField() {
-      return {
-        dtype: 'string',
-        values: ['b', 'a', null]
-      };
-    }
-  };
+  loader.nObs = 3;
   const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
-  adapter._metadata = datasetMetadata(3);
-  adapter._obsFieldsMetadata = [{
-    key: 'label',
-    kind: 'category',
-    categories,
-    _needsCodeComputation: true
-  }];
+  await adapter.initialize();
+  const first = await adapter.getObsFieldData('label');
+  assert.deepEqual(first.categories, ['a', 'b']);
+  assert.equal(first.palette.length, 2, 'colours named by the labels');
+  const colourOf = new Map(first.categories.map((label, i) => [label, first.palette[i]]));
 
-  const field = await adapter.getObsFieldData('label');
-  assert.deepEqual(Array.from(new Uint8Array(field.data)), [1, 0, 255]);
-  assert.equal(adapter._obsFieldDataCache.size, 0);
+  // The added cells hold 'A' and 'c': the categories grow in label order,
+  // 'a' and 'b' keep their colours.
+  values = ['b', 'a', null, 'c', 'A'];
+  const rows = await adapter.getObsFieldRows('label', [3, 3], { categories: first.categories });
+  assert.equal(rows.categories, undefined, 'no row, no new label');
+  loader.nObs = 5;
+  const grown = await adapter.getObsFieldRows('label', [3, 5], { categories: first.categories });
+  assert.deepEqual(grown.categories, ['A', 'a', 'b', 'c']);
+  assert.deepEqual(Array.from(grown.codes), [3, 0]);
+  for (const label of ['a', 'b']) assert.deepEqual(grown.palette[grown.categories.indexOf(label)], colourOf.get(label));
+  assert.deepEqual(asked.at(-1), ['a', 'b'], 'the rows are coded under the categories the field was loaded with');
+  // A whole load after it codes under the grown categories.
+  const again = await adapter.getObsFieldData('label');
+  assert.deepEqual(again.categories, ['A', 'a', 'b', 'c']);
+  assert.deepEqual(asked.at(-1), ['A', 'a', 'b', 'c']);
 });
 
 test('keeps the exact 65,535-category boundary on uint16 without uint32 output', async () => {
@@ -429,7 +445,7 @@ function categoricalFieldList(field) {
     outlier_min_points: 10,
     stored_outlier_latent_key: null,
     latent_key: null,
-    fields: [{ key: 'label', kind: 'category', fieldIndex: 0, palette: null, outlierQuantilesPath: null, ...field }],
+    fields: [{ key: 'label', kind: 'category', fieldIndex: 0, palette: null, discovered: false, outlierQuantilesPath: null, ...field }],
   };
 }
 

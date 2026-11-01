@@ -14,6 +14,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openDataMapping, openReadingSection } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -32,6 +33,9 @@ async function openDataset(page) {
       details.open = true;
     }
   });
+  // The Session panel's collapsed sections, so their controls are held to the standard too.
+  await openReadingSection(page);
+  await openDataMapping(page);
 }
 
 /** Computed style signatures of every visible element matching a selector. */

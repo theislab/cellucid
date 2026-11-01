@@ -10,7 +10,8 @@
  *   WebGL2 context);
  * - `rasterizePoints`: the shader-accurate point pass, on an OffscreenCanvas
  *   WebGL2 context this thread owns, returned as an ImageBitmap the page
- *   composites (`webgl-point-rasterizer.js`);
+ *   composites (`webgl-point-rasterizer.js`); `rasterContext` describes that
+ *   context (renderer, granted attributes, samples);
  * - `encodeRasterPngDataUrl`: the Hybrid SVG's point pass, placed and
  *   encoded as a PNG data URL;
  * - `svgPointMarkup`: the circles of a Full or Optimized Vector SVG, as one
@@ -29,10 +30,14 @@
  *
  * Messages: `{ id, op, session, uploads, args }` is answered with
  * `{ id, result }` or `{ id, error }`; `{ op: 'close', session }` has no reply.
+ * An upload larger than one ArrayBuffer (a WebAssembly memory's on the
+ * page, `utils/large-arrays.js`) arrives first in pieces, `{ session, piece }`
+ * (no reply), and `uploads` holds its placeholder.
  *
  * Where a worker cannot create a WebGL2 context (WebKitGTK, WPE; `webgl2`
  * answers false), the page runs this same handler for the point passes
- * (`spriteZoomLimit`, `rasterizePoints`): `figure-export-worker-client.js`.
+ * (`spriteZoomLimit`, `rasterizePoints`, `rasterContext`):
+ * `figure-export-worker-client.js`.
  *
  * @module ui/modules/figure-export/utils/figure-export-worker
  */
@@ -42,33 +47,16 @@ import {
   computeVisibleRealBounds,
 } from './coordinate-mapper.js';
 import {
+  describeRasterContext,
   exportSpriteZoomLimit,
   rasterizePointsWebgl,
   webgl2RasterAvailable,
 } from './webgl-point-rasterizer.js';
 import { embedPngTextChunks } from './png-metadata.js';
+import { PieceReceiver } from '../../../../../utils/large-arrays.js';
 import { writeSvgPointMarkup } from '../renderers/svg-point-markup.js';
-
-/**
- * An error as plain data that survives structured cloning.
- *
- * @param {unknown} error
- * @param {number} [depth]
- * @returns {object}
- */
-export function serializeFigureExportWorkerError(error, depth = 0) {
-  if (!(error instanceof Error)) {
-    return { name: 'Error', message: String(error) };
-  }
-  const record = { name: error.name, message: error.message };
-  if (error.cause !== undefined && depth < 8) {
-    record.cause = serializeFigureExportWorkerError(error.cause, depth + 1);
-  }
-  if (Array.isArray(error.errors) && depth < 8) {
-    record.errors = error.errors.map(item => serializeFigureExportWorkerError(item, depth + 1));
-  }
-  return record;
-}
+import { toWire } from '../../../../../utils/error-wire.js';
+import { cancelled } from '../../../../../utils/abort.js';
 
 /** Replace every `{ $array: id }` in `value` with the session's array. */
 function resolveArrays(value, arrays) {
@@ -90,12 +78,14 @@ function resolveArrays(value, arrays) {
 }
 
 /**
- * The renderer's exact LOD descriptor again: structured cloning drops the
- * freeze the descriptor contract requires (`assertLodMembership`).
+ * A figure's LOD record again (`shareLodMembership`): structured cloning
+ * drops the freeze the record's contract requires (`LodMembership`).
  */
 function reviveLodMembership(membership) {
   if (membership === null) return null;
   return Object.freeze({
+    admissionLevels: membership.admissionLevels,
+    count: membership.count,
     dimensionLevel: membership.dimensionLevel,
     generationToken: Object.freeze({}),
     indices: membership.indices,
@@ -160,6 +150,8 @@ const operations = {
 
   spriteZoomLimit: () => ({ result: exportSpriteZoomLimit() }),
 
+  rasterContext: ({ antialias }) => ({ result: describeRasterContext(antialias) }),
+
   visibleBounds: (args) => {
     const options = { ...args, lodMembership: reviveLodMembership(args.lodMembership) };
     return {
@@ -214,12 +206,38 @@ const operations = {
 export function createFigureExportWorkerHandler() {
   /** @type {Map<number, Map<number, ArrayBufferView>>} */
   const sessions = new Map();
+  /**
+   * The pieces of arrays too large to clone, by session, for the request
+   * that follows them (`utils/large-arrays.js`).
+   * @type {Map<number, PieceReceiver>}
+   */
+  const pieces = new Map();
+  /** Sessions whose export was stopped: their requests still queued are skipped. */
+  const cancelledSessions = new Set();
 
   return async function handle(message) {
     const { id, op, session } = message;
+    if (op === 'cancel') {
+      cancelledSessions.add(session);
+      return null;
+    }
+    if (message.piece !== undefined) {
+      let receiver = pieces.get(session);
+      if (receiver === undefined) {
+        receiver = new PieceReceiver();
+        pieces.set(session, receiver);
+      }
+      receiver.receive(message.piece);
+      return null;
+    }
     if (op === 'close') {
       sessions.delete(session);
+      pieces.delete(session);
+      cancelledSessions.delete(session);
       return null;
+    }
+    if (cancelledSessions.has(session)) {
+      return { reply: { id, error: toWire(cancelled('user', 'The figure export was cancelled.')) }, transfer: [] };
     }
     try {
       let arrays = sessions.get(session);
@@ -227,7 +245,10 @@ export function createFigureExportWorkerHandler() {
         arrays = new Map();
         sessions.set(session, arrays);
       }
-      for (const [arrayId, array] of message.uploads) arrays.set(arrayId, array);
+      const receiver = pieces.get(session);
+      pieces.delete(session);
+      const uploads = receiver === undefined ? message.uploads : receiver.resolve(message.uploads);
+      for (const [arrayId, array] of uploads) arrays.set(arrayId, array);
       const operation = Object.hasOwn(operations, op) ? operations[op] : undefined;
       if (operation === undefined) {
         throw new TypeError(`Figure-export worker has no operation "${op}".`);
@@ -235,7 +256,7 @@ export function createFigureExportWorkerHandler() {
       const { result, transfer = [] } = await operation(resolveArrays(message.args, arrays));
       return { reply: { id, result }, transfer };
     } catch (error) {
-      return { reply: { id, error: serializeFigureExportWorkerError(error) }, transfer: [] };
+      return { reply: { id, error: toWire(error) }, transfer: [] };
     }
   };
 }
@@ -250,6 +271,11 @@ if (
   // synchronous, and a GL context is never shared by two passes.
   let queue = Promise.resolve();
   self.onmessage = (event) => {
+    // A cancel is heard at once, ahead of the queue it stops.
+    if (event.data?.op === 'cancel') {
+      void handle(event.data);
+      return;
+    }
     queue = queue.then(async () => {
       const answer = await handle(event.data);
       if (answer !== null) self.postMessage(answer.reply, answer.transfer);

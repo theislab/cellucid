@@ -103,6 +103,8 @@ function createDEBoundaryProbe(pointCount = 6) {
   analysis.dataLayer = {
     state: { pointCount },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return [{ key: 'Gene A', name: 'Gene A' }];
@@ -173,7 +175,7 @@ test('DE rejects overlapping groups exactly, before any read', async () => {
       geneList: ['Gene A'],
       minCells: 2,
     }),
-    /groups must be disjoint.*overlap/i,
+    /groups must be disjoint; they share 1 cell/i,
   );
   assert.equal(calls.computeManager, 0);
   assert.equal(calls.expressionRead, 0);
@@ -223,6 +225,8 @@ function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
   analysis.dataLayer = {
     state: { pointCount: 6 },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return genes.map(key => ({ key, name: key }));
@@ -361,6 +365,8 @@ test('DE invalidation aborts streaming, dispatches no later gene, drains compute
   analysis.dataLayer = {
     state: { pointCount: 6 },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return ['Gene A', 'Gene B', 'Gene C'].map(key => ({ key, name: key }));
@@ -465,6 +471,8 @@ test('current and stale signature completion perform expiry cleanup without glob
       }
       return gates.shift().promise;
     },
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
     },

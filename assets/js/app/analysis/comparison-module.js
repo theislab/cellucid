@@ -14,10 +14,7 @@
 import { createDataLayer } from './data/data-layer.js';
 import { createMultiVariableAnalysis } from './stats/multi-variable-analysis.js';
 import { getNotificationCenter } from '../notification-center.js';
-import { getMemoryMonitor } from './shared/memory-monitor.js';
-import { clearActiveSourceCaches } from './shared/resource-cleanup.js';
 import { debugError } from './shared/debug-utils.js';
-import { closeModal } from './ui/components/modal.js';
 import { analysisViewSizes } from './shared/analysis-view-sizes.js';
 import { setOwnDataProperty } from '../../utils/exact-record.js';
 import { createGroup, createInfoTip } from '../ui/components/controls.js';
@@ -47,6 +44,8 @@ import './plots/types/volcanoplot.js';
 import './plots/types/scatterplot.js';
 import './plots/types/gene-heatmap.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { failureText } from '../../utils/errors.js';
+import { GeneUnavailableError, describeUnavailableGene } from '../utils/gene-lookup.js';
 
 /**
  * Comparison Module class
@@ -133,62 +132,10 @@ export class ComparisonModule {
       syncAxes: true // Synchronize axes across multi-page plots
     };
 
-    // Register with memory monitor for automatic cleanup
-    this._memoryMonitor = getMemoryMonitor();
-    this._memoryMonitor.registerCleanupHandler('comparison-module', async (reason) => {
-      const cleanupErrors = [];
-      const cleanupTasks = [];
-      const cleanup = operation => {
-        try {
-          return operation();
-        } catch (error) {
-          cleanupErrors.push(error);
-          return undefined;
-        }
-      };
-
-      if (
-        this.dataLayer === null ||
-        typeof this.dataLayer?.performCacheCleanup !== 'function'
-      ) {
-        cleanupErrors.push(
-          new TypeError('Comparison cleanup requires DataLayer.performCacheCleanup()')
-        );
-      } else {
-        cleanup(() => this.dataLayer.performCacheCleanup());
-      }
-
-      if (reason === 'threshold' || reason === 'critical') {
-        cleanup(() => clearActiveSourceCaches());
-
-        let modals = [];
-        cleanup(() => {
-          modals = document.querySelectorAll('.analysis-modal');
-        });
-        for (const modal of modals) {
-          const closeTask = cleanup(() => closeModal(modal));
-          if (closeTask && typeof closeTask.then === 'function') {
-            cleanupTasks.push(closeTask);
-          }
-        }
-      }
-
-      const outcomes = await Promise.allSettled(cleanupTasks);
-      cleanupErrors.push(
-        ...outcomes
-          .filter(outcome => outcome.status === 'rejected')
-          .map(outcome => outcome.reason)
-      );
-      if (cleanupErrors.length === 1) throw cleanupErrors[0];
-      if (cleanupErrors.length > 1) {
-        throw new AggregateError(
-          cleanupErrors,
-          `Comparison cleanup failed in ${formatCountOf(cleanupErrors.length, 'operation')}`
-        );
-      }
-    });
-    // Start monitoring if not already active
-    this._memoryMonitor.start({ checkInterval: 15000 });
+    // What the analyses keep by choice (page values, marker runs, the state
+    // runs keep in the workers) is counted and trimmed by the memory model
+    // (`data/memory-budget.js`), each where it is held; nothing in flight is
+    // invalidated and no analysis window is closed.
   }
 
   /**
@@ -343,7 +290,8 @@ export class ComparisonModule {
     const subscriptions = [
       ['page:changed', () => this.onPagesChanged()],
       ['highlight:changed', () => this.onHighlightChanged()],
-      ['visibility:changed', () => this.onCellVisibilityChanged()]
+      ['visibility:changed', () => this.onCellVisibilityChanged()],
+      ['genes:listed', () => this.onGenesListed()]
     ];
     try {
       for (const [eventName, handler] of subscriptions) {
@@ -523,7 +471,7 @@ export class ComparisonModule {
             error
           );
           this._notifications.error(
-            `Could not create the analysis window: ${error.message}`,
+            `Could not create the analysis window: ${failureText(error)}`,
             { category: 'analysis', title: 'Analysis window error' }
           );
         });
@@ -534,7 +482,7 @@ export class ComparisonModule {
         error
       );
       this._notifications.error(
-        `Could not create the analysis window: ${error.message}`,
+        `Could not create the analysis window: ${failureText(error)}`,
         { category: 'analysis', title: 'Analysis window error' }
       );
     }
@@ -742,6 +690,16 @@ export class ComparisonModule {
     this._analysisWindowManager.onCellVisibilityChanged();
   }
 
+  /**
+   * The gene list of the dataset shown was read after its first view (or
+   * could not be): every analysis that showed its genes loading lists them,
+   * in the panel and in every window.
+   */
+  onGenesListed() {
+    this._uiManager.onGenesListed();
+    this._analysisWindowManager.onGenesListed();
+  }
+
   // ===========================================================================
   // Configuration & Hooks
   // ===========================================================================
@@ -777,16 +735,6 @@ export class ComparisonModule {
   // ===========================================================================
 
   /**
-   * Perform periodic cleanup to prevent memory degradation
-   */
-  performCleanup() {
-    if (this.dataLayer && this.dataLayer.performCacheCleanup) {
-      const result = this.dataLayer.performCacheCleanup();
-      console.debug('[ComparisonModule] Cleanup completed:', result);
-    }
-  }
-
-  /**
    * Cleanup and destroy the module
    * @returns {Promise<void>}
    */
@@ -820,7 +768,6 @@ export class ComparisonModule {
         }
       }
     }
-    const memoryMonitor = this._memoryMonitor;
     const windowManager = this._analysisWindowManager;
     const uiManager = this._uiManager;
     const dataLayer = this.dataLayer;
@@ -828,25 +775,6 @@ export class ComparisonModule {
 
     this._destroyPromise = Promise.resolve().then(async () => {
       const errors = [...stateSubscriptionErrors];
-      let memoryHandlerDrain = null;
-      if (memoryMonitor !== null && memoryMonitor !== undefined) {
-        try {
-          memoryHandlerDrain = memoryMonitor.unregisterCleanupHandler(
-            'comparison-module'
-          );
-        } catch (error) {
-          errors.push(error);
-        }
-      }
-      this._memoryMonitor = null;
-
-      if (memoryHandlerDrain !== null && memoryHandlerDrain !== undefined) {
-        try {
-          await memoryHandlerDrain;
-        } catch (error) {
-          errors.push(error);
-        }
-      }
 
       // A dataset reset owns both managers until it has fully settled. Retire
       // those managers only after that owner releases them; otherwise destroy()
@@ -1228,22 +1156,22 @@ export class ComparisonModule {
   /**
    * Colour the cells by one gene of a result (a marker or a DE gene), through
    * the sidebar's gene selector, so its search box names the gene shown. A
-   * gene the shown expression matrix lacks (a result read from another
-   * matrix) is said in a notification; a newer choice supersedes this one.
+   * gene the gene list cannot choose -- still being read, or not in it (a
+   * result read from another matrix) -- is said as the selector's lookup
+   * words it (`utils/gene-lookup.js`); a newer choice supersedes this one.
    *
    * @param {string} geneKey
    * @returns {Promise<void>}
    */
   async colorByGene(geneKey) {
-    const known = this.dataLayer.getAvailableVariables('gene_expression').some(gene => gene.key === geneKey);
-    if (!known) {
-      this._notifications.info(`${geneKey} is not in the expression matrix shown`, { category: 'analysis' });
-      return;
-    }
     try {
       await this._colorByGene(geneKey);
     } catch (error) {
-      this._notifications.error(`Colouring by ${geneKey} failed: ${error.message}`, { category: 'analysis' });
+      if (error instanceof GeneUnavailableError) {
+        this._notifications.info(describeUnavailableGene(error.gene, { kind: error.reason }, error.failure), { category: 'analysis' });
+        return;
+      }
+      this._notifications.error(`Colouring by ${geneKey} failed: ${failureText(error)}`, { category: 'analysis' });
     }
   }
 

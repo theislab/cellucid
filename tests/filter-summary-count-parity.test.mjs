@@ -60,7 +60,8 @@ test('snapshot summaries and continuous counts use the exact renderer filter bou
       owner,
       'snapshot'
     ),
-    ['near_boundary: 0.00 – 1.00']
+    // The bound the filter applies, in significant figures (never "0.00").
+    ['near_boundary: 5e-7 – 1']
   );
   assert.deepEqual(
     FieldSummaryMethods.prototype._computeCountsForContinuous.call(
@@ -118,7 +119,8 @@ test('deleted observation filters cannot reduce continuous or categorical counts
       availableTotal: 3,
       total: [2, 1],
       visible: [2, 1],
-      visibleTotal: 3
+      visibleTotal: 3,
+      missing: { total: 0, available: 0, visible: 0 }
     }
   );
 });
@@ -148,6 +150,7 @@ test('field summaries count the cells whose one-byte transparency is 1', () => {
       total: [1, 1],
       visible: [0, 1],
       visibleTotal: 1,
+      missing: { total: 0, available: 0, visible: 0 },
     },
   );
 });
@@ -179,8 +182,15 @@ test('category counts match the per-cell rule for every code width and the missi
     owner.categoryTransparency = alpha;
     const total = new Array(categoryCount).fill(0);
     const visible = new Array(categoryCount).fill(0);
+    // The cells without a category: the legend's Missing row (K-06).
+    const missingRow = { total: 0, available: 0, visible: 0 };
     for (let cell = 0; cell < pointCount; cell++) {
-      if (codes[cell] === missing) continue;
+      if (codes[cell] === missing) {
+        missingRow.total++;
+        missingRow.available++;
+        missingRow.visible += alpha[cell];
+        continue;
+      }
       total[codes[cell]]++;
       visible[codes[cell]] += alpha[cell];
     }
@@ -191,6 +201,7 @@ test('category counts match the per-cell rule for every code width and the missi
     assert.deepEqual(counts.total, total, Codes.name);
     assert.deepEqual(counts.available, total, Codes.name);
     assert.deepEqual(counts.visible, visible, Codes.name);
-    assert.equal(counts.visibleTotal, visible.reduce((a, b) => a + b, 0));
+    assert.deepEqual(counts.missing, missingRow, Codes.name);
+    assert.equal(counts.visibleTotal, visible.reduce((a, b) => a + b, 0) + missingRow.visible);
   }
 });

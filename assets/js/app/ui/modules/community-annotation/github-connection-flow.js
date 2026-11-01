@@ -55,6 +55,7 @@ import {
   describeGitHubAuthReachabilityError,
   openExternal,
 } from './browser-integration.js';
+import { onAbort } from '../../../../utils/abort.js';
 
 const GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS = 10_000;
 const SYNC_SKIPPED_MESSAGE =
@@ -1537,9 +1538,7 @@ export function createGitHubConnectionFlow(controller) {
           const unsubscribeSyncBusy = controller.subscribeSyncBusy(() => {
             if (isModalOwnerCurrent()) updateUi();
           });
-          modalAbort.signal.addEventListener('abort', unsubscribeSyncBusy, {
-            once: true,
-          });
+          onAbort(modalAbort.signal, unsubscribeSyncBusy);
 
           // Convenience: after returning from GitHub (Add repo), refresh list automatically.
           window.addEventListener('focus', () => {

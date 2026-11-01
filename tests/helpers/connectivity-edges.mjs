@@ -4,7 +4,6 @@
  * matrix of the pairs, with weight 1 unless given.
  */
 import { extractConnectivityEdges } from '../../assets/js/data/connectivity-edges.js';
-import { createConnectivityEdgeOrder } from '../../assets/js/rendering/connectivity-edge-selection.js';
 
 export function connectivityEdgesFromPairs(sources, destinations, nCells, weights = null) {
   const rows = Array.from({ length: nCells }, () => []);
@@ -48,32 +47,18 @@ const EDGE_LISTS = new WeakMap();
 
 /**
  * An edge payload's edges in edge order (source, then destination), read
- * back from what it carries: `forwardOffsets` and the forward end of each
- * cell's `neighbors` give the pairs, the draw-ordered `records` the
- * strengths (record `r` is edge `order.at(r)`).
+ * back from what it carries: `forwardOffsets` gives each edge's source,
+ * `partners` its destination, `strengths` its strength.
  *
  * @returns {{sources: Uint32Array, destinations: Uint32Array, strength: Float32Array}}
  */
 export function edgeListOf(edges) {
   const known = EDGE_LISTS.get(edges);
   if (known !== undefined) return known;
-  const { forwardOffsets, neighborOffsets, neighbors, records, nCells, nEdges } = edges;
+  const { forwardOffsets, partners, strengths, nCells, nEdges } = edges;
   const sources = new Uint32Array(nEdges);
-  const destinations = new Uint32Array(nEdges);
-  const strength = new Float32Array(nEdges);
-  for (let cell = 0; cell < nCells; cell++) {
-    const start = forwardOffsets[cell];
-    const end = forwardOffsets[cell + 1];
-    const first = neighborOffsets[cell + 1] - (end - start);
-    for (let edge = start; edge < end; edge++) {
-      sources[edge] = cell;
-      destinations[edge] = neighbors[first + edge - start];
-    }
-  }
-  const at = createConnectivityEdgeOrder(nEdges).at;
-  const recordStrength = new Float32Array(records.buffer, records.byteOffset, records.length);
-  for (let rank = 0; rank < nEdges; rank++) strength[at(rank)] = recordStrength[rank * 3 + 2];
-  const list = { sources, destinations, strength };
+  for (let cell = 0; cell < nCells; cell++) sources.fill(cell, forwardOffsets[cell], forwardOffsets[cell + 1]);
+  const list = { sources, destinations: partners.slice(0, nEdges), strength: strengths.slice(0, nEdges) };
   EDGE_LISTS.set(edges, list);
   return list;
 }

@@ -10,10 +10,11 @@
  *   node cellucid/scripts/validate-tokens.js
  */
 
-const fs = require('fs');
-const path = require('path');
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const PROJECT_ROOT = path.resolve(__dirname, '..');
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const DEFINITIONS_DIRS = [
   path.join(PROJECT_ROOT, 'assets', 'css', 'tokens'),

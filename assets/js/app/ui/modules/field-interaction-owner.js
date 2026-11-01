@@ -6,26 +6,59 @@
  * choice, and exposes exact settlement boundaries to dataset replacement,
  * session capture, and destruction.
  *
+ * A field choice that ends without showing its field, other than for a newer
+ * choice or a dataset replaced, is said, never dropped in silence: the owner
+ * records why it refused one (`suspensionReason`, a session being saved or
+ * restored) or retired one (`retirementOf`), and `describeUnshownField`
+ * words it.
+ *
  * @module ui/modules/field-interaction-owner
  */
 
-const FIELD_INTERACTION_SUPERSEDED_CODE =
-  'CELLUCID_FIELD_INTERACTION_SUPERSEDED';
+import { cancelled, cancellationKind, isCancellation } from '../../../utils/abort.js';
 
 const tokenControllers = new WeakMap();
 const intentOwners = new WeakMap();
+/** Why a token was retired by something other than a newer choice. */
+const tokenRetirements = new WeakMap();
 
-function createFieldInteractionSupersededError() {
-  const error = new Error(
-    'Field interaction was superseded by a newer intent.'
-  );
-  error.name = 'AbortError';
-  error.code = FIELD_INTERACTION_SUPERSEDED_CODE;
-  return error;
+function requireReason(reason, label) {
+  if (typeof reason !== 'string' || reason.length === 0) {
+    throw new TypeError(`${label} must name why, as a non-empty string.`);
+  }
+  return reason;
 }
 
-export function isFieldInteractionSupersededError(error) {
-  return error?.code === FIELD_INTERACTION_SUPERSEDED_CODE;
+/**
+ * What to say when the field `name` was chosen and is not shown.
+ *
+ * @param {string} name - The field or gene chosen
+ * @param {string} reason - Why, as a clause (`a session is being restored`)
+ * @returns {string}
+ */
+export function describeUnshownField(name, reason) {
+  requireReason(reason, 'An unshown field');
+  return `${name} is not shown: ${reason}. Choose it again when that has ended.`;
+}
+
+/**
+ * Why a field choice that ended in a cancellation is not shown, as a clause
+ * for `describeUnshownField`, or null when there is nothing to say: a newer
+ * choice took its place, the person stopped it (Cancel), or the dataset it
+ * was made in was replaced (the new one says so itself).
+ *
+ * @param {FieldInteractionOwner} owner
+ * @param {object} token - The choice's token (`run`)
+ * @param {unknown} error - The cancellation it ended with
+ * @param {string|null} changed - What changed under it, as a clause, when
+ *   its dataset is still shown; null when that dataset was replaced
+ * @returns {string|null}
+ */
+export function unshownChoiceReason(owner, token, error, changed) {
+  if (!isCancellation(error)) throw new TypeError('Only a cancelled field choice is unshown.');
+  if (!owner.isCurrent(token)) return owner.retirementOf(token);
+  if (cancellationKind(error) === 'user' || changed === null) return null;
+  return requireReason(changed, 'A field choice change');
 }
 
 function requireOperation(operation) {
@@ -50,7 +83,7 @@ function collectOwnedFailures(outcomes, failures) {
   for (const outcome of outcomes) {
     if (
       outcome.status === 'rejected'
-      && !isFieldInteractionSupersededError(outcome.reason)
+      && !isCancellation(outcome.reason)
       && !failures.includes(outcome.reason)
     ) {
       failures.push(outcome.reason);
@@ -78,24 +111,25 @@ class FieldInteractionOwner {
     this._currentTask = null;
     this._tasks = new Set();
     this._settlers = new Set();
-    this._suspensionCount = 0;
+    this._suspensionReasons = [];
     this._destroyed = false;
     this._destroyPromise = null;
   }
 
-  _abortToken(token) {
+  _abortToken(token, reason = null) {
     if (token === null) return;
     const controller = tokenControllers.get(token);
     if (controller === undefined || controller.signal.aborted) return;
-    controller.abort(createFieldInteractionSupersededError());
+    if (reason !== null) tokenRetirements.set(token, reason);
+    controller.abort(cancelled('superseded', 'Field interaction was superseded by a newer intent.'));
   }
 
   beginIntent() {
     if (this._destroyed) {
       throw new Error('Field interaction owner has been destroyed.');
     }
-    if (this._suspensionCount > 0) {
-      throw createFieldInteractionSupersededError();
+    if (this._suspensionReasons.length > 0) {
+      throw cancelled('superseded', 'Field interaction was superseded by a newer intent.');
     }
     this._abortToken(this._currentToken);
     const intent = Object.freeze({
@@ -118,7 +152,7 @@ class FieldInteractionOwner {
 
   assertIntentCurrent(intent) {
     if (this.isIntentCurrent(intent)) return;
-    throw createFieldInteractionSupersededError();
+    throw cancelled('superseded', 'Field interaction was superseded by a newer intent.');
   }
 
   run(operation) {
@@ -126,8 +160,8 @@ class FieldInteractionOwner {
     if (this._destroyed) {
       throw new Error('Field interaction owner has been destroyed.');
     }
-    if (this._suspensionCount > 0) {
-      throw createFieldInteractionSupersededError();
+    if (this._suspensionReasons.length > 0) {
+      throw cancelled('superseded', 'Field interaction was superseded by a newer intent.');
     }
 
     this._abortToken(this._currentToken);
@@ -184,7 +218,7 @@ class FieldInteractionOwner {
       for (const settler of this._settlers) {
         if (!settler.pending.delete(task) || !rejected) continue;
         if (
-          !isFieldInteractionSupersededError(reason)
+          !isCancellation(reason)
           && !settler.failures.includes(reason)
         ) {
           settler.failures.push(reason);
@@ -211,40 +245,82 @@ class FieldInteractionOwner {
   assertCurrent(token) {
     if (this.isCurrent(token)) return;
     const reason = token?.signal?.reason;
-    if (isFieldInteractionSupersededError(reason)) {
+    if (isCancellation(reason)) {
       throw reason;
     }
-    throw createFieldInteractionSupersededError();
+    throw cancelled('superseded', 'Field interaction was superseded by a newer intent.');
   }
 
   isSuspended() {
-    return this._destroyed === false && this._suspensionCount > 0;
+    return this._destroyed === false && this._suspensionReasons.length > 0;
   }
 
-  acquireSuspension() {
+  /**
+   * Why a field choice is refused now (the latest suspension held), or null.
+   * @returns {string|null}
+   */
+  suspensionReason() {
+    if (!this.isSuspended()) return null;
+    return this._suspensionReasons[this._suspensionReasons.length - 1].reason;
+  }
+
+  /**
+   * @param {string} reason - Why choices are refused meanwhile, as a clause
+   *   (`a session is being saved`), said to whoever chooses a field then
+   * @returns {() => void} Release
+   */
+  acquireSuspension(reason) {
+    requireReason(reason, 'A field interaction suspension');
     if (this._destroyed) {
       throw new Error('Field interaction owner has been destroyed.');
     }
     // Freeze admission while preserving work that already owns the current
     // token or intent. The caller drains that work before reading shared state.
-    this._suspensionCount += 1;
+    const hold = { reason };
+    this._suspensionReasons.push(hold);
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this._suspensionCount = Math.max(0, this._suspensionCount - 1);
+      const at = this._suspensionReasons.indexOf(hold);
+      if (at >= 0) this._suspensionReasons.splice(at, 1);
     };
   }
 
-  acquireRetiringSuspension() {
-    const release = this.acquireSuspension();
-    this.invalidate();
+  /**
+   * Suspend, and retire the choice under way, which is told `reason`
+   * (`retirementOf`).
+   *
+   * @param {string} reason
+   * @returns {() => void} Release
+   */
+  acquireRetiringSuspension(reason) {
+    const release = this.acquireSuspension(reason);
+    this.invalidate(reason);
     return release;
   }
 
-  invalidate() {
+  /**
+   * Why `token` was retired by something other than a newer choice or a
+   * dataset replaced (`invalidate(reason)`), or null.
+   *
+   * @param {object} token
+   * @returns {string|null}
+   */
+  retirementOf(token) {
+    return tokenRetirements.get(token) ?? null;
+  }
+
+  /**
+   * Retire the choice under way. `reason` (a clause) is what it is told
+   * (`retirementOf`); none for a dataset replaced, whose new view says it.
+   *
+   * @param {string|null} [reason]
+   */
+  invalidate(reason = null) {
+    if (reason !== null) requireReason(reason, 'A field interaction retirement');
     if (this._destroyed) return;
-    this._abortToken(this._currentToken);
+    this._abortToken(this._currentToken, reason);
     this._revision += 1;
     this._currentToken = null;
     this._currentTask = null;

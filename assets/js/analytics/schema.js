@@ -11,11 +11,21 @@
  * ## Automatic hits
  *
  * `page_view` - sent once per page load by the `config` call in
- * `app/ui/core/ga-init.js`, with `page_location` reduced to origin + path. The
- * query string (dataset ids, `remote` addresses and `data` links, `sampleCatalog`) is
- * never part of it. GA4's own "enhanced measurement" adds further automatic
- * events (history-change page views, scrolls, outbound clicks); those are
- * configured in the GA4 admin, not here.
+ * `app/ui/core/ga-init.js`, with `page_location` and `page_referrer` reduced
+ * to origin + path for every hit. The query string (dataset ids, `remote`
+ * addresses and `data` links, `sampleCatalog`, a subsample) is never part of
+ * them. `ga-init.js` also denies advertising storage, advertising use of user
+ * data and personalisation, and turns Google signals off, before the tag
+ * loads. GA4's own "enhanced measurement" and "user-provided data
+ * collection" are settings of the GA4 property, not of this code (the
+ * documentation's privacy model lists the property's settings): enhanced
+ * measurement is on, so Google's tag also sends its own page-change, scroll,
+ * outbound-click, site-search, video, file-download and form-interaction
+ * events, with every data parameter redacted from the addresses in them;
+ * user-provided data collection is off. Beyond those, the page view and the
+ * events below are all that is sent.
+ * Viewer pages (`?viewer=…`: notebook widgets, Python and R browser-tab
+ * viewers) send nothing.
  *
  * ## Events
  *

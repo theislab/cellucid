@@ -47,6 +47,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
+import { browserLaunchOptions, requireHardwareRenderer } from './lib/browser-launch.mjs';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY = path.resolve(HERE, '..');
 
@@ -290,15 +292,9 @@ try {
     const shaper = createShaper(profile);
     const appServer = await serve({ root: ROOT, port: PORT, key, cert, shaper: null, cors: false });
     const dataServer = await serve({ root: DATA, port: PORT + 1, key, cert, shaper, cors: true });
-    const browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--ignore-certificate-errors',
-        '--use-angle=metal',
-        '--enable-precise-memory-info',
-        '--js-flags=--expose-gc',
-      ],
-    });
+    const browser = await chromium.launch(browserLaunchOptions('chromium', {
+      args: ['--ignore-certificate-errors', '--js-flags=--expose-gc'],
+    }));
     // Open the dataset in a fresh context: nothing read before is cached.
     const openPage = async () => {
       const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, ignoreHTTPSErrors: true });
@@ -346,6 +342,7 @@ try {
             heapLimitMB: Math.round(performance.memory.jsHeapSizeLimit / 2 ** 20),
             userAgent: navigator.userAgent,
           }));
+          environment.renderer = await requireHardwareRenderer(page);
           emit({ profile, flow: 'open', ms: openMs, environment });
           first = false;
         }

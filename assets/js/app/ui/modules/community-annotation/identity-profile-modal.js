@@ -37,6 +37,7 @@ import {
   assertExactAnnotationUserKey,
   assertExactGitHubLogin,
 } from './identity-assertions.js';
+import { isCancellation } from '../../../../utils/abort.js';
 
 /** Quiet period after the last keystroke before an ORCID lookup starts. */
 export const ORCID_SEARCH_DEBOUNCE_MS = 250;
@@ -568,7 +569,7 @@ export function createIdentityProfileModal({
                   ) {
                     return;
                   }
-                  if (err?.name === 'AbortError') {
+                  if (isCancellation(err)) {
                     renderSuggestions([], { loading: false });
                   } else {
                     renderSuggestions([], { loading: false });

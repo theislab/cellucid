@@ -114,15 +114,22 @@ export async function observePage(page) {
         childList: true,
         subtree: true,
       });
-      const center = document.getElementById('notification-center');
+      // The notification center is the application's own element: its code
+      // starts at DOMContentLoaded (the page boot, renderPageBoot in
+      // scripts/generate-web-asset-inventory.mjs), after this listener, so
+      // the recorder attaches when the center is appended to the body.
       // A notification is known by the id it was published with. Dismissing
       // one takes the id off its element while it animates out, and keyed by
       // its current id that exiting card was a second notification with the
       // same text: on a runner slow enough that a success card's four
       // seconds ran out before the check, "announced once" counted two.
       const publishedIds = new WeakMap();
-      const capture = () => {
+      // A card is held hidden for its first second (NOTICE_AFTER_MS in
+      // notification-center.js) and one that settles quietly in that time
+      // is never shown: only what came on screen is recorded.
+      const capture = center => {
         for (const node of center.querySelectorAll('.notification')) {
+          if (node.hidden) continue;
           if (!publishedIds.has(node)) publishedIds.set(node, node.id);
           const id = publishedIds.get(node);
           const type = node.dataset.type;
@@ -135,12 +142,27 @@ export async function observePage(page) {
           });
         }
       };
-      new MutationObserver(capture).observe(center, {
-        attributes: true,
-        characterData: true,
-        childList: true,
-        subtree: true,
+      const watchCenter = center => {
+        capture(center);
+        new MutationObserver(() => capture(center)).observe(center, {
+          attributes: true,
+          characterData: true,
+          childList: true,
+          subtree: true,
+        });
+      };
+      const present = document.getElementById('notification-center');
+      if (present !== null) {
+        watchCenter(present);
+        return;
+      }
+      const appended = new MutationObserver(() => {
+        const center = document.getElementById('notification-center');
+        if (center === null) return;
+        appended.disconnect();
+        watchCenter(center);
       });
+      appended.observe(document.body, { childList: true });
     });
   });
   return productErrors;

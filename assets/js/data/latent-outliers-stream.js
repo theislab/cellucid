@@ -5,9 +5,12 @@
  *
  * Every field asked for at once is computed in the same passes over the
  * latent space, so the file is read once for all of them, not once per
- * field. The latent space is checked as it is read (every value finite and
- * representable as float32, the check every mapped array gets) and narrowed
- * to float32, the values the writers compute from. When it fits the reader's
+ * field. The latent space is checked as it is read (every value of a placed
+ * cell representable as float32, the check every mapped array gets; a row
+ * holding NaN or an infinity is a cell the latent space does not place,
+ * which gets no quantile, `latent-outliers.js`; a latent space placing no
+ * cell is refused) and narrowed to float32, the values the writers compute
+ * from. When it fits the reader's
  * residency budget (`latentHold`) it is kept, one latent space at a time, so
  * every later field is computed without reading the file again; a larger one
  * is read again for the second pass and never held whole, so no latent space
@@ -20,8 +23,8 @@
  * @module data/latent-outliers-stream
  */
 
-import { LatentOutlierQuantiles } from './latent-outliers.js';
-import { MappingLoadError, valueLoadDefect } from './data-mapping-candidates.js';
+import { LatentOutlierQuantiles, placedRow } from './latent-outliers.js';
+import { MappingLoadError, everyRowMissing, valueLoadDefect } from './data-mapping-candidates.js';
 import { residencyBudgetBytes } from './memory-budget.js';
 import { allocateTypedArray } from './sparse-column-index.js';
 
@@ -45,11 +48,13 @@ export function latentReadLabel(key) {
 export class LatentOutlierReader {
   /**
    * @param {{nObs: number, forEachObsmRowSlab: Function}} loader
-   * @param {{budgetBytes?: number}} [options]
+   * @param {{budgetBytes?: number|(() => number)}} [options] - A fixed budget,
+   *   or a function read whenever one is decided (by default the
+   *   `latentHold` share, which changes with the allowance and the working set)
    */
-  constructor(loader, { budgetBytes = residencyBudgetBytes('latentHold') } = {}) {
+  constructor(loader, { budgetBytes = () => residencyBudgetBytes('latentHold') } = {}) {
     this._loader = loader;
-    this._budgetBytes = budgetBytes;
+    this._budgetBytes = typeof budgetBytes === 'function' ? budgetBytes : () => budgetBytes;
     /** @type {{key: string, width: number, latent: Float32Array}|null} */
     this._held = null;
   }
@@ -66,7 +71,12 @@ export class LatentOutlierReader {
 
   /** Whether `obsm[key]` would be kept once read. */
   wouldHold(width) {
-    return this._loader.nObs * width * 4 <= this._budgetBytes;
+    return this._loader.nObs * width * 4 <= this._budgetBytes();
+  }
+
+  /** The bytes of the latent space kept, 0 when none is. */
+  get heldBytes() {
+    return this._held?.latent.byteLength ?? 0;
   }
 
   /** Release the kept latent space. */
@@ -112,7 +122,7 @@ export class LatentOutlierReader {
     const rowsFor = (rowStart, rowEnd) => {
       if (kept !== null) return kept.subarray(rowStart * width, rowEnd * width);
       const length = (rowEnd - rowStart) * width;
-      if (scratch === null || scratch.length < length) scratch = new Float32Array(length);
+      if (scratch === null || scratch.length < length) scratch = allocateTypedArray(Float32Array, length, label);
       return scratch.subarray(0, length);
     };
     const read = (visit, pass) => this._loader.forEachObsmRowSlab(key, visit, {
@@ -122,6 +132,7 @@ export class LatentOutlierReader {
     });
 
     // Pass 1, checking every value once.
+    let placed = 0;
     await read((block, rowStart, rowEnd) => {
       const defect = valueLoadDefect(block, width, rowStart);
       if (defect !== null) {
@@ -129,8 +140,13 @@ export class LatentOutlierReader {
       }
       const rows = rowsFor(rowStart, rowEnd);
       narrowInto(rows, block);
+      for (let start = 0; start < rows.length; start += width) if (placedRow(rows, start, width)) placed++;
       for (const task of reading) task.addCentroidRows(rows, rowStart);
     }, 1);
+    if (nCells > 0 && placed === 0) {
+      const reason = everyRowMissing('latent values are');
+      throw new MappingLoadError(key, reason, `${label} cannot be used: ${reason}.`);
+    }
     for (const task of reading) task.finishCentroids();
 
     if (kept !== null) {

@@ -8,6 +8,7 @@ import {
   areLegendModelsSemanticallyEqual,
 } from '../assets/js/app/ui/modules/figure-export/utils/legend-model-equality.js';
 import './helpers/figure-export-worker-in-process.mjs';
+import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
 const IDENTITY = Float32Array.from([
   1, 0, 0, 0,
@@ -79,11 +80,11 @@ function categoryLegend() {
   return {
     kind: 'category',
     categories: ['Alpha', 'Beta'],
-    colors: [
+    colors: colorsOf([
       [1, 0, 0],
       [0, 1, 0],
-    ],
-    visible: [true, true],
+    ]),
+    visible: visibleOf([true, true]),
     picker: [
       [1, 0, 0],
       [0, 1, 0],
@@ -126,6 +127,7 @@ function makeView({
       lodMembership: null,
       drawOrder: null,
       lodSizeMultiplier: 1,
+      pointLayers: { readScale: 1, readEveryLevel: true },
       normTransform: {
         center: [0, 0, 0],
         scale: 1,
@@ -227,11 +229,11 @@ test('legend-model equality is deep, key-order independent, and non-mutating', (
       [1, 0, 0],
       [0, 1, 0],
     ],
-    visible: [true, true],
-    colors: [
+    visible: visibleOf([true, true]),
+    colors: colorsOf([
       [1, 0, 0],
       [0, 1, 0],
-    ],
+    ]),
     categories: ['Alpha', 'Beta'],
     kind: 'category',
   };
@@ -242,9 +244,9 @@ test('legend-model equality is deep, key-order independent, and non-mutating', (
   assert.deepEqual(left, leftBefore);
   assert.deepEqual(right, rightBefore);
 
-  right.colors[1][2] = 0.25;
+  right.colors[1 * 3 + 2] = 64;
   assert.equal(areLegendModelsSemanticallyEqual(left, right), false);
-  right.colors[1][2] = 0;
+  right.colors[1 * 3 + 2] = 0;
   right.categories.reverse();
   assert.equal(areLegendModelsSemanticallyEqual(left, right), false);
 });
@@ -271,7 +273,7 @@ test('multiview SVG shares only separately owned, semantically equal legends', a
   );
 
   const differentModel = structuredClone(categoryLegend());
-  differentModel.colors[1][2] = 0.25;
+  differentModel.colors[1 * 3 + 2] = 64;
   const different = payload({
     includeAxes: false,
     includeLegend: true,

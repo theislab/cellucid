@@ -10,6 +10,7 @@ import {
 } from './helpers/origins.mjs';
 import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { jsonResponse, serveAnnDataServer } from './helpers/anndata-server.mjs';
+import { TEST_COMMIT, answerLastCommit } from './helpers/github-api.mjs';
 
 const FIXTURE_ID = 'current-ui';
 const FIXTURE_NAME = 'Current UI fixture';
@@ -138,7 +139,14 @@ test('an exact GitHub URL startup never shows or paints onboarding', async ({
       datasets: [{ id: FIXTURE_ID, path: 'current-ui.h5ad' }],
     }));
   const bytes = readFileSync(FIXTURE_FILE);
+  // Listed at the catalog's ref; opened at the commit that last wrote it, as
+  // GitHub's API names it.
   await page.route(`${rawPrefix}current-ui.h5ad`, route => fulfillFile(route, bytes));
+  await answerLastCommit(page, { owner: 'cellucid-tests', repo: 'data' });
+  await page.route(
+    `https://raw.githubusercontent.com/cellucid-tests/data/${TEST_COMMIT}/catalog/current-ui.h5ad`,
+    route => fulfillFile(route, bytes),
+  );
 
   const githubUrl = new URL('/', APP_ORIGIN);
   githubUrl.searchParams.set(

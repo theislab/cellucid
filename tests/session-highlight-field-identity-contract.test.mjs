@@ -289,11 +289,11 @@ test(
     // The fingerprint cannot see an obs schema change, so the session is
     // accepted and the binding is what has to be right.
     assert.deepEqual(
-      getDatasetFingerprint({
+      await getDatasetFingerprint({
         state: destination,
         dataSourceManager: dataSourceManager(),
       }),
-      getDatasetFingerprint({
+      await getDatasetFingerprint({
         state: makeDatasetState({ pages: emptyPages() }),
         dataSourceManager: dataSourceManager(),
       }),

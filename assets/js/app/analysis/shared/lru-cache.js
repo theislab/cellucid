@@ -14,10 +14,16 @@
  * @typedef {Object} LRUCacheOptions
  * @property {number} [maxSize=100] - Maximum number of entries
  * @property {number} [maxAge=0] - Maximum age in milliseconds (0 = no expiration)
- * @property {number} [maxBytes=0] - Maximum total `sizeOf` of the held values
- *   (0 = unbounded). A value larger than the whole budget is not cached.
+ * @property {number|(() => number)} [maxBytes=0] - Maximum total `sizeOf` of the
+ *   held values (0 = unbounded), or a function read at every `set` (a
+ *   residency share of the device, `data/memory-budget.js`, which lowers
+ *   after a refused allocation). A value larger than the whole budget is
+ *   not cached.
  * @property {(value: *) => number} [sizeOf] - Byte size of one value; required
  *   with `maxBytes`
+ * @property {() => number} [heldBytes] - Bytes the owner holds beside the
+ *   entries that count against the same budget (arrays the entries share,
+ *   counted once); the entries take what is left
  * @property {Function} [onEvict] - Callback when entry is evicted: (key, value) => void
  */
 
@@ -71,13 +77,18 @@ export class LRUCache {
       maxAge = 0,
       maxBytes = 0,
       sizeOf = null,
+      heldBytes = null,
       onEvict = null
     } = options;
-    if (!Number.isFinite(maxBytes) || maxBytes < 0) {
-      throw new RangeError('LRUCache maxBytes must be a non-negative finite number');
+    const budgeted = typeof maxBytes === 'function' || maxBytes > 0;
+    if (typeof maxBytes !== 'function' && (!Number.isFinite(maxBytes) || maxBytes < 0)) {
+      throw new RangeError('LRUCache maxBytes must be a non-negative finite number or a function');
     }
-    if (maxBytes > 0 && typeof sizeOf !== 'function') {
+    if (budgeted && typeof sizeOf !== 'function') {
       throw new TypeError('LRUCache maxBytes requires a sizeOf function');
+    }
+    if (heldBytes !== null && (!budgeted || typeof heldBytes !== 'function')) {
+      throw new TypeError('LRUCache heldBytes is a function, with maxBytes');
     }
 
     /** @type {number} Maximum cache size */
@@ -86,11 +97,14 @@ export class LRUCache {
     /** @type {number} Maximum age in ms (0 = no expiration) */
     this.maxAge = maxAge;
 
-    /** @type {number} Byte budget (0 = unbounded) */
-    this.maxBytes = maxBytes;
+    /** @private @type {number|(() => number)} Byte budget (0 = unbounded) */
+    this._maxBytes = maxBytes;
 
     /** @type {Function|null} Value byte size, used with maxBytes */
-    this._sizeOf = maxBytes > 0 ? sizeOf : null;
+    this._sizeOf = budgeted ? sizeOf : null;
+
+    /** @private @type {(() => number)|null} Bytes held beside the entries */
+    this._heldBytes = heldBytes;
 
     /** @type {number} Total byte size of the held values */
     this._bytes = 0;
@@ -163,18 +177,47 @@ export class LRUCache {
    * cache.set('user:123', userData)
    *      .set('user:456', otherData);
    */
+  /**
+   * The byte budget now (0 = unbounded).
+   * @returns {number}
+   */
+  get maxBytes() {
+    const budget = typeof this._maxBytes === 'function' ? this._maxBytes() : this._maxBytes;
+    if (!Number.isFinite(budget) || budget < 0) {
+      throw new RangeError('LRUCache maxBytes must be a non-negative finite number');
+    }
+    return budget;
+  }
+
+  /**
+   * What the entries may hold now: the budget less the bytes held beside them.
+   * @returns {number}
+   * @private
+   */
+  _entryBudget() {
+    const held = this._heldBytes === null ? 0 : this._heldBytes();
+    if (!Number.isFinite(held) || held < 0) {
+      throw new RangeError('LRUCache heldBytes must return a non-negative finite number');
+    }
+    return this.maxBytes - held;
+  }
+
   set(key, value) {
     // If key exists, delete it first (will be re-added at end)
     this._remove(key);
 
     const bytes = this._sizeOf === null ? 0 : this._sizeOf(value);
+    const budget = this._sizeOf === null ? Infinity : this._entryBudget();
     if (this._sizeOf !== null) {
       if (!Number.isFinite(bytes) || bytes < 0) {
         throw new RangeError('LRUCache sizeOf must return a non-negative finite number');
       }
       // A value that alone exceeds the budget would evict everything else and
       // still overrun it, so it is simply not kept.
-      if (bytes > this.maxBytes) return this;
+      if (bytes > budget) {
+        this.trim();
+        return this;
+      }
     }
 
     // Evict oldest while at capacity, in entries or in bytes
@@ -182,7 +225,7 @@ export class LRUCache {
       this._cache.size > 0 &&
       (
         this._cache.size >= this.maxSize ||
-        (this._sizeOf !== null && this._bytes + bytes > this.maxBytes)
+        this._bytes + bytes > budget
       )
     ) {
       const oldestKey = this._cache.keys().next().value;
@@ -199,6 +242,24 @@ export class LRUCache {
     this._bytes += bytes;
 
     return this;
+  }
+
+  /**
+   * Evict the least recently used entries until what is held fits the
+   * budget: after the budget lowered or the bytes held beside the entries
+   * grew.
+   * @returns {number} Entries evicted
+   */
+  trim() {
+    if (this._sizeOf === null) return 0;
+    const budget = this._entryBudget();
+    let evicted = 0;
+    while (this._cache.size > 0 && this._bytes > budget) {
+      const oldestKey = this._cache.keys().next().value;
+      this._evict(oldestKey, this._cache.get(oldestKey)?.value);
+      evicted++;
+    }
+    return evicted;
   }
 
   /**

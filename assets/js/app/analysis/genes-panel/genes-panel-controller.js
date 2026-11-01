@@ -22,10 +22,10 @@ import {
 import { ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
 import { residencyBudgetBytes } from '../../../data/memory-budget.js';
-import { getMemoryMonitor } from '../shared/memory-monitor.js';
-import { filterGenes, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
+import { createGeneIndex, filterGenes, geneIdentities, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
 import { geneMomentsFor } from '../shared/gene-moments-cache.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { cellsReadFor, geneSampleUse, maskReadFor } from '../shared/gene-sample-cells.js';
 
 /** Synthetic id of a category's group. */
 export const GROUP_ID_PREFIX = 'category-code:';
@@ -52,6 +52,25 @@ function scopeDigest(scope) {
   return `${count}:${h1.toString(16)}:${h2.toString(16)}`;
 }
 
+/**
+ * Each column of a run, as a result says it used the gene sample
+ * (`geneSampleUse`): its cells among the cells genes are read for (`count`)
+ * of its cells in the scope's every open cell (`whole`, `describeGroups`
+ * without the sample; a pooled column's members summed).
+ *
+ * @param {ReadonlyArray<{groupName: unknown, count: number, members: number[]}>} columns
+ * @param {ReadonlyArray<{code: number, count: number}>} whole
+ * @returns {Array<{name: string, used: number, of: number}>}
+ */
+export function groupsInGeneSample(columns, whole) {
+  const of = new Map(whole.map(group => [group.code, group.count]));
+  return columns.map(column => ({
+    name: String(column.groupName),
+    used: column.count,
+    of: column.members.reduce((sum, code) => sum + (of.get(code) ?? 0), 0),
+  }));
+}
+
 /** The label a category is chosen by in the options (`testGroups`, `referenceGroup`). */
 export function categoryOptionId(label) {
   return String(label);
@@ -69,11 +88,6 @@ export class GenesPanelController {
     this._clusteringEngine = new ClusteringEngine();
     this._cache = new MarkerCache({ identity: this._getCacheIdentity() });
     this._closed = false;
-    this._pressureUnsubscribe = getMemoryMonitor().onMemoryPressure(event => {
-      if (event?.level === 'warning' || event?.level === 'cleanup' || event?.level === 'critical') {
-        this._cache.trim();
-      }
-    });
   }
 
   _assertOpen() {
@@ -88,15 +102,25 @@ export class GenesPanelController {
    * The cells a "Cells" choice scopes a run to: null for every cell, else one
    * byte a cell.
    * @param {string} cells - 'all', 'visible' or 'page:<id>'
+   * @param {{cells: number}|null} [sample] - Genes are read for a sample of
+   *   the open cells (`genes`, the open cells' now by default): the scope is
+   *   its cells among them (`shared/gene-sample-cells.js`); null for the
+   *   scope's every open cell
    * @returns {Uint8Array|null}
    */
-  scopeOf(cells) {
-    if (cells === 'all') return null;
-    if (cells === 'visible') return this.dataLayer.getVisibleCellMask();
+  scopeOf(cells, sample = this.dataLayer.state?.getGeneSample?.() ?? null) {
+    if (cells === 'all') {
+      if (sample === null) return null;
+      const scope = new Uint8Array(this.dataLayer.state.pointCount);
+      scope.fill(1, 0, sample.cells);
+      return scope;
+    }
+    if (cells === 'visible') return maskReadFor(this.dataLayer.getVisibleCellMask(), sample);
     if (typeof cells === 'string' && cells.startsWith('page:')) {
       const [{ cellIndices }] = this.dataLayer.getPageCells([cells.slice('page:'.length)]);
       const scope = new Uint8Array(this.dataLayer.state.pointCount);
-      for (let i = 0; i < cellIndices.length; i++) scope[cellIndices[i]] = 1;
+      const read = cellsReadFor(cellIndices, sample);
+      for (let i = 0; i < read.length; i++) scope[read[i]] = 1;
       return scope;
     }
     throw new RangeError(`Unknown cell scope ${String(cells)}`);
@@ -272,7 +296,7 @@ export class GenesPanelController {
       const hvg = await this.dataLayer.state.varFieldLoader.highlyVariableGenes();
       only = new Set(Array.isArray(hvg) ? hvg : []);
     } else if (options.onlyGenes === 'list') {
-      only = new Set(resolveGenes(parseGeneText(options.onlyGenesList), all).resolved);
+      only = new Set(resolveGenes(parseGeneText(options.onlyGenesList), createGeneIndex(all, geneIdentities(this.dataLayer.state?.varData))).resolved);
     }
     return filterGenes(all, { exclude: options.excludeGenes, pattern: options.excludePattern, only });
   }
@@ -306,15 +330,24 @@ export class GenesPanelController {
    * @param {Object} params.options - The marker options record
    * @param {import('../../jobs/cancellable-job.js').CancellableJob|null} [params.job]
    * @param {AbortSignal|null} [params.signal]
+   * @param {Object|null} [params.sample] - A first pass's cells
+   *   (`shared/progressive-cells.js`); null for every cell
    * @returns {Promise<{stats: Object, plan: Object, metadata: Object}>}
    */
-  async runAnalysis({ options, job = null, signal = job?.signal ?? null }) {
+  async runAnalysis({ options, job = null, signal = job?.signal ?? null, sample = null }) {
     this._assertOpen();
     this._cache.setIdentity(this._getCacheIdentity());
     const startTime = performance.now();
     job?.step(ANALYSIS_PHASES.INIT);
-    const scope = this.scopeOf(options.cells);
+    // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
+    const scope = sample === null ? this.scopeOf(options.cells) : sample.mask(this.scopeOf(options.cells));
     const described = await this.describeGroups(options.groupBy, scope);
+    if (signal?.aborted) throw signal.reason;
+    // Genes read for a sample of the open cells: each group's cells in the
+    // scope's every open cell too, for the result to say how many of them
+    // it used (`geneSampleUse`) and why a group is skipped.
+    const geneSample = this.dataLayer.state?.getGeneSample?.() ?? null;
+    const whole = geneSample === null ? null : await this.describeGroups(options.groupBy, this.scopeOf(options.cells, null));
     if (signal?.aborted) throw signal.reason;
     const plan = this.plan(options, described);
     if (plan.blocker !== null) throw new Error(plan.blocker);
@@ -352,8 +385,12 @@ export class GenesPanelController {
     let stats = this._cache.get(cacheParams);
     const cached = stats !== null;
     if (!cached) {
-      // Gene moments of the mapped matrix serve the module score later.
-      const moments = matrix.read === null ? geneMomentsFor(this.dataLayer.getDatasetGeneration()) : null;
+      // Gene moments of the mapped matrix serve the module score later
+      // (over every cell: not while genes are read for a sample of them,
+      // whose moments the module score reads over the sample's cells).
+      const moments = matrix.read === null && (this.dataLayer.state?.getGeneSample?.() ?? null) === null
+        ? geneMomentsFor(this.dataLayer.getDatasetGeneration())
+        : null;
       stats = await this._engine.discoverMarkers({
         grouping: {
           codes: described.codes,
@@ -396,6 +433,9 @@ export class GenesPanelController {
         groupBy: options.groupBy,
         matrix: options.matrix,
         matrixLabel: matrix.label,
+        // The cells genes are read for, when a sample (the scope is within
+        // it), and each group's cells among them of its cells in the scope.
+        geneSample: geneSampleUse(geneSample, whole === null ? [] : groupsInGeneSample(columns, whole.groups)),
         method,
         pConvention,
         correction: options.correction,
@@ -447,8 +487,6 @@ export class GenesPanelController {
     if (this._closed) return Promise.resolve();
     this._closed = true;
     this._cache.close();
-    this._pressureUnsubscribe?.();
-    this._pressureUnsubscribe = null;
     return Promise.resolve();
   }
 

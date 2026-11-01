@@ -38,9 +38,10 @@ test('weighted rendering uses one deterministic relative-strength encoding', () 
     Array.from(edgeListOf(extractConnectivityEdges(graphOf(...weights.map(Math.fround), Float32Array), 3)).strength),
     Array.from(edgeListOf(extractConnectivityEdges(graphOf(...weights.map(Math.fround)), 3)).strength)
   );
-  assert.throws(
-    () => extractConnectivityEdges(graphOf(Number.MIN_VALUE, Number.MAX_VALUE), 3),
-    /Float32 rendering precision/i
+  // An edge whose strength underflows float32 is still drawn, as the faintest (a normal float32).
+  assert.deepEqual(
+    Array.from(edgeListOf(extractConnectivityEdges(graphOf(Number.MIN_VALUE, Number.MAX_VALUE), 3)).strength),
+    [2 ** -126, 1]
   );
 });
 
@@ -64,9 +65,10 @@ test('instanced edge shaders read each shown edge\'s strength from its instance 
     new URL('../assets/js/rendering/connectivity-edge-selection.js', import.meta.url),
     'utf8'
   );
-  // The records arrive from the reader worker with each edge's relative
-  // strength's bits, and the selection copies them as they are.
-  assert.match(selectionSource, /out\[write \+ 2\] = records\[(read|at) \+ 2\];/);
+  // The reader worker hands each edge's relative strength over; the
+  // selection copies its bits as they are, by edge.
+  assert.match(selectionSource, /out\[write \+ 2\] = strengthBits\[edge\];/);
+  assert.doesNotMatch(selectionSource, /Math\.fround|maxWeight/);
   // The strengths are the payload's own: nothing is derived on the page.
   for (const file of ['connectivity-edge-selection.js', 'connectivity-edge-layer.js']) {
     const source = await readFile(new URL(`../assets/js/rendering/${file}`, import.meta.url), 'utf8');

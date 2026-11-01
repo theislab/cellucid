@@ -1392,6 +1392,44 @@ button.analysis-chip {
   color: var(--color-info-text);
 }
 
+/* How the open cells of a result were chosen: under the result, wrapping
+   in a narrow panel (a stratifying field's name can be long). */
+.analysis-cell-choice {
+  align-self: flex-start;
+  max-width: 100%;
+  white-space: normal;
+}
+
+/* The chip and the gene sample's line under a result, stacked; hidden
+   while neither has anything to say. */
+.analysis-cell-choice-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.analysis-cell-choice-row[hidden] {
+  display: none;
+}
+
+/* The gene sample a result read genes for: one warning-toned line that
+   fits the narrowest panel (compact counts), a link to Session › Open data:
+   Genes read for, with its exact words in the (i) beside it. */
+.analysis-gene-read .gene-read-note-row {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 0 var(--space-1-5);
+  border-radius: var(--radius-full);
+  background: var(--color-warning-soft);
+}
+
+.analysis-gene-read .gene-read-link {
+  color: var(--color-warning-text);
+  line-height: 1.6;
+}
+
 /* Run: one muted line above it says why it is disabled; nothing below it. */
 .analysis-run-row {
   display: flex;

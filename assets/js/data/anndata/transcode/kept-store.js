@@ -7,6 +7,7 @@
  */
 
 import { mappedStore } from '../../../formats/zarr/stores/mapped.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
 
 function toBase64(bytes) {
   let text = '';
@@ -16,7 +17,7 @@ function toBase64(bytes) {
 
 function fromBase64(text) {
   const binary = atob(text);
-  const bytes = new Uint8Array(binary.length);
+  const bytes = allocateTypedArray(Uint8Array, binary.length, 'Kept store entries');
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }

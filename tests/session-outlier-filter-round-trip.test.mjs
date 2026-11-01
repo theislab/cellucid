@@ -19,6 +19,8 @@ import {
   DataStateColorMethods,
 } from '../assets/js/app/state/managers/color-manager.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { drawn, rgbAt } from './helpers/category-state.mjs';
+import { withCategoryChanges, withCategoryColor, withCategoryVisibility } from '../assets/js/app/utils/category-state.js';
 
 function createHarness() {
   const leiden = {
@@ -58,11 +60,15 @@ function createHarness() {
     },
     setVisibilityForCategory(field, categoryIndex, visible) {
       this.ensureCategoryMetadata(field);
-      field._categoryVisible[categoryIndex] = visible;
+      withCategoryVisibility(field, categoryIndex, visible);
     },
     setColorForCategory(field, categoryIndex, color) {
       this.ensureCategoryMetadata(field);
-      field._categoryColors[categoryIndex] = [...color];
+      withCategoryColor(field, categoryIndex, color);
+    },
+    setCategoryStates(field, changes) {
+      this.ensureCategoryMetadata(field);
+      withCategoryChanges(field, changes);
     },
   };
   return { state, leiden, score };

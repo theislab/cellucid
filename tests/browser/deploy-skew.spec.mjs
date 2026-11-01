@@ -89,6 +89,27 @@ async function deployNextModule(page, path, body) {
   }));
 }
 
+/**
+ * Start the analysis data worker as the page does, through its worker-start
+ * module and worker scripts (the instances the page bundle imports too), and
+ * say whether its script started: it answers the worker pool's first message
+ * (`INIT`, acknowledged by `INIT_ACK`), or its script fails to load (`error`).
+ */
+async function startDataWorker() {
+  const { startWorker } = await import('/assets/js/workers/worker-script.js');
+  const { dataWorkerScript } = await import('/assets/workers/scripts.js');
+  const worker = startWorker(dataWorkerScript(), { type: 'module', name: 'cellucid-data' });
+  const started = await new Promise(resolve => {
+    worker.addEventListener('message', event => {
+      if (event.data?.type === 'INIT_ACK') resolve(true);
+    });
+    worker.addEventListener('error', () => resolve(false));
+    worker.postMessage({ type: 'INIT', payload: { id: 0 } });
+  });
+  worker.terminate();
+  return started;
+}
+
 async function openAppAndBenchmarkReady(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
@@ -235,11 +256,14 @@ test('a deployed page starts every worker from its bundle and loads nothing of a
     ...(nested ? [WORKER_SCRIPTS.get('decodeWorker').bundle] : []),
   ]));
 
-  // Every script is the page's own at the URL naming its bytes, or a bundle;
-  // no worker source, and nothing a worker imports, is asked for by path.
+  // Every script is the page's own at the URL naming its bytes, or a bundle
+  // (a worker's, or a file of the page bundle, assets/page/, whose name names
+  // its bytes); no worker source, and nothing a worker imports, is asked for
+  // by its plain path.
   const bundles = new Set([...WORKER_SCRIPTS.values()].map(({ bundle }) => bundle));
-  expect(requests.filter(({ path }) => WORKER_SOURCES.has(path)).map(({ path }) => path)).toEqual([]);
-  expect(requests.filter(({ path, versioned }) => !versioned && !bundles.has(path)).map(({ path }) => path)).toEqual([]);
+  const pageBundleFile = path => /^\/assets\/page\/[a-z0-9-]+\.[A-Z2-7]{8}\.js$/.test(path);
+  expect(requests.filter(({ path, versioned }) => !versioned && WORKER_SOURCES.has(path)).map(({ path }) => path)).toEqual([]);
+  expect(requests.filter(({ path, versioned }) => !versioned && !bundles.has(path) && !pageBundleFile(path)).map(({ path }) => path)).toEqual([]);
 });
 
 test('a worker started after a deploy says Cellucid was updated, while the worker already running keeps working', async ({ page }) => {
@@ -259,19 +283,10 @@ test('a worker started after a deploy says Cellucid was updated, while the worke
     body: '<!doctype html><title>File not found</title>',
   }));
 
-  // The analysis workers start now, from the bundle this page names.
-  const started = await page.evaluate(async () => {
-    const { WorkerPool } = await import('/assets/js/app/analysis/compute/worker-pool.js');
-    const pool = new WorkerPool({ poolSize: 1, defaultTimeout: 10_000 });
-    try {
-      await pool.init();
-      return true;
-    } catch {
-      return false;
-    } finally {
-      pool.terminate();
-    }
-  });
+  // An analysis worker starts now, from the bundle this page names, through
+  // the one worker-start module the page and its bundle share (imported at
+  // its own versioned URL: build-page-bundle.mjs, PAGE_EXTERNALS).
+  const started = await page.evaluate(startDataWorker);
   expect(started).toBe(false);
 
   const notice = page.locator('#cellucid-code-updated');
@@ -315,12 +330,7 @@ test('a worker that fails to start on the current build is not called an update'
   });
   await page.route(`**${WORKER_SCRIPTS.get('dataWorker').bundle}`, route => route.abort());
 
-  await page.evaluate(async () => {
-    const { WorkerPool } = await import('/assets/js/app/analysis/compute/worker-pool.js');
-    const pool = new WorkerPool({ poolSize: 1, defaultTimeout: 10_000 });
-    await pool.init().catch(() => {});
-    pool.terminate();
-  });
+  await page.evaluate(startDataWorker);
 
   await expect.poll(() => checked).toBe(true);
   await expect(page.locator('#cellucid-code-updated')).toHaveCount(0);

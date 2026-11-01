@@ -51,15 +51,6 @@ function nextMessage(port) {
   });
 }
 
-/** Whether a port receives anything within a few turns. */
-async function receivesNothing(port) {
-  let received = false;
-  port.onmessage = () => { received = true; };
-  for (let turn = 0; turn < 20; turn++) await new Promise(resolve => setImmediate(resolve));
-  port.onmessage = null;
-  return !received;
-}
-
 test('the reader delivers a task\'s genes to its worker and answers only their bytes', async () => {
   const { call } = await openReader();
   const channels = [new MessageChannel(), new MessageChannel()];
@@ -92,10 +83,13 @@ test('the reader delivers a task\'s genes to its worker and answers only their b
   assert.equal((await call('replaceRoutePort', 'route-1', 1, replacement.port1, 1)).reply.error, undefined);
   const stale = await call('deliverColumns', 'X', [1], null, { route: 'route-1', runs: [{ id: 9, worker: 1, generation: 0, first: 0, last: 1 }] });
   assert.equal(stale.reply.error, undefined);
-  assert.ok(await receivesNothing(replacement.port2), 'a delivery made for the replaced worker never comes');
+  // A port delivers in order, and holds what arrives before it is listened
+  // to: the first message on the new port is the delivery made for it, so
+  // the one made before it for the replaced worker never came (however
+  // late messages cross).
   const fresh = nextMessage(replacement.port2);
   await call('deliverColumns', 'X', [1], null, { route: 'route-1', runs: [{ id: 10, worker: 1, generation: 1, first: 0, last: 1 }] });
-  assert.equal((await fresh).id, 10);
+  assert.equal((await fresh).id, 10, 'a delivery made for the replaced worker never comes');
 
   assert.equal((await call('closeRoute', 'route-1')).reply.error, undefined);
   const closed = await call('deliverColumns', 'X', [1], null, { route: 'route-1', runs: [{ id: 11, worker: 0, generation: 0, first: 0, last: 1 }] });
@@ -237,9 +231,9 @@ test('the analysis worker runs a task on its delivery, whichever arrives first',
   assert.deepEqual(closed.result, { released: true });
   const failed = await waiting;
   assert.equal(failed.success, false);
-  assert.match(failed.error, /closed before its genes arrived/);
+  assert.match(failed.error.message, /closed before its genes arrived/);
   const unknown = await worker.send('MARKERS_COMPUTE_GENES', { ...base, delivery: { route: 'r', id: 5, generation: 1 } });
-  assert.match(unknown.error, /No gene route 'r'/);
+  assert.match(unknown.error.message, /No gene route 'r'/);
   channel.port1.close();
   replacement.port1.close();
 });

@@ -8,7 +8,9 @@
  * a bottom sheet instead:
  *
  * - full width, at one of three heights — 40%, 75% or all of the screen —
- *   chosen by dragging, tapping or arrowing its 24 px grip;
+ *   chosen by dragging, tapping or arrowing its 24 px grip; while the
+ *   panel's bar shows, the sheet stands on it, no taller than the screen
+ *   above it, so the way back to the panel is never covered;
  * - a tap on its header collapses it to the header, as anywhere else;
  * - one sheet shows at a time: the frontmost window. When there are several,
  *   a tab strip above the sheet names them all and brings one to the front.
@@ -75,6 +77,8 @@ export function createSheetLayout({ floatingRoot, StyleManager, panelFrame, rais
     const frame = panelFrame(details);
     if (frame === null) return;
     const percent = Math.round(SNAP_FRACTIONS[clamped] * 100);
+    // A share of the screen; standing on the panel's bar while it shows,
+    // the sheet is no taller than the screen above it (_analysis-windows.css).
     StyleManager.setVariable(frame, '--sheet-height', `${percent}dvh`);
     const grip = frame.querySelector(':scope > .floating-sheet-grip');
     if (grip !== null) {
@@ -225,6 +229,9 @@ export function createSheetLayout({ floatingRoot, StyleManager, panelFrame, rais
         event.preventDefault();
         const pointerId = event.pointerId;
         const startY = event.clientY;
+        // The sheet's foot: the top of the panel's bar while it shows, else
+        // the bottom of the screen. Its height is measured up from there.
+        const foot = frame.getBoundingClientRect().bottom;
         let travelled = 0;
         capturePointer(grip, pointerId);
         frame.classList.add('resizing');
@@ -233,7 +240,7 @@ export function createSheetLayout({ floatingRoot, StyleManager, panelFrame, rais
           travelled = Math.max(travelled, Math.abs(move.clientY - startY));
           if (travelled < TAP_TRAVEL_PX) return;
           details.open = true;
-          const height = Math.min(Math.max(window.innerHeight - move.clientY, 0), window.innerHeight);
+          const height = Math.min(Math.max(foot - move.clientY, 0), foot);
           StyleManager.setVariable(frame, '--sheet-height', `${Math.round(height)}px`);
         };
         const onUp = (up) => {
@@ -249,7 +256,7 @@ export function createSheetLayout({ floatingRoot, StyleManager, panelFrame, rais
             setSnap(details, (snapOf(details) + 1) % SNAP_FRACTIONS.length);
             return;
           }
-          const fraction = (window.innerHeight - up.clientY) / window.innerHeight;
+          const fraction = (foot - up.clientY) / window.innerHeight;
           setSnap(details, nearestSnap(fraction));
         };
         grip.addEventListener('pointermove', onMove, { signal });

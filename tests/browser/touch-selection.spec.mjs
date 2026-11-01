@@ -14,7 +14,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openPhoneSheet } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -34,6 +34,9 @@ function observeProductErrors(page) {
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  // A phone opens on the plot: the panel these tests drive is opened from
+  // its bar first, as a person does.
+  await openPhoneSheet(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
@@ -59,7 +62,9 @@ async function closeSidebar(page) {
 }
 
 async function openSidebar(page) {
-  await page.locator('#sidebar-toggle').tap();
+  // A phone's closed panel is the bar at the foot of the screen; elsewhere ☰.
+  const bar = page.locator('#phone-sheet-bar');
+  await ((await bar.isVisible()) ? bar : page.locator('#sidebar-toggle')).tap();
   await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
 }
 

@@ -13,38 +13,55 @@
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
+import { isExplainedFailure } from '../../../../data/data-source.js';
 import { getReadActivityLog } from '../../../../data/read-activity-log.js';
-import { abortReasonOf as abortReason, awaitWithSignal } from '../../../jobs/cancellable-job.js';
+import { factsText, geneReadPlanFacts } from '../../../../data/gene-read-plan.js';
+import { formatCount, formatCountOf, formatRemaining } from '../../../../utils/format-units.js';
+import { abortReason, awaitWithSignal, cancel, cancelled, cancellationKind, isCancellation, onAbort } from '../../../../utils/abort.js';
+import { cellsSteady, trackCellWork } from '../../../../data/open-cells-work.js';
+import { isColumnForm, requireColumnForm, unreadTailOf } from '../../../../data/column-forms.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { adoptScientificFieldDescriptors } from './descriptor-ownership.js';
+import { growFieldCategories } from './category-growth.js';
 import { requireOutlierQuantiles } from '../color-outliers.js';
 import {
   FetchScheduler,
   requirePriority
 } from '../../../../data/fetch-scheduler.js';
 import {
+  compactedColumn,
   releaseInactiveFieldsOverBudget,
   touchFieldResidency,
 } from './residency.js';
+import { markReported } from '../../../../utils/errors.js';
+
+/**
+ * Say that a field or gene could not be read: why, in one sentence (a
+ * failure written for the person is said as it is; any other is named, its
+ * raw text under Details), and Try again, which reads it again and shows it
+ * (the load that failed was the person's to see it).
+ *
+ * @param {Object} notifications
+ * @param {string} what - `field cell_type`, `gene CD3E`
+ * @param {unknown} error
+ * @param {() => void} again
+ */
+function announceLoadFailure(notifications, what, error, again) {
+  // Said here, once: a caller that would say it again skips it (`isReported`).
+  markReported(error);
+  const raw = error instanceof Error ? error.message : String(error);
+  notifications.error(
+    isExplainedFailure(error) ? `Cellucid could not read ${what}: ${raw}` : `Cellucid could not read ${what}.`,
+    {
+      category: 'data',
+      ...(isExplainedFailure(error) ? {} : { details: raw }),
+      action: { label: 'Try again', run: again }
+    }
+  );
+}
 
 const sharedLoadOwners = new WeakMap();
-
-const DATASET_FIELD_LOAD_SUPERSEDED_CODE =
-  'CELLUCID_DATASET_FIELD_LOAD_SUPERSEDED';
-
-export function createDatasetFieldLoadSupersededError() {
-  const error = new Error(
-    'Field loading was superseded by a replacement dataset generation.'
-  );
-  error.name = 'AbortError';
-  error.code = DATASET_FIELD_LOAD_SUPERSEDED_CODE;
-  return error;
-}
-
-export function isDatasetFieldLoadSupersededError(error) {
-  return error?.code === DATASET_FIELD_LOAD_SUPERSEDED_CODE;
-}
 
 /** @type {WeakMap<object, {generation: number, scheduler: FetchScheduler}>} */
 const fetchSchedulers = new WeakMap();
@@ -59,7 +76,7 @@ function fetchSchedulerOf(state) {
   const generation = readDatasetGeneration(state);
   let entry = fetchSchedulers.get(state);
   if (entry?.generation !== generation) {
-    entry?.scheduler.close(createDatasetFieldLoadSupersededError());
+    entry?.scheduler.close(cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.'));
     entry = { generation, scheduler: new FetchScheduler() };
     fetchSchedulers.set(state, entry);
   }
@@ -74,7 +91,7 @@ function requireOpenMatrix(state, matrix) {
   ) {
     throw new TypeError('An expression matrix is read through its openExpressionMatrix() handle.');
   }
-  if (matrix.generation !== readDatasetGeneration(state)) throw createDatasetFieldLoadSupersededError();
+  if (matrix.generation !== readDatasetGeneration(state)) throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
   return matrix;
 }
 
@@ -114,6 +131,8 @@ function createSharedLoadOwner() {
     settled: false,
     task: null,
     waiters: new Set(),
+    // Who hears a gene on more cells as they are read (`onPartial`).
+    partials: new Set(),
     readKey: `field-load-${nextSharedLoadKey++}`
   };
 }
@@ -129,28 +148,30 @@ function subscribeToSharedLoad(owner, signal) {
   }
   const lease = {};
   let released = false;
+  let stopListening = () => {};
   const release = () => {
     if (released) return;
     released = true;
-    signal?.removeEventListener('abort', release);
+    stopListening();
     owner.waiters.delete(lease);
     if (
       owner.settled === false
       && owner.waiters.size === 0
       && owner.controller.signal.aborted === false
     ) {
+      // The person's Cancel (the last to leave) says the load was stopped by
+      // them; any other way of leaving -- a supersession, a failure the
+      // waiter's own signal carried -- is the load no longer wanted, never a
+      // failure of the load itself.
       owner.controller.abort(
-        signal?.aborted === true
-          ? abortReason(signal)
-          : new DOMException(
-              'Field loading has no remaining consumers.',
-              'AbortError'
-            )
+        signal?.aborted === true && isCancellation(signal.reason)
+          ? signal.reason
+          : cancelled('superseded', 'Field loading has no remaining consumers.')
       );
     }
   };
   owner.waiters.add(lease);
-  signal?.addEventListener('abort', release, { once: true });
+  stopListening = onAbort(signal, release);
   return awaitWithSignal(owner.task, signal).finally(release);
 }
 
@@ -166,7 +187,7 @@ function observeSharedLoad(field, owner) {
 
 function requireCurrentSharedLoad(field, task) {
   if (field._loadingPromise !== task) {
-    throw createDatasetFieldLoadSupersededError();
+    throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
   }
 }
 
@@ -177,7 +198,7 @@ function abortSharedLoad(field, message) {
     && owner.settled === false
     && owner.controller.signal.aborted === false
   ) {
-    owner.controller.abort(new DOMException(message, 'AbortError'));
+    owner.controller.abort(cancelled('closed', message));
   }
 }
 
@@ -230,7 +251,7 @@ function isCurrentLoadOwner(state, owner) {
 
 function assertCurrentLoadOwner(state, owner) {
   if (!isCurrentLoadOwner(state, owner)) {
-    throw createDatasetFieldLoadSupersededError();
+    throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
   }
 }
 
@@ -247,24 +268,37 @@ function validateLoadedLength(values, pointCount, message) {
 /**
  * Give a categorical field the categories its first load found (an AnnData
  * column publishes none until it is read: a string or boolean column's are
- * its distinct values, a categorical's its stored dictionary), with the
- * colours its file stores for them, shown under their display names. A field
- * whose categories are known keeps them: the dataset codes a column one way
- * for its whole life.
+ * its labels among the open cells, a categorical's its stored dictionary,
+ * or, when that has more categories than there are open cells, the ones its
+ * open cells hold, `storedCategoryCount` of them stored), with their colours
+ * (the file's for a categorical, the ones its labels name for a text
+ * column), shown under their display names. A field whose categories are
+ * known keeps them: the dataset codes a column one way for its whole life,
+ * a text column's (and a categorical coded by the categories its open cells
+ * hold) growing by label when cells opened since hold labels it had not
+ * shown (`category-growth.js`).
  */
-function adoptFoundCategories(state, field, categories, palette = null) {
-  if (categories === undefined || field.categories !== null) return;
+function adoptFoundCategories(state, field, categories, palette = null, storedCategoryCount = undefined) {
+  if (categories === undefined) return;
   if (!Array.isArray(categories)) {
     throw new TypeError(`Field "${field.key}" found categories must be an array.`);
   }
+  if (storedCategoryCount !== undefined) {
+    // More categories stored than cells open: its categories are the ones
+    // its open cells hold (a saved category it lacks is held until cells
+    // holding it open, `pending-categories.js`), of `storedCategoryCount`.
+    field.discovered = true;
+    field.storedCategoryCount = storedCategoryCount;
+  }
+  const owner = { source: FieldSource.OBS, originalKey: field._originalKey || field.key, label: `obs field "${field.key}"` };
+  if (field.categories !== null) {
+    const shown = Object.hasOwn(field, '_originalCategories') ? field._originalCategories : field.categories;
+    if (categories.length > shown.length) growFieldCategories(state, field, { categories, palette }, owner);
+    return;
+  }
   if (Array.isArray(palette) && palette.length === categories.length) field.palette = palette;
   field.categories = [...categories];
-  state._applyCategoryOverlay(
-    field,
-    FieldSource.OBS,
-    field._originalKey || field.key,
-    `obs field "${field.key}"`
-  );
+  state._applyCategoryOverlay(field, owner.source, owner.originalKey, owner.label);
 }
 
 export class FieldLoadingMethods {
@@ -274,6 +308,8 @@ export class FieldLoadingMethods {
 
   setVarFieldLoader(loaderFn) {
     this.varFieldLoader = loaderFn;
+    // The open cells its genes are read for (`gene-sample.js`).
+    void this.refreshGeneSample();
   }
 
   getDatasetGeneration() {
@@ -292,6 +328,8 @@ export class FieldLoadingMethods {
     }));
     this.varData = { ...geneList, fields: normalizedFields };
     this._varFieldDataCache.clear();
+    // The genes listed: the open cells they are read for (`gene-sample.js`).
+    void this.refreshGeneSample();
   }
 
   /**
@@ -308,9 +346,24 @@ export class FieldLoadingMethods {
     } = options;
     const signal = requireAbortSignal(rawSignal);
     if (signal?.aborted) throw abortReason(signal);
+    // The open cells being changed in place: loaded on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await awaitWithSignal(steady, signal);
     const field = this.obsData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Obs field ${fieldIndex} is not available.`);
     const cacheKey = field._originalKey || field.key || String(fieldIndex);
+
+    // A field that holds its own values (a pushed column) has nothing to
+    // read: its values come with it, or with its session chunk.
+    if (
+      field.loaded !== true &&
+      field._isUserDefined === true &&
+      field.kind === FieldKind.CONTINUOUS &&
+      field._sourceField === null
+    ) {
+      throw new Error(`The values of "${field.key}" were not restored with the session.`);
+    }
 
     // User-defined continuous aliases are materialized by copying from their source field.
     if (
@@ -337,7 +390,7 @@ export class FieldLoadingMethods {
       if (signal?.aborted) throw abortReason(signal);
       assertCurrentLoadOwner(this, aliasOwner);
       if (this.obsData?.fields?.[sourceIndex] !== sourceField) {
-        throw createDatasetFieldLoadSupersededError();
+        throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
       }
       const values = sourceField?.values;
       if (!values || typeof values.length !== 'number') {
@@ -386,7 +439,7 @@ export class FieldLoadingMethods {
       if (cached.values) field.values = cached.values;
       if (cached.codes) field.codes = cached.codes;
       if (cached.outlierQuantiles) field.outlierQuantiles = cached.outlierQuantiles;
-      adoptFoundCategories(this, field, cached.categories, cached.palette);
+      adoptFoundCategories(this, field, cached.categories, cached.palette, cached.storedCategoryCount);
       field.loaded = true;
       touchFieldResidency(this, FieldSource.OBS, cacheKey);
       return field;
@@ -407,12 +460,15 @@ export class FieldLoadingMethods {
       source: FieldSource.OBS
     });
 
-    // Show loading notification (unless silent mode for batch operations)
-    const notifications = getNotificationCenter();
-    const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, { category: 'data' });
-
     const sharedOwner = createSharedLoadOwner();
     const sharedSignal = sharedOwner.controller.signal;
+    // Its notification (unless silent, batch operations) can stop it, as a
+    // gene's can: at 10M cells a field is a long read too.
+    const notifications = getNotificationCenter();
+    const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, {
+      category: 'data',
+      onCancel: () => cancel(sharedOwner.controller, 'user', `Loading "${field.key}" was cancelled.`)
+    });
     let task;
     task = Promise.resolve()
       .then(() => {
@@ -460,7 +516,7 @@ export class FieldLoadingMethods {
         // The categories a column has are found by its first load when its
         // field list could not state them (data-loaders.js).
         const foundCategories = loadedData?.categories;
-        adoptFoundCategories(this, field, foundCategories, loadedData?.palette ?? null);
+        adoptFoundCategories(this, field, foundCategories, loadedData?.palette ?? null, loadedData?.storedCategoryCount);
         if (nextValues !== undefined) field.values = nextValues;
         if (nextCodes !== undefined) field.codes = nextCodes;
         if (nextOutlierQuantiles !== undefined) {
@@ -477,7 +533,7 @@ export class FieldLoadingMethods {
           outlierQuantiles: field.outlierQuantiles,
           ...(foundCategories === undefined
             ? {}
-            : { categories: foundCategories, palette: loadedData?.palette ?? null })
+            : { categories: foundCategories, palette: loadedData?.palette ?? null, storedCategoryCount: loadedData?.storedCategoryCount })
         });
         touchFieldResidency(this, FieldSource.OBS, cacheKey);
         if (notifId) notifications.complete(notifId, `Loaded field: ${field.key}`);
@@ -489,16 +545,18 @@ export class FieldLoadingMethods {
           field._loadingSignal = null;
         }
         if (notifId) {
-          if (
-            sharedSignal.aborted
-            || isDatasetFieldLoadSupersededError(err)
-          ) {
+          if (cancellationKind(sharedSignal.reason) === 'user' || cancellationKind(err) === 'user') {
+            notifications.complete(notifId, `Stopped loading field: ${field.key}`);
+          } else if (sharedSignal.aborted || isCancellation(err)) {
+            // Superseded, or its dataset's caches released under it: never a failure.
             notifications.dismiss(notifId);
           } else {
-            notifications.fail(
-              notifId,
-              `Failed to load field: ${field.key}`
-            );
+            notifications.dismiss(notifId);
+            announceLoadFailure(notifications, `field ${field.key}`, err, () => {
+              void this.ensureFieldLoaded(fieldIndex)
+                .then(() => this.setActiveField(fieldIndex))
+                .catch(() => {});
+            });
           }
         }
         throw err;
@@ -507,7 +565,7 @@ export class FieldLoadingMethods {
     sharedOwner.task = task;
     sharedLoadOwners.set(field, sharedOwner);
     observeSharedLoad(field, sharedOwner);
-    field._loadingPromise = task;
+    field._loadingPromise = trackCellWork(task);
     field._loadingSignal = sharedSignal;
     return subscribeToSharedLoad(sharedOwner, signal);
   }
@@ -526,6 +584,13 @@ export class FieldLoadingMethods {
    *   load it starts is read for, whose notification shows it; a job joining
    *   a load already under way adopts its reads
    *   (`data/read-activity-log.js`, `adopt`)
+   * @param {((column: Float32Array|import('../../../../data/column-forms.js').ColumnForm, cells: number) => void)|null} [options.onPartial=null] -
+   *   While the gene index of a matrix indexed in segments is built (a
+   *   subsample's: `anndata/prefix-column-index.js`), the gene on the first
+   *   `cells` open cells (a sample of them), the rest not read, each time it
+   *   has more: its sparse form when smaller (`data/column-forms.js`), else
+   *   one value an open cell, NaN on the rest; the field itself loads only
+   *   whole (`showPartialVarField`)
    * @returns {Promise<Object>} The loaded field object
    */
   async ensureVarFieldLoaded(fieldIndex, options = {}) {
@@ -533,11 +598,14 @@ export class FieldLoadingMethods {
       signal: rawSignal = null,
       silent = false,
       priority = 'normal',
-      owner: readOwner = null
+      owner: readOwner = null,
+      onPartial = null
     } = options;
     requirePriority(priority);
     const signal = requireAbortSignal(rawSignal);
     if (signal?.aborted) throw abortReason(signal);
+    const steady = cellsSteady();
+    if (steady !== null) await awaitWithSignal(steady, signal);
     const field = this.varData?.fields?.[fieldIndex];
     if (!field) throw new Error(`Var field ${fieldIndex} is not available.`);
     const cacheKey = field._originalKey || field.key || String(fieldIndex);
@@ -567,7 +635,7 @@ export class FieldLoadingMethods {
       if (signal?.aborted) throw abortReason(signal);
       assertCurrentLoadOwner(this, aliasOwner);
       if (this.varData?.fields?.[sourceIndex] !== sourceField) {
-        throw createDatasetFieldLoadSupersededError();
+        throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
       }
       const values = sourceField?.values;
       if (!values || typeof values.length !== 'number') {
@@ -603,6 +671,7 @@ export class FieldLoadingMethods {
         // A job joining a load a view started takes its reads as its own:
         // one notification for the run, the job's.
         if (readOwner !== null) getReadActivityLog().adopt(activeOwner.readKey, readOwner);
+        if (typeof onPartial === 'function') activeOwner.partials.add(onPartial);
         return subscribeToSharedLoad(activeOwner, signal);
       }
       if (activeOwner?.task !== field._loadingPromise) {
@@ -613,7 +682,14 @@ export class FieldLoadingMethods {
 
     const cached = this._varFieldDataCache.get(cacheKey);
     if (cached) {
-      if (cached.values) field.values = cached.values;
+      if (cached.values) {
+        field.values = cached.values;
+      } else if (cached.form) {
+        // Kept as its sparse form while inactive (`field/residency.js`): its
+        // column made again from it, no read.
+        field.values = compactedColumn(cached);
+        this._varFieldDataCache.set(cacheKey, { values: field.values });
+      }
       field.loaded = true;
       touchFieldResidency(this, FieldSource.VAR, cacheKey);
       return field;
@@ -634,12 +710,55 @@ export class FieldLoadingMethods {
       source: FieldSource.VAR
     });
 
-    // Show loading notification for gene expression (unless silent mode for batch operations)
-    const notifications = getNotificationCenter();
-    const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, { category: 'data' });
-
     const sharedOwner = createSharedLoadOwner();
+    // When the read started: a gene sample's first gene times the link
+    // (`topUpGeneSample`).
+    const startedAt = performance.now();
+    // Genes read for more cells in the gene time wait while this one is read.
+    const resumeTopUp = this.yieldGeneSampleTopUp?.() ?? (() => {});
+    // The caller that starts the load hears its partial answers too, as one
+    // that joins it does (above).
+    if (typeof onPartial === 'function') sharedOwner.partials.add(onPartial);
     const sharedSignal = sharedOwner.controller.signal;
+    // Show loading notification for gene expression (unless silent mode for
+    // batch operations), with Cancel: a gene of a matrix stored cell by cell
+    // may read the whole matrix, and the person who waits decides.
+    const notifications = getNotificationCenter();
+    const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, {
+      category: 'data',
+      onCancel: () => sharedOwner.controller.abort(cancelled('user', `Loading \"${field.key}\" was cancelled.`))
+    });
+    // What the read costs is said before it runs, when it is the whole matrix.
+    if (notifId !== null && typeof loader.readPlan === 'function') {
+      Promise.resolve()
+        .then(() => loader.readPlan(loaderField))
+        .then((plan) => {
+          // One short line; why (from the file's layout) and what follows in its details.
+          const facts = geneReadPlanFacts(plan);
+          if (facts === null || sharedOwner.settled || !notifications.hasNotification(notifId)) return;
+          notifications.loading(`Reading gene ${field.key}: ${facts.summary}`, { id: notifId, category: 'data', details: factsText(facts.rows) });
+        })
+        .catch((error) => {
+          // The read itself reports what failed; the plan only describes it.
+          console.warn(`Could not tell what loading gene "${field.key}" costs:`, error);
+        });
+    }
+    // A wait its host named (a served store laying the matrix out, a host's
+    // request budget, `formats/io/byte-source.js`): said on the notification,
+    // in the host's own words, until the gene's bytes come. Not a failure.
+    let saidWaiting = false;
+    const stopWaitingNotice = notifId === null ? () => {} : getReadActivityLog().subscribe((activity) => {
+      if (sharedOwner.settled || !activity.keys?.includes(sharedOwner.readKey) || !notifications.hasNotification(notifId)) return;
+      if (activity.waiting) {
+        saidWaiting = true;
+        notifications.loading(`Reading gene ${field.key}: ${activity.waiting.text}`, { id: notifId, category: 'data' });
+      } else if (saidWaiting) {
+        saidWaiting = false;
+        notifications.loading(`Loading gene: ${field.key}`, { id: notifId, category: 'data' });
+      }
+    });
+    // The first partial answer (`onPartial`): when, and on how many cells.
+    let partialsSeen = null;
     let task;
     task = Promise.resolve()
       .then(() => {
@@ -656,7 +775,30 @@ export class FieldLoadingMethods {
               signal: downloadSignal,
               priority: startPriority,
               owner: readOwner,
-              key: sharedOwner.readKey
+              key: sharedOwner.readKey,
+              // The gene on more cells as they are read: said on its
+              // notification, and handed to whoever asked to see it.
+              onPartial: (column, cells) => {
+                if (sharedOwner.settled || sharedSignal.aborted || column.length !== owner.pointCount) return;
+                if (notifId !== null && notifications.hasNotification(notifId)) {
+                  // The whole gene's time left, from the cells coloured since
+                  // the first colours (every open cell's rows are read: the
+                  // time goes with the cells, `geneLayoutReason`). A gene read
+                  // for a sample of the open cells (`gene-sample.js`) is read
+                  // for those only: they are its whole.
+                  const readFor = Math.min(owner.pointCount, this.getGeneSample?.()?.cells ?? owner.pointCount);
+                  const now = performance.now();
+                  partialsSeen ??= { at: now, cells };
+                  const rate = cells > partialsSeen.cells ? (cells - partialsSeen.cells) / (now - partialsSeen.at) : null;
+                  const left = rate === null ? '' : ` · ${formatRemaining(Math.max(0, readFor - cells) / rate)} left`;
+                  // A sample of the cells; the others show as missing until read (said in the details).
+                  notifications.loading(
+                    `Reading gene ${field.key}: ${formatCount(cells)} of ${formatCountOf(readFor, 'cell')} coloured${left}`,
+                    { id: notifId, category: 'data' }
+                  );
+                }
+                for (const listener of sharedOwner.partials) listener(column, cells);
+              }
             })
           }),
           sharedSignal
@@ -677,6 +819,14 @@ export class FieldLoadingMethods {
         assertCurrentLoadOwner(this, owner);
         if (nextValues !== undefined) field.values = nextValues;
         field.loaded = true;
+        // The open cells its values were read for (`gene-sample.js`).
+        if (loadedData !== null && typeof loadedData === 'object' && Object.hasOwn(loadedData, 'geneSample')) {
+          this.noteGeneSample(loadedData.geneSample);
+          // The sample's first gene read its rows: the rest of the gene time
+          // reads genes for more cells (once per sample; later genes read
+          // the index).
+          if (loadedData.geneSample !== null) void this.topUpGeneSample?.(performance.now() - startedAt);
+        }
         if (field._loadingPromise === task) {
           field._loadingPromise = null;
           field._loadingSignal = null;
@@ -691,26 +841,39 @@ export class FieldLoadingMethods {
           field._loadingPromise = null;
           field._loadingSignal = null;
         }
-        if (notifId) {
-          if (
+        // Cancelled by the person: every waiter learns it was, whatever the
+        // read stopped with.
+        const personsReason = sharedSignal.aborted && cancellationKind(sharedSignal.reason) === 'user'
+          ? sharedSignal.reason
+          : null;
+        const stoppedByPerson = personsReason !== null || cancellationKind(err) === 'user';
+        if (notifId && notifications.hasNotification(notifId)) {
+          if (stoppedByPerson) {
+            notifications.complete(notifId, `Stopped loading gene: ${field.key}`);
+          } else if (
             sharedSignal.aborted
-            || isDatasetFieldLoadSupersededError(err)
+            // Superseded, or its dataset's caches released under it: never a failure.
+            || isCancellation(err)
           ) {
             notifications.dismiss(notifId);
           } else {
-            notifications.fail(
-              notifId,
-              `Failed to load gene: ${field.key}`
-            );
+            notifications.dismiss(notifId);
+            announceLoadFailure(notifications, `gene ${field.key}`, err, () => {
+              void this.ensureVarFieldLoaded(fieldIndex)
+                .then(() => this.setActiveVarField(fieldIndex))
+                .catch(() => {});
+            });
           }
         }
-        throw err;
+        throw personsReason ?? err;
       });
 
     sharedOwner.task = task;
     sharedLoadOwners.set(field, sharedOwner);
     observeSharedLoad(field, sharedOwner);
-    field._loadingPromise = task;
+    task.then(stopWaitingNotice, stopWaitingNotice);
+    task.then(resumeTopUp, resumeTopUp);
+    field._loadingPromise = trackCellWork(task);
     field._loadingSignal = sharedSignal;
     return subscribeToSharedLoad(sharedOwner, signal);
   }
@@ -783,7 +946,7 @@ export class FieldLoadingMethods {
    * @param {{generation: number, fields: ReadonlyArray<Object>, loader: Function}} matrix
    * @param {number[]} genes - Distinct positions in `matrix.fields`
    * @param {ArrayLike<number>} cells - Distinct cell positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options]
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
    */
   async readMatrixCellSubset(matrix, genes, cells, options = {}) {
@@ -801,7 +964,8 @@ export class FieldLoadingMethods {
       signal,
       start: downloadSignal => matrix.loader.readCellSubset(descriptors, cells, {
         signal: downloadSignal,
-        owner: options.owner ?? null
+        owner: options.owner ?? null,
+        runGenes: options.runGenes ?? null
       })
     });
   }
@@ -815,7 +979,7 @@ export class FieldLoadingMethods {
    *
    * @param {number[]} fieldIndices - Distinct var field positions
    * @param {ArrayLike<number>} cells - Distinct cell positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options] -
    *   `owner`: the job the read is for
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
    */
@@ -837,7 +1001,8 @@ export class FieldLoadingMethods {
       signal,
       start: downloadSignal => loader.readCellSubset(descriptors, cells, {
         signal: downloadSignal,
-        owner: options.owner ?? null
+        owner: options.owner ?? null,
+        runGenes: options.runGenes ?? null
       })
     });
   }
@@ -941,14 +1106,14 @@ export class FieldLoadingMethods {
    * @param {number[]} fieldIndices - Deliverable var fields
    * @param {ArrayLike<number>} cells
    * @param {Object} delivery
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options]
    * @returns {Promise<{bytes: number}>}
    */
   async deliverVarCellSubset(fieldIndices, cells, delivery, options = {}) {
     const signal = requireAbortSignal(options.signal ?? null);
     if (signal?.aborted) throw abortReason(signal);
     return this._deliverWith(this.varFieldLoader, this._deliverableDescriptors(fieldIndices), { ...options, priority: 'bulk' }, signal,
-      (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner }));
+      (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner, runGenes: options.runGenes ?? null }));
   }
 
   /**
@@ -960,7 +1125,7 @@ export class FieldLoadingMethods {
     const signal = requireAbortSignal(options.signal ?? null);
     if (signal?.aborted) throw abortReason(signal);
     return this._deliverWith(requireOpenMatrix(this, matrix).loader, matrixDescriptors(matrix, genes), { ...options, priority: 'bulk' }, signal,
-      (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner }));
+      (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner, runGenes: options.runGenes ?? null }));
   }
 
   /** The descriptors of deliverable var fields. @private */
@@ -1140,6 +1305,43 @@ export class FieldLoadingMethods {
       pointCount: this.pointCount,
       centroidInfo: ''
     };
+  }
+
+  /**
+   * Colour the view by a gene's values on the cells read so far, while its
+   * gene index is built (`ensureVarFieldLoaded`'s `onPartial`): the cells
+   * not read yet are NaN and are drawn as not read (`UNREAD_ALPHA_BYTE`,
+   * faded beneath the cells read). Only the colours change -- the
+   * gene is not loaded, so nothing else (filters, analysis, sessions) ever
+   * sees partial values -- and once it is loaded whole, showing it
+   * (`setActiveVarField`) writes every colour again.
+   *
+   * @param {number} fieldIndex
+   * @param {Float32Array|import('../../../../data/column-forms.js').ColumnForm} column -
+   *   The cells read so far: their sparse form (`readRows` the cells read),
+   *   or one value an open cell (NaN on the cells not read)
+   * @returns {boolean} Whether the colours were written
+   */
+  showPartialVarField(fieldIndex, column) {
+    const field = this.varData?.fields?.[fieldIndex];
+    if (!field || field.loaded === true) return false;
+    if (isColumnForm(column)) requireColumnForm(column, this.pointCount);
+    else if (!(column instanceof Float32Array) || column.length !== this.pointCount) return false;
+    // A form says which cells it read; a column's NaN tail is its cells not read.
+    const readRows = isColumnForm(column) ? column.readRows : unreadTailOf(column);
+    this.updateColorsContinuous({ ...field, values: column }, { expression: true, readRows });
+    this._pushColorsToViewer();
+    return true;
+  }
+
+  /**
+   * Write the colours of the field shown again: a gene's partial colours
+   * (`showPartialVarField`) were drawn and its load stopped or failed.
+   */
+  restoreActiveFieldColors() {
+    if (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0) return this.setActiveVarField(this.activeVarFieldIndex);
+    if (this.activeFieldSource === 'obs' && this.activeFieldIndex >= 0) return this.setActiveField(this.activeFieldIndex);
+    return this.clearActiveField();
   }
 
   getContinuousFieldRef(fieldIndex) {

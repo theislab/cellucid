@@ -4,9 +4,13 @@
  *
  * In each cell every gene is ranked by its value, highest first, ties given
  * their average rank (`rank = greater + (equal + 1) / 2`, `equal` counting
- * the gene itself). A set gene ranked past `maxRank` counts as
- * `maxRank + 1`, and a set of S genes scores
- * `1 − (Σ rank − S(S+1)/2) / (S · maxRank)`.
+ * the gene itself). As the UCell package scores (`u_stat`, R/HelperFunctions.R,
+ * Bioconductor UCell 2.x), `maxRank` is at most the dataset's genes, a set
+ * gene ranked at or past it counts as `maxRank`, and a set of S genes scores
+ * `1 − (Σ rank − S(S+1)/2) / (S · maxRank − S(S+1)/2)`: 1 when its genes are
+ * the cell's top S, 0 when none is within `maxRank`. (The 2021 paper's form,
+ * `maxRank + 1` over `S · maxRank`, gave a cell with no set gene in range
+ * (S − 1) / (2 · maxRank) instead of 0.)
  *
  * A worker holds a contiguous range of cells: each cell's set-gene values,
  * sorted, and two difference arrays over the S + 1 gaps between them. Every
@@ -18,6 +22,8 @@
  *
  * @module compute/ucell
  */
+
+import { formatCountOf } from '../../../utils/format-units.js';
 
 /**
  * Each cell's value of each set gene, cell-major (`cell * S + s`), from the
@@ -51,6 +57,19 @@ export function ucellSetValues(cellCount, S, parts) {
 }
 
 /**
+ * Bytes a cell of a UCell context holds for `S` set genes
+ * (`createUcellContext`'s arrays: its set values, sorted, their slots, the
+ * two difference arrays and the stored count): what a run's per-cell state
+ * costs in the workers, all of them together.
+ *
+ * @param {number} S
+ * @returns {number}
+ */
+export function ucellContextBytesPerCell(S) {
+  return 4 * S + 4 * S + 2 * S + 4 * (S + 1) + 4 * (S + 1) + 4;
+}
+
+/**
  * @param {object} options
  * @param {number} options.cellCount - Cells in the range
  * @param {Float32Array} options.setValues - Each cell's value of each set
@@ -58,12 +77,20 @@ export function ucellSetValues(cellCount, S, parts) {
  * @param {number} options.setGeneCount - S, the distinct genes of every set
  * @param {number} options.geneCount - Genes in the dataset
  * @param {number[][]} options.sets - Each set's genes, as indices into S
- * @param {number} options.maxRank
+ * @param {number} options.maxRank - Capped at `geneCount`, as the UCell package caps it
  */
 export function createUcellContext({ cellCount, setValues, setGeneCount, geneCount, sets, maxRank }) {
   const S = setGeneCount;
   if (!(setValues instanceof Float32Array) || setValues.length !== cellCount * S) {
     throw new TypeError('UCell set values must be a Float32Array of cells × set genes');
+  }
+  const rankCap = Math.min(maxRank, geneCount);
+  for (const members of sets) {
+    // S · maxRank − S(S+1)/2 must be positive: a set of S genes has room
+    // within the max rank.
+    if (!(rankCap > (members.length + 1) / 2)) {
+      throw new RangeError(`UCell's max rank (${rankCap}) must exceed half of one more than a set's ${formatCountOf(members.length, 'gene')}`);
+    }
   }
   // Each cell's set values ascending, and where each set gene landed.
   const sorted = new Float32Array(cellCount * S);
@@ -72,7 +99,16 @@ export function createUcellContext({ cellCount, setValues, setGeneCount, geneCou
   for (let c = 0; c < cellCount; c++) {
     const base = c * S;
     for (let s = 0; s < S; s++) order[s] = s;
-    order.sort((x, y) => setValues[base + x] - setValues[base + y] || x - y);
+    // A total order: a set gene without a value (NaN) after every value, as
+    // `bound` reads it, so the other set genes' counts are right.
+    order.sort((x, y) => {
+      const vx = setValues[base + x];
+      const vy = setValues[base + y];
+      const missingX = vx !== vx;
+      const missingY = vy !== vy;
+      if (missingX || missingY) return (missingX - missingY) || x - y;
+      return vx - vy || x - y;
+    });
     for (let k = 0; k < S; k++) {
       sorted[base + k] = setValues[base + order[k]];
       slotOf[base + order[k]] = k;
@@ -83,7 +119,7 @@ export function createUcellContext({ cellCount, setValues, setGeneCount, geneCou
     S,
     geneCount,
     sets,
-    maxRank,
+    maxRank: rankCap,
     sorted,
     slotOf,
     setValues,
@@ -177,14 +213,14 @@ export function ucellFinish(context) {
           break;
         }
         const k = slotOf[base + s];
-        let rank = greater[k] + (equal[k] + 1) / 2;
-        if (rank > maxRank) rank = maxRank + 1;
-        rankSum += rank;
+        const rank = greater[k] + (equal[k] + 1) / 2;
+        rankSum += rank >= maxRank ? maxRank : rank;
       }
       const size = members.length;
+      const fewest = (size * (size + 1)) / 2;
       scores[c * sets.length + set] = missing
         ? NaN
-        : 1 - (rankSum - (size * (size + 1)) / 2) / (size * maxRank);
+        : 1 - (rankSum - fewest) / (size * maxRank - fewest);
     }
   }
   return scores;

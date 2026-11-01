@@ -7,6 +7,7 @@
 
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { formatDecimal } from '../../../ui/components/display-format.js';
+import { createDecimalInput, readDecimalInput } from '../../../ui/components/controls.js';
 
 /**
  * Digits a readout needs to show every value a step can reach.
@@ -278,6 +279,21 @@ export function renderPlotOptions(container, plotTypeId, currentOptions = {}, on
           throw new RangeError(`Numeric option ${key} value must be within its declared range`);
         }
         optionRow.appendChild(createOptionLabel(labelText, inputId));
+
+        // A number with a fractional step is typed in a decimal box, read
+        // the same in every locale (`createDecimalInput`).
+        if (type === 'number' && !Number.isInteger(step)) {
+          input = createDecimalInput({ id: inputId, value });
+          input.addEventListener('change', () => {
+            const nextValue = readDecimalInput(input);
+            if (!Number.isFinite(nextValue) || nextValue < min || nextValue > max) {
+              throw new RangeError(`Numeric option ${key} produced an out-of-range value`);
+            }
+            onChange(key, nextValue);
+          });
+          optionRow.appendChild(input);
+          break;
+        }
 
         input = document.createElement('input');
         input.type = type;

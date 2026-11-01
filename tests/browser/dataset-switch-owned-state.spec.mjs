@@ -5,7 +5,9 @@
  * the old one left behind is read against the new one's cells, fields or
  * genes.
  *
- * Fixtures: `data-mapping-full.h5ad` (300 cells, 6 genes, three graphs) and
+ * Fixtures: `data-mapping-full.h5ad` (300 cells, three graphs; its genes are
+ * `raw`'s 8, which hold more genes than `X`'s 6: the default expression
+ * matrix, `data-mapping.js`) and
  * `byte-order-little-endian.h5ad` (8 cells, 3 genes, one graph).
  */
 
@@ -56,6 +58,11 @@ async function showEdges(page) {
 
 /** The last gene of the larger file: an index the smaller one does not have. */
 async function colourByLastGene(page) {
+  // A dataset lists its genes after its first view (`areGenesPending`).
+  await expect.poll(() => page.evaluate(() => {
+    const state = window._cellucidState;
+    return !state.areGenesPending() && state.varData.fields.length > 0;
+  })).toBe(true);
   return page.evaluate(async () => {
     const state = window._cellucidState;
     const index = state.varData.fields.length - 1;
@@ -130,7 +137,7 @@ test('a dataset opened while a gene colours a kept view and the live view replac
   const errors = collectBrowserErrors(page);
   await openLarger(page);
   const coloured = await colourByLastGene(page);
-  expect(coloured).toEqual({ index: 5, source: 'var' });
+  expect(coloured).toEqual({ index: 7, source: 'var' });
   await keepView(page);
   // The kept view is focused; colour it by an obs field so the two views
   // index both inventories.

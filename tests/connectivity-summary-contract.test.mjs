@@ -250,26 +250,34 @@ test('direct edge payloads must exactly match their adopted summary', async t =>
       error: /must contain exactly: .*\(unexpected: extra\)/i,
     },
     {
-      name: 'wrong record array type',
+      name: 'wrong partner array type',
       edgeData: {
         ...validEdgeData(),
-        records: Float32Array.from({ length: 6 }),
+        partners: Float32Array.from({ length: 2 }),
       },
       error: /must be Uint32Array/i,
     },
     {
-      name: 'records of another edge count',
+      name: 'wrong strength array type',
       edgeData: {
         ...validEdgeData(),
-        records: new Uint32Array(3),
+        strengths: Uint32Array.from({ length: 2 }),
+      },
+      error: /strengths a Float32Array/i,
+    },
+    {
+      name: 'fewer partners than edges',
+      edgeData: {
+        ...validEdgeData(),
+        partners: new Uint32Array(1),
       },
       error: /array lengths.*n_edges/i,
     },
     {
-      name: 'neighbours of another edge count',
+      name: 'fewer strengths than edges',
       edgeData: {
         ...validEdgeData(),
-        neighbors: new Uint32Array(2),
+        strengths: new Float32Array(1),
       },
       error: /array lengths.*n_edges/i,
     },

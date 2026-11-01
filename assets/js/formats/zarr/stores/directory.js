@@ -7,17 +7,22 @@
  * store root and its name is dropped from the keys. Nothing is read until a
  * key is asked for; reads of many files run many at a time (a view's ahead
  * of background work's, `createLimiter`), each a `File.slice().arrayBuffer()`
- * of only the bytes needed. Ranges of one file
- * asked for together (the inner chunks of a shard) that touch or overlap are
- * read as one slice: a file read costs a fixed open whatever its length, and
- * merging only touching ranges never reads a byte nobody asked for.
+ * of only the bytes needed. Every read measures the folder's link
+ * (`formats/io/link.js`): what one more read costs, in bytes, is its merge
+ * gap. Ranges of one file asked for in the same task, by any number of reads
+ * (the inner chunks of a shard, the few counted entries of many genes in one
+ * chunk file), are read as one slice where they lie within that gap, as a
+ * web host's are (`batchedRanges`): a file read costs a fixed open whatever
+ * its length.
  *
  * @module formats/zarr/stores/directory
  */
 
 import { ZarrFormatError } from '../errors.js';
 import { isMacOSMetadata } from '../../zip/names.js';
-import { createLimiter, mergeRanges, normalizeKey, storeRootPrefix } from './common.js';
+import { LOCAL_MERGED_READ_BYTES, batchedRanges, createLimiter, normalizeKey, storeRootPrefix } from './common.js';
+import { LinkMeter } from '../../io/link.js';
+import { LOCAL_POLICY } from '../../io/byte-source.js';
 
 /**
  * Local file reads in flight at once: enough that chunk files arrive faster
@@ -32,30 +37,22 @@ import { createLimiter, mergeRanges, normalizeKey, storeRootPrefix } from './com
 const LOCAL_CONCURRENCY = 16;
 
 /**
- * The longest slice touching ranges are merged into. Merging saves a read's
- * fixed cost; a longer slice only delays decoding its first chunk until its
- * last byte has arrived. A scheduling choice, measured in a Chromium worker
- * (Suo, Zarr v3, shards of 64 inner chunks; best of three): 1,000 cell rows
- * (inner chunks of 60 KB) take 744 ms read chunk by chunk, 519 ms merged to
- * 1 MiB, 510 ms to 32 MiB; the neighbour graph (inner chunks of 1 MB) 587,
- * 554 and 687 ms.
- */
-const MERGED_READ_BYTES = 1024 * 1024;
-
-/**
  * @param {Map<string, Blob>|Iterable<File>} files
- * @param {{name?: string, concurrency?: number, maxReadBytes?: number,
+ * @param {{name?: string, concurrency?: number, maxReadBytes?: number, link?: LinkMeter|null,
  *          readBlob?: (blob: Blob) => Promise<ArrayBuffer>}} [options]
- *   `maxReadBytes` is the longest slice touching ranges are merged into (a
- *   single range longer than it is read as it is); `readBlob`
- *   reads one file or slice (default `blob.arrayBuffer()`).
+ *   `maxReadBytes` is the longest slice ranges are merged into (a single
+ *   range longer than it is read as it is); `link` measures every read (a
+ *   local file's, `LOCAL_POLICY`, by default); `readBlob` reads one file or
+ *   slice (default `blob.arrayBuffer()`).
  */
 export function directoryStore(files, {
   name,
   concurrency = LOCAL_CONCURRENCY,
-  maxReadBytes = MERGED_READ_BYTES,
+  maxReadBytes = LOCAL_MERGED_READ_BYTES,
+  link = null,
   readBlob = blob => blob.arrayBuffer(),
 } = {}) {
+  const meter = link ?? new LinkMeter(LOCAL_POLICY);
   const raw = new Map();
   if (files instanceof Map) {
     for (const [path, file] of files) raw.set(normalizeKey(path), file);
@@ -76,7 +73,15 @@ export function directoryStore(files, {
   async function readSlice(file, start, end, signal, activity) {
     activity?.planned?.(end - start);
     return limit(async () => {
-      const bytes = new Uint8Array(await readBlob(start === 0 && end === file.size ? file : file.slice(start, end)));
+      const begun = meter.begin();
+      let bytes;
+      try {
+        bytes = new Uint8Array(await readBlob(start === 0 && end === file.size ? file : file.slice(start, end)));
+      } catch (error) {
+        meter.end(begun, null);
+        throw error;
+      }
+      meter.end(begun, bytes.length);
       if (bytes.length !== end - start) {
         throw new ZarrFormatError(`${storeName}: a file changed while the store was open; open it again.`);
       }
@@ -92,30 +97,29 @@ export function directoryStore(files, {
     if (file === undefined) return null;
     return readSlice(file, 0, file.size, signal, activity);
   };
+  /** What one more read costs on the folder's link, in bytes (its merge gap). */
+  const mergeGapBytes = () => meter.mergeGapBytes;
+  const ranged = batchedRanges({
+    read: (file, start, end, { signal, activity }) => readSlice(file, start, end, signal, activity),
+    gap: mergeGapBytes,
+    maxBytes: () => maxReadBytes,
+  });
 
   return Object.freeze({
     name: storeName,
     get,
     getMany: (keys, options) => Promise.all(keys.map(key => get(key, options))),
-    async getRanges(key, ranges, { signal = null, activity = null } = {}) {
+    async getRanges(key, ranges, options = {}) {
       const file = map.get(key);
       if (file === undefined) return null;
-      const bounds = ranges.map(range => {
+      return Promise.all(ranges.map(range => {
         const start = range.suffix !== undefined ? Math.max(0, file.size - range.suffix) : range.offset;
         const end = range.suffix !== undefined ? file.size : range.offset + range.length;
         if (start < 0 || end > file.size) throw new ZarrFormatError(`${storeName}: '${key}' is shorter than its index says.`);
-        return { offset: start, length: end - start };
-      });
-      const parts = new Array(bounds.length);
-      await Promise.all(mergeRanges(bounds, 0, maxReadBytes).map(async ({ start, end, members }) => {
-        const bytes = await readSlice(file, start, end, signal, activity);
-        for (const member of members) {
-          const { offset, length } = bounds[member];
-          parts[member] = bytes.subarray(offset - start, offset - start + length);
-        }
+        return ranged(file, start, end - start, options);
       }));
-      return parts;
     },
+    mergeGapBytes,
     storedSize: key => map.get(key)?.size ?? 0,
     list: () => [...map.keys()],
     stats: () => ({ ...stats }),

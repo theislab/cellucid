@@ -103,6 +103,20 @@ export class SignaturePageScorer {
     this._missingOffset = null;
   }
 
+  /**
+   * Bytes the scorer's own arrays hold (its per-cell sums and counts, the
+   * cell positions it built, a median's entries); a dense gene it keeps for
+   * a median is a view's, not its own.
+   */
+  heldBytes() {
+    let bytes = 0;
+    for (const array of [this.scores, this._missing, this._position, this._scaled, this._missingOffset,
+      this._entryCells, this._entryValues, this._entryOffsets, this._groupedEntries, this._buffer]) {
+      if (ArrayBuffer.isView(array)) bytes += array.byteLength;
+    }
+    return bytes;
+  }
+
   _positions() {
     if (this._position === null) {
       const position = new Int32Array(this._pointCount).fill(-1);

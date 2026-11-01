@@ -7,17 +7,22 @@
  * one of:
  *
  * - `{kind: 'sample', dataset}`: a dataset of the page's sample catalog;
- * - `{kind: 'link', locator, dataset}`: a data link (the `?data=` value) and
+ * - `{kind: 'link', locator, dataset}`: a data link in its public form and
  *   the dataset it holds;
  * - `{kind: 'remote', url, dataset}`: a Cellucid server;
  * - `{kind: 'file', name, dataset}`: a file or folder opened from this
- *   computer (`name` is the `.h5ad`, `.zarr.zip` or folder name). It cannot be
- *   opened from the session; loading the session asks for it by name;
+ *   computer (`name` is the `.h5ad`, `.zarr.zip` or folder name). The session
+ *   opens it only where this browser kept its handle, under `dataset`
+ *   (`app/local-file-handles.js`, Chromium); elsewhere loading the session
+ *   asks for it by name. The handle is never part of the session;
  * - `null`: a notebook, or no dataset.
  *
- * A link records what the person opened, so a session saved on a link that
- * carries an access key (a Dropbox link) carries the same key: anyone holding
- * the session can open the data, as anyone holding the link could.
+ * A link is recorded in its public form (`getConnectionInfo().locator`,
+ * `data/sources/link-credentials.js`): whatever the opened link carried to
+ * grant access (a Dropbox share key, a Drive resource key, a signature, a
+ * token) is never part of a session. A session of such a link opens its
+ * dataset for whoever has access to it; anyone else opens the link first,
+ * then loads the session.
  *
  * @module session/dataset-source-record
  */

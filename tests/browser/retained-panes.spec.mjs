@@ -33,15 +33,27 @@ test('a camera drag in one pane redraws only that pane, and the image equals a f
   // a drag moves one pane's camera.
   await page.evaluate(() => window._cellucidViewer.setCamerasLocked(false));
 
-  // Count point-pass draws per frame: one a pane drawn.
+
+  // Count point-pass draws in each animation frame (its timeline time, the
+  // same for every callback of one frame): one a pane drawn. A drag moves
+  // the camera in as many frames as the host draws while the pointer moves,
+  // more than the moves on a slow one, so it is the draws of each frame that
+  // are counted, not the moves.
   await page.evaluate(() => {
     const proto = WebGL2RenderingContext.prototype;
     const original = proto.drawArrays;
     const viewer = window._cellucidViewer;
     const pointCount = viewer.getPointCount();
-    window.__pointDraws = 0;
+    // A point-pass draw is one of the renderer's point programs' (the GPU
+    // gather of a tree's draw order draws as many points with its own).
+    const pointPrograms = new Set(Object.values(viewer.getHPRenderer().programs));
+    window.__pointDraws = new Map();
     proto.drawArrays = function (mode, first, count) {
-      if (mode === this.POINTS && first === 0 && count === pointCount) window.__pointDraws += 1;
+      if (mode === this.POINTS && first === 0 && count === pointCount
+        && pointPrograms.has(this.getParameter(this.CURRENT_PROGRAM))) {
+        const frame = document.timeline.currentTime;
+        window.__pointDraws.set(frame, (window.__pointDraws.get(frame) ?? 0) + 1);
+      }
       return original.apply(this, arguments);
     };
   });
@@ -70,24 +82,24 @@ test('a camera drag in one pane redraws only that pane, and the image equals a f
       y: rect.bottom - (first.viewportY + first.viewportHeight / 2) * scale,
     };
   });
-  // Press first (a press may move focus, which redraws every pane once).
+  // Press first (a press may move focus, which redraws every pane once),
+  // and count from when that redraw is over: the frame loop has settled.
   await page.mouse.move(pane.x, pane.y);
   await page.mouse.down();
-  await frames(4);
-  await page.evaluate(() => { window.__pointDraws = 0; });
-  let movedFrames = 0;
+  await settle();
+  await page.evaluate(() => { window.__pointDraws.clear(); });
   for (let step = 1; step <= 8; step++) {
     await page.mouse.move(pane.x + step * 6, pane.y + step * 2);
     await frames(1);
-    movedFrames += 1;
   }
-  const dragDraws = await page.evaluate(() => window.__pointDraws);
+  const dragDraws = await page.evaluate(() => [...window.__pointDraws.values()]);
   await page.mouse.up();
   await settle();
 
-  // Exactly one pane a moved frame (the camera of one pane moved); never four.
-  expect(dragDraws).toBeGreaterThan(0);
-  expect(dragDraws).toBeLessThanOrEqual(movedFrames + 2);
+  // Exactly one pane a frame drawn while dragging (the camera of one pane
+  // moved); never four.
+  expect(dragDraws.length).toBeGreaterThan(0);
+  expect(new Set(dragDraws)).toEqual(new Set([1]));
 
   const capture = () => page.evaluate(() => {
     const gl = window._cellucidViewer.getGLContext();

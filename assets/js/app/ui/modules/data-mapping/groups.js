@@ -179,10 +179,11 @@ export function buildGroupSection(ownerDocument, section) {
  *     disabledReason: string,
  *     error: string
  *   }>,
- *   hint: string
- * }} model
+ *   hint: string,
+ *   hintDetail?: string
+ * }} model - `hintDetail`: why the hint says what it says, behind it (its tooltip)
  */
-export function renderGroupSection(node, { summary, fields, hint }) {
+export function renderGroupSection(node, { summary, fields, hint, hintDetail = '' }) {
   const ownerDocument = node.root.ownerDocument;
   setText(node.description, summary);
   let shown = 0;
@@ -211,6 +212,8 @@ export function renderGroupSection(node, { summary, fields, hint }) {
   }
   node.hint.set(hint, 'muted');
   node.hint.root.hidden = hint === '';
+  if (hintDetail === '') node.hint.root.removeAttribute('title');
+  else node.hint.root.title = hintDetail;
   node.root.hidden = shown === 0;
 }
 

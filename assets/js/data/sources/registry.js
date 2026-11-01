@@ -9,7 +9,9 @@
  *   id,             // the locator scheme: `<id>:<value>` (the `url` provider
  *                   // writes its value bare, since it is already a URL)
  *   label,          // what the user reads
- *   capabilities,   // {folders, private: 'none'|'link'|'sign-in', versions, write}
+ *   capabilities,   // {folders, private: 'none'|'link'|'sign-in', public, versions, write}
+ *                   //   `public`: every file it serves is public (a 401/403
+ *                   //   is its host refusing this network, `providerFault`)
  *   match(input, {explicit}),
  *                   // pasted text, a short form, or its own canonical value
  *                   //   → canonical value, or null when it is not this provider's;
@@ -30,11 +32,24 @@
  *                   //   says what it is doing (`Listing the files of GSE…`),
  *                   //   shown by the opening progress; it makes as few
  *                   //   dependent round trips as the host allows
+ *   publicValue(value),
+ *                   // a value without what grants access to it (a share
+ *                   //   key, a signature, a share link that is itself the
+ *                   //   key): what sessions, Share links, figures,
+ *                   //   notifications, the opening's title and the console
+ *                   //   are given from the moment the value is known
+ *                   //   (`link-credentials.js`). Every provider states it,
+ *                   //   the value itself when none of its values carries
+ *                   //   access: no provider's value is shown by default
  *   auth?,          // {signIn, signOut, authorize(request)} for a provider
  *                   //   that reads behind a sign-in; tokens never leave it
  *                   //   but through `sources/access.js` to the reader
  * }
  * ```
+ *
+ * A resolved link has two forms: its `locator`, the read target (what was
+ * pasted, canonical), held in memory and in the page address only, and its
+ * `publicLocator`, which every other place is given.
  *
  * Adding a source is one module plus one line in `DEFAULT_PROVIDERS`;
  * removing it deletes both. Nothing else in the app names a provider.
@@ -54,6 +69,7 @@ import huggingface from './providers/huggingface.js';
 import onedrive from './providers/onedrive.js';
 import zenodo from './providers/zenodo.js';
 import { openableNamesText } from '../input-formats.js';
+import { publicLink } from './link-credentials.js';
 
 const PROVIDER_ID = /^[a-z][a-z0-9-]*$/;
 const PRIVATE_MODES = new Set(['none', 'link', 'sign-in']);
@@ -77,16 +93,20 @@ export function requireProvider(provider) {
   }
   if (typeof provider.match !== 'function') fail('needs match(input)');
   if (typeof provider.open !== 'function') fail('needs open(value, options)');
+  if (typeof provider.publicValue !== 'function') {
+    fail('needs publicValue(value): what may be shown of a value (itself when none carries access)');
+  }
   const capabilities = provider.capabilities;
   if (
     capabilities === null ||
     typeof capabilities !== 'object' ||
     typeof capabilities.folders !== 'boolean' ||
     !PRIVATE_MODES.has(capabilities.private) ||
+    typeof capabilities.public !== 'boolean' ||
     typeof capabilities.versions !== 'boolean' ||
     typeof capabilities.write !== 'boolean'
   ) {
-    fail('capabilities must state folders, private, versions and write');
+    fail('capabilities must state folders, private, public, versions and write');
   }
   if (capabilities.private === 'sign-in') {
     const auth = provider.auth;
@@ -153,11 +173,28 @@ export class ProviderRegistry {
   }
 
   /**
+   * Pasted text or a `?data=` value as it may be shown or kept: the public
+   * locator of the link it resolves to, or the text's public form
+   * (`publicLink`) when it names no source.
+   *
+   * @param {unknown} input
+   * @returns {string}
+   */
+  publicFormOf(input) {
+    const text = String(input).trim();
+    try {
+      return this.resolve(text).publicLocator;
+    } catch {
+      return publicLink(text);
+    }
+  }
+
+  /**
    * Resolve pasted text or a `?data=` value to one provider and its
    * canonical locator.
    *
    * @param {string} input
-   * @returns {{provider: Object, value: string, locator: string}}
+   * @returns {{provider: Object, value: string, locator: string, publicLocator: string}}
    */
   resolve(input) {
     if (typeof input !== 'string' || input.trim().length === 0) {
@@ -174,31 +211,50 @@ export class ProviderRegistry {
       const value = provider.match(scheme[2], { explicit: true });
       if (value === null) {
         throw new DataSourceError(
-          `"${scheme[2]}" is not a valid ${provider.label} reference.`,
+          `"${publicLink(scheme[2])}" is not a valid ${provider.label} reference.`,
           DataSourceErrorCode.INVALID_FORMAT,
           'link',
-          { input: text }
+          { input: publicLink(text) }
         );
       }
-      return Object.freeze({ provider, value, locator: formatLocator(provider, value) });
+      return resolved(provider, value);
     }
     for (const provider of this._providers.values()) {
       const value = provider.match(text, { explicit: false });
-      if (value !== null) {
-        return Object.freeze({ provider, value, locator: formatLocator(provider, value) });
-      }
+      if (value !== null) return resolved(provider, value);
     }
     throw new DataSourceError(
-      `Cellucid does not recognise "${text}". Paste a web address (${openableNamesText({ layouts: ['file', 'zip'] })}, ` +
+      `Cellucid does not recognise "${publicLink(text)}". Paste a web address (${openableNamesText({ layouts: ['file', 'zip'] })}, ` +
       'a Zarr store folder, or a folder holding ' +
       'datasets.json ending in "/"), a GitHub repository (owner/repo/path), a Hugging Face dataset ' +
       '(hf:user/repo), a Zenodo record or DOI, a Figshare item or DOI, a Google Drive, OneDrive or ' +
       'Dropbox file link, a CELLxGENE dataset link or id, or a GEO series or sample (GSE…, GSM…).',
       DataSourceErrorCode.INVALID_FORMAT,
       'link',
-      { input: text }
+      { input: publicLink(text) }
     );
   }
+}
+
+function resolved(provider, value) {
+  return Object.freeze({
+    provider,
+    value,
+    locator: formatLocator(provider, value),
+    publicLocator: publicLocatorOf(provider, value),
+  });
+}
+
+/**
+ * The public form of one provider value as a locator: without the share
+ * key, signature or token the value may carry.
+ *
+ * @param {Object} provider
+ * @param {string} value
+ * @returns {string}
+ */
+export function publicLocatorOf(provider, value) {
+  return formatLocator(provider, provider.publicValue(value));
 }
 
 /**
@@ -210,6 +266,21 @@ export class ProviderRegistry {
  */
 export function formatLocator(provider, value) {
   return provider.id === 'url' ? value : `${provider.id}:${value}`;
+}
+
+/**
+ * A page address with its data link (`?data=`) in public form
+ * (`publicFormOf`), for whatever reports where the page is: the address is
+ * the one place a link keeps its access key.
+ *
+ * @param {string} href
+ * @returns {string}
+ */
+export function publicPageAddress(href) {
+  const url = new URL(href);
+  const link = url.searchParams.get('data');
+  if (link !== null) url.searchParams.set('data', getProviderRegistry().publicFormOf(link));
+  return url.href;
 }
 
 let defaultRegistry = null;

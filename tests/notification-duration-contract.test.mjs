@@ -30,8 +30,8 @@ import {
   NotificationType,
 } from '../assets/js/app/notification-center.js';
 import {
-  isSessionRestoreReportedError,
 } from '../assets/js/app/session/session-serializer.js';
+import { isReported, markReported } from '../assets/js/utils/errors.js';
 
 /** The parts of a published notification `_updateNotification` writes into. */
 const PRESENT_PARTS = new Set([
@@ -114,14 +114,16 @@ function createRecordingCenter(t) {
   const originalDocument = globalThis.document;
   globalThis.requestAnimationFrame = () => 0;
   globalThis.document = { createElement: tag => new FakeElement(tag) };
+  const center = new NotificationCenter();
   t.after(() => {
+    // Work still in progress holds a timer to show its card: it ends with the test.
+    center.dismissAll();
     if (hadRaf) globalThis.requestAnimationFrame = originalRaf;
     else delete globalThis.requestAnimationFrame;
     if (hadDocument) globalThis.document = originalDocument;
     else delete globalThis.document;
   });
 
-  const center = new NotificationCenter();
   const scheduled = [];
   center.initialized = true;
   center.container = new FakeElement();
@@ -211,6 +213,9 @@ test('the types that are safe to time out keep the times they had', t => {
     null,
     'work in progress never schedules its own removal'
   );
+  // Once its card is on screen (NOTICE_AFTER_MS), a completion is a success
+  // card that times out like one.
+  center._reveal(center.notifications.get(active));
   center.complete(active, 'User data ready: 2K cells');
   assert.equal(resolvedDuration(scheduled, active), 4000);
 });
@@ -332,7 +337,7 @@ test('a restore failure the serializer already published is not announced twice'
     );
     assert.match(
       following,
-      /markSessionRestoreReported\(err\);/,
+      /markReported\(err\);/,
       'a failure shown to the user must be marked as shown'
     );
   }
@@ -346,7 +351,7 @@ test('a restore failure the serializer already published is not announced twice'
     'the load handler must still report its failures'
   );
   const loadFailure = controls.slice(loadFailureStart);
-  const guard = loadFailure.indexOf('isSessionRestoreReportedError(err)');
+  const guard = loadFailure.indexOf('isReported(err)');
   const publish = loadFailure.indexOf('showSessionStatus');
   assert.notEqual(guard, -1, 'the load handler must consult the mark');
   assert.notEqual(publish, -1, 'the load handler must still publish unmarked failures');
@@ -356,14 +361,8 @@ test('a restore failure the serializer already published is not announced twice'
   );
 
   // The predicate itself only claims what was actually marked.
-  assert.equal(isSessionRestoreReportedError(new Error('unreported')), false);
-  assert.equal(isSessionRestoreReportedError(null), false);
-  assert.equal(isSessionRestoreReportedError('not an error'), false);
-  const reported = new Error('reported');
-  Object.defineProperty(
-    reported,
-    Symbol.for('cellucid.sessionRestoreFailureReported'),
-    { value: true }
-  );
-  assert.equal(isSessionRestoreReportedError(reported), true);
+  assert.equal(isReported(new Error('unreported')), false);
+  assert.equal(isReported(null), false);
+  assert.equal(isReported('not an error'), false);
+  assert.equal(isReported(markReported(new Error('reported'))), true);
 });

@@ -33,6 +33,7 @@ import {
   compareCodePoints,
   defaultColumns,
   defaultEmbeddingSlots,
+  defaultGraph,
   describeObsmEntry,
   dimensionSlot,
   isBooleanVarDtype,
@@ -47,6 +48,7 @@ import {
   EmbeddingLoadError,
   MappingLoadError,
   assembleAnnDataCandidates,
+  axisGeneCount,
   axisScope,
   axisVarColumns,
   expressionAxisRoute,
@@ -67,7 +69,6 @@ import {
   LATENT_OUTLIER_MIN_POINTS,
   latentCandidateReason,
   resolveCandidateRef,
-  DEFAULT_KNN_KEY,
   obsmIndexOf,
   requireObspKey,
   openingSlot,
@@ -78,8 +79,6 @@ import { requireCellucidFileMetadata } from './anndata-cellucid-metadata.js';
 import { OutlierQuantileSource } from './outlier-quantile-source.js';
 import {
   getMetadataLoadSignal,
-  throwIfMetadataAborted,
-  waitForMetadata,
 } from './metadata-load-contract.js';
 import {
   categoricalStorageForCount,
@@ -88,16 +87,21 @@ import {
   requireCategoricalCategoryCount,
 } from './categorical-storage-contract.js';
 
-import { residencyBudgetBytes } from './memory-budget.js';
-import { scanpyCategoryPalette } from './palettes.js';
-import { onAbort } from '../formats/io/abort.js';
+import { isDrawn, registerResidentHolder, residencyBudgetBytes, typedArrayBytes } from './memory-budget.js';
+import { presentCategoryPalette, scanpyCategoryPalette } from './palettes.js';
+import { categoryNameSlots, paletteOfSlots } from './discovered-categories.js';
+import { onAbort, abortReason, cancelled, cancel, throwIfAborted, awaitWithSignal } from '../utils/abort.js';
 import { getReadActivityLog } from './read-activity-log.js';
 import { formatCountOf, countNoun } from '../utils/format-units.js';
+import { copyLargeArray } from '../utils/large-arrays.js';
+import { copyTypedArray } from './sparse-column-index.js';
+import { isContinuousValues } from './continuous-values.js';
 
 /** Each shared gene read's key, for a job that joins it to adopt it (`getGeneValues`). */
 let nextGeneReadKey = 1;
 
 const CONNECTIVITY_EDGE_LABEL = 'Direct AnnData connectivity edge loading';
+const CONNECTIVITY_ROW_LABEL = 'Direct AnnData connectivity row reading';
 /** Bytes a JavaScript array slot takes, for an obs field held as an Array. */
 const JS_ARRAY_ELEMENT_BYTES = 8n;
 
@@ -162,25 +166,6 @@ function validateCellucidCategories(categories, fieldKey) {
   return nCategories;
 }
 
-function comparePrimitiveCategories(left, right) {
-  const leftType = typeof left;
-  const rightType = typeof right;
-  if (leftType !== rightType) {
-    const leftOrder =
-      leftType === 'boolean' ? 0 : (leftType === 'number' ? 1 : 2);
-    const rightOrder =
-      rightType === 'boolean' ? 0 : (rightType === 'number' ? 1 : 2);
-    return leftOrder - rightOrder;
-  }
-  if (leftType === 'boolean') {
-    return Number(left) - Number(right);
-  }
-  if (leftType === 'number') {
-    return left - right;
-  }
-  return left < right ? -1 : (left > right ? 1 : 0);
-}
-
 function getCellucidCategoryStorage(categories, fieldKey) {
   return categoricalStorageForCount(
     validateCellucidCategories(categories, fieldKey),
@@ -238,12 +223,20 @@ class CoalescedCancellationOwner {
         this._uncancellable === 0 &&
         this._abandoned >= this._joined
       ) {
-        this._controller.abort();
+        cancel(this._controller, 'superseded', 'No one waits for this read any more.');
       }
     };
-    const stopWaiting = onAbort(callerSignal, abandon);
-    if (callerSignal.aborted) abandon();
-    return stopWaiting;
+    return onAbort(callerSignal, abandon);
+  }
+
+  /**
+   * Stop the shared work for every caller: its adapter was cleared or
+   * closed, so nobody can use what it would return.
+   *
+   * @param {DOMException} reason - A cancellation (`AbortError`)
+   */
+  cancel(reason) {
+    this._controller.abort(reason);
   }
 }
 
@@ -409,7 +402,8 @@ export class BaseAnnDataAdapter {
    * @param {Object} loader - The AnnData reader's API: an `AnnDataReaderClient`
    *   in the app, the reader of `anndata/reader.js` itself in tests
    * @param {Object} [options]
-   * @param {number} [options.cacheBudgetBytes] - Residency budget of the coordinate and obs caches
+   * @param {number} [options.cacheBudgetBytes] - A fixed residency budget of the caches (tests);
+   *   by default the `adapterCache` share, read whenever it is used
    * @param {Object} [options.defaults] - Launch defaults (`requireAnnDataLaunchDefaults`)
    */
   constructor(loader, options = {}) {
@@ -431,6 +425,9 @@ export class BaseAnnDataAdapter {
      */
     this._defaults = this._explicitDefaults;
 
+    /** The graph the default rule opens the file with (`defaultGraph`), once `initialize()` has listed `obsp`. @type {string|null} */
+    this._ruleGraph = null;
+
     /**
      * What the file says about itself (`uns['cellucid']`), checked; set by
      * `initialize()`.
@@ -450,6 +447,10 @@ export class BaseAnnDataAdapter {
 
     /** @type {Object|null} The frozen data-mapping candidate catalog */
     this._candidates = null;
+    /** The embedding slots the catalog was assembled with (`initialize`). */
+    this._mappingResolution = null;
+    /** The catalog completed with each matrix's counts (`completeMappingCandidates`), once asked. */
+    this._candidatesCompleted = null;
 
     /**
      * The described `obsm` entries, set before the catalog is assembled so the
@@ -493,7 +494,9 @@ export class BaseAnnDataAdapter {
 
     /**
      * The extracted neighbour graph asked for last, by obsp key (null for an
-     * absent key).
+     * absent key). While a view shows its edges or the k-NN tool uses it,
+     * it is counted as drawn (`memory-budget.js` `isDrawn`), never evicted;
+     * otherwise it is a cached copy like the others.
      * @type {Map<string, Object|null>}
      */
     this._connectivityCache = new Map();
@@ -502,14 +505,18 @@ export class BaseAnnDataAdapter {
     this._connectivitySummary = undefined;
 
     /**
-     * The display transform and bounds of every embedding read, by
-     * embedding id (`EmbeddingPayload`, `embedding-payload.js`).
-     * @type {Map<string, {transform: Object, bounds: Object|null}>}
+     * The display transform, bounds and unplaced cells of every embedding
+     * read, by embedding id (`EmbeddingPayload`, `embedding-payload.js`).
+     * @type {Map<string, {transform: Object, bounds: Object|null, unplacedCount: number, unplacedNames: ReadonlyArray<string>}>}
      */
     this._embeddingInfo = new Map();
 
-    /** @type {Map<string, number>} The largest vector of each cached vector field, by route */
-    this._vectorMagnitudes = new Map();
+    /**
+     * The largest vector and the cells without a vector of each cached
+     * vector field, by route.
+     * @type {Map<string, {maxMagnitude: number, unplacedCount: number, unplacedNames: ReadonlyArray<string>}>}
+     */
+    this._vectorInfo = new Map();
 
     /** @type {Map<string, Promise<Float32Array>>} */
     this._embeddingInFlight = new Map();
@@ -549,17 +556,89 @@ export class BaseAnnDataAdapter {
     this._closed = false;
 
     // A residency budget: it decides what the caches keep, never what loads.
-    const cacheBudgetBytes =
-      options.cacheBudgetBytes ?? residencyBudgetBytes('adapterCache');
+    // The obs payloads, the coordinates and the graph share it: one
+    // `adapterCache` share, counted once.
+    const cacheBudgetBytes = options.cacheBudgetBytes ?? null;
     if (
-      !Number.isSafeInteger(cacheBudgetBytes) ||
-      cacheBudgetBytes < 0
+      cacheBudgetBytes !== null && (
+        !Number.isSafeInteger(cacheBudgetBytes) ||
+        cacheBudgetBytes < 0
+      )
     ) {
       throw new TypeError(
         'AnnData adapter cache budget must be a non-negative safe integer.'
       );
     }
-    this._cacheBudgetBytes = BigInt(cacheBudgetBytes);
+    /** @type {bigint|null} A fixed budget, or null for the `adapterCache` share as it is now */
+    this._cacheBudgetBytes = cacheBudgetBytes === null ? null : BigInt(cacheBudgetBytes);
+    // The memory ledger counts what the caches keep and trims them when the
+    // allowance or the working set changes (`memory-budget.js`).
+    this._unregisterResidentHolder = registerResidentHolder('adapterCache', {
+      label: 'the dataset\'s cached copies',
+      bytes: () => Number(this._cachedBytes()),
+      trim: budget => this._trimCaches(BigInt(Math.floor(budget))),
+    });
+  }
+
+  /** The caches' budget now: a fixed one, or the `adapterCache` share. @private */
+  _cacheBudget() {
+    return this._cacheBudgetBytes ?? BigInt(residencyBudgetBytes('adapterCache'));
+  }
+
+  /** The bytes of the cached graph, unless it is drawn (counted there). @private */
+  _cachedGraphBytes() {
+    let bytes = 0n;
+    for (const graph of this._connectivityCache.values()) {
+      if (graph !== null && !isDrawn(graph)) bytes += BigInt(typedArrayBytes(graph));
+    }
+    return bytes;
+  }
+
+  /** What the caches keep: obs payloads, coordinates and a graph no view draws. @private */
+  _cachedBytes() {
+    return this._obsFieldDataCacheBytes + this._coordinateCacheBytes + this._cachedGraphBytes();
+  }
+
+  /**
+   * Let cached copies go until the caches keep no more than `target` bytes:
+   * the kind `first` names first, each kind least recently used first, then
+   * the others (obs payloads, coordinates no caller pins, the graph unless it
+   * is drawn). Reads in flight finish and are delivered; what goes is read
+   * again from the reader when asked.
+   *
+   * @param {bigint} target
+   * @param {'obs'|'coordinates'|'graph'} [first]
+   * @returns {string[]} What was let go, in words
+   * @private
+   */
+  _trimCaches(target, first = 'obs') {
+    const released = [];
+    const kinds = [first, ...['obs', 'coordinates', 'graph'].filter(kind => kind !== first)];
+    for (const kind of kinds) {
+      if (this._cachedBytes() <= target) break;
+      if (kind === 'obs') {
+        let fields = 0;
+        for (const key of [...this._obsFieldDataCache.keys()]) {
+          if (this._cachedBytes() <= target) break;
+          if (this._deleteObsFieldDataCache(key)) fields++;
+        }
+        if (fields > 0) released.push(`cached copies of ${formatCountOf(fields, 'field')}`);
+      } else if (kind === 'coordinates') {
+        let coordinates = 0;
+        for (const cacheKey of [...this._coordinateCacheLru.keys()]) {
+          if (this._cachedBytes() <= target) break;
+          if (!this._isCoordinateCacheKeyPinned(cacheKey) && this._deleteCoordinateCacheEntry(cacheKey)) coordinates++;
+        }
+        if (coordinates > 0) released.push(`cached copies of ${formatCountOf(coordinates, 'embedding')}`);
+      } else {
+        for (const [key, graph] of [...this._connectivityCache]) {
+          if (graph === null || isDrawn(graph)) continue;
+          this._connectivityCache.delete(key);
+          released.push('a cached copy of the neighbour graph');
+        }
+      }
+    }
+    return released;
   }
 
   /**
@@ -583,7 +662,10 @@ export class BaseAnnDataAdapter {
    */
   _assertLifecycleGeneration(generation) {
     if (this._closed || generation !== this._lifecycleGeneration) {
-      throw new Error(
+      // Never failed: the work is of a dataset no longer shown (closed), or
+      // its caches were given back under it (released: asked again, it works).
+      throw cancelled(
+        this._closed ? 'closed' : 'released',
         'AnnData adapter dataset changed, was cleared, or was closed while loading; start a new request against the active dataset'
       );
     }
@@ -653,7 +735,7 @@ export class BaseAnnDataAdapter {
     return new Promise((resolve, reject) => {
       const abort = () => {
         settled.catch(() => {});
-        reject(callerSignal.reason ?? new DOMException('The read was cancelled.', 'AbortError'));
+        reject(abortReason(callerSignal));
       };
       if (callerSignal.aborted) {
         abort();
@@ -815,20 +897,10 @@ export class BaseAnnDataAdapter {
   _makeCoordinateCacheRoom(additionalBytes) {
     // The budget decides what is evicted, never what loads: coordinates in
     // use stay pinned, and an entry larger than the budget is still admitted.
-    while (
-      this._coordinateCacheBytes + additionalBytes >
-      this._cacheBudgetBytes
-    ) {
-      let victimKey = null;
-      for (const cacheKey of this._coordinateCacheLru.keys()) {
-        if (!this._isCoordinateCacheKeyPinned(cacheKey)) {
-          victimKey = cacheKey;
-          break;
-        }
-      }
-      if (victimKey == null) return;
-      this._deleteCoordinateCacheEntry(victimKey);
-    }
+    // Coordinates go first, least recently used first, then the other kinds.
+    const budget = this._cacheBudget();
+    const target = budget > additionalBytes ? budget - additionalBytes : 0n;
+    this._trimCaches(target, 'coordinates');
   }
 
   /**
@@ -920,6 +992,17 @@ export class BaseAnnDataAdapter {
     return this._loader?.linkMeasurement?.() ?? null;
   }
 
+  /**
+   * The open cells genes are read for (`AnnDataReader.geneSample`,
+   * `subsample-plan.js` `genes`): `{cells, of, fit}`, or null when a gene is
+   * read for every open cell.
+   *
+   * @returns {Readonly<{cells: number, of: number, fit: Object|null}>|null}
+   */
+  geneSample() {
+    return this._loader?.geneSample ?? null;
+  }
+
   getFileTitle() {
     const title = this._metadata?.title;
     return typeof title === 'string' && title.length > 0 ? title : null;
@@ -939,7 +1022,16 @@ export class BaseAnnDataAdapter {
     return this._fileMetadata;
   }
 
-  async initialize() {
+  /**
+   * Read what the dataset is: its metadata, embeddings, fields and mapping
+   * candidates, and the embedding the first view draws. `firstView: false`
+   * leaves that embedding unread: an opening grown or cut in place
+   * (`AnnDataFileSource.reopenCells`) keeps the coordinates on screen and
+   * reads only the cells it adds.
+   *
+   * @param {{firstView?: boolean}} [options]
+   */
+  async initialize({ firstView: readFirstView = true } = {}) {
     const generation = this._captureLifecycleGeneration();
     try {
       const metadata = await this._loader.getDatasetMetadata();
@@ -987,6 +1079,8 @@ export class BaseAnnDataAdapter {
       }
       this._metadata = metadata;
       this._describedObsm = described.obsm;
+      this._ruleGraph = defaultGraph(described.obsp.map(item => item.key), { modality: described.defaultModality ?? null });
+      // Gene names are not read here: the first view never waits for them.
       const resolution = await this._resolveEmbeddingSlots(described, generation);
       this._slots = Object.freeze({ ...resolution.slots });
 
@@ -995,12 +1089,14 @@ export class BaseAnnDataAdapter {
       // opening. Candidate sources are adopted only after initialize()
       // resolves, so its payload is validated before then: corrupt bytes
       // cannot replace and close a still-working dataset.
-      const firstView = this.getEmbeddingForRef(this._slots[openingSlot(this._slots)]);
+      const firstView = readFirstView ? this.getEmbeddingForRef(this._slots[openingSlot(this._slots)]) : Promise.resolve(null);
       firstView.catch(() => {});
 
       await this._computeObsFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
       this._candidates = this._assembleCandidates(described, resolution);
+      this._mappingResolution = resolution;
+      this._candidatesCompleted = null;
       await this._computeVectorFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
       await firstView;
@@ -1015,7 +1111,10 @@ export class BaseAnnDataAdapter {
         this._defaults = this._explicitDefaults;
         this._slots = null;
         this._candidates = null;
+        this._mappingResolution = null;
+        this._candidatesCompleted = null;
         this._describedObsm = null;
+        this._ruleGraph = null;
         this._vectorBindings.clear();
         this._obsFieldsMetadata = null;
         this.clearCaches();
@@ -1172,8 +1271,8 @@ export class BaseAnnDataAdapter {
    * held to the rule's own checks.
    * @private
    */
-  _withDefaultRuleSlots(entries, requested) {
-    const slots = defaultEmbeddingSlots(entries);
+  _withDefaultRuleSlots(entries, requested, modality) {
+    const slots = defaultEmbeddingSlots(entries, { modality });
     for (const slot of DIMENSION_SLOTS) {
       if (Object.hasOwn(requested, slot)) {
         slots[slot] = requested[slot];
@@ -1213,9 +1312,10 @@ export class BaseAnnDataAdapter {
     // Slots a launch named are shown as named; the others follow the default
     // rule, and only when neither fills a slot is the best guess made.
     const requested = this._requestedEmbeddingSlots(entries);
+    const modality = described.defaultModality ?? null;
     const resolution = requested === null
-      ? await resolveEmbeddingSlotsAsync(entries, loadCheck)
-      : { slots: this._withDefaultRuleSlots(entries, requested), guessed: [], rejected: [] };
+      ? await resolveEmbeddingSlotsAsync(entries, loadCheck, { modality })
+      : { slots: this._withDefaultRuleSlots(entries, requested, modality), guessed: [], rejected: [] };
     this._assertLifecycleGeneration(generation);
     if (DIMENSION_SLOTS.every(slot => resolution.slots[slot] === null)) {
       const rejected = new Map(resolution.rejected);
@@ -1316,6 +1416,37 @@ export class BaseAnnDataAdapter {
   }
 
   /**
+   * The candidate catalog completed with what reading a matrix's values
+   * tells: whether each expression matrix holds counts (`holdsCounts`, the
+   * reader's `probeMapping`). The opening's catalog leaves that unknown, so
+   * the first view reads no matrix value -- a served store lays its
+   * matrices out in the background, a link pays a request for it; asked
+   * once per opening after the first view, it resolves to the catalog
+   * rebuilt with the counts, which `getMappingCandidates()` returns from
+   * then on (the app adopts it: `state.adoptMappingCandidates`). Nothing
+   * chosen changes: a mapping keeps its choices, the catalog only says more
+   * of them.
+   *
+   * @returns {Promise<Object>}
+   */
+  completeMappingCandidates() {
+    if (this._candidates === null) {
+      return Promise.reject(new Error('AnnData data-mapping candidates are not initialized'));
+    }
+    if (this._candidatesCompleted === null) {
+      const generation = this._captureLifecycleGeneration();
+      const resolution = this._mappingResolution;
+      this._candidatesCompleted = this._loader.probeMapping().then(probes => {
+        this._assertLifecycleGeneration(generation);
+        this._candidates = this._assembleCandidates(describeAnnDataProbes(probes), resolution);
+        return this._candidates;
+      });
+      this._candidatesCompleted.catch(() => {});
+    }
+    return this._candidatesCompleted;
+  }
+
+  /**
    * Compute obs field metadata (to be overridden by subclasses if needed)
    * @protected
    * @returns {Promise<void>}
@@ -1353,10 +1484,12 @@ export class BaseAnnDataAdapter {
       if (fieldInfo.dtype === 'float' || fieldInfo.dtype === 'int' || fieldInfo.dtype === 'uint') {
         return { key, kind: 'continuous', min: null, max: null };
       }
-      if (fieldInfo.dtype === 'string' || fieldInfo.dtype === 'bool') {
-        // A text column's categories are found by reading it, in an order a
-        // Scanpy palette was not written in: it opens in Cellucid's colours.
-        return { key, kind: 'category', categories: null, palette: null, _needsCodeComputation: true };
+      if (fieldInfo.dtype === 'string' || fieldInfo.dtype === 'bool' || fieldInfo.dtype === 'labels') {
+        // A text or boolean column's categories, or integer labels' (a Loom
+        // clustering), are found by reading it (the reader worker codes it,
+        // `discovered-categories.js`): its labels in label order, each in
+        // the colour its label names.
+        return { key, kind: 'category', categories: null, categorySlots: null, palette: null, _needsCodeComputation: true };
       }
       throw new Error(`Observation field '${key}' has unsupported dtype '${fieldInfo.dtype}'`);
     };
@@ -1405,59 +1538,69 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Discover primitive categories without whole-column filter/spread/map
-   * copies. The scan stops at the first unsupported unique count and accounts
-   * for the raw values plus Set/array/sort workspace as it grows.
+   * Adopt the categories a text or boolean column was coded under in the
+   * reader worker (`codeDiscoveredColumn`): the first ones, or more of them
+   * (every earlier one kept, in label order), each with the colour its label
+   * names (`categoryNameSlots`: a label shown keeps its colour). @private
    *
-   * @param {ArrayLike<unknown>} values
+   * @param {Object} meta - The field's metadata
+   * @param {ReadonlyArray<string|boolean>} categories
    * @param {string} key
-   * @returns {(string|number|boolean)[]}
-   * @private
    */
-  _discoverPrimitiveCategories(values, key) {
-    const length = Number(values?.length);
-    if (!Number.isSafeInteger(length) || length < 0) {
-      throw new Error(
-        `Observation field '${key}' has an invalid values length`
-      );
-    }
-
-    const categories = [];
-    const seen = new Set();
-
-    for (let index = 0; index < length; index++) {
-      const value = values[index];
-      if (value == null) continue;
-
-      const type = typeof value;
-      if (
-        type !== 'string' &&
-        type !== 'number' &&
-        type !== 'boolean'
-      ) {
-        throw new Error(
-          `Observation field '${key}' has an unsupported category label type`
-        );
-      }
-      if (type === 'number' && !Number.isFinite(value)) {
-        throw new Error(
-          `Observation field '${key}' has a non-finite numeric category label`
-        );
-      }
-
-      if (seen.has(value)) continue;
-      validateCellucidCategoryCount(categories.length + 1, key);
-      seen.add(value);
-      categories.push(value);
-    }
-
-    if (categories.every(category => typeof category === 'string')) {
-      categories.sort();
-    } else {
-      categories.sort(comparePrimitiveCategories);
-    }
+  _adoptDiscoveredCategories(meta, categories, key) {
     validateCellucidCategories(categories, key);
-    return categories;
+    const known = meta.categories;
+    if (known !== null && known.length === categories.length && known.every((label, i) => label === categories[i])) return;
+    const previous = new Map();
+    if (known !== null) {
+      const kept = new Set(categories);
+      known.forEach((label, i) => {
+        if (!kept.has(label)) {
+          throw new Error(`Observation field '${key}' was coded without its category ${JSON.stringify(label)}`);
+        }
+        previous.set(label, meta.categorySlots[i]);
+      });
+    }
+    const slots = categoryNameSlots(categories, previous);
+    meta.categories = Object.freeze([...categories]);
+    meta.categorySlots = slots;
+    meta.palette = paletteOfSlots(slots);
+  }
+
+  /**
+   * Adopt the categories a categorical with more categories than open cells
+   * was coded by in the reader (`AnnDataReader._readPresentCategorical`):
+   * the ones its open cells hold, in stored order, every one found before
+   * kept, each in the colour it has with every category open
+   * (`presentCategoryPalette`). Its stored dictionary's size stays
+   * `categoryCount`. @private
+   *
+   * @param {Object} meta - The field's metadata
+   * @param {{categories: ReadonlyArray<string|number|boolean>, present: {count: number, stored: Uint32Array, colors: ReadonlyArray<string>|null}}} field
+   * @param {string} key
+   */
+  _adoptPresentCategories(meta, field, key) {
+    const { categories, present } = field;
+    validateCellucidCategories(categories, key);
+    if (!(present?.stored instanceof Uint32Array) || present.stored.length !== categories.length ||
+        !Number.isSafeInteger(present.count) || present.count < categories.length) {
+      throw new Error(`Categorical observation field '${key}' arrived without the stored place of each of its categories`);
+    }
+    meta._presentCategories = true;
+    meta._dictionaryOnLoad = false;
+    meta.categoryCount = present.count;
+    const known = meta.categories;
+    const same = Array.isArray(known) && known.length === categories.length && known.every((label, i) => label === categories[i]);
+    if (!same && Array.isArray(known)) {
+      const kept = new Set(categories);
+      for (const label of known) {
+        if (!kept.has(label)) throw new Error(`Observation field '${key}' was coded without its category ${JSON.stringify(label)}`);
+      }
+    }
+    if (!same) meta.categories = Object.freeze([...categories]);
+    if (!same || !Array.isArray(meta.palette) || meta.palette.length !== categories.length) {
+      meta.palette = presentCategoryPalette(present.colors, present.stored);
+    }
   }
 
   /**
@@ -1531,13 +1674,10 @@ export class BaseAnnDataAdapter {
     const resultBytes = this._estimateObsFieldDataBytes(result);
 
     this._deleteObsFieldDataCache(key);
-    while (
-      this._obsFieldDataCache.size > 0 &&
-      this._obsFieldDataCacheBytes + resultBytes > this._cacheBudgetBytes
-    ) {
-      const oldestKey = this._obsFieldDataCache.keys().next().value;
-      this._deleteObsFieldDataCache(oldestKey);
-    }
+    // Obs payloads go first, least recently used first, then the other
+    // kinds; an entry larger than the budget is still admitted.
+    const budget = this._cacheBudget();
+    this._trimCaches(budget > resultBytes ? budget - resultBytes : 0n, 'obs');
 
     this._obsFieldDataCache.set(key, result);
     this._obsFieldDataCacheBytes += resultBytes;
@@ -1572,9 +1712,16 @@ export class BaseAnnDataAdapter {
       const fieldInfo = await this._loader.getObsFieldInfo(key);
       this._assertLifecycleGeneration(generation);
       if (meta._dictionaryOnLoad === true) {
-        validateCellucidCategories(fieldInfo.categories, key);
-        meta.categories = fieldInfo.categories;
-        meta.palette = scanpyCategoryPalette(fieldInfo.colors, fieldInfo.categories.length);
+        if (fieldInfo.present === true) {
+          // More categories than open cells: coded by the ones its open
+          // cells hold, found with its codes (`_adoptPresentCategories`).
+          meta._presentCategories = true;
+          meta.categoryCount = fieldInfo.categoryCount;
+        } else {
+          validateCellucidCategories(fieldInfo.categories, key);
+          meta.categories = fieldInfo.categories;
+          meta.palette = scanpyCategoryPalette(fieldInfo.colors, fieldInfo.categories.length);
+        }
         meta._dictionaryOnLoad = false;
       }
     }
@@ -1582,6 +1729,7 @@ export class BaseAnnDataAdapter {
     if (
       meta.kind === 'category' &&
       !meta._needsCodeComputation &&
+      meta._presentCategories !== true &&
       Array.isArray(meta.categories)
     ) {
       this._loader.seedObsFieldCategories?.(
@@ -1590,7 +1738,11 @@ export class BaseAnnDataAdapter {
         meta.ordered
       );
     }
-    const field = await this._loader.getObsField(key, { signal });
+    const field = await this._loader.getObsField(key, {
+      signal,
+      // A text or boolean column is coded under the categories already found.
+      ...(meta._needsCodeComputation ? { categories: meta.categories } : {}),
+    });
     try {
       this._assertLifecycleGeneration(generation);
       let result;
@@ -1608,45 +1760,43 @@ export class BaseAnnDataAdapter {
           }
         }
 
-        if (min === Infinity || max === -Infinity) {
-          throw new Error(
-            `Continuous observation field '${key}' contains no finite values`
-          );
-        }
-        meta.min = min;
-        meta.max = max;
+        // A column with no value among the open cells (a score computed for
+        // one batch only, read on a subsample of the others) loads: every
+        // cell is drawn as missing, and the legend says so.
+        meta.min = min === Infinity ? null : min;
+        meta.max = max === -Infinity ? null : max;
 
         result = {
           kind: 'continuous',
-          values: values instanceof Float32Array ? values : new Float32Array(values),
+          // Float32, or float64 for an integer column float32 cannot hold
+          // exactly (`readContinuous`): kept as read, never rounded.
+          values: isContinuousValues(values) ? values : copyTypedArray(Float32Array, values, `Observation field '${key}'`),
           min: meta.min,
           max: meta.max,
         };
       } else {
         // Categorical
         let codes, categories;
-        if (
-          !meta._needsCodeComputation &&
-          (field.dtype !== 'categorical' || !field.codes)
-        ) {
+        if (field.dtype !== 'categorical' || !field.codes || (field.discovered === true) !== (meta._needsCodeComputation === true) ||
+            (field.present !== undefined) !== (meta._presentCategories === true)) {
           throw new Error(
             `Categorical observation field '${key}' no longer matches its ` +
             'adopted categorical storage'
           );
         }
-        if (
-          meta._needsCodeComputation &&
-          (
-            (field.dtype !== 'string' && field.dtype !== 'bool') ||
-            !field.values
-          )
-        ) {
-          throw new Error(
-            `Categorical observation field '${key}' no longer matches its ` +
-            'adopted primitive storage'
-          );
-        }
-        if (!meta._needsCodeComputation) {
+        if (meta._presentCategories === true) {
+          // Coded by the categories its open cells hold, in stored order:
+          // every one found before kept (`_adoptPresentCategories`).
+          this._adoptPresentCategories(meta, field, key);
+          codes = field.codes;
+          categories = meta.categories;
+          const { TypedArrayClass } = getCellucidCategoryStorage(categories, key);
+          if (!(codes instanceof TypedArrayClass) || codes.length !== this._loader.nObs) {
+            throw new Error(
+              `Categorical observation field '${key}' must arrive as narrowed codes, one per cell`
+            );
+          }
+        } else if (!meta._needsCodeComputation) {
           validateCellucidCategories(field.categories, key);
           if (
             field.categories.length !== meta.categories.length ||
@@ -1669,44 +1819,17 @@ export class BaseAnnDataAdapter {
             );
           }
         } else {
-          // A string or boolean column: its categories are its distinct
-          // values, found the first time it is read and kept for the life
-          // of the dataset, so every later load codes it the same way.
-          if (meta.categories === null) {
-            const discovered = this._discoverPrimitiveCategories(field.values, key);
-            this._assertLifecycleGeneration(generation);
-            // The dataset identity keeps its null count: it describes what
-            // opening the file knows, and stays the same whichever fields
-            // were loaded.
-            meta.categories = discovered;
-          }
+          // A text or boolean column, coded in the reader worker under the
+          // categories found before and any these cells add: kept for the
+          // life of the dataset, so every later load codes it the same way.
+          this._adoptDiscoveredCategories(meta, field.categories, key);
+          codes = field.codes;
           categories = meta.categories;
-          const valueCount = Number(field.values?.length);
-          if (!Number.isSafeInteger(valueCount) || valueCount < 0) {
+          const { TypedArrayClass } = getCellucidCategoryStorage(categories, key);
+          if (!(codes instanceof TypedArrayClass) || codes.length !== this._loader.nObs) {
             throw new Error(
-              `Observation field '${key}' has an invalid values length`
+              `Categorical observation field '${key}' must arrive as narrowed codes, one per cell`
             );
-          }
-          const categoryMap = new Map();
-          for (let index = 0; index < categories.length; index++) {
-            categoryMap.set(categories[index], index);
-          }
-          const { TypedArrayClass, missingValue } = getCellucidCategoryStorage(categories, key);
-          codes = new TypedArrayClass(valueCount);
-          for (let i = 0; i < valueCount; i++) {
-            const v = field.values[i];
-            if (v == null) {
-              codes[i] = missingValue;
-              continue;
-            }
-            const code = categoryMap.get(v);
-            if (code === undefined) {
-              throw new Error(
-                `Observation field '${key}' contains undeclared category ` +
-                `at index ${i}`
-              );
-            }
-            codes[i] = code;
           }
         }
 
@@ -1714,6 +1837,7 @@ export class BaseAnnDataAdapter {
           kind: 'category',
           categories,
           codes,
+          ...(meta._presentCategories === true ? { storedCategoryCount: meta.categoryCount } : {}),
           ...(typeof field.ordered === 'boolean'
             ? { ordered: field.ordered }
             : {}),
@@ -1863,9 +1987,13 @@ export class BaseAnnDataAdapter {
       ? { n_cells: this._loader.nObs, n_edges: null, max_neighbors: null }
       : null;
     validateConnectivitySummary(connectivitySummary);
-    // The gene count of the gene list the file opens with (raw.X has its own).
-    const geneList = await this.getGeneList();
-    this._assertLifecycleGeneration(generation);
+    // The gene count of the gene list the file opens with (raw.X has its
+    // own), from metadata: no gene name is read before the first view.
+    const mappingDefaults = this._candidates.defaults;
+    const geneAxisRoute = mappingDefaults.expression === null
+      ? null
+      : expressionAxisRoute(this._candidates, mappingDefaults.expression, mappingDefaults.modality ?? null);
+    const geneCount = geneAxisRoute === null ? 0 : axisGeneCount(this._candidates, geneAxisRoute);
     const obsFields = this.getObsFields().fields.map(field => (
       field.kind === 'continuous'
         ? { key: field.key, kind: 'continuous' }
@@ -1886,7 +2014,7 @@ export class BaseAnnDataAdapter {
       description: file.description ?? description,
       stats: {
         n_cells: this._loader.nObs,
-        n_genes: geneList.fields.length,
+        n_genes: geneCount,
         n_obs_fields: obsFields.length,
         n_categorical_fields: obsFields.filter(
           field => field.kind === 'category'
@@ -1927,7 +2055,9 @@ export class BaseAnnDataAdapter {
    * The reader worker checked and normalized them (`embedding-payload.js`);
    * `transform` is their display transform (the identity for normalized
    * coordinates) and `bounds` their per-axis bounds, so the page neither
-   * normalizes nor scans them again.
+   * normalizes nor scans them again. A cell the embedding does not place
+   * (a NaN or infinite row) has NaN coordinates; `unplacedCount` counts
+   * those cells and `unplacedNames` names the first of them.
    *
    * The caller owns the returned positions, exactly as it owns a fetched
    * payload: the adapter hands over its cached array and drops its own
@@ -1954,14 +2084,14 @@ export class BaseAnnDataAdapter {
     }
     const embedding = await this.getEmbeddingForRef(ref, { signal });
     const { embeddingId } = this._resolveEmbeddingRef(ref);
-    const { transform, bounds } = this._embeddingInfo.get(embeddingId);
+    const { transform, bounds, unplacedCount, unplacedNames } = this._embeddingInfo.get(embeddingId);
     if (this._deleteCoordinateCacheEntry(this._embeddingCoordinateCacheKey(embeddingId), embedding)) {
-      return { positions: embedding, transform, bounds };
+      return { positions: embedding, transform, bounds, unplacedCount, unplacedNames };
     }
     // Another caller of the same computation was handed the cached array
     // first. Every caller sharing one computation resumes in the same turn,
     // before any of them can write to it, so this copy is still the payload.
-    return { positions: new Float32Array(embedding), transform, bounds };
+    return { positions: copyLargeArray(embedding), transform, bounds, unplacedCount, unplacedNames };
   }
 
   /**
@@ -2044,6 +2174,8 @@ export class BaseAnnDataAdapter {
             bounds: payload.bounds === null
               ? null
               : Object.freeze({ min: Object.freeze([...payload.bounds.min]), max: Object.freeze([...payload.bounds.max]) }),
+            unplacedCount: payload.unplacedCount,
+            unplacedNames: Object.freeze([...payload.unplacedNames]),
           });
           this._retainCoordinateCacheEntry({
             cacheKey: coordinateCacheKey,
@@ -2068,7 +2200,9 @@ export class BaseAnnDataAdapter {
    * scaled by the bound embedding's transform in the reader worker
    * (`EmbeddingPayloads.vectors`), so the vectors live in the space its
    * positions are shown in -- with the largest vector's magnitude. Both
-   * arrays are read at once when the embedding is not read yet.
+   * arrays are read at once when the embedding is not read yet. A cell
+   * whose vector row is not finite has NaN components (no arrow), counted
+   * in `unplacedCount`, the first named in `unplacedNames`.
    *
    * The vectors are shared, read-only: the cache and every caller hold the
    * same array.
@@ -2077,7 +2211,7 @@ export class BaseAnnDataAdapter {
    * @param {number} dimension - The bound embedding's dimension, as the caller's layout declares it.
    * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
    *   wait; the reads stop once no caller still waits for them.
-   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>} `dimension` components per cell.
+   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number, unplacedCount: number, unplacedNames: ReadonlyArray<string>}>} `dimension` components per cell.
    */
   async getVectorPayload(path, dimension, { signal = null } = {}) {
     const generation = this._captureLifecycleGeneration();
@@ -2109,7 +2243,7 @@ export class BaseAnnDataAdapter {
     const cachedPayload = () => {
       const vectors = this._vectorFieldCache.get(path);
       this._touchCoordinateCacheEntry(coordinateCacheKey, vectors);
-      return { vectors, maxMagnitude: this._vectorMagnitudes.get(path) };
+      return { vectors, ...this._vectorInfo.get(path) };
     };
 
     try {
@@ -2137,7 +2271,7 @@ export class BaseAnnDataAdapter {
             { signal: workSignal }
           );
           this._assertLifecycleGeneration(generation);
-          const { vectors, maxMagnitude } = payload;
+          const { vectors, maxMagnitude, unplacedCount, unplacedNames } = payload;
           if (!(vectors instanceof Float32Array) || vectors.length !== this._loader.nObs * dimension) {
             throw new Error(`Vector field '${vectorItem.key}' read did not return one vector per cell`);
           }
@@ -2149,8 +2283,9 @@ export class BaseAnnDataAdapter {
             label: `Vector field '${vectorItem.key}'`,
             value: vectors
           });
-          this._vectorMagnitudes.set(path, maxMagnitude);
-          return { vectors, maxMagnitude };
+          const info = Object.freeze({ maxMagnitude, unplacedCount, unplacedNames: Object.freeze([...unplacedNames]) });
+          this._vectorInfo.set(path, info);
+          return { vectors, ...info };
         },
         signal
       );
@@ -2202,6 +2337,9 @@ export class BaseAnnDataAdapter {
         codesDtype: storage.dtype,
         codesMissingValue: storage.missingValue,
         palette: field.palette,
+        // A text or boolean column: its categories are the labels its open
+        // cells hold (`discovered-categories.js`), not a stored dictionary.
+        discovered: field._needsCodeComputation === true,
         outlierQuantilesPath: latentIndex < 0 ? null : mappingLatentOutlierPath(latentIndex, fieldIndex),
       });
     });
@@ -2248,13 +2386,89 @@ export class BaseAnnDataAdapter {
         ? []
         : names.names.map((name, gene) => ({ key: name, kind: 'continuous', path: `${path}/${gene}` })),
       geneNames: names === null
-        ? { source: null, filledFromIndex: 0, renamed: [] }
+        ? { source: null, filledFromIndex: 0, renamed: [], ids: null }
         : {
             source: names.source,
             filledFromIndex: names.filledFromIndex,
             renamed: names.renamed.map(pair => [...pair]),
+            ids: names.ids === null ? null : [...names.ids],
           },
     };
+  }
+
+  /**
+   * The obs names of the open cells, in order: read when an export asks;
+   * every one, rows `[start, end)` of the open cells, or the open cells
+   * `cells` lists, in its order (their rows alone, read in the stored order).
+   * @param {{rows?: [number, number]|null, cells?: ArrayLike<number>|null}} [options]
+   * @returns {Promise<string[]>}
+   */
+  async getObsNames({ rows = null, cells = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const names = await this._loader.readObsNames({ rows, cells });
+    this._assertLifecycleGeneration(generation);
+    return names;
+  }
+
+  /**
+   * The rows of open cells of the expression matrix one gene payload path
+   * reads (`getGeneValues`), handed to `onPart` part by part as they arrive
+   * (`AnnDataReader.readMatrixRows`): each cell's non-zero genes, by
+   * position in that matrix's gene list, ascending, and their values. One
+   * read for every cell, so a writer holds one part at a time.
+   *
+   * @param {string} path - A gene payload path of the matrix
+   * @param {ArrayLike<number>} cells - Open cell positions
+   * @param {{signal?: AbortSignal|null, onPart: (part: {first: number, count: number, pointers: Float64Array, genes: Int32Array, values: Float32Array}) => void}} options
+   * @returns {Promise<{cells: number, entries: number}>}
+   */
+  async readMatrixRowsOf(path, cells, { signal = null, onPart }) {
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const read = await this._loader.readMatrixRows(route.element, cells, {
+      signal,
+      // A part of a dataset no longer shown is not handed on.
+      onPart: part => {
+        if (!this._closed && generation === this._lifecycleGeneration) onPart(part);
+      },
+    });
+    this._assertLifecycleGeneration(generation);
+    return read;
+  }
+
+  /**
+   * What reading the rows of open cells of the matrix one gene payload path
+   * reads costs now, before it is read (`readMatrixRowsOf`): its bytes,
+   * requests and time over the link as measured (`AnnDataReader.matrixRowsCost`,
+   * the model the gene sample is priced by), or null when it is not priced.
+   *
+   * @param {string} path
+   * @param {ArrayLike<number>} cells
+   * @returns {Promise<{cells: number, bytes: number, keptBytes: number, requests: number, ms: number|null}|null>}
+   */
+  async getMatrixRowsCostOf(path, cells) {
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const cost = await this._loader.matrixRowsCost(route.element, cells);
+    this._assertLifecycleGeneration(generation);
+    return cost;
+  }
+
+  /**
+   * Columns of one `obsm` array of the open cells, row-major, as stored.
+   *
+   * @param {string} key
+   * @param {ReadonlyArray<number>} columns
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, cells?: ArrayLike<number>|null}} [options] - `rows`:
+   *   `[start, end)` of the open cells; `cells`: listed open cells alone, in
+   *   their order (an export's); every open cell when both are null
+   * @returns {Promise<Float32Array|Float64Array>}
+   */
+  async getObsmColumns(key, columns, { signal = null, rows = null, cells = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const values = await this._loader.readObsmColumns(key, columns, { signal, rows, cells });
+    this._assertLifecycleGeneration(generation);
+    return values;
   }
 
   /**
@@ -2363,9 +2577,11 @@ export class BaseAnnDataAdapter {
   /**
    * The unique gene names of one axis and name source, read once and kept:
    * the var index, or one var column whose empty values take the index name.
+   * Names from a column keep the var index beside them (`ids`): what every
+   * boundary names a gene by (`geneIdentities`).
    *
    * @param {{varAxis: 'X'|'raw', column: string|null}} route
-   * @returns {Promise<{names: string[], renamed: Array<[string, string]>, filledFromIndex: number, source: string|null}>}
+   * @returns {Promise<{names: string[], renamed: Array<[string, string]>, filledFromIndex: number, source: string|null, ids: string[]|null}>}
    * @private
    */
   async _geneNames(route) {
@@ -2387,6 +2603,7 @@ export class BaseAnnDataAdapter {
       renamed: unique.renamed,
       filledFromIndex: unique.filledFromIndex,
       source: route.column,
+      ids: route.column === null ? null : Object.freeze([...index]),
     });
     this._geneNamesByRoute.set(cacheKey, result);
     return result;
@@ -2397,7 +2614,9 @@ export class BaseAnnDataAdapter {
    * @param {string} key - Field name
    * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
    *   wait; the read stops once no caller still waits for it.
-   * @returns {Promise<{data: ArrayBuffer, kind: string, categories?: string[], min?: number, max?: number}>}
+   * @returns {Promise<{data: ArrayBuffer, kind: string, dtype?: string, categories?: string[], min?: number, max?: number}>}
+   *   A continuous field's `dtype` names its buffer's values: `float32`, or
+   *   `float64` for an integer column float32 cannot hold exactly.
    */
   async getObsFieldData(key, { signal = null } = {}) {
     const generation = this._captureLifecycleGeneration();
@@ -2411,9 +2630,14 @@ export class BaseAnnDataAdapter {
         this._assertLifecycleGeneration(generation);
 
         if (fieldData.kind === 'continuous') {
+          // The caller owns the values from here (the field state keeps them,
+          // under its own residency budget): not kept here as well.
+          this._deleteObsFieldDataCache(key, fieldData);
           return {
             data: fieldData.values.buffer,
             kind: 'continuous',
+            // float32, or float64 for an integer column float32 cannot hold exactly.
+            dtype: fieldData.values instanceof Float64Array ? 'float64' : 'float32',
             min: fieldData.min,
             max: fieldData.max,
           };
@@ -2431,6 +2655,9 @@ export class BaseAnnDataAdapter {
           // The file's colours for them, for a field whose categories its
           // first load found (null for a text column's).
           palette: this._obsFieldsMetadata?.find(field => field.key === key)?.palette ?? null,
+          // Coded by the categories its open cells hold: how many its file
+          // stores (the categories above are those among the open cells).
+          ...(fieldData.storedCategoryCount === undefined ? {} : { storedCategoryCount: fieldData.storedCategoryCount }),
           dtype: dtypeStr,
           missingValue,
           ...(typeof fieldData.ordered === 'boolean'
@@ -2450,11 +2677,16 @@ export class BaseAnnDataAdapter {
    * the reader as one batch (`AnnDataReaderClient.getMatrixColumn`).
    *
    * @param {string} path
-   * @param {{signal?: AbortSignal|null}} [options] - Ends this caller's
-   *   wait; the read stops once no caller still waits for it.
+   * @param {{signal?: AbortSignal|null, onPartial?: ((column: Float32Array|import('./column-forms.js').ColumnForm, cells: number) => void)|null}} [options] -
+   *   `signal` ends this caller's wait; the read stops once no caller still
+   *   waits for it. `onPartial(column, cells)`: while the gene index of a
+   *   matrix indexed in segments is built, the gene on the first `cells`
+   *   open cells (a sample of them), the rest not read, each time it has
+   *   more (`AnnDataReader.getMatrixColumn`): its sparse form when smaller
+   *   (shared, never written), else each caller its own dense column.
    * @returns {Promise<Float32Array>}
    */
-  async getGeneValues(path, { signal = null, owner = null, key = null } = {}) {
+  async getGeneValues(path, { signal = null, owner = null, key = null, onPartial = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     const route = await this._geneRoute(path, generation);
     const inFlightKey = JSON.stringify([route.element, route.gene]);
@@ -2469,15 +2701,296 @@ export class BaseAnnDataAdapter {
       inFlightKey,
       generation,
       async workSignal => {
-        const column = await this._loader.getMatrixColumn(route.element, route.gene, { signal: workSignal, owner, key: readKey });
+        const column = await this._loader.getMatrixColumn(route.element, route.gene, {
+          signal: workSignal,
+          owner,
+          key: readKey,
+          // The gene on more cells as they are read, to every caller that
+          // asked for it, whenever it joined: a dense column copied for each
+          // caller after the first, a sparse form shared (never written).
+          onPartial: (column, cells) => {
+            const listeners = [...(this._geneExpressionInFlight.get(inFlightKey)?.partials ?? [])];
+            listeners.forEach((listener, i) => listener(i === 0 || !ArrayBuffer.isView(column) ? column : copyLargeArray(column), cells));
+          },
+        });
         this._assertLifecycleGeneration(generation);
         return column;
       },
       signal
     );
     const entry = this._geneExpressionInFlight.get(inFlightKey);
-    if (entry !== undefined) entry.readKey ??= readKey;
+    if (entry !== undefined) {
+      entry.readKey ??= readKey;
+      if (onPartial !== null) (entry.partials ??= new Set()).add(onPartial);
+    }
     return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rows of the open cells
+  //
+  // What an opening grown in place appends (`AnnDataFileSource.reopenCells`,
+  // `app/open-cells-resize.js`), and what an analysis's first pass reads on
+  // the first cells of priority order: rows `[start, end)` of the open cells
+  // of a field, an embedding, a vector field or a gene, read by the reader
+  // worker with `rows` (only what those cells need where the layout allows),
+  // never cached here. Each is, bit for bit, the whole read's rows.
+  // -------------------------------------------------------------------------
+
+  /** `rows` checked against the open cells. @private */
+  _requireRows(rows, label) {
+    const n = this._loader.nObs;
+    if (!Array.isArray(rows) || rows.length !== 2 || !Number.isSafeInteger(rows[0]) || !Number.isSafeInteger(rows[1]) ||
+        rows[0] < 0 || rows[1] < rows[0] || rows[1] > n) {
+      throw new RangeError(`${label}: rows are [start, end) within the ${formatCountOf(n, 'open cell')}; got ${JSON.stringify(rows)}.`);
+    }
+    return [rows[0], rows[1]];
+  }
+
+  /**
+   * Rows `[start, end)` of one obs field: a continuous field's float32
+   * values, or a categorical field's codes under `categories`, the
+   * categories the field was loaded with (the shown field's), in their
+   * storage (`getCellucidCategoryStorage`). A text or boolean column whose
+   * rows hold a label outside `categories` answers its grown categories
+   * (every earlier one kept, in label order) and their colours, the rows
+   * coded under them: the caller recodes the cells it holds by label.
+   *
+   * @param {string} key
+   * @param {[number, number]} rows
+   * @param {{categories?: ReadonlyArray<string|number|boolean>|null, signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{kind: 'continuous', values: Float32Array|Float64Array}|{kind: 'category', codes: ArrayBufferView, categories?: ReadonlyArray<string|boolean>, palette?: number[][]}>}
+   */
+  async getObsFieldRows(key, rows, { categories = null, signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Obs field '${key}'`);
+    const meta = this._obsFieldsMetadata?.find(field => field.key === key);
+    if (!meta) throw new Error(`Obs field '${key}' not found`);
+    if (meta.kind !== 'continuous' && !Array.isArray(categories)) {
+      throw new TypeError(`Rows of categorical field '${key}' are coded under the categories it was loaded with.`);
+    }
+    const field = await this._loader.getObsField(key, {
+      signal,
+      rows: [start, end],
+      ...(meta._needsCodeComputation ? { categories } : {}),
+    });
+    this._assertLifecycleGeneration(generation);
+    const count = end - start;
+    if (meta.kind === 'continuous') {
+      const values = isContinuousValues(field.values) ? field.values : copyTypedArray(Float32Array, field.values, `Observation field '${key}'`);
+      if (values.length !== count) throw new Error(`Continuous observation field '${key}' rows did not read one value per cell`);
+      return { kind: 'continuous', values };
+    }
+    if (field.dtype === 'categorical' && field.present !== undefined) {
+      // Coded by the categories its open cells hold (carried by the reader
+      // from the opening these rows grow): every one the caller shows is
+      // among them, in stored order, with any these rows add.
+      if (meta._needsCodeComputation) throw new Error(`Observation field '${key}' rows must arrive coded`);
+      if (!Array.isArray(meta.categories)) meta.categories = Object.freeze([...categories]);
+      this._adoptPresentCategories(meta, field, key);
+    } else if (meta._presentCategories === true) {
+      throw new Error(`Categorical observation field '${key}' rows must arrive coded by the categories its open cells hold`);
+    } else if (!meta._needsCodeComputation) {
+      if (field.dtype !== 'categorical' || field.categories.length !== categories.length ||
+          field.categories.some((category, index) => category !== categories[index])) {
+        throw new Error(`Categorical observation field '${key}' changed its category dictionary after it was loaded`);
+      }
+    } else if (field.dtype !== 'categorical' || field.discovered !== true) {
+      throw new Error(`Observation field '${key}' rows must arrive coded`);
+    }
+    const { TypedArrayClass } = getCellucidCategoryStorage(field.categories, key);
+    if (!(field.codes instanceof TypedArrayClass) || field.codes.length !== count) {
+      throw new Error(`Categorical observation field '${key}' rows must arrive as narrowed codes, one per cell`);
+    }
+    if (field.categories.length === categories.length) return { kind: 'category', codes: field.codes };
+    // A text or boolean column whose added cells hold labels it had not
+    // shown: its categories grow (every earlier one kept, in label order,
+    // its colour too), and these rows are coded under them. A categorical
+    // coded by the categories its open cells hold grows the same way, in
+    // stored order (adopted above).
+    if (field.present === undefined) this._adoptDiscoveredCategories(meta, field.categories, key);
+    return { kind: 'category', codes: field.codes, categories: meta.categories, palette: meta.palette };
+  }
+
+  /**
+   * Rows `[start, end)` of one embedding's display coordinates, by its route
+   * (`getEmbeddingPayload`), in the frame the dataset's cells are shown in
+   * (`EmbeddingPayloads.embedding`), with their bounds.
+   *
+   * @param {string} path
+   * @param {number} dimension
+   * @param {[number, number]} rows
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<import('./embedding-payload.js').EmbeddingPayload>}
+   */
+  async getEmbeddingRows(path, dimension, rows, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Embedding '${path}'`);
+    const route = parseMappingEmbeddingPath(path);
+    const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
+    if (item === undefined) throw new RangeError(`This dataset has no embedding '${path}'.`);
+    if (route.columns.length !== dimension) {
+      throw new RangeError(`Embedding payload '${path}' holds ${route.columns.length}D coordinates, not ${dimension}D.`);
+    }
+    const { columns } = this._resolveEmbeddingRef({ key: item.key, columns: route.columns });
+    const payload = await this._loader.readEmbedding(item.key, columns, this._defaults.normalizeEmbeddings !== false, { signal, rows: [start, end] });
+    this._assertLifecycleGeneration(generation);
+    if (!(payload.positions instanceof Float32Array) || payload.positions.length !== (end - start) * dimension) {
+      throw new Error(`Embedding '${path}' rows did not read one row per cell`);
+    }
+    return payload;
+  }
+
+  /**
+   * The cell-order digest of one embedding over the open cells, by its route
+   * (`obsm/{i}/{cols}`): its stored values, each cell named by its original
+   * position, summed in the reader worker as they were read
+   * (`cell-order-digest.js`). The same cells of the same file digest alike
+   * whatever order they were opened, grown or cut in.
+   *
+   * @param {string} path
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<string>}
+   */
+  async getCellOrderDigest(path, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const route = parseMappingEmbeddingPath(path);
+    const item = route === null ? undefined : this._candidates?.obsm[route.obsmIndex];
+    if (item === undefined) throw new RangeError(`This dataset has no embedding '${path}'.`);
+    const { columns } = this._resolveEmbeddingRef({ key: item.key, columns: route.columns });
+    const digest = await this._loader.readCellOrderDigest(item.key, columns, { signal });
+    this._assertLifecycleGeneration(generation);
+    return digest;
+  }
+
+  /**
+   * Rows `[start, end)` of one vector field, by its route
+   * (`getVectorPayload`), scaled as the whole field is, with their largest
+   * magnitude.
+   *
+   * @param {string} path
+   * @param {number} dimension
+   * @param {[number, number]} rows
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>}
+   */
+  async getVectorRows(path, dimension, rows, { signal = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Vector field '${path}'`);
+    const route = parseMappingVectorPath(path);
+    const vectorItem = route === null ? undefined : this._candidates?.obsm[route.vectorIndex];
+    const embeddingItem = route === null ? undefined : this._candidates?.obsm[route.embeddingIndex];
+    if (vectorItem === undefined || embeddingItem === undefined) throw new RangeError(`This dataset has no vector route '${path}'.`);
+    const embeddingRef = { key: embeddingItem.key, columns: route.embeddingColumns };
+    const resolved = resolveVectorBinding(this._candidates, { key: vectorItem.key, embedding: embeddingRef });
+    if (!resolved.ok || resolved.path !== path || resolved.dimension !== dimension) {
+      throw new RangeError(`Cannot draw vector field '${path}' at ${dimension}D.`);
+    }
+    const payload = await this._loader.readVectorField(
+      vectorItem.key,
+      route.vectorColumns,
+      { key: embeddingItem.key, columns: this._resolveEmbeddingRef(embeddingRef).columns },
+      this._defaults.normalizeEmbeddings !== false,
+      { signal, rows: [start, end] }
+    );
+    this._assertLifecycleGeneration(generation);
+    if (!(payload.vectors instanceof Float32Array) || payload.vectors.length !== (end - start) * dimension) {
+      throw new Error(`Vector field '${vectorItem.key}' rows did not read one vector per cell`);
+    }
+    return payload;
+  }
+
+  /**
+   * Rows `[start, end)` of one gene, by its route (`getGeneValues`): the
+   * gene on those cells only, reading what they need
+   * (`AnnDataReader.getMatrixColumn`, `rows`).
+   *
+   * @param {string} path
+   * @param {[number, number]} rows
+   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @returns {Promise<Float32Array>}
+   */
+  async getGeneValueRows(path, rows, { signal = null, owner = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const [start, end] = this._requireRows(rows, `Gene '${path}'`);
+    const route = await this._geneRoute(path, generation);
+    const column = await this._loader.getMatrixColumn(route.element, route.gene, { signal, owner, rows: [start, end] });
+    this._assertLifecycleGeneration(generation);
+    if (!(column instanceof Float32Array) || column.length !== end - start) {
+      throw new Error(`Gene '${path}' rows did not read one value per cell`);
+    }
+    return column;
+  }
+
+  /**
+   * What reading the gene at `path` costs now, before it is read
+   * (`AnnDataReader.geneReadPlan`): for a matrix stored cell by cell whose
+   * gene index is not built yet, the whole-matrix read the first gene needs.
+   *
+   * @param {string} path - A gene route, as `getGeneValues`
+   * @returns {Promise<Object|null>} Null when the loader cannot tell
+   */
+  async getGeneReadPlan(path) {
+    const generation = this._captureLifecycleGeneration();
+    if (typeof this._loader.geneReadPlan !== 'function') return null;
+    const route = await this._geneRoute(path, generation);
+    const plan = await this._loader.geneReadPlan(route.element);
+    this._assertLifecycleGeneration(generation);
+    return plan;
+  }
+
+  /**
+   * The gene sample the gene at `path` is read for
+   * (`AnnDataReader.geneSampleOf`): `{cells, of}` when its matrix's genes
+   * are read for the first open cells only, else null.
+   *
+   * @param {string} path - A gene route, as `getGeneValues`
+   * @returns {Promise<{cells: number, of: number}|null>}
+   */
+  async getGeneSample(path) {
+    if (typeof this._loader.geneSampleOf !== 'function' || this.geneSample() === null) return null;
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const sample = await this._loader.geneSampleOf(route.element);
+    this._assertLifecycleGeneration(generation);
+    return sample;
+  }
+
+  /**
+   * What reading the matrix of the gene at `path` for the first `target`
+   * open cells costs beyond the gene sample (`AnnDataReader.geneSampleCost`),
+   * or null.
+   *
+   * @param {string} path
+   * @param {number} target
+   * @param {{geneTime?: {ms: number, spentBytes: number, spentRequests?: number}|null}} [options]
+   */
+  async getGeneSampleCost(path, target, options = {}) {
+    if (typeof this._loader.geneSampleCost !== 'function') return null;
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const cost = await this._loader.geneSampleCost(route.element, target, options);
+    this._assertLifecycleGeneration(generation);
+    return cost;
+  }
+
+  /**
+   * Read genes of the matrix of the gene at `path` for the first `target`
+   * open cells (`AnnDataReader.growGeneSample`), building each step by
+   * reading that gene; what is read stays when `signal` stops the rest.
+   *
+   * @param {string} path
+   * @param {number} target
+   * @param {{signal?: AbortSignal|null, onStep?: ((sample: Object|null, cells: number) => void)|null, topUp?: boolean}} [options]
+   *   `topUp`: the page filling the gene time (`DataState.topUpGeneSample`), not a person's count
+   * @returns {Promise<Object|null>} The gene sample now
+   */
+  async growGeneSample(path, target, { signal = null, onStep = null, topUp = false } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const route = await this._geneRoute(path, generation);
+    const sample = await this._loader.growGeneSample(route.element, target, { signal, gene: route.gene, onStep, topUp });
+    this._assertLifecycleGeneration(generation);
+    return sample;
   }
 
   /**
@@ -2523,16 +3036,16 @@ export class BaseAnnDataAdapter {
    * @param {ReadonlyArray<string>} paths - Gene payload paths of one matrix
    *   (`getGeneValues`), each gene once
    * @param {ArrayLike<number>} cells - Distinct cell positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options] -
    *   `owner`: the job the read is for
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
    *   Gene `g` (of `paths`) has entries `pointers[g]` to `pointers[g + 1]`,
    *   each at position `cellIndex[k]` of `cells`, ascending
    */
-  async getGeneCellSubset(paths, cells, { signal = null, owner = null } = {}) {
+  async getGeneCellSubset(paths, cells, { signal = null, owner = null, runGenes = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     const { element, genes } = await this._geneRoutesOf(paths, generation, 'A cell subset');
-    const subset = await this._loader.getMatrixCellSubset(element, cells, genes, { signal, owner });
+    const subset = await this._loader.getMatrixCellSubset(element, cells, genes, { signal, owner, runGenes });
     this._assertLifecycleGeneration(generation);
     return subset;
   }
@@ -2616,13 +3129,13 @@ export class BaseAnnDataAdapter {
    * @param {ReadonlyArray<string>} paths
    * @param {ArrayLike<number>} cells
    * @param {Object} delivery
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options]
    * @returns {Promise<{bytes: number}>}
    */
-  async deliverGeneCellSubset(paths, cells, delivery, { signal = null, owner = null } = {}) {
+  async deliverGeneCellSubset(paths, cells, delivery, { signal = null, owner = null, runGenes = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     const { element, genes } = await this._geneRoutesOf(paths, generation, 'A cell subset');
-    const delivered = await this._loader.deliverMatrixCellSubset(element, cells, genes, delivery, { signal, owner });
+    const delivered = await this._loader.deliverMatrixCellSubset(element, cells, genes, delivery, { signal, owner, runGenes });
     this._assertLifecycleGeneration(generation);
     return delivered;
   }
@@ -2762,7 +3275,7 @@ export class BaseAnnDataAdapter {
       rest,
       'Direct AnnData connectivity edges'
     );
-    throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
+    throwIfAborted(signal);
     if (key === null) return null;
     requireObspKey(key);
     const generation = this._captureLifecycleGeneration();
@@ -2771,13 +3284,12 @@ export class BaseAnnDataAdapter {
       const cached = this._connectivityCache.get(key);
       await Promise.resolve();
       this._assertLifecycleGeneration(generation);
-      throwIfMetadataAborted(signal, CONNECTIVITY_EDGE_LABEL);
+      throwIfAborted(signal);
       return cached;
     }
 
     const isDefault = key === this._defaultGraphKey();
-    return waitForMetadata(
-      this._coalesceInFlight(
+    return awaitWithSignal(this._coalesceInFlight(
         this._connectivityInFlight,
         key,
         generation,
@@ -2786,7 +3298,7 @@ export class BaseAnnDataAdapter {
             this._assertLifecycleGeneration(generation);
             return this._connectivityCache.get(key);
           }
-          throwIfMetadataAborted(workSignal, CONNECTIVITY_EDGE_LABEL);
+          throwIfAborted(workSignal);
 
           console.log(
             `[BaseAnnDataAdapter] Loading connectivity edges of obsp['${key}']...`
@@ -2804,7 +3316,7 @@ export class BaseAnnDataAdapter {
             throw connectivityRefusal(key, error);
           }
           this._assertLifecycleGeneration(generation);
-          throwIfMetadataAborted(workSignal, CONNECTIVITY_EDGE_LABEL);
+          throwIfAborted(workSignal);
 
           if (edges === null) {
             console.log(
@@ -2829,21 +3341,50 @@ export class BaseAnnDataAdapter {
           return result;
         },
         signal
-      ),
-      signal,
-      CONNECTIVITY_EDGE_LABEL
-    );
+      ), signal);
+  }
+
+  /**
+   * Some open cells' neighbours in one neighbour graph, read from the file
+   * by row in the reader (`getConnectivityRows`): what the k-NN tool expands
+   * through, so the page never holds every cell's neighbour list. Nothing is
+   * cached here: the reader's decoded chunks serve a row read again.
+   *
+   * @param {{key?: string, cells: Uint32Array, signal?: AbortSignal|null}} options -
+   *   `key` defaults to the graph the file opens with (`_defaultGraphKey`)
+   * @returns {Promise<{offsets: Uint32Array, neighbors: Uint32Array}>}
+   */
+  async getConnectivityRows(options) {
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Connectivity row options must be an object.');
+    }
+    const { key = this._defaultGraphKey(), cells, ...rest } = options;
+    const signal = getMetadataLoadSignal(rest, 'Direct AnnData connectivity rows');
+    throwIfAborted(signal);
+    if (key === null) throw new Error('This file opens with no neighbour graph to read rows of.');
+    requireObspKey(key);
+    if (!(cells instanceof Uint32Array)) throw new TypeError('Connectivity rows are asked for by a Uint32Array of cells.');
+    if (typeof this._loader.getConnectivityRows !== 'function') {
+      throw new TypeError('Direct AnnData loaders are required to implement getConnectivityRows()');
+    }
+    const generation = this._captureLifecycleGeneration();
+    const rows = await this._loader.getConnectivityRows(key, cells, { signal });
+    this._assertLifecycleGeneration(generation);
+    throwIfAborted(signal);
+    if (rows === null) throw new Error(`obsp['${key}'] is not present in this file.`);
+    return rows;
   }
 
   /**
    * The neighbour graph the file opens with: the one a launch named
-   * (`defaults.knn`, null for none), else `obsp['connectivities']`.
+   * (`defaults.knn`, null for none), else the default rule's
+   * (`defaultGraph`: `connectivities`, else Seurat's `<modality>_snn`).
    *
    * @returns {string|null}
    * @private
    */
   _defaultGraphKey() {
-    return Object.hasOwn(this._defaults, 'knn') ? this._defaults.knn : DEFAULT_KNN_KEY;
+    return Object.hasOwn(this._defaults, 'knn') ? this._defaults.knn : this._ruleGraph;
   }
 
   /**
@@ -2856,6 +3397,9 @@ export class BaseAnnDataAdapter {
   _retainConnectivity(key, edges) {
     this._connectivityCache.clear();
     this._connectivityCache.set(key, edges);
+    // Kept within the budget with everything else cached here; until a view
+    // draws it, it is the most recent entry and the others go first.
+    this._trimCaches(this._cacheBudget(), 'obs');
   }
 
   /**
@@ -2904,13 +3448,21 @@ export class BaseAnnDataAdapter {
    */
   clearCaches() {
     this._lifecycleGeneration++;
-    this._embeddingInFlight.clear();
-    this._obsFieldDataInFlight.clear();
-    this._vectorFieldInFlight.clear();
-    this._connectivityInFlight.clear();
-    this._geneExpressionInFlight.clear();
+    // The reads in flight are of what this clears: stopped now, as a
+    // cancellation, so they neither download for nobody nor end as failures.
+    const superseded = cancelled('released', 'The read was superseded: its dataset\'s caches were cleared.');
+    for (const registry of [
+      this._embeddingInFlight,
+      this._obsFieldDataInFlight,
+      this._vectorFieldInFlight,
+      this._connectivityInFlight,
+      this._geneExpressionInFlight,
+      this._latentOutlierInFlight,
+    ]) {
+      for (const entry of registry.values()) entry.cancellation.cancel(superseded);
+      registry.clear();
+    }
     this._geneNamesByRoute.clear();
-    this._latentOutlierInFlight.clear();
     this._embeddingCache.clear();
     this._vectorFieldCache.clear();
     this._resetCoordinateCacheOwner();
@@ -2918,18 +3470,40 @@ export class BaseAnnDataAdapter {
     this._obsFieldDataCacheBytes = 0n;
     this._connectivityCache.clear();
     this._embeddingInfo.clear();
-    this._vectorMagnitudes.clear();
+    this._vectorInfo.clear();
   }
 
   /**
-   * Close and release resources
+   * Let every cached copy go (another dataset opens): reads in flight
+   * finish and are delivered; coordinates a caller pins and a graph that is
+   * drawn stay.
+   *
+   * @returns {string[]} What was let go, in words
    */
-  close() {
+  releaseCachedCopies() {
+    return this._trimCaches(0n);
+  }
+
+  /**
+   * Let go of what this adapter holds, leaving its reader open: the reader
+   * read again with other cells (`AnnDataFileSource.reopenCells`) gets a new
+   * adapter.
+   */
+  release() {
     if (this._closed) return;
     this.clearCaches();
     this._outliers?.close();
     this._closed = true;
     this._obsFieldsMetadata = null;
+    this._unregisterResidentHolder();
+  }
+
+  /**
+   * Close and release resources, the reader with them.
+   */
+  close() {
+    if (this._closed) return;
+    this.release();
     this._loader.close();
   }
 }

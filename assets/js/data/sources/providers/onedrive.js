@@ -33,7 +33,7 @@
  */
 
 import { DataSourceError, DataSourceErrorCode, explainedFailure } from '../../data-source.js';
-import { describeRemoteFile } from '../remote-file.js';
+import { describeRemoteFile, headBytesFor } from '../remote-file.js';
 import { requestJson } from '../api-request.js';
 import { registerSourceAccess, revokeSourceAccess } from '../access.js';
 import { getMicrosoftAuth } from '../auth/microsoft.js';
@@ -68,6 +68,28 @@ export function shareIdOf(link) {
 }
 
 const SHARE_ID = /^u![A-Za-z0-9_-]+$/;
+
+/** The host a share id's link (`u!` and the link in base64url) names, or null. */
+function shareHostOf(shareId) {
+  try {
+    const text = atob(shareId.slice(2).replace(/-/g, '+').replace(/_/g, '/'));
+    return new URL(text).host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What may be shown of a OneDrive value (`publicValue`): a share id, a folder
+ * or a page by the host of its link only (`share:1drv.ms`), a drive and item
+ * as they are.
+ */
+function publicOneDriveValue(value) {
+  if (SHARE_ID.test(value)) return `share:${shareHostOf(value) ?? 'onedrive'}`;
+  const linked = /^(folder|page):(https:\/\/[^/]+)/.exec(value);
+  if (linked !== null) return `${linked[1]}:${new URL(linked[2]).host}`;
+  return value;
+}
 const DRIVE_ITEM = /^([A-Za-z0-9!_.-]+)\/([A-Za-z0-9!_.-]+)$/;
 
 /**
@@ -248,6 +270,10 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
           ...(lifetimeMs === null ? {} : { expiresAt: issued + lifetimeMs - renewMs }),
         };
       },
+      // A download address names no version and its answers carry none:
+      // whether the file is still the one opened is asked of Graph (its
+      // cTag), before what is read of it is kept and when it is read again.
+      version: { confirm: async () => (await readItem(ids, { interactive: false })).cTag === cTag },
     });
   }
 
@@ -266,6 +292,7 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
     capabilities: Object.freeze({
       folders: false,
       private: 'sign-in',
+      public: false,
       versions: false,
       write: false,
     }),
@@ -276,6 +303,15 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
     }),
     match(input, { explicit = true } = {}) {
       return parseOneDrive(input, explicit);
+    },
+    /**
+     * A sharing link is itself what grants access to its file (anyone with
+     * it may read it), and a share id (`u!…`) or a folder or page value
+     * carries it whole: shown only as a share of its host, never the link.
+     * A drive and item id grants nothing without a sign-in.
+     */
+    publicValue(value) {
+      return publicOneDriveValue(value);
     },
     async open(value, { signal = null, onStep = null } = {}) {
       const parsed = parseOneDrive(value);
@@ -327,7 +363,10 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
       let head = null;
       if (Number.isSafeInteger(size)) {
         try {
-          head = headOfFile(await readFileHead(item[DOWNLOAD_URL], HEAD_BYTES, { signal }), size, HEAD_BYTES);
+          // Its whole head, or one byte when this browser keeps the file's
+          // parts (`headBytesFor`: a shorter head is no head, `headOfFile`).
+          const length = await headBytesFor(`onedrive:${encodeURIComponent(driveId)}:${encodeURIComponent(item.id)}`);
+          head = headOfFile(await readFileHead(item[DOWNLOAD_URL], length, { signal }), size, HEAD_BYTES);
         } catch (error) {
           if (signal?.aborted) throw error;
         }
@@ -340,7 +379,10 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
         name,
         size: Number.isSafeInteger(size) ? size : null,
         head,
-        version: `ctag:${item.cTag ?? ''}:${size}`,
+        // A validator only where the item states its cTag: without one the
+        // file has no version (`size:`), never a probe of its display link,
+        // which only its access reads.
+        version: typeof item.cTag === 'string' && item.cTag !== '' ? `ctag:${item.cTag}:${size}` : `size:${size}`,
         attribution: { title: name, url: typeof item.webUrl === 'string' ? item.webUrl : display },
         signal,
         onStep,

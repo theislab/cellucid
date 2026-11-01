@@ -28,10 +28,11 @@ function workerCapabilityDocument() {
   return {
     status: 'ok',
     service: 'Cellucid GitHub Auth',
-    contractVersion: 1,
+    contractVersion: 2,
     endpoints: [
       '/auth/login',
       '/auth/callback',
+      '/auth/revoke',
       '/auth/user',
       '/auth/installations',
       '/auth/installation-repos',
@@ -180,6 +181,7 @@ async function installStoredAuthentication(page) {
     sessionStorage.setItem(
       'cellucid:github-app-auth:session',
       JSON.stringify({
+        expiresAt: 4102444800000,
         token: 'synthetic-token',
         user,
       }),
@@ -383,6 +385,11 @@ async function installGitHubApi(
         contentType: 'application/json',
         body: JSON.stringify(workerCapabilityDocument()),
       });
+      return;
+    }
+    // Sign out revokes the token at GitHub through the worker.
+    if (method === 'POST' && url.pathname === '/auth/revoke') {
+      await route.fulfill({ status: 204 });
       return;
     }
     if (method !== 'GET') {
@@ -1044,10 +1051,11 @@ test(
     await installWorkerCapability(page, {
       status: 'ok',
       service: 'Cellucid GitHub Auth',
-      contractVersion: 1,
+      contractVersion: 2,
       endpoints: [
         '/auth/login',
         '/auth/callback',
+        '/auth/revoke',
         '/auth/user',
         '/auth/installations',
         '/auth/installation-repos',
@@ -1112,6 +1120,7 @@ test(
       sessionStorage.setItem(
         'cellucid:github-app-auth:session',
         JSON.stringify({
+          expiresAt: 4102444800000,
           token: 'synthetic-restored-token',
           user,
         }),
@@ -4302,7 +4311,8 @@ test(
       const callbackUrl =
         `${window.location.origin}${window.location.pathname}` +
         `${window.location.search}` +
-        '#cellucid_github_auth=1&cellucid_github_token=synthetic-token';
+        '#cellucid_github_auth=1&cellucid_github_token=synthetic-token' +
+        '&cellucid_github_token_expires_in=28800';
       await getGitHubAuthSession().completeSignInFromRedirect({
         url: callbackUrl,
       });
@@ -4382,7 +4392,7 @@ test(
     await expect(
       page.locator('.notification-error').filter({
         hasText:
-          'GitHub auth callback must contain exactly one token or one error',
+          'GitHub auth callback must contain exactly one token with its lifetime, or one error',
       }),
     ).toHaveCount(1);
 
@@ -4414,27 +4424,28 @@ test(
         owned:
           'cellucid_github_auth=1&cellucid_github_token=secret-one' +
           '&%63ellucid_github_token=secret-two',
-        message: 'exactly one token or one error',
+        message: 'exactly one token with its lifetime, or one error',
       },
       {
         owned:
           'cellucid_github_auth=1&cellucid_github_error=first' +
           '&cellucid_github_error=second',
-        message: 'exactly one token or one error',
+        message: 'exactly one token with its lifetime, or one error',
       },
       {
         owned:
           'cellucid_github_auth=1&cellucid_github_token=secret' +
           '&cellucid_github_error=denied',
-        message: 'exactly one token or one error',
+        message: 'exactly one token with its lifetime, or one error',
       },
       {
         owned: 'cellucid_github_auth=1',
-        message: 'exactly one token or one error',
+        message: 'exactly one token with its lifetime, or one error',
       },
       {
         owned:
-          'cellucid_github_auth=1&cellucid_github_token=%20secret',
+          'cellucid_github_auth=1&cellucid_github_token=%20secret' +
+          '&cellucid_github_token_expires_in=28800',
         message: 'token must be an exact nonblank string',
       },
       {
@@ -4595,6 +4606,7 @@ test(
             `#${retainedBeforeValue}` +
             '&cellucid_github_auth=1' +
             '&cellucid_github_token=synthetic-token' +
+            '&cellucid_github_token_expires_in=28800' +
             `&${retainedAfterValue}`,
         );
         const result =
@@ -4622,10 +4634,14 @@ test(
         user: AUTH_USER,
       },
     });
-    expect(JSON.parse(accepted.stored)).toEqual({
+    const { expiresAt, ...stored } = JSON.parse(accepted.stored);
+    expect(stored).toEqual({
       token: 'synthetic-token',
       user: AUTH_USER,
     });
+    // The token's own lifetime from now: an expiring user token, never indefinite.
+    expect(expiresAt).toBeGreaterThan(Date.now());
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + 28_800_000);
     expect(authUserRequestHashes).toEqual([cleanedHash]);
     expect(pageErrors).toEqual([]);
   },

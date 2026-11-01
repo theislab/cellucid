@@ -12,18 +12,18 @@
  * @module analysis-types/de-analysis-ui
  */
 
-import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { countNoun, formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
-import { toCSVCell } from '../../compute/csv-export.js';
+import { geneNameColumns, toCSVCell } from '../../compute/csv-export.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { DE_DISPLAY_KEYS, DE_OPTIONS } from '../../options/de-options.js';
 import { defineOptions } from '../../options/option-schema.js';
 import { renderOptionsForm } from '../../options/render-options-form.js';
 import { GenesPanelController, categoryOptionId } from '../../genes-panel/genes-panel-controller.js';
-import { countGeneFamilies } from '../../shared/gene-sets.js';
+import { countGeneFamilies, geneIdentities } from '../../shared/gene-sets.js';
 import { pseudobulkUnits } from '../../stats/pseudobulk.js';
 import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 import {
@@ -31,6 +31,8 @@ import {
   readResultEnvelope,
   requireDatasetGenes
 } from '../../shared/analysis-result-session.js';
+import { sharedCellCount } from '../../shared/page-overlap.js';
+import { failureText } from '../../../../utils/errors.js';
 
 /** The Wilcoxon p-value conventions as the form names them. */
 const P_CONVENTION_NAMES = Object.freeze(Object.fromEntries(
@@ -124,20 +126,35 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     // redraw (each posted its error): Run says why until the field changes.
     if (!this._pendingFields.has(field) && !this._fieldGroupFailures.has(field)) {
       this._pendingFields.add(field);
+      const cells = this._openCells();
       void this._helperController().describeGroups(field, null).then(value => {
+        // Described for cells no longer open: read again when next asked for.
+        if (this._isDestroyed || cells !== this._openCells()) return;
         this._pendingFields.delete(field);
-        if (this._isDestroyed) return;
         this._fieldGroups.set(field, value);
         this._refreshOptionsContext();
       }, error => {
+        if (this._isDestroyed || cells !== this._openCells()) return;
         this._pendingFields.delete(field);
-        if (this._isDestroyed) return;
         this._fieldGroupFailures.set(field, error);
-        this._notifications.error(`Differential expression groups: ${error.message}`, { category: 'analysis' });
+        this._notifications.error(`Differential expression groups: ${failureText(error)}`, { category: 'analysis' });
         this._refreshOptionsContext();
       });
     }
     return [];
+  }
+
+  /**
+   * Another set of open cells: every field's categories and codes are read
+   * again on them, and the groups resolved again.
+   * @override
+   */
+  _onOpenCellsChanged() {
+    this._fieldGroups.clear();
+    this._fieldGroupFailures.clear();
+    this._pendingFields.clear();
+    this._resolvedGroups = null;
+    this._replicateBlocker = null;
   }
 
   /**
@@ -155,7 +172,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const failure = this._fieldGroupFailures.get(field);
     return failure === undefined
       ? 'Reading the categories…'
-      : `The categories of ${field} could not be read: ${failure.message}`;
+      : `The categories of ${field} could not be read: ${failureText(failure)}`;
   }
 
   _getOptionsContext() {
@@ -293,10 +310,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       a = { name: nameOf(idsA), cells: cellsOf(keepA) };
       b = { name: nameOf(idsB), cells: cellsOf(keepB) };
     }
-    let overlap = 0;
-    for (let i = 0, j = 0; i < a.cells.length && j < b.cells.length;) {
-      if (a.cells[i] === b.cells[j]) { overlap++; i++; j++; } else if (a.cells[i] < b.cells[j]) i++; else j++;
-    }
+    const overlap = sharedCellCount(a.cells, b.cells);
     if (overlap > 0) return { reason: `The groups share ${formatCountOf(overlap, 'cell')}` };
     if (a.cells.length < 2 || b.cells.length < 2) return { reason: 'Each group needs at least 2 cells' };
     return { a, b };
@@ -315,12 +329,12 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     // Counting the samples is a pass over every cell: kept for these groups
     // and this sample field.
     const kept = this._replicateBlocker;
-    if (kept?.resolved === resolved && kept.codes === replicates.codes) return kept.blocker;
-    const units = pseudobulkUnits(resolved.a.cells, resolved.b.cells, replicates.codes, replicates.missingCode, this.dataLayer.state.pointCount);
+    if (kept?.resolved === resolved && kept.codes === replicates.codes && kept.minimum === replicates.minCellsPerSample) return kept.blocker;
+    const units = pseudobulkUnits(resolved.a.cells, resolved.b.cells, replicates.codes, replicates.missingCode, this.dataLayer.state.pointCount, replicates.minCellsPerSample);
     const blocker = units.unitsA < 2 || units.unitsB < 2
-      ? `Each group needs cells in at least 2 samples of ${options.replicates}`
+      ? `Each group needs at least 2 samples of ${options.replicates} with ${formatCountOf(replicates.minCellsPerSample, 'cell')} or more`
       : null;
-    this._replicateBlocker = { resolved, codes: replicates.codes, blocker };
+    this._replicateBlocker = { resolved, codes: replicates.codes, minimum: replicates.minCellsPerSample, blocker };
     return blocker;
   }
 
@@ -329,7 +343,12 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     this._groupsOfField(options.replicates);
     const described = this._fieldGroups.get(options.replicates);
     if (described === undefined) return null;
-    return { name: options.replicates, codes: described.codes, missingCode: missingCategoryCode(described.codes) };
+    return {
+      name: options.replicates,
+      codes: described.codes,
+      missingCode: missingCategoryCode(described.codes),
+      minCellsPerSample: options.minCellsPerSample
+    };
   }
 
   /** A swap beside Group A and Group B. */
@@ -352,9 +371,23 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   // Run
   // ===========================================================================
 
-  async _runAnalysisImpl(options, requestId, job) {
-    const resolved = this._resolveGroups(options);
-    if (resolved.reason) throw new Error(resolved.reason);
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  /** Its genes: a run reads every gene it tests (about the matrix's). @override */
+  _getRunUnits() {
+    return Math.max(1, this.dataLayer.state?.varData?.fields?.length ?? 1);
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
+    const groups = this._resolveGroups(options);
+    if (groups.reason) throw new Error(groups.reason);
+    // A first pass: each group's cells in the sample.
+    const resolved = sample === null
+      ? groups
+      : { a: { ...groups.a, cells: sample.cells(groups.a.cells) }, b: { ...groups.b, cells: sample.cells(groups.b.cells) } };
     const helper = this._helperController();
     const genes = await helper.genesToTest(options);
     const deResults = await this.multiVariableAnalysis.differentialExpression({
@@ -442,16 +475,33 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         ...(summary.matrix === 'mapped' ? [] : [summary.matrixLabel])
       ].join(' · ');
       header.appendChild(line);
+      const chips = document.createElement('div');
+      chips.className = 'analysis-result-chips';
       if (summary.lowN.length > 0) {
         const chip = document.createElement('span');
         chip.className = 'analysis-chip analysis-chip-warning';
         chip.textContent = 'low n';
         chip.title = `Fewer than ${formatCountOf(summary.minCells, 'cell')}: ${summary.lowN.join(', ')}`;
-        const chips = document.createElement('div');
-        chips.className = 'analysis-result-chips';
         chips.appendChild(chip);
-        header.appendChild(chips);
       }
+      const replicates = summary.replicates;
+      const leftOut = replicates === null ? 0 : replicates.smallSamplesA + replicates.smallSamplesB;
+      if (leftOut > 0) {
+        const chip = document.createElement('span');
+        chip.className = 'analysis-chip analysis-chip-info';
+        chip.textContent = `${formatCount(leftOut)} small ${countNoun(leftOut, 'sample')} left out`;
+        chip.title = `Samples of ${replicates.field} with fewer than ${formatCountOf(replicates.minCellsPerSample, 'cell')} of a group are left out of that side (${formatCount(replicates.smallSamplesA)} of ${summary.groupAName}, ${formatCount(replicates.smallSamplesB)} of ${summary.groupBName}; ${formatCountOf(replicates.cellsInSmallSamples, 'cell')}): their means are mostly noise, and every sample weighs the same.`;
+        chips.appendChild(chip);
+      }
+      const unmeasured = replicates === null ? 0 : replicates.genesWithUnmeasuredSamples;
+      if (unmeasured > 0) {
+        const chip = document.createElement('span');
+        chip.className = 'analysis-chip analysis-chip-info';
+        chip.textContent = `${formatCountOf(unmeasured, 'gene')} with fewer samples`;
+        chip.title = `For ${formatCountOf(unmeasured, 'gene')}, some samples of ${replicates.field} have fewer than ${formatCountOf(replicates.minCellsPerSample, 'cell')} with a value (cells without one were not measured: NaN), so those samples are left out of that gene's test. Each gene's samples tested are n_a and n_b in the CSV.`;
+        chips.appendChild(chip);
+      }
+      if (chips.childElementCount > 0) header.appendChild(chips);
       container.prepend(header);
     }
     return rendered;
@@ -500,6 +550,12 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       ...(summary.replicates === null ? [] : [[
         'Replicates',
         `${summary.replicates.field}: ${formatCount(summary.replicates.samplesA)} vs ${formatCountOf(summary.replicates.samplesB, 'sample')}`
+      ], [
+        `Samples left out (fewer than ${formatCountOf(summary.replicates.minCellsPerSample, 'cell')})`,
+        `${formatCount(summary.replicates.smallSamplesA)} vs ${formatCount(summary.replicates.smallSamplesB)} (${formatCountOf(summary.replicates.cellsInSmallSamples, 'cell')})`
+      ], [
+        `Genes with samples left out (fewer than ${formatCountOf(summary.replicates.minCellsPerSample, 'cell')} with a value)`,
+        formatCount(summary.replicates.genesWithUnmeasuredSamples)
       ]]),
       [`Significant (adj p ≤ ${options.maxAdjP}, |log2FC| ≥ ${options.minLog2FC})`, formatCount(up + down)],
       ['Up in A', formatCount(up)],
@@ -571,10 +627,14 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   _exportModalCSV() {
     const full = this._lastResult?.full;
     if (!full) return;
-    const lines = ['names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,mean_a,mean_b,n_a,n_b'];
-    for (const row of full.results) {
+    // Genes by identifier, the shown name beside it (`geneNameColumns`).
+    const { idOf } = geneIdentities(this.dataLayer.state?.varData);
+    const shown = full.results.map(row => row.gene);
+    const columns = geneNameColumns(shown, shown.map(gene => idOf(gene)));
+    const lines = [`${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,mean_a,mean_b,n_a,n_b`];
+    for (const [index, row] of full.results.entries()) {
       lines.push([
-        toCSVCell(row.gene),
+        columns.cells(index),
         toCSVCell(row.score),
         toCSVCell(row.log2FoldChange),
         toCSVCell(row.pValue),
@@ -595,7 +655,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   // Sessions
   // ===========================================================================
 
-  exportResult() {
+  _exportResult() {
     const full = this._lastResult?.full;
     if (!full) return null;
     const { tuning: _tuning, ...metadata } = full.metadata;
@@ -611,7 +671,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     if (
       !Array.isArray(full?.results) || typeof full.summary !== 'object' || full.summary === null ||
       typeof full.summary.matrix !== 'string' || typeof full.summary.matrixLabel !== 'string' ||
-      full.summary.replicates === undefined
+      full.summary.replicates === undefined ||
+      (full.summary.replicates !== null && !Number.isSafeInteger(full.summary.replicates.genesWithUnmeasuredSamples))
     ) {
       throw new TypeError('A differential expression result must hold its gene table, summary and expression matrix');
     }

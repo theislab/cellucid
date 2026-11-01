@@ -13,18 +13,20 @@
  *   them in the same pass; the person then picks one (`context.choose`),
  *   and a later choice in the same tab opens from what was kept.
  * - A Seurat v2 object, an object with no cell embedding, or one whose
- *   matrices live outside the file are refused with what to do.
+ *   matrices live outside the file are refused with what to do; an `.rds`
+ *   holding no S4 object (a data frame, a matrix) from its first bytes.
  *
  * @module data/anndata/transcode/r-object
  */
 
-import { INLINE_ELEMENTS, readRFile, savedObjects } from '../../../formats/rds/index.js';
+import { INLINE_ELEMENTS, isUncompressed, readRFile, savedObjects } from '../../../formats/rds/index.js';
 import { hasClass, classesOf, namedItems } from './r-values.js';
 import { isDroppedSeuratLayer, SEURAT_DROPPED_SLOTS, isSeurat, isSeuratV2, seuratModel } from './seurat.js';
 import { isSingleCellExperiment, isSummarizedExperiment, sceModel } from './sce.js';
 import { writeModel } from './anndata-model.js';
 import { RObjectRefusal, noEmbeddingRefusal } from './refusals.js';
 import { transcodeOnce } from './session.js';
+import { keptAbout } from './space.js';
 import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
 
 /** Slots whose large vectors are never needed (the small ones are: `misc$cellucid`). */
@@ -40,15 +42,69 @@ const DROPPED = new Set(SEURAT_DROPPED_SLOTS);
  */
 const SPARSE_PAYLOADS = new Set(['@x', '@i', '@p']);
 
-/** What the pass keeps (`formats/rds/parse.js` plan). */
-export const R_OBJECT_PLAN = Object.freeze({
-  drop: path => DROPPED.has(path[path.length - 1])
-    || (path[path.length - 1] === '@names' && SPARSE_PAYLOADS.has(path[path.length - 2])),
-  // A Seurat v5 assay's layers are a named list, whose names follow its
-  // elements: `scale.data` is given back as soon as they arrive.
-  dropByName: path => (path[path.length - 1] === '@layers' ? isDroppedSeuratLayer : null),
-  vector: (path, { length }) => (length > INLINE_ELEMENTS && path.some(segment => SMALL_ONLY.has(segment)) ? 'skip' : 'keep'),
-});
+/**
+ * What the pass keeps of a file (`formats/rds/parse.js` plan), named
+ * `fileName` in its refusal.
+ *
+ * Seurat, SingleCellExperiment and SummarizedExperiment objects are all S4
+ * objects, which an object's first word says: an `.rds` whose object is not
+ * one is refused from the file's first bytes (a GEO count data frame of
+ * 604 MB was refused only after its whole download, 194 s), and an object
+ * of a `save()` file that is not one is passed over as it streams, nothing
+ * of it kept. An S4 object that is none of them (a `dgCMatrix`) names its
+ * class after its slots: it is read on.
+ *
+ * @param {string} fileName
+ */
+export function rObjectPlan(fileName) {
+  return Object.freeze({
+    drop: path => DROPPED.has(path[path.length - 1])
+      || (path[path.length - 1] === '@names' && SPARSE_PAYLOADS.has(path[path.length - 2])),
+    // A Seurat v5 assay's layers are a named list, whose names follow its
+    // elements: `scale.data` is given back as soon as they arrive.
+    dropByName: path => (path[path.length - 1] === '@layers' ? isDroppedSeuratLayer : null),
+    vector: (path, { length }) => (length > INLINE_ELEMENTS && path.some(segment => SMALL_ONLY.has(segment)) ? 'skip' : 'keep'),
+    object: (path, item) => {
+      if (item.s4) return 'read';
+      if (path.length === 0) throw notSingleCellRefusal(fileName, [describeItem(item)], { early: true });
+      return 'drop';
+    },
+  });
+}
+
+/** The plan of a file whose name is not known to the caller. */
+export const R_OBJECT_PLAN = rObjectPlan('This file');
+
+/**
+ * What an object is, from its first word alone (`itemFlagsOf`): its class,
+ * if it has one, comes after its payload.
+ *
+ * @param {import('../../../formats/rds/parse.js').RdsItemFlags} item
+ */
+export function describeItem(item) {
+  const vectors = { integer: 'integer', double: 'numeric', logical: 'logical', complex: 'complex', raw: 'raw' };
+  const classed = item.classed ? ' with a class' : '';
+  if (item.type === 'list') return item.classed ? 'an R list with a class (a data frame, for one)' : 'an R list';
+  if (vectors[item.type] !== undefined) return `an R ${vectors[item.type]} vector or matrix${classed}`;
+  if (item.type === 'character') return `an R character vector${classed}`;
+  if (item.type === 'closure') return 'an R function';
+  return `an R ${item.type}${classed}`;
+}
+
+/**
+ * The refusal of a file that holds no single-cell object Cellucid shows.
+ * `early`: told from the file's first bytes, so nothing more of it was read.
+ */
+function notSingleCellRefusal(fileName, others, { reason = 'not-single-cell', early = false } = {}) {
+  return new RObjectRefusal(
+    `${fileName} holds ${others.join(', ')}, not a Seurat object or a SingleCellExperiment it can show. ` +
+    'Cellucid opens Seurat (v3 and later), SingleCellExperiment and SummarizedExperiment objects saved with saveRDS() or save()' +
+    (early ? ', each an S4 object, which this one is not: told from its first bytes, nothing more of it was read.' : '.') +
+    ' A count matrix opens once it is part of one with a cell embedding (in R: Seurat::CreateSeuratObject(counts), ' +
+    'NormalizeData(), FindVariableFeatures(), ScaleData(), RunPCA(), RunUMAP(), then saveRDS() or cellucid::cellucid_prepare()).',
+    { reason }
+  );
+}
 
 /**
  * The parts of an object the pass dropped that held something
@@ -93,6 +149,8 @@ function kindOf(node) {
 }
 
 function describeOther(node) {
+  // An object of a `save()` file passed over from its first word (`rObjectPlan`).
+  if (node?.kind === 'skipped' && node.item !== undefined) return describeItem(node.item);
   if (node?.kind === 'list' && hasClass(node, 'data.frame')) return 'an R data frame';
   if (node?.kind === 'S4') return `an R ${classesOf(node)[0] ?? 'S4'} object`;
   if (node?.kind === 'list') return 'an R list';
@@ -140,6 +198,10 @@ export async function transcodeRFile(source, context) {
     const result = await transcodeOnce({
       identity: reader.identity,
       fileName,
+      about: keptAbout({ name: fileName, url: file.url ?? null }),
+      bytes: reader.size,
+      // An uncompressed file is read by its structure, its arrays in place.
+      readsWhole: async () => !isUncompressed(await reader.read(0, Math.min(16, reader.size), { signal })),
       link: reader.link,
       sourceBlobs: new Map([['file', fileBlob(reader)]]),
       context,
@@ -154,11 +216,14 @@ export async function transcodeRFile(source, context) {
 }
 
 async function buildObjects(reader, fileName, space, { signal, activity }) {
-  const parsed = await readRFile(reader, { plan: R_OBJECT_PLAN, sink: space.sink, signal, activity });
+  const parsed = await readRFile(reader, { plan: rObjectPlan(fileName), sink: space.sink, signal, activity });
   const readRegion = region => (region.store === 'file'
     ? reader.read(region.offset, region.byteLength, { signal }).then(bytes => bytes.slice())
     : space.read(region));
-  const modelContext = { space, readRegion };
+  // An uncompressed file's arrays are read in place, never copied: its store
+  // keeps the object's order of cells (`priority.js`).
+  const ordered = !isUncompressed(await reader.read(0, Math.min(16, reader.size), { signal }));
+  const modelContext = { space, readRegion, signal, ordered };
   const candidates = parsed.container === 'rda' ? savedObjects(parsed.root) : [{ name: null, value: parsed.root }];
   const objects = [];
   const others = [];
@@ -185,11 +250,7 @@ async function buildObjects(reader, fileName, space, { signal, activity }) {
   }
   if (objects.length === 0) {
     if (refusal !== null && others.length === 1) throw refusal;
-    throw new RObjectRefusal(
-      `${fileName} holds ${others.join(', ')}, not a Seurat object or a SingleCellExperiment it can show. ` +
-      'Cellucid opens Seurat (v3 and later), SingleCellExperiment and SummarizedExperiment objects saved with saveRDS() or save().',
-      { reason: refusal?.reason ?? 'not-single-cell' }
-    );
+    throw notSingleCellRefusal(fileName, others, { reason: refusal?.reason ?? 'not-single-cell' });
   }
   return objects;
 }

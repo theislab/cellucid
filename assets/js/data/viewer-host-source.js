@@ -16,6 +16,18 @@
  *   viewer's events (selection, hover, click, ready, data mapping, …) back.
  *   The page reaches the host at the address it was loaded from, so a
  *   notebook proxy that carries the page carries the channel too.
+ *
+ * A notebook widget (`cellucid.Widget`) opens this page instead with
+ * `?viewer=embedded` inside its own output, and the host is reached through
+ * the widget: the viewer channel and every request run over the port the
+ * widget hands the page (`viewer-embed.js`), with the host named by
+ * `EMBEDDED_HOST_ORIGIN` (`formats/io/host-fetch.js`). Everything above the
+ * transport -- the documents, the store reads, the protocol -- is the same.
+ *
+ * Every cell crossing the channel is an original position (a row of the
+ * dataset's `obs`): the app hands this source cells in subset positions (the
+ * cells open now), and it names them by original position with the open
+ * dataset's cell identity (`setCellIdentityProvider`, `data/cell-identity.js`).
  */
 
 import { INPUT_FORMATS, isInputFormatId } from './input-formats.js';
@@ -26,12 +38,13 @@ import {
 } from './data-source.js';
 import {
   loadMetadataBatchAtomically,
-  throwIfMetadataAborted,
 } from './metadata-load-contract.js';
 import { getNotificationCenter } from '../app/notification-center.js';
-import { createDeadline } from '../utils/deadline.js';
 import { validateDataMapping } from './data-mapping.js';
 import { ViewerChannel } from './viewer-channel.js';
+import { connectEmbeddedHost, isEmbeddedViewerAddress } from './viewer-embed.js';
+import { routedFetch } from '../formats/io/host-fetch.js';
+import { publicPageAddress } from './sources/registry.js';
 import {
   VIEWER_CHANNEL_PATH,
   VIEWER_HOST_RUNTIMES,
@@ -39,7 +52,10 @@ import {
   VIEWER_PAGE_PARAMETERS,
   VIEWER_COMMAND_ERROR_REASON_LIMIT,
   VIEWER_DATA_MAPPING_ORIGINS,
+  VIEWER_RESULT_META_FIELDS,
+  isViewerResultEpoch,
   encodeViewerCells,
+  encodeViewerResult,
   viewerBinaryCommandTypes,
   viewerCommandTypes,
 } from './viewer-protocol.js';
@@ -50,6 +66,8 @@ import {
   servedStoreKey,
 } from './served-anndata.js';
 import { isPlainRecord, requireExactKeys } from '../utils/exact-record.js';
+import { abortReason, cancelled, cancel, onAbort, throwIfAborted } from '../utils/abort.js';
+import { failureText } from '../utils/errors.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -78,9 +96,24 @@ function requireSingleViewerHostParameter(params, key) {
   return values[0];
 }
 
+/** The page address a debug snapshot reports: public data link, no viewer token. */
+function snapshotAddress(href) {
+  const address = new URL(publicPageAddress(href));
+  address.searchParams.delete('viewerToken');
+  return address.href;
+}
+
 /**
- * The viewer host configuration from URL parameters
- * @returns {ViewerHostConfig|null}
+ * The configuration of a viewer a notebook widget embeds (`?viewer=embedded`):
+ * its credentials and the host's address arrive from the widget
+ * (`connectEmbeddedHost`), never in the page address.
+ */
+export const EMBEDDED_VIEWER_HOST = Object.freeze({ embedded: true });
+
+/**
+ * The viewer host configuration from URL parameters: a served viewer's
+ * exact routing fields, `EMBEDDED_VIEWER_HOST` for a widget's viewer, or null.
+ * @returns {ViewerHostConfig|typeof EMBEDDED_VIEWER_HOST|null}
  */
 export function getViewerHostConfig() {
   const params = new URLSearchParams(window.location.search);
@@ -88,6 +121,9 @@ export function getViewerHostConfig() {
   const modeValues = params.getAll(VIEWER_PAGE_MODE_PARAMETER);
   if (modeValues.length === 0) {
     return null;
+  }
+  if (isEmbeddedViewerAddress(params)) {
+    return EMBEDDED_VIEWER_HOST;
   }
   const annDataValues = params.getAll('anndata');
   if (
@@ -166,13 +202,9 @@ function captureViewerHostRuntimeConfig(config) {
   });
 }
 
-function createViewerHostLifecycleSupersededError(label) {
-  const error = new Error(
-    `${label} was superseded by a newer viewer host lifecycle.`
-  );
-  error.name = 'AbortError';
-  error.code = 'CELLUCID_VIEWER_HOST_LIFECYCLE_SUPERSEDED';
-  return error;
+/** Work of an older viewer host lifecycle a newer one replaced: a `superseded` cancellation. */
+function viewerHostLifecycleSuperseded(label) {
+  return cancelled('superseded', `${label} was superseded by a newer viewer host lifecycle.`);
 }
 
 function requireExactText(value, label, { allowWhitespace = false } = {}) {
@@ -295,58 +327,43 @@ function requireViewerHostHealthPayload(payload) {
 }
 
 /**
- * Deadline for one request to the host's server (Python or R): its health,
- * info and protocol documents. The server answers from the same machine, so
- * a request still open after this long has stalled; without a deadline it
- * would hold startup, or the health request that explains a failed channel
- * reopen, open forever.
+ * One JSON document of the host's server (`/_cellucid/<route>`), under the
+ * caller's signal and no clock of its own. The host is a Python or R
+ * session: a notebook kernel answers between cells (none while one runs,
+ * `viewer-embed.js`), a served one from the same machine, busy perhaps with
+ * a large dataset. A late answer is still an answer: what bounds the wait is
+ * its owner (startup's step, measured as silence and standing still while
+ * the notebook runs a cell; the viewer's lifecycle), and a host that went
+ * away refuses the connection or is said to have ended.
  */
-export const VIEWER_HOST_HEALTH_TIMEOUT_MS = 30_000;
-
 /**
- * One JSON document of the host's server (`/_cellucid/<route>`), within
- * `VIEWER_HOST_HEALTH_TIMEOUT_MS`.
+ * A request the Python or R host answered with an error: its status and
+ * address kept, so it is said by whose problem it is wherever it is shown
+ * (`describeHostFault`, `data-source.js`).
  */
+function viewerHostFailure(what, url, status) {
+  return new DataSourceError(`${what} request failed with HTTP ${status}`, DataSourceErrorCode.NETWORK_ERROR, 'jupyter', { url, status });
+}
+
 async function requestViewerHostDocument(config, route, label, signal = null) {
   const exactConfig = requireViewerHostRuntimeConfig(config);
-  throwIfMetadataAborted(signal, `Viewer host ${label} request`);
+  throwIfAborted(signal);
   const url = `${exactConfig.serverUrl}/_cellucid/${route}`;
-  const deadline = createDeadline(VIEWER_HOST_HEALTH_TIMEOUT_MS);
-  const requestSignal = signal === null
-    ? deadline.signal
-    : AbortSignal.any([signal, deadline.signal]);
-  try {
-    const response = await fetch(url, {
-      cache: 'no-store',
-      signal: requestSignal,
-    });
-    throwIfMetadataAborted(signal, `Viewer host ${label} request`);
-    if (!(response instanceof Response)) {
-      throw new TypeError(`Viewer host ${label} fetch must return a Response`);
-    }
-    if (!response.ok) {
-      throw new Error(
-        `Viewer host ${label} request failed with HTTP ${response.status}`
-      );
-    }
-    const payload = await readBoundedJson(response, {
-      label: `Viewer host ${label} request`,
-      signal: requestSignal,
-    });
-    throwIfMetadataAborted(signal, `Viewer host ${label} request`);
-    return payload;
-  } catch (error) {
-    if (deadline.signal.aborted && signal?.aborted !== true) {
-      throw new Error(
-        `The host's server did not answer ${url} within ` +
-        `${VIEWER_HOST_HEALTH_TIMEOUT_MS / 1000} s.`,
-        { cause: error }
-      );
-    }
-    throw error;
-  } finally {
-    deadline.release();
+  const response = await routedFetch(url, {
+    cache: 'no-store',
+    signal,
+  });
+  throwIfAborted(signal);
+  if (!(response instanceof Response)) {
+    throw new TypeError(`Viewer host ${label} fetch must return a Response`);
   }
+  if (!response.ok) throw viewerHostFailure(`Viewer host ${label}`, url, response.status);
+  const payload = await readBoundedJson(response, {
+    label: `Viewer host ${label} request`,
+    signal,
+  });
+  throwIfAborted(signal);
+  return payload;
 }
 
 async function requestViewerHostHealth(config, signal = null) {
@@ -486,50 +503,29 @@ export function requireViewerHostProtocolPayload(payload) {
  */
 async function requestViewerHostProtocol(config, signal = null) {
   const exactConfig = requireViewerHostRuntimeConfig(config);
-  throwIfMetadataAborted(signal, 'Viewer host protocol request');
+  throwIfAborted(signal);
   const protocolUrl = `${exactConfig.serverUrl}/_cellucid/protocol`;
-  const deadline = createDeadline(VIEWER_HOST_HEALTH_TIMEOUT_MS);
-  const requestSignal = signal === null
-    ? deadline.signal
-    : AbortSignal.any([signal, deadline.signal]);
-  try {
-    const response = await fetch(protocolUrl, {
-      cache: 'no-store',
-      signal: requestSignal,
-    });
-    throwIfMetadataAborted(signal, 'Viewer host protocol request');
-    if (!(response instanceof Response)) {
-      throw new TypeError('Viewer host protocol fetch must return a Response');
-    }
-    if (response.status === 404) {
-      throw new Error(
-        'The host offers no viewer channel: its cellucid package is older than this viewer. ' +
-        'Upgrade it (Python: pip install -U cellucid; R: install.packages("cellucid")) and run the cell again.'
-      );
-    }
-    if (!response.ok) {
-      throw new Error(
-        `Viewer host protocol request failed with HTTP ${response.status}`
-      );
-    }
-    const payload = await readBoundedJson(response, {
-      label: 'Viewer host protocol request',
-      signal: requestSignal,
-    });
-    throwIfMetadataAborted(signal, 'Viewer host protocol request');
-    return requireViewerHostProtocolPayload(payload);
-  } catch (error) {
-    if (deadline.signal.aborted && signal?.aborted !== true) {
-      throw new Error(
-        `The host's server did not answer ${protocolUrl} within ` +
-        `${VIEWER_HOST_HEALTH_TIMEOUT_MS / 1000} s.`,
-        { cause: error }
-      );
-    }
-    throw error;
-  } finally {
-    deadline.release();
+  const response = await routedFetch(protocolUrl, {
+    cache: 'no-store',
+    signal,
+  });
+  throwIfAborted(signal);
+  if (!(response instanceof Response)) {
+    throw new TypeError('Viewer host protocol fetch must return a Response');
   }
+  if (response.status === 404) {
+    throw new Error(
+      'The host offers no viewer channel: its cellucid package is older than this viewer. ' +
+      'Upgrade it (Python: pip install -U cellucid; R: install.packages("cellucid")) and run the cell again.'
+    );
+  }
+  if (!response.ok) throw viewerHostFailure('Viewer host protocol', protocolUrl, response.status);
+  const payload = await readBoundedJson(response, {
+    label: 'Viewer host protocol request',
+    signal,
+  });
+  throwIfAborted(signal);
+  return requireViewerHostProtocolPayload(payload);
 }
 
 /** Why a `data_mapping` event reports the mapping it carries. */
@@ -553,6 +549,25 @@ function requireDatasetCatalogPayload(payload) {
     name: requireExactText(entry.name, `${label}.name`, { allowWhitespace: true }),
     anndata: requireServedAnnData(entry.anndata, `${label}.anndata`),
   })];
+}
+
+/**
+ * The notebook server's catalog as it is now: one request, past the HTTP
+ * cache, so the store it names (its ETag the version of what is kept of
+ * it) is the one the server serves at this moment.
+ */
+async function fetchDatasetList(serverUrl, signal) {
+  const response = await routedFetch(`${serverUrl}/_cellucid/datasets`, { signal, cache: 'no-store' });
+  if (!(response instanceof Response)) {
+    throw new TypeError(
+      'Viewer host dataset listing fetch must return a Response'
+    );
+  }
+  if (!response.ok) throw viewerHostFailure('Viewer host dataset listing', `${serverUrl}/_cellucid/datasets`, response.status);
+  const catalogPayload = await readBoundedJson(response, {
+    label: 'Viewer host dataset listing',
+  });
+  return requireDatasetCatalogPayload(catalogPayload);
 }
 
 function deliverCallbacks(callbacks, args) {
@@ -641,10 +656,18 @@ export function describeViewerHostCommandFailure(commandType, error) {
  */
 export class ViewerHostDataSource {
   constructor(config = getViewerHostConfig()) {
-    /** @type {ViewerHostConfig|null} */
-    this._declaredConfig = config === null
-      ? null
+    /** @type {ViewerHostConfig|typeof EMBEDDED_VIEWER_HOST|null} */
+    this._declaredConfig = config === null || config === EMBEDDED_VIEWER_HOST
+      ? config
       : captureViewerHostRuntimeConfig(config);
+
+    /**
+     * How the host is reached: its configuration and the WebSocket class the
+     * viewer channel opens (the browser's, or the embedding widget's port,
+     * `viewer-embed.js`). Set by `connectHost()`.
+     * @type {{config: ViewerHostConfig, WebSocketImpl: typeof WebSocket|undefined}|null}
+     */
+    this._hostConnection = null;
 
     /** @type {ViewerHostConfig|null} */
     this._config = null;
@@ -672,10 +695,18 @@ export class ViewerHostDataSource {
     /** @type {Set<Function>} */
     this._endCallbacks = new Set();
 
+    /** @type {Set<Function>} Run when a dropped channel was opened again. */
+    this._reopenCallbacks = new Set();
+
     /** @type {boolean} */
     this._connected = false;
 
-    /** @type {Map<string, DatasetMetadata>} */
+    /**
+     * The metadata of each dataset opened on this connection, with the
+     * store it was read from (`servedStoreKey`): it stands only while the
+     * server's listing, asked at each opening, names that store.
+     * @type {Map<string, {key: string, metadata: DatasetMetadata}>}
+     */
     this._datasetCache = new Map();
     /**
      * What the dataset list shows of each served store, by store
@@ -713,11 +744,76 @@ export class ViewerHostDataSource {
     this._catalogController = null;
     /** @type {AbortController|null} */
     this._initializationController = null;
+    /** Ends what belongs to the lifecycle (`initialize` to `disconnect`). @type {AbortController|null} */
+    this._lifecycleController = null;
     this._destroyed = false;
     /** @type {string|null} The program serving the viewer (`VIEWER_HOST_RUNTIMES`) */
     this._runtime = null;
 
+    /**
+     * The open dataset's cell identity (`data/cell-identity.js`), asked for
+     * each event that names cells.
+     * @type {(() => import('./cell-identity.js').CellIdentity)|null}
+     */
+    this._cellIdentityProvider = null;
+
+    /**
+     * The id of the host's dataset the viewer shows, or null when the person
+     * opened another one in it (`setShownDatasetProvider`).
+     * @type {(() => string|null)|null}
+     */
+    this._shownDatasetProvider = null;
+
     this.type = 'jupyter';
+  }
+
+  /**
+   * Say which of the host's datasets the viewer shows: `provider` returns its
+   * id (`/_cellucid/datasets`), or null while the viewer shows a dataset the
+   * host did not serve. Events that name cells (a selection, a hover, a
+   * click) are sent only while it names one: the host's cell positions
+   * describe its own dataset.
+   *
+   * @param {() => string|null} provider
+   */
+  setShownDatasetProvider(provider) {
+    if (typeof provider !== 'function') {
+      throw new TypeError('Viewer host shown-dataset provider must be a function');
+    }
+    this._shownDatasetProvider = provider;
+  }
+
+  /** The id of the host's dataset the viewer shows, or null (another dataset). */
+  getShownHostDataset() {
+    if (this._shownDatasetProvider === null) {
+      throw new Error('Viewer host events name cells only once the app said which dataset it shows');
+    }
+    const id = this._shownDatasetProvider();
+    if (id !== null && (typeof id !== 'string' || id.length === 0)) {
+      throw new TypeError('Viewer host shown dataset must be a dataset id or null');
+    }
+    return id;
+  }
+
+  /**
+   * Name cells by original position from now on: `provider` returns the open
+   * dataset's cell identity.
+   *
+   * @param {() => import('./cell-identity.js').CellIdentity} provider
+   */
+  setCellIdentityProvider(provider) {
+    if (typeof provider !== 'function') {
+      throw new TypeError('Viewer host cell identity provider must be a function');
+    }
+    this._cellIdentityProvider = provider;
+  }
+
+  /** The open dataset's cell identity. */
+  _cellIdentity() {
+    if (this._cellIdentityProvider === null) {
+      throw new Error('Viewer host events name cells only once the app gave it the dataset\'s cell identity');
+    }
+    return this._cellIdentityProvider();
   }
 
   /**
@@ -779,7 +875,7 @@ export class ViewerHostDataSource {
       }
     }
     try {
-      getNotificationCenter().error(failure.message, {
+      getNotificationCenter().error(failureText(failure), {
         category: 'connectivity',
         title: failure.title,
         duration: 0
@@ -855,6 +951,20 @@ export class ViewerHostDataSource {
     this._endCallbacks.add(callback);
   }
 
+  /**
+   * Register what runs when the viewer channel, dropped (the network, a
+   * proxy restarting), was opened again: the viewer sends the host its
+   * results snapshot again.
+   *
+   * @param {() => void} callback
+   */
+  onChannelReopen(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('Viewer host channel-reopen callback must be a function');
+    }
+    this._reopenCallbacks.add(callback);
+  }
+
   _channelEnded(channel, end) {
     if (this._channel !== channel) return;
     this._connected = false;
@@ -872,7 +982,7 @@ export class ViewerHostDataSource {
       this._destroyed ||
       revision !== this._lifecycleRevision
     ) {
-      throw createViewerHostLifecycleSupersededError(label);
+      throw viewerHostLifecycleSuperseded(label);
     }
   }
 
@@ -893,7 +1003,7 @@ export class ViewerHostDataSource {
       !this._connected ||
       this._config !== owner.config
     ) {
-      throw createViewerHostLifecycleSupersededError(label);
+      throw viewerHostLifecycleSuperseded(label);
     }
   }
 
@@ -904,7 +1014,7 @@ export class ViewerHostDataSource {
       owner.catalogController !== this._catalogController ||
       owner.catalogController?.signal.aborted
     ) {
-      throw createViewerHostLifecycleSupersededError(label);
+      throw viewerHostLifecycleSuperseded(label);
     }
   }
 
@@ -913,7 +1023,7 @@ export class ViewerHostDataSource {
     const controller = new AbortController();
     this._catalogController = controller;
     const revision = ++this._catalogRevision;
-    previousController?.abort(new Error(reason));
+    cancel(previousController, 'superseded', reason);
     return { controller, revision };
   }
 
@@ -922,7 +1032,7 @@ export class ViewerHostDataSource {
     this._catalogController = null;
     this._catalogRevision += 1;
     this._metadataInFlight = new Map();
-    previousController?.abort(new Error(reason));
+    cancel(previousController, 'closed', reason);
   }
 
   /**
@@ -942,23 +1052,65 @@ export class ViewerHostDataSource {
   }
 
   /**
+   * Whether a notebook widget embeds this viewer (`?viewer=embedded`).
+   * @returns {boolean}
+   */
+  isEmbedded() {
+    return this._declaredConfig === EMBEDDED_VIEWER_HOST;
+  }
+
+  /**
+   * Reach the host: at once for a served viewer, whose address names it;
+   * for an embedded one, once the widget that embeds the page connected it
+   * (`connectEmbeddedHost`), which waits for nothing but the notebook: the
+   * kernel answers the widget between cells, so this has no deadline.
+   *
+   * @returns {Promise<void>}
+   */
+  async connectHost() {
+    this._assertAlive();
+    if (this._hostConnection !== null || this._declaredConfig === null) return;
+    if (this.isEmbedded()) {
+      const { config, WebSocketImpl } = await connectEmbeddedHost();
+      this._assertAlive();
+      this._hostConnection = { config: captureViewerHostRuntimeConfig(config), WebSocketImpl };
+      return;
+    }
+    this._hostConnection = { config: this._declaredConfig, WebSocketImpl: undefined };
+  }
+
+  /**
    * Initialize from URL parameters
    * @returns {Promise<boolean>} True if successfully initialized
    */
-  async initialize() {
+  /**
+   * @param {{signal?: AbortSignal|null}} [options] - What else stops the
+   *   initialization (startup's step): its requests have no clock of their own
+   */
+  async initialize({ signal = null } = {}) {
     this._assertAlive();
-    const config = this._declaredConfig;
-    if (config === null) {
+    if (this._declaredConfig === null) {
       return false;
     }
+    // A served viewer's requests start at once; an embedded one waits for
+    // the widget (`main.js` connects it first, outside any deadline).
+    if (this._hostConnection === null) {
+      if (this.isEmbedded()) await this.connectHost();
+      else this._hostConnection = { config: this._declaredConfig, WebSocketImpl: undefined };
+    }
+    const { config, WebSocketImpl } = this._hostConnection;
 
     const revision = ++this._lifecycleRevision;
     const previousController = this._initializationController;
     const controller = new AbortController();
     this._initializationController = controller;
-    previousController?.abort(
-      new Error('Viewer host initialization was superseded')
-    );
+    const stopRelay = onAbort(signal, () => controller.abort(abortReason(signal)));
+    cancel(previousController, 'superseded', 'Viewer host initialization was superseded.');
+    // What belongs to this lifecycle, not to one listing (the listing an
+    // opening reads to name its store): the next initialization or a
+    // disconnect ends it.
+    cancel(this._lifecycleController, 'superseded', 'A newer viewer host lifecycle replaced this one.');
+    this._lifecycleController = new AbortController();
     this._endCatalogGeneration(
       'Viewer host catalog was retired by initialization'
     );
@@ -971,6 +1123,7 @@ export class ViewerHostDataSource {
     this._summaries.clear();
     this._datasetEntries.clear();
     this._releaseAnnData();
+    let adopted = false;
     try {
       const health = await requestViewerHostHealth(config, controller.signal);
       this._assertLifecycle(revision, 'Viewer host initialization');
@@ -980,7 +1133,7 @@ export class ViewerHostDataSource {
       ]);
       this._assertLifecycle(revision, 'Viewer host initialization');
       if (this._initializationController !== controller) {
-        throw createViewerHostLifecycleSupersededError(
+        throw viewerHostLifecycleSuperseded(
           'Viewer host initialization'
         );
       }
@@ -989,13 +1142,25 @@ export class ViewerHostDataSource {
         viewerId: config.viewerId,
         viewerToken: config.viewerToken,
         channelPath: protocol.channel,
+        WebSocketImpl,
         onCommand: command => {
           if (this._channel === channel) this._observeCommand(command);
         },
         onEnd: end => this._channelEnded(channel, end),
+        onReopen: () => {
+          if (this._channel !== channel) return;
+          for (const callback of [...this._reopenCallbacks]) {
+            try {
+              callback();
+            } catch (error) {
+              console.error('[ViewerHost] channel-reopen handler failed:', error);
+            }
+          }
+        },
         isHostAlive: async () => {
           try {
-            await requestViewerHostHealth(config);
+            // Under the lifecycle: a disconnect stops the question.
+            await requestViewerHostHealth(config, this._lifecycleController?.signal ?? null);
             return true;
           } catch {
             return false;
@@ -1006,7 +1171,7 @@ export class ViewerHostDataSource {
       await channel.open();
       this._assertLifecycle(revision, 'Viewer host initialization');
       if (this._channel !== channel) {
-        throw createViewerHostLifecycleSupersededError('Viewer host initialization');
+        throw viewerHostLifecycleSuperseded('Viewer host initialization');
       }
       this._config = config;
       this._protocol = protocol;
@@ -1015,13 +1180,14 @@ export class ViewerHostDataSource {
       this._beginCatalogGeneration(
         'Viewer host catalog was initialized'
       );
+      adopted = true;
       return true;
     } catch (error) {
       if (
         revision !== this._lifecycleRevision ||
         this._initializationController !== controller
       ) {
-        throw createViewerHostLifecycleSupersededError(
+        throw viewerHostLifecycleSuperseded(
           'Viewer host initialization'
         );
       }
@@ -1033,6 +1199,11 @@ export class ViewerHostDataSource {
       }
       throw error;
     } finally {
+      stopRelay();
+      // A failed initialization stops every request it started that is
+      // still under way (it asks for the protocol and the host's info at
+      // once): nothing waits for them any more.
+      if (!adopted) cancel(controller, 'superseded', 'Viewer host initialization failed: nothing waits for its other requests.');
       if (this._initializationController === controller) {
         this._initializationController = null;
       }
@@ -1059,7 +1230,7 @@ export class ViewerHostDataSource {
       owner.config !== this._config
     ) {
       opened.release();
-      throw createViewerHostLifecycleSupersededError('Viewer host AnnData store');
+      throw viewerHostLifecycleSuperseded('Viewer host AnnData store');
     }
     this._releaseAnnData();
     this._annData = { key, datasetId: dataset.id, ...opened };
@@ -1155,7 +1326,10 @@ export class ViewerHostDataSource {
           type: 'debug_snapshot',
           requestId: data.requestId,
           ts: new Date().toISOString(),
-          locationHref: window.location.href,
+          // Where the page is, without what grants access: a data link in
+          // public form, and no viewer token (a snapshot is printed in a
+          // notebook's output, which is saved with it).
+          locationHref: snapshotAddress(window.location.href),
           origin: window.location.origin,
           serverUrl: config.serverUrl,
           connected: this._connected,
@@ -1220,6 +1394,35 @@ export class ViewerHostDataSource {
           data.requestId,
           'Viewer host session-bundle requestId'
         );
+        this._requireHostDatasetShown();
+        return deliverCallbacks(this._messageCallbacks, [data]);
+
+      case 'setGeneSet': {
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'name', 'description', 'genes'],
+          'Viewer host set-gene-set message'
+        );
+        requireExactText(data.requestId, 'Viewer host set-gene-set requestId');
+        requireExactText(data.name, 'Viewer host gene set name', { allowWhitespace: true });
+        if (typeof data.description !== 'string') {
+          throw new TypeError('Viewer host gene set description must be text');
+        }
+        if (!Array.isArray(data.genes)) {
+          throw new TypeError('Viewer host gene set genes must be a list');
+        }
+        data.genes.forEach((gene, index) => requireExactText(gene, `Viewer host gene set gene ${index}`));
+        return deliverCallbacks(this._messageCallbacks, [data]);
+      }
+
+      case 'setField':
+        // Decoded and checked by the channel (`decodeViewerBinaryCommand`):
+        // the header, the cells and the values.
+        requireExactKeys(
+          data,
+          ['type', 'requestId', 'key', 'kind', 'categories', 'nObs', 'cells', 'values'],
+          'Viewer host set-field message'
+        );
         return deliverCallbacks(this._messageCallbacks, [data]);
 
       default:
@@ -1239,10 +1442,13 @@ export class ViewerHostDataSource {
   _handleHighlight(data) {
     requireExactKeys(
       data,
-      ['type', 'cells', 'color'],
+      ['type', 'cells', 'color', 'label'],
       'Viewer host highlight message'
     );
-    const { cells, color } = data;
+    const { cells, color, label } = data;
+    if (label !== null) {
+      requireExactText(label, 'Viewer host highlight label', { allowWhitespace: true });
+    }
     requireCommandCells(cells, 'Viewer host highlight cells');
     if (
       typeof color !== 'string' ||
@@ -1252,7 +1458,7 @@ export class ViewerHostDataSource {
         'Viewer host highlight color must be an exact six-digit hex color'
       );
     }
-    return deliverCallbacks(this._highlightCallbacks, [cells, color]);
+    return deliverCallbacks(this._highlightCallbacks, [cells, color, label]);
   }
 
   /**
@@ -1303,7 +1509,7 @@ export class ViewerHostDataSource {
    * @private
    */
   _handleClearHighlights() {
-    return deliverCallbacks(this._highlightCallbacks, [null, null]);
+    return deliverCallbacks(this._highlightCallbacks, [null, null, null]);
   }
 
   /**
@@ -1345,6 +1551,23 @@ export class ViewerHostDataSource {
   }
 
   /**
+   * A session goes to the host only while the viewer shows the host's own
+   * dataset, as hover, click, selection and results do: a session of another
+   * dataset (a local file, a Drive file, a link opened in the viewer) is
+   * that dataset's, and is refused as a `command_error` the host reports.
+   *
+   * @private
+   */
+  _requireHostDatasetShown() {
+    if (this.getShownHostDataset() === null) {
+      throw new Error(
+        'the viewer shows another dataset than the one this notebook gave it, so its session is not sent; ' +
+        'open the notebook\'s dataset in the viewer again to capture its session'
+      );
+    }
+  }
+
+  /**
    * Send the session bundle the host asked for with `requestSessionBundle`.
    *
    * @param {string} requestId
@@ -1357,6 +1580,9 @@ export class ViewerHostDataSource {
     if (!(bundle instanceof Blob) || bundle.size <= 0) {
       throw new TypeError('A session bundle must be one non-empty Blob');
     }
+    // Checked again here: the person may have opened another dataset while
+    // the session was captured.
+    this._requireHostDatasetShown();
     if (!this._protocol.events.has('session_bundle')) return false;
     this._channel.sendBinary({
       type: 'session_bundle',
@@ -1371,15 +1597,22 @@ export class ViewerHostDataSource {
   // These methods send events to the host on the viewer channel.
   /**
    * Notify Python of cell selection change
-   * @param {number[]} cellIndices - Selected cell indices: unique non-negative
-   *   integers in any order, at least one. Python receives them ascending.
+   * @param {Uint32Array} cellIndices - Selected cells in subset positions,
+   *   ascending, at least one. The host receives their original positions.
    * @param {string} source - Selection source ('lasso', 'knn', 'proximity', 'annotation')
    */
   async notifySelection(cellIndices, source) {
     if (!this._connected) {
       throw new Error('Viewer host event source is not connected');
     }
-    const body = encodeViewerCells(cellIndices, 'Viewer host selection cells');
+    encodeViewerCells(cellIndices, 'Viewer host selection cells');
+    if (this.getShownHostDataset() === null) return false;
+    // Open cells in another order than their original one (a priority-ordered
+    // dataset) are named ascending, as the protocol names a cell set.
+    const body = encodeViewerCells(
+      this._cellIdentity().toOriginal(cellIndices).sort(),
+      'Viewer host selection cells'
+    );
     requireExactText(source, 'Viewer host selection source');
     this._captureConnection('Viewer host selection delivery');
     if (!this._protocol.events.has('selection')) return false;
@@ -1402,6 +1635,8 @@ export class ViewerHostDataSource {
     if (cellIndex !== null) {
       requireNonNegativeInteger(cellIndex, 'Viewer host hover cell');
     }
+    if (this.getShownHostDataset() === null) return false;
+    const cell = cellIndex === null ? null : this._cellIdentity().toOriginal([cellIndex])[0];
     if (position !== null) {
       requireExactKeys(
         position,
@@ -1418,7 +1653,7 @@ export class ViewerHostDataSource {
     }
     return this._sendEvent({
       type: 'hover',
-      cell: cellIndex,
+      cell,
       position
     });
   }
@@ -1458,9 +1693,10 @@ export class ViewerHostDataSource {
         'Viewer host click shift and ctrl must be booleans'
       );
     }
+    if (this.getShownHostDataset() === null) return false;
     const event = {
       type: 'click',
-      cell: cellIndex,
+      cell: this._cellIdentity().toOriginal([cellIndex])[0],
       button: options.button,
       shift: options.shift,
       ctrl: options.ctrl
@@ -1512,8 +1748,8 @@ export class ViewerHostDataSource {
   /**
    * Notify Python that viewer is ready with dataset info
    * @param {Object} info - Dataset info
-   * @param {number} info.nCells - Number of cells
    * @param {number} info.dimensions - Embedding dimensions (1, 2, or 3)
+   *   The cells open and in the dataset come from the cell identity.
    */
   async notifyReady(info) {
     if (!this._connected) {
@@ -1521,10 +1757,10 @@ export class ViewerHostDataSource {
     }
     requireExactKeys(
       info,
-      ['nCells', 'dimensions'],
+      ['dimensions'],
       'Viewer host ready info'
     );
-    requireNonNegativeInteger(info.nCells, 'Viewer host ready nCells');
+    const identity = this._cellIdentity();
     if (
       info.dimensions !== 1 &&
       info.dimensions !== 2 &&
@@ -1536,10 +1772,119 @@ export class ViewerHostDataSource {
     }
     const event = {
       type: 'ready',
-      n_cells: info.nCells,
+      n_cells: identity.n,
+      n_obs: identity.nOriginal,
       dimensions: info.dimensions
     };
     return this._sendEvent(event);
+  }
+
+  /**
+   * Send one result (`encodeViewerResult`), when the host accepts results.
+   * Its cells are already original positions: the results publisher
+   * (`app/viewer-host-results.js`) names them.
+   *
+   * @param {Parameters<typeof encodeViewerResult>[0]} result
+   * @returns {boolean} Whether it was sent
+   */
+  notifyResult(result) {
+    this._captureConnection('Viewer host result delivery');
+    const { header, body } = encodeViewerResult(result);
+    if (!this._protocol.events.has('result')) return false;
+    this._channel.sendBinary(header, new Blob(body));
+    return true;
+  }
+
+  /**
+   * Say a result is gone.
+   *
+   * @param {{epoch: string, revision: number, kind: string, id: string}} removal
+   * @returns {boolean} Whether it was sent
+   */
+  notifyResultRemoved(removal) {
+    requireExactKeys(removal, ['epoch', 'revision', 'kind', 'id'], 'Viewer host result removal');
+    if (!isViewerResultEpoch(removal.epoch)) throw new TypeError('Viewer host result removal epoch must be an epoch');
+    requireNonNegativeInteger(removal.revision, 'Viewer host result removal revision');
+    if (!Object.hasOwn(VIEWER_RESULT_META_FIELDS, removal.kind)) {
+      throw new TypeError('Viewer host result removal kind must be a result kind');
+    }
+    requireExactText(removal.id, 'Viewer host result removal id', { allowWhitespace: true });
+    return this._sendEvent({
+      type: 'result_removed',
+      epoch: removal.epoch,
+      revision: removal.revision,
+      kind: removal.kind,
+      id: removal.id
+    });
+  }
+
+  /**
+   * Send the inventory of every result of `epoch` at `revision`: the end of
+   * a snapshot (a dataset opened, the channel opened again). `dataset` is the
+   * host's dataset they describe, or null (the viewer shows another dataset,
+   * and `items` is empty).
+   *
+   * @param {{epoch: string, dataset: string|null, revision: number, nObs: number,
+   *   items: Array<{kind: string, id: string, revision: number}>}} inventory
+   * @returns {boolean} Whether it was sent
+   */
+  notifyResults(inventory) {
+    requireExactKeys(inventory, ['epoch', 'dataset', 'revision', 'nObs', 'items'], 'Viewer host results inventory');
+    if (!isViewerResultEpoch(inventory.epoch)) throw new TypeError('Viewer host results epoch must be an epoch');
+    if (inventory.dataset !== null) requireExactText(inventory.dataset, 'Viewer host results dataset');
+    requireNonNegativeInteger(inventory.revision, 'Viewer host results revision');
+    requireNonNegativeInteger(inventory.nObs, 'Viewer host results nObs');
+    if (!Array.isArray(inventory.items)) throw new TypeError('Viewer host results items must be a list');
+    if (inventory.dataset === null && inventory.items.length > 0) {
+      throw new TypeError('Viewer host results of another dataset list nothing');
+    }
+    for (const item of inventory.items) {
+      requireExactKeys(item, ['kind', 'id', 'revision'], 'Viewer host results item');
+    }
+    return this._sendEvent({
+      type: 'results',
+      epoch: inventory.epoch,
+      dataset: inventory.dataset,
+      revision: inventory.revision,
+      nObs: inventory.nObs,
+      items: inventory.items
+    });
+  }
+
+  /**
+   * Say which field the viewer colours by now.
+   *
+   * @param {{field: string|null, source: 'obs'|'var'|null, symbol: string|null}} colorBy
+   *   `field` a gene's identifier (the var index) or an obs key; `symbol` the
+   *   name the viewer shows for a gene when it differs from its identifier (a
+   *   var column names the genes), else null
+   * @returns {boolean} Whether it was sent
+   */
+  notifyColorBy(colorBy) {
+    requireExactKeys(colorBy, ['field', 'source', 'symbol', 'cells_read'], 'Viewer host colour-by report');
+    const { field, source, symbol, cells_read: cellsRead } = colorBy;
+    if ((field === null) !== (source === null)) {
+      throw new TypeError('Viewer host colour-by names a field and its source, or neither');
+    }
+    if (symbol !== null && source !== 'var') {
+      throw new TypeError('Viewer host colour-by names a symbol only for a gene');
+    }
+    if (field !== null) {
+      requireExactText(field, 'Viewer host colour-by field', { allowWhitespace: true });
+      if (source !== 'obs' && source !== 'var') throw new TypeError('Viewer host colour-by source must be obs or var');
+    }
+    if (symbol !== null) requireExactText(symbol, 'Viewer host colour-by symbol', { allowWhitespace: true });
+    // A gene read for the first open cells only (a gene sample): how many.
+    if (cellsRead !== null && (source !== 'var' || !Number.isSafeInteger(cellsRead) || cellsRead < 0)) {
+      throw new TypeError('Viewer host colour-by names the cells read only for a gene, as a count');
+    }
+    return this._sendEvent({
+      type: 'color_by',
+      field,
+      source,
+      symbol,
+      cells_read: cellsRead
+    });
   }
 
   // =========================================================================
@@ -1548,9 +1893,10 @@ export class ViewerHostDataSource {
 
   /**
    * Register callback for highlight commands from the host
-   * @param {Function} callback - Called with (cells, color): the ascending
-   *   Uint32Array of a highlight and its colour, or (null, null) to clear
-   *   every highlight
+   * @param {Function} callback - Called with (cells, color, label): the
+   *   ascending Uint32Array of a highlight's original positions, its colour
+   *   and its label (null: the viewer names it), or (null, null, null) to
+   *   clear every highlight
    */
   onHighlight(callback) {
     if (typeof callback !== 'function') {
@@ -1604,27 +1950,11 @@ export class ViewerHostDataSource {
     };
 
     try {
-      const response = await fetch(
-        `${owner.config.serverUrl}/_cellucid/datasets`,
-        { signal: catalogOwner.controller.signal }
+      const datasetList = await fetchDatasetList(
+        owner.config.serverUrl,
+        catalogOwner.controller.signal
       );
       this._assertCatalog(owner, 'Viewer host dataset listing');
-      if (!(response instanceof Response)) {
-        throw new TypeError(
-          'Viewer host dataset listing fetch must return a Response'
-        );
-      }
-      if (!response.ok) {
-        throw new Error(
-          `Viewer host dataset listing failed with HTTP ${response.status}`
-        );
-      }
-
-      const catalogPayload = await readBoundedJson(response, {
-        label: 'Viewer host dataset listing',
-      });
-      this._assertCatalog(owner, 'Viewer host dataset listing');
-      const datasetList = requireDatasetCatalogPayload(catalogPayload);
       // The listing describes each store; it does not open one. Listing is a
       // startup step that holds the data controls, and opening belongs to
       // the dataset load (`getMetadata`), which a newer choice replaces.
@@ -1651,7 +1981,7 @@ export class ViewerHostDataSource {
         owner.catalogRevision !== this._catalogRevision ||
         owner.catalogController !== this._catalogController
       ) {
-        throw createViewerHostLifecycleSupersededError(
+        throw viewerHostLifecycleSuperseded(
           'Viewer host dataset listing'
         );
       }
@@ -1665,6 +1995,28 @@ export class ViewerHostDataSource {
       'Viewer host dataset id',
       { allowWhitespace: true }
     );
+  }
+
+  /**
+   * One dataset as the server's listing names it now (`fetchDatasetList`),
+   * adopted as the connection's entry for it.
+   * @private
+   */
+  async _declaredNow(owner, id) {
+    if (owner.signal === null) throw viewerHostLifecycleSuperseded('Viewer host dataset metadata');
+    const datasetList = await fetchDatasetList(owner.config.serverUrl, owner.signal);
+    this._assertConnection(owner, 'Viewer host dataset metadata');
+    const dataset = datasetList.find(entry => entry.id === id);
+    if (dataset === undefined) {
+      throw new DataSourceError(
+        `Viewer host dataset ${JSON.stringify(id)} is not declared by the current listing`,
+        DataSourceErrorCode.NOT_FOUND,
+        this.type,
+        { datasetId: id }
+      );
+    }
+    this._datasetEntries.set(id, dataset);
+    return dataset;
   }
 
   _requireDeclaredDataset(datasetId) {
@@ -1718,10 +2070,6 @@ export class ViewerHostDataSource {
     }
     const id = this._requireDatasetId(datasetId);
 
-    if (this._datasetCache.has(id)) {
-      return this._datasetCache.get(id);
-    }
-
     // Opening the store belongs to the connection, not to one listing: the
     // dataset list is read again while a dataset opens (the controls list
     // every source when they start), and that must not cancel the open. The
@@ -1730,9 +2078,15 @@ export class ViewerHostDataSource {
     const owner = {
       config: this._config,
       lifecycleRevision: this._lifecycleRevision,
+      signal: this._lifecycleController?.signal ?? null,
     };
-    const dataset = this._requireDeclaredDataset(id);
+    // The store the server names now, asked at each opening: a file
+    // rewritten since an earlier listing has another ETag, so it opens as
+    // its new version, never as the one that listing named.
+    const dataset = await this._declaredNow(owner, id);
     const key = servedStoreKey(owner.config.serverUrl, dataset);
+    const opened = this._datasetCache.get(id);
+    if (opened?.key === key) return opened.metadata;
     const existing = this._metadataInFlight.get(key);
     if (
       existing?.config === owner.config &&
@@ -1755,11 +2109,11 @@ export class ViewerHostDataSource {
           declared === undefined ||
           servedStoreKey(owner.config.serverUrl, declared) !== key
         ) {
-          throw createViewerHostLifecycleSupersededError(
+          throw viewerHostLifecycleSuperseded(
             'Viewer host dataset metadata'
           );
         }
-        this._datasetCache.set(id, metadata);
+        this._datasetCache.set(id, { key, metadata });
         return metadata;
       } finally {
         if (this._metadataInFlight.get(key) === inFlight) {
@@ -1856,10 +2210,10 @@ export class ViewerHostDataSource {
     this._endCatalogGeneration(
       'Viewer host catalog was retired by disconnect'
     );
-    this._initializationController?.abort(
-      new Error('Viewer host initialization was cancelled by disconnect')
-    );
+    cancel(this._initializationController, 'closed', 'Viewer host initialization was cancelled by disconnect.');
     this._initializationController = null;
+    cancel(this._lifecycleController, 'closed', 'The viewer host was disconnected.');
+    this._lifecycleController = null;
     this._closeChannel();
     this._connected = false;
     this._config = null;

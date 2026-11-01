@@ -22,9 +22,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: ["22", "24", "26"]
-    # The repository is checked out beside the sibling repository its
-    # cross-repository contracts read (`../cellucid-datasets`), so those
-    # contracts run here instead of skipping.
+    # The repository is checked out beside the sibling repositories its
+    # cross-repository contracts read: `../cellucid-datasets` (the published
+    # session presets), and `../cellucid-python` and `../cellucid-r` (the
+    # notebook widget's front end both packages ship, driven by
+    # `tests/notebook-widget-requests-contract.test.mjs`), so those contracts
+    # run here. The siblings are checked out at their default branch when the
+    # job starts: a cross-repository change pushed here before its sibling's
+    # push lands fails these contracts until the next run (run 41213981681:
+    # cellucid-python's widget push landed after the job had checked out the
+    # previous commit). The widget contract names each checkout's commit and
+    # runs the behaviour contracts on both copies, so its failure says which
+    # repository is behind. Push the siblings first.
     defaults:
       run:
         working-directory: cellucid
@@ -44,6 +53,26 @@ jobs:
           sparse-checkout: |
             anndata/datasets.json
             anndata/*.cellucid-session
+          sparse-checkout-cone-mode: false
+
+      - name: Check out the Python package's notebook widget front end
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-python
+          path: cellucid-python
+          filter: blob:none
+          sparse-checkout: |
+            src/cellucid/jupyter/static/widget.js
+          sparse-checkout-cone-mode: false
+
+      - name: Check out the R package's copy of the widget front end
+        uses: actions/checkout@v7
+        with:
+          repository: theislab/cellucid-r
+          path: cellucid-r
+          filter: blob:none
+          sparse-checkout: |
+            inst/widget/widget.js
           sparse-checkout-cone-mode: false
 
       - name: Install Node.js
@@ -73,12 +102,20 @@ jobs:
       fail-fast: false
       # Pushes and pull requests run every engine on Linux plus WebKit on
       # macOS; the nightly schedule and manual dispatch run every engine on
-      # every operating system. An `include` row that matches an existing
-      # combination adds nothing, so the full matrix holds no duplicates.
+      # every operating system except WebKit on Windows. An `include` row that
+      # matches an existing combination adds nothing, so the full matrix holds
+      # no duplicates. WebKit on Windows is left out: Safari does not exist on
+      # Windows, and Playwright's Windows WebKit build has no origin-private
+      # file system and no OffscreenCanvas, which every Safari Cellucid
+      # supports has, so it failed on every run whatever the code did
+      # (decided 2026-10-31). Safari is covered by WebKit on macOS and Linux.
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
         browser: [chromium, firefox, webkit]
         shard: ["1/7", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"]
+        exclude:
+          - os: windows-latest
+            browser: webkit
         include:
           - os: macos-latest
             browser: webkit
@@ -143,6 +180,19 @@ jobs:
       # runner's software rasterizer explains a timing failure that no spec
       # change would). Linux Firefox is verified through the display server
       # the shard below runs under.
+      #
+      # Hosted Linux runners draw on software GL (Chromium: SwiftShader;
+      # Firefox: llvmpipe; WebKit masks its renderer as "Apple GPU" and drew
+      # 262,144 points in 30 ms, like llvmpipe).
+      # The page measures its device and acts on it (level of detail and
+      # frustum culling from the GPU's time for a frame of every cell, a
+      # progressive opening from what showing a cell cost, worker pools from
+      # the cores): on these runners those measures differ from a developer
+      # machine's. Every spec therefore runs on a fixed device, the `device`
+      # fixture (`tests/browser/helpers/device.mjs`): a fast GPU timed
+      # exactly, a held opening cost, fixed cores; a spec about one of those
+      # choices sets its own. See the web developer docs, "Testing, CI and
+      # release process".
       - name: Record the WebGL2 runtime through the Linux display server
         if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/7'
         run: >-

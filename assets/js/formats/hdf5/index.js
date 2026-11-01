@@ -8,11 +8,12 @@
  *     const x = root.get('obsm/X_umap');
  *     const values = await x.read([[0, 1000]]);
  *
- * `openHdf5` reads the superblock, then the whole object tree (every
- * group's links, every object's header and attributes) with as many reads
- * in flight at once as the tree allows; navigation afterwards is
- * synchronous. Array values are read on demand. The result implements the
- * array store (formats/store.js).
+ * `openHdf5` reads the superblock, then the root group and the paths its
+ * caller names (`load`, as `Group.load` takes them); anything deeper is
+ * read when a reader loads it (`root.load(paths)`), each object once, so
+ * opening never waits for objects nobody reads. Navigation is synchronous
+ * over what is loaded; array values are read on demand. The result
+ * implements the array store (formats/store.js).
  *
  * The package, by module:
  *
@@ -29,7 +30,7 @@
  * | chunk-index.js, fixed-array.js, extensible-array.js | every chunk index |
  * | filters.js, lzf.js | deflate, shuffle, fletcher32, LZF |
  * | read-plan.js | selections into fetches and copies |
- * | load.js | the object tree at open |
+ * | load.js | objects and group links as they are loaded |
  * | nodes.js | the store's groups and arrays |
  * | context.js, binary.js, checksum.js, lru.js, errors.js | shared plumbing |
  *
@@ -38,9 +39,11 @@
 
 import { FileContext } from './context.js';
 import { readSuperblock } from './superblock.js';
-import { loadTree } from './load.js';
+import { ObjectLoader } from './load.js';
 import { Hdf5Tree } from './nodes.js';
-import { Hdf5FormatError, Hdf5UnsupportedError, throwIfAborted } from './errors.js';
+import { Hdf5FormatError, Hdf5UnsupportedError } from './errors.js';
+import { cancelled, throwIfAborted } from '../../utils/abort.js';
+import { loadSpecsOf } from '../store.js';
 import { releaseIdleDecodeWorkers } from '../io/decode-pool.js';
 
 export { Hdf5FormatError, Hdf5UnsupportedError };
@@ -50,9 +53,12 @@ const MiB = 1024 * 1024;
 /**
  * @typedef {Object} OpenOptions
  * @property {AbortSignal|null} [signal]
- * @property {number} [decodedChunkCacheBytes] - Budget of the decoded-chunk cache (default 64 MiB)
+ * @property {number|import('../io/decoded-budget.js').DecodedBudget} [decodedChunkCacheBytes] - Budget of the
+ *   decoded-chunk cache (default 64 MiB), or one shared with the other caches of the file's decoded chunks
  * @property {boolean} [verifyChecksums] - Check newer-format metadata checksums (default true)
  * @property {import('../io/activity.js').ReadActivity|null} [activity] - Counts what opening reads
+ * @property {ReadonlyArray<string|{path: string, depth?: number}>} [load] - Paths loaded with the root
+ *   (`Group.load`), each the moment the links naming it are known: what the caller reads first
  */
 
 /**
@@ -60,9 +66,9 @@ const MiB = 1024 * 1024;
  *
  * @param {import('../io/byte-reader.js').ByteReader} reader
  * @param {OpenOptions} [options]
- * @returns {Promise<import('./nodes.js').Hdf5Group & {close: () => void, stats: () => Object}>}
+ * @returns {Promise<import('./nodes.js').Hdf5Group & {close: (reason?: Error) => void, stats: () => Object}>}
  */
-export async function openHdf5(reader, { signal = null, activity = null, decodedChunkCacheBytes = 64 * MiB, verifyChecksums = true } = {}) {
+export async function openHdf5(reader, { signal = null, activity = null, decodedChunkCacheBytes = 64 * MiB, verifyChecksums = true, load = [] } = {}) {
   if (reader === null || typeof reader !== 'object' || typeof reader.read !== 'function') {
     throw new TypeError('openHdf5 needs a byte reader (formats/io/byte-reader.js).');
   }
@@ -75,9 +81,17 @@ export async function openHdf5(reader, { signal = null, activity = null, decoded
   file.lengthSize = superblock.lengthSize;
   file.btreeK = superblock.btreeK;
   file.superblock = superblock;
-  const objects = await loadTree(file.withActivity(activity), superblock, signal);
+  const loader = new ObjectLoader(file, superblock.rootAddress);
+  const options = { signal, activity };
+  if (superblock.rootSymbolTable?.btreeAddress != null && superblock.rootSymbolTable.heapAddress != null) {
+    // The superblock caches the root group's B-tree and heap: its links are
+    // asked for with its header.
+    loader.cachedTables.set(superblock.rootAddress, superblock.rootSymbolTable);
+  }
+  if (superblock.extensionAddress !== null) await loader.readExtension(superblock.extensionAddress, options);
+  await loader.loadPaths(superblock.rootAddress, loadSpecsOf([{ path: '', depth: 1 }, ...load]), options);
   throwIfAborted(signal);
-  const tree = new Hdf5Tree(file, objects, superblock.rootAddress);
+  const tree = new Hdf5Tree(file, loader);
   const root = tree.root;
   if (root === null || root.kind !== 'group') {
     throw new Hdf5FormatError(`${reader.name}: the root object is not a group.`);
@@ -87,17 +101,24 @@ export async function openHdf5(reader, { signal = null, activity = null, decoded
     milliseconds: performance.now() - started,
     requests: after.requests - before.requests,
     bytes: after.bytes - before.bytes,
-    objects: objects.size,
+    objects: loader.objects.size,
   });
-  root.close = () => {
+  // `reason`: what the reads still under way reject with (a `closed` cancellation by default).
+  root.close = (reason = cancelled('closed', `${file.name} was closed.`)) => {
     file.closed = true;
+    // Every read still under way stops (`FileContext` `lifetime`).
+    file.lifetime.abort(reason);
     file.cache.clear();
     file.inflight.clear();
     reader.clear();
+    // What is being kept of the file (`io/kept-parts.js`) is completed now.
+    void reader.close?.();
     releaseIdleDecodeWorkers();
   };
   root.stats = () => ({
     open: openStats,
+    // Objects loaded so far: at open, and by every load since.
+    objects: loader.objects.size,
     reader: reader.stats(),
     decodedCache: file.cache.stats(),
     superblockVersion: superblock.version,

@@ -11,6 +11,18 @@
  * (`scipy.stats.ttest_ind(equal_var=False)` on the per-sample means); no
  * variance moderation (limma, edgeR, DESeq2) is applied.
  *
+ * Every unit weighs the same in that test, so a sample with a few cells of a
+ * group — common for a rare cell type — would count as much as one with
+ * thousands while its mean is mostly noise. As pseudobulk practice does, a
+ * unit with fewer cells than a minimum (10 by default) is left out; how many
+ * were is part of the result.
+ *
+ * A cell with no value of a gene (NaN: a modality that did not measure it)
+ * is left out of that gene's unit mean, as every analysis leaves it out, so
+ * a unit's mean is over its measured cells and the minimum counts those: a
+ * unit with fewer measured cells than the minimum is left out of that gene's
+ * test only, and each gene says how many units it tested (`nA`, `nB`).
+ *
  * @module analysis/stats/pseudobulk
  */
 
@@ -26,14 +38,21 @@ import { formatCountOf } from '../../../utils/format-units.js';
  * @param {ArrayLike<number>} codes - Each cell's sample code
  * @param {number} missingCode - The code of a cell with no sample
  * @param {number} pointCount
- * @returns {{cellUnit: Int32Array, unitCount: number, unitSide: Uint8Array, unitSample: Int32Array, unitsA: number, unitsB: number, cellsLeftOut: number}}
+ * @param {number} minCellsPerSample - A sample's cells of a side below this
+ *   make no unit: they are left out
+ * @returns {{cellUnit: Int32Array, unitCount: number, unitSide: Uint8Array, unitSample: Int32Array, unitsA: number, unitsB: number, cellsLeftOut: number, smallUnitsA: number, smallUnitsB: number, cellsInSmallUnits: number}}
  *   `cellUnit[cell]` is the cell's unit (-1: none); `unitSide[u]` 1 (A) or
  *   2 (B); `unitSample[u]` its sample code. Units are ordered A first, then
- *   by sample code.
+ *   by sample code. `cellsLeftOut` counts cells with no sample;
+ *   `smallUnitsA`/`smallUnitsB` the samples of each side left out for having
+ *   fewer cells than the minimum, and `cellsInSmallUnits` their cells.
  */
-export function pseudobulkUnits(cellsA, cellsB, codes, missingCode, pointCount) {
+export function pseudobulkUnits(cellsA, cellsB, codes, missingCode, pointCount, minCellsPerSample) {
   if (codes.length !== pointCount) {
     throw new RangeError(`The sample field has ${formatCountOf(codes.length, 'cell')}; the dataset has ${pointCount}`);
+  }
+  if (!Number.isSafeInteger(minCellsPerSample) || minCellsPerSample < 1) {
+    throw new RangeError('The minimum cells per sample must be a positive integer');
   }
   let maxCode = -1;
   for (const cells of [cellsA, cellsB]) {
@@ -45,16 +64,25 @@ export function pseudobulkUnits(cellsA, cellsB, codes, missingCode, pointCount) 
   const cellUnit = new Int32Array(pointCount).fill(-1);
   const sides = [];
   const samples = [];
+  const small = [0, 0, 0];
   let cellsLeftOut = 0;
+  let cellsInSmallUnits = 0;
   for (const [side, cells] of [[1, cellsA], [2, cellsB]]) {
-    // The side's samples in code order, then each cell's unit.
-    const unitOfCode = new Int32Array(maxCode + 1).fill(-1);
+    // The side's cells per sample, then its samples with enough of them in
+    // code order, then each cell's unit.
+    const cellsOfCode = new Uint32Array(maxCode + 1);
     for (let i = 0; i < cells.length; i++) {
       const code = codes[cells[i]];
-      if (code !== missingCode) unitOfCode[code] = 0;
+      if (code !== missingCode) cellsOfCode[code] += 1;
     }
+    const unitOfCode = new Int32Array(maxCode + 1).fill(-1);
     for (let code = 0; code <= maxCode; code++) {
-      if (unitOfCode[code] < 0) continue;
+      if (cellsOfCode[code] === 0) continue;
+      if (cellsOfCode[code] < minCellsPerSample) {
+        small[side] += 1;
+        cellsInSmallUnits += cellsOfCode[code];
+        continue;
+      }
       unitOfCode[code] = sides.length;
       sides.push(side);
       samples.push(code);
@@ -75,31 +103,40 @@ export function pseudobulkUnits(cellsA, cellsB, codes, missingCode, pointCount) 
     unitSample: Int32Array.from(samples),
     unitsA,
     unitsB: sides.length - unitsA,
-    cellsLeftOut
+    cellsLeftOut,
+    smallUnitsA: small[1],
+    smallUnitsB: small[2],
+    cellsInSmallUnits
   };
 }
 
 /**
  * One gene's sample-level test from its per-unit sums.
  *
- * @param {ArrayLike<number>} sum - The gene's sum over each unit's cells
+ * @param {ArrayLike<number>} sum - The gene's sum over each unit's measured cells
  * @param {ArrayLike<number>} expressing - Each unit's cells with a value above 0
- * @param {ArrayLike<number>} sizes - Each unit's cells
+ * @param {ArrayLike<number>} measured - Each unit's cells with a value of the gene
  * @param {Uint8Array} unitSide
  * @param {{mode: 'stored'|'log1p', base: number|null}} foldChange
+ * @param {number} minCellsPerSample - A unit with fewer measured cells is
+ *   left out of this gene's test
  * @returns {{meanA: number, meanB: number, pctA: number, pctB: number, log2FoldChange: number, pValue: number, statistic: number, score: number, auroc: number, nA: number, nB: number}}
  *   `meanA`/`meanB` the mean of the side's unit means; `nA`/`nB` the units
- *   whose mean is finite; `pctA`/`pctB` the share of the side's cells above 0
+ *   tested (with at least `minCellsPerSample` measured cells); `pctA`/`pctB`
+ *   the share of the side's measured cells above 0
  */
-export function pseudobulkGeneTest(sum, expressing, sizes, unitSide, foldChange) {
+export function pseudobulkGeneTest(sum, expressing, measured, unitSide, foldChange, minCellsPerSample) {
+  if (!Number.isSafeInteger(minCellsPerSample) || minCellsPerSample < 1) {
+    throw new RangeError('The minimum cells per sample must be a positive integer');
+  }
   const moments = [null, { n: 0, total: 0, squares: 0, cells: 0, above: 0 }, { n: 0, total: 0, squares: 0, cells: 0, above: 0 }];
   let minimum = Infinity;
   const means = new Float64Array(unitSide.length);
   for (let unit = 0; unit < unitSide.length; unit++) {
     const side = moments[unitSide[unit]];
-    side.cells += sizes[unit];
+    side.cells += measured[unit];
     side.above += expressing[unit];
-    const mean = sizes[unit] > 0 ? sum[unit] / sizes[unit] : NaN;
+    const mean = measured[unit] >= minCellsPerSample ? sum[unit] / measured[unit] : NaN;
     means[unit] = mean;
     if (!Number.isFinite(mean)) continue;
     side.n += 1;

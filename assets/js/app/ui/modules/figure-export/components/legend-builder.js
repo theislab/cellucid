@@ -5,17 +5,20 @@
  * DRY, color-consistent behavior across the app.
  *
  * Category legends are laid out in multiple columns as needed to show all
- * entries (never “+N more” truncation).
+ * entries (never “+N more” truncation), in a box never larger than the plot
+ * (`utils/layout.js`).
  *
  * @module ui/modules/figure-export/components/legend-builder
  */
 
-import { formatTick } from '../utils/tick-calculator.js';
+import { formatSignificant } from '../../../../../utils/format-units.js';
 import { LIGHT_INK } from '../utils/figure-ink.js';
 import { escapeXml } from '../../../../utils/dom-utils.js';
 import {
   areLegendModelsSemanticallyEqual,
 } from '../utils/legend-model-equality.js';
+import { geneSampleLayersNote, geneSampleText } from '../../../../../data/gene-read-plan.js';
+import { categoryCssAt } from '../../../../utils/category-state.js';
 
 /**
  * @typedef {object} Rect
@@ -45,23 +48,56 @@ export const HIDDEN_LEGEND_ENTRY_SUFFIX = ' (hidden)';
 /** Gap between the colorbar endpoint row and the scale note. */
 const SCALE_NOTE_GAP = 4;
 
-function rgb01ToCss(color01) {
-  const r = Math.round((color01?.[0] ?? 0) * 255);
-  const g = Math.round((color01?.[1] ?? 0) * 255);
-  const b = Math.round((color01?.[2] ?? 0) * 255);
-  return `rgb(${r},${g},${b})`;
-}
-
 /**
  * Parse a CSS stop string like "rgb(68,1,84) 0%".
  * @param {string} stop
  */
-function parseCssStop(stop) {
-  const parts = String(stop || '').trim().split(/\s+/);
-  if (parts.length < 2) return null;
-  const color = parts.slice(0, parts.length - 1).join(' ');
-  const offset = parts[parts.length - 1];
-  return { color, offset };
+/**
+ * A note's lines within `maxWidthPx`: words (split at spaces) taken greedily,
+ * a word wider than the line on a line of its own. A note is never cut.
+ *
+ * @param {string} note
+ * @param {number} maxWidthPx
+ * @param {(text: string) => number} measure
+ * @returns {string[]}
+ */
+function noteLines(note, maxWidthPx, measure) {
+  const lines = [];
+  let line = '';
+  for (const word of note.split(' ')) {
+    const candidate = line === '' ? word : `${line} ${word}`;
+    if (line !== '' && measure(candidate) > maxWidthPx) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line !== '') lines.push(line);
+  return lines;
+}
+
+/** Line height of a legend note, in font sizes. */
+const NOTE_LINE_HEIGHT = 1.25;
+
+/**
+ * The colour bar's stops from a legend model's `colorStops`: CSS colours,
+ * each optionally followed by its position (`'rgb(68, 1, 84) 0%'`). The
+ * colormaps' own stops (`getCssStopsForColormap`) are bare colours, evenly
+ * spaced; a colour with spaces inside its parentheses is one colour.
+ *
+ * @param {unknown} colorStops
+ * @returns {Array<{color: string, offset: number}>} Offsets from 0 to 1.
+ */
+function colorBarStops(colorStops) {
+  const stops = Array.isArray(colorStops) ? colorStops : [];
+  const last = Math.max(1, stops.length - 1);
+  return stops.map((stop, index) => {
+    const text = String(stop ?? '').trim();
+    const positioned = /^(.*\S)\s+(-?\d+(?:\.\d+)?)%$/.exec(text);
+    const offset = positioned === null ? index / last : Number(positioned[2]) / 100;
+    return { color: positioned === null ? text : positioned[1], offset: Math.min(1, Math.max(0, offset)) };
+  }).filter(stop => stop.color !== '');
 }
 
 function estimateTextWidthPxApprox(text, fontSizePx) {
@@ -110,7 +146,7 @@ function truncateCanvasTextToWidth(ctx, text, maxWidthPx) {
  */
 export function isCategoryHidden(model, index) {
   const visible = model?.visible;
-  if (visible !== null && typeof visible === 'object' && visible[index] === false) {
+  if (visible instanceof Uint8Array && visible[index] === 0) {
     return true;
   }
   const available = model?.counts?.available;
@@ -165,14 +201,28 @@ function isLogColorScale(model) {
  * @param {any} model
  * @param {unknown} min
  * @param {unknown} max
- * @returns {string|null} Null when the scale is linear.
+ * @returns {string|null} Null when the scale is linear and not centred at 0, every open cell's gene is read, and no zero is drawn gray.
  */
 export function buildColorScaleNote(model, min, max) {
-  if (!isLogColorScale(model)) return null;
+  // A gene read for a sample of the open cells (`model.geneSample`): the
+  // faded cells are those not read, which the figure says, with the gray
+  // for 0 when its zeros are drawn gray (`model.zeroGray.drawn`: gray for
+  // zero on, or a log scale); without a sample, that gray alone.
+  const sample = model?.geneSample ?? null;
+  const zeroGray = model?.zeroGray?.drawn === true;
+  const layers = sample !== null ? `${geneSampleText(sample)}. ${geneSampleLayersNote(zeroGray)}` : zeroGray ? 'Gray: 0' : null;
+  const notes = [scaleNote(model, min, max), layers].filter(note => note !== null);
+  return notes.length === 0 ? null : notes.join(' · ');
+}
+
+/** The scale's own note (`buildColorScaleNote`). */
+function scaleNote(model, min, max) {
+  // A diverging map centred on 0 (`computeContinuousDomain`): its middle is 0.
+  if (!isLogColorScale(model)) return model?.colorbar?.centered === true ? 'Color scale centred at 0' : null;
   const lo = Number(min);
   const hi = Number(max);
   if (Number.isFinite(lo) && Number.isFinite(hi) && lo > 0 && hi > 0) {
-    return `Log10 color scale (midpoint ${formatTick(Math.sqrt(lo * hi))})`;
+    return `Log10 color scale (midpoint ${formatSignificant(Math.sqrt(lo * hi))})`;
   }
   return 'Log10 color scale';
 }
@@ -268,7 +318,7 @@ export function renderSvgLegend({
 
   if (model.kind === 'category') {
     const categories = model.categories || [];
-    const colors = model.colors || [];
+    const colors = model.colors;
     const swatch = 10;
     const listTop = cursorY;
     const listBottom = y + h - padding;
@@ -301,16 +351,16 @@ export function renderSvgLegend({
       if (hidden) {
         parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="none" stroke="${HIDDEN_ENTRY_INK}" stroke-width="1"/>`);
       } else {
-        parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="${rgb01ToCss(colors[i])}" stroke="${ENTRY_INK}" stroke-width="0.25"/>`);
+        parts.push(`<rect x="${itemX}" y="${itemY}" width="${swatch}" height="${swatch}" fill="${categoryCssAt(colors, i)}" stroke="${ENTRY_INK}" stroke-width="0.25"/>`);
       }
       parts.push(`<text x="${labelX}" y="${itemY + swatch}" fill="${hidden ? HIDDEN_ENTRY_INK : ENTRY_INK}" dominant-baseline="ideographic">${escapeXml(label)}</text>`);
     }
   } else if (model.kind === 'continuous') {
     const gradId = `${idPrefix}_grad`;
-    const stops = (model.colorStops || []).map(parseCssStop).filter(Boolean);
+    const stops = colorBarStops(model.colorStops);
     defs.push(`<linearGradient id="${gradId}" x1="0" x2="1" y1="0" y2="0">`);
     for (const s of stops) {
-      defs.push(`<stop offset="${s.offset}" stop-color="${s.color}"/>`);
+      defs.push(`<stop offset="${+(s.offset * 100).toFixed(3)}%" stop-color="${s.color}"/>`);
     }
     defs.push(`</linearGradient>`);
 
@@ -321,15 +371,18 @@ export function renderSvgLegend({
 
     const min = model.colorbar?.min ?? model.stats?.min;
     const max = model.colorbar?.max ?? model.stats?.max;
-    const minText = formatTick(Number(min));
-    const maxText = formatTick(Number(max));
+    const minText = formatSignificant(Number(min));
+    const maxText = formatSignificant(Number(max));
     parts.push(`<text x="${x + padding}" y="${cursorY + fontSize}" fill="${SCALE_NOTE_INK}">${minText}</text>`);
     parts.push(`<text x="${x + padding + barW}" y="${cursorY + fontSize}" text-anchor="end" fill="${SCALE_NOTE_INK}">${maxText}</text>`);
 
     const note = buildColorScaleNote(model, min, max);
     if (note !== null) {
+      // Wrapped to the bar's width: a gene sample's note runs long.
       const noteBaseline = cursorY + fontSize * 2 + SCALE_NOTE_GAP;
-      parts.push(`<text x="${x + padding}" y="${noteBaseline}" fill="${SCALE_NOTE_INK}">${escapeXml(note)}</text>`);
+      noteLines(note, barW, text => estimateTextWidthPxApprox(text, fontSize)).forEach((line, index) => {
+        parts.push(`<text x="${x + padding}" y="${noteBaseline + index * fontSize * NOTE_LINE_HEIGHT}" fill="${SCALE_NOTE_INK}">${escapeXml(line)}</text>`);
+      });
     }
   }
 
@@ -393,7 +446,7 @@ export function drawCanvasLegend({
 
   if (model.kind === 'category') {
     const categories = model.categories || [];
-    const colors = model.colors || [];
+    const colors = model.colors;
     const swatch = 10;
 
     const listTop = cursorY;
@@ -426,7 +479,7 @@ export function drawCanvasLegend({
         ctx.lineWidth = 1;
         ctx.strokeRect(itemX, itemY, swatch, swatch);
       } else {
-        ctx.fillStyle = rgb01ToCss(colors[i]);
+        ctx.fillStyle = categoryCssAt(colors, i);
         ctx.fillRect(itemX, itemY, swatch, swatch);
         ctx.strokeStyle = ENTRY_INK;
         ctx.lineWidth = 0.5;
@@ -448,11 +501,7 @@ export function drawCanvasLegend({
     const barH = 12;
     const barW = Math.max(40, w - padding * 2);
     const grad = ctx.createLinearGradient(x + padding, 0, x + padding + barW, 0);
-    const stops = (model.colorStops || []).map(parseCssStop).filter(Boolean);
-    for (const s of stops) {
-      const pct = Number(String(s.offset).replace('%', '')) / 100;
-      if (Number.isFinite(pct)) grad.addColorStop(pct, s.color);
-    }
+    for (const s of colorBarStops(model.colorStops)) grad.addColorStop(s.offset, s.color);
     ctx.fillStyle = grad;
     ctx.fillRect(x + padding, cursorY, barW, barH);
     ctx.strokeStyle = ink.text;
@@ -464,14 +513,16 @@ export function drawCanvasLegend({
     const max = model.colorbar?.max ?? model.stats?.max;
     ctx.fillStyle = SCALE_NOTE_INK;
     ctx.textAlign = 'left';
-    ctx.fillText(formatTick(Number(min)), x + padding, cursorY + fontSize);
+    ctx.fillText(formatSignificant(Number(min)), x + padding, cursorY + fontSize);
     ctx.textAlign = 'right';
-    ctx.fillText(formatTick(Number(max)), x + padding + barW, cursorY + fontSize);
+    ctx.fillText(formatSignificant(Number(max)), x + padding + barW, cursorY + fontSize);
 
     const note = buildColorScaleNote(model, min, max);
     if (note !== null) {
       ctx.textAlign = 'left';
-      ctx.fillText(note, x + padding, cursorY + fontSize * 2 + SCALE_NOTE_GAP);
+      noteLines(note, barW, text => ctx.measureText(text).width).forEach((line, index) => {
+        ctx.fillText(line, x + padding, cursorY + fontSize * 2 + SCALE_NOTE_GAP + index * fontSize * NOTE_LINE_HEIGHT);
+      });
     }
   }
 

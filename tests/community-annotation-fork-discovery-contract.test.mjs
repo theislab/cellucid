@@ -726,7 +726,7 @@ test(
     await assert.rejects(
       attemptForkPublication(worker, { signal: controller.signal }),
       error => (
-        error?.code === 'GITHUB_REQUEST_ABORTED' &&
+        error?.name === 'AbortError' &&
         error.cause === reason
       ),
     );

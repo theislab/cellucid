@@ -11,6 +11,7 @@ import {
   decodeSpatialTreeJobResult,
   encodeSpatialTreeJobResult,
 } from '../assets/js/rendering/high-perf/spatial-tree-job.js';
+import { forEachLeafRun, leafIdsFollowDrawOrder } from '../assets/js/rendering/high-perf/draw-order.js';
 
 function positionsOf(count, dimension, seed, spread) {
   const positions = new Float32Array(count * dimension);
@@ -51,15 +52,33 @@ for (const [count, dimension, buildLOD] of [[20_000, 3, true], [12_000, 2, true]
     assert.deepEqual(decoded.tree.bounds, built.tree.bounds);
     assert.strictEqual(decoded.tree.bounds, decoded.tree.root.bounds);
     assert.deepEqual(Array.from(decoded.order.indices), Array.from(built.order.indices));
-    // Leaves share one buffer of ids, as the built tree's do.
+    // Leaves share one buffer of ids, as the built tree's do; in 3D the
+    // draw order holds them (its units are the leaves) and none cross.
     const buffers = new Set();
+    const seen = new Uint8Array(count);
     const stack = [decoded.tree.root];
     while (stack.length > 0) {
       const node = stack.pop();
       if (node === null) continue;
       if (node.indices) buffers.add(node.indices.buffer);
-      if (node.children) stack.push(...node.children);
+      if (node.children) {
+        stack.push(...node.children);
+        continue;
+      }
+      let cells = 0;
+      forEachLeafRun(node, decoded.order, (ids, start, end) => {
+        for (let i = start; i < end; i++) {
+          const cell = ids[i];
+          seen[cell]++;
+          cells++;
+          const b = node.bounds;
+          const [x, y, z] = [positions[cell * dimension], dimension > 1 ? positions[cell * dimension + 1] : 0, dimension > 2 ? positions[cell * dimension + 2] : 0];
+          assert.ok(x >= b.minX && x <= b.maxX && y >= b.minY && y <= b.maxY && z >= b.minZ && z <= b.maxZ, `cell ${cell} lies in its leaf`);
+        }
+      });
+      assert.equal(cells, node.pointCount, 'a leaf reads its own cells');
     }
-    assert.equal(buffers.size, 1);
+    assert.equal(buffers.size, leafIdsFollowDrawOrder(dimension) ? 0 : 1);
+    assert.ok(seen.every(times => times === 1), 'every cell in exactly one leaf');
   });
 }

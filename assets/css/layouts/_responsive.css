@@ -59,6 +59,90 @@
     padding-bottom: calc(var(--space-2-5) + var(--notification-stack-block-size, 0px));
   }
 
+  /* The plot comes first: the panel waits as a bar at the foot of the screen
+     (the peek state). Before the panel's code runs, the head's viewport
+     bootstrap marks the root (`data-phone-sheet="peek"`) so the first frame
+     is never covered; the controls then hold the state as `#sidebar.hidden`. */
+  :root[data-phone-sheet="peek"] #sidebar {
+    transform: translateX(calc(-1 * (var(--sidebar-width) + var(--space-5))));
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* The room the bar takes at the foot of the screen while it shows (the
+     panel is closed): every layer that stands at the foot stands above it
+     (the notification cards, the selection bar, a window's bottom sheet) and
+     a floating window is kept clear of it (`dockable-accordions.js`
+     `floatingArea`), so the one way back to the panel is never covered. */
+  :root[data-phone-sheet="peek"] body,
+  body:has(#sidebar.hidden) {
+    --phone-bar-space: calc(var(--phone-sheet-bar-height) + env(safe-area-inset-bottom, 0px));
+  }
+
+  .phone-sheet-bar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* Above the floating windows: one moved or grown over the foot of the
+       screen leaves the bar on top. Dialogs (--z-modal) stay above it. */
+    z-index: calc(var(--z-floating) + 1);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    box-sizing: border-box;
+    height: var(--phone-bar-space);
+    padding: var(--space-1) var(--space-3) calc(var(--space-1) + env(safe-area-inset-bottom, 0px));
+    background-color: var(--menu-paper);
+    border: 0;
+    border-top: var(--border-default);
+    box-shadow: var(--shadow-lg);
+    color: var(--color-text-primary);
+    font-family: inherit;
+    font-size: var(--type-body);
+    text-align: left;
+    cursor: pointer;
+    touch-action: none;
+  }
+
+  /* Open, the panel is the screen; the bar and the plot's own toggle go. */
+  :root:not([data-phone-sheet="peek"]) body:has(#sidebar:not(.hidden)) .phone-sheet-bar {
+    display: none;
+  }
+
+  #sidebar-toggle:not(.sidebar-open),
+  :root[data-phone-sheet="peek"] #sidebar-toggle {
+    display: none;
+  }
+
+  .phone-sheet-handle {
+    flex-shrink: 0;
+    width: var(--space-6);
+    height: 4px;
+    border-radius: var(--radius-full);
+    background: var(--color-border-strong, var(--color-text-secondary));
+  }
+
+  .phone-sheet-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: var(--font-weight-medium);
+  }
+
+  .phone-sheet-open {
+    flex-shrink: 0;
+    color: var(--color-text-secondary);
+  }
+
+  /* The notification cards and the selection bar stand above the bar. */
+  .notification-center,
+  .select-bar {
+    margin-bottom: var(--phone-bar-space, 0px);
+  }
+
   /* A full-width sidebar leaves no edge beside it, so the close control moves
      inside the viewport, above the sidebar; beside it, it would sit just past
      the screen and the plot behind the sidebar could not be reached. */

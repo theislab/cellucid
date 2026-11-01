@@ -5,6 +5,14 @@
  * large enough to take the worker path and requires every drawn point to equal,
  * with `Object.is`, the curve the one-thread trace builder sums for the same
  * values.
+ *
+ * The curve is cut into one slice per analysis worker, and the pool has one
+ * worker per core less the page's and the reader worker's
+ * (`analysisPoolSize`): a 3-core runner has one, so its curve is one slice
+ * (Web contracts run 41269083996, macOS Chromium and Firefox). Each point is
+ * summed whole in one worker, in the same order whatever the slice it falls
+ * in, so the identity holds at any slice count; the count the pool's size
+ * plans is what is required.
  */
 import { expect, test } from './helpers/test.mjs';
 import { openPlotHarness } from './helpers/plot-harness.mjs';
@@ -56,13 +64,14 @@ test('worker-summed density curves equal the one-thread curves bit for bit', asy
         null,
       );
       const backend = manager.getStatus().worker.status;
+      const poolSize = manager.getStatus().worker.stats?.poolSize ?? null;
       let mismatches = 0;
       for (let t = 0; t < reference.length; t++) {
         for (let i = 0; i < reference[t].y.length; i++) {
           if (!Object.is(drawn[t].y[i], reference[t].y[i]) || !Object.is(drawn[t].x[i], reference[t].x[i])) mismatches++;
         }
       }
-      results.push({ bandwidth, traces: drawn.length, points: drawn[0].y.length, mismatches, backend, slices });
+      results.push({ bandwidth, traces: drawn.length, points: drawn[0].y.length, mismatches, backend, slices, poolSize });
       window.Plotly.purge(host);
     }
     delete manager.execute;
@@ -72,7 +81,10 @@ test('worker-summed density curves equal the one-thread curves bit for bit', asy
     expect(result.traces).toBe(2);
     expect(result.points).toBe(100);
     expect(result.backend, 'the analysis workers are available').toBe('available');
-    expect(result.slices, 'the large curve was summed in worker slices').toBeGreaterThan(1);
+    // The continuous page is summed point by point; the quantized one is
+    // tabulated and asks for no kernel sum.
+    expect(result.slices, 'the large curve was summed in one slice per analysis worker')
+      .toBe(Math.min(result.poolSize, result.points));
     expect(result.mismatches, `${result.bandwidth} curve differs from the one-thread sum`).toBe(0);
   }
 });

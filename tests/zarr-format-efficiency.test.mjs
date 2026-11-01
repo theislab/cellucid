@@ -267,6 +267,108 @@ test('concurrent reads of a sharded array on a web host share shard indexes and 
   assert.ok(log.every(entry => !entry.range?.startsWith('bytes=-')));
 });
 
+test('a web host store\'s objects are kept in the page for the tab under its metadata\'s version: a re-read and another opening of the same version fetch nothing again', async t => {
+  const { createByteRangeCache } = await import('../assets/js/data/byte-range-cache.js');
+  const { adoptRangeCachePort } = await import('../assets/js/formats/io/range-cache.js');
+  const cache = createByteRangeCache({ budgetBytes: 64 << 20 });
+  const { port1, port2 } = new MessageChannel();
+  cache.connect(port1);
+  adoptRangeCachePort(port2);
+  t.after(() => {
+    adoptRangeCachePort(null);
+    port1.close();
+  });
+  const entries = await corpusEntries('v3/cases.zarr');
+  const log = [];
+  let etag = '"v1"';
+  const fetch = async (url, init = {}) => {
+    const relative = decodeURIComponent(new URL(url).pathname.replace(/^\/host\//, ''));
+    log.push({ key: relative, range: init.headers?.Range ?? null });
+    const bytes = entries.get(relative);
+    if (bytes === undefined) return new Response(null, { status: 404 });
+    const headers = etag === null ? {} : { ETag: etag };
+    const range = init.headers?.Range;
+    if (!range) return new Response(bytes, { status: 200, headers });
+    const [, a, b] = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const start = a === '' ? bytes.length - Number(b) : Number(a);
+    const end = a === '' ? bytes.length : Number(b) + 1;
+    return new Response(bytes.subarray(start, end), { status: 206, headers });
+  };
+  // The page answers on its own turn, as a page's main thread does.
+  const chunkRequests = () => log.filter(entry => !entry.key.endsWith('zarr.json') && entry.key !== '.zmetadata').length;
+  const readBoth = async root => {
+    const plain = await root.get('dtypes/float32').read();
+    const sharded = await root.get('sharding/end_index').read([[0, 8], [0, 10]]);
+    return [plain, sharded];
+  };
+  const first = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  const [plain, sharded] = await readBoth(first);
+  const fetched = chunkRequests();
+  assert.ok(fetched > 0);
+  await settle();
+  // Read again (whole chunks a read used whole are not kept decoded): from the page.
+  log.length = 0;
+  assert.deepEqual(await readBoth(first), [plain, sharded]);
+  assert.equal(chunkRequests(), 0, `nothing fetched twice in a session: ${JSON.stringify(log)}`);
+  // Another opening of the same store version (a new share in a new reader): from the page too.
+  log.length = 0;
+  const second = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  assert.deepEqual(await readBoth(second), [plain, sharded]);
+  assert.ok(log.some(entry => entry.key === 'zarr.json'), 'the metadata is read from the host, whose validator names the version');
+  assert.equal(chunkRequests(), 0, `another opening: ${JSON.stringify(log)}`);
+  // The store rewritten (its metadata's validator changed): nothing of the old version is used.
+  etag = '"v2"';
+  log.length = 0;
+  const rewritten = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  await readBoth(rewritten);
+  assert.equal(chunkRequests(), fetched);
+  // A host naming no version: nothing kept.
+  etag = null;
+  await settle();
+  const unversioned = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  await readBoth(unversioned);
+  await settle();
+  log.length = 0;
+  await readBoth(await openZarr(httpStore('https://example.test/host/', { fetch })));
+  assert.equal(chunkRequests(), fetched);
+});
+
+test('a read across shards asks for every shard index before any inner chunk, each index once', async () => {
+  const entries = await corpusEntries('v3/cases.zarr');
+  const log = [];
+  const fetch = async (url, init = {}) => {
+    const relative = decodeURIComponent(new URL(url).pathname.replace(/^\/host\//, ''));
+    log.push({ key: relative, range: init.headers?.Range ?? null });
+    const bytes = entries.get(relative);
+    if (bytes === undefined) return new Response(null, { status: 404 });
+    const range = init.headers?.Range;
+    if (!range) return new Response(bytes, { status: 200 });
+    const [, a, b] = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const start = a === '' ? bytes.length - Number(b) : Number(a);
+    const end = a === '' ? bytes.length : Number(b) + 1;
+    // An index answers late for one shard: the others' chunks still wait for it.
+    if (a === '' && relative.endsWith('/c/2/1')) {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      log.push({ key: 'late index answered', range: null });
+    }
+    return new Response(bytes.subarray(start, end), { status: 206 });
+  };
+  const root = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  log.length = 0;
+  const array = root.get('sharding/end_index');
+  // Every row and column: 3 x 2 shards of 8 x 10 elements (24 x 20).
+  const values = await array.read();
+  assert.equal(values[24 * 20 - 1], 24 * 20 - 1);
+  const shards = log.filter(entry => entry.key.startsWith('sharding/end_index/c/'));
+  const indexReads = shards.filter(entry => entry.range?.startsWith('bytes=-'));
+  assert.equal(indexReads.length, 6, 'one index read per shard');
+  assert.equal(new Set(indexReads.map(entry => entry.key)).size, 6);
+  const answered = log.findIndex(entry => entry.key === 'late index answered');
+  const firstChunk = log.findIndex(entry => entry.key.startsWith('sharding/end_index/c/') && !entry.range?.startsWith('bytes=-'));
+  assert.ok(answered >= 0 && firstChunk > answered, 'the inner chunks are asked for once every index is in, together');
+  assert.equal(shards.length - 6, 6, 'each shard\'s inner chunks in one request');
+});
+
 test('a host that refuses suffix ranges is read with HEAD, once it has refused', async () => {
   const entries = await corpusEntries('v3/cases.zarr');
   const log = [];

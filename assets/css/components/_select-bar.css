@@ -83,12 +83,19 @@
   border-top: var(--border-light);
 }
 
+/* One line whatever it says: the card stands on the bottom of the plot, so
+   a status that wrapped raised every row above it under the pointer (the
+   saved count changes on its own with the level of detail drawn). Cut, the
+   whole text is its title. */
 .select-bar-status {
   flex: 1 1 auto;
   min-width: 0;
   font-size: var(--type-heading);
   font-weight: var(--font-weight-medium);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Row 1: the selection in progress, with the tool's own step actions. */

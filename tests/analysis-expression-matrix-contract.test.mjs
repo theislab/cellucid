@@ -18,7 +18,7 @@ import { dotplotOptions } from '../assets/js/app/analysis/options/dotplot-option
 const EXPRESSION_MENU = [
   { value: null, label: 'None', usable: true, reason: null },
   { value: 'X', label: 'X', usable: true, reason: null },
-  { value: 'layer:counts', label: "layers['counts']", usable: true, reason: null },
+  { value: 'layer:counts', label: "layers['counts'] · counts", counts: true, usable: true, reason: null },
   { value: 'layer:bad', label: "layers['bad']", usable: false, reason: 'not a matrix' },
   { value: 'raw', label: 'raw.X · 3 genes', usable: true, reason: null },
 ];
@@ -72,8 +72,8 @@ test('the choices are the mapped matrix, then every other usable matrix of the f
   assert.deepEqual(layer.getExpressionMatrices(), {
     choices: [
       { value: 'mapped', label: 'Mapped (X)' },
-      { value: 'layer:counts', label: "layers['counts']" },
-      { value: 'raw', label: 'raw.X · 3 genes' },
+      { value: 'layer:counts', label: "layers['counts'] · counts", counts: true },
+      { value: 'raw', label: 'raw.X · 3 genes', counts: false },
     ],
     reason: null,
   });
@@ -97,7 +97,7 @@ test('a choice resolves to what it reads: the mapped matrix through the shown ge
   assert.deepEqual(layer.resolveExpressionMatrix('raw'), { matrix: 'raw', read: 'raw', label: 'raw' });
   assert.deepEqual(
     layer.resolveExpressionMatrix('layer:counts'),
-    { matrix: 'layer:counts', read: 'layer:counts', label: "layers['counts']" }
+    { matrix: 'layer:counts', read: 'layer:counts', label: "layers['counts'] · counts, not normalised" }
   );
   assert.throws(() => layer.resolveExpressionMatrix('layer:bad'), RangeError);
   assert.throws(() => layer.resolveExpressionMatrix('layer:absent'), RangeError);

@@ -14,8 +14,14 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN, encodedAppUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const GUESS_H5AD = path.join(FIXTURES, 'data-mapping-guess.h5ad');
@@ -119,7 +125,8 @@ for (const [format, input, file] of [
     await openCollapsedPanels(page);
     await openFile(page, input, file, 'data-mapping-guess');
 
-    // X_umap_old ranks first but holds a NaN, so the guess shows X_tsne.
+    // X_umap_old ranks first but holds a value past float32 (a NaN would only
+    // leave that cell unplaced), so the guess shows X_tsne.
     expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_tsne', columns: [0, 1] });
     await expect(guessNotification(page)).toContainText(
       "This file has no default UMAP (X_umap_1d, X_umap_2d, X_umap_3d, X_umap, X_UMAP, X_wnn.umap or X_ref.umap). "
@@ -153,9 +160,9 @@ for (const [format, input, file] of [
     await expect(others.locator('.data-mapping-row').filter({ hasText: 'PCA 1,2' })).toBeVisible();
     // Arrays that cannot be drawn are listed, with their reason, and stay off.
     const umapOld = checklistRow(page, 'UMAP old');
-    await expect(umapOld.locator('.data-mapping-reason')).toHaveText('NaN at cell 17');
+    await expect(umapOld.locator('.data-mapping-reason')).toHaveText('not representable as float32 at cell 17');
     await expect(umapOld.locator('.data-mapping-enable')).toBeDisabled();
-    await expect(umapOld.locator('.data-mapping-enable')).toHaveAttribute('title', 'NaN at cell 17');
+    await expect(umapOld.locator('.data-mapping-enable')).toHaveAttribute('title', 'not representable as float32 at cell 17');
     await expect(checklistRow(page, 'obs table').locator('.data-mapping-reason'))
       .toHaveText('obsm table, not an array');
     await expect(checklistRow(page, 'sparse').locator('.data-mapping-enable')).toBeDisabled();
@@ -467,7 +474,7 @@ test.describe('on a phone', () => {
   test('the guess leaves the plot uncovered, and Show opens the checklist in the menu', async ({ page }) => {
     const errors = collectBrowserErrors(page);
     await openApp(page);
-    await page.locator('#sidebar-toggle').click();
+    // A phone starts with the plot: the panel waits as its peek bar.
     await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
     await chooseFiles(page.locator('#user-data-file-input'), GUESS_H5AD);
     await expect(page.locator('#dataset-name')).toHaveText('data-mapping-guess');

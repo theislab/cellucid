@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { constants, gunzipSync, gzipSync } from 'node:zlib';
 
-import { gzipDecompress } from '../assets/js/app/session/codecs/gzip.js';
+import { gzipCompress, gzipDecompress } from '../assets/js/app/session/codecs/gzip.js';
 import {
+  NATIVE_CODEC_SLICE_MS,
   NATIVE_INFLATE_INPUT_SLICE_BYTES,
   createSlicedInputStream,
 } from '../assets/js/formats/io/inflate.js';
@@ -123,19 +124,17 @@ function storedThenMaxDistanceGzip(prefixBytes) {
 }
 
 /**
- * Replace the global native decompressor for one call. `factory` receives the
- * real constructor and returns the stream the codec pipes through.
+ * Replace a global native stream class (`DecompressionStream`,
+ * `CompressionStream`) for one call. `factory` receives the real constructor
+ * and returns the stream the codec pipes through.
  */
-async function withDecompressionStream(factory, run) {
-  const originalDescriptor = Object.getOwnPropertyDescriptor(
-    globalThis,
-    'DecompressionStream',
-  );
-  const Native = globalThis.DecompressionStream;
-  Object.defineProperty(globalThis, 'DecompressionStream', {
+async function withNativeStream(name, factory, run) {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+  const Native = globalThis[name];
+  Object.defineProperty(globalThis, name, {
     configurable: true,
     writable: true,
-    value: class InstrumentedDecompressionStream {
+    value: class InstrumentedNativeStream {
       constructor(format) {
         return factory(Native, format);
       }
@@ -144,12 +143,22 @@ async function withDecompressionStream(factory, run) {
   try {
     return await run();
   } finally {
-    Object.defineProperty(
-      globalThis,
-      'DecompressionStream',
-      originalDescriptor,
-    );
+    Object.defineProperty(globalThis, name, originalDescriptor);
   }
+}
+
+function withDecompressionStream(factory, run) {
+  return withNativeStream('DecompressionStream', factory, run);
+}
+
+function withCompressionStream(factory, run) {
+  return withNativeStream('CompressionStream', factory, run);
+}
+
+/** Hold the thread for `ms`, as a native transform does on its input. */
+function busyFor(ms) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) { /* the transform's work */ }
 }
 
 async function expectRejectedBeforeNative(compressed, maxOutputBytes, expected) {
@@ -449,3 +458,67 @@ test('sliced input streams every part in bounded slices and in order', async () 
     /Uint8Array parts/,
   );
 });
+
+test('gzip encode feeds the compressor in bounded slices and round-trips', async () => {
+  const input = new Uint8Array(3 * NATIVE_INFLATE_INPUT_SLICE_BYTES + 7);
+  for (let index = 0; index < input.byteLength; index += 1) input[index] = (index * 31) & 0xff;
+  const written = [];
+  const compressed = await withCompressionStream((Native, format) => {
+    // The real compressor, with each write it is handed counted.
+    const native = new Native(format);
+    const writer = native.writable.getWriter();
+    const writable = new WritableStream({
+      async write(chunk) {
+        written.push(chunk.byteLength);
+        await writer.write(chunk);
+      },
+      close: () => writer.close(),
+      abort: reason => writer.abort(reason),
+    });
+    return { writable, readable: native.readable };
+  }, () => gzipCompress(input, { signal: null }));
+  assert.equal(written.reduce((sum, bytes) => sum + bytes, 0), input.byteLength);
+  assert.ok(written.length > 1, 'the input is written in slices, not whole');
+  assert.ok(written.every(bytes => bytes <= NATIVE_INFLATE_INPUT_SLICE_BYTES));
+  assert.deepEqual(new Uint8Array(gunzipSync(compressed)), input);
+});
+
+for (const direction of ['compress', 'decompress']) {
+  test(`a long gzip ${direction} hands the event loop back between slices`, async () => {
+    // The native transform runs on the thread that feeds it; one taking a
+    // third of the slice budget a write makes eight writes span several
+    // budgets. A stream pumped by promises alone would end before a
+    // macrotask scheduled at its start could run.
+    const slices = 8;
+    const output = encoder.encode('paced');
+    const input = new Uint8Array(slices * NATIVE_INFLATE_INPUT_SLICE_BYTES);
+    let writes = 0;
+    let writesWhenTheMacrotaskRan = null;
+    const paced = () => new TransformStream({
+      transform() {
+        writes += 1;
+        busyFor(NATIVE_CODEC_SLICE_MS / 3);
+      },
+      flush(controller) {
+        controller.enqueue(output);
+      },
+    });
+    setImmediate(() => { writesWhenTheMacrotaskRan = writes; });
+    if (direction === 'compress') {
+      await withCompressionStream(paced, () => gzipCompress(input, { signal: null }));
+    } else {
+      // A valid envelope: only its constant-size parts are checked here.
+      const trailer = new Uint8Array(8);
+      writeUint32LE(trailer, 4, output.byteLength);
+      const compressed = concatBytes(Uint8Array.of(0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255), input, trailer);
+      await withDecompressionStream(paced, () => gzipDecompress(compressed, { maxOutputBytes: output.byteLength, signal: null }));
+    }
+    assert.ok(writes >= slices);
+    assert.notEqual(writesWhenTheMacrotaskRan, null, 'a macrotask ran before the work ended');
+    assert.ok(
+      writesWhenTheMacrotaskRan < writes,
+      `the macrotask ran after ${writesWhenTheMacrotaskRan} of ${writes} writes, not after all of them`,
+    );
+  });
+}
+

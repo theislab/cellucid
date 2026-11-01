@@ -13,69 +13,83 @@
 
 import {
   collectViewFilters,
-  isContinuousFilterFullRange,
+  hasOutlierFilter,
+  hasRangeFilter,
+  outlierThresholdOf,
+  rangeFilteredVarFields,
   visibilityResultInputs,
 } from '../filter-manager.js';
+import { requireOutlierQuantiles } from '../color-outliers.js';
 import {
   cellVisibilityMaskWrites,
   isAllShownCellVisibilityMask,
   transparencyEpoch,
 } from '../per-cell-array-ownership.js';
-import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
+import { isCategoricalCodes, missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
+import { abortReason } from '../../../../utils/abort.js';
+import { hiddenCategoryBytes, hiddenCategoryCount } from '../../../utils/category-state.js';
 
 /**
- * Resolve the filters that can hide a cell once per count.
+ * Resolve the filters that can hide a cell once per count: every category,
+ * range (obs field or gene) and outlier filter, whatever is coloured (as the
+ * visibility pass applies them).
  *
  * The count loops used to walk every field for every cell and re-derive each
  * filter's state there — at 5,000,000 cells that was most of a categorical
  * field switch. A category filter that hides nothing and a continuous filter
  * spanning its whole range can never hide a cell, so they are left out.
  *
- * @param {Array<object>} obsFields
- * @param {(field: object, index: number) => boolean} skipObs
- * @param {object|null} varField Active gene, filtered like an obs field.
+ * @param {object} owner - DataState (its `obsData`, `varData`, `pointCount`)
+ * @param {(field: object) => boolean} skip - A filter of this field (its
+ *   category visibility, or its range) left out; never its outlier filter
  * @returns {{categories: Array<{codes: ArrayLike<number>, hidden: Uint8Array}>,
- *   ranges: Array<{values: ArrayLike<number>, min: number, max: number}>}}
+ *   ranges: Array<{values: ArrayLike<number>, min: number, max: number}>,
+ *   outliers: Array<{quantiles: Float32Array, threshold: number}>}}
  */
-function resolveCellFilters(obsFields, skipObs, varField) {
+function resolveCellFilters(owner, skip) {
   const categories = [];
   const ranges = [];
+  const outliers = [];
   const addRange = field => {
-    if (
-      field._filterEnabled === false ||
-      !field._continuousStats ||
-      !field._continuousFilter ||
-      isContinuousFilterFullRange(field._continuousFilter, field._continuousStats)
-    ) {
-      return;
-    }
+    if (field._filterEnabled === false || !hasRangeFilter(field)) return;
     ranges.push({
       values: field.values || [],
       min: field._continuousFilter.min,
       max: field._continuousFilter.max,
     });
   };
+  const obsFields = owner.obsData?.fields || [];
   for (let index = 0; index < obsFields.length; index++) {
     const field = obsFields[index];
-    if (!field || field._isDeleted === true || skipObs(field, index)) continue;
+    if (!field || field._isDeleted === true) continue;
+    if (hasOutlierFilter(field) && field._outlierFilterEnabled !== false) {
+      outliers.push({
+        quantiles: requireOutlierQuantiles(field.outlierQuantiles, owner.pointCount),
+        threshold: outlierThresholdOf(field),
+      });
+    }
+    if (skip(field)) continue;
     if (field.kind === 'category' && field._categoryVisible) {
       if (field._categoryFilterEnabled === false) continue;
-      const count = (field.categories || []).length;
-      const hidden = new Uint8Array(count);
-      let hidesAny = false;
-      for (let code = 0; code < count; code++) {
-        if (field._categoryVisible[code] === false) {
-          hidden[code] = 1;
-          hidesAny = true;
-        }
+      const shown = field._categoryVisible;
+      const missingHidden = field._missingVisible === false;
+      if (missingHidden || hiddenCategoryCount(shown) > 0) {
+        categories.push({
+          codes: field.codes || [],
+          // One byte per category, 1 where hidden (made once per visibility).
+          hidden: hiddenCategoryBytes(shown),
+          missingCode: isCategoricalCodes(field.codes) ? missingCategoryCode(field.codes) : -1,
+          missingHidden,
+        });
       }
-      if (hidesAny) categories.push({ codes: field.codes || [], hidden });
     } else if (field.kind === 'continuous') {
       addRange(field);
     }
   }
-  if (varField !== null && varField.kind === 'continuous') addRange(varField);
-  return { categories, ranges };
+  for (const { field } of rangeFilteredVarFields(owner.varData)) {
+    if (!skip(field)) addRange(field);
+  }
+  return { categories, ranges, outliers };
 }
 
 /**
@@ -86,10 +100,11 @@ function resolveCellFilters(obsFields, skipObs, varField) {
  * the per-code table and is never hidden, exactly as the explicit range checks
  * it replaces decided.
  */
-function cellPassesFilters(categories, ranges, cell) {
+function cellPassesFilters(categories, ranges, outliers, cell) {
   for (let index = 0; index < categories.length; index++) {
     const filter = categories[index];
-    if (filter.hidden[filter.codes[cell]] === 1) return false;
+    const code = filter.codes[cell];
+    if (code === filter.missingCode ? filter.missingHidden : filter.hidden[code] === 1) return false;
   }
   for (let index = 0; index < ranges.length; index++) {
     const filter = ranges[index];
@@ -97,6 +112,11 @@ function cellPassesFilters(categories, ranges, cell) {
     if (value === null || value !== value || value < filter.min || value > filter.max) {
       return false;
     }
+  }
+  for (let index = 0; index < outliers.length; index++) {
+    const filter = outliers[index];
+    const q = filter.quantiles[cell];
+    if (q >= 0 && q > filter.threshold) return false;
   }
   return true;
 }
@@ -110,13 +130,21 @@ function sameResolvedFilters(left, right) {
   if (
     left.categories.length !== right.categories.length
     || left.ranges.length !== right.ranges.length
+    || left.outliers.length !== right.outliers.length
   ) {
     return false;
+  }
+  for (let index = 0; index < left.outliers.length; index++) {
+    const a = left.outliers[index];
+    const b = right.outliers[index];
+    if (a.quantiles !== b.quantiles || a.threshold !== b.threshold) return false;
   }
   for (let index = 0; index < left.categories.length; index++) {
     const a = left.categories[index];
     const b = right.categories[index];
-    if (a.codes !== b.codes || a.hidden.length !== b.hidden.length) return false;
+    if (a.codes !== b.codes || a.missingHidden !== b.missingHidden || a.hidden.length !== b.hidden.length) return false;
+    // One visibility array gives one table (`hiddenCategoryBytes`).
+    if (a.hidden === b.hidden) continue;
     for (let code = 0; code < a.hidden.length; code++) {
       if (a.hidden[code] !== b.hidden[code]) return false;
     }
@@ -210,7 +238,7 @@ export async function prepareCategoryTotals(codes, categoryCount, { signal = nul
     if (from < n) {
       await yieldToMacrotask();
       if (signal?.aborted) {
-        throw signal.reason ?? new DOMException('The category tally was aborted.', 'AbortError');
+        throw abortReason(signal);
       }
     }
   }
@@ -259,8 +287,7 @@ function visibleFromTotals(codes, alpha, total, categoryCount) {
     || cellVisibilityMaskWrites(inputs.mask) !== inputs.maskWrites
     || inputs.mask.length !== codes.length
     || inputs.continuousFilters.length !== 0
-    || inputs.varValues !== null
-    || inputs.outliers !== null
+    || inputs.outlierFilters.length !== 0
     || inputs.categoryFilters.length > 1
   ) {
     return null;
@@ -276,25 +303,8 @@ function visibleFromTotals(codes, alpha, total, categoryCount) {
 }
 
 /**
- * Per-category count of cells shown and not hidden by the active outlier
- * filter (the outlier test is repeated so the count never trusts a
- * transparency written for another threshold).
- */
-function tallyShownByCode(codes, alpha, outliers, threshold, categoryCount, n) {
-  const counts = new Float64Array(categoryCount);
-  for (let i = 0; i < n; i++) {
-    const code = codes[i];
-    if (code >= categoryCount || alpha[i] !== 1) continue;
-    const q = outliers[i];
-    if (q >= 0 && q > threshold) continue;
-    counts[code]++;
-  }
-  return counts;
-}
-
-/**
- * Per-category counts while the active outlier filter is the only other
- * filter: cells it keeps ("available") and those of them shown ("visible").
+ * Per-category counts while one outlier filter is the only other filter:
+ * cells it keeps ("available") and those of them shown ("visible").
  */
 function tallyOutlierCounts(codes, alpha, outliers, threshold, categoryCount, n) {
   const available = new Float64Array(categoryCount);
@@ -314,7 +324,7 @@ function tallyOutlierCounts(codes, alpha, outliers, threshold, categoryCount, n)
  * Per-category count of cells that pass every filter but the field's own
  * category visibility, kept per field while its inputs are unchanged.
  */
-function availableByCode(owner, field, codes, categoryCount, n, resolved, outliers, threshold) {
+function availableByCode(owner, field, codes, categoryCount, n, resolved) {
   if (!(owner._availableCountsMemos instanceof WeakMap)) {
     owner._availableCountsMemos = new WeakMap();
   }
@@ -324,27 +334,54 @@ function availableByCode(owner, field, codes, categoryCount, n, resolved, outlie
     && memo.codes === codes
     && memo.categoryCount === categoryCount
     && memo.n === n
-    && memo.outliers === outliers
-    && memo.threshold === threshold
     && sameResolvedFilters(memo.filters, resolved)
   ) {
     return memo.available;
   }
-  const { categories, ranges } = resolved;
+  const { categories, ranges, outliers } = resolved;
   const available = new Float64Array(categoryCount);
   for (let i = 0; i < n; i++) {
     const code = codes[i];
     if (code >= categoryCount) continue;
-    if (outliers !== null) {
-      const q = outliers[i];
-      if (q >= 0 && q > threshold) continue;
-    }
-    if (cellPassesFilters(categories, ranges, i)) available[code]++;
+    if (cellPassesFilters(categories, ranges, outliers, i)) available[code]++;
   }
   owner._availableCountsMemos.set(field, {
-    codes, categoryCount, n, outliers, threshold, filters: resolved, available,
+    codes, categoryCount, n, filters: resolved, available,
   });
   return available;
+}
+
+/** Cells without a category per codes array (published codes are never written in place). */
+const MISSING_TOTALS = new WeakMap();
+
+/** How many of the first `n` cells of `codes` have no category. */
+function missingTotal(codes, n) {
+  const cached = MISSING_TOTALS.get(codes);
+  if (cached !== undefined && cached.n === n) return cached.count;
+  const missing = missingCategoryCode(codes);
+  let count = 0;
+  for (let i = 0; i < n; i++) if (codes[i] === missing) count++;
+  MISSING_TOTALS.set(codes, { n, count });
+  return count;
+}
+
+/**
+ * The legend's Missing row: cells without a category, those every other
+ * filter keeps ("available") and those shown ("visible").
+ */
+function missingCounts(codes, alpha, resolved, n) {
+  const missing = missingCategoryCode(codes);
+  const { categories, ranges, outliers } = resolved;
+  let total = 0;
+  let available = 0;
+  let visible = 0;
+  for (let i = 0; i < n; i++) {
+    if (codes[i] !== missing) continue;
+    total++;
+    if (cellPassesFilters(categories, ranges, outliers, i)) available++;
+    visible += alpha[i];
+  }
+  return { total, available, visible };
 }
 
 const COUNT_MEMO_OWNERS = Object.freeze([
@@ -407,7 +444,7 @@ export class FieldSummaryMethods {
       ? this
       : this.viewContexts.get(key);
     if (!view) return [];
-    const lines = collectViewFilters(view)
+    const lines = collectViewFilters(view, { geneSampled: (this.getGeneSample?.() ?? null) !== null })
       .filter((filter) => filter.enabled)
       .map((filter) => filter.text);
     return lines.length > 0 ? lines : ['No filters active'];
@@ -419,9 +456,6 @@ export class FieldSummaryMethods {
       return;
     }
     const total = this.pointCount;
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
-    const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
     const alpha = this.categoryTransparency;
     if (!(alpha instanceof Uint8Array) || alpha.length !== total) {
       throw new TypeError('Filtered count requires the exact point transparency.');
@@ -434,24 +468,14 @@ export class FieldSummaryMethods {
       && memo !== null
       && memo.transparency === alpha
       && memo.epoch === transparencyEpoch(this)
-      && memo.outliers === outliers
-      && memo.threshold === threshold
     ) {
       this.filteredCount = { shown: memo.shown, total };
       return;
     }
-    // Transparency holds exactly 0 or 1 a cell (rendering/alpha-visibility.js).
+    // Transparency holds exactly 0 or 1 a cell (rendering/alpha-visibility.js),
+    // every filter applied (outlier filters included).
     let shown = 0;
-    if (!applyOutlierFilter) {
-      for (let i = 0; i < total; i++) shown += alpha[i];
-    } else {
-      for (let i = 0; i < total; i++) {
-        if (alpha[i] === 0) continue;
-        const q = outliers[i];
-        if (q >= 0 && q > threshold) continue;
-        shown++;
-      }
-    }
+    for (let i = 0; i < total; i++) shown += alpha[i];
     this.filteredCount = { shown, total };
   }
 
@@ -465,24 +489,11 @@ export class FieldSummaryMethods {
     const codes = field.codes || [];
     const categoryCount = categories.length;
     const alpha = this.categoryTransparency || [];
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
-    const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     const n = Math.min(this.pointCount, codes.length);
-    const fields = this.obsData?.fields || [];
-    const targetIndex = fields.indexOf(field);
-    const activeVarField =
-      this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0
-        ? this.varData?.fields?.[this.activeVarFieldIndex] ?? null
-        : null;
-    // "Available" respects every other filter but ignores this field's own
-    // category visibility.
-    const resolved = resolveCellFilters(
-      fields,
-      (_, index) => index === targetIndex,
-      activeVarField
-    );
-    const { categories: categoryFilters, ranges } = resolved;
+    // "Available" respects every other filter (its own outlier filter too)
+    // but ignores this field's own category visibility.
+    const resolved = resolveCellFilters(this, candidate => candidate === field);
+    const { categories: categoryFilters, ranges, outliers } = resolved;
 
     // One visibility change asks for the same counts more than once (the
     // centroid/legend refresh inside computeGlobalVisibility, then the Active
@@ -503,8 +514,6 @@ export class FieldSummaryMethods {
       && memo.n === n
       && memo.alpha === alpha
       && memo.epoch === epoch
-      && memo.outliers === outliers
-      && memo.threshold === threshold
       && sameResolvedFilters(memo.filters, resolved)
     ) {
       return memo.counts;
@@ -513,6 +522,8 @@ export class FieldSummaryMethods {
     let total;
     let available;
     let visible;
+    // The cells without a category: the legend's Missing row.
+    let missing = { total: 0, available: 0, visible: 0 };
     if (n === 0) {
       total = new Float64Array(categoryCount);
       available = total;
@@ -529,32 +540,30 @@ export class FieldSummaryMethods {
       // "visible"). "Visible" is each cell's 0-or-1 visibility added to its
       // code's slot, one branch-free pass.
       total = categoryTotals(codes, categoryCount, n);
-      const otherFilters = categoryFilters.length > 0 || ranges.length > 0;
-      if (!otherFilters && !applyOutlierFilter) {
+      if (categoryFilters.length === 0 && ranges.length === 0 && outliers.length === 0) {
         available = total;
         visible = (n === codes.length && alpha.length === n
           ? visibleFromTotals(codes, alpha, total, categoryCount)
           : null) ?? tallyVisibleByCode(codes, alpha, categoryCount, n);
-      } else if (!otherFilters) {
-        // The outlier slider alone: both tallies in one pass.
+      } else if (categoryFilters.length === 0 && ranges.length === 0 && outliers.length === 1) {
+        // One outlier slider alone: both tallies in one pass.
         ({ available, visible } = tallyOutlierCounts(
-          codes, alpha, outliers, threshold, categoryCount, n
+          codes, alpha, outliers[0].quantiles, outliers[0].threshold, categoryCount, n
         ));
       } else {
-        available = availableByCode(
-          this, field, codes, categoryCount, n, resolved, outliers, threshold
-        );
-        visible = applyOutlierFilter
-          ? tallyShownByCode(codes, alpha, outliers, threshold, categoryCount, n)
-          : tallyVisibleByCode(codes, alpha, categoryCount, n);
+        available = availableByCode(this, field, codes, categoryCount, n, resolved);
+        // The transparency holds every filter, outliers included.
+        visible = tallyVisibleByCode(codes, alpha, categoryCount, n);
       }
+      if (missingTotal(codes, n) > 0) missing = missingCounts(codes, alpha, resolved, n);
     }
     const counts = {
       total: toCountArray(total),
       available: toCountArray(available),
-      availableTotal: sumCounts(available),
+      availableTotal: sumCounts(available) + missing.available,
       visible: toCountArray(visible),
-      visibleTotal: sumCounts(visible)
+      visibleTotal: sumCounts(visible) + missing.visible,
+      missing,
     };
     this._categoryCountsMemos.set(field, {
       codes,
@@ -562,8 +571,6 @@ export class FieldSummaryMethods {
       n,
       alpha,
       epoch,
-      outliers,
-      threshold,
       filters: resolved,
       counts,
     });
@@ -574,39 +581,18 @@ export class FieldSummaryMethods {
     if (!field || field.kind !== 'continuous') return null;
     const n = this.pointCount || 0;
     if (!n) return { available: 0, visible: 0 };
-    const obsFields = this.obsData?.fields || [];
-    const activeVarField =
-      this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0
-        ? this.varData?.fields?.[this.activeVarFieldIndex] ?? null
-        : null;
     const targetValues = field.values || [];
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    const outliers = applyOutlierFilter ? this.getActiveOutlierQuantiles() : null;
-    const threshold = applyOutlierFilter ? this.getCurrentOutlierThreshold() : 1.0;
     let available = 0;
     let visible = 0;
     // With `ignoreSelfFilter`, the field's own range is left out of
     // "available" and applied below for "visible".
-    const filters = resolveCellFilters(
-      obsFields,
-      obsField => (
-        ignoreSelfFilter &&
-        source === 'obs' &&
-        obsField === field &&
-        obsField.kind === 'continuous'
-      ),
-      ignoreSelfFilter && source === 'var' && activeVarField === field
-        ? null
-        : activeVarField
-    );
+    const filters = resolveCellFilters(this, candidate => ignoreSelfFilter && candidate === field);
 
     // The self filter skipped above, applied for "visible" only.
     const selfFilter = (
       ignoreSelfFilter &&
       field._filterEnabled !== false &&
-      field._continuousStats &&
-      field._continuousFilter &&
-      !isContinuousFilterFullRange(field._continuousFilter, field._continuousStats)
+      hasRangeFilter(field)
     )
       ? field._continuousFilter
       : null;
@@ -626,22 +612,14 @@ export class FieldSummaryMethods {
       && memo.targetValues === targetValues
       && memo.selfMin === (selfFilter === null ? null : selfFilter.min)
       && memo.selfMax === (selfFilter === null ? null : selfFilter.max)
-      && memo.outliers === outliers
-      && memo.threshold === threshold
       && sameResolvedFilters(memo.filters, filters)
     ) {
       return { ...memo.counts };
     }
 
-    const { categories: categoryFilters, ranges } = filters;
+    const { categories: categoryFilters, ranges, outliers } = filters;
     for (let i = 0; i < n; i++) {
-      if (!cellPassesFilters(categoryFilters, ranges, i)) continue;
-
-      // Outliers only apply if the outlier filter is enabled
-      if (applyOutlierFilter) {
-        const q = outliers[i] ?? -1;
-        if (q >= 0 && q > threshold) continue;
-      }
+      if (!cellPassesFilters(categoryFilters, ranges, outliers, i)) continue;
 
       available++;
 
@@ -661,8 +639,6 @@ export class FieldSummaryMethods {
       targetValues,
       selfMin: selfFilter === null ? null : selfFilter.min,
       selfMax: selfFilter === null ? null : selfFilter.max,
-      outliers,
-      threshold,
       filters,
       counts,
     });

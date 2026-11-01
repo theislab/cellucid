@@ -61,6 +61,12 @@
   display: none;
 }
 
+/* The phone panel's peek bar exists only in the phone layout
+   (layouts/_responsive.css). */
+.phone-sheet-bar {
+  display: none;
+}
+
 #sidebar.resizing {
   transition: none;
   -webkit-user-select: none;

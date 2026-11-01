@@ -9,6 +9,8 @@
 
 import { formatCompactCount } from '../components/display-format.js';
 import {
+  PASSING_HOST_FAULTS,
+  describeHostFault,
   explainedFailure,
   isExplainedFailure,
   validateDatasetId,
@@ -25,12 +27,19 @@ import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { analytics } from '../../optional-analytics.js';
 import { debug } from '../../../utils/debug.js';
 import { initDatasetDrop, localFileLayout } from './dataset-drop.js';
+import { readFolderHandle } from '../../../data/local-folder.js';
 import {
-  createDatasetReloadSupersededError,
-  isDatasetReloadSupersededError
-} from '../../dataset-reload-outcome.js';
+  keepLocalFile,
+  keptLocalFile,
+  localHandlesAvailable,
+  readKeptLocalFile,
+  readPermissionOf,
+  rememberTabDataset,
+  tabLocalDataset
+} from '../../local-file-handles.js';
 import { isPlainRecord } from '../../../utils/exact-record.js';
 import { formatCountOf, countNoun } from '../../../utils/format-units.js';
+import { isCancellation, cancelled, onAbort } from '../../../utils/abort.js';
 
 const CONNECTION_OPTION_KEYS = Object.freeze([
   'clearDataset',
@@ -105,6 +114,10 @@ function requireSource(source, sourceType, label) {
   if (source.getType() !== sourceType) {
     throw new TypeError(`${label} must own source type "${sourceType}".`);
   }
+  // The address bar holds a link as it is read, with any access key it
+  // carries (`data/sources/link-credentials.js`); everything else the link's
+  // public form.
+  if (sourceType === 'link') requireMethod(source, 'getAddressLocator', label);
   return source;
 }
 
@@ -196,8 +209,8 @@ const DATA_SOURCE_FAILURES = Object.freeze({
     action: 'Check the address, then try again.'
   }),
   server: Object.freeze({
-    cause: 'the server reported a problem of its own.',
-    action: 'Wait a moment, then try again.'
+    cause: 'the host is not answering: a problem on its side, not with the address or with Cellucid.',
+    action: 'It usually passes; try again later.'
   }),
   'too-large': Object.freeze({
     cause: 'what is published there is larger than Cellucid opens in a browser.',
@@ -236,6 +249,12 @@ export function classifyDataSourceFailure(error) {
     return classifyDataSourceFailure(error.errors[0]);
   }
   if (!(error instanceof Error)) return null;
+  // A host fault says who is at fault (`hostFaultFailure`): one that may
+  // pass (the host failing, limiting or refusing this network for now, this
+  // computer offline) is never settled, whatever its status.
+  const fault = error.details?.hostFault?.kind;
+  if (fault === 'offline' || fault === 'connection') return 'unreachable';
+  if (PASSING_HOST_FAULTS.has(fault)) return 'server';
   const code = typeof error.code === 'string' ? error.code : null;
   if (code === 'NOT_FOUND' || code === 'FILE_NOT_FOUND') return 'not-found';
   if (code === 'PERMISSION_DENIED') return 'refused';
@@ -257,7 +276,9 @@ export function classifyDataSourceFailure(error) {
   if (status === null) return code === 'NETWORK_ERROR' ? 'unreachable' : null;
   if (status === 404) return 'not-found';
   if (status === 401 || status === 403) return 'refused';
-  if (status >= 500) return 'server';
+  // A host that timed the request out or turns this network away for now
+  // (408, 429) fails on its side, as a 5xx does: asking again may succeed.
+  if (status >= 500 || status === 408 || status === 429) return 'server';
   if (status >= 400) return 'rejected';
   return 'unreachable';
 }
@@ -285,6 +306,9 @@ export function describeDataSourceFailure(subject, verb, error) {
   if (isExplainedFailure(error)) {
     return `${subject} could not be opened: ${explainedMessage(error)}`;
   }
+  // A host's answer says whose problem it is (`describeHostFault`).
+  const fault = describeHostFault(error);
+  if (fault !== null) return `${subject} ${verb}: ${fault.sentence}`;
   const failure = classifyDataSourceFailure(error);
   if (failure === null) {
     return `${subject} ${verb}. ${UNCLASSIFIED_DATA_SOURCE_ACTION}`;
@@ -332,6 +356,8 @@ export function describeOpeningFailure(sentence, error, { withoutLink }) {
     // for now" is not: no answer may pass).
     return { summary: explainedMessage(error), settled: SETTLED_FAILURES.has(failure) };
   }
+  const fault = describeHostFault(error);
+  if (fault !== null) return { summary: fault.sentence, settled: !PASSING_HOST_FAULTS.has(fault.kind) };
   if (failure !== null) {
     const { cause, action } = DATA_SOURCE_FAILURES[failure];
     return { summary: `${sentence.slice(0, -1)}: ${cause} ${action}`, settled: SETTLED_FAILURES.has(failure) };
@@ -611,6 +637,7 @@ export function initDatasetConnections(options) {
       'Dataset connections select must be a focusable DOM element.'
     );
   }
+  const view = datasetSelect.ownerDocument?.defaultView ?? null;
   const lifecycleController = new AbortController();
   const activeOperations = new Set();
   /**
@@ -627,7 +654,7 @@ export function initDatasetConnections(options) {
 
   function assertAlive() {
     if (destroyed) {
-      throw createDatasetReloadSupersededError(
+      throw cancelled('superseded',
         'Dataset connection controls were destroyed.'
       );
     }
@@ -650,7 +677,7 @@ export function initDatasetConnections(options) {
     }
     const promise = trackOperation(work);
     void promise.catch(error => {
-      if (destroyed || isDatasetReloadSupersededError(error)) return;
+      if (destroyed || isCancellation(error)) return;
       debug.error(`[UI] ${label}: ${errorMessage(error)}`, error);
     });
     return promise;
@@ -713,11 +740,11 @@ export function initDatasetConnections(options) {
    * a sentence of its own, or the error (`saidFailure` for a sentence with
    * the error behind it), which the opening's notification shortens.
    */
-  function settleShownOpening(method, opening, outcome) {
+  function settleShownOpening(method, opening, outcome, failure = null) {
     if (destroyed) return;
     activeOpenings.delete(opening);
     if (method === 'complete') opening.end(outcome);
-    else opening.fail(outcome);
+    else opening.fail(outcome, failure);
   }
 
   /** End it with nothing to say: superseded, or explained where it failed. */
@@ -748,7 +775,7 @@ export function initDatasetConnections(options) {
       keys.length === 1 &&
       keys[0] === 'status'
     ) {
-      throw createDatasetReloadSupersededError(
+      throw cancelled('superseded',
         'Dataset catalog publication was superseded.'
       );
     }
@@ -774,12 +801,17 @@ export function initDatasetConnections(options) {
    * when the read finishes.
    */
   /**
-   * @param {{label: string, readFiles: () => Promise<ArrayLike<File>>}} selection
+   * @param {{label: string,
+   *   readFiles: (options: {signal: AbortSignal}) => Promise<ArrayLike<File>>,
+   *   handle?: FileSystemHandle|Promise<FileSystemHandle|null>|null}} selection
    *   `label` names the choice while it is read; `readFiles` yields its files,
    *   and runs under the choice's own intent (a dropped folder is listed
-   *   there).
+   *   there; `signal` stops the listing on Cancel or a newer choice);
+   *   `handle`, where the browser gave one, is kept once the dataset opened
+   *   (`app/local-file-handles.js`).
    * @param {{loadMethod: string,
    *   load: (source: Object, files: ArrayLike<File>) => Promise<Object>}} loader
+   * @returns {Promise<boolean>} Whether the choice is the dataset open now.
    */
   async function loadLocalUserSelection(selection, loader) {
     const intent = datasetIntents.begin({
@@ -787,7 +819,7 @@ export function initDatasetConnections(options) {
       value: null
     });
     try {
-      await loadLocalUserSelectionForIntent(intent, selection, loader);
+      return await loadLocalUserSelectionForIntent(intent, selection, loader);
     } finally {
       datasetIntents.settle(intent);
     }
@@ -803,12 +835,12 @@ export function initDatasetConnections(options) {
 
   async function loadLocalUserSelectionForIntent(
     intent,
-    { label, readFiles },
+    { label, readFiles, handle = null },
     { loadMethod, load }
   ) {
     const assertCurrentSelection = () => {
       if (destroyed || !datasetIntents.owns(intent)) {
-        throw createDatasetReloadSupersededError(
+        throw cancelled('superseded',
           'Local dataset selection was superseded.'
         );
       }
@@ -819,7 +851,7 @@ export function initDatasetConnections(options) {
       notifications.error('User data source is not available.', {
         category: 'data'
       });
-      return;
+      return false;
     }
     for (const method of [
       'createSelectionCandidate',
@@ -847,31 +879,45 @@ export function initDatasetConnections(options) {
     // The activation joins this request, so a file that cannot be read is
     // reported as a failed load too, and the duration includes reading it.
     const dataLoad = analytics.openDataLoad(loadMethod, 'local-user');
+    // Listing a folder of many files takes a while: Cancel and a newer
+    // choice stop it where it is, as they stop the read after it.
+    const listing = new AbortController();
     const localOpening = beginShownOpening(label, {
-      cancel: () => userSource.disconnect()
+      cancel: () => {
+        listing.abort();
+        userSource.disconnect();
+      }
     });
     // A newer dataset choice cancels the read itself, not only its result:
     // the candidate's disconnect retires a parsed file instead of adopting
     // it, and the read's progress
     // leaves the screen at once rather than when the read gets round to
     // noticing.
-    const cancelRead = () => {
+    const stopCancelling = onAbort(intent.transaction.signal, () => {
+      listing.abort();
       userSource.disconnect();
       if (destroyed) return;
       dismissShownOpening(localOpening);
-    };
-    intent.transaction.signal.addEventListener('abort', cancelRead, {
-      once: true
     });
     let candidatePublished = false;
     try {
       let metadata;
+      let files;
       try {
-        const files = await readFiles();
+        try {
+          files = await readFiles({ signal: listing.signal });
+        } catch (error) {
+          if (listing.signal.aborted) {
+            throw cancelled('superseded',
+              'The local dataset selection was stopped while it was listed.'
+            );
+          }
+          throw error;
+        }
         assertCurrentSelection();
         metadata = await load(userSource, files);
       } finally {
-        intent.transaction.signal.removeEventListener('abort', cancelRead);
+        stopCancelling();
       }
       assertCurrentSelection();
       const ready = await datasetIntents.activate(
@@ -890,7 +936,7 @@ export function initDatasetConnections(options) {
         // dataset select; a second toast would repeat it.
         userSource.disconnect();
         dismissShownOpening(localOpening);
-        return;
+        return false;
       }
       if (dataSourceManager.getSource('local-user') !== userSource) {
         throw new Error(
@@ -906,15 +952,25 @@ export function initDatasetConnections(options) {
         localOpening,
         `User data ready: ${formatCompactCount(metadata.stats.n_cells)} ${countNoun(metadata.stats.n_cells, 'cell')}`
       );
+      // What it was opened from reopens with one click later, where the
+      // browser gave its handle.
+      if (handle !== null && localHandlesAvailable(view)) {
+        void keepLocalFile(userSource.datasetId, {
+          handle,
+          files,
+          kind: loadMethod === DATA_LOAD_METHODS.LOCAL_FOLDER ? 'folder' : 'file'
+        });
+      }
+      return true;
     } catch (error) {
       if (destroyed) {
         dataLoad.cancel();
         const adopted =
           dataSourceManager.getSource('local-user') === userSource;
         if (!candidatePublished && !adopted) userSource.disconnect();
-        return;
+        return false;
       }
-      if (isDatasetReloadSupersededError(error)) {
+      if (isCancellation(error)) {
         dataLoad.cancel();
         // A candidate the activation already registered is the live
         // dataset's source until the newer choice replaces it, which retires
@@ -923,12 +979,13 @@ export function initDatasetConnections(options) {
           dataSourceManager.getSource('local-user') === userSource;
         if (!candidatePublished && !adopted) userSource.disconnect();
         dismissShownOpening(localOpening);
-        return;
+        return false;
       }
       dataLoad.fail(error);
       if (!candidatePublished) userSource.disconnect();
       debug.error(`[UI] Failed to load user data: ${errorMessage(error)}`, error);
       settleShownOpening('fail', localOpening, error);
+      return false;
     }
   }
 
@@ -958,13 +1015,73 @@ export function initDatasetConnections(options) {
     } = openMenu;
     // File… offers every single-file format the registry names.
     userDataFileInput.accept = filePickerAccept();
+    /**
+     * File… or Folder…. Where the browser gives the page a handle of what
+     * is chosen (`localHandlesAvailable`), its own pickers, so the choice
+     * reopens with one click after a reload or from a session
+     * (`app/local-file-handles.js`); elsewhere the file inputs. Either runs
+     * inside the click, as a dialog must.
+     */
+    const chooseLocal = kind => {
+      if (!localHandlesAvailable(view)) {
+        (kind === 'folder' ? userDataFolderInput : userDataFileInput).click();
+        return;
+      }
+      const picked = kind === 'folder'
+        ? view.showDirectoryPicker({ mode: 'read' })
+        : view.showOpenFilePicker({
+            types: [{
+              description: 'Datasets',
+              accept: { 'application/octet-stream': filePickerAccept().split(',') }
+            }]
+          }).then(([handle]) => handle);
+      void launchOperation(async () => {
+        let handle;
+        try {
+          handle = await picked;
+        } catch (error) {
+          // The dialog was closed without a choice.
+          if (isCancellation(error)) return;
+          // A browser policy that blocks its pickers leaves the file inputs,
+          // which the same click still opens.
+          if (error?.name === 'SecurityError' || error?.name === 'NotAllowedError') {
+            if (!destroyed) (kind === 'folder' ? userDataFolderInput : userDataFileInput).click();
+            return;
+          }
+          throw error;
+        }
+        if (destroyed) return;
+        if (kind === 'folder') {
+          await loadLocalUserSelection({
+            label: handle.name,
+            readFiles: ({ signal }) => readFolderHandle(handle, { signal }),
+            handle
+          }, LOCAL_LOADERS.folder);
+          return;
+        }
+        const file = await handle.getFile();
+        const layout = localFileLayout(file);
+        if (layout === null) {
+          notifications.error(
+            `"${file.name}" is not a file Cellucid can open. ${describePickableFiles()}`,
+            { category: 'data', title: 'Cannot open this file' }
+          );
+          return;
+        }
+        await loadLocalUserSelection({
+          label: file.name,
+          readFiles: async () => [file],
+          handle
+        }, LOCAL_LOADERS[layout]);
+      }, kind === 'folder' ? 'Folder selection failed' : 'File selection failed');
+    };
     initOpenDataMenu({
       button: userDataOpenBtn,
       menu: userDataOpenMenu,
       items: [userDataFileItem, userDataFolderItem],
       onChoose: item => {
         if (destroyed) return;
-        (item === userDataFolderItem ? userDataFolderInput : userDataFileInput).click();
+        chooseLocal(item === userDataFolderItem ? 'folder' : 'file');
       },
       signal: lifecycleController.signal
     });
@@ -1030,7 +1147,7 @@ export function initDatasetConnections(options) {
           if (destroyed) return;
           void launchOperation(
             () => loadLocalUserSelection(
-              { label: drop.label, readFiles: drop.readFiles },
+              { label: drop.label, readFiles: drop.readFiles, handle: drop.handle },
               LOCAL_LOADERS[drop.kind]
             ),
             'Dropped dataset failed'
@@ -1095,7 +1212,7 @@ export function initDatasetConnections(options) {
 
     function assertCurrentOperation(revision) {
       if (destroyed || revision !== operationRevision) {
-        throw createDatasetReloadSupersededError(
+        throw cancelled('superseded',
           `${inputLabel} operation was superseded.`
         );
       }
@@ -1115,8 +1232,9 @@ export function initDatasetConnections(options) {
     }
 
     function sourceInputValue(candidate) {
-      const info = candidate.getConnectionInfo();
-      return sourceType === 'remote' ? info.url : info.inputPath;
+      return sourceType === 'remote'
+        ? candidate.getConnectionInfo().url
+        : candidate.getAddressLocator();
     }
 
     /**
@@ -1345,7 +1463,7 @@ export function initDatasetConnections(options) {
           } catch (error) {
             // A choice made while the dataset loaded replaced it. The
             // connection itself still succeeded and is kept below.
-            if (!isDatasetReloadSupersededError(error) || destroyed) {
+            if (!isCancellation(error) || destroyed) {
               throw error;
             }
           } finally {
@@ -1486,7 +1604,7 @@ export function initDatasetConnections(options) {
         const cleanupError = disconnectCandidateOnce();
         if (cleanupError !== null) failureErrors.push(cleanupError);
         if (
-          isDatasetReloadSupersededError(error) &&
+          isCancellation(error) &&
           failureErrors.length === 1
         ) {
           dataLoad.cancel();
@@ -1505,13 +1623,18 @@ export function initDatasetConnections(options) {
               `${inputLabel} connection recovery failed.`
             );
         dataLoad.fail(exactError);
+        const said = describeDataSourceFailure(failureSubject, failureVerb, exactError);
+        // A host's problem that may pass (it fails, limits or refuses this
+        // network for now; this computer was offline) offers Try again, as
+        // the panel over the empty viewer does: the same address, asked again.
+        const fault = describeHostFault(exactError);
         settleShownOpening(
           'fail',
           connectOpening,
-          saidFailure(
-            describeDataSourceFailure(failureSubject, failureVerb, exactError),
-            exactError
-          )
+          saidFailure(said, exactError),
+          fault !== null && PASSING_HOST_FAULTS.has(fault.kind)
+            ? { summary: said, actions: [{ label: 'Try again', run: () => void handleConnect(inputValue, clickLoadMethod) }] }
+            : null
         );
         debug.error(`[UI] ${inputLabel} connection error: ${errorMessage(exactError)}`, exactError);
       } finally {
@@ -1563,7 +1686,7 @@ export function initDatasetConnections(options) {
         });
       } catch (error) {
         if (destroyed) return;
-        if (isDatasetReloadSupersededError(error)) return;
+        if (isCancellation(error)) return;
         recoveryBlocked = true;
         disconnectButton.disabled = true;
         notifications.error(
@@ -1649,7 +1772,7 @@ export function initDatasetConnections(options) {
           source
         );
       } catch (error) {
-        if (!isDatasetReloadSupersededError(error)) throw error;
+        if (!isCancellation(error)) throw error;
       } finally {
         datasetIntents.settle(intent);
       }
@@ -1802,7 +1925,7 @@ export function initDatasetConnections(options) {
         }
         await openKind(kind, value);
       } catch (error) {
-        if (probe.signal.aborted && error?.name === 'AbortError') return;
+        if (probe.signal.aborted && isCancellation(error)) return;
         throw error;
       } finally {
         if (asking !== null) dismissShownOpening(asking);
@@ -1858,6 +1981,13 @@ export function initDatasetConnections(options) {
     } catch (error) {
       cleanupErrors.push(error);
     }
+    if (notesShownDataset) {
+      try {
+        dataSourceManager.offDatasetChange(rememberShownDataset);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     for (const invalidate of operationInvalidators) {
       try {
         invalidate();
@@ -1894,6 +2024,93 @@ export function initDatasetConnections(options) {
   }
 
   /**
+   * The file or folder kept for the dataset `datasetId` (its handle,
+   * `app/local-file-handles.js`): its name, its kind, and whether the browser
+   * lets it be read without asking the person; null when none is kept, or
+   * the browser gives no handles.
+   *
+   * @param {string} datasetId
+   * @returns {Promise<{name: string, kind: 'file'|'folder', granted: boolean}|null>}
+   */
+  async function keptLocalFileOf(datasetId) {
+    if (!localHandlesAvailable(view)) return null;
+    const record = await keptLocalFile(datasetId);
+    if (record === null) return null;
+    return Object.freeze({
+      name: record.name,
+      kind: record.kind,
+      granted: await readPermissionOf(record) === 'granted'
+    });
+  }
+
+  /**
+   * Open the dataset `datasetId` again from the file or folder kept for it,
+   * as a picked one opens. The browser asks the person for leave to read it
+   * unless it is already given, and asks only inside the person's click:
+   * call it from one. Refused, gone or changed since, the opening fails
+   * saying to choose it with Open…. Resolves whether it is the dataset open
+   * now.
+   *
+   * @param {string} datasetId
+   * @returns {Promise<boolean>}
+   */
+  async function reopenLocalFile(datasetId) {
+    const record = localHandlesAvailable(view) ? await keptLocalFile(datasetId) : null;
+    if (record === null || destroyed) return false;
+    const layout = record.kind === 'folder'
+      ? 'folder'
+      : localFileLayout({ name: record.name }) ?? 'file';
+    return loadLocalUserSelection({
+      label: record.name,
+      readFiles: ({ signal }) => readKeptLocalFile(datasetId, record, { signal }),
+      handle: record.handle
+    }, LOCAL_LOADERS[layout]);
+  }
+
+  // A reload of a tab that showed a dataset opened from this computer
+  // offers it back, one click away, where its handle is kept; which one the
+  // tab shows is noted as it changes, in the tab's own storage. The offer
+  // leaves once that dataset is open again, however it was opened.
+  const shownBeforeReload = localHandlesAvailable(view) ? tabLocalDataset() : null;
+  let reopenOffer = null;
+  const rememberShownDataset = () => {
+    const sourceType = dataSourceManager.getCurrentSourceType();
+    const datasetId = dataSourceManager.getCurrentDatasetId?.() ?? null;
+    rememberTabDataset({ sourceType, datasetId });
+    if (reopenOffer !== null && sourceType === 'local-user' && datasetId === shownBeforeReload) {
+      notifications.dismiss(reopenOffer);
+      reopenOffer = null;
+    }
+  };
+  const notesShownDataset = localHandlesAvailable(view)
+    && typeof dataSourceManager.onDatasetChange === 'function';
+  if (notesShownDataset) {
+    dataSourceManager.onDatasetChange(rememberShownDataset);
+    if (shownBeforeReload !== null) {
+      void keptLocalFile(shownBeforeReload).then(record => {
+        if (record === null || destroyed) return;
+        reopenOffer = notifications.show({
+          type: 'info',
+          category: 'data',
+          message: `"${record.name}" was open in this tab before the page was reloaded.`,
+          duration: 0,
+          action: {
+            label: `Reopen ${record.name}`,
+            run: () => {
+              reopenOffer = null;
+              if (destroyed) return;
+              void launchOperation(
+                () => reopenLocalFile(shownBeforeReload),
+                'Reopening a local dataset failed'
+              );
+            }
+          }
+        });
+      });
+    }
+  }
+
+  /**
    * Open the connection of one source type at `value` (a data link's
    * locator, a server address).
    *
@@ -1910,5 +2127,10 @@ export function initDatasetConnections(options) {
     return opener(value);
   }
 
-  return Object.freeze({ destroy, openConnection });
+  return Object.freeze({
+    destroy,
+    openConnection,
+    keptLocalFile: keptLocalFileOf,
+    reopenLocalFile
+  });
 }

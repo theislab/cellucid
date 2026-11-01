@@ -1872,7 +1872,7 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
 
   const modal = page.locator('#welcome-modal');
-  const exploreButton = page.locator('#welcome-demo-btn');
+  const startButton = page.locator('#welcome-start-btn');
   const learnMore = modal.getByRole('link', { name: /Learn more/ });
   const canvas = page.locator('#glcanvas');
 
@@ -1880,20 +1880,20 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
   // It lands on the dialog itself, so no choice opens looking pre-selected.
   await expect(modal).toBeVisible();
   await expect(modal).toBeFocused();
-  await expect(exploreButton).not.toBeFocused();
+  await expect(startButton).not.toBeFocused();
 
   await page.keyboard.press('Tab');
-  await expect(exploreButton).toBeFocused();
+  await expect(startButton).toBeFocused();
   await page.keyboard.press('Tab');
   await expect(learnMore).toBeFocused();
   await page.keyboard.press('Tab');
-  await expect(exploreButton).toBeFocused();
+  await expect(startButton).toBeFocused();
   await page.keyboard.press('Tab');
   await expect(learnMore).toBeFocused();
   await expect(canvas).not.toBeFocused();
 
   await page.keyboard.press('Shift+Tab');
-  await expect(exploreButton).toBeFocused();
+  await expect(startButton).toBeFocused();
   await page.keyboard.press('Shift+Tab');
   await expect(learnMore).toBeFocused();
   await expect(canvas).not.toBeFocused();
@@ -1922,24 +1922,27 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
   await expect(modal).toBeHidden();
   await expect(resetCamera).toBeFocused();
 
-  // The explore action owns focus after it closes the modal, and the restored
-  // return target must not steal it back. It leads to the Session panel; the
-  // Sample dataset dropdown is never activated for the user.
-  await page.evaluate(async () => {
-    const { showWelcomeModal } = await import(
-      '/assets/js/app/ui/onboarding/welcome-modal.js'
-    );
-    if (showWelcomeModal() !== true) {
-      throw new Error('Welcome modal did not reopen');
-    }
-  });
-  await expect(modal).toBeFocused();
-  // From the keyboard, focus lands on the Session panel heading.
-  await exploreButton.focus();
-  await page.keyboard.press('Enter');
-  await expect(modal).toBeHidden();
-  await expect(page.locator('#session-section > summary')).toBeFocused();
-  await expect(page.locator('#dataset-select')).not.toBeFocused();
+  // Start exploring closes it like Escape: from the keyboard (Enter, then
+  // Space) focus returns to the invoker, and nothing else is opened or
+  // focused; the Sample dataset dropdown is never activated for the user.
+  const sessionOpen = await page.locator('#session-section').evaluate(section => section.open);
+  for (const key of ['Enter', 'Space']) {
+    await page.evaluate(async () => {
+      const { showWelcomeModal } = await import(
+        '/assets/js/app/ui/onboarding/welcome-modal.js'
+      );
+      if (showWelcomeModal() !== true) {
+        throw new Error('Welcome modal did not reopen');
+      }
+    });
+    await expect(modal).toBeFocused();
+    await startButton.focus();
+    await page.keyboard.press(key);
+    await expect(modal).toBeHidden();
+    await expect(resetCamera).toBeFocused();
+    await expect(page.locator('#dataset-select')).not.toBeFocused();
+    expect(await page.locator('#session-section').evaluate(section => section.open)).toBe(sessionOpen);
+  }
 
   expect(productErrors).toEqual([]);
 });

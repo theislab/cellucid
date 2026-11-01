@@ -15,6 +15,7 @@ import { cloneCameraState } from '../camera-state-contract.js';
 import { requireExactKeys } from '../../utils/exact-record.js';
 import { isProvenFiniteFloat32Array, markProvenFiniteFloat32Array } from '../position-layout.js';
 import { firstNonBinaryByte } from '../alpha-visibility.js';
+import { isProvenCellRows, requirePlacedOrUnplacedRows } from '../unplaced-positions.js';
 import {
   VIEWER_BACKGROUND_ERROR_MESSAGE,
   isViewerBackground
@@ -107,12 +108,9 @@ function assertExactFloat32Array(value, expectedLength, label) {
 }
 
 /**
- * A published positions or centroid array is never written after
- * publication, so it is proven finite once: scanned the first time it is
- * published, or already proven where it was made (an embedding the reader
- * worker checked, `publishPositionBounds`). A representation switch back to
- * a layout the viewer has shown costs no O(N) pass (a full scan is 30-60 ms
- * at 10M 3D).
+ * A published centroid array is never written after publication, so it is
+ * proven finite once: scanned the first time it is published. Cell
+ * positions are proven row by row instead (`assertCellPositions`).
  */
 function assertFiniteFloat32Array(value, expectedLength, label) {
   const exact = assertExactFloat32Array(value, expectedLength, label);
@@ -124,6 +122,22 @@ function assertFiniteFloat32Array(value, expectedLength, label) {
   }
   markProvenFiniteFloat32Array(exact);
   return exact;
+}
+
+/**
+ * Require one array of cell positions: `dimension` values a cell, each cell
+ * finite in every axis or NaN in every axis (a cell its embedding does not
+ * place, `unplaced-positions.js`). A published array is never written after
+ * publication, so it is proven once: scanned the first time it is published,
+ * or already proven where it was made (an embedding the reader worker
+ * checked, `publishPositionBounds`). A representation switch back to a
+ * layout the viewer has shown costs no O(N) pass (a full scan is 30-60 ms at
+ * 10M 3D).
+ */
+function assertCellPositions(value, expectedLength, dimension, label) {
+  const exact = assertExactFloat32Array(value, expectedLength, label);
+  if (isProvenCellRows(exact)) return exact;
+  return requirePlacedOrUnplacedRows(exact, dimension, label);
 }
 
 function assertExactUint8Array(value, expectedLength, label) {
@@ -204,9 +218,10 @@ function assertViewerDataPayload(payload) {
     );
   }
   const pointCount = exact.positions.length / dimensionLevel;
-  assertFiniteFloat32Array(
+  assertCellPositions(
     exact.positions,
     pointCount * dimensionLevel,
+    dimensionLevel,
     'Viewer positions'
   );
   assertExactUint8Array(exact.colors, pointCount * 4, 'Viewer colors');
@@ -445,8 +460,8 @@ function assertRenderMode(mode) {
 }
 
 export {
-  VALID_DIMENSION_LEVELS,
   assertCentroidLabelEntries,
+  assertCellPositions,
   assertCentroidPayload,
   assertExactBoolean,
   assertExactFloat32Array,

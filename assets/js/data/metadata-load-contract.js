@@ -1,4 +1,4 @@
-import { onAbort } from '../formats/io/abort.js';
+import { abortReason, onAbort, throwIfAborted } from '../utils/abort.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
 
 function isAbortSignal(value) {
@@ -47,18 +47,6 @@ export function getMetadataLoadSignal(options, label) {
   );
 }
 
-export function createMetadataAbortError(label) {
-  const error = new Error(`${label} was cancelled`);
-  error.name = 'AbortError';
-  return error;
-}
-
-export function throwIfMetadataAborted(signal, label) {
-  if (signal?.aborted) {
-    throw createMetadataAbortError(label);
-  }
-}
-
 /**
  * Execute one metadata generation as an atomic, fail-fast batch.
  *
@@ -90,15 +78,7 @@ export async function loadMetadataBatchAtomically(
   }
 
   const controller = new AbortController();
-  const abortFromOwner = () => {
-    controller.abort(ownerSignal?.reason);
-  };
-  if (ownerSignal !== null) {
-    ownerSignal.addEventListener('abort', abortFromOwner, {
-      once: true,
-    });
-    if (ownerSignal.aborted) abortFromOwner();
-  }
+  const stopRelay = onAbort(ownerSignal, () => controller.abort(ownerSignal.reason));
 
   let hasFailure = false;
   let firstFailure;
@@ -106,7 +86,7 @@ export async function loadMetadataBatchAtomically(
     const settled = await Promise.allSettled(
       items.map(async (item, index) => {
         try {
-          throwIfMetadataAborted(controller.signal, label);
+          throwIfAborted(controller.signal);
           return await loadItem(item, controller.signal, index);
         } catch (error) {
           if (!hasFailure && !ownerSignal?.aborted) {
@@ -119,56 +99,11 @@ export async function loadMetadataBatchAtomically(
       })
     );
 
-    if (ownerSignal?.aborted) {
-      throw createMetadataAbortError(label);
-    }
+    if (ownerSignal?.aborted) throw abortReason(ownerSignal);
     if (hasFailure) throw firstFailure;
     return settled.map(outcome => outcome.value);
   } finally {
-    ownerSignal?.removeEventListener('abort', abortFromOwner);
+    stopRelay();
   }
 }
 
-/**
- * Observe a direct metadata promise while allowing its consumer to cancel.
- * Both result handlers stay attached so late completion is never unhandled.
- *
- * @template T
- * @param {Promise<T>|T} value
- * @param {AbortSignal|null} signal
- * @param {string} label
- * @returns {Promise<T>}
- */
-export function waitForMetadata(value, signal, label) {
-  if (!signal) {
-    return Promise.resolve(value);
-  }
-  throwIfMetadataAborted(signal, label);
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let cleanup = () => {};
-    const abort = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(createMetadataAbortError(label));
-    };
-
-    cleanup = onAbort(signal, abort);
-    Promise.resolve(value).then(
-      result => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(result);
-      },
-      error => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(error);
-      }
-    );
-  });
-}

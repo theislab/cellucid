@@ -20,6 +20,8 @@ import {
 import { requireCategoryCodes } from '../../registries/user-defined-fields.js';
 import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { mapCells, mapValues, sessionCellOrder } from '../session-cell-order.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 
 export const id = 'user-defined-codes';
 
@@ -61,13 +63,6 @@ const CHUNK_META_KEYS = Object.freeze([
   'storedBytes',
   'uncompressedBytes'
 ]);
-
-function throwIfAborted(signal) {
-  if (signal !== null && signal.aborted) {
-    throw signal.reason ?? new DOMException('Aborted', 'AbortError');
-  }
-}
-
 
 function assertSignal(signal) {
   if (
@@ -391,7 +386,8 @@ export function capture(ctx) {
       codec: 'gzip',
       label: `User-defined codes: ${fieldKey}`,
       datasetDependent: true,
-      payload: encodeCodesBinary(codes)
+      // By original position (`session-cell-order.js`).
+      payload: encodeCodesBinary(mapValues(codes, sessionCellOrder(state.cellIdentity)?.toSession ?? null))
     });
   }
 
@@ -594,11 +590,12 @@ export async function restore(ctx, chunkMeta, payload) {
 
   const signal = assertSignal(ctx.abortSignal);
   const inventoryTracker = getInventoryTracker(ctx);
-  const codes = await decodeCodesBinary(payload, {
+  // Stored by original position (`session-cell-order.js`), held in open order.
+  const codes = mapValues(await decodeCodesBinary(payload, {
     expectedLength: pointCount,
     expectedCodesType: template._codesTypeHint,
     signal
-  });
+  }), sessionCellOrder(state.cellIdentity)?.toOpen ?? null);
 
   // The decode proves the length and the width, which is what the bundle
   // declared - not that the codes name categories this field actually has.

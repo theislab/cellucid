@@ -21,12 +21,11 @@ import {
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import { carryCategoryStateByCategory } from '../../../utils/categorical-ops.js';
-import {
-  createDatasetFieldLoadSupersededError
-} from './loading.js';
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
 import { requireFields } from './overlay-internals.js';
 import { requireObjectKeys, requireObjectRecord } from '../../../../utils/exact-record.js';
+import { cancelled } from '../../../../utils/abort.js';
+import { forgetLabelsChecked } from '../../../utils/category-state.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -408,6 +407,8 @@ export class FieldOverlayPublicMethods {
     const previousCategories = [...field.categories];
     StateValidator.validateCategoryLabel(originalLabel);
 
+    // The list changes in place: checked again on its next use.
+    forgetLabelsChecked(field.categories);
     if (newLabel === originalLabel) {
       // Revert this category label to its original.
       field.categories[categoryIndex] = originalLabel;
@@ -845,7 +846,7 @@ export class FieldOverlayPublicMethods {
       || currentFields !== fields
       || currentFields[fieldIndex] !== field
     ) {
-      throw createDatasetFieldLoadSupersededError();
+      throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
     }
 
     const existingKeys = fields
@@ -928,38 +929,12 @@ export class FieldOverlayPublicMethods {
         'Categorical duplicate field'
       );
 
-      // Carry forward category UI state (colors/visibility) as a convenience.
+      // Carry forward category UI state (colors/visibility) as a
+      // convenience: shared, as neither array is ever written
+      // (`utils/category-state.js`).
       this.ensureCategoryMetadata(field);
-      if (
-        !Array.isArray(field._categoryColors)
-        || field._categoryColors.length !== categories.length
-        || field._categoryColors.some(
-          color => (
-            !Array.isArray(color)
-            || color.length !== 3
-            || color.some(channel => !Number.isFinite(channel))
-          )
-        )
-      ) {
-        throw new TypeError(
-          'Categorical duplicate source colors must match its categories'
-        );
-      }
-      requireObjectRecord(
-        field._categoryVisible,
-        'Categorical duplicate source visibility'
-      );
-      const visible = {};
-      for (let index = 0; index < categories.length; index++) {
-        visible[index] = requireBoolean(
-          field._categoryVisible[index],
-          `Categorical duplicate visibility ${index}`
-        );
-      }
-      created.field._categoryColors = field._categoryColors.map(
-        color => [...color]
-      );
-      created.field._categoryVisible = visible;
+      created.field._categoryColors = field._categoryColors;
+      created.field._categoryVisible = field._categoryVisible;
       created.field._categoryFilterEnabled = requireBoolean(
         field._categoryFilterEnabled,
         'Categorical duplicate filter state'
@@ -1049,6 +1024,7 @@ export class FieldOverlayPublicMethods {
       for (const key of [
         '_useLogScale',
         '_useFilterColorRange',
+        '_zeroGray',
         '_filterEnabled',
         '_outlierFilterEnabled'
       ]) {
@@ -1345,5 +1321,84 @@ export class FieldOverlayPublicMethods {
       { userDefinedId: createdId }
     );
     return { fieldIndex: newFieldIndex, key, updatedInPlace: false };
+  }
+
+  /**
+   * Add a continuous obs field holding its own values -- a column a notebook
+   * pushed -- or replace the values of the one it pushed before under the
+   * same key. A field of that key the notebook did not push is never
+   * replaced: the push is refused instead.
+   *
+   * @param {{key: string, values: Float32Array, operation: {type: string}}} options
+   *   `values`: one per open cell, NaN where a cell has none
+   * @returns {{fieldIndex: number, fieldId: string, key: string, updatedInPlace: boolean}}
+   */
+  upsertUserDefinedContinuousField(options) {
+    requireExactOptions(
+      options,
+      new Set(['key', 'values', 'operation']),
+      'User-defined continuous upsert options'
+    );
+    const { key, values, operation } = options;
+    StateValidator.validateFieldKey(key);
+    requireObjectRecord(operation, 'User-defined continuous operation');
+    const registry = requireUserDefinedOwner(this);
+    const fields = requireInventory(this, FieldSource.OBS);
+    const existingIndex = fields.findIndex(
+      field => field._isDeleted !== true && field.key === key
+    );
+    if (existingIndex >= 0) {
+      const existing = fields[existingIndex];
+      if (
+        existing.kind !== FieldKind.CONTINUOUS
+        || existing._isUserDefined !== true
+        || existing._sourceField !== null
+        || existing._operation?.type !== operation.type
+      ) {
+        throw new Error(
+          `A field named "${key}" exists already; push the column under another key`
+        );
+      }
+      const fieldId = requireIdentifier(existing._userDefinedId, 'User-defined continuous target id');
+      registry.replaceStoredValues(fieldId, values, this);
+      // Every copy of the field (the live inventory and each snapshot view's)
+      // takes the new values; what was derived from the old ones is dropped.
+      const copies = [existing];
+      if (this.viewContexts instanceof Map) {
+        for (const context of this.viewContexts.values()) {
+          for (const field of context?.obsData?.fields ?? []) {
+            if (field !== existing && field?._userDefinedId === fieldId) copies.push(field);
+          }
+        }
+      }
+      // A filter on the old values goes with them: the cells it hid are
+      // shown again.
+      const filtered = copies.some(copy => copy._continuousFilter !== undefined);
+      for (const copy of copies) {
+        copy.values = values;
+        copy.loaded = true;
+        for (const derived of ['_continuousStats', '_continuousFilter', '_continuousColorRange', '_positiveStats', 'outlierQuantiles']) {
+          delete copy[derived];
+        }
+      }
+      const cacheKey = existing._originalKey || existing.key;
+      this._fieldDataCache.set(cacheKey, { values });
+      getFieldRegistry().invalidate();
+      if (this.activeFieldSource === FieldSource.OBS && this.activeFieldIndex === existingIndex) {
+        this.setActiveField(existingIndex);
+      } else if (filtered) {
+        this.computeGlobalVisibility();
+      }
+      this._notifyFieldChange(FieldSource.OBS, existingIndex, ChangeType.UPDATE, { operation: 'upsert-user-defined' });
+      return { fieldIndex: existingIndex, fieldId, key, updatedInPlace: true };
+    }
+    const created = registry.createStoredContinuous({ key, values, operation }, this);
+    const createdId = requireIdentifier(created.id, 'User-defined continuous creation id');
+    fields.push(created.field);
+    const newFieldIndex = fields.length - 1;
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: createdId });
+    return { fieldIndex: newFieldIndex, fieldId: createdId, key, updatedInPlace: false };
   }
 }

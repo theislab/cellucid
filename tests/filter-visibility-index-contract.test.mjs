@@ -36,7 +36,6 @@ function liveState(pointCount) {
     categoryTransparency: new Uint8Array(pointCount).fill(1),
     cellVisibilityMask: new Uint8Array(pointCount).fill(1),
     colorsArray: new Uint8Array(pointCount * 4).fill(255),
-    _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     isOutlierFilterEnabledForActiveField: () => false,
     getCurrentOutlierThreshold: () => 1,
     _updateActiveCategoryCounts: () => false,

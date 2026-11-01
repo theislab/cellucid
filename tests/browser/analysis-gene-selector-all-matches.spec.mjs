@@ -34,11 +34,12 @@ test('every matching gene is reachable from the analysis gene selector', async (
   await input.click();
   await input.fill('GENE');
   // None plus 2,500 matches, of which one page of rows exists. With no gene
-  // chosen, None is the chosen value and the active entry.
+  // chosen, None is the chosen value; the best match of what is typed is the
+  // active entry, what Enter takes (`utils/gene-lookup.js`).
   await expect(options.first()).toHaveText('None');
   await expect(options.first()).toHaveAttribute('aria-setsize', '2501');
   await expect(options.first()).toHaveClass(/\bselected\b/);
-  await expect(options.first()).toHaveClass(/\bactive\b/);
+  await expect.poll(activeText).toBe('GENE0000');
   expect(await rowCount()).toBe(100);
 
   // Scrolling to the end shows the last match, still as a window of rows.
@@ -57,13 +58,14 @@ test('every matching gene is reachable from the analysis gene selector', async (
   await input.press('Enter');
   await expect.poll(() => page.evaluate(() => window.__chosen.at(-1))).toBe('GENE2499');
 
-  // The chosen gene is the active entry whenever it is listed, wherever it
-  // is. Arrowing walks entry by entry past any window edge: down from the last
+  // Typing again makes the best match active, not the gene chosen before.
+  // Arrowing walks entry by entry past any window edge: down from the last
   // match wraps to None.
   await input.click();
   await input.fill('GENE');
+  await expect.poll(activeText).toBe('GENE0000');
+  await input.press('End');
   await expect.poll(activeText).toBe('GENE2499');
-  await expect(page.locator('#probe-gene-dropdown .dropdown-item.selected')).toHaveText('GENE2499');
   await input.press('ArrowDown');
   await expect.poll(activeText).toBe('None');
   for (let i = 0; i < 101; i++) await input.press('ArrowDown');

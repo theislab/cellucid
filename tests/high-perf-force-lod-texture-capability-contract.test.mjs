@@ -1,3 +1,4 @@
+import { DEFAULT_CELL_PRIORITY } from '../assets/js/data/cell-priority.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -408,7 +409,7 @@ function createRendererState(
   return Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: null,
+      _cellPriority: DEFAULT_CELL_PRIORITY,
       _alphaTexHeight: 0,
       _alphaTexWidth: 0,
       _alphaTexture: null,
@@ -499,7 +500,8 @@ test('explicit live forceLOD lazily builds one exact LOD generation when all LOD
   assert.equal(renderer.useAdaptiveLOD, false);
   assert.equal(renderer.options.USE_LOD, false);
   assert.ok(spatialIndex instanceof SpatialIndex);
-  assert.ok(spatialIndex.lodLevels.length > 1);
+  // Four cells are below the first level: one level, every cell.
+  assert.equal(spatialIndex.lodLevels.length, 1);
   assert.strictEqual(spatialIndex.positions, positions);
   // The live store adopted the new tree's banded draw order before the draw.
   assert.strictEqual(renderer._liveOrder.drawOrder, spatialIndex.drawOrder);
@@ -531,18 +533,18 @@ test('explicit snapshot forceLOD replaces a frustum-only pooled tree with one ca
     { buildLOD: false },
   );
   const geometryGeneration = 9;
-  const alphaTexData = new Uint8Array(4);
-  alphaTexData.fill(255);
+  // The published transparency, kept by reference: four shown cells.
+  const alphas = new Uint8Array(4).fill(1);
   const snapshotBuffer =
     gl._adoptBuffer('snapshot-buffer');
   const snapshot = {
-    alphaTexData,
+    alphas,
     alphaTexHeight: 1,
     alphaTexWidth: 4,
     alphaTexture:
       gl._adoptTexture('snapshot-alpha-texture'),
-    alphaTexPlan: planLinearTexture(alphaTexData.length, 16384, 256),
-    alphaTextureByteLength: alphaTexData.byteLength,
+    alphaTexPlan: planLinearTexture(alphas.length, 16384, 256),
+    alphaTextureByteLength: alphas.length,
     bounds: HighPerfRenderer.computeBoundsFromPositions(
       snapshotPositions,
       DIMENSION,
@@ -613,7 +615,7 @@ test('explicit snapshot forceLOD replaces a frustum-only pooled tree with one ca
       .get(DIMENSION),
     promoted,
   );
-  assert.ok(promoted.lodLevels.length > 1);
+  assert.equal(promoted.lodLevels.length, 1);
   assert.equal(spatialIndex.lodLevels.length, 0, 'the old tree is not promoted in place');
   assert.strictEqual(draw.exactSnapshot, snapshot);
   assert.strictEqual(draw.vao, snapshot.vao);
@@ -636,18 +638,17 @@ test('explicit snapshot forceLOD builds an exact missing pooled LOD tree when de
   const snapshotPositions = makePositions(3, 20);
   const geometryGeneration = 19;
   // Three points in a linear texture of one row, exactly three texels wide.
-  const alphaTexData = new Uint8Array(3);
-  alphaTexData.fill(255);
+  const alphas = new Uint8Array(3).fill(1);
   const snapshotBuffer =
     gl._adoptBuffer('unindexed-snapshot-buffer');
   const snapshot = {
-    alphaTexData,
+    alphas,
     alphaTexHeight: 1,
     alphaTexWidth: 3,
     alphaTexture:
       gl._adoptTexture('unindexed-snapshot-alpha-texture'),
     alphaTexPlan: planLinearTexture(3, 16384, 256),
-    alphaTextureByteLength: alphaTexData.byteLength,
+    alphaTextureByteLength: alphas.length,
     bounds: HighPerfRenderer.computeBoundsFromPositions(
       snapshotPositions,
       DIMENSION,
@@ -707,7 +708,7 @@ test('explicit snapshot forceLOD builds an exact missing pooled LOD tree when de
   assert.ok(pooledSpatialIndex instanceof SpatialIndex);
   assert.strictEqual(snapshot.spatialIndex, pooledSpatialIndex);
   assert.strictEqual(pooledSpatialIndex.positions, snapshotPositions);
-  assert.ok(pooledSpatialIndex.lodLevels.length > 1);
+  assert.equal(pooledSpatialIndex.lodLevels.length, 1);
   assert.strictEqual(draw.spatialIndex, pooledSpatialIndex);
   assert.equal(draw.lodLevel, 0);
   assert.deepEqual(result, { lodLevel: 0 });
@@ -720,7 +721,7 @@ test('alpha and draw-order R32UI linear textures use the runtime width beyond 40
   const alphaRenderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: null,
+      _cellPriority: DEFAULT_CELL_PRIORITY,
       _alphaTexHeight: 0,
       _alphaTexWidth: 0,
       _alphaTexture: null,
@@ -739,7 +740,7 @@ test('alpha and draw-order R32UI linear textures use the runtime width beyond 40
     { length: pointCount },
     (_value, index) => pointCount - 1 - index,
   );
-  const record = orderRenderer._createDrawOrderRecord(
+  const record = orderRenderer._createStoreOrder(
     Object.freeze({ indices, pointCount }),
     'test draw order',
   );
@@ -781,7 +782,8 @@ test('invalid texture capabilities reject before allocation and preserve exact a
     const alphaRenderer = Object.assign(
       Object.create(HighPerfRenderer.prototype),
       {
-        _alphaTexData: acceptedAlphaData,
+        _cellPriority: DEFAULT_CELL_PRIORITY,
+        _currentAlphas: acceptedAlphaData,
         _alphaTexHeight: 1,
         _alphaTexWidth: 2,
         _alphaTexture: acceptedAlphaTexture,
@@ -795,7 +797,7 @@ test('invalid texture capabilities reject before allocation and preserve exact a
       /needs a positive MAX_(TEXTURE_SIZE|ARRAY_TEXTURE_LAYERS)/,
     );
     assert.strictEqual(alphaRenderer._alphaTexture, acceptedAlphaTexture);
-    assert.strictEqual(alphaRenderer._alphaTexData, acceptedAlphaData);
+    assert.strictEqual(alphaRenderer._currentAlphas, acceptedAlphaData);
     assert.equal(alphaRenderer._alphaTexWidth, 2);
     assert.equal(alphaRenderer._alphaTexHeight, 1);
     assert.equal(gl._state.creates.textures.length, 0);
@@ -805,7 +807,7 @@ test('invalid texture capabilities reject before allocation and preserve exact a
     const acceptedOrder = Object.freeze({ id: `accepted-order-${label}` });
     orderRenderer._liveOrder = acceptedOrder;
     assert.throws(
-      () => orderRenderer._createDrawOrderRecord(
+      () => orderRenderer._createStoreOrder(
         Object.freeze({ indices: Uint32Array.from([2, 0, 1]), pointCount: 3 }),
         'test draw order',
       ),
@@ -825,7 +827,7 @@ test('per-point textures hold more than MAX_TEXTURE_SIZE^2 points in layers', ()
   const alphaRenderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: null,
+      _cellPriority: DEFAULT_CELL_PRIORITY,
       _alphaTexHeight: 0,
       _alphaTexWidth: 0,
       _alphaTexture: null,
@@ -838,7 +840,7 @@ test('per-point textures hold more than MAX_TEXTURE_SIZE^2 points in layers', ()
   assert.equal(alphaRenderer._alphaTexPlan.rowsPerLayer, 3);
   const orderRenderer = createRendererState(gl, makePositions(17), makeColors(17));
   const indices = Uint32Array.from({ length: 17 }, (_value, index) => 16 - index);
-  const record = orderRenderer._createDrawOrderRecord(
+  const record = orderRenderer._createStoreOrder(
     Object.freeze({ indices, pointCount: 17 }),
     'test draw order',
   );
@@ -864,7 +866,8 @@ test('texture-capacity failures preserve accepted alpha and draw-order publicati
   const alphaRenderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: acceptedAlphaData,
+      _cellPriority: DEFAULT_CELL_PRIORITY,
+      _currentAlphas: acceptedAlphaData,
       _alphaTexHeight: 1,
       _alphaTexWidth: 4,
       _alphaTexture: acceptedAlphaTexture,
@@ -882,7 +885,7 @@ test('texture-capacity failures preserve accepted alpha and draw-order publicati
     acceptedAlphaTexture,
   );
   assert.strictEqual(
-    alphaRenderer._alphaTexData,
+    alphaRenderer._currentAlphas,
     acceptedAlphaData,
   );
   assert.equal(alphaRenderer._alphaTexWidth, 4);
@@ -904,7 +907,7 @@ test('texture-capacity failures preserve accepted alpha and draw-order publicati
   };
 
   assert.throws(
-    () => orderRenderer._createDrawOrderRecord(
+    () => orderRenderer._createStoreOrder(
       Object.freeze({
         indices: Uint32Array.from({ length: 17 }, (_value, index) => index),
         pointCount: 17,

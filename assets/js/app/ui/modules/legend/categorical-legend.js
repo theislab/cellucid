@@ -29,10 +29,14 @@ import {
   ICONS,
   coalesceToFrame,
   createButton,
+  createCheckbox,
   createIconButton
 } from '../../components/controls.js';
-import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { MISSING_LABEL } from '../../../state/managers/filter-manager.js';
+import { formatCount, formatCountOf, formatOpenCells } from '../../../../utils/format-units.js';
 import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
+import { categoryRgbAt, categoryShownAt } from '../../../utils/category-state.js';
+import { failureText } from '../../../../utils/errors.js';
 
 const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 const INIT_KEYS = new Set(['state', 'legendEl', 'dataSourceManager']);
@@ -248,6 +252,28 @@ function formatCategoryCount(visibleCount, availableCount) {
   return `${formatCountOf(visibleCount, 'cell')}`;
 }
 
+/**
+ * What the legend's counts are of, said only on a subsample: the open cells
+ * of every cell of the dataset (`formatOpenCells`); and, for a field whose
+ * file stores more categories than there are open cells (`field.storedCategoryCount`,
+ * coded by the ones its open cells hold), how many of them those are. ''
+ * when every cell is open and the field lists every category it stores.
+ *
+ * @param {{pointCount?: number, cellIdentity?: {nOriginal?: number}|null}} state
+ * @param {{categories?: ReadonlyArray<unknown>|null, _originalCategories?: ReadonlyArray<unknown>, storedCategoryCount?: number}|null} [field]
+ * @returns {string}
+ */
+export function describeCountedCells(state, field = null) {
+  const open = state.pointCount ?? 0;
+  const total = state.cellIdentity?.nOriginal ?? open;
+  const cells = total === open ? '' : `Counted on the ${formatOpenCells(open, total)} open.`;
+  const stored = field?.storedCategoryCount;
+  const found = (field?._originalCategories ?? field?.categories ?? []).length;
+  if (!Number.isSafeInteger(stored) || stored <= found) return cells;
+  const among = `${formatCount(found)} of its ${formatCountOf(stored, 'category', 'categories')} are among ${cells === '' ? 'the cells' : 'them'}.`;
+  return cells === '' ? among : `${cells} ${among}`;
+}
+
 /** Write text only when it changed, so an unchanged row is not relaid out. */
 function setTextIfChanged(element, text) {
   if (element.textContent !== text) element.textContent = text;
@@ -290,6 +316,9 @@ function parseCategoryDragPayload(dataTransfer) {
   return payload;
 }
 
+/** Count records checked against the category list they were made for. */
+const CHECKED_COUNTS = new WeakMap();
+
 function requireCategoricalLegendModel(field, model) {
   if (
     field === null
@@ -304,44 +333,40 @@ function requireCategoricalLegendModel(field, model) {
     || model.kind !== FieldKind.CATEGORY
     || model.categories !== field.categories
     || model.categories.length === 0
-    || !Array.isArray(model.colors)
-    || model.colors.length !== model.categories.length
+    // Colours and visibility as `utils/category-state.js` holds them (checked
+    // once per array where they are made).
+    || !(model.colors instanceof Uint8Array)
+    || model.colors.length !== model.categories.length * 3
     || model.counts === null
     || typeof model.counts !== 'object'
     || Array.isArray(model.counts)
     || Object.getPrototypeOf(model.counts) !== Object.prototype
     || Object.keys(model.counts).sort().join(',') !==
-      'available,availableTotal,total,visible,visibleTotal'
+      'available,availableTotal,missing,total,visible,visibleTotal'
+    || model.counts.missing === null
+    || typeof model.counts.missing !== 'object'
     || !Array.isArray(model.counts.total)
     || !Array.isArray(model.counts.visible)
     || !Array.isArray(model.counts.available)
     || model.counts.total.length !== model.categories.length
     || model.counts.visible.length !== model.categories.length
     || model.counts.available.length !== model.categories.length
-    || model.visible === null
-    || typeof model.visible !== 'object'
-    || Array.isArray(model.visible)
-    || Object.getPrototypeOf(model.visible) !== Object.prototype
-    || Object.keys(model.visible).length !== model.categories.length
+    || !(model.visible instanceof Uint8Array)
+    || model.visible.length !== model.categories.length
   ) {
     throw new TypeError(
       'Categorical legend requires an exact category field and complete model'
     );
   }
+  // A count record is made for one category list and never changed: it is
+  // checked against it once, not on every draw (a field of a million
+  // categories is drawn again on every filter and count).
+  if (CHECKED_COUNTS.get(model.counts) === model.categories) return model;
   let totalCount = 0;
   let availableTotal = 0;
   let visibleTotal = 0;
   for (let index = 0; index < model.categories.length; index++) {
     StateValidator.validateCategoryLabel(model.categories[index]);
-    rgbToHex(model.colors[index]);
-    if (!Object.hasOwn(model.visible, index)) {
-      throw new TypeError(
-        `Category visibility ${index} must be present exactly once`
-      );
-    }
-    if (model.visible[index] !== true && model.visible[index] !== false) {
-      throw new TypeError(`Category visibility ${index} must be exactly boolean`);
-    }
     requireCategoryCounts(
       model.counts.visible[index],
       model.counts.available[index]
@@ -359,15 +384,22 @@ function requireCategoricalLegendModel(field, model) {
     availableTotal += model.counts.available[index];
     visibleTotal += model.counts.visible[index];
   }
+  // The cells without a category (the Missing row) count in the totals.
+  const missing = model.counts.missing;
+  requireCategoryCounts(missing.visible, missing.available);
+  if (!Number.isSafeInteger(missing.total) || missing.total < missing.available) {
+    throw new TypeError('Missing-value total count must contain its available count');
+  }
   if (
-    model.counts.availableTotal !== availableTotal
-    || model.counts.visibleTotal !== visibleTotal
+    model.counts.availableTotal !== availableTotal + missing.available
+    || model.counts.visibleTotal !== visibleTotal + missing.visible
     || totalCount > Number.MAX_SAFE_INTEGER
   ) {
     throw new TypeError(
       'Categorical legend count totals must match their category arrays'
     );
   }
+  CHECKED_COUNTS.set(model.counts, model.categories);
   return model;
 }
 
@@ -549,17 +581,22 @@ export function initCategoricalLegend(options) {
       );
     }
     const active = group !== null;
-    highlightBtn.classList.toggle(
-      'legend-highlight-btn--active',
-      active
-    );
-    highlightBtn.setAttribute('aria-pressed', String(active));
-    highlightBtn.disabled = !hasCells && !active;
-    highlightBtn.title = active
+    // Each written only when it changes: a count refresh syncs every row's
+    // button, and a write of the value held is still a DOM write.
+    if (highlightBtn.classList.contains('legend-highlight-btn--active') !== active) {
+      highlightBtn.classList.toggle('legend-highlight-btn--active', active);
+    }
+    if (highlightBtn.getAttribute('aria-pressed') !== String(active)) {
+      highlightBtn.setAttribute('aria-pressed', String(active));
+    }
+    const disabled = !hasCells && !active;
+    if (highlightBtn.disabled !== disabled) highlightBtn.disabled = disabled;
+    const title = active
       ? 'Remove highlight from this category'
       : hasCells
         ? 'Highlight all cells in this category'
         : 'No visible cells to highlight in this category';
+    if (highlightBtn.title !== title) highlightBtn.title = title;
   };
 
   // The rows of the current render, by category index, so a count refresh
@@ -574,6 +611,10 @@ export function initCategoricalLegend(options) {
   // scrolling shows the same counts as the rows already drawn.
   let renderedModel = null;
   let renderedAnnotating = false;
+  // The line saying what the counts are of (a subsample's open cells).
+  let renderedCellsNote = null;
+  /** @type {((counts: Object) => void)|null} Keeps the Missing row's count current. */
+  let renderedMissingRow = null;
 
   const syncCategoryHighlightButtons = () => {
     if (isRendering) return;
@@ -736,6 +777,8 @@ export function initCategoricalLegend(options) {
         syncCategoryHighlightButton(entry.highlightBtn, idx, visible > 0);
       }
     }
+    if (renderedCellsNote !== null) setTextIfChanged(renderedCellsNote, describeCountedCells(state, activeField));
+    renderedMissingRow?.(counts);
     if (annotationAvailabilityChanged) {
       renderCategoricalLegend(activeField, model);
       return;
@@ -750,9 +793,11 @@ export function initCategoricalLegend(options) {
     closeTransientInteractions();
     isRendering = true;
     try {
-      const { section, rows, annotating, mount } = _doRenderCategoricalLegend(field, model);
+      const { section, rows, annotating, mount, cellsNote, syncMissingRow } = _doRenderCategoricalLegend(field, model);
       legendEl.replaceChildren(section);
       mount();
+      renderedCellsNote = cellsNote;
+      renderedMissingRow = syncMissingRow;
       renderedRows = rows;
       renderedField = field;
       renderedModel = model;
@@ -928,6 +973,11 @@ export function initCategoricalLegend(options) {
       })
     );
     catSection.appendChild(controlsDiv);
+    // On a subsample the counts are of the open cells, and the legend says so.
+    const cellsNote = ownerDocument.createElement('p');
+    cellsNote.className = 'status-line legend-cells-note';
+    cellsNote.textContent = describeCountedCells(state, field);
+    catSection.appendChild(cellsNote);
 
     const categories = model.categories;
     const labels = categories.map(formatCategoryLabel);
@@ -1001,13 +1051,19 @@ export function initCategoricalLegend(options) {
         StateValidator.validateCategoryLabel(originalLabel);
       }
       // A virtual window is rebuilt after the counts were refreshed, so it
-      // reads the model the legend drew last.
-      const current = renderedField === field && renderedModel !== null ? renderedModel : model;
+      // reads the counts the legend drew last; the rows this render builds
+      // read the model it draws.
+      const current = !isRendering && renderedField === field && renderedModel !== null ? renderedModel : model;
+      // A row shows each category's colour and visibility as the field
+      // holds them now. A model holds the arrays of the moment it was made:
+      // every change makes new ones (`utils/category-state.js`), so a model
+      // kept from an earlier draw shows a category as it was then (a filter
+      // removed in Active filters left its box unticked).
       return buildCategoryRow({
         catIdx,
         label: labels[catIdx],
-        color: current.colors[catIdx],
-        isVisible: current.visible[catIdx],
+        color: categoryRgbAt(field._categoryColors, catIdx),
+        isVisible: categoryShownAt(field._categoryVisible, catIdx),
         visibleCount: current.counts.visible[catIdx],
         availableCount: current.counts.available[catIdx],
         annotating,
@@ -1121,7 +1177,29 @@ export function initCategoricalLegend(options) {
     });
 
     catSection.appendChild(itemsContainer);
-    return { section: catSection, rows, annotating, mount };
+    // Cells without a category: counted, and shown or hidden like a
+    // category (`setMissingCategoryVisibility`), drawn in the no-value gray.
+    const missingToggle = createCheckbox({
+      label: MISSING_LABEL,
+      checked: field._missingVisible !== false,
+      onChange: visible => state.setMissingCategoryVisibility(field, visible),
+    });
+    const missingCount = ownerDocument.createElement('span');
+    missingCount.className = 'legend-count';
+    const missingRow = ownerDocument.createElement('div');
+    missingRow.className = 'legend-missing-row';
+    missingRow.append(missingToggle.root, missingCount);
+    catSection.appendChild(missingRow);
+    // Written only when it changes, as every count is (`setTextIfChanged`):
+    // setting `hidden` to the value it holds is still a DOM write, so a
+    // category toggled would rewrite this row too.
+    const syncMissingRow = counts => {
+      const hidden = counts.missing.total === 0;
+      if (missingRow.hidden !== hidden) missingRow.hidden = hidden;
+      setTextIfChanged(missingCount, formatCategoryCount(counts.missing.visible, counts.missing.available));
+    };
+    syncMissingRow(model.counts);
+    return { section: catSection, rows, annotating, mount, cellsNote, syncMissingRow };
   }
 
   /**
@@ -1248,7 +1326,7 @@ export function initCategoricalLegend(options) {
             );
           } catch (error) {
             if (!(error instanceof Error)) throw error;
-            getNotificationCenter().error(error.message, { category: 'filter' });
+            getNotificationCenter().error(failureText(error), { category: 'filter' });
           }
         },
         onCancel: () => {
@@ -1370,7 +1448,7 @@ export function initCategoricalLegend(options) {
             getNotificationCenter().success(msg, { category: 'filter', duration: 2400 });
           } catch (error) {
             if (!(error instanceof Error)) throw error;
-            getNotificationCenter().error(error.message, { category: 'filter' });
+            getNotificationCenter().error(failureText(error), { category: 'filter' });
           }
         },
         onCancel: () => {
@@ -1647,6 +1725,8 @@ export function initCategoricalLegend(options) {
     renderedField = null;
     renderedModel = null;
     renderedAnnotating = false;
+    renderedCellsNote = null;
+    renderedMissingRow = null;
   }
 
   return {

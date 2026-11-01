@@ -25,8 +25,14 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const REPRESENTATIONS_H5AD = path.join(FIXTURES, 'data-mapping-representations.h5ad');
@@ -191,8 +197,10 @@ test('four views of four representations pick, highlight, build LOD, label, expo
     umap2d: await layoutOf(page, 'UMAP', 2),
     tsne: await layoutOf(page, 't-SNE', 2),
   };
-  // Colour by cell type first: kept views copy it.
+  // Colour by cell type first, with its labels shown (a label is made only
+  // while its view shows labels): kept views copy it.
   await page.locator('#categorical-field').selectOption('cell_type');
+  await page.locator('#toggle-centroid-labels').check();
   await expect.poll(() => page.evaluate(() => window._cellucidState.centroidLabels.length)).toBe(3);
   await keepView(page, 2);
   await keepView(page, 3);
@@ -381,9 +389,15 @@ test('running out of memory releases what no view shows, and the switch succeeds
     await state.setViewRepresentation('live', umap2d, { followsDefault: false });
     const original = manager.loadLayout.bind(manager);
     let failures = 0;
-    let evictions = 0;
-    const evictUnpinned = manager.evictUnpinned.bind(manager);
-    manager.evictUnpinned = () => { evictions += 1; return evictUnpinned(); };
+    // Each release of every layout no view shows (`trimUnshown(0)`), with
+    // what it released.
+    const releases = [];
+    const trimUnshown = manager.trimUnshown.bind(manager);
+    manager.trimUnshown = budget => {
+      const released = trimUnshown(budget);
+      if (budget === 0) releases.push(released);
+      return released;
+    };
     manager.loadLayout = (key, options) => {
       if (key === phate && failures === 0) {
         failures += 1;
@@ -393,10 +407,11 @@ test('running out of memory releases what no view shows, and the switch succeeds
     };
     await state.setViewRepresentation('live', phate, { followsDefault: false });
     manager.loadLayout = original;
-    manager.evictUnpinned = evictUnpinned;
-    return { failures, evictions, shows: state.getViewLayoutKey('live') };
+    manager.trimUnshown = trimUnshown;
+    return { failures, releases, shows: state.getViewLayoutKey('live') };
   }, { phate, umap2d });
-  expect(cpu).toEqual({ failures: 1, evictions: 1, shows: phate });
+  // The 3D UMAP the view showed first is released before the one retry.
+  expect(cpu).toEqual({ failures: 1, releases: ['the positions of 1 layout no view shows'], shows: phate });
 
   // GPU: geometry kept for unshown representations is released, then the
   // upload is retried once.

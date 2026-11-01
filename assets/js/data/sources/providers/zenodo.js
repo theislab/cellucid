@@ -20,10 +20,12 @@
  * @module data/sources/providers/zenodo
  */
 
-import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultOfResponse } from '../../data-source.js';
 import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
+import { keptAtAddress } from '../../anndata/transcode/space.js';
 import { fileFormatOfName, readsFromHead } from '../../input-formats.js';
 import { HEAD_BYTES, headOfFile, readFileHead } from '../../../formats/io/byte-source.js';
+import { cancel } from '../../../utils/abort.js';
 
 const API = 'https://zenodo.org/api/records/';
 const RECORD = /^[1-9][0-9]*$/;
@@ -67,11 +69,16 @@ export default Object.freeze({
   capabilities: Object.freeze({
     folders: false,
     private: 'none',
+    public: false,
     versions: true,
     write: false,
   }),
   match(input, { explicit = true } = {}) {
     return parseZenodo(input, explicit);
+  },
+  /** A value carries nothing that grants access: it is shown as it is. */
+  publicValue(value) {
+    return value;
   },
   async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseZenodo(value);
@@ -85,24 +92,31 @@ export default Object.freeze({
     }
     const [recordId, requested = null] = parsed.split(/\/(.*)/s);
     const fileUrl = (version, name) => `${API}${version}/files/${encodeURIComponent(name)}/content`;
-    // The named file's first read goes out with the record request.
+    // The named file's first read goes out with the record request, unless
+    // this browser keeps the file's parts at the address the link names (a
+    // later visit: its head is read from there, and Zenodo's request budget
+    // is not spent on it).
     const early = new AbortController();
     const earlySignal = signal === null ? early.signal : AbortSignal.any([signal, early.signal]);
-    const headRead = requested !== null && readsFromHead(fileFormatOfName(requested))
+    const headRead = requested !== null && readsFromHead(fileFormatOfName(requested)) &&
+      !(await keptAtAddress({ kind: 'remote', key: `zenodo:${recordId}:${encodeURIComponent(requested)}` }))
       ? readFileHead(fileUrl(recordId, requested), HEAD_BYTES, { signal: earlySignal })
       : null;
     headRead?.catch(() => {});
     // A concept record redirects to its latest version, so the record read
-    // here names the exact version that opens.
+    // here names the exact version that opens: asked of Zenodo now, never a
+    // cached answer.
     let response;
     try {
-      response = await fetchWhenNotBusy(`${API}${recordId}`, { signal });
+      response = await fetchWhenNotBusy(`${API}${recordId}`, { signal, cache: 'no-cache' });
     } catch (error) {
       early.abort(error);
       throw error;
     }
     if (!response.ok) {
-      early.abort(new DOMException('The record could not be read.', 'AbortError'));
+      cancel(early, 'superseded', 'The record could not be read.');
+      const fault = hostFaultOfResponse(response, `record ${recordId}`, { url: `${API}${recordId}`, recordId });
+      if (fault !== null) throw fault;
       throw new DataSourceError(
         response.status === 404 || response.status === 410
           ? `Zenodo record ${recordId} does not exist or is not public.`
@@ -143,7 +157,7 @@ export default Object.freeze({
         if (signal?.aborted) throw error;
       }
     } else {
-      early.abort(new DOMException('Another version is read instead.', 'AbortError'));
+      cancel(early, 'superseded', 'Another version is read instead.');
     }
     const metadata = record.metadata ?? {};
     const title = typeof metadata.title === 'string' && metadata.title.trim()

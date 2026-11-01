@@ -32,22 +32,28 @@
  * - In-place normalization of positions to [-1,1] range for consistent rendering
  * - Per-view layout state tracking
  * - A least-recently-used position cache bounded by `maxPositionBytes` (by
- *   default the `positions` residency budget of `memory-budget.js`, a share
- *   of the device memory the browser reports), in which every layout a view
- *   shows, or a caller pinned, is never evicted. The budget only decides
- *   what is evicted: a layout of any size is loaded and shown.
- * - Memory pressure: a JS heap above 85 % of its limit (Chromium reports it),
- *   or a failed typed-array allocation (every engine), evicts every unpinned
- *   layout -- and tells the renderer to drop the geometry it retains -- before
- *   one retry
+ *   default the `positions` share of the memory model, `memory-budget.js`, as
+ *   it is whenever a layout loads), in which every layout a view shows, or a
+ *   caller pinned, is never evicted. The budget only decides what is evicted:
+ *   a layout of any size is loaded and shown.
+ * - The memory model counts the positions of layouts no view shows
+ *   (`unshownBytes`) and trims them when the allowance or the working set
+ *   changes, or the page is hidden (`trimUnshown`; trimmed to nothing, it
+ *   also tells the renderer to drop the geometry it retains). A failed
+ *   typed-array allocation evicts every unpinned layout before one retry.
  */
 
-import { loadPointsBinary } from './data-loaders.js';
+import { loadCellOrderDigest, loadPointsBinary } from './data-loaders.js';
 import { MappingLoadError } from './data-mapping-candidates.js';
 import { normalizePositions } from '../rendering/gl-utils.js';
-import { publishPositionBounds } from '../rendering/position-layout.js';
+import { publishPositionBounds, readPositionBounds } from '../rendering/position-layout.js';
+import { publishUnplacedCount, unplacedCountOf } from '../rendering/unplaced-positions.js';
 import { residencyBudgetBytes } from './memory-budget.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { cellsSteady, trackCellWork, useOpenCells } from './open-cells-work.js';
+import { cellOrderDigest } from './cell-order-digest.js';
+import { allocateTypedArray } from './sparse-column-index.js';
+import { isCancellation, cancelled, cancel } from '../utils/abort.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 const LAYOUT_ORIGINS = new Set(['identity', 'mapping']);
@@ -73,18 +79,6 @@ export function isAllocationFailure(error) {
     /alloc|out of memory|array buffer|invalid array length/i.test(String(error.message));
 }
 
-function heapUnderPressure() {
-  const memory = globalThis.performance?.memory;
-  if (
-    !memory ||
-    !Number.isFinite(memory.usedJSHeapSize) ||
-    !Number.isFinite(memory.jsHeapSizeLimit) ||
-    memory.jsHeapSizeLimit <= 0
-  ) {
-    return false;
-  }
-  return memory.usedJSHeapSize > 0.85 * memory.jsHeapSizeLimit;
-}
 const FLOAT32_BYTES = Float32Array.BYTES_PER_ELEMENT;
 
 function toSupportedDimension(value) {
@@ -388,7 +382,7 @@ export function parseEmbeddingMetadata(meta) {
  * @param {Object} options - Configuration options
  * @param {string} options.baseUrl - Base URL for loading layout files
  * @param {Object} options.embeddingsMetadata - The dataset identity's embeddings metadata
- * @param {number} options.maxPositionBytes - Maximum retained/transient position bytes
+ * @param {number|null} [options.maxPositionBytes] - A fixed bound of retained/transient position bytes (tests); by default the `positions` share, read whenever a layout loads
  * @returns {DimensionManager}
  */
 export function createDimensionManager(options = {}) {
@@ -527,11 +521,13 @@ class DimensionManager {
     candidateAnnDataBinding = null,
     baseUrl = '',
     embeddingsMetadata = null,
-    maxPositionBytes = residencyBudgetBytes('positions')
+    maxPositionBytes = null
   } = {}) {
     if (
-      !Number.isSafeInteger(maxPositionBytes) ||
-      maxPositionBytes <= 0
+      maxPositionBytes !== null && (
+        !Number.isSafeInteger(maxPositionBytes) ||
+        maxPositionBytes <= 0
+      )
     ) {
       throw new TypeError(
         'DimensionManager maxPositionBytes must be a positive safe integer.'
@@ -547,7 +543,8 @@ class DimensionManager {
     }
     this.baseUrl = baseUrl;
     this.candidateAnnDataBinding = candidateAnnDataBinding;
-    this._maxPositionBytes = BigInt(maxPositionBytes);
+    /** @type {bigint|null} A fixed budget, or null for the `positions` share as it is now */
+    this._maxPositionBytes = maxPositionBytes === null ? null : BigInt(maxPositionBytes);
 
     // Registered layouts: layoutKey -> frozen descriptor, in registration
     // order.
@@ -570,6 +567,15 @@ class DimensionManager {
     // Told when positions leave the cache (so a renderer can drop geometry it
     // keeps for them) and when memory runs short. See setResidencyListener().
     this._residencyListener = null;
+
+    // Told when a layout leaves cells unplaced (NaN coordinates: its
+    // embedding has no position for them), once per layout and dataset and
+    // again for unplaced cells an opening grown in place adds. See
+    // setUnplacedCellsListener().
+    this._unplacedListener = null;
+
+    // Layouts whose unplaced cells were told of in this dataset.
+    this._unplacedTold = new Set();
 
     // In-memory layouts produced on demand (synthetic datasets): layoutKey ->
     // () => raw Float32Array coordinates.
@@ -1044,6 +1050,10 @@ class DimensionManager {
    * @returns {Promise<Float32Array>} Raw position data
    */
   async loadLayout(layoutKey) {
+    // The open cells being changed in place: read for the cells after it
+    // (`open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const generation = this._generation;
     const layout = this.getLayout(layoutKey);
     const key = layout.layoutKey;
@@ -1091,7 +1101,7 @@ class DimensionManager {
           this.loadingPromises.delete(key);
         }
       });
-      this.loadingPromises.set(key, produced);
+      this.loadingPromises.set(key, trackCellWork(produced));
       return produced;
     }
     const url = `${this.baseUrl}${layout.path}`;
@@ -1107,7 +1117,7 @@ class DimensionManager {
       dimension: dim,
       signal: controller.signal
     })
-      .then(({ positions, transform, bounds }) => {
+      .then(({ positions, transform, bounds, unplacedCount, unplacedNames }) => {
         this._assertGeneration(generation, key, promise);
 
         // Validate and cache
@@ -1132,8 +1142,14 @@ class DimensionManager {
 
         // The reader worker scanned the coordinates: their bounds are known.
         if (bounds !== null) publishPositionBounds(positions, dim, bounds);
+        // And counted the cells it does not place.
+        if (Number.isSafeInteger(unplacedCount)) publishUnplacedCount(positions, unplacedCount);
         this.loadedTransformCache.set(key, transform);
         this.positionCache.set(key, positions);
+        if (!this._unplacedTold.has(key)) {
+          this._unplacedTold.add(key);
+          this._tellUnplaced(key, unplacedCount, unplacedNames, false);
+        }
         if (this.loadingPromises.get(key) === promise) {
           this.loadingPromises.delete(key);
         }
@@ -1144,7 +1160,7 @@ class DimensionManager {
         if (err instanceof MappingLoadError) {
           // A refused mapping choice: the panel names it and keeps the rest.
           console.warn(`[DimensionManager] ${err.message}`);
-        } else if (err?.name !== 'AbortError') {
+        } else if (!isCancellation(err)) {
           console.error(`[DimensionManager] Failed to load ${dim}D:`, err);
         }
         throw err;
@@ -1158,7 +1174,7 @@ class DimensionManager {
         }
       });
 
-    this.loadingPromises.set(key, promise);
+    this.loadingPromises.set(key, trackCellWork(promise));
     return promise;
   }
 
@@ -1170,6 +1186,8 @@ class DimensionManager {
    * @returns {Promise<Float32Array>} Normalized positions (n_cells * dim)
    */
   async getPositions(layoutKey) {
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const generation = this._generation;
     const key = this.getLayout(layoutKey).layoutKey;
 
@@ -1198,8 +1216,38 @@ class DimensionManager {
         this.normalizedLoadingPromises.delete(key);
       }
     });
-    this.normalizedLoadingPromises.set(key, promise);
+    this.normalizedLoadingPromises.set(key, trackCellWork(promise));
     return promise;
+  }
+
+  /**
+   * The cell-order digest of one layout over the open cells
+   * (`cell-order-digest.js`): the stored values of the embedding it plots,
+   * each cell named by its original position, from the reader worker, which
+   * summed them as it read them. Nothing on the page is folded, and the
+   * layout need not be loaded. A layout held only in memory (a generated
+   * dataset: every cell open, nothing stored) is digested over the
+   * coordinates it holds. Taken once no change of the open cells is under
+   * way, as work on them (`open-cells-work.js`).
+   *
+   * @param {string} layoutKey
+   * @returns {Promise<string>} 16 lowercase hexadecimal characters
+   */
+  async getCellOrderDigest(layoutKey) {
+    return useOpenCells(async () => {
+      const generation = this._generation;
+      const layout = this.getLayout(layoutKey);
+      if (layout.path === null) {
+        const positions = await this.getPositions(layout.layoutKey);
+        this._assertGeneration(generation);
+        return cellOrderDigest(positions, layout.dimension);
+      }
+      const digest = await loadCellOrderDigest(`${this.baseUrl}${layout.path}`, {
+        candidateAnnDataBinding: this.candidateAnnDataBinding
+      });
+      this._assertGeneration(generation);
+      return digest;
+    });
   }
 
   /**
@@ -1235,7 +1283,7 @@ class DimensionManager {
         console.warn(
           `[DimensionManager] Allocation failed loading "${layoutKey}"; releasing cached positions and retrying once.`
         );
-        this.releaseUnderPressure();
+        this.trimUnshown(0);
         rawPositions = await this.loadLayout(layoutKey);
       }
       this._assertGeneration(generation);
@@ -1413,10 +1461,9 @@ class DimensionManager {
       this._getRetainedPositionBytes([rawPositions])
     );
     let workingBytes = plannedBytes();
-    const underPressure = heapUnderPressure();
-    if (underPressure) this._residencyListener?.onPressure?.();
+    const budget = this._positionBudget();
     for (const candidate of this._evictableLayouts(new Set([layoutKey]))) {
-      if (!underPressure && workingBytes <= this._maxPositionBytes) break;
+      if (workingBytes <= budget) break;
       this._evictLayout(candidate);
       workingBytes = plannedBytes();
     }
@@ -1452,24 +1499,59 @@ class DimensionManager {
     };
   }
 
+  /** The position budget now: a fixed one, or the `positions` share. @private */
+  _positionBudget() {
+    return this._maxPositionBytes ?? BigInt(residencyBudgetBytes('positions'));
+  }
+
   /**
-   * Release the cached positions of every layout no view shows and no caller
-   * pinned.
+   * Bytes of the positions of layouts no view shows and no caller pinned
+   * (what the memory model counts as the `positions` share): each buffer
+   * once, none a shown or pinned layout shares.
    *
-   * @returns {string[]} The layouts whose positions were released.
+   * @returns {number}
    */
-  evictUnpinned() {
-    const evicted = this._evictableLayouts();
-    for (const layoutKey of evicted) {
-      this._evictLayout(layoutKey);
+  unshownBytes() {
+    const evictable = new Set(this._evictableLayouts());
+    const kept = new Set();
+    const unshown = new Map();
+    for (const cache of [this.normalizedPositionCache, this.positionCache]) {
+      for (const [layoutKey, positions] of cache) {
+        const descriptor = this._describePositionBuffer(positions);
+        if (evictable.has(layoutKey)) unshown.set(descriptor.identity, descriptor.bytes);
+        else kept.add(descriptor.identity);
+      }
     }
-    return evicted;
+    let total = 0n;
+    for (const [identity, bytes] of unshown) if (!kept.has(identity)) total += bytes;
+    return Number(total);
+  }
+
+  /**
+   * Release the positions of layouts no view shows and no caller pinned,
+   * least recently used first, until they hold no more than `budget` bytes;
+   * at 0 the renderer also drops the geometry it retains for them. They load
+   * again when shown.
+   *
+   * @param {number} budget
+   * @returns {string|null} What was let go, in words
+   */
+  trimUnshown(budget) {
+    if (budget === 0) this._residencyListener?.onPressure?.();
+    let released = 0;
+    for (const layoutKey of this._evictableLayouts()) {
+      if (this.unshownBytes() <= budget) break;
+      this._evictLayout(layoutKey);
+      released++;
+    }
+    return released === 0 ? null : `the positions of ${formatCountOf(released, 'layout')} no view shows`;
   }
 
   /**
    * Install the listener told when cached positions are evicted
-   * (`onEvict(positions)`, the released array) and when memory runs short
-   * (`onPressure()`), or remove it with null.
+   * (`onEvict(positions)`, the released array) and when the memory model
+   * releases every layout no view shows (`onPressure()`), or remove it with
+   * null.
    *
    * @param {{onEvict?: (positions: Float32Array) => void, onPressure?: () => void}|null} listener
    */
@@ -1481,14 +1563,28 @@ class DimensionManager {
   }
 
   /**
-   * Release everything not shown or pinned, CPU and (through the listener)
-   * GPU: the response to memory pressure, and to a page left hidden.
+   * Hear of the cells a layout does not place (`EmbeddingPayload`
+   * `unplacedCount`: NaN coordinates, drawn in no view showing it): when it
+   * is first loaded in a dataset (`added` false) and when an opening grown
+   * in place adds unplaced cells to it (`added` true, counting those). Null
+   * removes the listener.
    *
-   * @returns {string[]} The layouts whose positions were released.
+   * @param {((notice: {layoutKey: string, label: string, count: number, names: ReadonlyArray<string>, added: boolean}) => void)|null} listener
    */
-  releaseUnderPressure() {
-    this._residencyListener?.onPressure?.();
-    return this.evictUnpinned();
+  setUnplacedCellsListener(listener) {
+    if (listener !== null && typeof listener !== 'function') {
+      throw new TypeError('An unplaced-cells listener must be a function or null.');
+    }
+    this._unplacedListener = listener;
+  }
+
+  /** @private */
+  _tellUnplaced(layoutKey, count, names, added) {
+    if (!Number.isSafeInteger(count) || count < 0 || !Array.isArray(names)) {
+      throw new TypeError(`Layout "${layoutKey}" must state the cells it does not place.`);
+    }
+    if (count === 0) return;
+    this._unplacedListener?.({ layoutKey, label: this.getLayout(layoutKey).label, count, names: Object.freeze([...names]), added });
   }
 
   /** @private */
@@ -1604,12 +1700,122 @@ class DimensionManager {
   }
 
   /**
+   * The layouts whose positions are resident (`getResidentPositions`), with
+   * their dimension and route: what an opening grown in place reads the
+   * added cells of (`app/open-cells-resize.js`).
+   *
+   * @returns {Array<{layoutKey: string, dimension: number, path: string|null}>}
+   */
+  residentLayouts() {
+    return [...this.normalizedPositionCache.keys()].map(layoutKey => {
+      const layout = this.getLayout(layoutKey);
+      return { layoutKey, dimension: layout.dimension, path: layout.path };
+    });
+  }
+
+  /**
+   * The cell axis grown or cut in place (`app/open-cells-resize.js`): open
+   * cells `[0, min(nCells, n))` are the same cells before and after. Every
+   * resident layout keeps those cells' positions and takes `added`'s for the
+   * cells after them (`{positions, bounds, unplacedCount, unplacedNames}` of
+   * rows `[nCells, n)`, in the layout's display frame), or is cut to them; a layout growing without
+   * added positions is let go, and so is every load under way (it reads the
+   * earlier cells), each read again when next asked for. Pins and views
+   * stay; the transforms stay (the frame does not move).
+   *
+   * @param {number} n
+   * @param {Map<string, {positions: Float32Array, bounds: {min: number[], max: number[]}|null, unplacedCount: number, unplacedNames: string[]}>} [added]
+   * @returns {Map<string, Float32Array>} The resized positions by layout
+   */
+  resizeCells(n, added = new Map()) {
+    if (!Number.isSafeInteger(n) || n < 1) {
+      throw new TypeError(`A cell axis is resized to a positive count, not ${n}.`);
+    }
+    const from = this.nCells;
+    for (const controller of this.loadingControllers.values()) cancel(controller, 'superseded', 'The open cells were changed.');
+    this.loadingControllers.clear();
+    this.loadingPromises.clear();
+    this.normalizedLoadingPromises.clear();
+    this.positionCache.clear();
+    this.loadedTransformCache.clear();
+    const resized = new Map();
+    for (const [layoutKey, positions] of [...this.normalizedPositionCache]) {
+      const dim = this.getLayout(layoutKey).dimension;
+      const rows = added.get(layoutKey) ?? null;
+      if (n > from && rows === null) {
+        this._evictLayout(layoutKey);
+        continue;
+      }
+      const next = allocateTypedArray(Float32Array, n * dim, `Layout "${layoutKey}" positions`);
+      next.set(positions.subarray(0, Math.min(from, n) * dim));
+      if (n > from) {
+        if (!(rows.positions instanceof Float32Array) || rows.positions.length !== (n - from) * dim) {
+          throw new RangeError(`The cells added to layout "${layoutKey}" must hold ${formatCountOf((n - from) * dim, 'value')}; got ${rows.positions?.length}.`);
+        }
+        next.set(rows.positions, from * dim);
+        this._tellUnplaced(layoutKey, rows.unplacedCount, rows.unplacedNames, true);
+      }
+      // Bounds of the placed kept cells (cut) or of both parts (grown),
+      // exactly; a part placing no cell (`bounds` null, every kept cell
+      // unplaced) adds nothing.
+      const keptCells = n > from ? positions : next;
+      const kept = unplacedCountOf(keptCells, dim) < keptCells.length / dim ? readPositionBounds(keptCells, dim) : null;
+      const addedBounds = n > from ? rows.bounds : null;
+      const bounds = kept !== null && addedBounds !== null
+        ? { min: kept.min.map((v, axis) => Math.min(v, addedBounds.min[axis])), max: kept.max.map((v, axis) => Math.max(v, addedBounds.max[axis])) }
+        : kept ?? addedBounds ?? readPositionBounds(next, dim);
+      publishPositionBounds(next, dim, bounds);
+      this.normalizedPositionCache.set(layoutKey, next);
+      this._residencyListener?.onEvict?.(positions);
+      resized.set(layoutKey, next);
+    }
+    this.nCells = n;
+    return resized;
+  }
+
+  /**
+   * The same open cells in another order (`app/open-cells-resize.js`): open
+   * cell `j` after is open cell `order[j]` before. Every resident layout's
+   * positions move with their cells (the frame does not move); loads under
+   * way, which read the earlier order, are let go.
+   *
+   * @param {Uint32Array} order
+   * @returns {Map<string, Float32Array>} The reordered positions by layout
+   */
+  reorderCells(order) {
+    const n = this.nCells;
+    if (!(order instanceof Uint32Array) || order.length !== n) {
+      throw new TypeError(`An order of the ${formatCountOf(n, 'open cell')} names each once.`);
+    }
+    for (const controller of this.loadingControllers.values()) cancel(controller, 'superseded', 'The open cells were reordered.');
+    this.loadingControllers.clear();
+    this.loadingPromises.clear();
+    this.normalizedLoadingPromises.clear();
+    this.positionCache.clear();
+    this.loadedTransformCache.clear();
+    const reordered = new Map();
+    for (const [layoutKey, positions] of [...this.normalizedPositionCache]) {
+      const dim = this.getLayout(layoutKey).dimension;
+      const next = allocateTypedArray(Float32Array, n * dim, `Layout "${layoutKey}" positions`);
+      for (let j = 0; j < n; j++) {
+        const from = order[j] * dim;
+        for (let axis = 0; axis < dim; axis++) next[j * dim + axis] = positions[from + axis];
+      }
+      publishPositionBounds(next, dim, readPositionBounds(next, dim));
+      this.normalizedPositionCache.set(layoutKey, next);
+      this._residencyListener?.onEvict?.(positions);
+      reordered.set(layoutKey, next);
+    }
+    return reordered;
+  }
+
+  /**
    * Clear all cached data
    */
   clearCache() {
     this._generation += 1;
     for (const controller of this.loadingControllers.values()) {
-      controller.abort();
+      cancel(controller, 'released', 'The embedding caches were cleared.');
     }
     this.positionCache.clear();
     this.loadedTransformCache.clear();
@@ -1619,6 +1825,7 @@ class DimensionManager {
     this.loadingPromises.clear();
     this.loadingControllers.clear();
     this._layoutPins.clear();
+    this._unplacedTold.clear();
     this.nCells = 0;
     this._cellAxisPublished = false;
   }
@@ -1638,11 +1845,7 @@ class DimensionManager {
       this.loadingPromises.get(layoutKey) === promise
     );
     if (generation !== this._generation || !promiseIsCurrent) {
-      const error = new Error(
-        'Dimension load was superseded because the dataset cache changed.'
-      );
-      error.name = 'AbortError';
-      throw error;
+      throw cancelled('released', 'Dimension load was superseded because the dataset cache changed.');
     }
   }
 

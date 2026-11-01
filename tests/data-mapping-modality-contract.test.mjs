@@ -63,8 +63,9 @@ test('a CITE-seq MuData opens with RNA; its proteins are a modality read through
     const mapping = validateDataMapping(candidates.defaults);
     assert.equal(mapping.modality, 'rna');
     assert.equal(mapping.expression, 'X');
+    assert.equal(mapping.geneNames, 'index');
 
-    // The dataset's own gene list is RNA's.
+    // The dataset's own gene list is RNA's, named by its var index.
     const own = await adapter.getGeneList('var');
     assert.equal(own.fields.length, 28);
     assert.equal(own.fields[0].key, 'GENE0');

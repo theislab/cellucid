@@ -169,9 +169,22 @@ test('the step and detail follow the reads of the opening', () => {
   // Background work (a gene index) is never part of an opening.
   log.record({ id: 2, kind: 'index', label: 'X, indexed by gene', status: 'running', bytesFetched: 1, background: true });
   assert.equal(seen.at(-1).step, "Reading the file's structure");
+  // One bar for the whole opening: a read joining it adds its bytes to what
+  // is planned, and the share shown holds rather than start over.
+  log.record({ id: 4, kind: 'field', label: "obs['cell_type']", status: 'running', bytesFetched: 0, bytesTotal: 6_000_000 });
+  assert.equal(Math.round(seen.at(-1).percent), 33, 'never moves back');
+  assert.match(seen.at(-1).detail, /1\.9 MB of 11 MB/);
+  log.record({ id: 4, kind: 'field', label: "obs['cell_type']", status: 'running', bytesFetched: 5_000_000, bytesTotal: 6_000_000 });
+  assert.equal(Math.round(seen.at(-1).percent), 58);
+  log.record({ id: 4, kind: 'field', label: "obs['cell_type']", status: 'done', bytesFetched: 6_000_000, bytesTotal: 6_000_000 });
   log.record({ id: 1, kind: 'open', label: 'the structure of a.h5ad', status: 'done', bytesFetched: 6_000_000, bytesTotal: 6_000_000 });
   log.record({ id: 3, kind: 'embedding', label: "obsm['X_umap'] columns 0, 1", status: 'running', bytesFetched: 0, bytesTotal: 174_000 });
   assert.equal(seen.at(-1).step, 'Reading embedding X_umap');
+  assert.ok(seen.at(-1).percent >= 58, 'a read starting after others ended does not restart the bar');
+  // A read that has not said what it plans to read: how much is left is not
+  // known, and no one read's share is shown.
+  log.record({ id: 5, kind: 'names', label: 'gene names of var', status: 'running', bytesFetched: 10 });
+  assert.equal(seen.at(-1).percent, null);
   assert.equal(progress.shows({ kind: 'embedding' }), true, 'its reads are shown here, not as read notifications');
   handle.end();
   assert.equal(progress.shows({ kind: 'embedding' }), false);
@@ -195,6 +208,28 @@ test('reads are named as people say them', () => {
   assert.equal(describeOpeningRead({ kind: 'field', label: "categories of obs['cell_type']" }), 'Reading field cell_type');
   assert.equal(describeOpeningRead({ kind: 'names', label: 'gene names of var' }), 'Reading gene names');
   assert.equal(describeOpeningRead({ kind: 'graph', label: "obsp['connectivities']" }), 'Reading the neighbour graph');
+});
+
+test('a file read whole is said up front, by a layer or by the reader, and the note lasts while the opening runs', () => {
+  const { progress, seen } = harness();
+  assert.equal(describeOpeningRead({ kind: 'transcode', label: 'seu.rds' }), 'Reading seu.rds whole, once');
+  progress.notice('ignored: nothing is opening');
+  const link = progress.begin({ title: 'geo:GSE1/seu.rds', step: 'Finding the file' });
+  assert.equal(seen.at(-1).note, null);
+  link.notice('ftp.ncbi.nlm.nih.gov serves this file only whole.');
+  assert.equal(seen.at(-1).note, 'ftp.ncbi.nlm.nih.gov serves this file only whole.');
+  // The reader, which holds no handle, replaces it once the file is read whole.
+  progress.notice('An R object (.rds) cannot be read in parts.');
+  link.step('Reading the file');
+  assert.equal(seen.at(-1).note, 'An R object (.rds) cannot be read in parts.');
+  const before = seen.length;
+  progress.notice('An R object (.rds) cannot be read in parts.');
+  assert.equal(seen.length, before, 'the same note again changes nothing');
+  link.end();
+  assert.equal(seen.at(-1).state, 'done');
+  progress.notice('too late');
+  assert.equal(seen.at(-1).note, 'An R object (.rds) cannot be read in parts.');
+  assert.equal(progress.begin({ title: 'next.h5ad' }) && seen.at(-1).note, null, 'a new opening starts with none');
 });
 
 test('a stoppable layer stops on Cancel or on its signal, and rejects with why', () => {

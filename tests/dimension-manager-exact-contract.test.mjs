@@ -74,6 +74,7 @@ test('valid embedding metadata replacement invalidates all prior coordinate stat
   manager.loadingPromises.set('X_umap', Promise.resolve(oldRaw));
   manager.normalizedLoadingPromises.set('X_umap', Promise.resolve(oldPadded));
   manager.loadingControllers.set('X_umap', {
+    signal: { aborted: false },
     abort() {
       aborted = true;
     },
@@ -584,7 +585,7 @@ test('position caches are keyed by layout and every shown or pinned layout survi
   assert.ok(manager.normalizedPositionCache.has('X_umap'));
   assert.ok(manager.normalizedPositionCache.has('tsne'));
   assert.ok(manager.normalizedPositionCache.has('pca'));
-  manager.evictUnpinned();
+  manager.trimUnshown(0);
   assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap', 'tsne']);
 
   // Released, the pinned layout is the least recently used evictable one.
@@ -594,7 +595,7 @@ test('position caches are keyed by layout and every shown or pinned layout survi
   assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap', 'pca']);
 
   // A layout no view shows and nobody pinned is released explicitly.
-  assert.deepEqual(manager.evictUnpinned(), ['pca']);
+  assert.equal(manager.trimUnshown(0), 'the positions of 1 layout no view shows');
   assert.deepEqual([...manager.normalizedPositionCache.keys()], ['X_umap']);
   // The transform outlives eviction: centroids normalized with it stay valid.
   assert.ok(manager.getNormTransform('pca'));

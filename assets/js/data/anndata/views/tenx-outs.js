@@ -18,18 +18,24 @@
  * order; a cell a projection lacks is NaN (refused as unplottable by the
  * usual rule) and a cell a clustering lacks has no category.
  *
- * The CSV files are a few megabytes at most (two to ten numbers per cell)
- * and are read whole, with the small reader here: Cell Ranger writes them
- * unquoted, comma-separated, one header line.
+ * The CSV files hold two to ten numbers a cell (a 10M-cell projection is
+ * about 400 MB) and are read by the text-table reader every cell table goes
+ * through (`transcode/tables.js`): streamed in two passes into typed
+ * columns, rows matched to barcodes without a `Map`. Cell Ranger writes them
+ * unquoted, comma-separated, one header line; one that is empty or ragged is
+ * refused.
  *
  * @module data/anndata/views/tenx-outs
  */
 
 import { isGroup, numericDtype, stringDtype } from '../../../formats/store.js';
 import { LayoutRefusal } from './refusal.js';
-import { TENX_H5_FORMAT, isTenxRoot, tenxView } from './tenx-h5.js';
+import { TENX_H5_FORMAT, TENX_OPENING_PATHS, recognizeTenxRoot, tenxView } from './tenx-h5.js';
 import { encodingAttrs, joinPath, valueArray, viewGroup } from './view-nodes.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { allocateTypedArray } from '../../sparse-column-index.js';
+import { readTable } from '../transcode/tables.js';
+import { StringIndex } from '../../../utils/string-index.js';
 
 /** The matrix files of an `outs/` folder, preferred first: the filtered matrix of each Cell Ranger era. */
 export const OUTS_MATRIX_FILES = Object.freeze([
@@ -62,18 +68,18 @@ export function outsMatrixFile(files) {
   return null;
 }
 
-/** The rows of one Cell Ranger CSV: its header and each line's fields. */
-function parseCsv(text, label) {
-  const lines = text.split(/\r?\n/).filter(line => line.length > 0);
-  if (lines.length === 0) throw new LayoutRefusal(`${label} is empty.`, { reason: 'outs-csv' });
-  const header = lines[0].split(',');
-  const rows = lines.slice(1).map(line => line.split(','));
-  for (const [index, row] of rows.entries()) {
-    if (row.length !== header.length) {
-      throw new LayoutRefusal(`${label} line ${index + 2} has ${formatCountOf(row.length, 'field')} where its header has ${header.length}.`, { reason: 'outs-csv' });
-    }
+/**
+ * One Cell Ranger CSV, its rows matched to the barcodes (`cells`, their
+ * index; `readTable`); an empty or ragged one is refused. `asText`: the
+ * columns read as labels.
+ */
+async function readOutsCsv(reader, cells, label, asText, options) {
+  const table = await readTable(reader, { cells, header: true, asText, ...options });
+  if (table.names.length === 0) throw new LayoutRefusal(`${label} is empty.`, { reason: 'outs-csv' });
+  if (table.ragged !== null) {
+    throw new LayoutRefusal(`${label} line ${table.ragged.line} has ${formatCountOf(table.ragged.fields, 'field')} where its header has ${table.names.length}.`, { reason: 'outs-csv' });
   }
-  return { header, rows };
+  return table;
 }
 
 /** The gene-expression library first, then by name. */
@@ -89,12 +95,14 @@ function libraryOrder(left, right) {
  * @param {Map<string, Object>} files - A picked folder's `File`s, or a served folder's remote files
  * @param {string} base - The folder of the matrix file, `''` or ending in `/`
  * @param {string[]} barcodes - The matrix's barcodes, in its order
- * @param {(file: Object) => Promise<string>} readText - One file, whole, as text
+ * @param {(file: Object) => {size: number, read: Function}} readerOf - One file's byte reader
+ * @param {{signal?: AbortSignal|null, activity?: Object|null}} options
  * @returns {Promise<{obs: Map<string, Function>, obsm: Map<string, Function>}>}
  */
-async function readAnalysis(files, base, barcodes, readText) {
-  const cellOf = new Map(barcodes.map((barcode, cell) => [barcode, cell]));
+async function readAnalysis(files, base, barcodes, readerOf, options) {
   const nCells = barcodes.length;
+  // The barcodes' index, made once for every table of the folder.
+  const cells = StringIndex.of(barcodes);
   const projections = new Map();
   const clusterings = [];
   for (const [path, file] of files) {
@@ -115,14 +123,17 @@ async function readAnalysis(files, base, barcodes, readText) {
   for (const [kind, found] of projections) {
     found.sort((left, right) => libraryOrder(left.dir, right.dir));
     for (const [position, { dir, path, file }] of found.entries()) {
-      const { header, rows } = parseCsv(await readText(file), path);
-      const width = header.length - 1;
+      const table = await readOutsCsv(readerOf(file), cells, path, () => false, options);
+      const width = table.names.length - 1;
       if (width < 1) continue;
-      const values = new Float64Array(nCells * width).fill(Number.NaN);
-      for (const row of rows) {
-        const cell = cellOf.get(row[0]);
-        if (cell === undefined) continue;
-        for (let column = 0; column < width; column++) values[cell * width + column] = Number(row[column + 1]);
+      const values = allocateTypedArray(Float64Array, nCells * width, 'Cell Ranger analysis values').fill(Number.NaN);
+      for (let row = 0; row < table.rows; row++) {
+        const cell = table.rowOf[row];
+        if (cell < 0) continue;
+        for (let column = 0; column < width; column++) {
+          const numbers = table.numbers[column + 1];
+          values[cell * width + column] = numbers === null ? Number.NaN : numbers[row];
+        }
       }
       const key = position === 0 ? `X_${kind}` : `X_${kind}_${dir.replace(/_?\d+_components$/, '') || dir}`;
       if (obsm.has(key)) continue;
@@ -138,14 +149,19 @@ async function readAnalysis(files, base, barcodes, readText) {
   const obs = new Map();
   clusterings.sort((left, right) => libraryOrder(left.dir, right.dir) || 0);
   for (const { dir, path, file } of clusterings) {
-    const { rows } = parseCsv(await readText(file), path);
-    const labels = [...new Set(rows.map(row => row[1]))];
-    labels.sort((left, right) => (Number(left) - Number(right)) || (left < right ? -1 : left > right ? 1 : 0));
-    const codeOf = new Map(labels.map((label, code) => [label, code]));
-    const codes = new Int32Array(nCells).fill(-1);
-    for (const row of rows) {
-      const cell = cellOf.get(row[0]);
-      if (cell !== undefined) codes[cell] = codeOf.get(row[1]);
+    const table = await readOutsCsv(readerOf(file), cells, path, (_name, index) => index === 1, options);
+    if (table.names.length < 2 || table.text[1] === null) continue;
+    // Every label the file names, in numeric then text order.
+    const { codes: rowCodes, labels: found } = table.text[1];
+    const order = found.map((_, code) => code)
+      .sort((a, b) => (Number(found[a]) - Number(found[b])) || (found[a] < found[b] ? -1 : found[a] > found[b] ? 1 : 0));
+    const remap = allocateTypedArray(Int32Array, found.length, 'Cell Ranger cluster labels');
+    order.forEach((code, position) => { remap[code] = position; });
+    const labels = order.map(code => found[code]);
+    const codes = allocateTypedArray(Int32Array, nCells, 'Cell Ranger cluster codes').fill(-1);
+    for (let row = 0; row < table.rows; row++) {
+      const cell = table.rowOf[row];
+      if (cell >= 0 && rowCodes[row] >= 0) codes[cell] = remap[rowCodes[row]];
     }
     const columnPath = joinPath('/obs', dir);
     obs.set(dir, () => viewGroup({
@@ -179,19 +195,21 @@ function barcodesOf(root) {
  *
  * @param {Object} root - The matrix file's root group
  * @param {{name: string, files: Map<string, Object>, base: string, signal?: AbortSignal|null,
- *   readText?: (file: Object) => Promise<string>, fromLink?: boolean}} context - `readText` reads a remote
- *   file of a served folder; a picked folder's `File`s read themselves
+ *   readerOf: (file: Object) => {size: number, read: Function}, fromLink?: boolean}} context -
+ *   `readerOf`: a byte reader of one file of the folder (picked or served)
  * @returns {Promise<Object>}
  */
-export async function tenxOutsView(root, { name, files, base, signal = null, readText = file => file.text(), fromLink = false }) {
+export async function tenxOutsView(root, { name, files, base, signal = null, activity = null, readerOf, fromLink = false }) {
+  await root.load(TENX_OPENING_PATHS, { signal, activity });
   const barcodes = Array.from(await barcodesOf(root).read(undefined, { signal }), String);
-  const analysis = await readAnalysis(files, base, barcodes, readText);
+  const analysis = await readAnalysis(files, base, barcodes, readerOf, { signal, activity });
   return tenxView(root, { name, analysis, signal, fromLink });
 }
 
 /** The `outs/` folder entry of `LAYOUT_VIEWS`: a folder whose matrix is one HDF5 file. */
 export const TENX_OUTS_VIEW = Object.freeze({
-  recognize: isTenxRoot,
+  recognize: recognizeTenxRoot,
+  openingPaths: TENX_OPENING_PATHS,
   view: tenxOutsView,
   readerFormat: TENX_H5_FORMAT,
   matrixFile: outsMatrixFile,

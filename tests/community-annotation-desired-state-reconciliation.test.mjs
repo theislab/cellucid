@@ -1284,7 +1284,7 @@ test(
               signal: owner.signal,
             }),
             error => {
-              assert.equal(error?.code, 'GITHUB_REQUEST_ABORTED');
+              assert.equal(error?.name, 'AbortError');
               assert.equal(error?.cause, callerReason);
               return true;
             },
@@ -1933,8 +1933,8 @@ test(
               assert.equal(error?.operation?.kind, 'contents-put');
               assert.equal(error?.operation?.outcome, 'unknown');
               assert.equal(
-                error?.cause?.code,
-                'GITHUB_REQUEST_ABORTED',
+                error?.cause?.name,
+                'AbortError',
               );
               assert.equal(error?.cause?.cause, callerReason);
               return true;

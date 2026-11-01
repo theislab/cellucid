@@ -192,7 +192,7 @@ const PREVIEW_MODES = [
     prototype: DEAnalysisUI.prototype,
     plotType: '__defects-de-preview__',
     result: {
-      full: { summary: { groupAName: 'A', groupBName: 'B', groupASize: 3, groupBSize: 4, method: 'wilcox', genesTested: 5, lowN: [], minCells: 10 } },
+      full: { summary: { groupAName: 'A', groupBName: 'B', groupASize: 3, groupBSize: 4, method: 'wilcox', genesTested: 5, lowN: [], minCells: 10, replicates: null } },
     },
     configure(ui) {
       ui._plotContainerIdBase = 'de-preview';

@@ -11,14 +11,38 @@
  *
  * ## Nodes
  *
- * Navigation is synchronous: a store is opened with its whole node tree
- * (names, shapes, element types, attributes) already read, in as few round
- * trips as the format allows. Only array values are read on demand, with
- * `read()`.
+ * A store's tree is read as it is navigated into, a group at a time, and
+ * navigation is synchronous over what is read. A group is *loaded* once its
+ * children are known: their names and kinds, their attributes and, for an
+ * array, its shape, element type and chunks. Opening a store loads its root
+ * (and the paths its opener names, `openHdf5(reader, {load})`); anything
+ * deeper is loaded by whoever reads it, before navigating to it:
  *
- * - `Group`: `kind: 'group'`, `keys()` (child names, sorted by code point),
- *   `get(name)` (a child, or a `/`-separated path below this group; `null`
- *   when absent), `has(name)`.
+ *     await root.load([{ path: 'obs', depth: 1 }, 'obs/cell_type']);
+ *     const codes = root.get('obs/cell_type/codes');
+ *
+ * `load(paths, {signal, activity})` loads, below the group it is called on,
+ * each path (a string, or `{path, depth}`; `''` is the group itself, a `*`
+ * part is every child) and the groups on the way to it: the node at the
+ * path to `depth` levels (0: only the way, so the node itself is known; 1:
+ * its children are known; `Infinity`, the default: its whole subtree), and
+ * every group on the way to depth 1. A
+ * path that leads nowhere loads nothing more. `load()` alone loads the
+ * group's whole subtree. Each object is read once however many loads ask
+ * for it at once, a load stops only once every asker has withdrawn
+ * (`signal`), and the reads count in the asker's `activity`
+ * (`io/activity.js`). A format whose whole tree is described in one place
+ * (Zarr consolidated metadata, a listed Zarr store's metadata files read in
+ * one batch) is loaded whole at open and resolves every load at once.
+ *
+ * `keys()`, `get()` and `has()` of a group not loaded throw
+ * `StoreNotLoadedError` (a reader that did not load what it reads), never
+ * answer as if it were empty; `loaded` says whether a group is. Only array
+ * values are read on demand beyond that, with `read()`.
+ *
+ * - `Group`: `kind: 'group'`, `loaded`, `load(paths, options)`, `keys()`
+ *   (child names, sorted by code point), `get(name)` (a child, or a
+ *   `/`-separated path below this group; `null` when absent), `has(name)`.
  * - `ArrayNode`: `kind: 'array'`, `shape`, `dtype`, `chunks`, `fillValue`,
  *   `read(selection, options)`, `storedBytes(selection, options)`, and for
  *   compound element types `readField(field, selection, options)`.
@@ -26,11 +50,33 @@
  *   stored in one piece (any range of it costs only its own bytes).
  *   `partialChunks` is true when a chunk's rows (along the first dimension,
  *   every later one selected whole) are fetched alone, not the whole chunk
- *   (an unfiltered HDF5 chunk): a one-dimensional range then costs only its
- *   own bytes, as if the array were stored in one piece.
+ *   (an unfiltered HDF5 chunk; a Zarr chunk stored as its values' bytes in
+ *   C order, with no compressor or filter, as a served store answers): a
+ *   one-dimensional range then costs only its own bytes, as if the array
+ *   were stored in one piece.
  *   `storedBytes` resolves to the number of stored (compressed) bytes a read
  *   of the selection fetches, so a caller can say what a read will cost
- *   before making it.
+ *   before making it, without reading more than the index it already holds:
+ *   over an HDF5 version 1 chunk B-tree whose leaves are read as needed, a
+ *   chunk whose leaf is not read yet counts the stored size of its leaf's
+ *   first chunk (held by the leaf's parent), and over a sharded Zarr v3
+ *   array whose shard indexes are not read yet, one more index is read and
+ *   the other shards' inner chunks count the mean stored size of the
+ *   indexes in hand; the answer is then an estimate (exact for unfiltered
+ *   HDF5 chunks). With `{toFetch: true}` it counts only the bytes a read
+ *   would fetch now: those neither kept in this browser from an earlier
+ *   reading of the same version of the file (`io/kept-parts.js`) nor cached
+ *   by its byte reader (`ByteReader.bytesToFetch`); a store that cannot
+ *   tell counts every byte. What a time estimate prices (the first gene's
+ *   read, a progressive opening's first view) is this.
+ *   Optional, where a read finds its chunks through an index read as it is
+ *   needed (an HDF5 version 1 chunk B-tree, a sharded Zarr v3 array's shard
+ *   indexes): `chunkIndexReads(options)` resolves to a function of runs of
+ *   chunk bands along the first dimension, `[first, last]`, to `{nodes,
+ *   levels, steps}`: the index reads a read of them would make before its
+ *   chunks (each once), and the dependent round trips they take with the
+ *   reads of each (`steps`, from the first); null when the index is known.
+ *   No request beyond what any read of the array makes.
  * - Both: `path` (absolute, `/` for the root), `name`, `attrs`.
  *
  * ## Attributes
@@ -89,6 +135,26 @@
  * dimensions left out are read whole; `undefined` reads everything. Reading
  * touches only the chunks the selection intersects, fetching them in
  * parallel and decoding each once.
+ *
+ * ## Rows of a column of variable-length elements
+ *
+ * A one-dimensional array of variable-length elements (strings) whose
+ * values a share of its rows can read for less than every row has
+ * `readRows(runs, options)`: the rows `[runs.starts[r], runs.ends[r])`
+ * (`runs.count` runs, ascending by start), one run after another, each value
+ * what `read()` returns for it. It reads what those rows need and decodes
+ * those rows alone: an HDF5 array the stored references of the chunks they
+ * touch and then the global heap objects of those rows only (a heap is as
+ * large as its column), a Zarr array the chunks they touch, each item of
+ * them decoded only when a row asked for it is copied out. What it holds
+ * meanwhile is a window of chunks and what the rows asked for, never every
+ * row's value (`views/cell-subset.js` reads a subsample's kept rows of such
+ * a column through it). `options.chunks`, when given, may keep what is
+ * decoded whole per chunk for the next read of other rows of it (a Zarr
+ * chunk's items as stored; an HDF5 column keeps nothing, its references
+ * being a fraction of the heap a later read reads anyway):
+ * `get(key, decode, options)`, as `data/anndata/decoded-chunks.js` keeps
+ * decoded chunks.
  *
  * @module formats/store
  */
@@ -266,6 +332,83 @@ export function compareNames(left, right) {
 export function isGroup(value) {
   return value !== null && typeof value === 'object' && value.kind === 'group' &&
     typeof value.keys === 'function' && typeof value.get === 'function';
+}
+
+/**
+ * A group navigated before it was loaded (`Group.load`): the reader skipped
+ * loading what it reads. Never an answer about the file.
+ */
+export class StoreNotLoadedError extends Error {
+  /** @param {string} path - The group's path */
+  constructor(path) {
+    super(`${path} was navigated before it was loaded: load it first (formats/store.js, Group.load).`);
+    this.name = 'StoreNotLoadedError';
+    this.path = path;
+  }
+}
+
+/**
+ * @typedef {{parts: string[], depth: number}} LoadSpec
+ * A path below a group (its parts; `*` is every child) and the depth to load
+ * the node there to (`Group.load`).
+ */
+
+/**
+ * The paths a `load(paths)` names, checked: each a string (its whole
+ * subtree) or `{path, depth}` (`depth` 0 loads only the way to the node, so
+ * the node itself is known; 1 its children; `Infinity` everything below).
+ *
+ * @param {ReadonlyArray<string|{path: string, depth?: number}>} paths
+ * @returns {LoadSpec[]}
+ */
+export function loadSpecsOf(paths) {
+  if (!Array.isArray(paths)) throw new TypeError('A store load names its paths in an array.');
+  return paths.map(entry => {
+    const { path, depth = Infinity } = typeof entry === 'string' ? { path: entry } : (entry ?? {});
+    if (depth !== Infinity && (!Number.isSafeInteger(depth) || depth < 0)) {
+      throw new RangeError(`A store load's depth is a whole number or Infinity, not ${depth}.`);
+    }
+    return { parts: pathParts(path), depth };
+  });
+}
+
+/**
+ * Load `specs` below `group` (`Group.load`) for a group whose own loading is
+ * `loadOwn(depth, options)` and whose children are its own nodes: the walk of
+ * a group that presents other groups (a layout view, `views/view-nodes.js`).
+ * The group is loaded first (to the deepest depth asked of it, and to 1 when
+ * a path goes below it), then each child a path or the depth reaches, all at
+ * once. A path into an array, or one that leads nowhere, ends there.
+ *
+ * @param {Object} group
+ * @param {LoadSpec[]} specs
+ * @param {{signal?: AbortSignal|null, activity?: Object|null}} options
+ * @param {(depth: number, options: Object) => Promise<void>} loadOwn
+ * @returns {Promise<void>}
+ */
+export async function loadBelow(group, specs, options, loadOwn) {
+  let own = 0;
+  const deeper = [];
+  for (const spec of specs) {
+    if (spec.parts.length === 0) own = Math.max(own, spec.depth);
+    else deeper.push(spec);
+  }
+  if (deeper.length > 0) own = Math.max(own, 1);
+  if (own === 0) return;
+  await loadOwn(own, options);
+  const byChild = new Map();
+  const add = (name, spec) => {
+    if (!byChild.has(name)) byChild.set(name, []);
+    byChild.get(name).push(spec);
+  };
+  if (own > 1) for (const name of group.keys()) add(name, { path: '', depth: own - 1 });
+  for (const { parts: [first, ...rest], depth } of deeper) {
+    for (const name of first === '*' ? group.keys() : [first]) add(name, { path: rest.join('/'), depth });
+  }
+  await Promise.all([...byChild].map(([name, paths]) => {
+    const node = group.get(name);
+    return isGroup(node) ? node.load(paths, options) : null;
+  }));
 }
 
 /** Whether `value` is a store array. */

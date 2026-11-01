@@ -97,6 +97,10 @@ function assertUserDefinedMetaItem(item, index) {
   requirePlainRecord(item, `User-defined field metadata ${index}`);
   const commonContext = `User-defined field metadata ${index}`;
   if (item.kind === 'continuous') {
+    // A continuous alias names its source; a field that holds its own values
+    // (a pushed column) names their length and type instead
+    // (`user-defined/values/<id>`).
+    const stored = Object.hasOwn(item, 'valuesType');
     requireExactKeys(
       item,
       [
@@ -108,10 +112,17 @@ function assertUserDefinedMetaItem(item, index) {
         'isPurged',
         'sourceField',
         'operation',
-        'createdAt'
+        'createdAt',
+        ...(stored ? ['valuesLength', 'valuesType'] : [])
       ],
       commonContext
     );
+    if (stored) {
+      if (item.valuesType !== 'Float32Array' || item.sourceField !== null) {
+        throw new TypeError(`${commonContext} stores Float32Array values and has no source.`);
+      }
+      assertSafeInteger(item.valuesLength, `${commonContext} valuesLength`, { minimum: 1 });
+    }
   } else if (item.kind === 'category') {
     requireExactKeys(
       item,

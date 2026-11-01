@@ -7,7 +7,8 @@
  *   (`data-mapping-full.expected.json`, computed by
  *   `scripts/generate-data-mapping-fixtures.py` with the rule of
  *   `scripts/generate-latent-outlier-conformance.py`);
- * - a latent space with a NaN is refused in the server's words;
+ * - a latent space with NaN rows gives its placed cells quantiles, the
+ *   cells it does not place none (as `prepare()` stores them);
  * - the stated rule holds on a hand-checked case: ties share the larger rank,
  *   missing codes and small categories are NaN.
  *
@@ -36,7 +37,7 @@ import { LatentOutlierReader } from '../assets/js/data/latent-outliers-stream.js
 // Cases whose quantiles numpy computes independently of the browser
 // (scripts/generate-latent-outlier-conformance.py, which `--check`s this file).
 const CONFORMANCE_BYTES = await readFile(new URL('./fixtures/latent-outlier-conformance.json', import.meta.url));
-const CONFORMANCE_SHA256 = '99f6a92dc25d0e1e783793bc0bd9e84ab5b2046d550e91a440661e5bb1945fdd';
+const CONFORMANCE_SHA256 = 'a812db4dd25c9b5b44549c001a0e3927043042ca12ad7d8567c73f583ecf498d';
 
 const EXPECTED = JSON.parse(
   await readFile(new URL('./browser/fixtures/data-mapping-full.expected.json', import.meta.url), 'utf8')
@@ -183,14 +184,28 @@ test('streamed in row slabs, the quantiles are the in-memory bytes; a small late
   assert.equal(small.heldKey, null);
 });
 
-test('a value past float32 is refused at its own cell, wherever its slab falls', async () => {
+test('a value past float32 is refused at its own cell, wherever its slab falls; NaN rows are cells left out', async () => {
   const width = 2;
   const values = new Float64Array(40 * width).fill(0.5);
-  values[27 * width + 1] = Number.NaN;
+  values[27 * width + 1] = 1e300;
   const reader = new LatentOutlierReader(slabLoader(values, width, 8), { budgetBytes: 0 });
   await assert.rejects(
     reader.quantiles('X_bad', width, [{ codes: new Int32Array(40), nCategories: 1 }], 1),
-    error => error instanceof MappingLoadError && error.key === 'X_bad' && error.reason === 'NaN at cell 27'
+    error => error instanceof MappingLoadError && error.key === 'X_bad' && error.reason === 'not representable as float32 at cell 27'
+  );
+  // A NaN or infinite row is a cell the latent space does not place: no
+  // quantile for it, the others ranked over the placed cells.
+  values[27 * width + 1] = Number.NaN;
+  values[3 * width] = Infinity;
+  const [gaps] = await new LatentOutlierReader(slabLoader(values, width, 8), { budgetBytes: 0 })
+    .quantiles('X_gaps', width, [{ codes: new Int32Array(40), nCategories: 1 }], 1);
+  assert.ok(Number.isNaN(gaps[27]) && Number.isNaN(gaps[3]));
+  assert.ok([...gaps].every((q, cell) => cell === 3 || cell === 27 || q === 1), 'all placed cells tie at the centre');
+  // A latent space placing no cell is refused.
+  await assert.rejects(
+    new LatentOutlierReader(slabLoader(new Float64Array(8).fill(Number.NaN), 2, 2), { budgetBytes: 0 })
+      .quantiles('X_empty', 2, [{ codes: new Int32Array(4), nCategories: 1 }], 1),
+    error => error instanceof MappingLoadError && error.reason === "every cell's latent values are missing (NaN or infinite)"
   );
   // No category scored: nothing is read.
   const untouched = slabLoader(values, width, 8);
@@ -213,10 +228,12 @@ test('slabs must arrive in order and cover every cell once per pass', () => {
 test('the conformance cases give the bytes numpy computes by the stated rule', () => {
   assert.equal(createHash('sha256').update(CONFORMANCE_BYTES).digest('hex'), CONFORMANCE_SHA256);
   const { cases } = JSON.parse(CONFORMANCE_BYTES.toString('utf8'));
-  assert.equal(cases.length, 4);
+  assert.equal(cases.length, 5);
   for (const entry of cases) {
-    const latent = Float32Array.from(entry.latent);
-    assert.deepEqual([...latent], entry.latent, `${entry.name}: float32 values`);
+    // null: a NaN row's value (a cell the latent space does not place).
+    const stored = entry.latent.map(value => (value === null ? Number.NaN : value));
+    const latent = Float32Array.from(stored);
+    assert.deepEqual([...latent], stored, `${entry.name}: float32 values`);
     const quantiles = computeLatentOutlierQuantiles({
       latent,
       width: entry.width,
@@ -240,16 +257,18 @@ test('the conformance cases give the bytes numpy computes by the stated rule', (
 });
 
 /**
- * The rule as the module states it, step by step: column sums in cell order,
- * squared differences accumulated column by column, a sorted copy and one
+ * The rule as the module states it, step by step: the category's placed
+ * cells (rows finite in every column), column sums in cell order, squared
+ * differences accumulated column by column, a sorted copy and one
  * `searchsorted(..., side="right")` per cell.
  */
 function quantilesByTheRule({ latent, width, codes, nCategories, minPoints }) {
   const nCells = latent.length / width;
   const quantiles = new Float32Array(nCells).fill(Number.NaN);
+  const placed = cell => latent.subarray(cell * width, (cell + 1) * width).every(Number.isFinite);
   for (let code = 0; code < nCategories; code++) {
     const members = [];
-    for (let cell = 0; cell < nCells; cell++) if (codes[cell] === code) members.push(cell);
+    for (let cell = 0; cell < nCells; cell++) if (codes[cell] === code && placed(cell)) members.push(cell);
     const n = members.length;
     if (n < minPoints) continue;
     const squared = new Float64Array(n);
@@ -290,8 +309,10 @@ test('large categories, ranked by radix ordering, give the rule bit for bit', ()
     { width: 5, value: () => (random() - 0.5) * 6 },
     // Integer values: long runs of tied distances.
     { width: 2, value: () => Math.round((random() - 0.5) * 4) },
-    // An infinite coordinate makes NaN distances in its category.
+    // An infinite coordinate is a cell the latent space does not place.
     { width: 3, value: () => (random() < 1e-4 ? Infinity : random()) },
+    // NaN rows, as a modality that did not measure some cells leaves them.
+    { width: 2, value: () => (random() < 0.05 ? Number.NaN : random()) },
   ];
   for (const { width, value } of cases) {
     const latent = new Float32Array(nCells * width);

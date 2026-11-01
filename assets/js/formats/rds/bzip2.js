@@ -17,6 +17,7 @@
  */
 
 import { RdsFormatError, RdsUnsupportedError } from './errors.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 const BLOCK_MAGIC_HIGH = 0x314159;
 const BLOCK_MAGIC_LOW = 0x265359;
@@ -335,7 +336,7 @@ export async function* bunzip2(pieces, { signal = null } = {}) {
     const tt = new Uint32Array(blockSize);
     streams++;
     for (;;) {
-      if (signal?.aborted) throw signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
+      throwIfAborted(signal);
       // A compressed block is never much longer than its block size.
       await ensure(blockSize * 1.25 + 4096);
       const high = bits.read(24);

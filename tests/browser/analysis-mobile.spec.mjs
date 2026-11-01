@@ -146,6 +146,62 @@ test('a window is a bottom sheet with snap heights, a grip, a collapsing header 
   expect(errors).toEqual([]);
 });
 
+/** Whether a tap at the centre of the panel's bar lands on the bar. */
+function barTakesTap(page) {
+  return page.evaluate(() => {
+    const bar = document.getElementById('phone-sheet-bar');
+    const box = bar.getBoundingClientRect();
+    return document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)?.closest('#phone-sheet-bar') === bar;
+  });
+}
+
+test('the panel\'s bar stays in reach over every window: a sheet stands on it, a floating panel is kept above it', async ({ page }) => {
+  const errors = observeProductErrors(page);
+  await openDataset(page);
+  // A panel of the sidebar floated, as a window of its own (not a sheet).
+  const floated = page.locator('.accordion-panel:has(> #coloring-filtering-section)');
+  await floated.locator('> .accordion-panel-actions > .accordion-undock-btn').dispatchEvent('click');
+  await expectFloatingSettled(floated);
+  await copy(page, 'simple');
+  const sheet = page.locator(WINDOW).first();
+  await expectFloatingSettled(sheet);
+
+  // The panel closed, its bar is the way back to it, at the foot of the screen.
+  await page.locator('#sidebar-toggle').click();
+  const bar = page.locator('#phone-sheet-bar');
+  await expect(bar).toBeVisible();
+  const foot = Math.round((await bar.boundingBox()).y);
+  expect(foot).toBeLessThan(844);
+
+  // The sheet stands on the bar at each of its heights (shares of the
+  // screen, no taller than the screen above the bar), and the bar takes a
+  // tap at every one.
+  const grip = sheet.locator('> .floating-sheet-grip');
+  for (const share of [75, 100, 40]) {
+    await expect(grip).toHaveAttribute('aria-valuenow', String(share));
+    await expect.poll(async () => {
+      const box = await sheet.boundingBox();
+      return [Math.round(box.y + box.height), Math.abs(box.height - Math.min(844 * share / 100, foot)) <= 2];
+    }).toEqual([foot, true]);
+    expect(await barTakesTap(page)).toBe(true);
+    if (share !== 40) await grip.tap();
+  }
+
+  // The floating panel moved down as far as it goes stops above the bar.
+  await sheet.locator('> details > summary').tap();
+  const header = floated.locator('> details > summary');
+  await header.focus();
+  for (let step = 0; step < 40; step++) await page.keyboard.press('Alt+Shift+ArrowDown');
+  const box = await floated.boundingBox();
+  expect(box.y + box.height).toBeLessThanOrEqual(foot);
+  expect(await barTakesTap(page)).toBe(true);
+
+  // And the bar opens the panel.
+  await bar.tap();
+  await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
+  expect(errors).toEqual([]);
+});
+
 test('turning the phone to a screen wider than 720 px gives the window back its place and size', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openDataset(page);

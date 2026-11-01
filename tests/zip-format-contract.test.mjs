@@ -9,6 +9,7 @@ import { deflateRawSync } from 'node:zlib';
 
 import { bytesByteSource } from '../assets/js/formats/io/byte-source.js';
 import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
+import { virtualTime } from './helpers/virtual-time.mjs';
 import {
   ZipFormatError,
   ZipUnsupportedError,
@@ -246,7 +247,11 @@ const TAIL_FILLER = { name: 'zz/filler', content: new Uint8Array(300 * 1024) };
 test('each entry is one range (header and data together); entries read together are merged', async () => {
   const { bytes } = buildZip([...Array.from({ length: 30 }, (_, i) => ({ name: `c/${i}`, content: new Uint8Array(3000).fill(i) })), TAIL_FILLER]);
   const source = recorded(bytes, { mergeGapBytes: 64 * 1024, maxRequestBytes: 8 * 1024 * 1024 });
-  const archive = await openZipArchive(createByteReader(source));
+  // On a clock that stands still the link is never measured: the reads are
+  // shaped by the source's prior, not by how long this machine took to read
+  // the archive's end (measured on the real clock, a slow runner priced the
+  // gaps between far-apart entries as worth fetching).
+  const archive = await openZipArchive(createByteReader(source, { clock: virtualTime().now }));
   source.calls.length = 0;
   const one = await archive.entry('c/5').read();
   assert.equal(one[0], 5);
@@ -259,7 +264,7 @@ test('each entry is one range (header and data together); entries read together 
   // Far apart entries go out in parallel, not one after another.
   const { bytes: apart } = buildZip([...Array.from({ length: 30 }, (_, i) => ({ name: `c/${i}`, content: new Uint8Array(100_000).fill(i) })), TAIL_FILLER]);
   const sparse = recorded(apart, { mergeGapBytes: 0, maxRequestBytes: 8 * 1024 * 1024, concurrency: 8 });
-  const sparseArchive = await openZipArchive(createByteReader(sparse));
+  const sparseArchive = await openZipArchive(createByteReader(sparse, { clock: virtualTime().now }));
   sparse.calls.length = 0;
   await Promise.all([0, 10, 20].map(i => sparseArchive.entry(`c/${i}`).read()));
   assert.equal(sparse.calls.length, 3);
@@ -449,7 +454,7 @@ test('CRC-32 matches the reference values', () => {
   assert.equal(crc32(data.subarray(500), crc32(data.subarray(0, 500))), crc32(data));
 });
 
-test('signal and activity reach every read of the byte reader, through the archive and a Zarr store', async () => {
+test('activity and cancellation reach every read of the byte reader, through the archive and a Zarr store', async () => {
   const meta = JSON.stringify({ zarr_format: 2, shape: [4], chunks: [2], dtype: '<u1', compressor: null, fill_value: 0, filters: null, order: 'C' });
   const { bytes } = buildZip([
     { name: '.zgroup', content: '{"zarr_format":2}' },
@@ -460,16 +465,41 @@ test('signal and activity reach every read of the byte reader, through the archi
   ]);
   const inner = createByteReader(bytesByteSource(bytes, { name: 'test.zip' }));
   const seen = [];
-  const reader = { ...inner, read: (offset, length, options = {}) => { seen.push(options); return inner.read(offset, length, options); } };
+  let held = null;
+  const reader = {
+    ...inner,
+    read: async (offset, length, options = {}) => {
+      seen.push(options);
+      if (held !== null) {
+        await new Promise((resolve, reject) => {
+          held.push(resolve);
+          options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+      }
+      return inner.read(offset, length, options);
+    },
+  };
   const activity = { fetched() {}, planned() {} };
   const signal = new AbortController().signal;
   const archive = await openZipArchive(reader, { activity, signal });
-  const root = await openZarr(zipStore(archive), { activity, signal });
+  const root = await openZarr(zipStore(archive), { activity, signal, decodedChunkCacheBytes: 0 });
   assert.deepEqual(await root.get('a').read(undefined, { activity, signal }), Uint8Array.of(1, 2, 3, 4));
   await archive.entry('a/0').readRange(0, 1, { activity, signal });
   assert.ok(seen.length >= 4);
   for (const options of seen) {
     assert.equal(options.activity, activity);
-    assert.equal(options.signal, signal);
+    assert.ok(options.signal instanceof AbortSignal, 'every read can be cancelled');
   }
+  // A chunk read alone, cancelled: the byte reader's read it waits on is
+  // cancelled with it (work several reads share runs with a signal of its
+  // own, which aborts once every one of them withdrew: `SharedWork`).
+  held = [];
+  seen.length = 0;
+  const cancel = new AbortController();
+  const reading = root.get('a').read([[2, 4]], { activity, signal: cancel.signal });
+  for (let i = 0; i < 20 && seen.length === 0; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(seen.length > 0, 'the chunk is being read');
+  cancel.abort(new DOMException('cancelled', 'AbortError'));
+  await assert.rejects(reading, error => error.name === 'AbortError');
+  for (const options of seen) assert.equal(options.signal.aborted, true, 'the cancellation reached the byte reader');
 });

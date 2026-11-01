@@ -16,16 +16,19 @@
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { compositionOptions, COMPOSITION_DISPLAY_OPTIONS } from '../../options/composition-options.js';
-import { testComposition } from '../../stats/composition-tests.js';
+import { NO_CELLS, testComposition } from '../../stats/composition-tests.js';
 import { presentCompositionUnits } from '../../compute/composition-counts.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { createResultEnvelope, readResultEnvelope } from '../../shared/analysis-result-session.js';
+import { describeOpenCellChoice } from '../../shared/open-cell-choice.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
-import { categoryColorCss, createFieldGroups } from './field-groups.js';
+import { createFieldGroups } from './field-groups.js';
+import { fieldCategoryCss } from '../../../utils/category-state.js';
 import { formatCount, formatCountOf, countNoun } from '../../../../utils/format-units.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 import '../../plots/types/composition-bars.js';
+import { failureText } from '../../../../utils/errors.js';
 
 const ADJUSTED_P_SIGNIFICANT = 0.05;
 
@@ -160,8 +163,13 @@ export class CompositionUI extends FormBasedAnalysisUI {
     this._fieldGroups = createFieldGroups({
       dataLayer: this.dataLayer,
       onReady: () => this._refreshOptionsContext(),
-      onError: error => this._notifications.error(`Composition cell types: ${error.message}`, { category: 'analysis' })
+      onError: error => this._notifications.error(`Composition cell types: ${failureText(error)}`, { category: 'analysis' })
     });
+  }
+
+  /** Another set of open cells: the categories' counts are counted again on them. @override */
+  _onOpenCellsChanged() {
+    this._fieldGroups.reset();
   }
 
   _getTitle() {
@@ -212,6 +220,12 @@ export class CompositionUI extends FormBasedAnalysisUI {
     if (options.onlyTypes.mode === 'subset' && options.onlyTypes.ids.length < 2) {
       return 'Choose at least two cell types';
     }
+    // Cells drawn by the cell-type field at unequal shares: its proportions
+    // are the subsample's design, not the data's.
+    const choice = describeOpenCellChoice(this._openCells());
+    if (choice !== null && choice.method === 'stratified' && !choice.representative && choice.field === options.cellTypes) {
+      return `The open cells keep each ${options.cellTypes} at a chosen size, so its proportions are the subsample's, not the data's. Open every cell, or a uniform or proportional subsample.`;
+    }
     return null;
   }
 
@@ -235,7 +249,12 @@ export class CompositionUI extends FormBasedAnalysisUI {
     return mask;
   }
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     const signal = job.signal;
     job.setPlan('Counts every cell once');
     job.step('Reading the fields');
@@ -258,14 +277,15 @@ export class CompositionUI extends FormBasedAnalysisUI {
       if (chosen !== null && !chosen.has(name)) return;
       typeIndexOfCode[code] = typeNames.length;
       typeNames.push(name);
-      typeColors.push(categoryColorCss(typeFieldState, code));
+      typeColors.push(fieldCategoryCss(typeFieldState, code));
     });
     const identity = categories => Int32Array.from(categories.map((_, index) => index));
     const sampleNames = sampleField === null ? null : sampleField.categories.map(String);
     const conditionNames = conditionField === null ? [] : conditionField.categories.map(String);
     const conditionFieldState = conditionField === null ? null : fieldOf(options.condition);
     const cellCount = typeField.codes.length;
-    const scope = this._scopeMask(options.cells, cellCount);
+    // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
+    const scope = sample === null ? this._scopeMask(options.cells, cellCount) : sample.mask(this._scopeMask(options.cells, cellCount));
 
     job.step('Counting cells');
     const counted = await getComputeManager().execute(
@@ -333,7 +353,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
       samples: sampleNames === null ? null : [...new Set(units.map(unit => unit.sample))],
       units,
       conditions: presentConditions.map(index => conditionNames[index]),
-      conditionColors: presentConditions.map(index => categoryColorCss(conditionFieldState, index)),
+      conditionColors: presentConditions.map(index => fieldCategoryCss(conditionFieldState, index)),
       counts,
       conditionOfUnit,
       splitSamples,
@@ -392,6 +412,16 @@ export class CompositionUI extends FormBasedAnalysisUI {
     if (composition.test !== null && composition.samples !== null) {
       const thin = [...composition.test.unitsPerCondition].some(n => n < 2);
       if (thin) chips.push({ text: 'Too few samples', tone: 'warning', title: 'A test across samples needs at least two samples in every condition.' });
+    }
+    if (composition.test !== null) {
+      const absent = composition.types.filter((_, index) => composition.test.typeTest[index] === NO_CELLS);
+      if (absent.length > 0) {
+        chips.push({
+          text: `${formatCount(absent.length)} ${countNoun(absent.length, 'type')} without cells`,
+          tone: 'info',
+          title: `No cells in scope, so not tested and not counted in the multiple-testing correction: ${absent.join(', ')}`
+        });
+      }
     }
     return chips;
   }
@@ -483,7 +513,9 @@ export class CompositionUI extends FormBasedAnalysisUI {
         const ratio = test.log2Ratio[index];
         cells.push(Number.isFinite(ratio) ? ratio.toFixed(2) : '–');
       }
-      if (test !== null) {
+      if (test !== null && test.typeTest[index] === NO_CELLS) {
+        cells.push('No cells in scope', '–', '–');
+      } else if (test !== null) {
         cells.push(
           Number.isFinite(test.statistic[index]) ? test.statistic[index].toPrecision(3) : '–',
           formatP(test.pValue[index]),
@@ -499,6 +531,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
 
   /** The counts, one row per cell type and one column per sample (or condition). */
   _downloadCounts() {
+    if (this._refuseStaleExport('CSV')) return;
     const composition = this._lastResult?.composition;
     if (!composition) return;
     const { types, units, counts } = composition;
@@ -542,7 +575,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
 
   // ---------------------------------------------------------------- Sessions
 
-  exportResult() {
+  _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('composition', this._lastResult);
   }

@@ -20,9 +20,11 @@
  *   geneSets     [{name, start, end}] index ranges of `genes` (end exclusive)
  *   groups       group names, in plot order
  *   color        Float64Array, gene-major (`color[gene * groups + group]`)
- *   fraction     Float64Array, gene-major, 0–1
+ *   fraction     Float64Array, gene-major, 0–1, of the measured cells
  *   mean         Float64Array, gene-major, unscaled (for hover and export)
  *   cellCounts   number[] cells per group
+ *   measured     Uint32Array, gene-major: the group's cells with a value of
+ *                the gene (a cell a modality did not measure has none)
  *   colorLabel   the colour bar title
  *   colorMap     'Reds' | 'Viridis' | 'Blues'
  *   maxDotSize   'auto' or a diameter in px
@@ -37,7 +39,22 @@ import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 import { textHeight, textWidth } from '../text-measure.js';
-import { formatCountOf } from '../../../../utils/format-units.js';
+import { formatCountOf, formatSignificant } from '../../../../utils/format-units.js';
+
+/**
+ * A dot's hover: its gene and group, the group's cells (and how many hold a
+ * value of the gene, when some do not), the mean and the share expressing.
+ */
+function dotHoverText(data, gene, group, geneName, groupName) {
+  const at = gene * data.groups.length + group;
+  const cells = data.cellCounts[group];
+  const measured = data.measured[at];
+  const counted = measured < cells
+    ? `${formatCountOf(cells, 'cell')}, ${formatCountOf(measured, 'cell')} with a value`
+    : formatCountOf(cells, 'cell');
+  return `${geneName} in ${groupName} (${counted})<br>`
+    + `mean ${formatSignificant(data.mean[at])} · ${formatSignificant(data.fraction[at] * 100)}% expressing`;
+}
 
 /**
  * The color maps, as matplotlib draws them (scanpy's defaults come from
@@ -358,8 +375,8 @@ function violinTraces(data, colorscale, colorbar, escapedGenes, escapedGroups) {
         fillcolor: colorAt(colorscale, (data.color[at] - low) / span),
         line: { width: 0.5, color: 'rgba(0, 0, 0, 0.35)' },
         hoveron: 'fills',
-        text: `${escapedGenes[gene]} in ${escapedGroups[group]}: mean ${data.mean[at].toPrecision(3)} · `
-          + `${(data.fraction[at] * 100).toFixed(1)}% expressing · values ${range[2 * gene].toPrecision(3)} to ${range[2 * gene + 1].toPrecision(3)}`,
+        text: `${dotHoverText(data, gene, group, escapedGenes[gene], escapedGroups[group])} · `
+          + `values ${formatSignificant(range[2 * gene])} to ${formatSignificant(range[2 * gene + 1])}`,
         hoverinfo: 'text',
         hoverlabel: COMMON_HOVER_STYLE,
         showlegend: false
@@ -442,10 +459,7 @@ const dotplotDefinition = {
           const group = swap ? a : d;
           const at = gene * groupCount + group;
           row.push(Number.isFinite(data.color[at]) ? data.color[at] : null);
-          textRow.push(
-            `${escapedGenes[gene]} in ${escapedGroups[group]}<br>`
-            + `mean ${data.mean[at].toPrecision(3)} · ${(data.fraction[at] * 100).toFixed(1)}% expressing`
-          );
+          textRow.push(dotHoverText(data, gene, group, escapedGenes[gene], escapedGroups[group]));
         }
         z.push(row);
         text.push(textRow);
@@ -480,10 +494,7 @@ const dotplotDefinition = {
         y.push(swap ? escapedGenes[gene] : escapedGroups[group]);
         size.push(dotDiameter(data.fraction[at], dotMax, largest));
         color.push(Number.isFinite(data.color[at]) ? data.color[at] : null);
-        text.push(
-          `${escapedGenes[gene]} in ${escapedGroups[group]} (${formatCountOf(data.cellCounts[group], 'cell')})<br>`
-          + `mean ${data.mean[at].toPrecision(3)} · ${(data.fraction[at] * 100).toFixed(1)}% expressing`
-        );
+        text.push(dotHoverText(data, gene, group, escapedGenes[gene], escapedGroups[group]));
       }
     }
     const traces = [{
@@ -653,7 +664,7 @@ const dotplotDefinition = {
    * The long table: one row per group and gene.
    */
   exportCSV(data) {
-    const columns = ['group', 'gene', 'gene_group', 'mean', 'fraction_expressing', 'n_cells'];
+    const columns = ['group', 'gene', 'gene_group', 'mean', 'fraction_expressing', 'n_cells', 'n_measured'];
     const setOf = gene => data.geneSets.find(set => gene >= set.start && gene < set.end)?.name ?? '';
     const rows = [];
     for (let group = 0; group < data.groups.length; group++) {
@@ -665,7 +676,8 @@ const dotplotDefinition = {
           gene_group: setOf(gene),
           mean: data.mean[at],
           fraction_expressing: data.fraction[at],
-          n_cells: data.cellCounts[group]
+          n_cells: data.cellCounts[group],
+          n_measured: data.measured[at]
         });
       }
     }

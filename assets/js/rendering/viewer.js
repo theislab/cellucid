@@ -5,7 +5,7 @@
  * Keeps smoke, grid, studio backdrop, and line rendering.
  */
 
-import { glStateOf } from './gl-state-shadow.js';
+import { primeGlState } from './gl-state-shadow.js';
 import { GRID_VS_SOURCE, GRID_FS_SOURCE } from './shaders/edge-grid-shaders.js';
 import { createConnectivityEdgeLayer } from './connectivity-edge-layer.js';
 import {
@@ -18,7 +18,8 @@ import {
   createProgram,
   createProgramBatch,
   createCanvasResizeObserver,
-  deleteProgramReleasingUse
+  deleteProgramReleasingUse,
+  fenceHasPassed
 } from './gl-utils.js';
 import { CENTROID_VS, CENTROID_FS } from './shaders/centroid-shaders.js';
 import { STUDIO_VS_SOURCE, STUDIO_FS_SOURCE } from './shaders/studio-shaders.js';
@@ -37,7 +38,10 @@ import { createBackdropLookRenderer } from './backdrops/backdrop-look-renderer.j
 import { backdropLookSurface01, isBackdropLook } from './backdrops/backdrop-looks.js';
 import { SmokeRenderer } from './smoke-cloud/smoke-renderer.js';
 import { HighPerfRenderer } from './high-perf-renderer.js';
-import { isContextLostError, requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
+import { createFullDetailFrameCost, INTERACTIVE_FRAME_BUDGET_MS } from './full-detail-frame-cost.js';
+import { lodLadder } from './high-perf/draw-order.js';
+import { LOD_FULL_DETAIL_ADMISSION_LEVEL, requireLodMembership } from './high-perf/renderer-contracts.js';
+import { cancelDeferredWebGLErrorChecks, isContextLostError, requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
@@ -86,12 +90,12 @@ import {
   createViewerRendererFacade
 } from './viewer/renderer-facade.js';
 import {
-  VALID_DIMENSION_LEVELS,
   assertCentroidLabelEntries,
   assertCentroidPayload,
   assertExactBoolean,
   assertExactFunction,
   assertExactUint8Array,
+  assertCellPositions,
   assertFiniteFloat32Array,
   assertFiniteNumberInRange,
   assertIntegerInRange,
@@ -153,8 +157,11 @@ const AMBIENT_FRAME_CAUSE = 'highlight';
  * - Registrations: `set…Callback` / `set…Handler`, and the listeners that
  *   need no frame (`onPresentedViewStateChanged` does: its baseline is the
  *   next frame drawn).
- * - Work that changes nothing on screen: `prepareCellPicking` builds, in a
- *   worker, the index those lookups read; `releaseRetainedGeometry` frees
+ * - Work that changes nothing on screen when called: `prepareCellPicking`
+ *   builds, in a worker, the index those lookups read (the store adopts its
+ *   draw order once it lands, which asks for its own frames:
+ *   `onAsyncTreeReady`, and `isPresentedGeometrySettled` is false until
+ *   then); `releaseRetainedGeometry` frees
  *   geometry no view draws; `stopInertia` stops a camera that the frame
  *   already shows where it is; `setFrameInvalidationTracing` and
  *   `debugRendererStatus` are diagnostics.
@@ -207,8 +214,20 @@ const SELF_INVALIDATING_VIEWER_METHODS = new Set([
   'updateSnapshotAttributes'
 ]);
 
+/**
+ * Whether a viewer method only reads what the page holds (`get`, `has`, `is`):
+ * it stays callable while the WebGL context is away, so the session can be
+ * captured then (`app/graphics-reset-session.js`). Every other method waits
+ * for the context to come back.
+ */
+function isContextLossReadableMethodName(methodName) {
+  return /^(get|has|is)[A-Z]/.test(methodName);
+}
+
 const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'dispose',
+  'onGraphicsReset',
+  'setGraphicsResetSessionSaver',
   'getGLContext',
   'getAntialiasing',
   'getHPRenderer',
@@ -242,6 +261,9 @@ export {
   runSynchronousBorrowedViewDataCallback,
   selectPresentedCameraState
 } from './viewer/presented-view-layout.js';
+import { copyLargeArray } from '../utils/large-arrays.js';
+import { cellLayerColors } from './read-cell-layer.js';
+import { StyleManager } from '../utils/style-manager.js';
 
 /**
  * Release dataset-sized owners held by a stable per-frame render descriptor.
@@ -291,72 +313,6 @@ export function centroidSnapshotBufferOwnsData(
   );
 }
 
-function requireViewerLodMembership(membership, pointCount) {
-  if (membership === null) return null;
-  if (
-    typeof membership !== 'object' ||
-    Array.isArray(membership) ||
-    !Object.isFrozen(membership) ||
-    !(membership.admissionLevels instanceof Uint8Array) ||
-    membership.admissionLevels.length !== pointCount ||
-    !(membership.indices instanceof Uint32Array) ||
-    membership.indices.length > pointCount ||
-    membership.pointCount !== pointCount ||
-    !VALID_DIMENSION_LEVELS.has(membership.dimensionLevel) ||
-    !Number.isInteger(membership.lodLevel) ||
-    membership.lodLevel < 0 ||
-    membership.lodLevel >= 0xff ||
-    membership.generationToken === null ||
-    typeof membership.generationToken !== 'object' ||
-    !Object.isFrozen(membership.generationToken)
-  ) {
-    throw new TypeError(
-      'Viewer LOD membership must be null or one exact frozen renderer descriptor.'
-    );
-  }
-  return membership;
-}
-
-function requireViewerSequentialLodMembership(membership, pointCount) {
-  if (membership === null) return null;
-  const exactKeys = [
-    'dimensionLevel',
-    'generationToken',
-    'indices',
-    'lodLevel',
-    'pointCount',
-  ];
-  const ownKeys =
-    typeof membership === 'object' && membership !== null
-      ? Reflect.ownKeys(membership)
-      : [];
-  if (
-    typeof membership !== 'object' ||
-    Array.isArray(membership) ||
-    Object.getPrototypeOf(membership) !== Object.prototype ||
-    !Object.isFrozen(membership) ||
-    ownKeys.length !== exactKeys.length ||
-    ownKeys.some((key) => (
-      typeof key !== 'string' || !exactKeys.includes(key)
-    )) ||
-    !(membership.indices instanceof Uint32Array) ||
-    membership.indices.length > pointCount ||
-    membership.pointCount !== pointCount ||
-    !VALID_DIMENSION_LEVELS.has(membership.dimensionLevel) ||
-    !Number.isInteger(membership.lodLevel) ||
-    membership.lodLevel < 0 ||
-    membership.lodLevel >= 0xff ||
-    membership.generationToken === null ||
-    typeof membership.generationToken !== 'object' ||
-    !Object.isFrozen(membership.generationToken)
-  ) {
-    throw new TypeError(
-      'Viewer sequential LOD membership must be null or one exact frozen compact descriptor.'
-    );
-  }
-  return membership;
-}
-
 function createLodFilteredVisibilityOwner(
   transparency,
   membership
@@ -369,14 +325,11 @@ function createLodFilteredVisibilityOwner(
       'LOD-filtered connectivity requires one non-empty Uint8 transparency array.'
     );
   }
-  const exactMembership = requireViewerLodMembership(
-    membership,
-    transparency.length
-  );
   return Object.freeze({
-    admissionLevels:
-      exactMembership?.admissionLevels ?? null,
-    lodLevel: exactMembership?.lodLevel ?? -1,
+    lodMembership: requireLodMembership(membership, {
+      pointCount: transparency.length,
+      owner: 'Connectivity level of detail',
+    }),
     transparency,
   });
 }
@@ -457,19 +410,19 @@ export function createViewer({
   if (!gl) {
     throw new Error('WebGL2 is required but not supported in this browser.');
   }
-  // Installed before anything changes the state, so the one read it takes
-  // reads the defaults; every renderer sharing this context reads its
+  // Installed before anything changes the state, and read whole now, while
+  // nothing is queued: every renderer sharing this context reads its
   // fixed-function state from here instead of asking the GPU.
-  glStateOf(gl);
+  primeGlState(gl);
 
   // Starts off, with nothing allocated. `render-controls.js` is the one owner of
   // the preference and publishes it before `start()` draws the first frame, so
   // there is no value to duplicate here and no frame drawn with the wrong one.
-  const sceneMsaaTarget = createSceneMsaaTarget(gl);
+  let sceneMsaaTarget = createSceneMsaaTarget(gl);
   // While highlights pulse, each pane's base layer is kept and only the upper
   // layer is drawn again (pulse-layer-cache.js). The drawing buffer's depth
   // bits are read once, now, while it is the bound framebuffer.
-  const pulseLayerCache = createPulseLayerCache(gl, { depthBits: gl.getParameter(gl.DEPTH_BITS) });
+  let pulseLayerCache = createPulseLayerCache(gl, { depthBits: gl.getParameter(gl.DEPTH_BITS) });
   let pulseLayerCaching = true;
   // Per pane: what its kept base was drawn for.
   const pulseBaseRecords = new Map();
@@ -478,7 +431,7 @@ export function createViewer({
   // Multisampled frames keep no base: a pulse frame draws again only the
   // samples the rings cover (pulse-sample-mask.js). Per pane: what its
   // samples in the scene target were last drawn for.
-  const pulseSampleMask = createPulseSampleMask(gl);
+  let pulseSampleMask = createPulseSampleMask(gl);
   pulseSampleMask.prepare();
   const maskedPaneRecords = new Map();
   let pulsePanesMasked = 0;
@@ -497,43 +450,125 @@ export function createViewer({
   const vec4 = glMatrix.vec4;
 
   // === HIGH-PERFORMANCE RENDERER FOR SCATTER POINTS ===
-  const hpRenderer = new HighPerfRenderer(gl, {
-    USE_LOD: false,
-    USE_FRUSTUM_CULLING: false
+  // Every GPU owner below is made by a function of its own: once here, and
+  // again on a context the browser restores after losing it
+  // (`restoreLostGraphics`).
+  function createHpRendererOwner() {
+    const renderer = new HighPerfRenderer(gl, {
+      USE_LOD: false,
+      USE_FRUSTUM_CULLING: false
+    });
+    // A tree built off the main thread has landed: draw, so its view adopts it.
+    renderer.onAsyncTreeReady = () => invalidateFrame();
+    return renderer;
+  }
+  let hpRenderer = createHpRendererOwner();
+  // Whether drawing every cell is too slow for interaction here, measured
+  // once per opening, and whether the levels of detail and culling turned on
+  // for it make frames faster (`full-detail-frame-cost.js`); the render
+  // controls turn them on, and off again, by what it reports
+  // (`onFullDetailFrameCost`).
+  const fullDetailFrameCostListeners = new Set();
+  // Each opening's measurement (`armFullDetailFrameCost`) is numbered, and
+  // every report and every change of level of detail or culling names the
+  // opening it belongs to (`onPerformanceSettingsChanged`): a caller that sets
+  // them itself makes the opening's choice, and the render controls leave the
+  // rest of that opening's reports alone.
+  let fullDetailOpening = 0;
+  const performanceSettingsListeners = new Set();
+  const reportPerformanceSettings = () => {
+    const event = Object.freeze({ opening: fullDetailOpening });
+    for (const listener of [...performanceSettingsListeners]) {
+      try {
+        listener(event);
+      } catch (error) {
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
+  };
+  const reportFullDetailFrameCost = event => {
+    const frozen = Object.freeze({ ...event, opening: fullDetailOpening });
+    for (const listener of [...fullDetailFrameCostListeners]) {
+      try {
+        listener(frozen);
+      } catch (error) {
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
+  };
+  // What the last frame of every cell sampled could have drawn fewer of
+  // (`presentedDrawsFewer`), for the answer it is part of.
+  let lastSampledDrawsFewer = null;
+  const fullDetailFrameCost = createFullDetailFrameCost({
+    gl,
+    requestFrame: () => {
+      if (!disposed && !webglContextLost) invalidateFrame();
+    },
+    onTooSlow: answer => {
+      // Levels of detail turned on while the last sample was in flight: the
+      // frames are no longer of every cell, and the choice is made.
+      if (hpRenderer.useAdaptiveLOD) return;
+      reportFullDetailFrameCost({
+        kind: 'too-slow',
+        // The frame time and the GPU's share of the cheapest frame of every
+        // cell, as bounds (`full-detail-frame-cost.js`).
+        frame: answer.frame,
+        gpu: answer.gpu,
+        budgetMilliseconds: INTERACTIVE_FRAME_BUDGET_MS,
+        // Whether culling could leave out a cell of the frames measured
+        // (`presentedDrawsFewer`): only then is it worth trying.
+        cullable: lastSampledDrawsFewer?.culling === true,
+      });
+    },
+    onVerified: ({ verdict, answer, full }) => {
+      reportFullDetailFrameCost({ kind: 'verified', verdict, frame: answer.frame, fullFrame: full.frame });
+    },
   });
   // Terminal cleanup is an internal lifecycle capability, not a replaceable
   // facade extension point. Capture the exact implementation before callers
   // can legitimately customize other preterminal renderer methods.
-  const handleHpRendererContextLost =
+  let handleHpRendererContextLost =
     hpRenderer.handleContextLost.bind(hpRenderer);
-  const disposeHpRenderer =
+  let disposeHpRenderer =
     hpRenderer.dispose.bind(hpRenderer);
-  // A tree built off the main thread has landed: draw, so its view adopts it.
-  hpRenderer.onAsyncTreeReady = () => invalidateFrame();
   console.log('[Viewer] HighPerfRenderer initialized');
 
   // === ORBIT ANCHOR RENDERER ===
   // Per-view compass visualization with proper elevation indicator and cardinal markers
-  const orbitAnchorRenderer = new OrbitAnchorRenderer(gl, canvas);
+  let orbitAnchorRenderer = new OrbitAnchorRenderer(gl, canvas);
   console.log('[Viewer] OrbitAnchorRenderer initialized');
 
   // === SMOKE RENDERER ===
-  const smokeRenderer = new SmokeRenderer(gl, createProgram);
-  // Noise textures generate on their own schedule: the frame that shows them
-  // is asked for when they land, not by drawing every frame until then.
-  smokeRenderer.setNoiseSettledHandler(() => {
-    if (!disposed && !webglContextLost) invalidateFrame();
-  });
+  function createSmokeOwner() {
+    const renderer = new SmokeRenderer(gl, createProgram);
+    // Noise textures generate on their own schedule: the frame that shows
+    // them is asked for when they land, not by drawing every frame until then.
+    renderer.setNoiseSettledHandler(() => {
+      if (!disposed && !webglContextLost) invalidateFrame();
+    });
+    return renderer;
+  }
+  let smokeRenderer = createSmokeOwner();
+  // What the smoke controls set, given again to a smoke renderer made on a
+  // restored context.
+  const smokeSettings = { params: {}, resolutionScale: null, noiseResolution: null };
   console.log('[Viewer] SmokeRenderer initialized');
 
   // The grid, studio backdrop and centroid programs, compiled and linked in
   // one batch (`createProgramBatch`): one wait instead of three.
-  const [initialGridProgram, initialStudioProgram, initialCentroidProgram] =
-    createProgramBatch(gl, [
+  function compileViewerPrograms() {
+    return createProgramBatch(gl, [
       { label: 'grid', vs: GRID_VS_SOURCE, fs: GRID_FS_SOURCE },
       { label: 'studio backdrop', vs: STUDIO_VS_SOURCE, fs: STUDIO_FS_SOURCE },
       { label: 'centroid', vs: CENTROID_VS, fs: CENTROID_FS },
     ]);
+  }
+  const [initialGridProgram, initialStudioProgram, initialCentroidProgram] =
+    compileViewerPrograms();
 
   // === GRID PROGRAM ===
   let gridProgram = initialGridProgram;
@@ -560,15 +595,27 @@ export function createViewer({
   // One full-pane triangle in its own vertex array, so the draw neither reads
   // nor disturbs the attribute state another pass left on the default one.
   let studioProgram = initialStudioProgram;
-  let studioVao = gl.createVertexArray();
-  let studioCornerBuffer = gl.createBuffer();
-  gl.bindVertexArray(studioVao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, studioCornerBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-  gl.bindVertexArray(null);
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  let studioVao = null;
+  let studioCornerBuffer = null;
+  function createStudioQuad() {
+    studioVao = gl.createVertexArray();
+    studioCornerBuffer = gl.createBuffer();
+    if (!studioVao || !studioCornerBuffer) {
+      if (studioVao) gl.deleteVertexArray(studioVao);
+      if (studioCornerBuffer) gl.deleteBuffer(studioCornerBuffer);
+      studioVao = null;
+      studioCornerBuffer = null;
+      throw new Error('Viewer could not allocate the studio backdrop quad.');
+    }
+    gl.bindVertexArray(studioVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, studioCornerBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+  createStudioQuad();
   const studioUniformLocations = {
     invMvpMatrix:     gl.getUniformLocation(studioProgram, 'u_invMvpMatrix'),
     eye:              gl.getUniformLocation(studioProgram, 'u_eye'),
@@ -598,21 +645,24 @@ export function createViewer({
   // === BACKDROP LOOKS ===
   // Baked procedural backgrounds; see rendering/backdrops/. Bakes run in idle
   // slices outside the frame and wake the viewer once when they land.
-  const backdropLooks = createBackdropLookRenderer(gl, {
-    invalidate: () => invalidateFrame(),
-    prefersReducedMotion: () => prefersReducedMotion(),
-    readViewSource: (viewId) => {
-      const record = viewPositionsCache.get(viewId);
-      if (!(record?.positions instanceof Float32Array)) return null;
-      let colors = null;
-      let visibility = null;
-      let generation = 0;
-      try { colors = getExactViewColors(viewId); } catch { colors = null; }
-      try { visibility = getExactViewTransparency(viewId); } catch { visibility = null; }
-      try { generation = getViewDataGeneration(viewId); } catch { generation = 0; }
-      return { positions: record.positions, dimension: record.dimension, colors, visibility, generation };
-    },
-  });
+  function createBackdropLooksOwner() {
+    return createBackdropLookRenderer(gl, {
+      invalidate: () => invalidateFrame(),
+      prefersReducedMotion: () => prefersReducedMotion(),
+      readViewSource: (viewId) => {
+        const record = viewPositionsCache.get(viewId);
+        if (!(record?.positions instanceof Float32Array)) return null;
+        let colors = null;
+        let visibility = null;
+        let generation = 0;
+        try { colors = getExactViewColors(viewId); } catch { colors = null; }
+        try { visibility = getExactViewTransparency(viewId); } catch { visibility = null; }
+        try { generation = getViewDataGeneration(viewId); } catch { generation = 0; }
+        return { positions: record.positions, dimension: record.dimension, colors, visibility, generation };
+      },
+    });
+  }
+  let backdropLooks = createBackdropLooksOwner();
 
   // === CENTROID PROGRAM (simple WebGL2 shader for small centroid count) ===
   let centroidProgram = initialCentroidProgram;
@@ -629,6 +679,32 @@ export function createViewer({
     viewportHeight: gl.getUniformLocation(centroidProgram, 'u_viewportHeight'),
     fov: gl.getUniformLocation(centroidProgram, 'u_fov'),
   };
+
+  /**
+   * The grid, studio and centroid programs made again on a restored
+   * context, with their locations read into the records every pass reads
+   * (each uniform is `u_<key>`), the studio quad, the centroid buffers and
+   * the grid planes.
+   */
+  function rebuildViewerGlResources() {
+    [gridProgram, studioProgram, centroidProgram] = compileViewerPrograms();
+    gridAttribLocations.position = gl.getAttribLocation(gridProgram, 'a_position');
+    centroidAttribLocations.position = gl.getAttribLocation(centroidProgram, 'a_position');
+    centroidAttribLocations.color = gl.getAttribLocation(centroidProgram, 'a_color');
+    for (const [program, locations] of [
+      [gridProgram, gridUniformLocations],
+      [studioProgram, studioUniformLocations],
+      [centroidProgram, centroidUniformLocations],
+    ]) {
+      for (const key of Object.keys(locations)) {
+        locations[key] = gl.getUniformLocation(program, `u_${key}`);
+      }
+    }
+    createStudioQuad();
+    createCentroidBuffers();
+    for (const key of Object.keys(gridPlaneBuffers)) gridPlaneBuffers[key] = gl.createBuffer();
+    initGridPlanes(GRID_SIZE);
+  }
 
   // Highlight toolset (renderer + interactive tools)
   let highlightTools = null;
@@ -742,40 +818,49 @@ export function createViewer({
   // === BUFFERS ===
   // Centroid buffers (small count, separate from main points)
   // Color buffer now stores RGBA as uint8 (alpha packed in)
-  let centroidPositionBuffer = gl.createBuffer();
-  let centroidColorBuffer = gl.createBuffer(); // RGBA uint8
+  let centroidPositionBuffer = null;
+  let centroidColorBuffer = null; // RGBA uint8
   // The live centroid pass owns its vertex array, so its attribute state never
   // lands on whichever vertex array another pass left bound.
-  let centroidVao = gl.createVertexArray();
-  if (!centroidPositionBuffer || !centroidColorBuffer || !centroidVao) {
-    if (centroidPositionBuffer) gl.deleteBuffer(centroidPositionBuffer);
-    if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
-    if (centroidVao) gl.deleteVertexArray(centroidVao);
-    throw new Error(
-      'Viewer could not allocate the required centroid buffers.'
-    );
+  let centroidVao = null;
+  function createCentroidBuffers() {
+    centroidPositionBuffer = gl.createBuffer();
+    centroidColorBuffer = gl.createBuffer();
+    centroidVao = gl.createVertexArray();
+    if (!centroidPositionBuffer || !centroidColorBuffer || !centroidVao) {
+      if (centroidPositionBuffer) gl.deleteBuffer(centroidPositionBuffer);
+      if (centroidColorBuffer) gl.deleteBuffer(centroidColorBuffer);
+      if (centroidVao) gl.deleteVertexArray(centroidVao);
+      throw new Error(
+        'Viewer could not allocate the required centroid buffers.'
+      );
+    }
   }
+  createCentroidBuffers();
 
   // === CONNECTIVITY EDGES ===
   // The graph, each pane's shown edges and their GPU records
   // (connectivity-edge-layer.js). The layer reads a pane's positions from the
   // renderer at draw time, so a representation switch needs no call here.
-  const edgeLayer = createConnectivityEdgeLayer({
-    gl,
-    getViewGeometry: viewId => getCertifiedEdgeGeometry(viewId),
-    retainsPositions: positions => hpRenderer.holdsGeometryFor(positions),
-    onVisibleCount: (viewId, stats) => {
-      for (const listener of edgeVisibleCountListeners) {
-        try {
-          listener(viewId, stats);
-        } catch (error) {
-          queueMicrotask(() => {
-            throw error;
-          });
+  function createEdgeLayerOwner() {
+    return createConnectivityEdgeLayer({
+      gl,
+      getViewGeometry: viewId => getCertifiedEdgeGeometry(viewId),
+      retainsPositions: positions => hpRenderer.holdsGeometryFor(positions),
+      onVisibleCount: (viewId, stats) => {
+        for (const listener of edgeVisibleCountListeners) {
+          try {
+            listener(viewId, stats);
+          } catch (error) {
+            queueMicrotask(() => {
+              throw error;
+            });
+          }
         }
-      }
-    },
-  });
+      },
+    });
+  }
+  let edgeLayer = createEdgeLayerOwner();
   const edgeVisibleCountListeners = new Set();
   let useInstancedEdges = false; // Whether published edges are drawn
   // Scratch for the per-draw model-view product the edge shader reads.
@@ -908,6 +993,104 @@ export function createViewer({
   // === Scene Variables ===
   let pointCount = 0;
   let centroidCount = 0;
+  // The live centroids last published (`setCentroids`).
+  let liveCentroidPayload = null;
+
+  /**
+   * Upload the live centroids (`setCentroids`, and again on a restored
+   * context, `restoreLostGraphics`).
+   */
+  function publishLiveCentroids(payload) {
+    const {
+      positions,
+      colors,
+      count: nextCentroidCount
+    } = assertCentroidPayload(payload);
+    // Kept (the arrays are small) to draw them again on a restored context.
+    liveCentroidPayload = payload;
+    // The buffers keep their storage when a field has no centroids: the next
+    // field's usually fit, and drawing reads only `centroidCount` points.
+    if (nextCentroidCount === 0) {
+      centroidCount = 0;
+      return;
+    }
+    if (
+      positions.byteLength <= centroidPositionCapacity &&
+      colors.byteLength <= centroidColorCapacity
+    ) {
+      // Writes into accepted storage allocate nothing: only a lost context
+      // refuses them, so no error is read back.
+      requireLiveContext(gl, 'Viewer centroid publication');
+      gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, positions);
+      gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      requireLiveContext(gl, 'Viewer centroid publication');
+      centroidCount = nextCentroidCount;
+      return;
+    }
+    requireLiveContext(gl, 'Viewer centroid publication');
+    let candidatePositions = null;
+    let candidateColors = null;
+    try {
+      candidatePositions = gl.createBuffer();
+      candidateColors = gl.createBuffer();
+      if (!candidatePositions || !candidateColors) {
+        throw new Error(
+          'Viewer could not allocate candidate centroid buffers.'
+        );
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, candidatePositions);
+      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, candidateColors);
+      gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      // The one read: a refused allocation must not stay resident.
+      requireCleanWebGLState(gl, 'Viewer candidate centroid publication');
+    } catch (error) {
+      const rollbackFailures = [];
+      try {
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      } catch (rollbackError) {
+        rollbackFailures.push(rollbackError);
+      }
+      queueCentroidSnapshotRetirement({
+        buffer: candidatePositions,
+      });
+      queueCentroidSnapshotRetirement({
+        buffer: candidateColors,
+      });
+      rollbackFailures.push(
+        ...drainCentroidSnapshotRetirements()
+      );
+      if (rollbackFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackFailures],
+          'Viewer centroid publication failed and rollback was incomplete.'
+        );
+      }
+      throw error;
+    }
+
+    const previousPositions = centroidPositionBuffer;
+    const previousColors = centroidColorBuffer;
+    centroidPositionBuffer = candidatePositions;
+    centroidColorBuffer = candidateColors;
+    centroidPositionCapacity = positions.byteLength;
+    centroidColorCapacity = colors.byteLength;
+    centroidCount = nextCentroidCount;
+    queueCentroidSnapshotRetirement({
+      buffer: previousPositions,
+    });
+    queueCentroidSnapshotRetirement({
+      buffer: previousColors,
+    });
+    reportCommittedRetirementFailures(
+      drainCentroidSnapshotRetirements(),
+      'Live centroid prior generation could not be fully retired.'
+    );
+  }
   // Bytes the live centroid buffers hold: a publication that fits is written
   // in place, with no allocation and so no error read (a GPU round trip).
   let centroidPositionCapacity = 0;
@@ -1488,18 +1671,20 @@ export function createViewer({
 	    }
 	    const lodLevel =
 	      hpRenderer.getCurrentLODLevel(exactViewId);
-	    const lodMembership = requireViewerSequentialLodMembership(
-	      hpRenderer.getCurrentLodSequentialMembership(
-	        exactViewId,
-	        dimensionLevel
-	      ),
-	      pointCountForView
+	    const lodMembership = hpRenderer.getCurrentLodMembership(
+	      exactViewId,
+	      dimensionLevel
 	    );
 	    const lodSizeMultiplier =
 	      hpRenderer.getCurrentLODSizeMultiplier(
 	        exactViewId,
 	        dimensionLevel
 	      );
+	    // The size the cells read were drawn at (larger while some cells are
+	    // not read) and whether at every level (`rendering/read-cell-layer.js`).
+	    const drawnLayers = hpRenderer.getCurrentPointLayers(exactViewId);
+	    const readSizeMultiplier = drawnLayers?.readSizeMultiplier ?? lodSizeMultiplier;
+	    const readEveryLevel = drawnLayers?.readEveryLevel ?? lodLevel < 0;
 	    // The order the pane draws its points in at full detail (null: source
 	    // order); a reduced level draws a prefix of it.
 	    const drawOrder = hpRenderer.getViewDrawOrder(exactViewId);
@@ -1525,6 +1710,8 @@ export function createViewer({
 	      lodSizeMultiplier,
 	      pointCount: pointCountForView,
 	      positions,
+	      readEveryLevel,
+	      readSizeMultiplier,
 	      transparency,
 	      viewId: exactViewId
 	    });
@@ -1554,7 +1741,9 @@ export function createViewer({
 	      current.lodLevel !== owner.lodLevel ||
 	      current.lodMembership !== owner.lodMembership ||
 	      current.drawOrder !== owner.drawOrder ||
-	      current.lodSizeMultiplier !== owner.lodSizeMultiplier
+	      current.lodSizeMultiplier !== owner.lodSizeMultiplier ||
+	      current.readSizeMultiplier !== owner.readSizeMultiplier ||
+	      current.readEveryLevel !== owner.readEveryLevel
 	    ) {
 	      throw new Error(
 	        `${boundary} for view "${owner.viewId}" changed during capture.`
@@ -1565,10 +1754,10 @@ export function createViewer({
 	  function createPresentedLodMembership(membership) {
 	    if (membership === null) return null;
 	    // Presentation observers need a freshness certificate, never the
-	    // renderer-owned admitted-index array. The borrowed synchronous
+	    // renderer-owned membership arrays. The borrowed synchronous
 	    // boundary remains the only route that can clone those data.
 	    return Object.freeze({
-	      admittedCount: membership.indices.length,
+	      admittedCount: membership.count,
 	      dimensionLevel: membership.dimensionLevel,
 	      generationToken: membership.generationToken,
 	      lodLevel: membership.lodLevel,
@@ -1880,7 +2069,9 @@ export function createViewer({
   // Render mode state
   let renderMode = 'points';
   const startTime = performance.now();
-  // Initialize highlight tools after shared start time is available
+  // Initialize highlight tools after shared start time is available. A
+  // restored context keeps them and gives them a new renderer
+  // (`resumeRendering`).
   highlightTools = new HighlightTools({
     gl,
     canvas,
@@ -2085,7 +2276,8 @@ export function createViewer({
   const PHYSICS_TICK_RATE = 60;          // Reference frame rate for frame-independent physics (Hz)
   const SMOOTH_ZOOM_RATE = 0.15;         // Fraction of the remaining zoom closed per reference tick
 
-  const projectileSystem = createProjectileSystem({
+  function createProjectileOwner() {
+    return createProjectileSystem({
     gl,
     canvas,
     mat4,
@@ -2108,7 +2300,9 @@ export function createViewer({
     getCollisionStage: getLiveCollisionStage,
     // For dimension-aware spatial index collision queries
     getCurrentDimensionLevel: () => getPublishedDimensionLevel(LIVE_VIEW_ID),
-  });
+    });
+  }
+  let projectileSystem = createProjectileOwner();
 
   // Reused stage records, so a physics step allocates nothing.
   const gridCollisionStage = { kind: 'box', min: -GRID_SIZE, max: GRID_SIZE };
@@ -2226,17 +2420,29 @@ export function createViewer({
   let webglContextOverlayMessage = null;
   let webglContextOverlayAction = null;
   const webglContextOverlayCleanupFns = [];
-  const hpRendererFacade = createViewerRendererFacade(
-    hpRenderer,
-    () => (
-      disposed
-        ? 'disposed'
-        : webglContextLost
-          ? 'context-lost'
-          : null
-    ),
-    invalidateFrame
-  );
+  function createHpRendererFacade() {
+    return createViewerRendererFacade(
+      hpRenderer,
+      () => (
+        disposed
+          ? 'disposed'
+          : webglContextLost
+            ? 'context-lost'
+            : null
+      ),
+      invalidateFrame
+    );
+  }
+  let hpRendererFacade = createHpRendererFacade();
+
+  // The notice shown while the browser has taken the graphics context away:
+  // a dialog over the page, since nothing can be drawn or changed until the
+  // context is back (every viewer method refuses meanwhile). It offers the
+  // session captured at the loss (`setGraphicsResetSessionSaver`), and
+  // Reload only once restoring failed.
+  let webglContextOverlaySave = null;
+  let graphicsResetSessionSaver = null;
+  const graphicsResetListeners = new Set();
 
   function ensureWebglContextOverlay() {
     if (webglContextOverlay) return webglContextOverlay;
@@ -2259,7 +2465,7 @@ export function createViewer({
       display: none;
       align-items: center;
       justify-content: center;
-      background: rgba(0, 0, 0, 0.65);
+      background: rgba(0, 0, 0, 0.45);
       color: #fff;
       font-family: var(--font-sans, system-ui, sans-serif);
       padding: 24px;
@@ -2280,12 +2486,27 @@ export function createViewer({
     const title = document.createElement('div');
     title.id = titleId;
     title.style.cssText = 'font-size: 16px; font-weight: 700; margin-bottom: 10px;';
-    title.textContent = 'WebGL Context Lost';
+    title.textContent = 'Graphics reset by the browser';
 
     const message = document.createElement('div');
     message.id = messageId;
     message.style.cssText = 'font-size: 13px; line-height: 1.5; opacity: 0.95; margin-bottom: 14px;';
-    message.textContent = 'WebGL context lost. Reload required.';
+
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display: flex; gap: 8px; justify-content: center;';
+
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'btn';
+    save.textContent = 'Save session';
+    save.style.cssText = 'cursor: pointer;';
+    const handleSave = () => {
+      const saver = graphicsResetSessionSaver;
+      if (saver === null) return;
+      Promise.resolve()
+        .then(() => saver())
+        .catch(error => console.error('[Viewer] The session captured at the graphics reset could not be saved.', error));
+    };
 
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -2293,37 +2514,76 @@ export function createViewer({
     btn.textContent = 'Reload';
     btn.style.cssText = 'cursor: pointer;';
     const handleReload = () => window.location.reload();
+    // Focus stays on the dialog's shown buttons.
     const containDialogFocus = event => {
       if (event.key !== 'Tab') return;
+      const shown = [save, btn].filter(button => button.style.display !== 'none');
+      if (shown.length === 0) return;
       event.preventDefault();
-      btn.focus({ preventScroll: true });
+      const at = shown.indexOf(document.activeElement);
+      const next = at === -1 ? 0 : (at + (event.shiftKey ? shown.length - 1 : 1)) % shown.length;
+      shown[next].focus({ preventScroll: true });
     };
+    save.addEventListener('click', handleSave);
     btn.addEventListener('click', handleReload);
     overlay.addEventListener('keydown', containDialogFocus);
     webglContextOverlayCleanupFns.push(
+      () => save.removeEventListener('click', handleSave),
       () => btn.removeEventListener('click', handleReload),
       () => overlay.removeEventListener('keydown', containDialogFocus)
     );
 
+    actions.appendChild(save);
+    actions.appendChild(btn);
     panel.appendChild(title);
     panel.appendChild(message);
-    panel.appendChild(btn);
+    panel.appendChild(actions);
     overlay.appendChild(panel);
 
     document.body.appendChild(overlay);
     webglContextOverlay = overlay;
     webglContextOverlayMessage = message;
     webglContextOverlayAction = btn;
+    webglContextOverlaySave = save;
     return overlay;
   }
 
-  function showWebglContextOverlay(message) {
+  /**
+   * Show the notice: `restoring` while the browser may give the context
+   * back (no Reload), else the failure, with Reload.
+   */
+  function showWebglContextOverlay(message, { restoring }) {
     const overlay = ensureWebglContextOverlay();
     if (webglContextOverlayMessage) {
       webglContextOverlayMessage.textContent = message;
     }
+    if (webglContextOverlayAction) {
+      webglContextOverlayAction.style.display = restoring ? 'none' : '';
+    }
+    if (webglContextOverlaySave) {
+      webglContextOverlaySave.style.display = graphicsResetSessionSaver === null ? 'none' : '';
+    }
     overlay.style.display = 'flex';
-    webglContextOverlayAction?.focus({ preventScroll: true });
+    const first = [webglContextOverlaySave, webglContextOverlayAction]
+      .find(button => button !== null && button.style.display !== 'none');
+    first?.focus({ preventScroll: true });
+  }
+
+  function hideWebglContextOverlay() {
+    if (webglContextOverlay) webglContextOverlay.style.display = 'none';
+  }
+
+  /** Tell every graphics-reset listener `phase` (`lost`, `restored`, `failed`). */
+  function publishGraphicsReset(phase) {
+    for (const listener of [...graphicsResetListeners]) {
+      try {
+        listener(phase);
+      } catch (error) {
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
   }
 
   function invalidateViewerWebGLOwnersAfterContextLoss() {
@@ -2357,7 +2617,8 @@ export function createViewer({
       gridPlaneBuffers[key] = null;
     }
 
-    edgeLayer.abandon();
+    // The edge layer forgot its handles and handed back what it shows
+    // (`suspend`); a restored context resumes it.
     useInstancedEdges = false;
   }
 
@@ -2476,11 +2737,45 @@ export function createViewer({
   const handleContextMenu = (e) => { e.preventDefault(); return false; };
   addEventListenerWithCleanup(canvas, 'contextmenu', handleContextMenu);
 
+  // === LOST AND RESTORED GRAPHICS ===
+  //
+  // A browser may take the WebGL context away (a GPU process crash or reset,
+  // a driver timeout, memory pressure). Every GPU object dies with it, but
+  // nothing the viewer shows exists only on the GPU: the live cells, every
+  // kept view, the highlights, the edges, the centroids and every setting
+  // are held on the CPU, here or in the owners' records. So the loss is
+  // answered by asking for the context back (`preventDefault`), fencing the
+  // GPU owners, and, once the browser restores it, making every GPU object
+  // again from what the CPU holds (`restoreLostGraphics`). Filters,
+  // selections, kept views and analyses never leave the page. The session
+  // is captured at the loss (`setGraphicsResetSessionSaver`); Reload is
+  // offered only if restoring fails.
+
+  /** What the GPU owners were set to, taken before they are fenced. */
+  let lostGraphicsSettings = null;
+  let pausedBeforeContextLoss = false;
+
+  function captureGraphicsSettings() {
+    return {
+      antialiasing: sceneMsaaTarget.isEnabled(),
+      showOrbitAnchor: orbitAnchorRenderer.getShowAnchor(),
+      quality: currentShaderQuality,
+      adaptiveLOD: hpRenderer.useAdaptiveLOD,
+      frustumCulling: hpRenderer.useFrustumCulling,
+      forceLOD: hpRenderer.forceLODLevel,
+      cellPriority: hpRenderer.getCellPriority(),
+      projectilesEnabled: false,
+      edgeLayer: null,
+    };
+  }
+
   addContextEventListenerWithCleanup(canvas, 'webglcontextlost', (e) => {
-    // Do not prevent the default action. Some engines will physically restore
-    // this context, but Cellucid's logical renderer generation remains
-    // terminal and only a reload may construct a coherent replacement.
+    // Ask for the context back: `webglcontextrestored` rebuilds every GPU
+    // object (`restoreLostGraphics`).
+    e.preventDefault();
     if (webglContextLost) return;
+    lostGraphicsSettings = captureGraphicsSettings();
+    pausedBeforeContextLoss = renderPaused;
     webglContextLost = true;
     renderPaused = true;
     contextLossTransitioning = true;
@@ -2488,12 +2783,9 @@ export function createViewer({
       disposalRequestedDuringContextLoss = true;
     }
     const contextLossFailures = [];
-    const attemptContextLossStep = (operation, disposalStep = null) => {
+    const attemptContextLossStep = (operation) => {
       try {
         operation();
-        if (disposalStep !== null) {
-          completedDisposalSteps.add(disposalStep);
-        }
       } catch (error) {
         contextLossFailures.push(
           error instanceof Error
@@ -2505,7 +2797,7 @@ export function createViewer({
     let projectileBuildCompletionToPublish = null;
     try {
       // Fence asynchronous work first, but defer its external completion
-      // observer until every GPU owner below is terminal.
+      // observer until every GPU owner below is fenced.
       const scheduledAnimationHandle = animationHandle;
       animationHandle = null;
       if (scheduledAnimationHandle !== null) {
@@ -2519,9 +2811,11 @@ export function createViewer({
           detachPendingProjectileBuild();
       });
 
-      // Terminalize the complete GPU ownership graph before any DOM or
-      // application callback can re-enter viewer.dispose().
+      // Fence every GPU owner: each drops its dead handles without a GL
+      // call. Those that hold what they show on the CPU keep it for the
+      // restored context (highlight tools, the edge layer).
       attemptContextLossStep(handleHpRendererContextLost);
+      attemptContextLossStep(() => fullDetailFrameCost.handleContextLost());
       attemptContextLossStep(
         () => sceneMsaaTarget.handleContextLost()
       );
@@ -2545,63 +2839,31 @@ export function createViewer({
           vectorFieldOverlay?.handleContextLost?.();
         }
       });
+      attemptContextLossStep(() => highlightTools?.suspendRendering());
       attemptContextLossStep(() => {
-        const owner = highlightTools;
-        if (owner !== null) {
-          owner.handleContextLost?.();
-          highlightTools = null;
-        }
+        lostGraphicsSettings.edgeLayer = edgeLayer.suspend();
       });
       attemptContextLossStep(
         invalidateViewerWebGLOwnersAfterContextLoss
       );
-
-      // A context-lost overlay can now be semantically disposed without any
-      // WebGL calls. This also retires detached retry owners.
+      // The velocity overlay keeps no CPU copy of its fields: its owner
+      // draws it again on the restored context (`onGraphicsReset`).
       attemptContextLossStep(() => {
         if (overlayManager !== null) {
           overlayManager.dispose();
           overlayManager = null;
         }
         vectorFieldOverlay = null;
-      }, 'overlay manager retirement');
-
-      // Remove all ordinary input/application listeners while retaining the
-      // dedicated context pair until disposal has fully settled.
+      });
       attemptContextLossStep(
-        () => retireCleanupCallbacks(
-          eventCleanupFns,
-          'Viewer event-listener'
-        ),
-        'event listener retirement'
-      );
-      attemptContextLossStep(
-        () => canvasResizeObserver.disconnect(),
-        'resize observer retirement'
-      );
-
-      attemptContextLossStep(
-        retireViewTitleOwners,
-        'view-title retirement'
-      );
-      attemptContextLossStep(
-        retireCentroidLabelOwners,
-        'centroid-label retirement'
-      );
-      attemptContextLossStep(
-        () => retirePointerLockLifecycle(null),
-        'pointer-lock retirement'
+        () => retirePointerLockLifecycle(null)
       );
       attemptContextLossStep(
         () => projectileSystem.retireContextLostUI?.()
       );
-      attemptContextLossStep(
-        retireViewerCpuCaches,
-        'viewer cache retirement'
-      );
 
-      // All GPU and semantic owners are fenced. Observers and reload UI are
-      // now safe even if they synchronously request disposal.
+      // Every GPU owner is fenced. Observers and the notice are now safe
+      // even if they synchronously request disposal.
       attemptContextLossStep(() => {
         publishProjectileBuildResult(
           projectileBuildCompletionToPublish,
@@ -2609,10 +2871,12 @@ export function createViewer({
           PROJECTILE_CONTEXT_LOSS_MESSAGE
         );
         projectileBuildCompletionToPublish = null;
-      }, 'projectile build cancellation');
+      });
+      attemptContextLossStep(() => publishGraphicsReset('lost'));
       attemptContextLossStep(() => {
         showWebglContextOverlay(
-          'WebGL context lost. Reload required to continue.'
+          'The graphics were reset by the browser. Restoring them; your filters, selections, kept views and analyses are kept.',
+          { restoring: true }
         );
       });
     } finally {
@@ -2633,36 +2897,169 @@ export function createViewer({
           cleanupError
         );
       } catch {
-        // Terminal diagnostics cannot reopen the lost generation.
+        // Diagnostics cannot reopen the lost generation.
       }
     }
   });
+
+  /**
+   * Make every GPU object again on the restored context and show what the
+   * CPU holds: the live cells, each kept view with its own geometry and
+   * centroids, the highlights, the edges and every setting. The owners whose
+   * inputs the app computes (the smoke volume, the velocity field) are told
+   * their source changed (`publishSmokeSourceChange`, `onGraphicsReset`).
+   */
+  function restoreLostGraphics() {
+    const settings = lostGraphicsSettings;
+    primeGlState(gl);
+    sceneMsaaTarget = createSceneMsaaTarget(gl);
+    sceneMsaaTarget.setEnabled(settings.antialiasing);
+    pulseBaseRecords.clear();
+    maskedPaneRecords.clear();
+    pulseLayerCache = createPulseLayerCache(gl, { depthBits: gl.getParameter(gl.DEPTH_BITS) });
+    pulseSampleMask = createPulseSampleMask(gl);
+    pulseSampleMask.prepare();
+    rebuildViewerGlResources();
+    backdropLooks = createBackdropLooksOwner();
+    orbitAnchorRenderer = new OrbitAnchorRenderer(gl, canvas);
+    orbitAnchorRenderer.setShowAnchor(settings.showOrbitAnchor);
+
+    hpRenderer = createHpRendererOwner();
+    hpRenderer.setLayerBackground(bgColor);
+    handleHpRendererContextLost = hpRenderer.handleContextLost.bind(hpRenderer);
+    disposeHpRenderer = hpRenderer.dispose.bind(hpRenderer);
+    hpRendererFacade = createHpRendererFacade();
+    hpRenderer.setQuality(settings.quality);
+    hpRenderer.setAdaptiveLOD(settings.adaptiveLOD);
+    hpRenderer.setFrustumCulling(settings.frustumCulling);
+    hpRenderer.setForceLOD(settings.forceLOD);
+
+    smokeRenderer = createSmokeOwner();
+    if (Object.keys(smokeSettings.params).length > 0) smokeRenderer.setParams(smokeSettings.params);
+    if (smokeSettings.resolutionScale !== null) smokeRenderer.setResolutionScale(smokeSettings.resolutionScale);
+    if (smokeSettings.noiseResolution !== null) smokeRenderer.setNoiseTextureResolution(smokeSettings.noiseResolution);
+
+    // Every per-view record that names a lost object goes; each is made
+    // again on the next frame.
+    overlayCtxByView.clear();
+    overlayCtxOptionsByView.clear();
+    publishedLodCertificates.clear();
+
+    const live = viewPositionsCache.get(LIVE_VIEW_ID);
+    if (positionsArray !== null && pointCount > 0 && live !== undefined) {
+      hpRenderer.loadData(live.positions, colorsArray, {
+        alphaValues: transparencyArray,
+        dimensionLevel: live.dimension,
+      });
+      hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
+      hpRenderer.setCellPriority(settings.cellPriority);
+      for (const snapshot of snapshotViews) {
+        hpRenderer.createSnapshotBuffer(
+          snapshot.id,
+          snapshot.colors,
+          snapshot.transparency,
+          live.positions,
+          live.dimension,
+          LIVE_VIEW_ID
+        );
+        if (snapshot.transparency instanceof Uint8Array) {
+          hpRenderer._adoptSnapshotAlphasOwner(snapshot.id, snapshot.transparency);
+        }
+        const record = viewPositionsCache.get(snapshot.id);
+        if (record !== undefined && record.positions !== live.positions) {
+          hpRenderer.updateSnapshotPositions(snapshot.id, record.positions, record.dimension);
+          publishViewPositions(
+            snapshot.id,
+            hpRenderer.getSnapshotPositions(snapshot.id),
+            record.dimension
+          );
+        }
+        if (snapshot.centroidPositions !== null) {
+          createCentroidSnapshotBuffer(
+            snapshot.id,
+            snapshot.centroidPositions,
+            snapshot.centroidColors
+          );
+        }
+      }
+    }
+    if (liveCentroidPayload !== null) publishLiveCentroids(liveCentroidPayload);
+
+    edgeLayer = createEdgeLayerOwner();
+    if (settings.edgeLayer !== null) {
+      edgeLayer.resume(settings.edgeLayer);
+      useInstancedEdges = edgeLayer.hasGraph();
+    }
+    highlightTools?.resumeRendering(hpRenderer);
+    projectileSystem = createProjectileOwner();
+
+    publishSmokeSourceChange();
+  }
 
   addContextEventListenerWithCleanup(
     canvas,
     'webglcontextrestored',
     () => {
-      // Firefox may physically restore the underlying context. The viewer,
-      // renderer facade, animation loop, and all ownership records deliberately
-      // remain terminal.
       if (!webglContextLost || disposed) return;
-      renderPaused = true;
       try {
-        showWebglContextOverlay(
-          'WebGL context restored, but Cellucid requires a reload to reinitialize GPU resources.'
-        );
+        restoreLostGraphics();
       } catch (error) {
-        try {
-          console.error(
-            '[Viewer] WebGL restoration notice could not be displayed.',
-            error
-          );
-        } catch {
-          // Logical context loss remains authoritative.
-        }
+        failLostGraphics(error);
+        return;
+      }
+      lostGraphicsSettings = null;
+      webglContextLost = false;
+      renderPaused = pausedBeforeContextLoss;
+      // Another GPU context is measured afresh: once the viewer is usable
+      // again, since the render controls turn their own choice off for it
+      // through the viewer (`armFullDetailFrameCost`).
+      armFullDetailFrameCost();
+      hideWebglContextOverlay();
+      publishGraphicsReset('restored');
+      if (frameLoopStarted && !renderPaused) {
+        invalidateFrame();
+        reconcileFramePhases();
       }
     }
   );
+
+  /**
+   * The context did not come back usable: the viewer stays fenced for good
+   * (as a disposed one: listeners, observers and per-view records go), and
+   * the notice offers the session captured at the loss and Reload.
+   */
+  function failLostGraphics(error) {
+    console.error('[Viewer] The graphics could not be restored.', error);
+    const failures = [];
+    const attempt = (operation) => {
+      try {
+        operation();
+      } catch (failure) {
+        failures.push(failure);
+      }
+    };
+    attempt(() => {
+      // Whatever the attempt made on the context goes with it.
+      handleHpRendererContextLost();
+      highlightTools?.handleContextLost();
+      highlightTools = null;
+      edgeLayer.abandon();
+      useInstancedEdges = false;
+    });
+    attempt(() => retireCleanupCallbacks(eventCleanupFns, 'Viewer event-listener'));
+    attempt(() => canvasResizeObserver.disconnect());
+    attempt(retireViewTitleOwners);
+    attempt(retireCentroidLabelOwners);
+    attempt(retireViewerCpuCaches);
+    attempt(() => publishGraphicsReset('failed'));
+    attempt(() => showWebglContextOverlay(
+      'The graphics could not be restored. Save the session, then reload the page to continue.',
+      { restoring: false }
+    ));
+    if (failures.length > 0) {
+      console.error('[Viewer] Retiring the unrestored graphics was incomplete.', new AggregateError(failures));
+    }
+  }
 
   /**
    * In grid mode, a camera press in a different view's area focuses that view,
@@ -4767,10 +5164,12 @@ export function createViewer({
     } = viewport;
 
     // A large pane's click before its tree lands scans every point (the
-    // same exact pick, a few milliseconds a million cells) and asks for the
-    // tree off the main thread; a hover read waits for the tree. Small panes
-    // always scan.
-    const queryOwner = getSpatialQueryOwner(clickedViewId, buildIndex);
+    // same exact pick, a few milliseconds a million cells); a hover read
+    // never scans and answers that the lookup is being prepared, with the
+    // promise of the tree. Either asks for the tree off the main thread, so
+    // the first hover over a large pane starts it as a click would. Small
+    // panes always scan.
+    const queryOwner = getSpatialQueryOwner(clickedViewId, true);
     const positions = queryOwner.positions;
     if (
       !buildIndex
@@ -4778,12 +5177,32 @@ export function createViewer({
       && positions.length / queryOwner.dimensionLevel
         >= INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD
     ) {
-      return null;
+      return Object.freeze({
+        viewId: clickedViewId,
+        preparing: hpRenderer.buildSpatialIndexInBackground(clickedViewId),
+      });
     }
     const lodMembership = hpRenderer.getCurrentLodMembership(
       clickedViewId,
       queryOwner.dimensionLevel
     );
+    // A reduced level draws its dots larger (`lodSizeMultiplier`): the same
+    // factor the renderer sizes them with.
+    const drawnPointSize = basePointSize * hpRenderer.getCurrentLODSizeMultiplier(
+      clickedViewId,
+      queryOwner.dimensionLevel
+    );
+    // The layers the pane was drawn with: an upper layer wins, and the cells
+    // read are found at their own size (larger while some are not read) and
+    // at every level they were drawn at (`rendering/read-cell-layer.js`).
+    const drawnLayers = hpRenderer.getCurrentPointLayers(clickedViewId);
+    const pointLayers = drawnLayers !== null && drawnLayers.colors.length === (positions.length / queryOwner.dimensionLevel) * 4
+      ? {
+        colors: drawnLayers.colors,
+        readEveryLevel: drawnLayers.readEveryLevel,
+        readPointSize: basePointSize * drawnLayers.readSizeMultiplier,
+      }
+      : null;
 
     // The pane exactly as drawn: its projection, its camera, the model matrix,
     // and the point-size uniforms the vertex shader sizes every dot with.
@@ -4803,9 +5222,10 @@ export function createViewer({
       mvpMatrix: paneMvp,
       cursor: { x: vpLocalX, y: vpLocalY },
       pane: { cssWidth: vpWidth, cssHeight: vpHeight, framebufferHeight },
-      pointSize: basePointSize,
+      pointSize: drawnPointSize,
       sizeAttenuation,
-      fov
+      fov,
+      pointLayers
     });
     if (pick.cellIndex === -1) return null;
 
@@ -5749,8 +6169,13 @@ export function createViewer({
     sceneMsaaTarget.beginFrame(frameSize.width, frameSize.height);
     lodConvergingInLastFrame = false;
     ambientFramePacer.frameDrawn(frameStartedAt);
+    // The opening's frame-cost measurement opens the frame before its first
+    // command (the GPU timer's query begins here).
+    if (fullDetailFrameCost.isArmed()) fullDetailFrameCost.frameStarted(frameStartedAt);
+    let sceneDrawn = false;
     try {
       renderSceneFrame();
+      sceneDrawn = true;
     } catch (error) {
       // The loss can also happen *inside* the frame, after the check above
       // passed. The renderer identifies that refusal so this boundary can tell
@@ -5780,9 +6205,145 @@ export function createViewer({
       } else {
         sceneMsaaTarget.endFrameUnchanged();
       }
+      // A frame that failed or lost its context is no sample.
+      if (!sceneDrawn) fullDetailFrameCost.frameEnded(false);
+    }
+    if (sceneDrawn && fullDetailFrameCost.isArmed()) {
+      sampleFullDetailFrameCost();
     }
     // What only reflects the drawn frame (readouts, observers) runs now.
     drainAfterFramePhase();
+  }
+
+  /**
+   * Measure the opening that starts now (`full-detail-frame-cost.js`): a
+   * dataset's cells published, grown or cut, another representation, a
+   * restored context, or a new framing the render controls ask for
+   * (`measureFullDetailFrameCost`). Every one changes what the last answer
+   * was measured on, so it is first said (`kind` 'measuring'), and the render
+   * controls turn their own automatic choice off then: the opening is
+   * measured with every cell drawn, and the choice is turned on and verified
+   * again exactly as at the first opening. Levels of detail still on after
+   * that were chosen by a person, a session or a caller: the opening is
+   * theirs, and nothing is measured.
+   */
+  function armFullDetailFrameCost() {
+    fullDetailOpening += 1;
+    reportFullDetailFrameCost({ kind: 'measuring' });
+    if (hpRenderer.useAdaptiveLOD) {
+      fullDetailFrameCost.disarm();
+      return;
+    }
+    fullDetailFrameCost.arm();
+    // Measured now, not at whatever next draws a frame: a measurement left
+    // armed on a still scene (a framing asked for after the camera settled
+    // draws nothing more) answered at the next hover or pulse, and turned
+    // level of detail on under whatever ran then.
+    if (!disposed && !webglContextLost) invalidateFrame();
+  }
+
+  /**
+   * Whether the opening's frame-cost measurement still owes frames: armed
+   * (it asks for the frames it samples, and its answer can turn level of
+   * detail and culling on) while the loop can draw, or a sampled frame
+   * still being read. A paused, lost or disposed viewer draws nothing: the
+   * measurement waits with it.
+   */
+  function frameCostOwesFrames() {
+    if (fullDetailFrameCost.isSampling()) return true;
+    return fullDetailFrameCost.isArmed() && !disposed && !webglContextLost && !renderPaused;
+  }
+
+  /**
+   * Whether the frame just drawn is one of every cell by setting: levels of
+   * detail off (with them on, a person, a session or a caller chose fewer
+   * cells already, and a frame drawn before the levels land is no measure of
+   * the choice), and every presented pane drew every cell. Culling may be on:
+   * a frame of the whole view still draws every cell, and level of detail is
+   * still to decide.
+   */
+  function presentedAtFullDetail() {
+    if (pointCount === 0 || presentedLayout === null) return false;
+    if (hpRenderer.useAdaptiveLOD) return false;
+    for (const pane of presentedLayout.panes) {
+      if (hpRenderer.getCurrentLODLevel(pane.viewId) !== -1) return false;
+    }
+    return true;
+  }
+
+  /**
+   * The frame just drawn, to the opening's frame-cost measurement: the first
+   * answer is of frames of every cell; a verification of the automatic
+   * choice, of frames drawn with it in effect (its trees built and adopted:
+   * until then a frame still draws every cell).
+   */
+  function sampleFullDetailFrameCost() {
+    const measuringFull = fullDetailFrameCost.phase() === 'full';
+    if (measuringFull && pointCount === 0) {
+      // No cells: nothing to measure, and nothing left armed (a scene is not
+      // settled while it is).
+      fullDetailFrameCost.disarm();
+      return;
+    }
+    const eligible = measuringFull ? presentedAtFullDetail() : hpRenderer.isPresentedGeometrySettled();
+    const fewer = measuringFull && eligible ? presentedDrawsFewer() : null;
+    if (fewer !== null && !fewer.lod && !fewer.culling) {
+      // Nothing the page could turn on would draw fewer cells of this frame
+      // (no reduced level for its cells, every cell in view): no answer
+      // could change what is drawn, so no frame is asked for to measure it.
+      // On a GPU that takes seconds a frame, those frames were most of an
+      // opening's time. The next framing is looked at afresh
+      // (`nothing-fewer`).
+      fullDetailFrameCost.disarm();
+      lastSampledDrawsFewer = null;
+      reportFullDetailFrameCost({ kind: 'nothing-fewer' });
+      return;
+    }
+    if (fewer !== null) lastSampledDrawsFewer = fewer;
+    fullDetailFrameCost.frameEnded(eligible);
+  }
+
+  /**
+   * What the automatic choice could draw fewer of in the frame just drawn,
+   * pane by pane: `lod`, a pane whose cells have a reduced level
+   * (`lodLadder`); `culling`, a pane some of whose cells may lie outside
+   * its view (the corners of its cells' bounds, through the camera it was
+   * just drawn with, `recordPaneDraw`, outside the clip volume). Exact where
+   * it says no: a pane whose bounds lie in its view culls nothing.
+   *
+   * @returns {{lod: boolean, culling: boolean}}
+   */
+  function presentedDrawsFewer() {
+    const fewer = { lod: false, culling: false };
+    if (presentedLayout === null) return fewer;
+    for (const pane of presentedLayout.panes) {
+      const dimension = getPublishedDimensionLevel(pane.viewId);
+      const positions = getExactViewPositions(pane.viewId);
+      if (positions.length === 0) continue;
+      if (lodLadder(positions.length / dimension).length > 1) fewer.lod = true;
+      if (!fewer.culling && cellsMayLeaveView(pane.viewId, positions, dimension)) fewer.culling = true;
+    }
+    return fewer;
+  }
+
+  function cellsMayLeaveView(viewId, positions, dimension) {
+    // The camera the pane on screen was last drawn with (a retained pane
+    // keeps its record); none: not known to hold them all.
+    const record = paneDrawRecords.get(viewId);
+    if (record === undefined) return true;
+    const { min, max } = readPositionBounds(positions, dimension);
+    const m = record.mvp;
+    for (let corner = 0; corner < 8; corner++) {
+      const x = corner & 1 ? max[0] : min[0];
+      const y = corner & 2 ? max[1] : min[1];
+      const z = corner & 4 ? max[2] : min[2];
+      const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+      if (!(w > 0)) return true;
+      if (Math.abs(m[0] * x + m[4] * y + m[8] * z + m[12]) > w) return true;
+      if (Math.abs(m[1] * x + m[5] * y + m[9] * z + m[13]) > w) return true;
+      if (Math.abs(m[2] * x + m[6] * y + m[10] * z + m[14]) > w) return true;
+    }
+    return false;
   }
 
   /** The frame-phase driver: this viewer while its loop runs. */
@@ -6787,6 +7348,14 @@ export function createViewer({
         gridBgColor = [1, 1, 1];
         gridColor = [0.7, 0.7, 0.7];
     }
+    // The grey of the cells with no value and the fade of the cells not
+    // read are made from this background (`rendering/read-cell-layer.js`),
+    // and the page's legends show them in the same colours (CSS variables).
+    hpRenderer.setLayerBackground(bgColor);
+    const layerColors = cellLayerColors(bgColor);
+    const pageRoot = canvas.ownerDocument?.documentElement ?? null;
+    StyleManager.setVariable(pageRoot, '--cell-zero-color', `rgb(${layerColors.zero.join(', ')})`);
+    StyleManager.setVariable(pageRoot, '--cell-unread-color', `rgb(${layerColors.unread.join(', ')})`);
     publishPresentedViewStateChange(
       'background',
       focusedViewId
@@ -7446,62 +8015,110 @@ export function createViewer({
     return pane === null ? null : pane.viewId;
   }
 
-  // === Public API ===
-  const publicApi = {
-    setData(payload) {
-      const {
-        positions,
-        colors,
-        transparency,
+  /**
+   * Publish the live points (`setData`, `resizeLiveCells`). `keepView`: the
+   * same dataset with cells added or removed in place, its first cells
+   * unchanged and where they were (`app/open-cells-resize.js`): the camera
+   * and navigation stay; a new dataset starts from its dimension's default
+   * framing. `capacity`: the cells a growth under way reaches
+   * (`HighPerfRenderer#resizeLiveCells`).
+   */
+  function publishLiveData(payload, { keepView, capacity = null }) {
+    const {
+      positions,
+      colors,
+      transparency,
+      dimensionLevel,
+      layoutKey,
+      pointCount: nextPointCount
+    } = assertViewerDataPayload(payload);
+    if (keepView && dimensionLevel !== getPublishedDimensionLevel(LIVE_VIEW_ID)) {
+      throw new RangeError('Cells added or removed in place keep the dimension the live view shows.');
+    }
+    // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
+    // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree).
+    // Cells added or removed in place keep the stores of the cells kept
+    // (`HighPerfRenderer#resizeLiveCells`): only added cells go up.
+    if (keepView) {
+      hpRenderer.resizeLiveCells(positions, colors, {
+        alphaValues: transparency,
         dimensionLevel,
-        layoutKey,
-        pointCount: nextPointCount
-      } = assertViewerDataPayload(payload);
-      // Load data into HP renderer (alpha is packed in colors as RGBA uint8)
-      // Pass dimension level so the renderer can build the appropriate spatial index (BinaryTree/Quadtree/Octree)
+        ...(capacity === null ? {} : { capacity })
+      });
+    } else {
       hpRenderer.loadData(positions, colors, {
         alphaValues: transparency,
         dimensionLevel
       });
+    }
 
-      // The renderer generation is authoritative once loadData returns. The
-      // connectivity graph and every pane's edge records belong to the
-      // superseded dataset, so they go before any later viewer work can
-      // render or throw.
-      edgeLayer.clear();
-      useInstancedEdges = false;
+    // The renderer generation is authoritative once loadData returns. The
+    // connectivity graph and every pane's edge records belong to the
+    // superseded dataset, so they go before any later viewer work can
+    // render or throw.
+    edgeLayer.clear();
+    useInstancedEdges = false;
 
-      highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
-      cancelPendingProjectileBuild(
-        'Projectile preparation was cancelled because the dataset changed.'
-      );
-      projectileSystem.setEnabled(false);
-      pointCount = nextPointCount;
-      positionsArray = positions;
-      colorsArray = colors;
-      transparencyArray = new Uint8Array(transparency);
-      hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
-      computePointBoundsFromPositions(positions, dimensionLevel);
-      viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
-      viewLayoutKeys.set(LIVE_VIEW_ID, layoutKey);
-      publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
-      publishViewDataGeneration(LIVE_VIEW_ID);
-      // A pose belongs to the cells it framed. The outgoing dataset's camera
-      // (its own preset's close-up, say) says nothing about the incoming
-      // cells, and kept as it was it framed a 28,000-cell 2D file from
-      // inside the cloud a 562,000-cell 3D preset had placed it in: a canvas
-      // of giant points. A new scene starts from the default framing of its
-      // dimension, which fits every normalized embedding; a session or a
-      // published preset replayed afterwards still sets its own camera.
+    highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
+    cancelPendingProjectileBuild(
+      'Projectile preparation was cancelled because the dataset changed.'
+    );
+    projectileSystem.setEnabled(false);
+    pointCount = nextPointCount;
+    positionsArray = positions;
+    colorsArray = colors;
+    transparencyArray = new Uint8Array(transparency);
+    hpRenderer._adoptCurrentAlphasOwner(transparencyArray);
+    computePointBoundsFromPositions(positions, dimensionLevel);
+    viewDimensionLevels.set(LIVE_VIEW_ID, dimensionLevel);
+    viewLayoutKeys.set(LIVE_VIEW_ID, layoutKey);
+    publishViewPositions(LIVE_VIEW_ID, positions, dimensionLevel);
+    publishViewDataGeneration(LIVE_VIEW_ID);
+    // A pose belongs to the cells it framed. The outgoing dataset's camera
+    // (its own preset's close-up, say) says nothing about the incoming
+    // cells, and kept as it was it framed a 28,000-cell 2D file from
+    // inside the cloud a 562,000-cell 3D preset had placed it in: a canvas
+    // of giant points. A new scene starts from the default framing of its
+    // dimension, which fits every normalized embedding; a session or a
+    // published preset replayed afterwards still sets its own camera.
+    // Cells added or removed in place keep the pose: the cells shown
+    // before are where they were.
+    if (!keepView) {
       resetViewCameraForDimension(LIVE_VIEW_ID, dimensionLevel);
       applyDimensionNavigationDefault(LIVE_VIEW_ID, dimensionLevel);
-      vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
-      // The smoke volume is the replaced dataset's: its 3D textures and the
-      // copies of its colours and visibility it was built from go now (in
-      // smoke mode the owner builds the new one), instead of staying
-      // resident until the next build.
-      smokeRenderer.clearVolume();
-      publishSmokeSourceChange();
+    }
+    vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
+    // The smoke volume is the replaced dataset's: its 3D textures and the
+    // copies of its colours and visibility it was built from go now (in
+    // smoke mode the owner builds the new one), instead of staying
+    // resident until the next build.
+    smokeRenderer.clearVolume();
+    publishSmokeSourceChange();
+    // A new opening, or its cells grown or cut: measured afresh, once
+    // published. A publication that failed changed nothing, the automatic
+    // choice and its measurement included.
+    armFullDetailFrameCost();
+  }
+
+  // === Public API ===
+  const publicApi = {
+    setData(payload) {
+      publishLiveData(payload, { keepView: false });
+    },
+
+    /**
+     * The live points of the dataset shown, with cells added or removed in
+     * place (`app/open-cells-resize.js`): its first cells are the ones shown
+     * before, where they were. As `setData`, but the camera and navigation
+     * stay. No kept view may be published (they are re-made after).
+     *
+     * @param {Object} payload - As `setData`'s
+     */
+    resizeLiveCells(payload, { capacity = null } = {}) {
+      if (snapshotViews.length > 0) {
+        throw new Error('Cells cannot be added or removed in place while kept views are published.');
+      }
+      publishLiveData(payload, { keepView: true, capacity });
     },
 
     updateColors(colors) {
@@ -7606,9 +8223,10 @@ export function createViewer({
      */
     updatePositions(positions, dimensionLevel) {
       getDefaultNavigationMode(dimensionLevel);
-      assertFiniteFloat32Array(
+      assertCellPositions(
         positions,
         pointCount * dimensionLevel,
+        dimensionLevel,
         'Viewer live positions'
       );
       const previousDimensionLevel =
@@ -7646,6 +8264,9 @@ export function createViewer({
       publishViewDataGeneration(LIVE_VIEW_ID);
       vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
       publishSmokeSourceChange();
+      // Another representation costs another frame: measured afresh, once
+      // published (a publication that failed changed nothing).
+      armFullDetailFrameCost();
     },
 
     /**
@@ -7655,7 +8276,7 @@ export function createViewer({
     getPositions() {
       return positionsArray === null
         ? null
-        : new Float32Array(positionsArray);
+        : copyLargeArray(positionsArray);
     },
 
     /**
@@ -7849,9 +8470,10 @@ export function createViewer({
     setViewPositions(viewId, positions, dimensionLevel) {
       const vid = assertKnownViewId(viewId);
       getDefaultNavigationMode(dimensionLevel);
-      assertFiniteFloat32Array(
+      assertCellPositions(
         positions,
         pointCount * dimensionLevel,
+        dimensionLevel,
         `Positions for view "${vid}"`
       );
       let publishedPositions = positions;
@@ -7939,7 +8561,7 @@ export function createViewer({
      * @returns {Float32Array} Positions array
      */
     getViewPositions(viewId) {
-      return new Float32Array(getExactViewPositions(viewId));
+      return copyLargeArray(getExactViewPositions(viewId));
     },
 
     /**
@@ -8021,7 +8643,12 @@ export function createViewer({
       return pickCellRecordAtScreen(screenX, screenY);
     },
 
-    /** Like pickCellRecordAtScreen, but never builds a missing large index. */
+    /**
+     * Like pickCellRecordAtScreen, but never scans a large pane without its
+     * tree: it asks the worker for the tree and answers
+     * `{viewId, preparing}`, `preparing` settling once the tree is
+     * installed (or failed).
+     */
     pickReadyCellRecordAtScreen(screenX, screenY) {
       return pickReadyCellRecordAtScreen(screenX, screenY);
     },
@@ -8055,8 +8682,21 @@ export function createViewer({
         // nothing until something changes. This, not a wall-clock wait with
         // no draw in it, is when a scene is quiet: a renderer that takes
         // longer per frame than such a wait draws nothing in it while it is
-        // still settling.
-        settled: nextFrameCause(size) === null && settleWindowElapsed(),
+        // still settling. Nor is a scene quiet while the opening's frame
+        // cost is measured and a sampled frame's fence is awaited: the loop
+        // has stopped, but the measurement asks for its next frame when the
+        // fence passes (`full-detail-frame-cost.js`), seconds later on a slow
+        // GPU (Web contracts run 41269083996, macOS Firefox:
+        // idle-frame-scheduling.spec.mjs counted those frames as idle draws);
+        // nor while it is armed at all and the loop can draw: it asks for
+        // the frames it samples, and its answer can turn level of detail and
+        // culling on (`frameCostOwesFrames`).
+        settled: nextFrameCause(size) === null && settleWindowElapsed()
+          && !frameCostOwesFrames(),
+        // That measurement, while it samples ('full': frames of every cell;
+        // 'verify': frames drawn with levels of detail or culling the page
+        // turned on), else null.
+        frameCostPhase: fullDetailFrameCost.phase(),
         invalidated: frameInvalidated,
         animationCause: sceneAnimationCause(),
         canvasResized:
@@ -8334,14 +8974,24 @@ export function createViewer({
       highlightTools.setKnnEdgeLoadCallback(callback);
     },
 
+    // Told when the k-NN tool is left while it holds its graph.
+    setKnnEdgeReleaseCallback(callback) {
+      highlightTools.setKnnEdgeReleaseCallback(callback);
+    },
+
+    // Told when a k-NN expansion could not read the neighbour rows it needed.
+    setKnnFailureCallback(callback) {
+      highlightTools.setKnnFailureCallback(callback);
+    },
+
     getKnnState() {
       return highlightTools.getKnnState();
     },
 
-    // Load the k-NN tool's graph: the edge payload's adjacency over the
-    // published cells (`ConnectivityEdges`).
-    loadKnnEdges(edgeData) {
-      return highlightTools.loadKnnEdges(edgeData, pointCount);
+    // Load the k-NN tool's graph over the published cells: its rows, read
+    // by cell from the file (`KnnRowSource`, selection-gesture-queries.js).
+    loadKnnEdges(rowSource) {
+      return highlightTools.loadKnnEdges(rowSource, pointCount);
     },
 
     clearKnnEdges() {
@@ -8384,93 +9034,7 @@ export function createViewer({
     },
 
   setCentroids(payload) {
-    const {
-      positions,
-      colors,
-      count: nextCentroidCount
-    } = assertCentroidPayload(payload);
-    // The buffers keep their storage when a field has no centroids: the next
-    // field's usually fit, and drawing reads only `centroidCount` points.
-    if (nextCentroidCount === 0) {
-      centroidCount = 0;
-      return;
-    }
-    if (
-      positions.byteLength <= centroidPositionCapacity &&
-      colors.byteLength <= centroidColorCapacity
-    ) {
-      // Writes into accepted storage allocate nothing: only a lost context
-      // refuses them, so no error is read back.
-      requireLiveContext(gl, 'Viewer centroid publication');
-      gl.bindBuffer(gl.ARRAY_BUFFER, centroidPositionBuffer);
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, positions);
-      gl.bindBuffer(gl.ARRAY_BUFFER, centroidColorBuffer);
-      gl.bufferSubData(gl.ARRAY_BUFFER, 0, colors);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      requireLiveContext(gl, 'Viewer centroid publication');
-      centroidCount = nextCentroidCount;
-      return;
-    }
-    requireLiveContext(gl, 'Viewer centroid publication');
-    let candidatePositions = null;
-    let candidateColors = null;
-    try {
-      candidatePositions = gl.createBuffer();
-      candidateColors = gl.createBuffer();
-      if (!candidatePositions || !candidateColors) {
-        throw new Error(
-          'Viewer could not allocate candidate centroid buffers.'
-        );
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, candidatePositions);
-      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, candidateColors);
-      gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      // The one read: a refused allocation must not stay resident.
-      requireCleanWebGLState(gl, 'Viewer candidate centroid publication');
-    } catch (error) {
-      const rollbackFailures = [];
-      try {
-        gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      } catch (rollbackError) {
-        rollbackFailures.push(rollbackError);
-      }
-      queueCentroidSnapshotRetirement({
-        buffer: candidatePositions,
-      });
-      queueCentroidSnapshotRetirement({
-        buffer: candidateColors,
-      });
-      rollbackFailures.push(
-        ...drainCentroidSnapshotRetirements()
-      );
-      if (rollbackFailures.length > 0) {
-        throw new AggregateError(
-          [error, ...rollbackFailures],
-          'Viewer centroid publication failed and rollback was incomplete.'
-        );
-      }
-      throw error;
-    }
-
-    const previousPositions = centroidPositionBuffer;
-    const previousColors = centroidColorBuffer;
-    centroidPositionBuffer = candidatePositions;
-    centroidColorBuffer = candidateColors;
-    centroidPositionCapacity = positions.byteLength;
-    centroidColorCapacity = colors.byteLength;
-    centroidCount = nextCentroidCount;
-    queueCentroidSnapshotRetirement({
-      buffer: previousPositions,
-    });
-    queueCentroidSnapshotRetirement({
-      buffer: previousColors,
-    });
-    reportCommittedRetirementFailures(
-      drainCentroidSnapshotRetirements(),
-      'Live centroid prior generation could not be fully retired.'
-    );
+    publishLiveCentroids(payload);
   },
 
     setCentroidLabels(labels, viewId) {
@@ -8869,13 +9433,29 @@ export function createViewer({
 
     // Smoke renderer API (delegates to SmokeRenderer)
     clearSmokeVolume() { smokeRenderer.clearVolume(); },
-    buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, options); },
+    // The lower layers' colours are made from the view's background (`cellLayerColors`).
+    buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, { ...options, layerColors: cellLayerColors(bgColor) }); },
+    /**
+     * The colours the lower layers are drawn in now, from the view's
+     * background (`rendering/read-cell-layer.js` `cellLayerColors`): what a
+     * cell's colour shows as (`drawnCellRgb`).
+     */
+    getCellLayerColors() { return cellLayerColors(bgColor); },
     hasSmokeVolume() { return smokeRenderer.hasVolume(); },
     getSmokeSupport() { return smokeRenderer.getSupport(); },
-    setSmokeParams(params) { smokeRenderer.setParams(params); },
-    setCloudResolutionScale(scale) { smokeRenderer.setResolutionScale(scale); },
+    setSmokeParams(params) {
+      smokeRenderer.setParams(params);
+      Object.assign(smokeSettings.params, params);
+    },
+    setCloudResolutionScale(scale) {
+      smokeRenderer.setResolutionScale(scale);
+      smokeSettings.resolutionScale = scale;
+    },
     getCloudResolutionScale() { return smokeRenderer.getResolutionScale(); },
-    setNoiseTextureResolution(size) { smokeRenderer.setNoiseTextureResolution(size); },
+    setNoiseTextureResolution(size) {
+      smokeRenderer.setNoiseTextureResolution(size);
+      smokeSettings.noiseResolution = size;
+    },
     getNoiseTextureResolution() { return smokeRenderer.getNoiseTextureResolution(); },
     hasPendingSmokeNoiseGeneration() {
       return smokeRenderer.hasPendingNoiseGeneration();
@@ -8886,6 +9466,48 @@ export function createViewer({
       showConnectivity = assertExactBoolean(show, 'Connectivity visibility');
     },
     getShowConnectivity() { return showConnectivity; },
+
+    /**
+     * Hear when an opening is to be measured (`kind` 'measuring', before
+     * its measurement starts: the render controls turn their own choice off
+     * then); when the GPU's share of a frame drawing every cell of every
+     * presented pane is proven over the interactive budget on this device
+     * (`full-detail-frame-cost.js`): at most once per opening, with the
+     * frame time and GPU share measured (bounds in milliseconds), the
+     * budget, and whether culling could leave a cell out (`kind`
+     * 'too-slow', `cullable`); that nothing the render controls could turn
+     * on would draw fewer cells of the frame, so it is not measured (`kind`
+     * 'nothing-fewer'); and whether the frames drawn with the render
+     * controls' choice are faster (`kind` 'verified': `verdict` 'faster',
+     * 'not-faster' or 'unresolved', with both frame times). Each names the
+     * opening it belongs to (`opening`, as `onPerformanceSettingsChanged`).
+     *
+     * @param {(cost: {kind: 'measuring'|'too-slow'|'nothing-fewer'|'verified', opening: number,
+     *   frame?: {lo: number, hi: number}, gpu?: {lo: number, hi: number}, fullFrame?: {lo: number, hi: number},
+     *   verdict?: 'faster'|'not-faster'|'unresolved', budgetMilliseconds?: number, cullable?: boolean}) => void} listener
+     * @returns {() => void} Unsubscribe.
+     */
+    onFullDetailFrameCost(listener) {
+      const exactListener = assertExactFunction(listener, 'Full-detail frame cost listener');
+      fullDetailFrameCostListeners.add(exactListener);
+      return () => fullDetailFrameCostListeners.delete(exactListener);
+    },
+    /**
+     * Hear every call that sets level of detail or frustum culling
+     * (`setAdaptiveLOD`, `setFrustumCulling`), whoever made it, with the
+     * opening it was made in: the number `onFullDetailFrameCost` reports
+     * carry. The render controls tell their own calls from a caller's (a
+     * benchmark configuration, a notebook, a test), whose setting is that
+     * opening's choice.
+     *
+     * @param {(change: {opening: number}) => void} listener
+     * @returns {() => void} Unsubscribe.
+     */
+    onPerformanceSettingsChanged(listener) {
+      const exactListener = assertExactFunction(listener, 'Performance settings listener');
+      performanceSettingsListeners.add(exactListener);
+      return () => performanceSettingsListeners.delete(exactListener);
+    },
     setConnectivityLineWidth(width) {
       connectivityLineWidth = assertFiniteNumberInRange(
         width,
@@ -9446,7 +10068,10 @@ export function createViewer({
       // assertSnapshotConfig). Transparency is published from the caller's
       // array and copied into the view's own owner (made at creation) only
       // once the publication succeeded, so a failed one leaves the accepted
-      // generation intact without a new array per update.
+      // generation intact without a new array per update. The renderer keeps
+      // the accepted transparency by reference (it holds no copy of the
+      // view's R8 image), so it is handed the view's owner back at once: the
+      // caller's array is application state, rewritten in place.
       const nextColors = colorsChanged
         ? assertExactUint8Array(
             attrs.colors,
@@ -9570,7 +10195,10 @@ export function createViewer({
       }
 
       snap.colors = nextColors;
-      if (transparencyChanged) snap.transparency.set(nextTransparency);
+      if (transparencyChanged) {
+        snap.transparency.set(nextTransparency);
+        hpRenderer._adoptSnapshotAlphasOwner(exactId, snap.transparency);
+      }
       if (visibilityMoved && edgeLayer.hasView(exactId)) {
         edgeLayer.publishVisibility(
           exactId,
@@ -9934,7 +10562,7 @@ export function createViewer({
             resolve();
             return;
           }
-          if (gl.clientWaitSync(fence, 0, 0) === gl.TIMEOUT_EXPIRED) {
+          if (!fenceHasPassed(gl, fence)) {
             setTimeout(poll, 0);
             return;
           }
@@ -10245,6 +10873,7 @@ export function createViewer({
      *   geometryGeneration: number,
      *   lodMembership: Object|null,
      *   lodSizeMultiplier: number,
+     *   pointLayers: {readSizeMultiplier: number, readEveryLevel: boolean},
      *   certificate: Object
      * }}
      */
@@ -10378,6 +11007,8 @@ export function createViewer({
           owner.geometryGeneration,
           owner.lodLevel,
           owner.lodSizeMultiplier,
+          owner.readSizeMultiplier,
+          owner.readEveryLevel,
           lodGenerationId,
           cameraKey,
           layoutKey,
@@ -10437,6 +11068,11 @@ export function createViewer({
         geometryGeneration: owner.geometryGeneration,
         lodMembership: presentedLodMembership,
         lodSizeMultiplier: owner.lodSizeMultiplier,
+        // The cells read: their size and whether drawn at every level.
+        pointLayers: Object.freeze({
+          readSizeMultiplier: owner.readSizeMultiplier,
+          readEveryLevel: owner.readEveryLevel,
+        }),
         certificate
       });
     },
@@ -10456,16 +11092,50 @@ export function createViewer({
       hpRenderer.setFrustumCulling(
         assertExactBoolean(enabled, 'Frustum culling')
       );
+      reportPerformanceSettings();
+    },
+    /**
+     * The priority of the published cells: the order every LOD level admits
+     * them in (`HighPerfRenderer.setCellPriority`).
+     */
+    setCellPriority(priority) {
+      hpRenderer.setCellPriority(priority);
     },
     setAdaptiveLOD(enabled) {
       hpRenderer.setAdaptiveLOD(
         assertExactBoolean(enabled, 'Adaptive LOD')
       );
+      // Turned on, by whoever: the opening's choice is made.
+      if (enabled) fullDetailFrameCost.disarm();
+      reportPerformanceSettings();
     },
+    /**
+     * Measure the current framing afresh (`armFullDetailFrameCost`): the
+     * render controls ask for it at the next framing after their automatic
+     * choice was measured no faster.
+     */
+    measureFullDetailFrameCost() {
+      armFullDetailFrameCost();
+    },
+    /**
+     * Measure the frames drawn now, with the render controls' automatic
+     * choice on, against the opening's frames of every cell: a `verified`
+     * report (`onFullDetailFrameCost`) says whether they are faster.
+     */
+    verifyFullDetailFrameCost() {
+      fullDetailFrameCost.verify();
+    },
+    // A level of the ladder (`rendering/high-perf/draw-order.js`
+    // `lodLadder`), -1 for Auto; one past the cells shown draws the last.
     setForceLOD(level) {
       hpRenderer.setForceLOD(
-        assertIntegerInRange(level, -1, 17, 'Forced LOD level')
+        assertIntegerInRange(level, -1, LOD_FULL_DETAIL_ADMISSION_LEVEL - 1, 'Forced LOD level')
       );
+    },
+    // Levels of detail of the live cells (the forced-level slider's range):
+    // the ladder of their count, whether or not they are drawn yet.
+    getLODLevelCount() {
+      return pointCount > 0 ? lodLadder(pointCount).length : 0;
     },
     hasRendererStats(viewId) {
       return hpRenderer.hasStats(assertKnownViewId(viewId));
@@ -10582,6 +11252,32 @@ export function createViewer({
 
     isContextLost() {
       return webglContextLost;
+    },
+
+    /**
+     * Follow the graphics context: `listener(phase)` hears `lost` when the
+     * browser takes it away, `restored` once every GPU object was made again
+     * from the CPU (an owner whose input the app computes, such as the
+     * velocity field, draws it again then), and `failed` when it could not
+     * be restored (the viewer stays fenced; Reload is offered).
+     *
+     * @param {(phase: 'lost'|'restored'|'failed') => void} listener
+     * @returns {() => void} Unsubscribe.
+     */
+    onGraphicsReset(listener) {
+      const exactListener = assertExactFunction(listener, 'Graphics reset listener');
+      graphicsResetListeners.add(exactListener);
+      return () => graphicsResetListeners.delete(exactListener);
+    },
+
+    /**
+     * What the notice's Save session does: write the session captured when
+     * the graphics were lost (null: the notice offers no Save session).
+     *
+     * @param {(() => Promise<void>)|null} saver
+     */
+    setGraphicsResetSessionSaver(saver) {
+      graphicsResetSessionSaver = saver === null ? null : assertExactFunction(saver, 'Graphics reset session saver');
     },
 
     isDisposalSettled() {
@@ -10743,6 +11439,10 @@ export function createViewer({
 	      attempt('connectivity edge retirement', () => {
 	        edgeLayer.dispose();
 	      });
+	      attempt('full-detail frame measurement retirement', () => {
+	        if (webglContextLost) fullDetailFrameCost.handleContextLost();
+	        else fullDetailFrameCost.dispose();
+	      });
 	      attempt('high-performance renderer retirement', () => {
 	        disposeHpRenderer();
 	      });
@@ -10829,6 +11529,14 @@ export function createViewer({
 	      attempt('viewer cache retirement', () => {
 	        retireViewerCpuCaches();
 	      });
+	      // The checks still waiting for their fence (`deferWebGLErrorCheck`)
+	      // are of the owners retired above: none is read, and none asks for
+	      // another frame to poll in. On a GPU that takes seconds a frame,
+	      // their polls went on after the RAF fence (Web contracts run
+	      // 41269083996, macOS Firefox, viewer-terminal-disposal.spec.mjs).
+	      attempt('deferred WebGL error check retirement', () => {
+	        cancelDeferredWebGLErrorChecks(gl);
+	      });
 
 	      if (failures.length > 0) {
 	        throw new AggregateError(
@@ -10862,7 +11570,7 @@ export function createViewer({
       if (disposed) {
         throw createViewerDisposedError(methodName);
       }
-      if (webglContextLost) {
+      if (webglContextLost && !isContextLossReadableMethodName(methodName)) {
         throw createViewerContextLostError(
           `Viewer method "${methodName}"`
         );

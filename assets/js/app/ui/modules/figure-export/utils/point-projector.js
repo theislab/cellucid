@@ -12,8 +12,10 @@
  * - Early culling of clipped points
  *
  * TRANSPARENCY HANDLING:
- * - Accepts separate Uint8 transparency array (0 or 1) OR uses RGBA alpha (0..255)
- * - Transparency array takes precedence when provided
+ * - The caller names what the colours' alpha byte is (`colorAlpha`,
+ *   `requireColorAlphaMeaning`): the cells' layer (visibility is then the
+ *   Uint8 transparency, 0 or 1, every cell shown without one) or a marker's
+ *   own opacity (0..255; a transparency, when given, takes precedence)
  * - Points with alpha < 0.01 are skipped for performance
  *
  * DEPTH SORTING:
@@ -31,11 +33,13 @@
  */
 
 import { requirePositionArray } from '../../../../../rendering/position-layout.js';
+import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, requireColorAlphaMeaning } from '../../../../../rendering/alpha-visibility.js';
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
 import {
   assertDrawOrder,
   assertLodMembership,
   drawnSequence,
+  requireFigurePointLayers,
   POINT_VISIBILITY_THRESHOLD,
 } from './lod-membership.js';
 
@@ -63,16 +67,23 @@ import {
  * @param {1|2|3} options.dimension - components per position (axes the
  *   embedding does not have are zero)
  * @param {Uint8Array|null} options.colors - length = n*4 (RGBA)
+ * @param {'layer'|'opacity'} options.colorAlpha - What the colours' alpha
+ *   byte is (`requireColorAlphaMeaning`): the cells' layer, drawn beneath
+ *   first, or a marker's opacity.
  * @param {Uint8Array|null} [options.transparency] - optional length = n (0 or 1)
  * @param {RenderStateLike} options.renderState
  * @param {PlotRect} options.plotRect
  * @param {number} [options.radiusPx]
- * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
  * @param {Uint32Array|null} [options.drawOrder] - The pane's full-detail draw
  *   order (`drawnSequence`); null draws in source order.
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop] - optional framing crop in normalized viewport coords
  * @param {boolean} [options.sortByDepth] - if true, draw back-to-front using binned depth ordering
  * @param {number} [options.depthBins]
+ * @param {import('./lod-membership.js').FigurePointLayers|null} [options.pointLayers] -
+ *   While some cells are not read: they come first in their own colour at
+ *   `radiusPx` (before every depth-sorted cell, as the pane draws them
+ *   without depth writes), the cells read at `radiusPx * readScale`.
  * @param {(x: number, y: number, r: number, g: number, b: number, a: number, radius: number, index: number) => void} options.onPoint
  * @returns {{ drawn: number, skipped: number }}
  */
@@ -80,6 +91,7 @@ export function forEachProjectedPoint({
   positions,
   dimension,
   colors,
+  colorAlpha,
   transparency = null,
   renderState,
   plotRect,
@@ -89,11 +101,25 @@ export function forEachProjectedPoint({
   crop = null,
   sortByDepth = false,
   depthBins = 256,
+  pointLayers = null,
   onPoint
 }) {
+  const alphaIsOpacity = requireColorAlphaMeaning(colorAlpha, 'Figure-export projected colours') === 'opacity';
+  const layers = alphaIsOpacity ? null : requireFigurePointLayers(pointLayers, 'Figure-export projected point layers');
+  const unreadRgb = layers === null ? null : layers.unreadColor.map(channel => Math.round(channel * 255));
+  const zeroRgb = layers === null ? null : layers.zeroColor.map(channel => Math.round(channel * 255));
+  const readRadiusPx = radiusPx * (layers === null ? 1 : layers.readScale);
+  const isUnread = i => layers !== null && colors[i * 4 + 3] === UNREAD_ALPHA_BYTE;
+  // The grey of the cells with no value is drawn in the figure's own (`zeroCellColor`).
+  const isZero = i => zeroRgb !== null && colors[i * 4 + 3] === BENEATH_ALPHA_BYTE;
   if (!positions || !colors || !renderState?.mvpMatrix) {
     return { drawn: 0, skipped: 0 };
   }
+  // A point's opacity: its transparency, else (a marker's) its alpha byte,
+  // else shown.
+  const opacityOf = i => (
+    transparency ? (transparency[i] ?? 1.0) : (alphaIsOpacity ? colors[i * 4 + 3] / 255 : 1.0)
+  );
 
   const positionCount = requirePositionArray(
     positions,
@@ -106,7 +132,7 @@ export function forEachProjectedPoint({
     pointCount: positionCount,
   });
   assertDrawOrder(drawOrder, { pointCount: positionCount });
-  const admittedIndices = drawnSequence(lodMembership, drawOrder);
+  const admittedIndices = drawnSequence(lodMembership, drawOrder, alphaIsOpacity ? null : colors, layers?.readEveryLevel === true);
   const candidateCount = admittedIndices?.length ?? n;
   const mvp = renderState.mvpMatrix;
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
@@ -133,9 +159,49 @@ export function forEachProjectedPoint({
   let drawn = 0;
   let skipped = n - candidateCount;
 
+  // A point at index `i` projected into the plot, or false where it is not
+  // drawn: x, y in `projected`.
+  const projected = [0, 0];
+  const project = i => {
+    const rawAlpha = opacityOf(i);
+    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
+    if (alpha < 0) alpha = 0;
+    else if (alpha > 1) alpha = 1;
+    if (alpha < POINT_VISIBILITY_THRESHOLD) return 0;
+    const ix = i * dimension;
+    const x = positions[ix];
+    const y = dimension > 1 ? positions[ix + 1] : 0;
+    const z = dimension > 2 ? positions[ix + 2] : 0;
+    const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+    if (!Number.isFinite(clipW) || clipW <= 0) return 0;
+    const ndcX = (mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12]) / clipW;
+    const ndcY = (mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13]) / clipW;
+    const ndcZ = (mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14]) / clipW;
+    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) return 0;
+    const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
+    const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
+    if (hasCrop && (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH)) return 0;
+    projected[0] = offsetX + (viewportX - srcX0) * scale;
+    projected[1] = offsetY + (viewportY - srcY0) * scale;
+    return alpha;
+  };
+
   // The binned sort is O(n) in time and memory, so a requested depth sort is
   // honoured at every point count.
   if (sortByDepth) {
+    // Cells not read lead the sequence (`drawnSequence`) and lie under every
+    // cell read whatever their depth: drawn first, in sequence order.
+    let unreadDrawn = 0;
+    if (layers !== null) {
+      for (let candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
+        const i = admittedIndices === null ? candidateIndex : admittedIndices[candidateIndex];
+        if (!isUnread(i)) break;
+        const alpha = project(i);
+        if (alpha === 0) continue;
+        onPoint(projected[0], projected[1], unreadRgb[0], unreadRgb[1], unreadRgb[2], alpha, radiusPx, i);
+        unreadDrawn++;
+      }
+    }
     let bins = depthBins | 0;
     if (bins < 16) bins = 16;
     else if (bins > 1024) bins = 1024;
@@ -151,7 +217,8 @@ export function forEachProjectedPoint({
       const i = admittedIndices === null
         ? candidateIndex
         : admittedIndices[candidateIndex];
-      const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+      if (isUnread(i)) continue;
+      const rawAlpha = opacityOf(i);
       let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
       if (alpha < 0) alpha = 0;
       else if (alpha > 1) alpha = 1;
@@ -185,7 +252,7 @@ export function forEachProjectedPoint({
       total++;
     }
 
-    if (total === 0) return { drawn: 0, skipped: n };
+    if (total === 0) return { drawn: unreadDrawn, skipped: n - unreadDrawn };
 
     // Prefix sums -> offsets.
     const offsets = new Uint32Array(bins);
@@ -211,7 +278,8 @@ export function forEachProjectedPoint({
       const i = admittedIndices === null
         ? candidateIndex
         : admittedIndices[candidateIndex];
-      const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+      if (isUnread(i)) continue;
+      const rawAlpha = opacityOf(i);
       let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
       if (alpha < 0) alpha = 0;
       else if (alpha > 1) alpha = 1;
@@ -259,9 +327,10 @@ export function forEachProjectedPoint({
 
       const cj = i * 4;
       const oj = slot * 4;
-      outRGBA[oj] = colors[cj];
-      outRGBA[oj + 1] = colors[cj + 1];
-      outRGBA[oj + 2] = colors[cj + 2];
+      const zero = isZero(i);
+      outRGBA[oj] = zero ? zeroRgb[0] : colors[cj];
+      outRGBA[oj + 1] = zero ? zeroRgb[1] : colors[cj + 1];
+      outRGBA[oj + 2] = zero ? zeroRgb[2] : colors[cj + 2];
       outRGBA[oj + 3] = colors[cj + 3];
       outA[slot] = alpha;
       outIndex[slot] = i;
@@ -275,11 +344,12 @@ export function forEachProjectedPoint({
         const a = outA[s];
         if (a < POINT_VISIBILITY_THRESHOLD) continue;
         const oj = s * 4;
-        onPoint(outX[s], outY[s], outRGBA[oj], outRGBA[oj + 1], outRGBA[oj + 2], a, radiusPx, outIndex[s]);
+        onPoint(outX[s], outY[s], outRGBA[oj], outRGBA[oj + 1], outRGBA[oj + 2], a, readRadiusPx, outIndex[s]);
         drawn++;
       }
     }
 
+    drawn += unreadDrawn;
     skipped = Math.max(0, n - drawn);
     return { drawn, skipped };
   }
@@ -292,7 +362,7 @@ export function forEachProjectedPoint({
     const i = admittedIndices === null
       ? candidateIndex
       : admittedIndices[candidateIndex];
-    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    const rawAlpha = opacityOf(i);
     let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (alpha < 0) alpha = 0;
     else if (alpha > 1) alpha = 1;
@@ -339,7 +409,9 @@ export function forEachProjectedPoint({
     const py = offsetY + (viewportY - srcY0) * scale;
 
     const j = i * 4;
-    onPoint(px, py, colors[j], colors[j + 1], colors[j + 2], alpha, radiusPx, i);
+    if (isUnread(i)) onPoint(px, py, unreadRgb[0], unreadRgb[1], unreadRgb[2], alpha, radiusPx, i);
+    else if (isZero(i)) onPoint(px, py, zeroRgb[0], zeroRgb[1], zeroRgb[2], alpha, readRadiusPx, i);
+    else onPoint(px, py, colors[j], colors[j + 1], colors[j + 2], alpha, layers === null ? radiusPx : readRadiusPx, i);
     drawn++;
   }
 

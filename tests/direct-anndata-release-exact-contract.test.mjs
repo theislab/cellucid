@@ -62,17 +62,15 @@ test('the AnnData reader reports every required resource-release failure', () =>
   assert.notEqual(reader._store, null, 'the store whose release failed stays owned');
 });
 
-test('direct AnnData sources propagate cache-release failures', () => {
-  for (const source of [new AnnDataFileSource(), new AnnDataFileSource()]) {
-    const releaseFailure = new Error(`${source.getType()} cache release failed`);
-    source.clearCaches = () => {
-      throw releaseFailure;
-    };
-    assert.throws(
-      () => source.onDeactivate(),
-      (error) => error === releaseFailure
-    );
-  }
+test('a direct AnnData source no longer shown propagates a cache-release failure', () => {
+  const source = new AnnDataFileSource();
+  const releaseFailure = new Error(`${source.getType()} cache release failed`);
+  source._adapter = { clearCaches: () => { throw releaseFailure; } };
+  assert.throws(
+    () => source.suspend(),
+    (error) => error === releaseFailure
+  );
+  source._adapter = null;
 });
 
 test('direct AnnData connectivity access without an active adapter is terminal', async () => {

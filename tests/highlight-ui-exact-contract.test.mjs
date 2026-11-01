@@ -225,6 +225,12 @@ function createCategoryHighlightState() {
     removeHighlightGroup() {
       return true;
     },
+    highlightGroupRecord() {
+      return null;
+    },
+    restoreHighlightGroup() {
+      return false;
+    },
     toggleHighlightEnabled() {
       return true;
     },
@@ -824,6 +830,12 @@ test('highlight pages reject alternate page schemas before rebuilding the tab st
     combineHighlightPages() {},
     createHighlightPage() {},
     deleteHighlightPage() {},
+    highlightPageRecord() {
+      return null;
+    },
+    restoreHighlightPage() {
+      return false;
+    },
     ensureHighlightPage() {},
     getActivePageId() {
       return page.id;
@@ -891,6 +903,12 @@ test('highlight summary rejects state-operation no-ops instead of accepting them
     removeHighlightGroup() {
       return false;
     },
+    highlightGroupRecord() {
+      return null;
+    },
+    restoreHighlightGroup() {
+      return false;
+    },
     toggleHighlightEnabled() {
       return false;
     }
@@ -952,6 +970,12 @@ test('highlight summary rejects alternate group schemas before mutating the DOM'
       return 1;
     },
     removeHighlightGroup() {
+      return true;
+    },
+    highlightGroupRecord(id) {
+      return { group: { id, label: id }, pageId: 'page_1', index: 0, cells: null };
+    },
+    restoreHighlightGroup() {
       return true;
     },
     toggleHighlightEnabled() {

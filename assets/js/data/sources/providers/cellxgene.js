@@ -7,7 +7,13 @@
  * be opened from a link (the error says so and what to do instead).
  *
  * Accepts a dataset id (a UUID), a Discover Explorer link
- * (`cellxgene.cziscience.com/e/<dataset_id>.cxg/`), or `cellxgene:<id>`.
+ * (`cellxgene.cziscience.com/e/<dataset_id>.cxg/`), or `cellxgene:<id>`;
+ * and a Census copy's own address (`s3://cellxgene-census-public-us-west-2/
+ * cell-census/<build>/h5ads/<id>.h5ad`, as the Census documentation hands
+ * it out, or any HTTPS address of it), opened as `cellxgene:census/<build>/
+ * <id>`: the same bytes by either route are one dataset (`cellxgene:<id>`,
+ * version `census:<build>`), so its sessions, annotations and what this
+ * browser keeps of it carry over.
  *
  * Opening costs two dependent round trips, the release list and then the
  * file's probe, and usually one: the release this browser read last is
@@ -19,8 +25,10 @@
  * @module data/sources/providers/cellxgene
  */
 
-import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultOfResponse } from '../../data-source.js';
 import { describeRemoteFile } from '../remote-file.js';
+import { fileFormatOfName, titleOfName } from '../../input-formats.js';
+import { cancel } from '../../../utils/abort.js';
 
 export const CENSUS_BUCKET_URL =
   'https://cellxgene-census-public-us-west-2.s3.us-west-2.amazonaws.com';
@@ -29,6 +37,48 @@ export const CENSUS_BUCKET_URL =
 const RELEASE_MEMORY_KEY = 'cellucid:cellxgene-census-release';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** The Census bucket's name, which every address of a copy names (`CENSUS_BUCKET_URL`). */
+const CENSUS_BUCKET = 'cellxgene-census-public-us-west-2';
+
+/** A copy's key in the bucket: `cell-census/<build>/h5ads/<file>`, the file `<id>.h5ad`. */
+const CENSUS_COPY = /^\/?cell-census\/([0-9]{4}-[0-9]{2}-[0-9]{2})\/h5ads\/([^/]+)$/;
+
+/**
+ * `census/<build>/<id>` for an address of a Census copy: `s3://<bucket>/<key>`,
+ * the bucket's virtual-hosted address on any S3 endpoint, or a path-style
+ * one; else null.
+ */
+function censusCopyOf(text) {
+  let bucket;
+  let key;
+  const uri = /^s3:\/\/([^/]+)(\/.*)$/i.exec(text);
+  if (uri !== null) {
+    [, bucket, key] = uri;
+  } else {
+    let url;
+    try {
+      url = new URL(text);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== 'https:' || url.search !== '') return null;
+    const host = url.hostname.toLowerCase();
+    if (!/(^|\.)s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com$/.test(host)) return null;
+    if (host.startsWith(`${CENSUS_BUCKET}.`)) {
+      bucket = CENSUS_BUCKET;
+      key = url.pathname;
+    } else {
+      const parts = url.pathname.split('/');
+      bucket = parts[1];
+      key = `/${parts.slice(2).join('/')}`;
+    }
+  }
+  const copy = bucket === CENSUS_BUCKET ? CENSUS_COPY.exec(key.toLowerCase()) : null;
+  if (copy === null || fileFormatOfName(copy[2])?.format !== 'h5ad') return null;
+  const id = titleOfName(copy[2]);
+  return UUID.test(id) ? `census/${copy[1]}/${id}` : null;
+}
 
 function refuse(message, details) {
   return new DataSourceError(message, DataSourceErrorCode.UNSUPPORTED, 'link', details);
@@ -43,6 +93,10 @@ function parseCellxgene(input) {
   const text = input.trim();
   const lower = text.toLowerCase();
   if (UUID.test(lower)) return lower;
+  const named = /^census\/([0-9]{4}-[0-9]{2}-[0-9]{2})\/([0-9a-f-]{36})$/.exec(lower);
+  if (named !== null && UUID.test(named[2])) return lower;
+  const copy = censusCopyOf(text);
+  if (copy !== null) return copy;
   const prefixed = /^(collection|version)\/([0-9a-f-]{36})$/.exec(lower);
   if (prefixed !== null && UUID.test(prefixed[2])) return lower;
   let url;
@@ -77,6 +131,8 @@ async function latestCensusRelease(signal) {
     cache: 'no-cache',
   });
   if (!response.ok) {
+    const fault = hostFaultOfResponse(response, 'the Census release list', { url: `${CENSUS_BUCKET_URL}/cell-census/release.json` });
+    if (fault !== null) throw fault;
     throw new DataSourceError(
       `The CELLxGENE Census release list could not be read (HTTP ${response.status}).`,
       DataSourceErrorCode.NETWORK_ERROR,
@@ -129,11 +185,16 @@ export default Object.freeze({
   capabilities: Object.freeze({
     folders: false,
     private: 'none',
+    public: true,
     versions: false,
     write: false,
   }),
   match(input) {
     return parseCellxgene(input);
+  },
+  /** A value carries nothing that grants access: it is shown as it is. */
+  publicValue(value) {
+    return value;
   },
   async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseCellxgene(value);
@@ -144,6 +205,26 @@ export default Object.freeze({
         'link',
         { input: value }
       );
+    }
+    if (parsed.startsWith('census/')) {
+      // A copy named by its build: those bytes, under the dataset's identity.
+      const [, build, id] = parsed.split('/');
+      onStep?.(`Checking the dataset in Census ${build}`);
+      const file = await describeRemoteFile({
+        url: `${CENSUS_BUCKET_URL}/cell-census/${build}/h5ads/${id}.h5ad`,
+        id: `cellxgene:${id}`,
+        name: `${id}.h5ad`,
+        title: `CELLxGENE ${id}`,
+        version: `census:${build}`,
+        attribution: {
+          title: `CELLxGENE Discover dataset ${id}`,
+          url: `https://cellxgene.cziscience.com/e/${id}.cxg/`,
+          licence: 'CC BY 4.0',
+          via: `CZ CELLxGENE Census ${build}`,
+        },
+        signal,
+      });
+      return { title: `CELLxGENE ${id}`, file, attribution: file.attribution };
     }
     const [kind, id] = parsed.includes('/') ? parsed.split('/') : ['dataset', parsed];
     if (kind === 'collection') {
@@ -197,7 +278,7 @@ export default Object.freeze({
       remembered.h5adsUrl === release.h5adsUrl;
     let probe = speculative;
     if (!same) {
-      early.abort(new DOMException('A newer Census release is read instead.', 'AbortError'));
+      cancel(early, 'superseded', 'A newer Census release is read instead.');
       onStep?.(`Checking the dataset in Census ${release.build}`);
       probe = describeIn(release, signal);
     }

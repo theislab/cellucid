@@ -15,12 +15,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  DATASET_VIEW_LOAD_SUPERSEDED_CODE,
   DataStateViewMethods,
 } from '../assets/js/app/state/managers/view-manager.js';
 import {
   createDataState,
 } from '../assets/js/app/state/core/data-state.js';
+import { cancellationKind, isCancellation } from '../assets/js/utils/abort.js';
 
 function createDeferred() {
   let reject;
@@ -56,6 +56,10 @@ function createLayoutManagerStub({
   return {
     viewLayouts,
     enabled,
+    // What the memory model counts of a layout manager: these hold no
+    // layout no view shows.
+    unshownBytes: () => 0,
+    trimUnshown: () => null,
     getDefaultDimension() {
       return Math.max(...defaults.keys());
     },
@@ -558,7 +562,7 @@ test('real DataState rejects deferred coordinates after dataset-owner replacemen
   ]));
   await assert.rejects(
     representationChange,
-    error => error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE,
+    error => cancellationKind(error) === 'superseded',
   );
   assert.strictEqual(state.dimensionManager, replacementManager);
   assert.strictEqual(state.positionsArray, replacementPositions);
@@ -590,7 +594,7 @@ test('real DataState rejects deferred coordinates after terminal viewer disposal
 
   await assert.rejects(
     representationChange,
-    error => error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE,
+    error => cancellationKind(error) === 'superseded',
   );
   assert.deepEqual(runtime.calls.positionPublications, []);
   assert.deepEqual(runtime.calls.dimensionPublications, []);
@@ -658,7 +662,7 @@ test('real DataState rejects deferred vectors after manager and dataset replacem
 
   await assert.rejects(
     vectorLoad,
-    error => error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE,
+    error => cancellationKind(error) === 'superseded',
   );
   assert.strictEqual(
     state.getVectorFieldManager(),

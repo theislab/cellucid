@@ -4,8 +4,9 @@
  * array-store model (`formats/store.js`) and therefore identically for an
  * `.h5ad` (HDF5) and an AnnData Zarr store.
  *
- * Everything here is synchronous: a store is opened with its whole node tree,
- * so element rules never read array values. Files from earlier anndata
+ * Everything here is synchronous over a loaded store: whoever judges an
+ * element loads it first (`Group.load`, `ANNDATA_OPENING_PATHS` at open),
+ * and element rules never read array values. Files from earlier anndata
  * releases are presented in the current layout before these rules see them
  * (`older-layouts.js`), so there is one set of rules.
  *
@@ -31,6 +32,41 @@ import { formatCountOf } from '../../utils/format-units.js';
 export const H5AD_FORMAT = Object.freeze({ storage: 'HDF5', file: 'H5AD' });
 /** @type {AnnDataFormat} */
 export const ZARR_FORMAT = Object.freeze({ storage: 'Zarr', file: 'AnnData Zarr' });
+
+/**
+ * What opening an AnnData group loads (`formats/store.js`, `Group.load`):
+ * every element's own node -- the group to depth 2: each dataframe column,
+ * each `obsm`, `varm`, `obsp`, `varp` and `layers` entry and each `uns`
+ * entry, with its attributes, shape and element type; `raw` the same -- and
+ * every expression matrix whole (`X`, `layers`, `raw.X`: opening prices the
+ * default one, and a gene of any is read without waiting for its
+ * structure), with `uns['cellucid']`. So anything that names an element
+ * finds it loaded, whatever step of the opening or which reading names it.
+ * What waits is what lies inside an element: a categorical's codes and
+ * categories, a nullable column's values and mask, a graph's arrays, a
+ * nested `uns` entry's children (about half of a CELLxGENE file's objects:
+ * HLCA's 259); the reading that reads an element loads it first
+ * (`AnnDataReader._ready`).
+ */
+export const ANNDATA_OPENING_PATHS = Object.freeze([
+  Object.freeze({ path: '', depth: 2 }),
+  Object.freeze({ path: 'X', depth: Infinity }),
+  Object.freeze({ path: 'layers', depth: Infinity }),
+  Object.freeze({ path: 'raw', depth: 2 }),
+  Object.freeze({ path: 'raw/X', depth: Infinity }),
+  Object.freeze({ path: 'uns/cellucid', depth: Infinity }),
+]);
+
+/**
+ * `ANNDATA_OPENING_PATHS` of the AnnData group at `prefix` (a MuData
+ * modality's: `mod/rna`, or `mod/*` for every one).
+ *
+ * @param {string} prefix
+ * @returns {Array<{path: string, depth: number}>}
+ */
+export function annDataOpeningPaths(prefix) {
+  return ANNDATA_OPENING_PATHS.map(({ path, depth }) => ({ path: path === '' ? prefix : `${prefix}/${path}`, depth }));
+}
 
 /** Encodings of nullable dataframe columns (anndata 0.1.0 element specs). */
 export const NULLABLE_ENCODINGS = Object.freeze(new Set([
@@ -233,9 +269,8 @@ export function validateDataFrame(node, format, label) {
     seen.add(key);
   }
   if (!node.has(indexKey)) throw new Error(`${label} index child '${indexKey}' was not found`);
-  for (const key of columnOrder) {
-    if (!node.has(key)) throw new Error(`${label} declared column '${key}' was not found`);
-  }
+  // A declared column that is not there is that column's defect, left out
+  // of the dataset with the reason (`dataframe.js` `columnDefect`).
   // Files from anndata 0.7 keep categories there; they are read through
   // `older-layouts.js`, so one here, unless it is a column of that name, is
   // a dataframe that mixes two layouts.

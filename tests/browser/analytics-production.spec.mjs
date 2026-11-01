@@ -47,10 +47,18 @@ async function routeProduction(context) {
   const google = [];
   await context.route(`${PRODUCTION_ORIGIN}/**`, async route => {
     const url = new URL(route.request().url());
-    const response = await route.fetch({
-      url: appUrl(`${url.pathname}${url.search}`),
-    });
-    await route.fulfill({ response });
+    try {
+      const response = await route.fetch({
+        url: appUrl(`${url.pathname}${url.search}`),
+      });
+      await route.fulfill({ response });
+    } catch (error) {
+      // A page navigated away (the next viewer URL) lets go of the requests
+      // it still had in flight, and their fetched responses with them
+      // (Web contracts run 41269083996, Windows Chromium: "Fetch response
+      // has been disposed"). Nothing waits for them; anything else fails.
+      if (!/has been disposed|has been closed/.test(String(error?.message))) throw error;
+    }
   });
   await context.route('https://www.googletagmanager.com/**', route => {
     google.push(route.request().url());
@@ -142,6 +150,18 @@ test('a production session sends exactly the declared events', async ({
   await runSession(page, PRODUCTION_ORIGIN, (name, outcome) => (
     waitForEvent(page, name, outcome)
   ));
+  // Whether the browser recorded a largest contentful paint at all: it
+  // stops at the first input (here the Escape that closes the welcome
+  // dialog), so a runner that painted no text or image before it has none
+  // to report. Every one it has must be reported.
+  const browserHasLcp = await page.evaluate(() => {
+    if (!PerformanceObserver.supportedEntryTypes?.includes('largest-contentful-paint')) return false;
+    const observer = new PerformanceObserver(() => {});
+    observer.observe({ type: 'largest-contentful-paint', buffered: true });
+    const recorded = observer.takeRecords().length > 0;
+    observer.disconnect();
+    return recorded;
+  });
   await hidePage(page);
   // Every metric is reported once, on the first hide; a second hide is inert.
   await hidePage(page);
@@ -150,11 +170,29 @@ test('a production session sends exactly the declared events', async ({
   expect(google.every(url => url.startsWith('https://www.googletagmanager.com/gtag/js'))).toBe(true);
   expect(pageErrors).toEqual([]);
 
+  // Before the tag: advertising use denied, Google signals off, and every
+  // hit's location and referrer reduced to origin and path.
+  expect(dataLayer.filter(entry => entry[0] === 'consent')).toEqual([
+    ['consent', 'default', {
+      ad_storage: 'denied',
+      ad_user_data: 'denied',
+      ad_personalization: 'denied',
+      analytics_storage: 'granted',
+    }],
+  ]);
+  const address = { page_location: `${PRODUCTION_ORIGIN}/`, page_referrer: '' };
+  expect(dataLayer.filter(entry => entry[0] === 'set' && entry[1] !== 'user_properties')).toEqual([
+    ['set', address],
+  ]);
   const config = dataLayer.filter(entry => entry[0] === 'config');
   expect(config).toEqual([
-    ['config', 'G-K4774ZWGEQ', { page_location: `${PRODUCTION_ORIGIN}/` }],
+    ['config', 'G-K4774ZWGEQ', {
+      ...address,
+      allow_google_signals: false,
+      allow_ad_personalization_signals: false,
+    }],
   ]);
-  const userProperties = dataLayer.filter(entry => entry[0] === 'set');
+  const userProperties = dataLayer.filter(entry => entry[0] === 'set' && entry[1] === 'user_properties');
   expect(userProperties.map(entry => Object.keys(entry[2]))).toEqual([
     ['input_class', 'viewport_class'],
     ['renderer_class', 'smoke_supported'],
@@ -207,7 +245,7 @@ test('a production session sends exactly the declared events', async ({
   expect(new Set(metrics).size).toBe(metrics.length);
   // WebKit exposes none of the observed entry types, so it reports nothing.
   if (browserName === 'chromium') {
-    expect(metrics).toEqual(expect.arrayContaining(['FCP', 'LCP', 'CLS']));
+    expect(metrics).toEqual(expect.arrayContaining(['FCP', 'CLS', ...(browserHasLcp ? ['LCP'] : [])]));
   }
 
   // Nothing the user named or opened is in any payload.
@@ -251,4 +289,20 @@ test('a local origin runs the same session without any analytics', async ({
   // Off production every event is still validated; a violation would surface
   // here as an uncaught error.
   expect(pageErrors).toEqual([]);
+});
+
+test('a viewer page on the production host never loads analytics', async ({ page, context }) => {
+  // A notebook widget frames the hosted app as `?viewer=embedded`; a Python
+  // or R browser-tab viewer is `?viewer=true…`. Neither ever reports.
+  const google = await routeProduction(context);
+  for (const search of ['?viewer=embedded', '?viewer=true&viewerId=v1&viewerToken=t1']) {
+    await page.goto(`${PRODUCTION_ORIGIN}/${search}`, { waitUntil: 'domcontentloaded' });
+    expect(await page.evaluate(() => ({
+      enabled: window.cellucidAnalyticsEnabled,
+      gtag: Object.hasOwn(window, 'gtag'),
+      dataLayer: Object.hasOwn(window, 'dataLayer'),
+      preconnect: [...document.querySelectorAll('link[rel="preconnect"]')].map(link => link.href),
+    }))).toEqual({ enabled: false, gtag: false, dataLayer: false, preconnect: [] });
+  }
+  expect(google).toEqual([]);
 });

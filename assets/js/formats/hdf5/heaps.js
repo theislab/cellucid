@@ -13,6 +13,7 @@
 
 import { formatError } from './errors.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 /** The library's default collection size, for callers that cannot count. */
 const DEFAULT_COLLECTION_BYTES = 4096;
@@ -119,8 +120,9 @@ function collectionSize(file, bytes, address) {
 }
 
 /**
- * Load the collections in `needs` (collection address -> bytes of it the
- * caller's elements need, or an iterable of addresses), each once, parsed.
+ * Start loading the collections in `needs` (collection address -> bytes of
+ * it the caller's elements need, or an iterable of addresses), each once,
+ * parsed: each address's load, settling as its own bytes arrive.
  *
  * Each collection is read once, from its address for the bytes its
  * referenced objects take (the caller counts them from the elements'
@@ -128,51 +130,86 @@ function collectionSize(file, bytes, address) {
  * into one in the byte reader. When that is only the start of a collection
  * (the elements read are some of many), the objects it holds are indexed;
  * decoding an object past them raises `IncompleteCollectionError`, and the
- * caller loads those collections again with `complete: true`.
+ * caller loads those collections again with `complete: true`, handing the
+ * ones it read in part as `held`: only their remaining bytes are fetched.
  *
- * `cache: true` (attributes) reads through the metadata block cache.
+ * `cache: true` (attributes) reads through the metadata block cache and
+ * keeps the parsed collections in the file's cache. Any other load whose
+ * collections need less than one of its blocks (`ByteReader.blockBytes`)
+ * reads through the block cache too: a read that short costs the same round
+ * trip as the block, and the collections beside it (the next categories, the
+ * next colours, the rest of a collection a later read needs) come with it
+ * instead of a dependent round trip each. A load of more (a string column's
+ * collections) is read exactly, its reads merged by the byte reader. Either
+ * way an element's collections are the caller's alone: they go once the
+ * caller has decoded its elements from them (a column's heap is as large as
+ * the column, and a share of its rows needs only their objects).
  *
  * @param {import('./context.js').FileContext} file
  * @param {Map<number, number>|Iterable<number>} needs
- * @param {{cache?: boolean, complete?: boolean, signal?: AbortSignal|null}} [options]
- * @returns {Promise<Map<number, Collection>>}
+ * @param {{cache?: boolean, complete?: boolean, signal?: AbortSignal|null, held?: Map<number, Collection>|null}} [options]
+ * @returns {Map<number, Promise<Collection>>}
  */
-export async function loadCollections(file, needs, { cache = false, complete = false, signal = null } = {}) {
+export function collectionLoads(file, needs, { cache = false, complete = false, signal = null, held = null } = {}) {
   const wanted = needs instanceof Map ? needs : new Map([...needs].map(address => [address, DEFAULT_COLLECTION_BYTES]));
+  let wantedBytes = 0;
+  for (const bytes of wanted.values()) wantedBytes += bytes;
+  const throughBlocks = cache || wantedBytes < (file.reader.blockBytes ?? 0);
   const sorted = [...wanted.keys()].sort((a, b) => a - b);
-  const result = new Map();
-  const loads = [];
+  const loads = new Map();
   for (let i = 0; i < sorted.length; i++) {
     const address = sorted[i];
     const key = `gcol:${address}`;
     const cached = file.cache.get(key);
     if (cached !== undefined && (cached.complete || !complete)) {
-      result.set(address, cached);
+      loads.set(address, Promise.resolve(cached));
       continue;
     }
     // Never past the next collection asked for: requests do not overlap. At
-    // least what one round trip of the link is worth is read (its bytes take
-    // no longer than the round trip a second read would cost): the rest of a
-    // collection then comes with the bytes the elements need, instead of a
-    // second, dependent round trip when an object lies past them.
+    // least a collection's smallest size is read (`DEFAULT_COLLECTION_BYTES`,
+    // the HDF5 minimum, the size libhdf5 gives every collection of small
+    // objects): a collection of that size comes whole with the bytes its
+    // elements need, so an object lying past them costs no second round trip.
+    // Not more: an object's attributes, a dataframe's columns and a string
+    // array's collections are each read at once, and padding each read to a
+    // round trip's worth of the link (bandwidth x latency) fetched that many
+    // times the link's round trip -- on CELLxGENE's HLCA (S3), 3.4 MB of the
+    // 20 MB an opening read, for 4 KB collections. A larger collection whose
+    // object lies past what was read is completed by a second read.
     // Bytes held already (a file's head) are read only as far as they go
-    // when they hold what the elements need: reading on for a round trip's
-    // worth would cost the round trip it saves.
+    // when they hold what the elements need.
     const next = i + 1 < sorted.length ? sorted[i + 1] : Infinity;
     const need = Math.max(wanted.get(address), 8 + file.lengthSize);
-    const roundTrip = file.reader.link?.roundTripBytes ?? file.shaping.mergeGapBytes;
-    const held = (file.reader.cachedEnd?.(file.absolute(address)) ?? 0) - file.absolute(address);
-    const length = Math.min(next - address, held >= need ? held : Math.max(need, Math.floor(roundTrip)));
+    const heldEnd = (file.reader.cachedEnd?.(file.absolute(address)) ?? 0) - file.absolute(address);
+    const length = Math.min(next - address, heldEnd >= need ? heldEnd : Math.max(need, DEFAULT_COLLECTION_BYTES));
     const memoKey = complete ? `${key}:complete` : key;
     // A collection read in part before: only its remaining bytes are fetched.
-    const partial = cached !== undefined && !cached.complete ? cached : null;
-    loads.push(file.once(memoKey, () => loadCollection(file, address, length, cache, complete, signal, partial)).then(collection => {
-      file.memo.delete(memoKey);
-      file.cache.set(key, collection, collection.bytes.length + 64);
-      result.set(address, collection);
-    }));
+    const inPart = held?.get(address) ?? (cached !== undefined && !cached.complete ? cached : null);
+    const partial = inPart !== null && !inPart.complete ? inPart : null;
+    // One load however many reads ask, stopped once every one of them withdrew.
+    const load = file.loading.run(memoKey, work => loadCollection(file, address, length, throughBlocks, complete, work.signal, partial), { signal });
+    loads.set(address, cache
+      ? load.then(collection => {
+        file.cache.set(key, collection, collection.bytes.length + 64);
+        return collection;
+      })
+      : load);
   }
-  await Promise.all(loads);
+  return loads;
+}
+
+/**
+ * Load the collections in `needs` (`collectionLoads`), every one of them.
+ *
+ * @param {import('./context.js').FileContext} file
+ * @param {Map<number, number>|Iterable<number>} needs
+ * @param {{cache?: boolean, complete?: boolean, signal?: AbortSignal|null, held?: Map<number, Collection>|null}} [options]
+ * @returns {Promise<Map<number, Collection>>}
+ */
+export async function loadCollections(file, needs, options = {}) {
+  const loads = collectionLoads(file, needs, options);
+  const result = new Map();
+  await Promise.all([...loads].map(([address, load]) => load.then(collection => { result.set(address, collection); })));
   return result;
 }
 
@@ -188,7 +225,7 @@ export async function withCollections(file, needs, options, decode) {
   } catch (error) {
     if (!(error instanceof IncompleteCollectionError)) throw error;
   }
-  return decode(await loadCollections(file, needs, { ...options, complete: true }));
+  return decode(await loadCollections(file, needs, { ...options, complete: true, held: collections }));
 }
 
 /** Bytes a collection holding objects of `dataBytes` needs for one more of them. */
@@ -208,7 +245,7 @@ async function loadCollection(file, address, length, cache, complete, signal, pa
   if (!complete) return parseCollection(file, first.slice(), address, false);
   file.requireRange(address, size, what);
   const rest = await read(address + first.length, size - first.length);
-  const bytes = new Uint8Array(size);
+  const bytes = allocateTypedArray(Uint8Array, size, 'HDF5 global heap collection');
   bytes.set(first, 0);
   bytes.set(rest, first.length);
   return parseCollection(file, bytes, address, true);

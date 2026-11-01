@@ -13,13 +13,7 @@
 
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
-import { defaultCategoryColor } from '../../../../data/palettes.js';
-
-/** A field's category color as CSS. */
-export function categoryColorCss(field, index) {
-  const rgb = field._categoryColors?.[index] ?? defaultCategoryColor(field, index);
-  return `rgb(${Math.round(rgb[0] * 255)}, ${Math.round(rgb[1] * 255)}, ${Math.round(rgb[2] * 255)})`;
-}
+import { fieldCategoryCss } from '../../../utils/category-state.js';
 
 /**
  * @param {object} options
@@ -59,7 +53,7 @@ export function createFieldGroups({ dataLayer, onReady, onError }) {
         id: name,
         name,
         count: counted.counts[index],
-        color: categoryColorCss(state, index)
+        color: fieldCategoryCss(state, index)
       })),
       task: null
     });

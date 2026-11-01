@@ -128,6 +128,7 @@ test.beforeEach(async ({ page }) => {
     sessionStorage.setItem(
       'cellucid:github-app-auth:session',
       JSON.stringify({
+        expiresAt: 4102444800000,
         token: 'browser-contract-token',
         user: { id: 42, login: 'cap-voting-tester' },
       })
@@ -188,7 +189,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          contractVersion: 1,
+          contractVersion: 2,
           results: [{
             id: isQuick
               ? 'quick'
@@ -683,7 +684,7 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          contractVersion: 1,
+          contractVersion: 2,
           results: [],
           omittedInvalidCount: 0,
         }),

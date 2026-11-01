@@ -7,6 +7,7 @@ import {
   describeDatasetSourceRecord,
 } from '../assets/js/app/session/dataset-source-record.js';
 import { getOpeningProgress } from '../assets/js/data/opening-progress.js';
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { initSessionControls } from '../assets/js/app/ui/modules/session-controls.js';
 
 function manager(sourceType, datasetId, info = null) {
@@ -111,6 +112,9 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
         whenSettled: async () => {},
       },
       currentDatasetIdentityId: () => openIdentity,
+      localFiles: { kept: async () => null, reopen: async () => false },
+      currentCellIdentity: () => null,
+      reopenDataset: async () => ({ shown: false, inPlace: false }),
       openDatasetSource: async record => {
         calls.push(['open', record]);
         return opens;
@@ -119,7 +123,7 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
         downloadSession() {},
         async readSessionDataset(blob) {
           assert.equal(blob, file);
-          return { datasetId: 'suo-identity', source: recorded };
+          return { datasetId: 'suo-identity', source: recorded, cells: null };
         },
         async loadSessionFromFile({ beforeRestore }) {
           const proceed = await beforeRestore(file);
@@ -176,4 +180,166 @@ test('a recorded dataset that could not be opened abandons the restore', async (
     })).at(-1),
     ['restore', false],
   );
+});
+
+/**
+ * Load a session saved on a file of this computer (`{kind: 'file'}`) with
+ * `kept` (the handle kept of it, `app/local-file-handles.js`), recording
+ * what the controls ask and offer.
+ */
+async function loadLocalSession({ kept, opens = true }) {
+  const button = loadButton();
+  const calls = [];
+  const file = new Blob(['session']);
+  const recorded = { kind: 'file', name: 'cells.h5ad', dataset: 'h5ad_cells_1a2b3c4d' };
+  let openIdentity = 'suo';
+  const notifications = getNotificationCenter();
+  const show = notifications.show;
+  const offers = [];
+  notifications.show = options => {
+    offers.push(options);
+    return 'offer';
+  };
+  try {
+    const controls = initSessionControls({
+      dom: { loadBtn: button },
+      datasetChanges: { recordAction: () => 1, settled: true, whenSettled: async () => {} },
+      currentDatasetIdentityId: () => openIdentity,
+      localFiles: {
+        kept: async datasetId => {
+          calls.push(['kept', datasetId]);
+          return kept;
+        },
+        reopen: async datasetId => {
+          calls.push(['reopen', datasetId]);
+          if (opens) openIdentity = recorded.dataset;
+          return opens;
+        },
+      },
+      currentCellIdentity: () => null,
+      reopenDataset: async () => ({ shown: false, inPlace: false }),
+      openDatasetSource: async record => {
+        calls.push(['open', record]);
+        return false;
+      },
+      sessionSerializer: {
+        downloadSession() {},
+        async readSessionDataset() {
+          return { datasetId: recorded.dataset, source: recorded, cells: null };
+        },
+        async loadSessionFromFile({ beforeRestore }) {
+          const proceed = await beforeRestore(file);
+          calls.push(['restore', proceed]);
+          return proceed;
+        },
+        async restoreFromBlob(blob) {
+          assert.equal(blob, file);
+          calls.push(['restore', 'offered']);
+        },
+      },
+    });
+    await button.click();
+    if (offers.length > 0) {
+      calls.push(['offer', offers[0].message, offers[0].action.label]);
+      offers[0].action.run();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await controls.destroy();
+  } finally {
+    notifications.show = show;
+  }
+  return calls;
+}
+
+test('a session saved on a file of this computer opens it from its kept handle', async () => {
+  // Leave to read it is given: it opens at once, then the session applies.
+  assert.deepEqual(
+    await loadLocalSession({ kept: { name: 'cells.h5ad', kind: 'file', granted: true } }),
+    [['kept', 'h5ad_cells_1a2b3c4d'], ['reopen', 'h5ad_cells_1a2b3c4d'], ['restore', true]],
+  );
+  // Leave must be asked in a click: the session offers Reopen, and its click
+  // reopens the file, then applies the same session file.
+  assert.deepEqual(
+    await loadLocalSession({ kept: { name: 'cells.h5ad', kind: 'file', granted: false } }),
+    [
+      ['kept', 'h5ad_cells_1a2b3c4d'],
+      ['restore', false],
+      ['offer', 'This session was saved on "cells.h5ad", opened from this computer.', 'Reopen cells.h5ad'],
+      ['reopen', 'h5ad_cells_1a2b3c4d'],
+      ['restore', 'offered'],
+    ],
+  );
+  // A reopen that failed (refused, gone, changed: said by its opening)
+  // applies nothing.
+  assert.deepEqual(
+    (await loadLocalSession({ kept: { name: 'cells.h5ad', kind: 'file', granted: false }, opens: false })).at(-1),
+    ['reopen', 'h5ad_cells_1a2b3c4d'],
+  );
+  // Nothing kept (another browser, or Firefox and Safari): applied to what is
+  // open, as before, and the restore names the file it needs.
+  assert.deepEqual(
+    await loadLocalSession({ kept: null }),
+    [['kept', 'h5ad_cells_1a2b3c4d'], ['restore', true]],
+  );
+});
+
+test('a newer session file retires the Reopen offer of the last one, and that offer then applies nothing', async () => {
+  const button = loadButton();
+  const file = new Blob(['session']);
+  const recorded = { kind: 'file', name: 'cells.h5ad', dataset: 'h5ad_cells_1a2b3c4d' };
+  const notifications = getNotificationCenter();
+  const { show, dismiss } = notifications;
+  const offers = [];
+  const dismissed = [];
+  const reopened = [];
+  notifications.show = options => {
+    offers.push(options);
+    return `offer-${offers.length}`;
+  };
+  notifications.dismiss = id => {
+    dismissed.push(id);
+    return true;
+  };
+  try {
+    const controls = initSessionControls({
+      dom: { loadBtn: button },
+      datasetChanges: { recordAction: () => 1, settled: true, whenSettled: async () => {} },
+      currentDatasetIdentityId: () => 'suo',
+      localFiles: {
+        kept: async () => ({ name: 'cells.h5ad', kind: 'file', granted: false }),
+        reopen: async datasetId => {
+          reopened.push(datasetId);
+          return false;
+        },
+      },
+      currentCellIdentity: () => null,
+      reopenDataset: async () => ({ shown: false, inPlace: false }),
+      openDatasetSource: async () => false,
+      sessionSerializer: {
+        downloadSession() {},
+        async readSessionDataset() {
+          return { datasetId: recorded.dataset, source: recorded, cells: null };
+        },
+        async loadSessionFromFile({ beforeRestore }) {
+          return beforeRestore(file);
+        },
+        async restoreFromBlob() {},
+      },
+    });
+    await button.click();
+    await button.click();
+    assert.equal(offers.length, 2);
+    assert.deepEqual(dismissed, ['offer-1']);
+    // The first offer, clicked anyway, is no longer this tab's restore.
+    offers[0].action.run();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(reopened, []);
+    offers[1].action.run();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(reopened, ['h5ad_cells_1a2b3c4d']);
+    await controls.destroy();
+  } finally {
+    notifications.show = show;
+    notifications.dismiss = dismiss;
+  }
 });

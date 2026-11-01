@@ -24,6 +24,7 @@
 
 import { log2Exact, readUintLE } from './binary.js';
 import { formatError } from './errors.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
 
 /**
  * Visit every allocated entry: `onEntry(index, address, size, mask)`.
@@ -140,7 +141,7 @@ export async function readExtensibleArray(file, address, { filtered, chunkBytes 
       if (blockAddress === null) continue;
       let pages = null;
       if (block.pagesPerBlock > 0) {
-        pages = new Uint8Array(block.pagesPerBlock);
+        pages = allocateTypedArray(Uint8Array, block.pagesPerBlock, 'HDF5 extensible array pages');
         for (let p = 0; p < block.pagesPerBlock; p++) {
           // Bits are numbered across data blocks, though each block is
           // allotted whole bytes (as the library does).

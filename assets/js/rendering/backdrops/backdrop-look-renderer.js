@@ -36,7 +36,7 @@
 
 import { glStateOf } from '../gl-state-shadow.js';
 import { BACKDROP_LOOK_PROGRAMS } from './backdrop-look-shaders.js';
-import { deleteProgramReleasingUse, deleteTextureTracked } from '../gl-utils.js';
+import { deleteProgramReleasingUse, deleteTextureTracked, fenceHasPassed } from '../gl-utils.js';
 import {
   ATELIER_KEY_LIGHT,
   ATELIER_PAPER_GAP,
@@ -484,9 +484,9 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
     let previous = issuedAt;
     job.stage = 'band-wait';
     for (;;) {
-      const status = gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
+      const passed = fenceHasPassed(gl, fence);
       const polled = now();
-      if (status !== gl.TIMEOUT_EXPIRED) {
+      if (passed) {
         gl.deleteSync(fence);
         job.stage = 'bands';
         return (previous - issuedAt) + (polled - previous) / 2;

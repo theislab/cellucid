@@ -13,33 +13,85 @@
 // ============================================================================
 
 /**
- * Calculate mean of an array.
+ * The mean of an array's values less a pivot: their compensated sum
+ * (Neumaier's improved Kahan summation, left to right) over their count.
+ * The sum is exact to the last bit or two whatever the values' spread of
+ * magnitudes, and adding a zero leaves the running sum and its compensation
+ * as they are, so the sparse gene kernels, which add only the non-zero
+ * entries in the same order, get the same double (`gene-statistics.js`). A
+ * constant array's is its value less the pivot exactly. Every value is taken
+ * as given (callers pass finite values).
  *
- * @param {number[]} arr - Array of numeric values
+ * @param {ArrayLike<number>} values
+ * @param {number} pivot
+ * @returns {number} NaN when empty
+ */
+function compensatedMean(values, pivot) {
+  const n = values.length;
+  if (n === 0) return NaN;
+  let sum = 0;
+  let compensation = 0;
+  let low = Infinity;
+  let high = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const raw = values[i];
+    const value = raw - pivot;
+    const total = sum + value;
+    compensation += Math.abs(sum) >= Math.abs(value) ? (sum - total) + value : (value - total) + sum;
+    sum = total;
+    if (raw < low) low = raw;
+    if (raw > high) high = raw;
+  }
+  // `+ 0`: a constant of zeros, some of them -0, has the mean 0.
+  return low === high ? (low - pivot) + 0 : (sum + compensation) / n;
+}
+
+/**
+ * The mean and centred sum of squares of an array, about a pivot: the
+ * values less the pivot are averaged (`compensatedMean`) and squared about
+ * that, so values far from zero but close to each other (1e8 apart by 1e-3:
+ * a timestamp, a count with an offset) keep every digit of their spread when
+ * the pivot is one of them — the pivot's own rounding never enters a
+ * difference of two means or a spread, as SciPy's `f_oneway` shifts by the
+ * data's mean. `shifted` is the mean less the pivot; `mean` the mean itself.
+ * `M2` is exactly 0 for a constant array, so rounding never gives a constant
+ * a spread.
+ *
+ * @param {ArrayLike<number>} values
+ * @param {number} [pivot=0] - A value near the data (the first value of a test's data)
+ * @returns {{n: number, mean: number, shifted: number, m2: number}} NaN moments when empty
+ */
+export function centredMoments(values, pivot = 0) {
+  const n = values.length;
+  if (n === 0) return { n, mean: NaN, shifted: NaN, m2: NaN };
+  const shifted = compensatedMean(values, pivot);
+  let m2 = 0;
+  for (let i = 0; i < n; i++) m2 += ((values[i] - pivot) - shifted) ** 2;
+  return { n, mean: pivot + shifted, shifted, m2 };
+}
+
+/**
+ * Calculate mean of an array (`compensatedMean`, no pivot).
+ *
+ * @param {ArrayLike<number>} arr - Array of numeric values
  * @returns {number} Mean value, or NaN if empty
  */
 export function mean(arr) {
   if (!arr || arr.length === 0) return NaN;
-  // Left-to-right accumulation from 0, i.e. exactly what `reduce` performed,
-  // written as an index loop so a TypedArray is not walked through a callback.
-  let sum = 0;
-  for (let i = 0; i < arr.length; i++) sum += arr[i];
-  return sum / arr.length;
+  return compensatedMean(arr, 0);
 }
 
 /**
- * Calculate variance of an array.
+ * Calculate variance of an array (`centredMoments`: about its compensated
+ * mean, so an offset costs its spread only the mean's last bit).
  *
- * @param {number[]} arr - Array of numeric values
+ * @param {ArrayLike<number>} arr - Array of numeric values
  * @param {number} [ddof=0] - Delta degrees of freedom (0 for population, 1 for sample)
  * @returns {number} Variance, or NaN if insufficient data
  */
 export function variance(arr, ddof = 0) {
   if (!arr || arr.length <= ddof) return NaN;
-  const m = mean(arr);
-  let sumSq = 0;
-  for (let i = 0; i < arr.length; i++) sumSq += (arr[i] - m) ** 2;
-  return sumSq / (arr.length - ddof);
+  return centredMoments(arr).m2 / (arr.length - ddof);
 }
 
 /**
@@ -54,30 +106,22 @@ export function std(arr, ddof = 0) {
 }
 
 /**
- * Sample mean and sample variance (ddof = 1) from one pass pair.
- *
- * Two passes in the same left-to-right order `mean()` and `variance(arr, 1)`
- * use, so the moments are bit identical to calling those two functions — but
- * the mean is accumulated once instead of twice. Callers that need both moments
- * (Welch's t-test and its display wrapper) go through here so that a two-group
- * comparison walks each group exactly twice rather than four times.
+ * Sample mean and sample variance (ddof = 1) in one pair of passes about a
+ * pivot (`centredMoments`). Callers that need both moments (Welch's t-test
+ * and its display wrapper) go through here so that a comparison walks each
+ * group twice, not four times; a comparison passes both groups one pivot and
+ * subtracts the `shifted` means, so a large common offset never costs digits.
  *
  * @param {ArrayLike<number>} values
- * @returns {{mean: number, variance: number, n: number}} `NaN` moments when
- *   fewer than two values are present.
+ * @param {number} [pivot=0]
+ * @returns {{mean: number, shifted: number, variance: number, n: number}}
+ *   `NaN` moments when fewer than two values are present.
  */
-export function sampleMoments(values) {
+export function sampleMoments(values, pivot = 0) {
   const n = values.length;
-  if (n < 2) return { mean: n === 1 ? values[0] : NaN, variance: NaN, n };
-
-  let sum = 0;
-  for (let i = 0; i < n; i++) sum += values[i];
-  const m = sum / n;
-
-  let sumSq = 0;
-  for (let i = 0; i < n; i++) sumSq += (values[i] - m) ** 2;
-
-  return { mean: m, variance: sumSq / (n - 1), n };
+  if (n < 2) return { mean: n === 1 ? values[0] : NaN, shifted: n === 1 ? values[0] - pivot : NaN, variance: NaN, n };
+  const moments = centredMoments(values, pivot);
+  return { mean: moments.mean, shifted: moments.shifted, variance: moments.m2 / (n - 1), n };
 }
 
 // ============================================================================
@@ -1409,7 +1453,8 @@ export function mannWhitneyU(group1, group2) {
 /**
  * Welch's t-test from precomputed sample moments.
  *
- * @param {number} mean1 - First sample mean
+ * @param {number} mean1 - First sample mean (or both means less one pivot:
+ *   only their difference enters t)
  * @param {number} variance1 - First sample variance (ddof=1)
  * @param {number} n1 - First sample size
  * @param {number} mean2 - Second sample mean
@@ -1477,14 +1522,16 @@ export function welchTTest(group1, group2) {
     return { statistic: NaN, pValue: NaN, df: NaN };
   }
 
-  const momentsA = sampleMoments(group1);
-  const momentsB = sampleMoments(group2);
+  // One pivot for both groups: only the difference of the means enters t.
+  const pivot = group1[0];
+  const momentsA = sampleMoments(group1, pivot);
+  const momentsB = sampleMoments(group2, pivot);
 
   return welchTTestFromMoments(
-    momentsA.mean,
+    momentsA.shifted,
     momentsA.variance,
     n1,
-    momentsB.mean,
+    momentsB.shifted,
     momentsB.variance,
     n2
   );
@@ -1578,20 +1625,22 @@ export function pairedCentredMoments(xs, ys) {
 }
 
 /**
- * Pearson coefficient from centred moments: exactly 0 when either variable has
- * no variance, otherwise clamped to [-1, 1] against final-bit round-off.
+ * Pearson coefficient from centred moments, clamped to [-1, 1] against
+ * final-bit round-off; NaN when either variable has no variance: a constant
+ * says nothing about a correlation (SciPy returns NaN with a
+ * `ConstantInputWarning`), and r = 0 would read as evidence of none.
  *
  * @param {{ sxx: number, syy: number, sxy: number }} moments
  * @returns {number}
  */
 export function pearsonFromCentredMoments({ sxx, syy, sxy }) {
-  if (!(sxx > 0) || !(syy > 0)) return 0;
+  if (!(sxx > 0) || !(syy > 0)) return NaN;
   const r = sxy / Math.sqrt(sxx * syy);
   return Math.max(-1, Math.min(1, r));
 }
 
 /**
- * Pearson correlation of the finite (x, y) pairs (0 for a constant variable).
+ * Pearson correlation of the finite (x, y) pairs (NaN for a constant variable).
  *
  * @param {ArrayLike<number>} xs
  * @param {ArrayLike<number>} ys

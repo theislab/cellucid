@@ -48,6 +48,7 @@ test('every key is read as it is stored, and a single text may be a one-element 
     source: { name: 'Lab' },
     defaults: { embedding2d: ['X_umap'], obsKeys: ['cell_type'], embedding3d: { key: 'X_pca', columns: [0, 1, 2] } },
     session: { anything: 'is never read' },
+    priority: { seed: 7, specVersion: 1, nObs: 5, levels: [1, 2, 3] },
   }, 'h5ad');
   assert.equal(CELLUCID_UNS_SCHEMA, 1);
   assert.equal(metadata.id, 'atlas-1');
@@ -62,6 +63,21 @@ test('every key is read as it is stored, and a single text may be a one-element 
   });
   // Every key is optional.
   assert.equal(requireCellucidFileMetadata({}, 'h5ad').id, null);
+});
+
+test('a priority record is never refused here: the reader verifies it against the cells', () => {
+  // priority-layout.js reads one that does not describe the file's cells as
+  // a file Cellucid did not write, with a notice (priority-verification-contract).
+  for (const priority of [
+    { specVersion: 1 },
+    { seed: -1, specVersion: 1, nObs: 3 },
+    { seed: 2 ** 32, specVersion: 1 },
+    { seed: 0, specVersion: 2, nObs: 3 },
+    { seed: 0, specVersion: 1, nObs: 3, levels: [4, 2] },
+    { seed: 0, specVersion: 1, order: 'rank' },
+  ]) {
+    assert.doesNotThrow(() => requireCellucidFileMetadata({ priority }, 'h5ad'), JSON.stringify(priority));
+  }
 });
 
 test('a key not in the contract, or a value of the wrong shape, refuses the file with a clear message', () => {

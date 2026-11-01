@@ -17,20 +17,65 @@
  * the readers under test schedule their plans with `setImmediate`, and a
  * pending one is listed there. Real timers (`setTimeout`) are not waited for;
  * code that waits on one is not under virtual time.
+ *
+ * The event loop lists nothing for work on libuv's thread pool, and Node's
+ * `DecompressionStream` (the readers' DEFLATE, `io/inflate.js`) and
+ * `CompressionStream` inflate and deflate there (`node:zlib`). So zlib's work
+ * is counted here (each chunk from when its transform starts to when it
+ * finishes or its stream closes) and idle waits for it too. Without that the
+ * clock moved while a chunk was still inflating, and requests its decoded
+ * bytes lead to were counted a round late on a machine that inflates slowly
+ * (macOS CI, 2026-11-01: a global heap read in 4 rounds, not 3).
  */
 
+import zlib from 'node:zlib';
+
 const IDLE_ROUNDS_LIMIT = 100_000;
+
+/** zlib chunks in work on the thread pool, and who waits for there to be none. */
+let zlibWorking = 0;
+let zlibIdle = [];
+
+function zlibChunkDone() {
+  zlibWorking -= 1;
+  if (zlibWorking > 0) return;
+  const waiting = zlibIdle;
+  zlibIdle = [];
+  for (const resolve of waiting) resolve();
+}
+
+// Every zlib, brotli and zstd stream transforms through ZlibBase's `_transform`.
+let zlibBase = zlib.Inflate.prototype;
+while (!Object.hasOwn(zlibBase, '_transform')) zlibBase = Object.getPrototypeOf(zlibBase);
+const zlibTransform = zlibBase._transform;
+zlibBase._transform = function countedTransform(chunk, encoding, callback) {
+  zlibWorking += 1;
+  let counted = true;
+  // A chunk that fails ends its stream without calling back.
+  const finish = () => {
+    if (!counted) return;
+    counted = false;
+    this.off('close', finish);
+    zlibChunkDone();
+  };
+  this.once('close', finish);
+  return zlibTransform.call(this, chunk, encoding, (...args) => {
+    finish();
+    callback(...args);
+  });
+};
 
 /** The wait for idle in progress, shared: two waits of their own would each see the other's callback pending. */
 let idle = null;
 
-/** Resolves on a later macrotask once no `setImmediate` callback is pending. */
+/** Resolves on a later macrotask once no `setImmediate` callback is pending and zlib has no chunk in work. */
 export function settle() {
   idle ??= (async () => {
     try {
       for (let round = 0; round < IDLE_ROUNDS_LIMIT; round++) {
+        if (zlibWorking > 0) await new Promise(resolve => { zlibIdle.push(resolve); });
         await new Promise(resolve => setImmediate(resolve));
-        if (!process.getActiveResourcesInfo().includes('Immediate')) return;
+        if (zlibWorking === 0 && !process.getActiveResourcesInfo().includes('Immediate')) return;
       }
       throw new Error(`the process never went idle in ${IDLE_ROUNDS_LIMIT} rounds of setImmediate`);
     } finally {

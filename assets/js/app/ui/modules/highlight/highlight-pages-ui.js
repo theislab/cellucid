@@ -17,6 +17,7 @@ import {
 } from './exact-contract.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
 import { countNoun } from '../../../../utils/format-units.js';
+import { removeWithUndo } from './undo-removal.js';
 
 /**
  * @param {object} options
@@ -43,7 +44,9 @@ export function initHighlightPagesUI(options) {
       'getActivePageId',
       'getHighlightedCellCountForPage',
       'getHighlightPages',
+      'highlightPageRecord',
       'renameHighlightPage',
+      'restoreHighlightPage',
       'setHighlightPageColor',
       'switchToPage'
     ]
@@ -53,6 +56,16 @@ export function initHighlightPagesUI(options) {
     ['pagesTabsEl', 'addPageBtn'],
     'Highlight pages DOM'
   );
+  /** Delete a page at once, offering Undo (`undo-removal.js`). */
+  function deletePageWithUndo(page) {
+    return removeWithUndo({
+      record: state.highlightPageRecord(page.id),
+      remove: () => state.deleteHighlightPage(page.id),
+      restore: record => state.restoreHighlightPage(record),
+      removed: `Page "${page.name}"`
+    });
+  }
+
   const highlightPagesTabsEl = requireDomElement(
     dom.pagesTabsEl,
     'Highlight pages tabs',
@@ -736,7 +749,7 @@ export function initHighlightPagesUI(options) {
         if (e.key === 'Delete' && pages.length > 1) {
           e.preventDefault();
           requirePageOperation(
-            state.deleteHighlightPage(page.id),
+            deletePageWithUndo(page),
             'Highlight page keyboard deletion'
           );
           focusPageTab(state.getActivePageId());
@@ -784,7 +797,7 @@ export function initHighlightPagesUI(options) {
         listen(deleteBtn, 'click', (e) => {
           e.stopPropagation();
           requirePageOperation(
-            state.deleteHighlightPage(page.id),
+            deletePageWithUndo(page),
             'Highlight page deletion'
           );
         });

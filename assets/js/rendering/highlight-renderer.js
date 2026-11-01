@@ -1,4 +1,5 @@
 import { requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
+import { getNotificationCenter } from '../app/notification-center.js';
 import { CellSet } from '../app/utils/cell-set.js';
 import {
   KnnExpansion,
@@ -27,9 +28,12 @@ import {
 } from './shaders/high-perf-shaders.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 import { GpuPermuter } from './high-perf/gpu-permute.js';
+import { forEachSegmentRange } from './high-perf/point-store-segments.js';
+import { requireLodMembership } from './high-perf/renderer-contracts.js';
 import {
   allocateLinearTexture,
   planLinearTextureFor,
+  resizedLinearPlan,
   writeLinearTextureRows,
 } from './linear-texture.js';
 import {
@@ -46,6 +50,8 @@ import {
   SELECT_MODE_OFF,
 } from './select-mode.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { isCancellation } from '../utils/abort.js';
+import { failureText } from '../utils/errors.js';
 
 /**
  * The kind of field one pane is colored by, as the annotation tool reads it.
@@ -389,36 +395,6 @@ function requireHighlightTransparencyGeneration(generation) {
   return generation;
 }
 
-function requireHighlightLodMembership(
-  membership,
-  pointCount,
-  dimensionLevel
-) {
-  if (membership === null) return null;
-  if (
-    typeof membership !== 'object' ||
-    Array.isArray(membership) ||
-    !Object.isFrozen(membership) ||
-    !(membership.admissionLevels instanceof Uint8Array) ||
-    membership.admissionLevels.length !== pointCount ||
-    !(membership.indices instanceof Uint32Array) ||
-    membership.indices.length > pointCount ||
-    membership.pointCount !== pointCount ||
-    membership.dimensionLevel !== dimensionLevel ||
-    !Number.isInteger(membership.lodLevel) ||
-    membership.lodLevel < 0 ||
-    membership.lodLevel >= 0xff ||
-    membership.generationToken === null ||
-    typeof membership.generationToken !== 'object' ||
-    !Object.isFrozen(membership.generationToken)
-  ) {
-    throw new TypeError(
-      'Highlight LOD membership must be null or one exact frozen renderer descriptor.'
-    );
-  }
-  return membership;
-}
-
 const EMPTY_HIGHLIGHT_INDICES = new Uint32Array(0);
 // Fixed staging block (1 MiB) every highlight store is packed through, so a
 // publication allocates nothing proportional to the selection.
@@ -449,10 +425,15 @@ const HIGHLIGHT_COLOR_WORDS = (() => {
 })();
 
 /**
- * Pack the admitted highlighted cells of `candidateIndices[from, ...)` into
- * the staging block, a record a cell (XYZ, the axes the embedding does not
- * have written as the zero they are, then the colour word), until the block
- * is full or the candidates end. The admission test is `rebuildBuffer`'s.
+ * Pack the admitted highlighted cells of candidates `[from, candidateCount)`
+ * into the staging block, a record a cell (XYZ, the axes the embedding does
+ * not have written as the zero they are, then the colour word), until the
+ * block is full or the candidates end. Candidate `j` is cell
+ * `candidateIndices[j]`, or cell `j` when `candidateIndices` is null (a
+ * level's first cells). The admission test is `rebuildBuffer`'s: a level's
+ * candidates are its cells, so only their highlight is tested; the
+ * highlighted cells' candidates are tested against the level
+ * (`admissionLevels`, else the first `lodPrefix` cells).
  * A function of its own so its loop is compiled for itself alone.
  *
  * @returns {number} The next candidate; the records written are in
@@ -460,11 +441,13 @@ const HIGHLIGHT_COLOR_WORDS = (() => {
  */
 function packHighlightRecords(
   candidateIndices,
+  candidateCount,
   from,
   iterateLodPrefix,
   highlightData,
   admissionLevels,
   activeLodLevel,
+  lodPrefix,
   transparency,
   positions,
   dimension,
@@ -473,13 +456,15 @@ function packHighlightRecords(
   packed
 ) {
   const capacity = HIGHLIGHT_STAGING_POINTS;
-  const checkAdmission = !iterateLodPrefix && admissionLevels !== null;
   let slot = 0;
   let j = from;
-  for (; j < candidateIndices.length && slot < capacity; j++) {
-    const i = candidateIndices[j];
-    if (iterateLodPrefix && highlightData[i] < MIN_VISIBLE_ALPHA_BYTE) continue;
-    if (checkAdmission && admissionLevels[i] > activeLodLevel) continue;
+  for (; j < candidateCount && slot < capacity; j++) {
+    const i = candidateIndices === null ? j : candidateIndices[j];
+    if (iterateLodPrefix) {
+      if (highlightData[i] < MIN_VISIBLE_ALPHA_BYTE) continue;
+    } else if (admissionLevels !== null ? admissionLevels[i] > activeLodLevel : i >= lodPrefix) {
+      continue;
+    }
     if (transparency[i] < POINT_VISIBILITY_THRESHOLD) continue;
     const record = slot * 4;
     const base = i * dimension;
@@ -493,21 +478,25 @@ function packHighlightRecords(
   return j;
 }
 
-/** How many of `candidateIndices` `packHighlightRecords` admits. */
+/** How many candidates `packHighlightRecords` admits. */
 function countHighlightRecords(
   candidateIndices,
+  candidateCount,
   iterateLodPrefix,
   highlightData,
   admissionLevels,
   activeLodLevel,
+  lodPrefix,
   transparency
 ) {
-  const checkAdmission = !iterateLodPrefix && admissionLevels !== null;
   let count = 0;
-  for (let j = 0; j < candidateIndices.length; j++) {
-    const i = candidateIndices[j];
-    if (iterateLodPrefix && highlightData[i] < MIN_VISIBLE_ALPHA_BYTE) continue;
-    if (checkAdmission && admissionLevels[i] > activeLodLevel) continue;
+  for (let j = 0; j < candidateCount; j++) {
+    const i = candidateIndices === null ? j : candidateIndices[j];
+    if (iterateLodPrefix) {
+      if (highlightData[i] < MIN_VISIBLE_ALPHA_BYTE) continue;
+    } else if (admissionLevels !== null ? admissionLevels[i] > activeLodLevel : i >= lodPrefix) {
+      continue;
+    }
     if (transparency[i] < POINT_VISIBILITY_THRESHOLD) continue;
     count++;
   }
@@ -524,18 +513,20 @@ const HIGHLIGHT_SLOT_BYTES = 4;
 /**
  * How many cells `packHighlightRecords` admits, counted in source order (a
  * sequential pass): highlighted, shown, and, with a reduced level of detail,
- * members of the level (`admissionLevels`, or null at full detail).
+ * members of the level (`admissionLevels`, else the first `lodPrefix`
+ * cells; every cell at full detail).
  * A function of its own so its loop is compiled for itself alone.
  */
-function countAdmittedCells(highlightData, transparency, admissionLevels, activeLodLevel) {
+function countAdmittedCells(highlightData, transparency, admissionLevels, activeLodLevel, lodPrefix) {
   let count = 0;
-  const n = highlightData.length;
   if (admissionLevels === null) {
+    const n = Math.min(highlightData.length, lodPrefix);
     for (let i = 0; i < n; i++) {
       if (highlightData[i] >= MIN_VISIBLE_ALPHA_BYTE && transparency[i] >= POINT_VISIBILITY_THRESHOLD) count++;
     }
     return count;
   }
+  const n = highlightData.length;
   for (let i = 0; i < n; i++) {
     if (
       highlightData[i] >= MIN_VISIBLE_ALPHA_BYTE
@@ -831,11 +822,12 @@ export class HighlightRenderer {
       dimensionLevel: 0,
       drawFailure: null,
       // Vertices the draw submits: the records, or every slot of the point
-      // store the highlight is drawn from (`storeBuffer`, in the order
-      // `storeSlotSources`), most of them rejected.
+      // store the highlight is drawn from (`storeBuffer`, in the store order
+      // `storeOrder`, rendering/high-perf/store-order.js), most of them
+      // rejected.
       drawCount: 0,
       storeBuffer: null,
-      storeSlotSources: null,
+      storeOrder: null,
       // The view's visibility bytes as a texture, for a draw from the store.
       visibleTexture: null,
       // What the VAO's attributes point at: the record buffer, or the store
@@ -860,6 +852,12 @@ export class HighlightRenderer {
       published: false,
       transparencyGeneration: -1,
       vertexArray: null,
+      // Drawn from a segmented point store (`point-store-segments.js`): the
+      // store's segments, and a VAO for each segment after the first
+      // (`vertexArray` is the first's), each binding that segment's
+      // positions and its run of slot words.
+      storeSegments: null,
+      segmentVertexArrays: [],
     };
   }
 
@@ -908,6 +906,9 @@ export class HighlightRenderer {
   _detachViewResources(viewBuffer) {
     const buffer = viewBuffer.buffer;
     const vertexArray = viewBuffer.vertexArray;
+    for (const extra of viewBuffer.segmentVertexArrays ?? []) this._pendingVertexArrayDeletes.add(extra);
+    viewBuffer.segmentVertexArrays = [];
+    viewBuffer.storeSegments = null;
     const visible = viewBuffer.visibleTexture ?? null;
     if (visible !== null) {
       viewBuffer.visibleTexture = null;
@@ -961,11 +962,11 @@ export class HighlightRenderer {
     const exactTransparencyGeneration =
       requireHighlightTransparencyGeneration(transparencyGeneration);
     const pointCount = this._highlightDataRef?.length ?? null;
-    const exactMembership = requireHighlightLodMembership(
-      lodMembership,
-      pointCount,
-      exactDimensionLevel
-    );
+    const exactMembership = requireLodMembership(lodMembership, {
+      pointCount: pointCount,
+      dimensionLevel: exactDimensionLevel,
+      owner: 'Highlight LOD membership',
+    });
     let viewBuffer = this._viewBuffers.get(vid);
     if (viewBuffer === undefined) {
       viewBuffer = this._createViewBufferRecord();
@@ -1013,7 +1014,7 @@ export class HighlightRenderer {
     viewBuffer.pointCount = 0;
     viewBuffer.drawCount = 0;
     viewBuffer.storeBuffer = null;
-    viewBuffer.storeSlotSources = null;
+    viewBuffer.storeOrder = null;
     viewBuffer.published = true;
     viewBuffer.transparencyGeneration = transparencyGeneration;
     viewBuffer.drawSerial = ++this._drawSerials;
@@ -1070,11 +1071,11 @@ export class HighlightRenderer {
     const exactTransparencyGeneration =
       requireHighlightTransparencyGeneration(transparencyGeneration);
     const pointCount = this._highlightDataRef?.length ?? null;
-    const exactMembership = requireHighlightLodMembership(
-      lodMembership,
-      pointCount,
-      exactDimensionLevel
-    );
+    const exactMembership = requireLodMembership(lodMembership, {
+      pointCount: pointCount,
+      dimensionLevel: exactDimensionLevel,
+      owner: 'Highlight LOD membership',
+    });
     const viewBuffer = this._viewBuffers.get(vid);
 
     if (
@@ -1228,11 +1229,11 @@ export class HighlightRenderer {
       exactDimensionLevel
     );
     const exactHighlightData = requireHighlightData(highlightData, pointCount);
-    const exactMembership = requireHighlightLodMembership(
-      lodMembership,
-      pointCount,
-      exactDimensionLevel
-    );
+    const exactMembership = requireLodMembership(lodMembership, {
+      pointCount: pointCount,
+      dimensionLevel: exactDimensionLevel,
+      owner: 'Highlight LOD membership',
+    });
     const exactTransparency = requireHighlightTransparency(
       viewTransparency,
       pointCount
@@ -1246,17 +1247,28 @@ export class HighlightRenderer {
     // Cache is rebuilt only at the exact updateHighlight publication boundary.
     this.updateHighlightCache(exactHighlightData);
     const highlightedIndices = this._highlightedIndicesCache;
+    // The level's cells (`LodMembership`): by admission level, or the first
+    // `lodPrefix` cells (every cell at full detail).
     const admissionLevels =
       exactMembership?.admissionLevels ?? null;
     const activeLodLevel =
       exactMembership?.lodLevel ?? -1;
-    const lodIndices = exactMembership?.indices ?? null;
+    const lodPrefix = exactMembership === null || admissionLevels !== null
+      ? pointCount
+      : exactMembership.count;
+    // The fewer candidates: the level's cells (its indices, or its first
+    // `count` cells) when the level is smaller than the highlight, else
+    // the highlighted cells.
     const iterateLodPrefix =
-      lodIndices !== null &&
-      lodIndices.length < highlightedIndices.length;
+      exactMembership !== null &&
+      exactMembership.count < highlightedIndices.length &&
+      (exactMembership.indices !== null || admissionLevels === null);
     const candidateIndices = iterateLodPrefix
-      ? lodIndices
+      ? exactMembership.indices
       : highlightedIndices;
+    const candidateCount = iterateLodPrefix
+      ? exactMembership.count
+      : highlightedIndices.length;
 
     // Get or create per-view buffer entry
     let viewBuffer = this._viewBuffers.get(vid);
@@ -1279,14 +1291,15 @@ export class HighlightRenderer {
       ? this._slotStoreFor(vid, exactPositions, exactDimensionLevel, exactMembership)
       : null;
     const fromStore = store !== null
-      && candidateIndices.length * HIGHLIGHT_RECORD_BYTES >= store.slots * HIGHLIGHT_SLOT_BYTES;
+      && candidateCount * HIGHLIGHT_RECORD_BYTES >= store.slots * HIGHLIGHT_SLOT_BYTES;
     let count;
     if (fromStore) {
       count = countAdmittedCells(
         exactHighlightData,
         exactTransparency,
-        exactMembership === null ? null : admissionLevels,
-        activeLodLevel
+        admissionLevels,
+        activeLodLevel,
+        lodPrefix
       );
     } else {
       // Count visible highlighted cells using cached indices
@@ -1294,10 +1307,12 @@ export class HighlightRenderer {
       // LOD prefix and the exact point-shader alpha boundary.
       count = countHighlightRecords(
         candidateIndices,
+        candidateCount,
         iterateLodPrefix,
         exactHighlightData,
         admissionLevels,
         activeLodLevel,
+        lodPrefix,
         exactTransparency
       );
     }
@@ -1388,13 +1403,22 @@ export class HighlightRenderer {
         }
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
         gl.bindVertexArray(null);
+        // Written at every highlight change: checked in a later frame, so
+        // the write never waits for the GPU (`deferWebGLErrorCheck`).
         this._slotWordWriter().writeHighlightWords(
           candidateBuffer,
           store.slots,
           store.order,
           this._highlightByteTexture(exactHighlightData),
           this._visibleByteTexture(viewBuffer, exactTransparency, exactTransparencyGeneration),
-          MIN_VISIBLE_ALPHA_BYTE
+          MIN_VISIBLE_ALPHA_BYTE,
+          {
+            onError: error => {
+              // The next publication verifies again, as after any failure.
+              viewBuffer.verifiedByteLength = 0;
+              getNotificationCenter().error(`Highlights of view "${vid}" could not be written: ${failureText(error)}`);
+            },
+          }
         );
         gl.bindVertexArray(candidateVertexArray);
         gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
@@ -1412,10 +1436,12 @@ export class HighlightRenderer {
         }
         this._uploadHighlightChunks(
           candidateIndices,
+          candidateCount,
           iterateLodPrefix,
           exactHighlightData,
           admissionLevels,
           activeLodLevel,
+          lodPrefix,
           exactTransparency,
           exactPositions,
           exactDimensionLevel
@@ -1425,30 +1451,16 @@ export class HighlightRenderer {
       // new or its source changed (records, or which store).
       const layoutSource = fromStore ? store.buffer : candidateBuffer;
       if (isInitialPublication || viewBuffer.layoutSource !== layoutSource
-        || viewBuffer.layoutDimension !== exactDimensionLevel) {
+        || viewBuffer.layoutDimension !== exactDimensionLevel
+        || (fromStore && viewBuffer.storeSegments !== store.buffer.segments)) {
         if (fromStore) {
-          // The axes a store does not have read as 0, as records write them.
-          gl.bindBuffer(gl.ARRAY_BUFFER, store.buffer);
-          gl.enableVertexAttribArray(this.attribLocations.position);
-          gl.vertexAttribPointer(
-            this.attribLocations.position,
-            exactDimensionLevel,
-            gl.FLOAT,
-            false,
-            exactDimensionLevel * 4,
-            0
-          );
-          gl.bindBuffer(gl.ARRAY_BUFFER, candidateBuffer);
-          gl.enableVertexAttribArray(this.attribLocations.color);
-          gl.vertexAttribPointer(
-            this.attribLocations.color,
-            4,
-            gl.UNSIGNED_BYTE,
-            true,
-            HIGHLIGHT_SLOT_BYTES,
-            0
-          );
+          // One VAO a store segment: the segment's positions, and its run of
+          // slot words in the one word buffer. The axes a store does not
+          // have read as 0, as records write them.
+          this._bindStoreSegmentLayouts(viewBuffer, candidateVertexArray, store.buffer, candidateBuffer, exactDimensionLevel);
+          gl.bindVertexArray(candidateVertexArray);
         } else {
+          this._releaseStoreSegmentLayouts(viewBuffer);
           gl.enableVertexAttribArray(this.attribLocations.position);
           gl.vertexAttribPointer(
             this.attribLocations.position,
@@ -1536,7 +1548,7 @@ export class HighlightRenderer {
     viewBuffer.layoutSource = fromStore ? store.buffer : viewBuffer.buffer;
     viewBuffer.layoutDimension = exactDimensionLevel;
     viewBuffer.storeBuffer = fromStore ? store.buffer : null;
-    viewBuffer.storeSlotSources = fromStore ? store.slotSources : null;
+    viewBuffer.storeOrder = fromStore ? store.order : null;
     viewBuffer.published = true;
     viewBuffer.transparencyGeneration =
       exactTransparencyGeneration;
@@ -1557,10 +1569,12 @@ export class HighlightRenderer {
    */
   _uploadHighlightChunks(
     candidateIndices,
+    candidateCount,
     iterateLodPrefix,
     highlightData,
     admissionLevels,
     activeLodLevel,
+    lodPrefix,
     transparency,
     positions,
     dimension
@@ -1570,14 +1584,16 @@ export class HighlightRenderer {
     const { colorView, posView, wordView } = this._stagingBuffer;
     let writtenBytes = 0;
     let next = 0;
-    while (next < candidateIndices.length) {
+    while (next < candidateCount) {
       next = packHighlightRecords(
         candidateIndices,
+        candidateCount,
         next,
         iterateLodPrefix,
         highlightData,
         admissionLevels,
         activeLodLevel,
+        lodPrefix,
         transparency,
         positions,
         dimension,
@@ -1675,6 +1691,49 @@ export class HighlightRenderer {
   }
 
   /**
+   * Bind one VAO a segment of the point store `positions`
+   * (`point-store-segments.js`): `first` (the view's own VAO) for the first
+   * segment, a VAO of `viewBuffer.segmentVertexArrays` for each later one,
+   * each reading that segment's positions and the segment's run of slot words
+   * in `words` (one 4-byte word a slot, from the segment's first slot).
+   * Leaves no VAO bound.
+   * @private
+   */
+  _bindStoreSegmentLayouts(viewBuffer, first, positions, words, dimension) {
+    const gl = this.gl;
+    const segments = positions.segments;
+    const extras = viewBuffer.segmentVertexArrays ?? [];
+    while (extras.length > segments.length - 1) this._pendingVertexArrayDeletes.add(extras.pop());
+    while (extras.length < segments.length - 1) {
+      const vao = gl.createVertexArray();
+      if (!vao) throw new Error('Unable to allocate a highlight vertex array for a point-store segment.');
+      extras.push(vao);
+    }
+    viewBuffer.segmentVertexArrays = extras;
+    for (let index = 0; index < segments.length; index++) {
+      gl.bindVertexArray(index === 0 ? first : extras[index - 1]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, segments[index].buffer);
+      gl.enableVertexAttribArray(this.attribLocations.position);
+      gl.vertexAttribPointer(this.attribLocations.position, dimension, gl.FLOAT, false, dimension * 4, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, words);
+      gl.enableVertexAttribArray(this.attribLocations.color);
+      gl.vertexAttribPointer(
+        this.attribLocations.color, 4, gl.UNSIGNED_BYTE, true, HIGHLIGHT_SLOT_BYTES,
+        segments[index].first * HIGHLIGHT_SLOT_BYTES
+      );
+    }
+    gl.bindVertexArray(null);
+    viewBuffer.storeSegments = segments;
+  }
+
+  /** Release the per-segment VAOs of a view no longer drawn from a store. @private */
+  _releaseStoreSegmentLayouts(viewBuffer) {
+    for (const extra of viewBuffer.segmentVertexArrays ?? []) this._pendingVertexArrayDeletes.add(extra);
+    viewBuffer.segmentVertexArrays = [];
+    viewBuffer.storeSegments = null;
+  }
+
+  /**
    * The view's point store, when the highlights can be drawn from it: it
    * holds exactly `positions` (`dimension` components a point) and, with a
    * reduced level of detail, the level's members are its first slots, in
@@ -1685,19 +1744,21 @@ export class HighlightRenderer {
     const store = this.hpRenderer?.getViewPointStore?.(viewId) ?? null;
     if (store === null || store.positions !== positions || store.dimension !== dimension) return null;
     if (membership === null) {
-      return {
-        buffer: store.buffer,
-        slotSources: store.slotSources,
-        order: store.order,
-        slots: positions.length / dimension,
-      };
+      return { buffer: store.buffer, order: store.order, slots: positions.length / dimension };
     }
-    const prefix = membership.indices;
-    const sources = store.slotSources;
-    if (sources === null || prefix.buffer !== sources.buffer || prefix.byteOffset !== sources.byteOffset) {
+    // A level admitting the first `count` cells is the store's first slots
+    // in any order a ranked store holds (`LodMembership`); a level admitting
+    // by priority rank is a prefix only of the tree's own order.
+    if (membership.admissionLevels !== null) {
+      const prefix = membership.indices;
+      const sources = store.order?.drawOrder?.indices ?? null;
+      if (sources === null || prefix.buffer !== sources.buffer || prefix.byteOffset !== sources.byteOffset) {
+        return null;
+      }
+    } else if (store.order !== null && !store.order.ranked) {
       return null;
     }
-    return { buffer: store.buffer, slotSources: sources, order: store.order, slots: prefix.length };
+    return { buffer: store.buffer, order: store.order, slots: membership.count };
   }
 
   /** The transform-feedback pass that writes slot words (created on first use). @private */
@@ -1720,6 +1781,11 @@ export class HighlightRenderer {
     const activeTexture = glStateOf(gl).activeTexture;
     gl.activeTexture(gl.TEXTURE0);
     const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D_ARRAY);
+    if (texture !== null && plan.itemCount !== bytes.length && bytes.length > 0 && bytes.length <= plan.texels) {
+      // Cells cut in place, or as many again: the storage holds them, laid
+      // out as before; only its rows are written.
+      plan = resizedLinearPlan(plan, bytes.length);
+    }
     if (texture === null || plan.itemCount !== bytes.length) {
       if (texture !== null) deleteTextureTracked(gl, texture);
       texture = gl.createTexture();
@@ -1749,6 +1815,19 @@ export class HighlightRenderer {
   }
 
   /** The highlight bytes as a texture (`_byteTexture`). @private */
+  /**
+   * Let the highlight bytes' texture go, and the highlight array it holds:
+   * nothing is highlighted (a new dataset publishes an empty highlight, a
+   * page is cleared). The next highlight drawn from a store makes it again.
+   */
+  releaseHighlightTexture() {
+    const record = this._highlightTexture ?? null;
+    if (record === null) return;
+    this._highlightTexture = null;
+    deleteTextureTracked(this.gl, record.texture);
+    this._publishGpuAllocationChange();
+  }
+
   _highlightByteTexture(highlightData) {
     this._highlightTexture = this._byteTexture(this._highlightTexture ?? null, highlightData, this._highlightDataVersion);
     return this._highlightTexture;
@@ -1771,7 +1850,7 @@ export class HighlightRenderer {
     const store = this.hpRenderer?.getViewPointStore?.(viewId) ?? null;
     return store === null
       || store.buffer !== viewBuffer.storeBuffer
-      || store.slotSources !== viewBuffer.storeSlotSources;
+      || store.order !== viewBuffer.storeOrder;
   }
 
   /**
@@ -1854,6 +1933,42 @@ export class HighlightRenderer {
   /**
    * Drop handles invalidated by context loss without issuing WebGL work.
    */
+  /**
+   * What this renderer shows that lives on the CPU: the highlight bytes and
+   * cell list it was given, and its style. A renderer made on a restored
+   * context takes it (`adoptPublication`) and draws the same rings.
+   *
+   * @returns {object}
+   */
+  publication() {
+    return {
+      highlightData: this._highlightDataRef,
+      highlightedIndices: this._highlightedIndicesCache,
+      atFullIntensity: this._cacheAtFullIntensity,
+      style: {
+        highlightColor: this.highlightColor,
+        highlightScale: this.highlightScale,
+        highlightRingWidth: this.highlightRingWidth,
+        highlightHaloStrength: this.highlightHaloStrength,
+        highlightHaloShape: this.highlightHaloShape,
+        highlightRingStyle: this.highlightRingStyle,
+        highlightAnimated: this.highlightAnimated,
+        _storeDrawing: this._storeDrawing,
+      },
+    };
+  }
+
+  /** Show a lost renderer's `publication`: every view republishes when drawn. */
+  adoptPublication(record) {
+    Object.assign(this, record.style);
+    this._styleGeneration++;
+    if (record.highlightData !== null && record.highlightedIndices !== null) {
+      this.setHighlightedIndicesCache(record.highlightedIndices, record.highlightData, record.atFullIntensity);
+    } else if (record.highlightData !== null) {
+      this.updateHighlightCache(record.highlightData);
+    }
+  }
+
   handleContextLost() {
     if (this._disposed) return false;
     this._disposeStarted = true;
@@ -2128,8 +2243,17 @@ export class HighlightRenderer {
 
       // Attribute layout is immutable for the lifetime of the resource pair;
       // each frame needs one VAO bind instead of reconfiguring two attributes.
-      gl.bindVertexArray(vertexArray);
-      drawPointsInSegments(gl, 0, drawCount);
+      const segments = (viewBuffer.storeBuffer ?? null) !== null ? (viewBuffer.storeSegments ?? null) : null;
+      if (segments === null) {
+        gl.bindVertexArray(vertexArray);
+        drawPointsInSegments(gl, 0, drawCount);
+      } else {
+        // One draw a store segment the drawn slots reach, in slot order.
+        forEachSegmentRange(segments, 0, drawCount, (index, localFirst, localCount) => {
+          gl.bindVertexArray(index === 0 ? vertexArray : viewBuffer.segmentVertexArrays[index - 1]);
+          drawPointsInSegments(gl, localFirst, localCount);
+        });
+      }
     } catch (error) {
       drawFailure = error;
     } finally {
@@ -2598,6 +2722,7 @@ export class HighlightTools {
     this.getViewTransparency = getViewTransparency;
     this.getSpatialQueryOwner = getSpatialQueryOwner;
 
+    this._startTime = startTime;
     this.highlightRenderer = new HighlightRenderer(gl, hpRenderer, startTime);
     let lassoOverlay;
     try {
@@ -2675,6 +2800,14 @@ export class HighlightTools {
     this.knnGraph = null;
     this.knnEdgesLoaded = false;
     this.knnEdgeLoadCallback = null;
+    // Told when the tool is left: the graph it read may be let go.
+    this.knnEdgeReleaseCallback = null;
+    // Told when a k-NN expansion could not read the rows it needed.
+    this.knnFailureCallback = null;
+    // Released k-NN steps still reading their rows, committed in order;
+    // a cancel raises the epoch, and steps of an earlier one are dropped.
+    this._knnCommits = null;
+    this._knnCommitEpoch = 0;
 
     // The cell query of the gesture in flight (selection-gesture-queries.js),
     // with what it was built from; rebuilt when any of that changes.
@@ -3064,6 +3197,9 @@ export class HighlightTools {
     // or even constructing the shared membership map.
     this.highlightRenderer.updateHighlightCache(this.highlightArray);
     if (this.highlightRenderer._highlightedIndicesCache.length === 0) {
+      // Nothing highlighted: the bytes texture (and the array it was
+      // written from, a previous dataset's included) goes too.
+      this.highlightRenderer.releaseHighlightTexture();
       this.highlightRenderer.publishEmptyView(vid);
       return;
     }
@@ -3481,9 +3617,10 @@ export class HighlightTools {
       if (this.isKnnDragging) {
         this.isKnnDragging = false;
         clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-        this._knnExpansion = null;
+        this._dropKnnExpansion();
         this.canvas.classList.remove('knn-dragging');
       }
+      if (this.knnEdgesLoaded) this.knnEdgeReleaseCallback?.();
     } else if (!this.knnEdgesLoaded && this.knnEdgeLoadCallback) {
       this.knnEdgeLoadCallback();
     }
@@ -3521,6 +3658,19 @@ export class HighlightTools {
     );
   }
 
+  /** Be told when the k-NN tool is left while it holds its graph. */
+  setKnnEdgeReleaseCallback(callback) {
+    this.knnEdgeReleaseCallback = requireCallback(
+      callback,
+      'KNN edge-release callback'
+    );
+  }
+
+  /** Be told when a k-NN expansion could not read the neighbour rows it needed (the gesture ends). */
+  setKnnFailureCallback(callback) {
+    this.knnFailureCallback = requireCallback(callback, 'KNN failure callback');
+  }
+
   getKnnState() {
     return {
       inProgress: this.knnCandidateSet !== null,
@@ -3531,10 +3681,10 @@ export class HighlightTools {
   }
 
   /**
-   * Load the k-NN tool's graph: the adjacency the reader worker built with
-   * the edges (`ConnectivityEdges` of `data/connectivity-edges.js`), used as it is.
+   * Load the k-NN tool's graph: its rows, read by cell from the file
+   * (`KnnRowSource` of `selection-gesture-queries.js`).
    *
-   * @param {import('../data/connectivity-edges.js').ConnectivityEdges} graph
+   * @param {import('./selection-gesture-queries.js').KnnRowSource} graph
    * @param {number} cellCount - Cells of the published views.
    * @returns {true}
    */
@@ -3545,7 +3695,7 @@ export class HighlightTools {
         `The KNN graph covers ${formatCountOf(graph.nCells, 'cell')}; the views hold ${cellCount}.`
       );
     }
-    this._knnExpansion = null;
+    this._dropKnnExpansion();
     this.knnGraph = graph;
     this.knnEdgesLoaded = true;
     return true;
@@ -3560,7 +3710,7 @@ export class HighlightTools {
     if (hadActiveOverlay) {
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
     }
-    this._knnExpansion = null;
+    this._dropKnnExpansion();
     this.knnSeedCell = null;
     this.knnCurrentDegree = 0;
     this.knnCandidateSet = null;
@@ -3575,6 +3725,14 @@ export class HighlightTools {
   }
 
   confirmKnnSelection() {
+    // A released step still reading its rows is part of what is confirmed.
+    const pending = this._knnCommits ?? null;
+    if (pending !== null) {
+      void pending.then(() => {
+        if (this._disposed !== true) this.confirmKnnSelection();
+      });
+      return;
+    }
     if (this.knnCandidateSet && this.knnCandidateSet.size > 0) {
       const finalIndices = this.knnCandidateSet.toUint32Array();
       if (this.knnCallback) {
@@ -3591,6 +3749,8 @@ export class HighlightTools {
   }
 
   cancelKnnSelection() {
+    // Released steps still reading their rows are cancelled with the rest.
+    this._knnCommitEpoch = (this._knnCommitEpoch ?? 0) + 1;
     this.knnCandidateSet = null;
     this.knnStepCount = 0;
     if (this.knnStepCallback) {
@@ -3605,7 +3765,7 @@ export class HighlightTools {
       this.isKnnDragging = false;
       this.canvas.classList.remove('knn-dragging');
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-      this._knnExpansion = null;
+      this._dropKnnExpansion();
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
       this.updateSelectionCursor();
@@ -3855,9 +4015,121 @@ export class HighlightTools {
     ) {
       return record.query;
     }
+    this._dropKnnExpansion();
     const query = new KnnExpansion({ graph, seed: seed.cellIndex, transparency });
     this._knnExpansion = { seed, graph, transparency, generation, query };
     return query;
+  }
+
+  /** Let the gesture's expansion go, stopping the reads it has in flight. */
+  _dropKnnExpansion() {
+    this._knnExpansion?.query.dispose();
+    this._knnExpansion = null;
+  }
+
+  /**
+   * Expand the k-NN gesture in flight to its degree for one slice: publish
+   * its preview when done; else continue in the next slice, or once the rows
+   * it reads have arrived. A failed read ends the gesture.
+   */
+  _advanceKnnExpansion(deadline) {
+    let query;
+    try {
+      query = this._knnQuery();
+      if (query.expandTo(this.knnCurrentDegree, deadline)) {
+        this._publishKnnPreview(query);
+        return;
+      }
+    } catch (error) {
+      this._failKnnGesture(error);
+      return;
+    }
+    const waiting = query.waiting;
+    if (waiting === null) {
+      this._scheduleSelectionWork();
+      return;
+    }
+    waiting.then(() => {
+      if (this._disposed !== true && this._knnExpansion?.query === query) this._scheduleSelectionWork();
+    }, () => {
+      if (this._disposed !== true && this._knnExpansion?.query === query) this._scheduleSelectionWork();
+    });
+  }
+
+  /** End the k-NN gesture in flight: a read it needed failed. */
+  _failKnnGesture(error) {
+    if (this.isKnnDragging) {
+      this.isKnnDragging = false;
+      this.canvas.classList.remove('knn-dragging');
+      clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
+      this.knnSeedCell = null;
+      this.knnCurrentDegree = 0;
+      this.updateSelectionCursor();
+    }
+    this._dropKnnExpansion();
+    this._reportKnnFailure(error);
+  }
+
+  _reportKnnFailure(error) {
+    if (isCancellation(error)) return;
+    console.error('[HighlightTools] The k-NN expansion could not read its neighbour rows:', error);
+    this.knnFailureCallback?.(error);
+  }
+
+  /**
+   * Commit a released k-NN step once its expansion holds `step.degree`: at
+   * once when its rows are all read, else when they arrive, after every step
+   * released before it. A step whose graph was replaced meanwhile is
+   * dropped.
+   *
+   * @param {KnnExpansion} query
+   * @param {{graph: object, mode: string, seedCellIndex: number, degree: number}} step
+   */
+  _commitKnnStep(query, step) {
+    const epoch = this._knnCommitEpoch ?? 0;
+    const commit = () => {
+      if (this._disposed === true || this.knnGraph !== step.graph || (this._knnCommitEpoch ?? 0) !== epoch) return;
+      const allCells = query.cells();
+      // A subtract with nothing selected yet leaves an empty set, exactly
+      // as proximity does, so the release still publishes a step the tool
+      // can answer instead of vanishing under a wiped drag preview.
+      this.knnCandidateSet = commitCandidateStep(
+        this.knnCandidateSet,
+        allCells,
+        step.mode,
+        allCells.cellCount
+      );
+      this.knnStepCount++;
+      if (this.knnStepCallback) {
+        this.knnStepCallback({
+          step: this.knnStepCount,
+          candidateCount: this.knnCandidateSet.size,
+          candidates: this.knnCandidateSet.toUint32Array(),
+          mode: step.mode,
+          seedCellIndex: step.seedCellIndex,
+          degree: step.degree
+        });
+      }
+    };
+    try {
+      if (this._knnCommits === null && query.expandTo(step.degree, Infinity)) {
+        commit();
+        query.dispose();
+        return;
+      }
+    } catch (error) {
+      query.dispose();
+      this._reportKnnFailure(error);
+      return;
+    }
+    const commits = (this._knnCommits ?? Promise.resolve())
+      .then(() => query.completeTo(step.degree))
+      .then(commit, error => this._reportKnnFailure(error))
+      .finally(() => {
+        query.dispose();
+        if (this._knnCommits === commits) this._knnCommits = null;
+      });
+    this._knnCommits = commits;
   }
 
   /** Continue the gesture's pending pass as a separate task. */
@@ -3903,12 +4175,7 @@ export class HighlightTools {
       return;
     }
     if (this.isKnnDragging && this.knnSeedCell && this.knnGraph && this.knnPreviewCallback) {
-      const query = this._knnQuery();
-      if (!query.expandTo(this.knnCurrentDegree, deadline)) {
-        this._scheduleSelectionWork();
-      } else {
-        this._publishKnnPreview(query);
-      }
+      this._advanceKnnExpansion(deadline);
     }
   }
 
@@ -4191,7 +4458,7 @@ export class HighlightTools {
           viewId: viewId  // Store viewId for multi-dimensional support
         };
         this.knnCurrentDegree = 0;
-        this._knnExpansion = null;
+        this._dropKnnExpansion();
         this.isKnnDragging = true;
         this.canvas.style.cursor = 'ns-resize';
         this.canvas.classList.add('knn-dragging');
@@ -4381,12 +4648,7 @@ export class HighlightTools {
 
         if (this.knnPreviewCallback) {
           // The expansion runs through the cells this view draws.
-          const query = this._knnQuery();
-          if (!query.expandTo(this.knnCurrentDegree, performance.now() + SELECTION_SLICE_MS)) {
-            this._scheduleSelectionWork();
-          } else {
-            this._publishKnnPreview(query);
-          }
+          this._advanceKnnExpansion(performance.now() + SELECTION_SLICE_MS);
         }
       }
       return true;
@@ -4442,7 +4704,7 @@ export class HighlightTools {
       this.isKnnDragging = false;
       this.canvas.classList.remove('knn-dragging');
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-      this._knnExpansion = null;
+      this._dropKnnExpansion();
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
       this.updateSelectionCursor();
@@ -4606,37 +4868,28 @@ export class HighlightTools {
       this.canvas.classList.remove('knn-dragging');
 
       if (this.knnGraph && this.knnSeedCell) {
-        const mode = this.knnSeedCell.mode || 'intersect';
-        // The expansion runs through the cells this view draws.
-        const query = this._knnQuery();
-        query.expandTo(this.knnCurrentDegree, Infinity);
-        const allCells = query.cells();
-        // A subtract with nothing selected yet leaves an empty set, exactly
-        // as proximity does, so the release still publishes a step the tool
-        // can answer instead of vanishing under a wiped drag preview.
-        this.knnCandidateSet = commitCandidateStep(
-          this.knnCandidateSet,
-          allCells,
-          mode,
-          allCells.cellCount
-        );
-
-        this.knnStepCount++;
-
-        if (this.knnStepCallback) {
-          this.knnStepCallback({
-            step: this.knnStepCount,
-            candidateCount: this.knnCandidateSet.size,
-            candidates: this.knnCandidateSet.toUint32Array(),
-            mode: mode,
+        // The expansion runs through the cells this view draws; the step is
+        // committed once it holds the degree (its rows may still be read).
+        let query = null;
+        try {
+          query = this._knnQuery();
+        } catch (error) {
+          this._reportKnnFailure(error);
+        }
+        if (query !== null) {
+          // The step owns the expansion now: the gesture lets go of it unstopped.
+          this._knnExpansion = null;
+          this._commitKnnStep(query, {
+            graph: this.knnGraph,
+            mode: this.knnSeedCell.mode || 'intersect',
             seedCellIndex: this.knnSeedCell.cellIndex,
-            degree: this.knnCurrentDegree
+            degree: this.knnCurrentDegree,
           });
         }
       }
 
       clearKnnOverlay({ canvas: this.canvas, lassoCtx: this.lassoCtx });
-      this._knnExpansion = null;
+      this._dropKnnExpansion();
       this.knnSeedCell = null;
       this.knnCurrentDegree = 0;
       this.updateSelectionCursor();
@@ -4680,6 +4933,31 @@ export class HighlightTools {
   /**
    * Fence GPU handles first, then reuse ordinary DOM/CPU retirement.
    */
+  /**
+   * The context was lost and may come back: only the drawing half goes (its
+   * handles died with the context); the tools, their DOM and callbacks, and
+   * what the renderer showed stay for `resumeRendering`.
+   */
+  suspendRendering() {
+    if (this._disposed || this._suspendedPublication !== undefined) return;
+    this._suspendedPublication = this.highlightRenderer.publication();
+    this.highlightRenderer.handleContextLost();
+  }
+
+  /**
+   * Draw again on the restored context, through `hpRenderer` (the renderer
+   * made on it): a new highlight renderer showing what the lost one did.
+   */
+  resumeRendering(hpRenderer) {
+    if (this._disposed || this._suspendedPublication === undefined) return;
+    const renderer = new HighlightRenderer(this.gl, hpRenderer, this._startTime);
+    renderer.adoptPublication(this._suspendedPublication);
+    this._suspendedPublication = undefined;
+    this.hpRenderer = hpRenderer;
+    this.highlightRenderer = renderer;
+    renderer.prepareStoreDrawing();
+  }
+
   handleContextLost() {
     if (this._disposed) return false;
     const failures = [];
@@ -4765,7 +5043,7 @@ export class HighlightTools {
       this.knnEdgesLoaded = false;
       this._lassoHitTest = null;
       this._proximityHitTest = null;
-      this._knnExpansion = null;
+      this._dropKnnExpansion();
       this.altKeyDown = false;
       this.selectMode = SELECT_MODE_OFF;
 
@@ -4783,6 +5061,7 @@ export class HighlightTools {
         'knnPreviewCallback',
         'knnStepCallback',
         'knnEdgeLoadCallback',
+        'knnFailureCallback',
         'pickCellAtScreen',
         'screenToRay',
         'getViewportInfoAtScreen',

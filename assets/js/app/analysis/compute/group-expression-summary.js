@@ -2,11 +2,19 @@
  * @fileoverview Per-group expression summaries of a gene — what a dot plot
  * draws (scanpy `pl.dotplot` / `pl.matrixplot`).
  *
- * For each group: the sum of the gene's values, the number of cells whose
- * value is above the expression cutoff, and the sum over those cells. The
- * mean, the fraction expressing and the mean of the expressing cells follow
- * from these and the group's size. One pass over the gene's non-zero entries,
- * O(nnz); zero entries are accounted per group at once.
+ * For each group: the cells with a value (measured), the sum of the gene's
+ * values, the number of cells whose value is above the expression cutoff,
+ * and the sum over those cells. The mean, the fraction expressing and the
+ * mean of the expressing cells follow from these over the measured cells.
+ * One pass over the gene's non-zero entries, O(nnz); zero entries are
+ * accounted per group at once.
+ *
+ * A non-finite value (NaN, an infinity) is a missing measurement — a MuData
+ * modality's cell the assay did not measure, a layer holding NaN — and is
+ * left out of every number as differential expression, markers, signatures
+ * and UCell leave it out (`gene-statistics.js`): it adds nothing to a sum, a
+ * count or a bin, and the group's measured cells, which every share and mean
+ * divides by, do not count it.
  *
  * @module analysis/compute/group-expression-summary
  */
@@ -49,10 +57,12 @@ export function createGroupSummaryContext(cellGroup, groupCount) {
  * @param {number} [bins=0] - With bins, also each gene's distribution in
  *   each group: `bins` equal bins over the gene's range in the grouped cells
  *   (zero included), for a stacked violin.
- * @returns {{sum: Float64Array, expressing: Uint32Array, sumExpressing: Float64Array, sizes: Uint32Array, geneCount: number, groupCount: number, bins: number, range: Float64Array, histogram: Uint32Array}}
- *   Gene-major: `sum[gene * groupCount + group]`; `range[2 * gene]` and
- *   `[2 * gene + 1]` the low and high ends of a gene's bins;
- *   `histogram[(gene * groupCount + group) * bins + bin]`.
+ * @returns {{sum: Float64Array, expressing: Uint32Array, sumExpressing: Float64Array, measured: Uint32Array, sizes: Uint32Array, geneCount: number, groupCount: number, bins: number, range: Float64Array, histogram: Uint32Array}}
+ *   Gene-major: `sum[gene * groupCount + group]`, `measured[...]` the
+ *   group's cells with a finite value of the gene; `sizes[group]` every cell
+ *   of the group; `range[2 * gene]` and `[2 * gene + 1]` the low and high
+ *   ends of a gene's bins; `histogram[(gene * groupCount + group) * bins + bin]`
+ *   over the measured cells.
  */
 export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
   if (!Array.isArray(genes)) throw new TypeError('Group summary genes must be an array');
@@ -63,12 +73,12 @@ export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
   const sum = new Float64Array(geneCount * groupCount);
   const expressing = new Uint32Array(geneCount * groupCount);
   const sumExpressing = new Float64Array(geneCount * groupCount);
+  const measured = new Uint32Array(geneCount * groupCount);
   const nonZero = new Uint32Array(groupCount);
+  const missing = new Uint32Array(groupCount);
   const zeroExpressed = 0 > cutoff;
   const range = new Float64Array(bins > 0 ? geneCount * 2 : 0);
   const histogram = new Uint32Array(bins > 0 ? geneCount * groupCount * bins : 0);
-  let grouped = 0;
-  for (let group = 0; group < groupCount; group++) grouped += sizes[group];
 
   for (let gene = 0; gene < geneCount; gene++) {
     const sample = geneSampleOf(genes[gene], 0);
@@ -77,6 +87,7 @@ export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
     }
     const base = gene * groupCount;
     nonZero.fill(0);
+    missing.fill(0);
     const { indices, values } = sample;
     for (let entry = 0; entry < indices.length; entry++) {
       const group = cellGroup[indices[entry]];
@@ -84,6 +95,11 @@ export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
       const value = values[entry];
       // A stored zero is a zero: it is accounted with the implicit ones.
       if (value === 0) continue;
+      // Not measured: out of every number of the group.
+      if (!Number.isFinite(value)) {
+        missing[group] += 1;
+        continue;
+      }
       nonZero[group] += 1;
       sum[base + group] += value;
       if (value > cutoff) {
@@ -91,16 +107,20 @@ export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
         sumExpressing[base + group] += value;
       }
     }
-    if (zeroExpressed) {
-      for (let group = 0; group < groupCount; group++) {
-        expressing[base + group] += sizes[group] - nonZero[group];
-      }
+    let measuredCells = 0;
+    for (let group = 0; group < groupCount; group++) {
+      measured[base + group] = sizes[group] - missing[group];
+      measuredCells += measured[base + group];
+      if (zeroExpressed) expressing[base + group] += measured[base + group] - nonZero[group];
     }
-    if (bins > 0) binGene(gene);
+    if (bins > 0) binGene(gene, measuredCells);
   }
 
-  /** The gene's distribution per group, over its range in the grouped cells. */
-  function binGene(gene) {
+  /**
+   * The gene's distribution per group, over its range in the grouped cells
+   * with a value (`measuredCells` of them).
+   */
+  function binGene(gene, measuredCells) {
     const sample = geneSampleOf(genes[gene], 0);
     const { indices, values } = sample;
     let stored = 0;
@@ -109,12 +129,13 @@ export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
     for (let entry = 0; entry < indices.length; entry++) {
       if (cellGroup[indices[entry]] < 0) continue;
       const value = values[entry];
-      if (value === 0) continue;
+      if (value === 0 || !Number.isFinite(value)) continue;
       stored += 1;
       if (value < low) low = value;
       if (value > high) high = value;
     }
-    if (stored < grouped) {
+    // Some measured cell holds 0: the range takes it in.
+    if (stored < measuredCells) {
       low = Math.min(low, 0);
       high = Math.max(high, 0);
     }
@@ -133,42 +154,43 @@ export function summarizeGenesByGroup(context, genes, cutoff, bins = 0) {
       const group = cellGroup[indices[entry]];
       if (group < 0) continue;
       const value = values[entry];
-      if (value === 0) continue;
+      if (value === 0 || !Number.isFinite(value)) continue;
       counted[group] += 1;
       histogram[(base + group) * bins + binOf(value)] += 1;
     }
     for (let group = 0; group < groupCount; group++) {
-      histogram[(base + group) * bins + zeroBin] += sizes[group] - counted[group];
+      histogram[(base + group) * bins + zeroBin] += measured[base + group] - counted[group];
     }
   }
   return {
-    sum, expressing, sumExpressing, sizes: sizes.slice(), geneCount, groupCount, bins, range, histogram
+    sum, expressing, sumExpressing, measured, sizes: sizes.slice(), geneCount, groupCount, bins, range, histogram
   };
 }
 
 /**
  * The values a dot plot shows, from a summary: per gene and group the mean,
  * the fraction of cells expressing and the mean of the expressing cells (0
- * where no cell expresses, as scanpy's `mean_only_expressed` fills it). An
- * empty group has NaN everywhere.
+ * where no cell expresses, as scanpy's `mean_only_expressed` fills it), each
+ * over the group's measured cells. A group with no measured cell has NaN
+ * everywhere.
  *
- * @param {ReturnType<typeof summarizeGenesByGroup>} summary
+ * @param {{sum: Float64Array, expressing: Uint32Array, sumExpressing: Float64Array, measured: Uint32Array, geneCount: number, groupCount: number}} summary
  * @returns {{mean: Float64Array, fraction: Float64Array, meanExpressing: Float64Array}}
  */
 export function groupSummaryValues(summary) {
-  const { sum, expressing, sumExpressing, sizes, geneCount, groupCount } = summary;
+  const { sum, expressing, sumExpressing, measured, geneCount, groupCount } = summary;
   const total = geneCount * groupCount;
+  if (!(measured instanceof Uint32Array) || measured.length !== total) {
+    throw new TypeError('A group summary needs the measured cells of every gene and group');
+  }
   const mean = new Float64Array(total);
   const fraction = new Float64Array(total);
   const meanExpressing = new Float64Array(total);
-  for (let gene = 0; gene < geneCount; gene++) {
-    for (let group = 0; group < groupCount; group++) {
-      const at = gene * groupCount + group;
-      const n = sizes[group];
-      mean[at] = n > 0 ? sum[at] / n : NaN;
-      fraction[at] = n > 0 ? expressing[at] / n : NaN;
-      meanExpressing[at] = n === 0 ? NaN : expressing[at] > 0 ? sumExpressing[at] / expressing[at] : 0;
-    }
+  for (let at = 0; at < total; at++) {
+    const n = measured[at];
+    mean[at] = n > 0 ? sum[at] / n : NaN;
+    fraction[at] = n > 0 ? expressing[at] / n : NaN;
+    meanExpressing[at] = n === 0 ? NaN : expressing[at] > 0 ? sumExpressing[at] / expressing[at] : 0;
   }
   return { mean, fraction, meanExpressing };
 }

@@ -31,10 +31,7 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
     const { WorkerPool } = await import(
       '/assets/js/app/analysis/compute/worker-pool.js'
     );
-    const pool = new WorkerPool({
-      poolSize: 1,
-      defaultTimeout: 10_000
-    });
+    const pool = new WorkerPool({ poolSize: 1 });
     try {
       await pool.init();
       const result = await pool.execute(

@@ -14,6 +14,7 @@ import { FieldOverlayInternalMethods } from './field/overlay-internals.js';
 import { FieldCategoryOpsMethods } from './field/category-ops.js';
 import { FieldLoadingMethods } from './field/loading.js';
 import { FieldSummaryMethods } from './field/summary.js';
+import { FieldGeneSampleMethods } from './field/gene-sample.js';
 
 function applyMixin(targetProto, mixinProto) {
   const descriptors = Object.getOwnPropertyDescriptors(mixinProto);
@@ -28,6 +29,7 @@ applyMixin(DataStateFieldMethods.prototype, FieldOverlayPublicMethods.prototype)
 applyMixin(DataStateFieldMethods.prototype, FieldCategoryOpsMethods.prototype);
 applyMixin(DataStateFieldMethods.prototype, FieldLoadingMethods.prototype);
 applyMixin(DataStateFieldMethods.prototype, FieldSummaryMethods.prototype);
+applyMixin(DataStateFieldMethods.prototype, FieldGeneSampleMethods.prototype);
 
 export class FieldManager extends BaseManager {
   constructor(coordinator) {

@@ -17,6 +17,7 @@ import {
 } from '../../data/categorical-storage-contract.js';
 import { isCategoricalCodes } from '../../data/categorical-storage-contract.js';
 import { getCategoryColor } from '../../data/palettes.js';
+import { carriedCategoryState } from './category-state.js';
 
 function requireCategories(categories) {
   if (!Array.isArray(categories) || categories.length === 0) {
@@ -220,31 +221,20 @@ export function applyCategoryIndexMapping(codes, mapping, newCategoryCount) {
  * or else takes the palette colour of its index and is shown.
  *
  * @param {ReturnType<typeof buildDeleteToUnassignedTransform>} transform
- * @param {{colors: number[][], visible: Object<number, boolean>}} state - by old index
- * @returns {{colors: number[][], visible: Object<number, boolean>}} by new index
+ * @param {{colors: Uint8Array, visible: Uint8Array}} state - by old index (`category-state.js`)
+ * @returns {{colors: Uint8Array, visible: Uint8Array}} by new index
  */
-export function carryCategoryStateThroughDelete(transform, { colors, visible }) {
+export function carryCategoryStateThroughDelete(transform, state) {
   const count = transform.categories.length;
-  const nextColors = new Array(count);
-  const nextVisible = {};
-  for (let index = 0; index < count; index++) nextVisible[index] = true;
+  const from = new Int32Array(count).fill(-1);
   const unassignedOld = transform.keptOldUnassignedIndex;
-  const unassignedNew = transform.unassignedNewIndex;
-  if (unassignedOld !== null) {
-    nextColors[unassignedNew] = [...colors[unassignedOld]];
-    nextVisible[unassignedNew] = visible[unassignedOld];
-  } else {
-    nextColors[unassignedNew] = [...getCategoryColor(unassignedNew)];
-    nextVisible[unassignedNew] = true;
-  }
+  if (unassignedOld !== null) from[transform.unassignedNewIndex] = unassignedOld;
   const merged = new Set(transform.mergedOldIndices);
   for (let oldIndex = 0; oldIndex < transform.mapping.length; oldIndex++) {
     if (oldIndex === unassignedOld || merged.has(oldIndex)) continue;
-    const newIndex = transform.mapping[oldIndex];
-    nextColors[newIndex] = [...colors[oldIndex]];
-    nextVisible[newIndex] = visible[oldIndex];
+    from[transform.mapping[oldIndex]] = oldIndex;
   }
-  return { colors: nextColors, visible: nextVisible };
+  return carriedCategoryState(state, count, index => from[index], getCategoryColor);
 }
 
 /**
@@ -255,23 +245,21 @@ export function carryCategoryStateThroughDelete(transform, { colors, visible }) 
  * @param {ReturnType<typeof buildMergeCategoriesTransform>} transform
  * @param {number} fromIndex - The dragged category, by old index.
  * @param {number} toIndex - The category it was dropped on, by old index.
- * @param {{colors: number[][], visible: Object<number, boolean>}} state - by old index
- * @returns {{colors: number[][], visible: Object<number, boolean>}} by new index
+ * @param {{colors: Uint8Array, visible: Uint8Array}} state - by old index (`category-state.js`)
+ * @returns {{colors: Uint8Array, visible: Uint8Array}} by new index
  */
-export function carryCategoryStateThroughMerge(transform, fromIndex, toIndex, { colors, visible }) {
+export function carryCategoryStateThroughMerge(transform, fromIndex, toIndex, state) {
   const count = transform.categories.length;
-  const nextColors = new Array(count);
-  const nextVisible = {};
-  for (let index = 0; index < count; index++) nextVisible[index] = true;
-  nextColors[transform.targetNewIndex] = [...colors[fromIndex]];
-  nextVisible[transform.targetNewIndex] = visible[fromIndex] || visible[toIndex];
+  const from = new Int32Array(count).fill(-1);
+  from[transform.targetNewIndex] = fromIndex;
   for (let oldIndex = 0; oldIndex < transform.mapping.length; oldIndex++) {
     if (oldIndex === fromIndex || oldIndex === toIndex) continue;
-    const newIndex = transform.mapping[oldIndex];
-    nextColors[newIndex] = [...colors[oldIndex]];
-    nextVisible[newIndex] = visible[oldIndex];
+    from[transform.mapping[oldIndex]] = oldIndex;
   }
-  return { colors: nextColors, visible: nextVisible };
+  const carried = carriedCategoryState(state, count, index => from[index], getCategoryColor);
+  // Shown while either was (the array is still being made: no one shares it).
+  if (state.visible[toIndex] === 1) carried.visible[transform.targetNewIndex] = 1;
+  return carried;
 }
 
 /**
@@ -281,34 +269,11 @@ export function carryCategoryStateThroughMerge(transform, fromIndex, toIndex, { 
  *
  * @param {Array<string|number|boolean>} previousCategories
  * @param {Array<string|number|boolean>} categories
- * @param {{colors: number[][], visible: Object<number, boolean>}} state - by previous index
- * @returns {{colors: number[][], visible: Object<number, boolean>}} by new index
+ * @param {{colors: Uint8Array, visible: Uint8Array}} state - by previous index (`category-state.js`)
+ * @returns {{colors: Uint8Array, visible: Uint8Array}} by new index
  */
-export function carryCategoryStateByCategory(previousCategories, categories, { colors, visible }) {
+export function carryCategoryStateByCategory(previousCategories, categories, state) {
   const previousIndexOf = new Map();
   previousCategories.forEach((category, index) => previousIndexOf.set(category, index));
-  const nextColors = new Array(categories.length);
-  const nextVisible = {};
-  for (let index = 0; index < categories.length; index++) {
-    const previousIndex = previousIndexOf.get(categories[index]);
-    if (previousIndex === undefined) {
-      nextColors[index] = [...getCategoryColor(index)];
-      nextVisible[index] = true;
-      continue;
-    }
-    const previousColor = colors[previousIndex];
-    if (
-      !Array.isArray(previousColor)
-      || previousColor.length !== 3
-      || previousColor.some(channel => !Number.isFinite(channel))
-    ) {
-      throw new TypeError(`Existing category color ${previousIndex} is invalid`);
-    }
-    if (typeof visible[previousIndex] !== 'boolean') {
-      throw new TypeError(`Existing category visibility ${previousIndex} must be exactly boolean`);
-    }
-    nextColors[index] = [...previousColor];
-    nextVisible[index] = visible[previousIndex];
-  }
-  return { colors: nextColors, visible: nextVisible };
+  return carriedCategoryState(state, categories.length, index => previousIndexOf.get(categories[index]) ?? -1, getCategoryColor);
 }

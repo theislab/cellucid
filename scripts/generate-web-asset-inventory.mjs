@@ -15,10 +15,22 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
+  BUNDLE_FILE,
+  WORKERS_DIR,
+  WORKER_SCRIPTS_PATH,
   buildWorkerBundles,
   staleWorkerFiles,
   writeWorkerBundles,
 } from './build-worker-bundles.mjs';
+import {
+  PAGE_BUNDLE_FILE,
+  PAGE_DIR,
+  PAGE_ENTRY,
+  buildPageBundle,
+  stalePageFiles,
+  writePageBundle,
+} from './build-page-bundle.mjs';
+import { THIS_MACHINE_HOSTS } from '../assets/js/workers/worker-script.js';
 
 const execFileAsync = promisify(execFile);
 const INVENTORY_FILENAME = 'cellucid-web-assets.json';
@@ -40,6 +52,10 @@ const REQUIRED_ROOT_ASSETS = Object.freeze([
   'index.html',
   // The privacy policy the Google and Microsoft sign-in screens link to.
   'privacy.html',
+  // The code cache a deployed page registers (index.html,
+  // CELLUCID_PAGE_BOOT). A service worker controls only the pages below its
+  // own folder, so it lives at the root.
+  'service-worker.js',
   'site.webmanifest',
   // The terms of use, linked from the footer and from Google's and
   // Microsoft's app branding.
@@ -65,6 +81,11 @@ const MIME_BY_EXTENSION = Object.freeze({
   '.md': 'text/markdown; charset=utf-8',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
+  // The licences shipped beside third-party files (assets/wasm/LICENSES/,
+  // assets/external/).
+  '.txt': 'text/plain; charset=utf-8',
+  // The WebAssembly decoders: what WebAssembly.compileStreaming requires.
+  '.wasm': 'application/wasm',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.woff2': 'font/woff2',
   '.xml': 'application/xml; charset=utf-8',
@@ -184,28 +205,64 @@ export async function stampBuildId({ rootDir, paths, today = new Date() }) {
   return buildId;
 }
 
-// Content-addressed script URLs. A host that caches by path (GitHub Pages
-// answers every file with `max-age=600`; a static server's Last-Modified
-// lets a browser guess a freshness of its own) can hand a page one module
-// from the build before a deploy and the next from the build after it, and
-// an import of an export the cached module does not have then stops the app
-// before it starts. So every script under assets/ is requested at a URL that
-// names its bytes: `<path>?v=<the first 12 hex digits of its SHA-256>`. Each
-// shipped page carries one import map listing every such module (an ES import
-// is resolved to a URL and then looked up in it, so relative imports are
-// covered), the `src` of each script it names says the same, and its
-// Content-Security-Policy allows exactly its inline scripts by hash. A file
-// whose bytes did not change keeps its URL, so it stays cached across
-// deploys. Workers get no import map (no engine has one for workers), so
-// each worker is also built into one bundle named by its bytes
-// (build-worker-bundles.mjs), written before everything else here.
+// Content-addressed URLs. A host that caches by path (GitHub Pages answers
+// every file with `max-age=600`; a static server's Last-Modified lets a
+// browser guess a freshness of its own) can hand a page one module from the
+// build before a deploy and the next from the build after it, and an import
+// of an export the cached module does not have then stops the app before it
+// starts. So every script and stylesheet under assets/ is requested at a URL
+// that names its bytes: `<path>?v=<the first 12 hex digits of its SHA-256>`.
+// Each shipped page carries one import map listing every such module (an ES
+// import is resolved to a URL and then looked up in it, so relative imports
+// are covered), the `src` of each script it names says the same, and its
+// Content-Security-Policy allows exactly its inline scripts by hash.
+// Stylesheets name what they `@import` and the files they use (`url()`) the
+// same way, written into assets/css/ by this generator; a stylesheet's version
+// is that of its stamped bytes, so a change to a partial changes the URL of
+// every stylesheet above it. A page names its stylesheet and the files it
+// preloads at their versions, and preloads every stylesheet its stylesheet
+// imports, directly or not, so all of them are asked for at once rather than
+// one `@import` level per round trip. A file whose bytes did not change keeps
+// its URL, so it stays cached across deploys. A file whose name already names
+// its bytes (a worker or page bundle) needs no `?v=` and is not in the import
+// map. Workers get no import map (no engine has one for workers), so each
+// worker is also built into one bundle named by its bytes
+// (build-worker-bundles.mjs), written before everything else here; the page's
+// own graph is built into the page bundle (build-page-bundle.mjs) that a
+// deployed page runs (`renderPageBoot`).
 const MODULE_VERSION_LENGTH = 12;
 const SCRIPT_ELEMENT = /<script\b([^>]*)>([\s\S]*?)<\/script>/g;
 const SCRIPT_SRC = /(\ssrc=")([^"?#]+)(?:\?v=[0-9a-f]*)?(")/;
 const CSP_META = /(<meta http-equiv="Content-Security-Policy" content=")([^"]*)(")/;
+// A stylesheet link, a preload of a shipped file, and a generated stylesheet
+// preload, as the shipped pages write them.
+const STYLESHEET_LINK = /^([ \t]*)<link rel="stylesheet" href="([^"?#]+)(?:\?v=[0-9a-f]*)?" \/>$/gm;
+const PRELOAD_HREF = /(<link rel="preload" href=")([^"?#]+)(?:\?v=[0-9a-f]*)?(")/g;
+const STYLE_PRELOAD_LINE = /^[ \t]*<link rel="preload" as="style" href="[^"]*" \/>\n/gm;
+// The `@import` and `url()` references of a stylesheet.
+const CSS_IMPORT = /(@import\s+)(['"])([^'"?#]+)(?:\?v=[0-9a-f]*)?\2/g;
+const CSS_URL = /(url\(\s*)(['"]?)([^'")?#\s]+)(?:\?v=[0-9a-f]*)?\2(\s*\))/g;
+/** The id of the page's boot script, whose text the generator writes (`renderPageBoot`). */
+export const PAGE_BOOT_ID = 'cellucid-page-boot';
 
 function isScriptAssetPath(path) {
   return path.startsWith('assets/') && extname(path) === '.js';
+}
+
+function isStylesheetAssetPath(path) {
+  return path.startsWith('assets/') && extname(path) === '.css';
+}
+
+/** Whether a shipped file's name already names its bytes: a worker or page bundle. */
+export function namesItsBytes(path) {
+  const folder = posix.dirname(path);
+  const name = posix.basename(path);
+  return (folder === WORKERS_DIR && BUNDLE_FILE.test(name))
+    || (folder === PAGE_DIR && PAGE_BUNDLE_FILE.test(name));
+}
+
+function versionOf(bytes) {
+  return createHash('sha256').update(bytes).digest('hex').slice(0, MODULE_VERSION_LENGTH);
 }
 
 function inlineScriptHash(text) {
@@ -227,17 +284,183 @@ function pageRelativeSpecifier(pagePath, assetPath) {
   return relativePath.startsWith('../') ? relativePath : `./${relativePath}`;
 }
 
+const isExternalReference = reference =>
+  /^[a-z][a-z0-9+.-]*:/i.test(reference) || reference.startsWith('//') || reference.startsWith('#');
+
+/** Every match of `pattern` in `text` outside its `/* … *\/` comments. */
+function referencesOutsideComments(text, pattern, commentPattern) {
+  const masked = text.replace(commentPattern, comment => ' '.repeat(comment.length));
+  return [...masked.matchAll(pattern)].map(match => ({ index: match.index, length: match[0].length }));
+}
+
+function replaceReferences(text, pattern, commentPattern, replace) {
+  let result = '';
+  let offset = 0;
+  for (const { index, length } of referencesOutsideComments(text, pattern, commentPattern)) {
+    const original = text.slice(index, index + length);
+    pattern.lastIndex = 0;
+    result += text.slice(offset, index) + original.replace(new RegExp(pattern.source), replace);
+    offset = index + length;
+  }
+  return result + text.slice(offset);
+}
+
+const CSS_COMMENT = /\/\*[\s\S]*?\*\//g;
+
+/** The stylesheets `cssText` (at `cssPath`) imports, as shipped paths, in order. */
+function stylesheetImports(cssPath, cssText) {
+  const masked = cssText.replace(CSS_COMMENT, comment => ' '.repeat(comment.length));
+  return [...masked.matchAll(CSS_IMPORT)].map(match => posix.normalize(posix.join(posix.dirname(cssPath), match[3])));
+}
+
 /**
- * The import map of the page at `pagePath`: every script asset, keyed by its
- * page-relative URL and mapped to the same URL with its content version.
- * One entry per line, so a change to one file is a one-line diff.
+ * Every shipped stylesheet with its references stamped: each `@import` and
+ * `url()` of a shipped file carries `?v=` and that file's version, a
+ * stylesheet's version being that of its own stamped bytes.
+ *
+ * @param {{ rootDir: string, paths: string[] }} options
+ * @returns {Promise<Map<string, string>>} stamped text by path
+ */
+export async function stampedStylesheets({ rootDir, paths }) {
+  const exactRoot = resolve(rootDir);
+  const shipped = new Set(paths);
+  const sources = new Map();
+  for (const path of paths.filter(isStylesheetAssetPath)) {
+    sources.set(path, await readFile(join(exactRoot, ...path.split('/')), 'utf8'));
+  }
+  const fileVersions = new Map();
+  const stamped = new Map();
+  const visiting = new Set();
+  const versionOfFile = async target => {
+    if (isStylesheetAssetPath(target)) return versionOf(Buffer.from(await stamp(target), 'utf8'));
+    if (!fileVersions.has(target)) {
+      fileVersions.set(target, versionOf(await readFile(join(exactRoot, ...target.split('/')))));
+    }
+    return fileVersions.get(target);
+  };
+  async function stamp(path) {
+    if (stamped.has(path)) return stamped.get(path);
+    if (visiting.has(path)) throw new TypeError(`${path} imports itself through its @imports.`);
+    visiting.add(path);
+    const text = sources.get(path);
+    const targets = new Map();
+    for (const pattern of [CSS_IMPORT, CSS_URL]) {
+      const masked = text.replace(CSS_COMMENT, comment => ' '.repeat(comment.length));
+      for (const match of masked.matchAll(pattern)) {
+        const reference = match[3];
+        if (isExternalReference(reference) || reference.startsWith('data:')) continue;
+        const target = posix.normalize(posix.join(posix.dirname(path), reference));
+        if (target.startsWith('../') || !shipped.has(target)) {
+          throw new TypeError(`${path} names a file that is not a shipped asset: ${reference}`);
+        }
+        targets.set(reference, await versionOfFile(target));
+      }
+    }
+    const withVersion = (prefix, quote, reference, suffix = '') =>
+      targets.has(reference)
+        ? `${prefix}${quote}${reference}?v=${targets.get(reference)}${quote}${suffix}`
+        : `${prefix}${quote}${reference}${quote}${suffix}`;
+    let result = replaceReferences(text, CSS_IMPORT, CSS_COMMENT, (_, prefix, quote, reference) =>
+      withVersion(prefix, quote, reference));
+    result = replaceReferences(result, CSS_URL, CSS_COMMENT, (_, prefix, quote, reference, close) =>
+      withVersion(prefix, quote, reference, close));
+    visiting.delete(path);
+    stamped.set(path, result);
+    return result;
+  }
+  for (const path of sources.keys()) await stamp(path);
+  return stamped;
+}
+
+/**
+ * The shipped stylesheets whose stamped references are not current, each with
+ * the bytes it should have.
+ */
+export async function staleStylesheets({ rootDir, stylesheets }) {
+  const exactRoot = resolve(rootDir);
+  const stale = [];
+  for (const [path, text] of [...stylesheets].sort(([a], [b]) => a.localeCompare(b))) {
+    const absolutePath = join(exactRoot, ...path.split('/'));
+    const bytes = Buffer.from(text, 'utf8');
+    if (!(await readFile(absolutePath)).equals(bytes)) stale.push({ path, absolutePath, bytes });
+  }
+  return stale;
+}
+
+/**
+ * The import map of the page at `pagePath`: every script asset whose name
+ * does not already name its bytes, keyed by its page-relative URL and mapped
+ * to the same URL with its content version. One entry per line, so a change
+ * to one file is a one-line diff.
  */
 export function renderImportMap({ pagePath, versions }) {
-  const entries = [...versions.keys()].filter(isScriptAssetPath).sort().map(path => {
-    const specifier = pageRelativeSpecifier(pagePath, path);
-    return `    ${JSON.stringify(specifier)}: ${JSON.stringify(`${specifier}?v=${versions.get(path)}`)}`;
-  });
+  const entries = [...versions.keys()]
+    .filter(path => isScriptAssetPath(path) && !namesItsBytes(path))
+    .sort()
+    .map(path => {
+      const specifier = pageRelativeSpecifier(pagePath, path);
+      return `    ${JSON.stringify(specifier)}: ${JSON.stringify(`${specifier}?v=${versions.get(path)}`)}`;
+    });
   return `\n  {\n  "imports": {\n${entries.join(',\n')}\n  }\n  }\n  `;
+}
+
+/**
+ * The text of the page's boot script (`<script id="cellucid-page-boot">`):
+ * where the page's code starts, and when.
+ *
+ * On this machine (`THIS_MACHINE_HOSTS`, the rule workers follow too:
+ * `assets/js/workers/worker-script.js`) the page runs its sources,
+ * `assets/js/app/main.js` through the import map, so an edited module is
+ * live on the next reload with nothing built. Anywhere else it runs the page
+ * bundle: the entry and every chunk it imports at startup are preloaded at
+ * once, from the head, while the rest of the document arrives. Either way the
+ * entry is imported once the document is parsed (its code reads the page's
+ * elements as it starts), and a failure to load, link or run it is handed to
+ * the code-load watch (`ui/core/code-load-watch.js`) as a
+ * `cellucid-code-load-failed` event.
+ *
+ * @param {{ entry: string, preload: string[] }} page the page bundle's entry and startup chunks
+ */
+export function renderPageBoot({ entry, preload }) {
+  const list = paths => paths.map(path => `\n      ${JSON.stringify(path)}`).join(',');
+  return `
+    // Written by scripts/generate-web-asset-inventory.mjs (renderPageBoot):
+    // sources on this machine, the page bundle (assets/page/) anywhere else.
+    (() => {
+      const thisMachine = ${JSON.stringify(THIS_MACHINE_HOSTS)}.includes(location.hostname);
+      const bundle = [${list([entry, ...preload])}
+      ];
+      const entry = new URL(thisMachine ? ${JSON.stringify(PAGE_ENTRY)} : bundle[0], document.baseURI).href;
+      if (!thisMachine) {
+        for (const path of bundle) {
+          const link = document.createElement('link');
+          link.rel = 'modulepreload';
+          link.href = path;
+          document.head.append(link);
+        }
+        // The code cache (service-worker.js), once the page has loaded: a
+        // later visit takes every file whose address names its bytes from
+        // this browser. It is told which files this visit loaded, so the next
+        // one already finds them.
+        if ('serviceWorker' in navigator) {
+          window.addEventListener('load', () => {
+            const build = document.querySelector('meta[name="cellucid-web-build-id"]')?.content ?? '';
+            navigator.serviceWorker.register(\`service-worker.js?build=\${encodeURIComponent(build)}\`)
+              .then(() => navigator.serviceWorker.ready)
+              .then(registration => registration.active?.postMessage({
+                keep: performance.getEntriesByType('resource').map(entry => entry.name),
+              }))
+              .catch(() => {});
+          }, { once: true });
+        }
+      }
+      const start = () => import(entry).catch(error => {
+        window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry, error } }));
+      });
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+      else start();
+    })();
+  `;
 }
 
 /**
@@ -260,14 +483,21 @@ function scriptElements(html) {
 
 const isModuleScript = element => /\stype="module"/.test(element.attributes);
 const isImportMap = element => /\stype="importmap"/.test(element.attributes);
+const isPageBoot = element => element.attributes.includes(` id="${PAGE_BOOT_ID}"`);
 
-function stampScriptElement({ element, pagePath, versions }) {
+function stampScriptElement({ element, pagePath, versions, page }) {
   const { attributes, text } = element;
   if (isImportMap(element)) {
     return `<script${attributes}>${renderImportMap({ pagePath, versions })}</script>`;
   }
+  if (isPageBoot(element)) {
+    if (page === null || page === undefined) {
+      throw new TypeError(`${pagePath} has a boot script, so it needs the page bundle's entry and chunks.`);
+    }
+    return `<script${attributes}>${renderPageBoot(page)}</script>`;
+  }
   const source = SCRIPT_SRC.exec(attributes);
-  if (source === null || /^[a-z][a-z0-9+.-]*:/i.test(source[2]) || source[2].startsWith('//')) {
+  if (source === null || isExternalReference(source[2])) {
     return `<script${attributes}>${text}</script>`;
   }
   const assetPath = resolvePageReference(pagePath, source[2]);
@@ -279,15 +509,59 @@ function stampScriptElement({ element, pagePath, versions }) {
 }
 
 /**
- * The page with every content version current: the import map of a page
- * that runs ES modules, the `?v=` of each script it names, and the
- * `script-src` hashes of its inline scripts. A page that runs modules
- * declares its one `<script type="importmap">` itself, before its first
- * module script; the generator writes only what is inside it.
+ * The page's stylesheet links at their versions, each led by a preload of
+ * every stylesheet it imports (directly or not, in the order they are met),
+ * and its file preloads at their versions.
  */
-export function stampPageScripts({ html, pagePath, versions }) {
+function stampPageStyles({ html, pagePath, versions, stylesheets }) {
+  const reference = (written, assetPath) => {
+    const href = written.startsWith('/') ? `/${assetPath}` : posix.relative(posix.dirname(pagePath), assetPath);
+    return `${href}?v=${versions.get(assetPath)}`;
+  };
+  const closure = (path, seen = new Set()) => {
+    for (const imported of stylesheetImports(path, stylesheets.get(path) ?? '')) {
+      if (seen.has(imported)) continue;
+      seen.add(imported);
+      closure(imported, seen);
+    }
+    return seen;
+  };
+  let stamped = html.replace(STYLE_PRELOAD_LINE, '');
+  stamped = stamped.replace(STYLESHEET_LINK, (_, indent, href) => {
+    const assetPath = resolvePageReference(pagePath, href);
+    if (assetPath === null || !versions.has(assetPath) || !stylesheets.has(assetPath)) {
+      throw new TypeError(`${pagePath} names a stylesheet that is not a shipped asset: ${href}`);
+    }
+    const preloads = [...closure(assetPath)].map(path =>
+      `${indent}<link rel="preload" as="style" href="${reference(href, path)}" />\n`);
+    return `${preloads.join('')}${indent}<link rel="stylesheet" href="${reference(href, assetPath)}" />`;
+  });
+  return stamped.replace(PRELOAD_HREF, (match, open, href, close) => {
+    if (isExternalReference(href)) return match;
+    const assetPath = resolvePageReference(pagePath, href);
+    if (assetPath === null || !versions.has(assetPath)) {
+      throw new TypeError(`${pagePath} preloads a file that is not a shipped asset: ${href}`);
+    }
+    return `${open}${href}?v=${versions.get(assetPath)}${close}`;
+  });
+}
+
+/**
+ * The page with every content version current: the import map and the boot
+ * script of a page that runs ES modules, the `?v=` of each script it names,
+ * its stylesheet links and their preloads, and the `script-src` hashes of
+ * its inline scripts. A page that runs modules declares its one
+ * `<script type="importmap">` itself, before its first module or boot
+ * script; the generator writes only what is inside it.
+ *
+ * @param {{ html: string, pagePath: string, versions: Map<string, string>,
+ *   stylesheets?: Map<string, string>, page?: { entry: string, preload: string[] } }} options
+ *   `stylesheets`: the stamped stylesheets (`stampedStylesheets`); `page`:
+ *   the page bundle's entry and startup chunks, for a page with a boot script
+ */
+export function stampPage({ html, pagePath, versions, stylesheets = new Map(), page = null }) {
   const elements = scriptElements(html);
-  const firstModule = elements.findIndex(isModuleScript);
+  const firstModule = elements.findIndex(element => isModuleScript(element) || isPageBoot(element));
   const importMaps = elements.filter(isImportMap);
   if (firstModule !== -1 && importMaps.length !== 1) {
     throw new TypeError(`${pagePath} runs ES modules, so it must declare exactly one <script type="importmap">.`);
@@ -302,10 +576,11 @@ export function stampPageScripts({ html, pagePath, versions }) {
   let stamped = '';
   let offset = 0;
   for (const element of elements) {
-    stamped += html.slice(offset, element.start) + stampScriptElement({ element, pagePath, versions });
+    stamped += html.slice(offset, element.start) + stampScriptElement({ element, pagePath, versions, page });
     offset = element.end;
   }
   stamped += html.slice(offset);
+  stamped = stampPageStyles({ html: stamped, pagePath, versions, stylesheets });
 
   // The policy allows the page's inline scripts by hash, and only them.
   const policy = CSP_META.exec(stamped);
@@ -325,29 +600,43 @@ export function stampPageScripts({ html, pagePath, versions }) {
   return stamped.replace(CSP_META, (_, open, __, close) => `${open}${directives.join(';')}${close}`);
 }
 
-async function readContentVersions({ rootDir, paths }) {
+/**
+ * The content version of every shipped file, a stylesheet's taken over its
+ * stamped bytes.
+ */
+async function readContentVersions({ rootDir, paths, stylesheets }) {
   const exactRoot = resolve(rootDir);
   const versions = new Map();
   for (const path of paths) {
-    const bytes = await readFile(join(exactRoot, ...path.split('/')));
-    versions.set(path, createHash('sha256').update(bytes).digest('hex').slice(0, MODULE_VERSION_LENGTH));
+    const bytes = stylesheets.has(path)
+      ? Buffer.from(stylesheets.get(path), 'utf8')
+      : await readFile(join(exactRoot, ...path.split('/')));
+    versions.set(path, versionOf(bytes));
   }
   return versions;
 }
 
 /**
- * The shipped pages whose script versions, import map or CSP hashes are not
- * current, each with the bytes it should have. Writing them is what the
- * generator does; `--check` refuses while any remains.
+ * The shipped pages whose script versions, import map, boot script,
+ * stylesheet links or CSP hashes are not current, each with the bytes it
+ * should have. Writing them is what the generator does; `--check` refuses
+ * while any remains.
+ *
+ * @param {{ rootDir: string, paths: string[], stylesheets: Map<string, string>,
+ *   page: { entry: string, preload: string[] } }} options
  */
-export async function stalePageScripts({ rootDir, paths }) {
+export async function stalePages({ rootDir, paths, stylesheets, page }) {
   const exactRoot = resolve(rootDir);
-  const versions = await readContentVersions({ rootDir, paths: paths.filter(isScriptAssetPath) });
+  const versions = await readContentVersions({
+    rootDir,
+    paths: paths.filter(path => path.startsWith('assets/')),
+    stylesheets,
+  });
   const stale = [];
   for (const pagePath of [...paths].filter(path => extname(path) === '.html').sort()) {
     const absolutePath = join(exactRoot, ...pagePath.split('/'));
     const html = (await readFile(absolutePath)).toString('utf8');
-    const stamped = stampPageScripts({ html, pagePath, versions });
+    const stamped = stampPage({ html, pagePath, versions, stylesheets, page });
     if (stamped !== html) stale.push({ pagePath, absolutePath, bytes: Buffer.from(stamped, 'utf8') });
   }
   return stale;
@@ -577,10 +866,22 @@ async function runCli() {
   if (args.length === 0) {
     await writeWorkerBundles({ rootDir, built: workers, write: writeInventoryAtomically });
   }
-  const paths = await listSourceControlledAssets(rootDir);
-  const stalePages = await stalePageScripts({ rootDir, paths });
+  // Then the page bundle, which imports the worker scripts at their version.
+  const page = await buildPageBundle({
+    rootDir,
+    externalBytes: new Map([[WORKER_SCRIPTS_PATH, workers.files.get(WORKER_SCRIPTS_PATH)]]),
+  });
   if (args.length === 0) {
-    for (const { absolutePath, bytes } of stalePages) {
+    await writePageBundle({ rootDir, built: page, write: writeInventoryAtomically });
+  }
+  const paths = await listSourceControlledAssets(rootDir);
+  // Then the stylesheets' references, and the pages, which name the
+  // stylesheets at their stamped bytes.
+  const stylesheets = await stampedStylesheets({ rootDir, paths });
+  const staleStyles = await staleStylesheets({ rootDir, stylesheets });
+  const pages = await stalePages({ rootDir, paths, stylesheets, page });
+  if (args.length === 0) {
+    for (const { absolutePath, bytes } of [...staleStyles, ...pages]) {
       await writeInventoryAtomically(absolutePath, bytes);
     }
     await stampBuildId({ rootDir, paths });
@@ -601,9 +902,22 @@ async function runCli() {
           + 'worker sources build.'
       );
     }
-    if (stalePages.length !== 0) {
+    const stalePage = await stalePageFiles({ rootDir, built: page });
+    if (stalePage.length !== 0) {
       throw new Error(
-        `${stalePages.map(page => page.pagePath).join(', ')} name script versions `
+        `${stalePage.join(', ')} ${stalePage.length === 1 ? 'is' : 'are'} not what the `
+          + 'page sources build.'
+      );
+    }
+    if (staleStyles.length !== 0) {
+      throw new Error(
+        `${staleStyles.map(style => style.path).join(', ')} name files at versions `
+          + 'that are not their current bytes.'
+      );
+    }
+    if (pages.length !== 0) {
+      throw new Error(
+        `${pages.map(stale => stale.pagePath).join(', ')} name script or stylesheet versions `
           + 'that are not the current bytes.'
       );
     }

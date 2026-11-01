@@ -62,7 +62,6 @@ import {
   loadGeneList,
   varLoaderMappingOf,
 } from '../../../data/data-loaders.js';
-import { createDatasetFieldLoadSupersededError } from './field/loading.js';
 import {
   describeMappingGroupValue,
   log1pMenu,
@@ -71,6 +70,7 @@ import {
 } from '../../../data/dataset-mapping.js';
 import { sameJson } from '../../utils/same-json.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { cancelled } from '../../../utils/abort.js';
 
 /** The groups beside the embeddings, in the order a transaction applies them. */
 const MAPPING_GROUPS = Object.freeze([
@@ -138,14 +138,28 @@ function formatGeneCount(count) {
 }
 
 /**
+ * Whether one expression choice holds counts (an integer dtype, or whole
+ * non-negative first values: `holdsCounts` in the reader), as the catalog
+ * says; false when it was not probed.
+ */
+function expressionHoldsCounts(scope, expression) {
+  if (expression === 'X') return scope.X?.counts === true;
+  if (expression === 'raw') return scope.raw?.X?.counts === true;
+  const key = expression.slice('layer:'.length);
+  return scope.layers.find(layer => layer.key === key)?.counts === true;
+}
+
+/**
  * The words one expression choice is listed with: `X`, `raw.X · 30,000
- * genes`, `layers['counts']`. `scope` is the dataset's or its modality's
- * expression side (`modalityScope`).
+ * genes`, `layers['counts']`, each followed by `· counts` when it holds
+ * counts. `scope` is the dataset's or its modality's expression side
+ * (`modalityScope`).
  */
 function describeExpression(scope, expression) {
-  if (expression === 'X') return 'X';
-  if (expression === 'raw') return `raw.X · ${formatGeneCount(scope.raw.n_vars)}`;
-  return `layers['${expression.slice('layer:'.length)}']`;
+  const counts = expressionHoldsCounts(scope, expression) ? ' · counts' : '';
+  if (expression === 'X') return `X${counts}`;
+  if (expression === 'raw') return `raw.X · ${formatGeneCount(scope.raw.n_vars)}${counts}`;
+  return `layers['${expression.slice('layer:'.length)}']${counts}`;
 }
 
 /**
@@ -272,7 +286,7 @@ export class DataStateMappingGroupMethods {
           const reason = layer !== null && !layer.usable
             ? layer.reason
             : this.getMappingChoiceUnusableReason('expression', value);
-          return { value, label: describeExpression(scope, value), usable: reason === null, reason };
+          return { value, label: describeExpression(scope, value), counts: expressionHoldsCounts(scope, value), usable: reason === null, reason };
         }),
       ];
     }
@@ -616,7 +630,7 @@ export class DataStateMappingGroupMethods {
     const generation = this._datasetGeneration;
     const url = `${this._requireMappingRuntime().getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
     const geneList = await loadGeneList(url, {});
-    if (this._datasetGeneration !== generation) throw createDatasetFieldLoadSupersededError();
+    if (this._datasetGeneration !== generation) throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
     if (geneList.n_points !== this.pointCount) {
       throw new RangeError(`${String(expression)} has ${formatCountOf(geneList.n_points, 'cell')}; the dataset has ${this.pointCount}.`);
     }
@@ -687,11 +701,12 @@ export class DataStateMappingGroupMethods {
       hasRaw: scope.raw !== null && scope.raw.X !== null,
       layers,
     });
+    // The probes themselves: their dtypes, and what in their values refutes uns['log1p'].
     const { log1p } = defaultLog1p({
       log1p: scope.log1p,
-      hasX: scope.X !== null,
-      raw: scope.raw === null || scope.raw.X === null ? null : { dtype: scope.raw.X.dtype },
-      layers,
+      X: scope.X,
+      raw: scope.raw === null || scope.raw.X === null ? null : scope.raw.X,
+      layers: scope.layers.filter(layer => layer.usable),
     });
     const { highlyVariable } = expression === null
       ? { highlyVariable: null }

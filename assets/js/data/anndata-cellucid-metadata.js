@@ -16,11 +16,15 @@
  * | `defaults` | the launch defaults the dataset opens with (`requireAnnDataLaunchDefaults`) |
  * | `outlierQuantiles` | `{latentKey, minPoints, fields}`: every categorical obs field's outlier quantiles in that latent space, one float32 array per field (`data/latent-outliers.js`) |
  * | `session` | the record of a session applied to the file in Python; never read |
+ * | `priority` | `{seed, specVersion, nObs, levels}`: the file stores its cells in priority order (`anndata/priority-layout.js`): the subsampling specification's `uniform` rank under `seed`, `specVersion` that specification's version, `nObs` the cell count it was written with, `levels` the ascending prefix sizes `varm['cellucid_prefix_counts']` counts at |
  *
  * Every key is optional, and a file without `uns['cellucid']` opens exactly as
  * any AnnData file does. A key that is present must be exactly right, and a key
  * not in the table refuses the file, so a misspelt default never passes
- * unnoticed. The reader (`anndata/reader.js`) hands the mapping over as plain
+ * unnoticed -- except `priority`, which is never checked here: the reader
+ * verifies it against the file's cells, and a record that does not describe
+ * them (a file subset, combined or reordered and saved again, or written by a
+ * newer Cellucid) is not used, never refused (`readPriorityLayout`). The reader (`anndata/reader.js`) hands the mapping over as plain
  * JSON values; this module checks it.
  *
  * A text value may be stored as one value or as a one-element list (a writer
@@ -35,7 +39,7 @@ import { isObjectRecord, requireObjectKeys } from '../utils/exact-record.js';
 /** The one schema this viewer reads. */
 export const CELLUCID_UNS_SCHEMA = 1;
 
-const KEYS = Object.freeze(['schema', 'id', 'name', 'description', 'citation', 'source', 'defaults', 'outlierQuantiles', 'session']);
+const KEYS = Object.freeze(['schema', 'id', 'name', 'description', 'citation', 'source', 'defaults', 'outlierQuantiles', 'session', 'priority']);
 const OUTLIER_KEYS = Object.freeze(['latentKey', 'minPoints', 'fields']);
 const CITATION_KEYS = Object.freeze(['text', 'url']);
 const SOURCE_KEYS = Object.freeze(['name', 'url']);

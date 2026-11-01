@@ -652,6 +652,13 @@ export class AnalysisWindowManager {
     }
   }
 
+  /** The gene list was read: each window lists it (`BaseAnalysisUI.onGenesListed`). */
+  onGenesListed() {
+    for (const entry of this._windows.values()) {
+      entry.ui.onGenesListed();
+    }
+  }
+
   // ===========================================================================
   // Internal helpers
   // ===========================================================================

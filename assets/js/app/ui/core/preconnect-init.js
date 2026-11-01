@@ -8,11 +8,14 @@
  * element) never contacts the default one and must not open a connection to
  * it: a test, a notebook or an offline lab server would reach out to the
  * Internet for nothing, and WebKit reports the failed handshake as a console
- * error. A classic script in the head, where the static link was, so the
- * connection starts before the stylesheet and the modules are requested.
+ * error. Nor does a viewer page (`?viewer=…`: a notebook widget, a Python or
+ * R browser-tab viewer), which never reads the sample catalog. A classic
+ * script in the head, where the static link was, so the connection starts
+ * before the stylesheet and the modules are requested.
  */
 (() => {
-  if (new URLSearchParams(window.location.search).has('sampleCatalog')) return;
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('sampleCatalog') || params.has('viewer')) return;
   const meta = document.querySelector('meta[name="cellucid-sample-catalog"]');
   if (meta === null) return;
   let origin;

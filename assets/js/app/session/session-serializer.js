@@ -19,6 +19,7 @@ import {
   assertDatasetSourceRecord,
   captureDatasetSourceRecord,
 } from './dataset-source-record.js';
+import { captureCellSubsetRecord, captureGeneSampleRecord, decodeCellSubsetRecord, decodeGeneSampleRecord } from './cell-subset-record.js';
 import { writeBundle } from './bundle/writer.js';
 import { downloadBlob } from '../utils/download.js';
 import {
@@ -38,7 +39,7 @@ import {
   collectRequiredFields,
   describeMissingRequiredFields,
   createSessionRestoreTransaction,
-  datasetFingerprintMatches,
+  datasetFingerprintStillCurrent,
   getDatasetFingerprint,
   verifySessionFingerprint,
   registerSessionRestoreSnapshots,
@@ -53,6 +54,9 @@ import {
 } from './schema-contract.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { useOpenCells } from '../../data/open-cells-work.js';
+import { throwIfAborted, isCancellation, cancelled, cancellationKind, abortReason, onAbort } from '../../utils/abort.js';
+import { markReported } from '../../utils/errors.js';
 
 /**
  * @typedef {'eager'|'lazy'} ChunkPriority
@@ -76,78 +80,6 @@ import { formatCountOf } from '../../utils/format-units.js';
  * @property {(ctx: any) => Promise<SessionChunk[]|void>|SessionChunk[]|void} capture
  * @property {(ctx: any, chunkMeta: any, payload: any) => Promise<void>|void} restore
  */
-
-const SESSION_RESTORE_SUPERSEDED_CODE =
-  'CELLUCID_SESSION_RESTORE_SUPERSEDED';
-const SESSION_RESTORE_CANCELED_CODE =
-  'CELLUCID_SESSION_RESTORE_CANCELED';
-
-export function createSessionRestoreCanceledError() {
-  const error = new Error('Session restore was canceled by the user.');
-  error.name = 'AbortError';
-  error.code = SESSION_RESTORE_CANCELED_CODE;
-  return error;
-}
-
-export function isSessionRestoreCanceledError(error) {
-  return error?.code === SESSION_RESTORE_CANCELED_CODE;
-}
-
-function createSessionRestoreSupersededError() {
-  const error = new Error(
-    'Session restore was superseded by a newer restore.'
-  );
-  error.name = 'AbortError';
-  error.code = SESSION_RESTORE_SUPERSEDED_CODE;
-  return error;
-}
-
-export function isSessionRestoreSupersededError(error) {
-  return error?.code === SESSION_RESTORE_SUPERSEDED_CODE;
-}
-
-/**
- * Marks a restore failure that has already been shown to the user.
- *
- * A restore owns a "Session file" progress notification, and failing that
- * notification is how the failure reaches the screen. The same error is then
- * rethrown so the caller can roll its own state back — and a caller that also
- * reports it publishes the identical sentence a second time. Users saw the
- * message twice, once as "Session file: <message>" and once bare.
- *
- * This was invisible while the two copies had different lifetimes: one expired
- * before the other, so the duplicate looked like a flicker rather than a defect
- * (CEL-0220).
- */
-const SESSION_RESTORE_REPORTED = Symbol.for(
-  'cellucid.sessionRestoreFailureReported'
-);
-
-function markSessionRestoreReported(error) {
-  if (error instanceof Error) {
-    Object.defineProperty(error, SESSION_RESTORE_REPORTED, {
-      configurable: true,
-      enumerable: false,
-      value: true,
-      writable: false
-    });
-  }
-  return error;
-}
-
-/**
- * Whether this failure has already been published to the user by the restore
- * that produced it, so a caller must not announce it again.
- *
- * @param {unknown} error
- * @returns {boolean}
- */
-export function isSessionRestoreReportedError(error) {
-  return (
-    error instanceof Error &&
-    error[SESSION_RESTORE_REPORTED] === true
-  );
-}
 
 const BUILT_IN_STATIC_CHUNK_PROFILES = Object.freeze([
   ...CURRENT_GENERIC_STATIC_CHUNK_PROFILES
@@ -187,44 +119,53 @@ function validateBuiltInStaticChunkProfile(entry, context) {
 
 function isExpectedRestoreDismissal(error, signal) {
   return (
-    isSessionRestoreSupersededError(error)
-    || isSessionRestoreCanceledError(error)
-    || isSessionRestoreSupersededError(signal.reason)
-    || isSessionRestoreCanceledError(signal.reason)
+    cancellationKind(error) === 'superseded'
+    || cancellationKind(error) === 'user'
+    || cancellationKind(signal.reason) === 'superseded'
+    || cancellationKind(signal.reason) === 'user'
   );
 }
 
 /**
- * @param {AbortSignal | null | undefined} signal
+ * What a session says about the dataset it is saved on, read once, at the
+ * start of the capture: its fingerprint (whose cell-order digest the reader
+ * worker answers), and then, in the same turn as the guard's record, the
+ * cells it was saved on (`cells`), where it was opened from (`source`) and
+ * the fields its state uses (`requires`). The capture runs with the open
+ * cells in use (`useOpenCells`), so no growth step or Apply changes them
+ * under it; the guard catches a dataset replaced meanwhile.
+ *
+ * @param {object} ctx
+ * @param {object} base - The serializer's base context
  */
-function throwIfAborted(signal) {
-  if (signal !== null && signal.aborted) {
-    if (signal.reason instanceof Error) throw signal.reason;
-    throw new DOMException('Aborted', 'AbortError');
-  }
-}
-
-function captureSessionDatasetOwner(ctx) {
+async function captureSessionDatasetOwner(ctx, base) {
+  const fingerprint = Object.freeze(await getDatasetFingerprint(ctx));
   const state = ctx.state;
   const getGeneration = requireMethod(
     state,
     'getDatasetGeneration',
     'Session capture DataState'
   );
-  const generation = assertSafeInteger(
-    getGeneration.call(state),
-    'Session capture dataset generation'
-  );
-  return Object.freeze({
-    fingerprint: Object.freeze(getDatasetFingerprint(ctx)),
-    generation,
+  const owner = Object.freeze({
+    fingerprint,
+    generation: assertSafeInteger(
+      getGeneration.call(state),
+      'Session capture dataset generation'
+    ),
+    cellIdentity: state.cellIdentity ?? null,
     obsData: state.obsData,
     obsFields: state.obsData?.fields,
     positionsArray: state.positionsArray,
     state,
     varData: state.varData,
-    varFields: state.varData?.fields
+    varFields: state.varData?.fields,
+    cells: captureCellSubsetRecord(base.dataSourceManager),
+    genes: captureGeneSampleRecord(base.dataSourceManager),
+    source: captureDatasetSourceRecord(base.dataSourceManager),
+    requires: collectRequiredFields(base.state)
   });
+  assertSessionDatasetOwner(ctx, owner);
+  return owner;
 }
 
 function assertSessionDatasetOwner(ctx, owner) {
@@ -241,18 +182,17 @@ function assertSessionDatasetOwner(ctx, owner) {
   if (
     state !== owner.state
     || generation !== owner.generation
+    || (state.cellIdentity ?? null) !== owner.cellIdentity
     || state.obsData !== owner.obsData
     || state.obsData?.fields !== owner.obsFields
     || state.positionsArray !== owner.positionsArray
     || state.varData !== owner.varData
     || state.varData?.fields !== owner.varFields
-    || !datasetFingerprintMatches(
-      owner.fingerprint,
-      getDatasetFingerprint(ctx)
-    )
+    || !datasetFingerprintStillCurrent(ctx, owner.fingerprint)
   ) {
     const error = new Error(
-      'Session capture dataset generation changed before capture completed.'
+      'The dataset changed while the session was being saved (another dataset, '
+      + 'its data mapping or the cells shown). Save the session again.'
     );
     error.code = 'SESSION_CAPTURE_DATASET_CHANGED';
     throw error;
@@ -271,9 +211,17 @@ function validateManifest(manifest, contributorById, manifestProfile) {
   ) {
     throw new TypeError('Session manifest profile is invalid.');
   }
+  // `cells` is present only for a session saved on a subsample
+  // (`cell-subset-record.js`); without it the session was saved on every
+  // cell. `genes` only for one saved while genes were read for a sample of
+  // the open cells.
   requireExactKeys(
     manifest,
-    ['createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks'],
+    [
+      'createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks',
+      ...(Object.hasOwn(manifest ?? {}, 'cells') ? ['cells'] : []),
+      ...(Object.hasOwn(manifest ?? {}, 'genes') ? ['genes'] : []),
+    ],
     'Session manifest'
   );
   if (
@@ -287,6 +235,15 @@ function validateManifest(manifest, contributorById, manifestProfile) {
     'Session manifest datasetFingerprint'
   );
   assertDatasetSourceRecord(manifest.source, 'Session manifest source');
+  if (Object.hasOwn(manifest, 'cells')) {
+    const cells = decodeCellSubsetRecord(manifest.cells, 'Session manifest cells');
+    if (cells.spec.k !== manifest.datasetFingerprint.cellCount) {
+      throw new TypeError('Session manifest cells must keep exactly the fingerprint cell count.');
+    }
+  }
+  if (Object.hasOwn(manifest, 'genes')) {
+    decodeGeneSampleRecord(manifest.genes, manifest.datasetFingerprint.cellCount, 'Session manifest genes');
+  }
   assertSessionRequires(manifest.requires, 'Session manifest requires');
   if (manifestProfile === 'published-default' && manifest.source !== null) {
     throw new TypeError(
@@ -741,30 +698,89 @@ export class SessionSerializer {
     this._captureSettlement = null;
     /** @type {(() => Promise<void>|void)|null} */
     this._restoreSettlement = null;
+    /** @type {{saving: () => (() => Promise<void>|void), restored: () => Promise<void>|void}|null} */
+    this._sessionFileObserver = null;
     /** @type {Promise<void>} */
     this._stateOperationTail = Promise.resolve();
+    /** The analysis module's arrival (`setAnalysisRefs`). @type {Promise<void>} */
+    this._analysisReady = Promise.resolve();
   }
 
   /**
-   * Update the analysis module references once it is initialized.
-   * This avoids hard coupling to `main.js` bootstrap order.
+   * The analysis module, which the page imports on demand (`main.js`): its
+   * references once it has started, or null when its code could not load.
+   * Session capture and restore wait for it, so a session's analysis parts
+   * are taken and given only once it exists; when it never started, there is
+   * nothing of it to take, and a session's analysis parts are refused with
+   * that reason (the analysis contributors).
    *
-   * @param {{ comparisonModule: object, analysisWindowManager: object }} refs
+   * @param {Promise<{ comparisonModule: object, analysisWindowManager: object }|null>} ready
    */
-  setAnalysisRefs(refs) {
-    requireExactKeys(
-      refs,
-      ['comparisonModule', 'analysisWindowManager'],
-      'Session analysis references'
-    );
-    this._base.comparisonModule = assertOwner(
-      refs.comparisonModule,
-      'Session comparisonModule'
-    );
-    this._base.analysisWindowManager = assertOwner(
-      refs.analysisWindowManager,
-      'Session analysisWindowManager'
-    );
+  setAnalysisRefs(ready) {
+    if (typeof ready?.then !== 'function') {
+      throw new TypeError('Session analysis references must arrive as a promise.');
+    }
+    this._analysisReady = Promise.resolve(ready).then(refs => {
+      if (refs === null) return;
+      requireExactKeys(
+        refs,
+        ['comparisonModule', 'analysisWindowManager'],
+        'Session analysis references'
+      );
+      this._base.comparisonModule = assertOwner(
+        refs.comparisonModule,
+        'Session comparisonModule'
+      );
+      this._base.analysisWindowManager = assertOwner(
+        refs.analysisWindowManager,
+        'Session analysisWindowManager'
+      );
+    });
+  }
+
+  /**
+   * What a reading of the same dataset with other cells keeps (Open data ›
+   * Cells to open, `ui/modules/subsample-control.js`): every view with its
+   * camera, layout and embedding, each view's active field and filters, the
+   * sidebar controls, and the floating analysis windows — the session's own
+   * `core-state` and `analysis-windows` records, taken in memory. Nothing per
+   * cell: highlights and labels are carried by original cell position
+   * (`cell-subset-carry.js`).
+   *
+   * @returns {{core: object, windows: Uint8Array|null}}
+   */
+  captureViewCarry() {
+    const ctx = { ...this._base };
+    const take = id => this._contributorById.get(id).capture(ctx)[0].payload;
+    return {
+      core: take('core-state'),
+      windows: this._base.analysisWindowManager === null ? null : take('analysis-windows'),
+    };
+  }
+
+  /**
+   * Give a `captureViewCarry` record back to the dataset read again. Each
+   * part is applied on its own: a part the new reading cannot take (a filter
+   * on a category none of its cells has) is skipped and named, the rest
+   * applied.
+   *
+   * @param {{core: object, windows: Uint8Array|null}} carry
+   * @returns {Promise<string[]>} The parts that could not be kept, and why
+   */
+  async restoreViewCarry(carry) {
+    const ctx = { ...this._base, abortSignal: null, restoreTransaction: null };
+    const failures = [];
+    const give = async (id, payload, label) => {
+      if (payload === null) return;
+      try {
+        await this._contributorById.get(id).restore(ctx, null, payload);
+      } catch (error) {
+        failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    await give('core-state', carry.core, 'views, fields and filters');
+    await give('analysis-windows', carry.windows, 'analysis windows');
+    return failures;
   }
 
   /**
@@ -833,6 +849,24 @@ export class SessionSerializer {
       );
     }
     this._restoreSettlement = settle;
+  }
+
+  /**
+   * Hear when a session file comes to hold what is shown: `saving()` as a
+   * session is saved (its result is called once the file is written), and
+   * `restored()` once a session file is restored. The page's highlight
+   * draft (`app/highlight-draft.js`) is installed once after bootstrap.
+   *
+   * @param {{saving: () => (() => Promise<void>|void), restored: () => Promise<void>|void}} observer
+   */
+  setSessionFileObserver(observer) {
+    requireExactKeys(observer, ['saving', 'restored'], 'Session file observer');
+    requireMethod(observer, 'saving', 'Session file observer');
+    requireMethod(observer, 'restored', 'Session file observer');
+    if (this._sessionFileObserver !== null) {
+      throw new Error('Session file observer is already installed.');
+    }
+    this._sessionFileObserver = observer;
   }
 
   /**
@@ -907,7 +941,7 @@ export class SessionSerializer {
   cancelRestore() {
     if (this._activeRestoreAbort !== null) {
       this._activeRestoreAbort.abort(
-        createSessionRestoreCanceledError()
+        cancelled('user', 'Session restore was canceled by the user.')
       );
     }
     const activeTask = this._activeRestoreTask;
@@ -950,24 +984,12 @@ export class SessionSerializer {
     const previousTask = this._activeRestoreTask;
     if (this._activeRestoreAbort !== null) {
       this._activeRestoreAbort.abort(
-        createSessionRestoreSupersededError()
+        cancelled('superseded', 'Session restore was superseded by a newer restore.')
       );
     }
 
     const abortController = new AbortController();
-    let detachCallerAbort = null;
-    if (callerSignal !== null) {
-      const forwardCallerAbort = () => abortController.abort();
-      callerSignal.addEventListener('abort', forwardCallerAbort, {
-        once: true
-      });
-      detachCallerAbort = () => {
-        callerSignal.removeEventListener('abort', forwardCallerAbort);
-      };
-      if (callerSignal.aborted) {
-        abortController.abort();
-      }
-    }
+    const detachCallerAbort = onAbort(callerSignal, () => abortController.abort(abortReason(callerSignal)));
 
     const ownedTask = this._runExclusiveStateOperation(async () => {
       if (previousTask !== null) {
@@ -996,12 +1018,12 @@ export class SessionSerializer {
         if (
           abortController.signal.aborted
           && (
-            isSessionRestoreSupersededError(
+            cancellationKind(
               abortController.signal.reason
-            )
-            || isSessionRestoreCanceledError(
+            ) === 'superseded'
+            || cancellationKind(
               abortController.signal.reason
-            )
+            ) === 'user'
           )
         ) {
           failure = abortController.signal.reason;
@@ -1028,7 +1050,7 @@ export class SessionSerializer {
     this._activeRestoreTask = ownedTask;
 
     const releaseOwnership = () => {
-      if (detachCallerAbort !== null) detachCallerAbort();
+      detachCallerAbort();
       if (this._activeRestoreTask === ownedTask) {
         this._activeRestoreTask = null;
         this._activeRestoreAbort = null;
@@ -1056,12 +1078,23 @@ export class SessionSerializer {
     );
   }
 
-  async _captureSessionBundlePayload() {
+  /**
+   * Capture with the open cells in use (`useOpenCells`): a growth step or
+   * Apply waits until the bundle is written, so every chunk, the
+   * fingerprint and the cell record describe the same cells. @private
+   */
+  _captureSessionBundlePayload() {
+    return useOpenCells(() => this._captureSessionBundleOnOpenCells());
+  }
+
+  async _captureSessionBundleOnOpenCells() {
+    // The analysis module's parts are taken once it has started.
+    await this._analysisReady;
     const ctx = buildSessionContext(this._base, {
       abortSignal: null,
       restoreTransaction: null
     });
-    const datasetOwner = captureSessionDatasetOwner(ctx);
+    const datasetOwner = await captureSessionDatasetOwner(ctx, this._base);
 
     /** @type {SessionChunk[]} */
     const emittedChunks = [];
@@ -1132,12 +1165,18 @@ export class SessionSerializer {
       });
     }
 
+    // The chunks were compressed over several turns: the dataset they
+    // describe is still the one open.
+    assertSessionDatasetOwner(ctx, datasetOwner);
+    const { cells, genes } = datasetOwner;
     const manifest = {
       createdAt: new Date().toISOString(),
       datasetFingerprint: datasetOwner.fingerprint,
-      source: captureDatasetSourceRecord(this._base.dataSourceManager),
-      requires: collectRequiredFields(this._base.state),
-      chunks: manifestChunks
+      source: datasetOwner.source,
+      requires: datasetOwner.requires,
+      chunks: manifestChunks,
+      ...(cells === null ? {} : { cells }),
+      ...(genes === null ? {} : { genes })
     };
 
     validateManifest(manifest, this._contributorById, null);
@@ -1150,8 +1189,10 @@ export class SessionSerializer {
    */
   async downloadSession(filename) {
     assertNonEmptyString(filename, 'Session download filename');
+    const saved = this._sessionFileObserver?.saving() ?? null;
     const blob = await this.createSessionBundle();
     downloadBlob(blob, filename);
+    if (saved !== null) await saved();
   }
 
   /**
@@ -1192,8 +1233,8 @@ export class SessionSerializer {
       return true;
     } catch (error) {
       if (
-        isSessionRestoreCanceledError(error)
-        || isSessionRestoreSupersededError(error)
+        cancellationKind(error) === 'user'
+        || cancellationKind(error) === 'superseded'
       ) {
         return false;
       }
@@ -1207,7 +1248,11 @@ export class SessionSerializer {
    * applied, and no chunk is read.
    *
    * @param {Blob} blob
-   * @returns {Promise<{datasetId: string, name: string|null, source: object|null}>}
+   * @returns {Promise<{datasetId: string, name: string|null, source: object|null,
+   *   cells: {spec: object, kept: Uint32Array, digest: string}|null,
+   *   genes: {cells: number, order: Object|null, digest: string}|null}>}
+   *   `cells`: the subsample it was saved on, null for every cell; `genes`:
+   *   the open cells genes were read for, null for every open cell
    */
   async readSessionDataset(blob) {
     if (!(blob instanceof Blob)) {
@@ -1219,7 +1264,13 @@ export class SessionSerializer {
       return Object.freeze({
         datasetId: bundle.manifest.datasetFingerprint.datasetId,
         name: bundle.manifest.datasetFingerprint.name,
-        source: bundle.manifest.source
+        source: bundle.manifest.source,
+        cells: Object.hasOwn(bundle.manifest, 'cells')
+          ? decodeCellSubsetRecord(bundle.manifest.cells, 'Session manifest cells')
+          : null,
+        genes: Object.hasOwn(bundle.manifest, 'genes')
+          ? decodeGeneSampleRecord(bundle.manifest.genes, bundle.manifest.datasetFingerprint.cellCount, 'Session manifest genes')
+          : null
       });
     } finally {
       await bundle.cancel('Only the session manifest was needed.');
@@ -1252,6 +1303,7 @@ export class SessionSerializer {
       }),
       { signal: null }
     );
+    await this._sessionFileObserver?.restored();
   }
 
   /**
@@ -1357,6 +1409,7 @@ export class SessionSerializer {
       );
     }
 
+    await this._analysisReady;
     const restoreTransaction = createSessionRestoreTransaction();
     if (refreshUi !== null) {
       restoreTransaction.register(
@@ -1390,7 +1443,7 @@ export class SessionSerializer {
       ? assertNonEmptyString(
         notifications.startDownload('Session file', totalBytes, {
           onCancel: () => abortController.abort(
-            createSessionRestoreCanceledError()
+            cancelled('user', 'Session restore was canceled by the user.')
           )
         }),
         'Session download notification id'
@@ -1420,7 +1473,8 @@ export class SessionSerializer {
       // touches state.
       const mismatch = await verifySessionFingerprint(
         ctx,
-        manifest.datasetFingerprint
+        manifest.datasetFingerprint,
+        { profile: manifestProfile }
       );
       throwIfAborted(abortController.signal);
       if (mismatch !== null) {
@@ -1549,8 +1603,11 @@ export class SessionSerializer {
       await restoreTransaction.commit();
       // The restore's own progress notification is the one place its outcome
       // is published, success and failure alike. A second toast for the same
-      // event put "Session fully restored." on screen twice.
-      notifications.completeDownload(downloadId, 'Session fully restored.');
+      // event put "Session fully restored." on screen twice. A sample's own
+      // view (`published-default`) is part of opening it, which the person
+      // did not ask for as a session: it restores without a word.
+      if (manifestProfile === 'published-default') notifications.dismissDownload(downloadId);
+      else notifications.completeDownload(downloadId, 'Session fully restored.');
     } catch (err) {
       // A restore that stops before the bundle's end releases its source.
       if (bundle !== null) await bundle.cancel(err);
@@ -1560,7 +1617,7 @@ export class SessionSerializer {
         preserveRestoreRollbackFailure(err, rollbackError);
       }
       const isAbortFailure =
-        err instanceof Error && err.name === 'AbortError';
+        isCancellation(err);
       const isSilentReplacement =
         isExpectedRestoreDismissal(err, abortController.signal)
         || (
@@ -1578,10 +1635,10 @@ export class SessionSerializer {
         notifications.dismissDownload(downloadId);
       } else if (isAbortFailure) {
         notifications.failDownload(downloadId, 'Session restore canceled.');
-        markSessionRestoreReported(err);
+        markReported(err);
       } else {
         notifications.failDownload(downloadId, failureMessage(err));
-        markSessionRestoreReported(err);
+        markReported(err);
       }
       throw err;
     }

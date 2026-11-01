@@ -6,8 +6,11 @@
  * `data/input-formats.js` names (any file, folder or archive the registry
  * lists) is opened through the same reader as the matching file input — the
  * caller's `openDataset` — so it is validated, reported and superseded
- * exactly as a picked file is. Anything else is refused with a message that
- * says what can be dropped.
+ * exactly as a picked file is. A dropped folder's files are listed
+ * concurrently (`data/local-folder.js`), and where the browser gives the
+ * item's handle (Chromium) it travels with the drop, to be kept for a
+ * one-click reopen (`app/local-file-handles.js`). Anything else is refused
+ * with a message that says what can be dropped.
  *
  * The browser's own reaction to a dropped file is to navigate to it, which
  * would leave the application. `ui/core/file-drop-guard.js`, a classic script
@@ -20,6 +23,7 @@
  */
 
 import { fileFormatOfName, openableNamePhrases } from '../../../data/input-formats.js';
+import { readFolderEntry, readFolderHandle } from '../../../data/local-folder.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
 /**
@@ -50,52 +54,6 @@ function refusal(message) {
   return Object.freeze({ kind: 'refused', message });
 }
 
-function readDirectoryBatch(reader) {
-  return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
-}
-
-function readEntryFile(entry) {
-  return new Promise((resolve, reject) => entry.file(resolve, reject));
-}
-
-/**
- * List every file under a dropped folder, each carrying the path a folder
- * input would give it (`<folder>/<path inside>`), which is what the Zarr
- * folder reader takes. Hidden files (`.zgroup`, `.zarray`, `.zattrs`,
- * `.zmetadata`) are listed like any other.
- *
- * @param {FileSystemDirectoryEntry} root
- * @returns {Promise<File[]>}
- */
-export async function readDroppedFolder(root) {
-  const files = [];
-  const pending = [[root, root.name]];
-  while (pending.length > 0) {
-    const [directory, directoryPath] = pending.shift();
-    const reader = directory.createReader();
-    // readEntries() answers in batches until it answers with none.
-    for (;;) {
-      const batch = await readDirectoryBatch(reader);
-      if (batch.length === 0) break;
-      for (const entry of batch) {
-        const entryPath = `${directoryPath}/${entry.name}`;
-        if (entry.isDirectory) {
-          pending.push([entry, entryPath]);
-        } else if (entry.isFile) {
-          const file = await readEntryFile(entry);
-          Object.defineProperty(file, 'webkitRelativePath', {
-            configurable: true,
-            enumerable: true,
-            value: entryPath
-          });
-          files.push(file);
-        }
-      }
-    }
-  }
-  return files;
-}
-
 /**
  * How one local file arrives, by what its name says it is
  * (`data/input-formats.js`): `file` (a file that is the container itself, an
@@ -112,13 +70,39 @@ export function localFileLayout(file) {
 }
 
 /**
+ * The browser's handle of a dropped item, asked for inside the `drop` event
+ * as its items are: a promise answering it, or null (an item the browser has
+ * no handle for, or a browser without them).
+ *
+ * @param {DataTransferItem|null} item
+ * @returns {Promise<FileSystemHandle|null>|null}
+ */
+function droppedHandleOf(item) {
+  if (typeof item?.getAsFileSystemHandle !== 'function') return null;
+  try {
+    return Promise.resolve(item.getAsFileSystemHandle()).then(found => found ?? null, () => null);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Decide what a drop is. It must run inside the `drop` event: the items of a
  * DataTransfer are readable only while that event is dispatched.
+ *
+ * `readFiles` yields what was dropped (a folder's every file, listed
+ * concurrently, `data/local-folder.js`, through its handle where the drop
+ * gave one; `signal` stops the listing).
+ * `handle` is the browser's handle of the dropped file or folder where it
+ * gives one (Chromium's `getAsFileSystemHandle`), so it can be kept for a
+ * reopen (`app/local-file-handles.js`); null elsewhere, and its promise
+ * answers null when the browser has none for this item.
  *
  * @param {DataTransfer} dataTransfer
  * @returns {Readonly<
  *   {kind: 'file'|'zip'|'folder', label: string,
- *     readFiles: () => Promise<ArrayLike<File>>} |
+ *     readFiles: (options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<File>>,
+ *     handle: Promise<FileSystemHandle|null>|null} |
  *   {kind: 'refused', message: string}
  * >}
  */
@@ -141,13 +125,25 @@ export function describeDatasetDrop(dataTransfer) {
   const entry = typeof item?.webkitGetAsEntry === 'function'
     ? item.webkitGetAsEntry()
     : null;
+  const handle = droppedHandleOf(item);
   if (entry?.isDirectory) {
     // A folder is read as a store folder; one that is not is refused by the
-    // reader, which says what it lacks.
+    // reader, which says what it lacks. Chromium lists a dropped folder
+    // faster through its handle than through its entries, whose calls its
+    // file system answers one at a time however many are asked at once
+    // (measured on real drops, medians of five: 22,023 files in 2.7 s
+    // against 4.4 s, `suo.zarr`'s 6,272 in 0.63 s against 1.2 s), so its
+    // handle is read where the drop gave one.
     return Object.freeze({
       kind: 'folder',
       label: entry.name,
-      readFiles: () => readDroppedFolder(entry)
+      readFiles: async ({ signal = null } = {}) => {
+        const folder = handle === null ? null : await handle;
+        return folder?.kind === 'directory'
+          ? readFolderHandle(folder, { signal })
+          : readFolderEntry(entry, { signal });
+      },
+      handle
     });
   }
 
@@ -157,7 +153,7 @@ export function describeDatasetDrop(dataTransfer) {
   }
   const readFiles = async () => [file];
   const layout = localFileLayout(file);
-  if (layout !== null) return Object.freeze({ kind: layout, label: file.name, readFiles });
+  if (layout !== null) return Object.freeze({ kind: layout, label: file.name, readFiles, handle });
   return refusal(`"${file.name}" is not a file Cellucid can open. ${WHAT_CAN_BE_DROPPED}`);
 }
 
@@ -168,7 +164,8 @@ export function describeDatasetDrop(dataTransfer) {
  * @param {Document} options.documentOwner
  * @param {HTMLElement} options.overlay Shown while files are dragged over the page.
  * @param {(drop: {kind: string, label: string,
- *   readFiles: () => Promise<ArrayLike<File>>}) => void} options.openDataset
+ *   readFiles: (options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<File>>,
+ *   handle: Promise<FileSystemHandle|null>|null}) => void} options.openDataset
  * @param {(message: string) => void} options.refuse
  * @returns {() => void} Retires the drop target.
  */

@@ -55,6 +55,7 @@ import { expect, test } from './helpers/test.mjs';
 import { anndataZarrZip } from './helpers/anndata-zarr-zip.mjs';
 import { writeServedFixture } from './helpers/served-fixture.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForDatasetReady } from './helpers/dataset-ready.mjs';
 import { QUIET_WINDOW_MS, sceneQuietness } from './helpers/frame-scheduling.mjs';
 import { reportFromUnattachedWebKit } from './helpers/unattached-webkit.mjs';
 
@@ -246,7 +247,16 @@ async function runFlowMeasured({ flowName, budget, reportedGap }) {
   };
   let ran = [];
   let ranKinds = [];
+  // Every probe has run once: the worker has started and each kind of task
+  // is being seen.
+  const kindsSeen = new Set();
+  let allSeen;
+  const everyProbeRan = new Promise(resolve => {
+    allSeen = resolve;
+  });
   const probeRan = kind => {
+    kindsSeen.add(kind);
+    if (kindsSeen.size === Object.keys(probes).length) allSeen();
     const now = performance.now();
     const probe = probes[kind];
     const gap = now - probe.last;
@@ -271,8 +281,8 @@ async function runFlowMeasured({ flowName, budget, reportedGap }) {
     { type: 'text/javascript' },
   )));
   pinger.onmessage = () => probeRan('ping');
-  // Let the page settle, and the worker start, before the run starts.
-  await new Promise(resolve => setTimeout(resolve, 200));
+  // The run starts once every probe is running.
+  await everyProbeRan;
 
   // The evidence a failure reports: every worker the run starts (and how
   // long its construction held the page), and what the app logs.
@@ -404,7 +414,8 @@ async function measure(page, flow) {
 async function openDataset(page) {
   await page.goto(`/?sampleCatalog=${encodeURIComponent(served.root)}&dataset=${DATASET}`, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await page.waitForFunction(count => window._comparisonModule?.state?.pointCount === count, CELLS, { timeout: OPENING_TIMEOUT_MS });
+  // The runs name genes through the data layer: once they are read.
+  await waitForDatasetReady(page, CELLS, { timeout: OPENING_TIMEOUT_MS });
   // The frames the opening owes are drawn before the run, not during it.
   await expect.poll(() => sceneQuietness(page), { timeout: OPENING_TIMEOUT_MS }).toBe('quiet');
 }
@@ -460,6 +471,8 @@ async function measured() {
   app.document.dispatchEvent(new app.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   await until(() => !welcomeShown(), 'Escape did not close the welcome');
   await until(() => app._comparisonModule?.state?.pointCount === ${CELLS}, 'the dataset did not open');
+  // The runs name genes through the data layer: once they are read.
+  await app._comparisonModule.state.whenGenesListed();
   // The frames the opening owes are drawn before the run, not during it.
   for (;;) {
     await until(() => app._cellucidViewer.getFrameScheduleState().settled, 'the scene did not settle');

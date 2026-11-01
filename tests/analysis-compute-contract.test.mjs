@@ -14,6 +14,7 @@ import {
 } from '../assets/js/app/analysis/compute/operations.js';
 import { WorkerPool } from '../assets/js/app/analysis/compute/worker-pool.js';
 import { toCSV } from '../assets/js/app/analysis/shared/analysis-utils.js';
+import { undoLater } from './helpers/teardown.mjs';
 
 const COMPUTE_ROOT = new URL('../assets/js/app/analysis/compute/', import.meta.url);
 
@@ -86,7 +87,7 @@ test('CSV conversion requires own headers and row cells for prototype-named colu
 
 test('ComputeManager executes exactly one preselected backend and propagates its error', async t => {
   const manager = createInitializedManager();
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
   manager.selectBackend = () => 'worker';
 
   const calls = [];
@@ -107,7 +108,7 @@ test('ComputeManager executes exactly one preselected backend and propagates its
 
 test('worker execution failure is never recomputed on the main thread', async t => {
   const manager = createInitializedManager({ worker: true });
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
 
   const calls = [];
   manager._executeOnBackend = async backend => {
@@ -127,7 +128,7 @@ test('worker execution failure is never recomputed on the main thread', async t 
 
 test('an explicit backend request is exact and rejected before execution when unavailable', async t => {
   const manager = createInitializedManager({ worker: false });
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
 
   const calls = [];
   manager._executeOnBackend = async backend => {
@@ -161,7 +162,7 @@ test('an explicit backend request is exact and rejected before execution when un
 
 test('WorkerPool never executes scientific work on the main thread', async t => {
   const pool = new WorkerPool({ poolSize: 1 });
-  t.after(() => pool.terminate());
+  undoLater(t, () => pool.terminate());
   pool.workersAvailable = false;
 
   await assert.rejects(
@@ -204,12 +205,13 @@ test('WorkerPool rejects every undeclared or coercive configuration shape', asyn
   for (const options of [
     { poolSize: 0 },
     { poolSize: 1.5 },
-    { defaultTimeout: '30000' },
+    // No deadline: a slow task is not a failed one (CE-05).
+    { defaultTimeout: 30000 },
     { poolSize: 1, alias: true }
   ]) {
     assert.throws(
       () => new WorkerPool(options),
-      /positive safe integer|WorkerPool options may contain only: defaultTimeout, poolSize \(unexpected: alias\)/i
+      /positive safe integer|WorkerPool options may contain only: poolSize \(unexpected: (alias|defaultTimeout)\)/i
     );
   }
 
@@ -234,7 +236,7 @@ test('WorkerPool rejects every undeclared or coercive configuration shape', asyn
 test('WorkerPool preflights broadcasts before dispatching any work', async t => {
   const posted = [];
   const pool = new WorkerPool({ poolSize: 2 });
-  t.after(() => pool.terminate());
+  undoLater(t, () => pool.terminate());
   pool.workers = [
     { postMessage: message => posted.push(message), terminate() {} },
     { postMessage: message => posted.push(message), terminate() {} }
@@ -257,7 +259,7 @@ test('WorkerPool preflights broadcasts before dispatching any work', async t => 
 
 test('WorkerPool makes transfer traversal failure terminal immediately', async t => {
   const pool = new WorkerPool({ poolSize: 1 });
-  t.after(() => pool.terminate());
+  undoLater(t, () => pool.terminate());
   let terminated = false;
   pool.workers = [{
     postMessage() {
@@ -312,7 +314,7 @@ test('a running-task abort answers its caller and leaves the pool and its queue 
     }
   }
   globalThis.Worker = SilentWorker;
-  t.after(() => {
+  undoLater(t, () => {
     if (originalWorker === undefined) {
       delete globalThis.Worker;
     } else {
@@ -320,8 +322,8 @@ test('a running-task abort answers its caller and leaves the pool and its queue 
     }
   });
 
-  const pool = new WorkerPool({ poolSize: 1, defaultTimeout: 1_000 });
-  t.after(() => pool.terminate());
+  const pool = new WorkerPool({ poolSize: 1 });
+  undoLater(t, () => pool.terminate());
   pool.workers = [new SilentWorker()];
   pool.workerStates = ['idle'];
   pool.taskQueues = [[]];
@@ -373,7 +375,7 @@ test('a worker crash has one terminal owner and never creates a replacement', as
     }
   }
   globalThis.Worker = SilentWorker;
-  t.after(() => {
+  undoLater(t, () => {
     if (originalWorker === undefined) {
       delete globalThis.Worker;
     } else {
@@ -382,7 +384,7 @@ test('a worker crash has one terminal owner and never creates a replacement', as
   });
 
   const pool = new WorkerPool({ poolSize: 1 });
-  t.after(() => pool.terminate());
+  undoLater(t, () => pool.terminate());
   const worker = new SilentWorker();
   pool.workers = [worker];
   pool.workerStates = ['busy'];
@@ -443,7 +445,7 @@ test('ComputeManager retires a terminal worker pool and discovers a fresh one fo
     }
   }
   globalThis.Worker = AcknowledgingWorker;
-  t.after(() => {
+  undoLater(t, () => {
     if (originalWorker === undefined) {
       delete globalThis.Worker;
     } else {
@@ -452,26 +454,41 @@ test('ComputeManager retires a terminal worker pool and discovers a fresh one fo
   });
 
   const manager = new ComputeManager();
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
   await manager.init();
   assert.equal(manager.getStatus().worker.status, BackendStatus.AVAILABLE);
   const firstPool = manager._workerBackend;
   assert.equal(workers.length, firstPool.poolSize);
 
-  // A running-task timeout is terminal for the exact pool that owned it.
-  const timedOut = manager.execute(
+  // A task that runs long is waited for: no deadline turns it into a
+  // failure of the pool, of this task or of any other window's (CE-05).
+  const slow = manager.execute(
     OperationType.COMPUTE_CORRELATION,
     {
       xValues: new Float32Array([1, 2, 3]),
       yValues: new Float32Array([1, 2, 3])
     },
-    { backend: 'worker', timeout: 1, transfer: false }
+    { backend: 'worker', transfer: false }
   );
-  const terminalFailure = await timedOut.then(
-    () => assert.fail('a silent worker must time out'),
+  let slowOutcome = 'pending';
+  slow.then(() => { slowOutcome = 'done'; }, () => { slowOutcome = 'failed'; });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(slowOutcome, 'pending', 'a silent worker is still being waited for');
+  assert.equal(firstPool.isTerminal(), false);
+  await assert.rejects(
+    manager.execute(OperationType.COMPUTE_CORRELATION, { xValues: [1], yValues: [1] }, { backend: 'worker', timeout: 1 }),
+    /Execution options may contain only/,
+    'a task takes no deadline'
+  );
+
+  // A transport failure (the worker's `error`) is terminal for the exact pool
+  // that owned it: every task it held fails with it.
+  workers[0].onerror({ message: 'worker crashed' });
+  const terminalFailure = await slow.then(
+    () => assert.fail('a crashed worker\'s task fails'),
     error => error
   );
-  assert.match(terminalFailure.message, /timed out after 1ms/);
+  assert.match(terminalFailure.message, /worker crashed/);
   assert.equal(firstPool.isTerminal(), true);
   assert.equal(firstPool.getTerminalFailure(), terminalFailure);
   assert.ok(workers.every(worker => worker.terminated));
@@ -496,7 +513,7 @@ test('ComputeManager retires a terminal worker pool and discovers a fresh one fo
 
 test('a pool retired elsewhere is replaced before the manager selects a backend', async t => {
   const manager = createInitializedManager({ worker: true });
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
   const terminalFailure = new Error('terminal worker transport failure');
   manager._workerBackend = {
     async execute() {
@@ -535,7 +552,7 @@ test('a pool retired elsewhere is replaced before the manager selects a backend'
 
 test('ComputeManager rejects alternate option records', async t => {
   const manager = createInitializedManager({ worker: false });
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
 
   await assert.rejects(
     manager.execute(
@@ -552,7 +569,7 @@ test('ComputeManager rejects alternate option records', async t => {
 
 test('CPU and worker selections return the exact same scientific contract', async t => {
   const manager = createInitializedManager({ worker: true });
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
   manager._workerBackend.execute = async (operation, payload) =>
     structuredClone(executeOperation(operation, payload));
 
@@ -596,7 +613,7 @@ test('CPU and worker selections return the exact same scientific contract', asyn
 
 test('compute metadata contains no retry or fallback narrative', async t => {
   const manager = createInitializedManager({ worker: false });
-  t.after(() => manager.terminate());
+  undoLater(t, () => manager.terminate());
 
   const result = await manager.execute(
     OperationType.COMPUTE_CORRELATION,

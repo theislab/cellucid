@@ -67,7 +67,7 @@ app's own copy of that surface (the startup failure screen) uses too.
 
 The sidebar, its floating (undocked) panels, the phone full-screen sheet, the
 analysis windows, the dialogs (welcome, license, confirm, figure export,
-community annotation), notifications, the selection bar, the view title chips,
+community annotation, and the app dialogs: Cite, Share, Stored), notifications, the selection bar, the view title chips,
 the camera-path transport bar and the info popovers are one product. Every control pattern below has exactly
 one implementation: one rule set in `components/_controls.css` or
 `components/_buttons.css`, sized from `tokens/_controls.css`, and one builder in
@@ -84,8 +84,9 @@ a control sits), never a second look for a control.
 | Composite field caption | `span.field-label[id]` named by the group's `aria-labelledby` (chip groups, select pairs) | per builder |
 | Info button | `button.info-btn[aria-controls]` + `div.info-tooltip[role=dialog][data-info-tip][hidden]`, empty in markup; its text comes from the tip registry `ui/components/info-tips.js` | `createInfoTip`; `info-popovers.js` (one document-level controller) |
 | Checkbox + info | `div.checkbox-info-row` > `label.checkbox-inline` + `button.info-btn` | static |
-| Select, text, number, textarea | `.obs-select` | `createSelect`, or the element with `.obs-select` |
-| Slider | `label[for]` + `div.slider-row` > `input[type=range]` + `output.slider-value` (or `span`) | `createSliderField` |
+| Select, text, whole number, textarea | `.obs-select`; a whole number is `input[type=number]` with an integer `step` | `createSelect`, or the element with `.obs-select` |
+| Decimal number (typed; any locale) | `input.obs-select[type=text][inputmode=decimal][autocomplete=off][spellcheck=false]`, read by `parseDecimalText` (a point or a comma), written with a point; never `input[type=number]`, which refuses a decimal comma in Firefox on a page marked English and shows the system's locale in Chromium (`tests/decimal-number-input-contract.test.mjs`) | `createDecimalInput`, `readDecimalInput`, `writeDecimalInput` |
+| Slider | `label[for]` + `div.slider-row` > `input[type=range]` + `output.slider-value` (or `span`); a value the user can type is `input.obs-select.slider-number` (+ `span.slider-unit`) | `createSliderField` |
 | Checkbox | `label.checkbox-inline` wrapping `input[type=checkbox]` + text | `createCheckbox` |
 | Switch (applies immediately) | `button.switch[role=switch][aria-checked]` > `.switch-track` + `.switch-label` | `createSwitch` |
 | Segmented (2–4 exclusive settings) | `div.segmented[role=group][aria-label]` > `button.segmented-btn[aria-pressed]` | `createSegmented` |
@@ -100,7 +101,11 @@ a control sits), never a second look for a control.
 | Settings box (settings of the choice above) | `.control-box`, a quiet tinted box | – |
 | Solid box (a list the user edits) | `.list-box` | – |
 | Removable row in a list box | `div.list-item` > checkbox + `.list-item-text` + `button.icon-btn.list-item-remove` | `createListItem` |
+| Row chosen for an action in a list box (Remove selected) | `label.select-item` > checkbox + `.select-item-body` (`.select-item-head` > `.select-item-name` + `.select-item-size`, then `.select-item-meta`); a row that cannot be chosen has its checkbox disabled and says why | `createSelectItem` |
 | Collapsible sub-section | `div.disclosure` > `button.disclosure-header[aria-expanded][aria-controls]` + `div.disclosure-content[hidden]`; in a `.disclosure-list` | `createDisclosure`; `bindDisclosure` for template or static markup (`[data-static-disclosure]`) |
+| Collapsible section of a panel (Session › Subsampling, Data mapping) | `div.control-block.disclosure.disclosure-inline.session-disclosure` > `.disclosure-header-row` (`h3.section-title.session-disclosure-heading` > `button.disclosure-header` with `.disclosure-title`, a one-line `.disclosure-desc` summary shown while collapsed, `.disclosure-chevron`; then the `.info-btn`) + `div.disclosure-content[hidden]`; open state kept per viewer in `localStorage` | `initSessionSections` (`ui/modules/session-sections.js`) |
+| Details (the facts behind a short summary: the Dataset box, Cells to open) | `div.disclosure.disclosure-inline.details-disclosure` titled "Details" > `dl.fact-list` of label and value rows (a value's longer text is its `title`) | `renderFactList` (rows `{label, value, title?, href?, lines?}`) |
+| App dialog (Cite, Share, Stored) | native `dialog.app-dialog` opened with `showModal()` > `.app-dialog-header` + `.app-dialog-body` (+ `.app-dialog-actions`) | `wireAppDialog` (`components/app-dialog.js`) |
 
 ### Rules
 

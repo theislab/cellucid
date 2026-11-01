@@ -1,6 +1,8 @@
 /**
- * Opening a Zarr store: every node's metadata is read up front, in as few
- * round trips as the store allows, so navigation afterwards is synchronous.
+ * Opening a Zarr store: every node's metadata is read at open, in as few
+ * round trips as the store allows (the whole tree is described in one
+ * place, or listed and read in one batch), so every group is loaded from
+ * the start (`formats/store.js`, `Group.load`) and navigation never waits.
  *
  * - The format version is found from the root: `zarr.json` is Zarr v3;
  *   `.zgroup`, `.zarray`, `.zattrs` or `.zmetadata` is Zarr v2. A store that
@@ -17,6 +19,15 @@
  * Groups that exist only as the parent of other nodes (no metadata of their
  * own) are opened as empty-attribute groups, so no node is lost.
  *
+ * Every read made through the opened store (a chunk, a shard index, the
+ * check that a host serves a hidden path) runs within the store's lifetime
+ * (`storeWithin`): `close()` stops each one still under way where it is --
+ * its fetch, its wait to be made again, its place in the queue -- whoever
+ * asked for it, background work with no signal of its own included, so
+ * nothing of a closed store reads on (a source disconnected while an index
+ * was being kept read its host's `X/indptr` on, retrying, for as long as
+ * the worker lived).
+ *
  * @module formats/zarr/open
  */
 
@@ -26,8 +37,10 @@ import { parseV2Array, parseV3Array } from './metadata.js';
 import { createArrayNode } from './array.js';
 import { createGroupNode } from './group.js';
 import { ByteLru } from './cache.js';
+import { DecodedBudget } from '../io/decoded-budget.js';
 import { createLimiter } from './stores/common.js';
 import { releaseIdleDecodeWorkers } from '../io/decode-pool.js';
+import { SharedWorks, cancelled, withinLifetime } from '../../utils/abort.js';
 import { isObjectRecord } from '../../utils/exact-record.js';
 
 const MiB = 1024 * 1024;
@@ -146,6 +159,22 @@ async function readV3(store, keys, rootFetched, consolidatedWanted, options, sto
   return docs;
 }
 
+/**
+ * `store` with every read (`get`, `getMany`, `getRanges`) run within
+ * `lifetime` as well as its caller's signal (`withinLifetime`); every other
+ * member is the store's own.
+ */
+function storeWithin(store, lifetime) {
+  const reads = {
+    get: { value: (key, options = {}) => withinLifetime(lifetime, options.signal, signal => store.get(key, { ...options, signal })) },
+    getMany: { value: (keys, options = {}) => withinLifetime(lifetime, options.signal, signal => store.getMany(keys, { ...options, signal })) },
+  };
+  if (typeof store.getRanges === 'function') {
+    reads.getRanges = { value: (key, ranges, options = {}) => withinLifetime(lifetime, options.signal, signal => store.getRanges(key, ranges, { ...options, signal })) };
+  }
+  return Object.freeze(Object.create(store, reads));
+}
+
 /** A path segment some static hosts never serve (Jekyll, GitHub Pages' default, hides them). */
 const HIDDEN_SEGMENT = /^[_.]/;
 
@@ -206,14 +235,15 @@ function hiddenPathChecks(store, nodes, storeName) {
  * Open a Zarr store.
  *
  * @param {Object} store - A store backend (`directoryStore`, `zipStore`, `httpStore`, `memoryStore`)
- * @param {{decodedChunkCacheBytes?: number, shardIndexCacheBytes?: number,
- *          version?: 2|3|null, consolidated?: boolean,
+ * @param {{decodedChunkCacheBytes?: number|import('../io/decoded-budget.js').DecodedBudget,
+ *          shardIndexCacheBytes?: number, version?: 2|3|null, consolidated?: boolean,
  *          signal?: AbortSignal|null, activity?: Object|null}} [options]
  *   `decodedChunkCacheBytes` (default 64 MiB) budgets the decoded chunks kept
- *   between reads; `version` forces a format when a store holds both;
+ *   between reads (a `DecodedBudget`: shared with the other caches of the
+ *   store's decoded chunks); `version` forces a format when a store holds both;
  *   `consolidated: false` ignores consolidated metadata (listed stores only).
  * @returns {Promise<Object>} The root node (a Group, or an ArrayNode for a
- *   store that is a single array), with `close()` and `stats()`
+ *   store that is a single array), with `close(reason?)` and `stats()`
  */
 export async function openZarr(store, {
   decodedChunkCacheBytes = 64 * MiB,
@@ -265,12 +295,18 @@ export async function openZarr(store, {
 
   const context = {
     decoded: new ByteLru(decodedChunkCacheBytes),
-    indexes: new ByteLru(shardIndexCacheBytes),
-    inflight: new Map(),
+    // Shard indexes are the store's structure: kept while it is open, not
+    // counted or trimmed as decoded chunks.
+    indexes: new ByteLru(new DecodedBudget(shardIndexCacheBytes, { structure: true })),
+    // Chunks and shard indexes being read, shared by every read asking (`SharedWorks`).
+    inflight: new SharedWorks(),
     decodeLimit: createLimiter(DECODE_CONCURRENCY),
     stats: { chunksDecoded: 0, decodedBytes: 0, cacheHits: 0, sharedChunks: 0 },
     closed: false,
   };
+  /** Aborted by `close()`: every read made through the store stops (module overview). */
+  const lifetime = new AbortController();
+  const reads = storeWithin(store, lifetime.signal);
 
   // Every node: path -> {kind, attrs, array metadata}.
   const nodes = new Map();
@@ -324,8 +360,10 @@ export async function openZarr(store, {
 
   const rootExtra = {
     zarrFormat: format,
-    close() {
+    /** Close the store: `reason`, what its reads still under way reject with (a `closed` cancellation by default). */
+    close(reason = cancelled('closed', `${storeName} was closed.`)) {
       context.closed = true;
+      lifetime.abort(reason);
       context.decoded.clear();
       context.indexes.clear();
       context.inflight.clear();
@@ -340,7 +378,7 @@ export async function openZarr(store, {
     },
   };
 
-  const served = keys === null ? hiddenPathChecks(store, nodes, storeName) : new Map();
+  const served = keys === null ? hiddenPathChecks(reads, nodes, storeName) : new Map();
 
   const built = new Map();
   const childrenOf = new Map();
@@ -355,10 +393,10 @@ export async function openZarr(store, {
     let node;
     if (info.kind === 'array') {
       if (path === '') {
-        const arrayNode = createArrayNode({ path: absolute, name, attrs, meta: info.meta, store, context, served: served.get(path) ?? null });
+        const arrayNode = createArrayNode({ path: absolute, name, attrs, meta: info.meta, store: reads, context, served: served.get(path) ?? null });
         node = Object.freeze({ ...arrayNode, ...rootExtra });
       } else {
-        node = createArrayNode({ path: absolute, name, attrs, meta: info.meta, store, context, served: served.get(path) ?? null });
+        node = createArrayNode({ path: absolute, name, attrs, meta: info.meta, store: reads, context, served: served.get(path) ?? null });
       }
     } else {
       const children = new Map();

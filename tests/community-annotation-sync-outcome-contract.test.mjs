@@ -104,7 +104,7 @@ test('the wizard derives status from outcomes and follows sync-busy transitions'
   );
   assert.match(
     flowSource,
-    /modalAbort\.signal\.addEventListener\('abort', unsubscribeSyncBusy/
+    /onAbort\(modalAbort\.signal, unsubscribeSyncBusy\)/
   );
   assert.match(
     flowSource,

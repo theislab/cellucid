@@ -18,7 +18,7 @@ test('session maintainer reference describes only the atomic current format', as
   for (const exact of [
     'one current state document',
     'one awaited public operation',
-    'CELLUCID_SESSION/2',
+    'CELLUCID_SESSION/3',
     'ui/figure-export',
     'analysis/docked',
     'cinematic/camera',

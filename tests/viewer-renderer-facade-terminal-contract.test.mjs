@@ -364,15 +364,13 @@ test('renderer facade recursively fences cached ownership and reflection escapes
   assert.equal(renderer.programs.nonConfigOwner.nested.value, 10);
   assert.equal(renderer.programs.nonConfigOwner.injected, undefined);
 
+  // A method's result is fenced like every other value the facade hands
+  // out (no special case per method): its arrays are detached copies.
   const membership = facade.getCurrentLodMembership();
   assert.notStrictEqual(membership.indices, renderer.membership.indices);
   assert.notStrictEqual(
     membership.admissionLevels,
     renderer.membership.admissionLevels,
-  );
-  assert.strictEqual(
-    membership.generationToken,
-    renderer.membership.generationToken,
   );
   membership.indices[0] = 99;
   membership.admissionLevels[0] = 99;

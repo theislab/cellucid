@@ -5,6 +5,7 @@
  * retires the old permutation texture, after the new one is accepted. A failed
  * build therefore changes nothing a frame can observe.
  */
+import { StoreOrder } from '../assets/js/rendering/high-perf/store-order.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -128,13 +129,15 @@ function createFixture({ pointCount, staleTree }) {
   );
   oldTree.ensureDrawOrder();
   const oldOrderTexture = gl._adoptTexture('old-draw-order');
-  const oldOrder = {
-    byteLength: pointCount * 4,
-    drawOrder: oldTree.drawOrder,
-    height: 1,
-    texture: oldOrderTexture,
-    width: pointCount,
-  };
+  const oldOrder = new StoreOrder({
+    pointCount,
+    target: oldTree.drawOrder,
+    adopted: pointCount,
+    base: null,
+    baseEnd: pointCount,
+    map: { texture: oldOrderTexture, plan: null, byteLength: pointCount * 4 },
+    ranked: false,
+  });
   const oldBoundingSphere = Object.freeze({ center: [0, 0, 0], radius: 99 });
   const perViewState = new Map([['live', { id: 'live' }], ['snapshot-a', { id: 'snapshot-a' }]]);
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
@@ -205,7 +208,10 @@ test('successful stale spatial-index replacement publishes the tree and defers t
 
   assert.notStrictEqual(published, oldTree);
   assert.strictEqual(renderer.spatialIndices.get(DIMENSION), published);
-  assert.ok(published.lodLevels.length > 1, 'adaptive LOD builds the levels');
+  // Adaptive LOD builds the levels: 64 cells are below the first ladder
+  // count, so one level of every cell, in a banded order.
+  assert.equal(published.lodLevels.length, 1);
+  assert.ok(published.drawOrder.levelBands instanceof Uint8Array);
   // The store still holds the old order, whole: nothing was uploaded or retired.
   assert.strictEqual(renderer._liveOrder, oldOrder);
   assert.deepEqual(gl._state.deleted, []);

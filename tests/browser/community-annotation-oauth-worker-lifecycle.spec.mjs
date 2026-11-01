@@ -191,6 +191,9 @@ test(
       return new Response(
         JSON.stringify({
           access_token: `oauth-token-${body.code}`,
+          expires_in: 28_800,
+          refresh_token: 'refresh-token',
+          refresh_token_expires_in: 15_897_600,
           scope: '',
           token_type: 'bearer',
         }),

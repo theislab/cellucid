@@ -8,7 +8,8 @@
 
 /**
  * Light gray default when no field is selected (0-255).
- * Used by categorical coloring paths.
+ * Used by the categorical and continuous colours and by the grey for 0
+ * (`rendering/read-cell-layer.js`, which makes it from the background).
  */
 export const NEUTRAL_GRAY_UINT8 = 211;
 

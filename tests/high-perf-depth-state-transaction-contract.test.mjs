@@ -5,6 +5,7 @@ import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
+import { DEFAULT_CELL_PRIORITY } from '../assets/js/data/cell-priority.js';
 
 function identityMatrix() {
   const matrix = new Float32Array(16);
@@ -161,6 +162,7 @@ function makeRenderer({
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
+      _cellPriority: DEFAULT_CELL_PRIORITY,
       _colorsDirty: false,
       _dummyLodIndexTexture: dummyLodIndexTexture,
       _firstRenderDone: true,
@@ -214,16 +216,17 @@ function makeRenderer({
     },
   );
   if (snapshot) {
-    const alphaTexData = Uint8Array.of(255);
+    // The published transparency, kept by reference: one shown cell.
+    const alphas = Uint8Array.of(1);
     renderer.snapshotBuffers.set(viewId, {
-      alphaTexData,
+      alphas,
       alphaTexHeight: 1,
       alphaTexWidth: 1,
       alphaTexture: Object.freeze({
         id: 'snapshot-alpha-texture',
       }),
-      alphaTexPlan: planLinearTexture(alphaTexData.length, 16384, 256),
-      alphaTextureByteLength: alphaTexData.byteLength,
+      alphaTexPlan: planLinearTexture(alphas.length, 16384, 256),
+      alphaTextureByteLength: alphas.length,
       dimensionLevel,
       geometryGeneration: 1,
       id: viewId,

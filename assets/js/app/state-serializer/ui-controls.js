@@ -9,6 +9,7 @@
 
 import { isGeneratedDomId } from '../ui/components/dom-id.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 const SERIALIZABLE_INPUT_TYPES = new Set([
   'checkbox',
@@ -282,6 +283,18 @@ function buildCurrentInventory(sidebar) {
   return inventory;
 }
 
+/**
+ * Whether a slider's session value is a preference its owner keeps
+ * (`data-session-preference`): one whose range follows data that may not be
+ * read when a session is restored (the edge-count slider's, a graph's
+ * visible edges). The session records the preference; restoring it hands it
+ * to the owner (`session-preference`), which shows what the data allows of
+ * it, so a range not known yet never refuses the session.
+ */
+function holdsPreference(element) {
+  return typeof element?.dataset?.sessionPreference === 'string';
+}
+
 function assertFiniteNumericControlValue(element, value, id) {
   if (value.length === 0 || !Number.isFinite(Number(value))) {
     throw new TypeError(`Session UI control "${id}" value must be a finite numeric string.`);
@@ -359,6 +372,17 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
   requireExactKeys(record, ['type', 'value'], `Session UI control "${id}"`);
   if (typeof record.value !== 'string') {
     throw new TypeError(`Session UI control "${id}" value must be a string.`);
+  }
+
+  if ((type === 'range' || type === 'number') && holdsPreference(element)) {
+    // A preference, whatever the data's range is now (`holdsPreference`), so
+    // its record is checked here in full, before any current value: a count
+    // a person can choose, at least one (the slider's smallest stop is one
+    // edge or more wherever there is an edge to show).
+    if (!/^[1-9][0-9]*$/.test(record.value) || !Number.isSafeInteger(Number(record.value))) {
+      throw new TypeError(`Session UI control "${id}" preference must be a positive whole number.`);
+    }
+    return;
   }
 
   if (!valueAgainstCurrent) return;
@@ -493,6 +517,16 @@ function restoreValidatedControl(id, entry, data) {
     }
     return;
   }
+  if (holdsPreference(element)) {
+    // The owner takes the preference and shows what the data allows of it.
+    if (element.dataset.sessionPreference === data.value) return;
+    element.dataset.sessionPreference = data.value;
+    dispatchControlEvent(id, element, 'session-preference');
+    if (element.dataset.sessionPreference !== data.value) {
+      throw new Error(`Session UI control "${id}" rejected restored preference "${data.value}".`);
+    }
+    return;
+  }
   if (element.value === data.value) return;
   element.value = data.value;
   dispatchControlEvent(
@@ -567,7 +601,7 @@ export function createUiControlSerializer({ sidebar }) {
           pressedId: pressedButtonId(pressedGroupButtons(element, id), id),
         };
       } else {
-        controls[id] = { type, value: element.value };
+        controls[id] = { type, value: holdsPreference(element) ? element.dataset.sessionPreference : element.value };
       }
     }
     return controls;
@@ -600,9 +634,7 @@ export function createUiControlSerializer({ sidebar }) {
       ? options.abortSignal
       : null;
     const withheldIds = new Set(options.withholdControlIds ?? []);
-    if (abortSignal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
+    throwIfAborted(abortSignal);
 
     const inventory = buildCurrentInventory(sidebar);
     const deferredIds = new Set([
@@ -655,9 +687,7 @@ export function createUiControlSerializer({ sidebar }) {
           if (deferredIds.has(id) !== restoreDeferred) continue;
           // Validated, but not applied: see `withholdControlIds`.
           if (withheldIds.has(id)) continue;
-          if (abortSignal?.aborted) {
-            throw new DOMException('Aborted', 'AbortError');
-          }
+          throwIfAborted(abortSignal);
           restoreValidatedControl(id, staged.entry, staged.data);
         }
       }

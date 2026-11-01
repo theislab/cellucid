@@ -57,7 +57,8 @@ await h5wasm.ready;
 
 async function openOurs(file) {
   const bytes = new Uint8Array(readFileSync(file));
-  return openHdf5(createByteReader(bytesByteSource(bytes, { name: path.basename(file) })));
+  // Its whole tree, as the comparison with the reference walks all of it.
+  return openHdf5(createByteReader(bytesByteSource(bytes, { name: path.basename(file) })), { load: [''] });
 }
 
 /** A deterministic pseudo-random generator per path. */

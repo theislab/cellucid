@@ -11,6 +11,8 @@ import { categoryCounts } from '../../shared/category-counts.js';
 import { computeStats } from '../../shared/number-utils.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
+import { sharedCellsReason } from '../../shared/page-overlap.js';
+import { formatCount, formatSignificant } from '../../../../utils/format-units.js';
 
 // =============================================================================
 // LARGE PAGES: STATISTICS ON THE ANALYSIS WORKERS
@@ -82,7 +84,8 @@ export async function preparePageStatistics(pageData, dataType) {
       { transfer: !ArrayBuffer.isView(pd.values) }
     ).then(({ _compute, ...stats }) => summaryCache.set(pd.values, stats)));
   }
-  if (pageData.length >= 2 && cachedTests(pageData, dataType) === null) {
+  // Pages that share cells are not tested (`renderStatisticalAnnotations`).
+  if (pageData.length >= 2 && cachedTests(pageData, dataType) === null && sharedCellsReason(pageData) === null) {
     const pages = pageData.map(pd => ({ pageName: pd.pageName, values: typedCopy(pd.values) }));
     work.push(manager.execute(
       OperationType.COMPUTE_STATISTICAL_TESTS,
@@ -198,7 +201,7 @@ export function renderSummaryStats(container, pageData, variableName) {
 
     const tbody = document.createElement('tbody');
     const stats = ['count', 'mean', 'median', 'min', 'max', 'std'];
-    const statLabels = { count: 'Count', mean: 'Mean', median: 'Median', min: 'Min', max: 'Max', std: 'Std Dev' };
+    const statLabels = { count: 'Count', mean: 'Mean', median: 'Median', min: 'Min', max: 'Max', std: 'SD (population)' };
 
     for (const stat of stats) {
       const row = document.createElement('tr');
@@ -210,7 +213,7 @@ export function renderSummaryStats(container, pageData, variableName) {
         const cell = document.createElement('td');
         if (pageStats?.count > 0) {
           const raw = pageStats[stat];
-          cell.textContent = stat === 'count' ? String(raw) : raw.toFixed(2);
+          cell.textContent = stat === 'count' ? formatCount(raw) : formatSignificant(raw);
         } else {
           cell.textContent = '-';
         }
@@ -243,6 +246,19 @@ export function renderStatisticalAnnotations(container, pageData, dataType) {
     empty.className = 'empty-state';
     empty.textContent = 'Select 2+ pages for statistics.';
     container.appendChild(empty);
+    return;
+  }
+
+  // Tests of independent groups do not apply to pages that share cells:
+  // said instead, as differential expression refuses such groups.
+  const shared = sharedCellsReason(pageData);
+  if (shared !== null) {
+    const note = document.createElement('p');
+    note.className = 'status-line analysis-shared-cells';
+    note.dataset.tone = 'warning';
+    note.setAttribute('role', 'status');
+    note.textContent = shared;
+    container.appendChild(note);
     return;
   }
 

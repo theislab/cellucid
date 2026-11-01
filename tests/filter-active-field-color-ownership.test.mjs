@@ -4,6 +4,7 @@ import test from 'node:test';
 import { DataStateColorMethods } from '../assets/js/app/state/managers/color-manager.js';
 import { DataStateFilterMethods } from '../assets/js/app/state/managers/filter-manager.js';
 import { DataStateViewMethods } from '../assets/js/app/state/managers/view-manager.js';
+import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
 const POINT_COUNT = 4;
 
@@ -13,8 +14,8 @@ function createState() {
     key: 'leiden',
     categories: ['x', 'y'],
     codes: new Uint8Array([0, 0, 1, 1]),
-    _categoryColors: [[1, 0, 0], [0, 1, 0]],
-    _categoryVisible: { 0: true, 1: true },
+    _categoryColors: colorsOf([[1, 0, 0], [0, 1, 0]]),
+    _categoryVisible: visibleOf([true, true]),
     _categoryFilterEnabled: true,
   };
   const other = {
@@ -22,8 +23,8 @@ function createState() {
     key: 'cell_type',
     categories: ['A', 'B'],
     codes: new Uint8Array([0, 1, 0, 1]),
-    _categoryColors: [[0, 0, 1], [1, 1, 0]],
-    _categoryVisible: { 0: true, 1: false },
+    _categoryColors: colorsOf([[0, 0, 1], [1, 1, 0]]),
+    _categoryVisible: visibleOf([true, false]),
     _categoryFilterEnabled: true,
   };
   const pushes = [];
@@ -83,7 +84,7 @@ test('removing a filter on a non-active field keeps the active field palette', (
 
   state.removeFilter('obs-category-1');
 
-  assert.equal(other._categoryVisible[1], true);
+  assert.equal(other._categoryVisible[1], 1);
   assert.deepEqual(rgbPerCell(state), ACTIVE_RGB);
 });
 

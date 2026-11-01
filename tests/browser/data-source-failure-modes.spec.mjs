@@ -207,7 +207,9 @@ const CATALOG_FAILURES = Object.freeze([
   Object.freeze({
     label: 'absent',
     base: `${ORIGIN}/tests/browser/fixtures/no-such-catalog/`,
-    notice: 'nothing is published at that address',
+    notice: 'datasets.json was not found at',
+    // Nothing at the address: the notice says to check the link.
+    advice: false,
   }),
   Object.freeze({
     label: 'truncated',
@@ -313,7 +315,7 @@ test('a catalog failure recovers in place once the catalog is reachable', async 
   const retry = page.locator(`${CATALOG_NOTICE} button`);
   await expect(retry).toHaveText('Try again');
   await expect(page.locator(CATALOG_NOTICE)).toContainText(
-    'the server reported a problem of its own',
+    /is not answering \(HTTP 503, service unavailable\) for datasets\.json: a problem on [^ ]+'s side/,
   );
   await recordUserFacingFailure(page, testInfo, 'transient-503');
   expect(requests).toBeGreaterThan(1);
@@ -327,7 +329,7 @@ test('a catalog failure recovers in place once the catalog is reachable', async 
   await retry.click();
   await expect(retry).toHaveText('Try again', { timeout: 5_000 });
   await expect(page.locator(CATALOG_NOTICE)).toContainText(
-    'the server reported a problem of its own',
+    /is not answering \(HTTP 503, service unavailable\) for datasets\.json: a problem on [^ ]+'s side/,
   );
   expect(requests).toBe(shown + 1);
 
@@ -388,9 +390,10 @@ for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
         contentType: 'application/json',
       });
       expect(errors.length).toBeGreaterThan(0);
-      // The notification says it in one sentence; what happened and what to
-      // do stay next to the selector.
-      expect(errors.join('\n')).toContain(`Could not open "${GOOD_DATASET.name}".`);
+      // The notification says it in one sentence: a host's answer by whose
+      // problem it is (`describeHostFault`), any other cause generically;
+      // what happened and what to do stay next to the selector too.
+      expect(errors.join('\n')).toMatch(new RegExp(`Could not open "${GOOD_DATASET.name}"\\.|"${GOOD_DATASET.name}" could not be opened: `));
       await expect(page.locator(CATALOG_NOTICE)).toContainText(
         `"${GOOD_DATASET.name}" could not be opened`,
       );
@@ -445,7 +448,7 @@ for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
     const card = page.locator('#notification-center .notification-error');
     await expect(card).toHaveCount(1);
     await expect(card.locator('.notification-message')).toHaveText(
-      `Could not open "${GOOD_DATASET.name}".`,
+      new RegExp(`^(Could not open "${GOOD_DATASET.name}"\\.|"${GOOD_DATASET.name}" could not be opened: .+)$`),
     );
     // The raw error is folded under Details, not in the sentence.
     await expect(card.locator('.notification-details-text')).toBeHidden();
@@ -568,7 +571,8 @@ test('an offline dataset switch is reported and the session survives', async ({
     contentType: 'application/json',
   });
   expect(errors.length).toBeGreaterThan(0);
-  expect(errors.join('\n')).toContain(`Could not open "${MIXED_DEFAULT.name}".`);
+  // This computer offline: the connection on this side, not the host.
+  expect(errors.join('\n')).toContain(`"${MIXED_DEFAULT.name}" could not be opened: This computer is offline`);
   await expect(page.locator(CATALOG_NOTICE)).toContainText(
     `"${MIXED_DEFAULT.name}" could not be opened`,
   );
@@ -619,12 +623,19 @@ test('a load cancelled by switching datasets leaves the winner rendered', async 
   };
   page.context().on('requestfinished', settleSuperseded);
   page.context().on('requestfailed', settleSuperseded);
+  // Every read of the 3D file is held until the 1D dataset has rendered, so
+  // the newer choice supersedes it however slow the runner; then each is
+  // answered, and a load that was not stopped would land on it.
+  let releaseSuperseded;
+  const supersededReleased = new Promise(resolve => {
+    releaseSuperseded = resolve;
+  });
   await page.route(supersededUrl, async route => {
     superseded.started += 1;
     // The newer choice stops the superseded read and ends its reader worker,
     // whose requests are then never answered.
     onWorkerClose(page, workerScriptPattern('annDataReaderWorker'), () => settleSuperseded(route.request()));
-    await new Promise(resolve => setTimeout(resolve, 1_500));
+    await supersededReleased;
     await route.continue().catch(() => {});
   });
   await page.locator('#dataset-select').selectOption(
@@ -644,6 +655,7 @@ test('a load cancelled by switching datasets leaves the winner rendered', async 
       () => window._cellucidViewer.getPointCount(),
     ))
     .toBe(48);
+  releaseSuperseded();
   // Let the superseded 3-D load land if it were going to: every request it
   // issued has been answered or abandoned, and the page has run its
   // continuations without the load issuing another one.

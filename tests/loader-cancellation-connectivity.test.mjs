@@ -7,6 +7,9 @@ import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
 import { edgeListOf } from './helpers/connectivity-edges.mjs';
 
+/** The graph a launch names: these loaders hold one without describing their obsp. */
+const GRAPH_DEFAULT = Object.freeze({ defaults: { knn: 'connectivities' } });
+
 const isAbortError = error => error?.name === 'AbortError';
 
 function deferred() {
@@ -124,7 +127,7 @@ test(
   'a cancelled connectivity request publishes nothing and leaves nothing in flight',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
     const controller = new AbortController();
 
     const outcome = trackOutcome(
@@ -171,7 +174,7 @@ test(
   'a pre-cancelled connectivity request never reaches the loader',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
     const controller = new AbortController();
     controller.abort();
 
@@ -197,7 +200,7 @@ test(
   'a connectivity request that is not cancelled is unaffected',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
     const controller = new AbortController();
 
     const request = adapter.getConnectivityEdges({
@@ -228,7 +231,7 @@ test(
   'a connectivity re-load after a cancellation succeeds from a clean adapter',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
     const cancelled = new AbortController();
 
     const abandoned = trackOutcome(
@@ -263,7 +266,7 @@ test(
   'one cancelled connectivity caller cannot strand a coalesced sibling',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
     const cancelled = new AbortController();
     const retained = new AbortController();
 
@@ -293,7 +296,7 @@ test(
   'an uncancellable coalesced caller keeps shared connectivity work alive',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
     const cancelled = new AbortController();
 
     const identityRead = adapter.getConnectivityEdges();
@@ -317,7 +320,7 @@ test(
   'a cancelled warm-cache connectivity read reports cancellation',
   async () => {
     const scenario = createGatedConnectivityLoader();
-    const adapter = new BaseAnnDataAdapter(scenario.loader);
+    const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
 
     const request = adapter.getConnectivityEdges();
     await scenario.loaderStarted();
@@ -349,7 +352,7 @@ for (const [label, SourceClass] of [
     `${label} source connectivity edges forward their cancellation signal`,
     async () => {
       const scenario = createGatedConnectivityLoader();
-      const adapter = new BaseAnnDataAdapter(scenario.loader);
+      const adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
       const source = new SourceClass();
       source._loader = scenario.loader;
       source._adapter = adapter;
@@ -378,7 +381,7 @@ for (const [label, SourceClass] of [
       const scenario = createGatedConnectivityLoader();
       const source = new SourceClass();
       source._loader = scenario.loader;
-      source._adapter = new BaseAnnDataAdapter(scenario.loader);
+      source._adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
 
       const controller = new AbortController();
       controller.abort();
@@ -399,7 +402,7 @@ for (const [label, SourceClass] of [
       const scenario = createGatedConnectivityLoader();
       const source = new SourceClass();
       source._loader = scenario.loader;
-      source._adapter = new BaseAnnDataAdapter(scenario.loader);
+      source._adapter = new BaseAnnDataAdapter(scenario.loader, GRAPH_DEFAULT);
 
       const outcome = trackOutcome(
         source.getConnectivityEdges({

@@ -148,6 +148,10 @@ function createState() {
     combineHighlightPages() {},
     createHighlightPage() {},
     deleteHighlightPage() {},
+    highlightPageRecord() { return null; },
+    restoreHighlightPage() { return false; },
+    highlightGroupRecord() { return null; },
+    restoreHighlightGroup() { return false; },
     ensureHighlightPage() {},
     getActiveField() {
       return state.getFieldForView(state.activeViewId);

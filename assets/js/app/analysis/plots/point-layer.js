@@ -24,6 +24,8 @@
 import { analysisWorkerCount } from '../shared/performance-config.js';
 import { pointRasterWorkerScript } from '../../../../workers/scripts.js';
 import { startWorker } from '../../../workers/worker-script.js';
+import { workerFailureReason } from '../../../workers/worker-failure.js';
+import { registerIdleWorkers } from '../../../workers/idle-retirement.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
@@ -33,6 +35,15 @@ const rasterWorkers = [];
 let nextRequestId = 1;
 /** @type {Map<number, {resolve: (answer: {blob: Blob, positions: Float64Array}) => void, reject: (error: Error) => void, slot: {worker: Worker, pending: number}}>} */
 const pendingRasters = new Map();
+
+/** Raster workers with nothing to draw end after a while (`workers/idle-retirement.js`). */
+const idleRasters = registerIdleWorkers(() => {
+  for (const slot of [...rasterWorkers]) {
+    if (slot.pending > 0) continue;
+    rasterWorkers.splice(rasterWorkers.indexOf(slot), 1);
+    slot.worker.terminate();
+  }
+});
 
 function retireWorker(slot, error) {
   const index = rasterWorkers.indexOf(slot);
@@ -59,12 +70,13 @@ function rasterWorker() {
       if (pending === undefined) return;
       pendingRasters.delete(data.id);
       created.pending--;
+      if (pendingRasters.size === 0) idleRasters.idle();
       if (typeof data.error === 'string') pending.reject(new Error(`Point raster failed: ${data.error}`));
       else pending.resolve({ blob: data.blob, positions: data.positions });
     };
     worker.onerror = event => {
       event.preventDefault?.();
-      retireWorker(created, new Error(`The point raster worker failed: ${event.message || 'unknown error'}`));
+      retireWorker(created, new Error(`The point raster worker failed: ${workerFailureReason(event)}`));
     };
     rasterWorkers.push(created);
     slot = created;

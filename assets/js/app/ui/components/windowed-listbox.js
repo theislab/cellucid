@@ -231,6 +231,7 @@ export function createWindowedListbox({
     windowStart = 0;
     windowEnd = 0;
     nodes = [];
+    delete listbox.dataset.message;
     // A new list starts at the top; a list left scrolled from an earlier,
     // longer one would otherwise build its next page unasked.
     listbox.scrollTop = 0;
@@ -244,12 +245,15 @@ export function createWindowedListbox({
   }
 
   /**
-   * List nothing and show `node` (an empty-state message) instead.
+   * List nothing and show `node` (an empty-state message) instead. A message
+   * is not a list: it is shown whole, never cut to the list's scroll height
+   * (`data-message`, `_forms.css`).
    *
    * @param {Node} node
    */
   function showMessage(node) {
     reset(0);
+    listbox.dataset.message = '';
     listbox.replaceChildren(node);
   }
 

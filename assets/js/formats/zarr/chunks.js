@@ -22,9 +22,10 @@
 
 import { ZarrFormatError } from './errors.js';
 import { float16Values } from './dtypes.js';
-import { codecsOf, decodesOffThread, expectedSizes, reviveZarrError } from './codecs/pipeline.js';
+import { codecsOf, decoderFamily, decodesOffThread, expectedSizes, reviveZarrError } from './codecs/pipeline.js';
 import { decodeChunkBytes } from '../io/decode-pool.js';
-import { vlenDecode } from './codecs/vlen.js';
+import { VlenItems, vlenItems } from './codecs/vlen.js';
+import { needsSwap, swapBytes } from '../io/byte-order.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 /**
@@ -34,45 +35,18 @@ import { formatCountOf } from '../../utils/format-units.js';
  * @property {number} bytes - Memory it holds, for the cache budget
  */
 
-function swap16(words) {
-  for (let i = 0; i < words.length; i++) {
-    const v = words[i];
-    words[i] = ((v & 0xff) << 8) | (v >>> 8);
-  }
-}
-
-function swap32(words) {
-  for (let i = 0; i < words.length; i++) {
-    const v = words[i];
-    words[i] = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | (v >>> 24);
-  }
-}
-
-function swap64(words) {
-  for (let i = 0; i < words.length; i += 2) {
-    const a = words[i];
-    const b = words[i + 1];
-    words[i] = ((b & 0xff) << 24) | ((b & 0xff00) << 8) | ((b >>> 8) & 0xff00) | (b >>> 24);
-    words[i + 1] = ((a & 0xff) << 24) | ((a & 0xff00) << 8) | ((a >>> 8) & 0xff00) | (a >>> 24);
-  }
-}
-
 /** Elements of `bytes` as a typed array, copying only when the bytes are misaligned or must change. */
 function numericValues(bytes, owned, type, count) {
   const size = type.itemSize;
   const Values = type.valueClass;
-  const swap = !type.littleEndian && size > 1;
+  const swap = needsSwap(type.littleEndian, size);
   let buffer = bytes;
   let own = owned;
   if (bytes.byteOffset % size !== 0 || (swap && !owned)) {
     buffer = bytes.slice();
     own = true;
   }
-  if (swap) {
-    if (size === 2) swap16(new Uint16Array(buffer.buffer, buffer.byteOffset, count));
-    else if (size === 4) swap32(new Uint32Array(buffer.buffer, buffer.byteOffset, count));
-    else swap64(new Uint32Array(buffer.buffer, buffer.byteOffset, count * 2));
-  }
+  if (swap) swapBytes(buffer.subarray(0, count * size), size);
   return { data: new Values(buffer.buffer, buffer.byteOffset, count), owned: own };
 }
 
@@ -120,6 +94,7 @@ export async function decodeChunk(stored, pipeline, count, what, signal = null) 
       description: { codecs: codecsOf(pipeline), sizes },
       input: stored,
       size: decodedSize ?? stored.length,
+      family: decoderFamily(pipeline, stored),
       signal,
       revive: reviveZarrError,
       inThread: () => runDecoders(stored, decoders, sizes),
@@ -128,8 +103,12 @@ export async function decodeChunk(stored, pipeline, count, what, signal = null) 
     bytes = await runDecoders(stored, decoders, sizes);
   }
   if (pipeline.serializer.kind === 'vlen') {
-    const data = vlenDecode(bytes, count, what);
-    return { data, owned: true, bytes: bytes.length + 16 * count };
+    // Held as the chunk's bytes and an offset per item, each item decoded
+    // when it is copied out (`VlenItems`, `copyItems`): never a view of a
+    // larger buffer it would keep alive.
+    const own = owned || (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes : bytes.slice();
+    const data = vlenItems(own, count, what);
+    return { data, owned: true, bytes: data.byteLength };
   }
   if (bytes.length !== decodedSize) {
     throw new ZarrFormatError(`${what}: a chunk decodes to ${formatCountOf(bytes.length, 'byte')}, not the ${decodedSize} its shape and type declare.`);
@@ -280,6 +259,51 @@ export function copyBox(src, srcStart, srcStrides, dst, dstStart, dstStrides, bo
       }
     }
     // Advance the outer axes (odometer).
+    let axis = last - 1;
+    while (axis >= 0) {
+      index[axis]++;
+      s += srcSteps[axis];
+      d += dstSteps[axis];
+      if (index[axis] < extents[axis]) break;
+      s -= srcSteps[axis] * extents[axis];
+      d -= dstSteps[axis] * extents[axis];
+      index[axis] = 0;
+      axis--;
+    }
+    if (axis < 0) return;
+  }
+}
+
+/**
+ * Copy a box of variable-length items (`VlenItems`) into the `Array` `dst`,
+ * decoding each item copied and no other (`copyBox`'s walk, one item per
+ * element).
+ *
+ * @param {VlenItems} src
+ * @param {number} srcStart
+ * @param {number[]} srcStrides
+ * @param {Array<unknown>} dst
+ * @param {number} dstStart
+ * @param {number[]} dstStrides
+ * @param {number[]} boxExtents
+ */
+export function copyItems(src, srcStart, srcStrides, dst, dstStart, dstStrides, boxExtents) {
+  if (!(src instanceof VlenItems)) throw new TypeError('copyItems copies variable-length items.');
+  const { strides: [srcSteps, dstSteps], extents } = mergeAxes([srcStrides, dstStrides], boxExtents);
+  const rank = extents.length;
+  if (rank === 0) {
+    dst[dstStart] = src.at(srcStart);
+    return;
+  }
+  const last = rank - 1;
+  const run = extents[last];
+  const srcStep = srcSteps[last];
+  const dstStep = dstSteps[last];
+  const index = new Array(last).fill(0);
+  let s = srcStart;
+  let d = dstStart;
+  for (;;) {
+    for (let k = 0, a = s, b = d; k < run; k++, a += srcStep, b += dstStep) dst[b] = src.at(a);
     let axis = last - 1;
     while (axis >= 0) {
       index[axis]++;

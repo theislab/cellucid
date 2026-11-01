@@ -11,6 +11,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openPhoneSheet } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -30,6 +31,8 @@ function observeProductErrors(page) {
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  // A phone starts with the panel as its peek bar; its controls are used open.
+  await openPhoneSheet(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );

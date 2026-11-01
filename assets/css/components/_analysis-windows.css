@@ -124,18 +124,24 @@
 
 /* On a phone a window is a bottom sheet: full width, one of three heights,
    a 24 px grip above its header and, with several windows, a tab strip
-   above the grip. Its own box (`--pos-*`) is kept for a wider screen. */
+   above the grip. Its own box (`--pos-*`) is kept for a wider screen. It
+   stands on the panel's bar while the bar shows (`--phone-bar-space`,
+   layouts/_responsive.css), no taller than the screen above the bar: the
+   bar showing lifts every window by its height, sheets and floating
+   windows alike (`dockable-accordions.js` `floatingArea`), so none moves
+   over another's header. */
 .accordion-panel.accordion-floating.floating-sheet {
   --sheet-grip: 24px;
   --sheet-tabs: 0px;
+  --sheet-area: calc(100dvh - var(--phone-bar-space, 0px));
   left: 0;
   right: 0;
   top: auto;
-  bottom: 0;
+  bottom: var(--phone-bar-space, 0px);
   width: 100%;
   max-width: 100%;
-  height: var(--sheet-height, 75dvh);
-  max-height: 100dvh;
+  height: min(var(--sheet-height, 75dvh), var(--sheet-area));
+  max-height: var(--sheet-area);
   padding-top: calc(var(--sheet-grip) + var(--sheet-tabs));
   box-sizing: border-box;
   background: var(--color-surface-elevated);
@@ -172,7 +178,7 @@
 
 .floating-sheet > .accordion-section .accordion-content {
   max-height: calc(
-    var(--sheet-height, 75dvh) - var(--sheet-grip) - var(--sheet-tabs)
+    min(var(--sheet-height, 75dvh), var(--sheet-area)) - var(--sheet-grip) - var(--sheet-tabs)
     - var(--floating-header-height, 0px) - 2 * var(--border-width-1)
   );
 }

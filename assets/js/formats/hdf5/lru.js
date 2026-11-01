@@ -18,17 +18,26 @@
  * @module formats/hdf5/lru
  */
 
+import { DecodedBudget } from '../io/decoded-budget.js';
+
 export class ByteCache {
-  /** @param {number} budgetBytes */
+  /**
+   * @param {number|DecodedBudget} budgetBytes - Bytes kept at most, or a
+   *   budget shared with the other caches of decoded chunks of the file
+   *   (`formats/io/decoded-budget.js`)
+   */
   constructor(budgetBytes) {
-    if (!Number.isSafeInteger(budgetBytes) || budgetBytes < 0) {
-      throw new TypeError('A cache budget must be a whole number of bytes.');
-    }
-    this.budget = budgetBytes;
+    this._budget = DecodedBudget.of(budgetBytes);
     this.bytes = 0;
     this.entries = new Map();
     this.hits = 0;
     this.misses = 0;
+    this._budget.attach(this);
+  }
+
+  /** The bytes this cache and those sharing its budget keep at most. */
+  get budget() {
+    return this._budget.budgetBytes;
   }
 
   get(key) {
@@ -53,11 +62,19 @@ export class ByteCache {
     }
     this.entries.set(key, { value, bytes });
     this.bytes += bytes;
-    while (this.bytes > this.budget) {
-      const [oldest, entry] = this.entries.entries().next().value;
-      this.entries.delete(oldest);
-      this.bytes -= entry.bytes;
-    }
+    this._budget.settle(this);
+    return true;
+  }
+
+  /**
+   * Let the least recently used entry go, never the most recent (the one
+   * just kept); false when there is none other.
+   */
+  evictOldest() {
+    if (this.entries.size < 2) return false;
+    const oldest = this.entries.keys().next().value;
+    this.bytes -= this.entries.get(oldest).bytes;
+    this.entries.delete(oldest);
     return true;
   }
 

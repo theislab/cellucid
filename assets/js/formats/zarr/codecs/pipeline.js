@@ -27,19 +27,23 @@
  */
 
 import { inflate } from '../../io/inflate.js';
-import { genericError } from '../../io/decode-pool.js';
+import { fromWire } from '../../../utils/error-wire.js';
 import { byteUnshuffle } from '../../io/shuffle.js';
 import { ZarrFormatError, ZarrUnsupportedError } from '../errors.js';
 import { hasByteOrder, vlenType, withByteOrder } from '../dtypes.js';
-import { bloscDecode } from './blosc.js';
+import { bloscDecode, bloscFamily } from './blosc.js';
 import { crc32cDecode } from './crc32c.js';
 import { numcodecsLz4Decode } from './lz4.js';
 import { zstdDecompress } from './zstd.js';
+import { bunzip2 } from '../../rds/bzip2.js';
+import { unxz } from '../../rds/xz.js';
+import { formatCountOf } from '../../../utils/format-units.js';
+import { allocateTypedArray } from '../../../data/sparse-column-index.js';
 
 /**
  * @typedef {Object} BytesDecoder
  * @property {string} name
- * @property {(bytes: Uint8Array, expectedSize: number|null) => (Uint8Array|Promise<Uint8Array>)} decode
+ * @property {(bytes: Uint8Array, expectedSize: number|null, choices?: Object<string, string>|null) => (Uint8Array|Promise<Uint8Array>)} decode
  * @property {boolean} allocates - Whether the output is a new buffer (not a view of the input)
  * @property {(outputSize: number|null) => (number|null)} inputSize - Encoded size for a decoded size, when fixed
  */
@@ -62,13 +66,52 @@ function inflateDecoder(name, format) {
     name,
     allocates: true,
     inputSize: unknownSize,
-    async decode(bytes, expectedSize) {
+    async decode(bytes, expectedSize, choices = null) {
       try {
-        return await inflate(bytes, { format, expectedSize, label: `A ${name} chunk` });
+        return await inflate(bytes, { format, expectedSize, label: `A ${name} chunk`, choices });
       } catch (cause) {
         if (cause?.name === 'InflateError') throw new ZarrFormatError(cause.message, { cause });
         throw cause;
       }
+    },
+  };
+}
+
+/**
+ * A decoder over one of the streaming decompressors the R reader uses
+ * (`rds/bzip2.js` `bunzip2`, `rds/xz.js` `unxz`): one chunk is one stream,
+ * its pieces gathered into the decoded size when it is known.
+ */
+function streamDecoder(name, decompress) {
+  return {
+    name,
+    allocates: true,
+    inputSize: unknownSize,
+    async decode(bytes, expectedSize) {
+      const pieces = [];
+      let length = 0;
+      try {
+        for await (const piece of decompress((async function* one() { yield bytes; })())) {
+          length += piece.length;
+          if (expectedSize !== null && length > expectedSize) {
+            throw new ZarrFormatError(`A ${name} chunk decodes to more than its ${formatCountOf(expectedSize, 'byte')}.`);
+          }
+          pieces.push(piece);
+        }
+      } catch (cause) {
+        if (cause instanceof ZarrFormatError) throw cause;
+        throw new ZarrFormatError(`A ${name} chunk could not be decompressed: ${cause?.message ?? cause}`, { cause });
+      }
+      if (expectedSize !== null && length !== expectedSize) {
+        throw new ZarrFormatError(`A ${name} chunk decodes to ${formatCountOf(length, 'byte')}, not its ${expectedSize}.`);
+      }
+      const output = allocateTypedArray(Uint8Array, length, `A ${name} chunk`);
+      let at = 0;
+      for (const piece of pieces) {
+        output.set(piece, at);
+        at += piece.length;
+      }
+      return output;
     },
   };
 }
@@ -132,7 +175,7 @@ function numcodecsDecoderOf(id, configuration, what) {
     case 'blosc':
       return { name: 'blosc', allocates: true, inputSize: unknownSize, decode: bloscDecode };
     case 'zstd':
-      return { name: 'zstd', allocates: true, inputSize: unknownSize, decode: zstdDecompress };
+      return { name: 'zstd', allocates: true, inputSize: unknownSize, decode: (bytes, expectedSize, choices = null) => zstdDecompress(bytes, expectedSize, { choices }) };
     case 'lz4':
       return { name: 'lz4', allocates: true, inputSize: unknownSize, decode: numcodecsLz4Decode };
     case 'crc32c':
@@ -142,7 +185,10 @@ function numcodecsDecoderOf(id, configuration, what) {
     case 'bitround':
       return IDENTITY;
     case 'bz2':
+      return streamDecoder('bz2', bunzip2);
     case 'lzma':
+      // numcodecs' LZMA writes the xz container by default (`format=FORMAT_XZ`).
+      return streamDecoder('lzma', unxz);
     case 'lzf':
     case 'snappy':
     case 'zfpy':
@@ -322,6 +368,28 @@ export function codecsOf(pipeline) {
 /** Decoders rebuilt from codec descriptions, by description. */
 const rebuilt = new Map();
 
+/** The codec family each decompressing codec id belongs to (`io/decoder-choice.js`). */
+const FAMILIES = Object.freeze({ gzip: 'deflate', zlib: 'deflate', zstd: 'zstd', lz4: 'lz4', blosc: 'blosc' });
+
+/**
+ * The family of the codec that decompresses a chunk (its pipeline's first
+ * decoder that is one), or null: what the decode pool chooses a decoder
+ * for. A Blosc frame whose streams are zlib is DEFLATE's (`bloscFamily`),
+ * when Blosc is the first decoder (the stored bytes are its frame).
+ *
+ * @param {Pipeline} pipeline
+ * @param {Uint8Array} stored - The chunk as stored
+ * @returns {string|null}
+ */
+export function decoderFamily(pipeline, stored) {
+  for (const [index, decoder] of pipeline.decoders.entries()) {
+    const family = FAMILIES[decoder.codec?.id];
+    if (family === undefined) continue;
+    return family === 'blosc' && index === 0 ? bloscFamily(stored) : family;
+  }
+  return null;
+}
+
 /**
  * Run the decoders a codec list describes (in decode order) over `input`:
  * what a decode worker does with a Zarr chunk.
@@ -329,9 +397,10 @@ const rebuilt = new Map();
  * @param {Uint8Array} input
  * @param {Array<{id: string, configuration: Object}>} codecs
  * @param {Array<number|null>} sizes - What each decoder must produce
+ * @param {Object<string, string>|null} [choices] - The decoders the task names (`io/decoder-choice.js`)
  * @returns {Promise<Uint8Array>}
  */
-export async function decodeWithCodecs(input, codecs, sizes) {
+export async function decodeWithCodecs(input, codecs, sizes, choices = null) {
   const key = JSON.stringify(codecs);
   let decoders = rebuilt.get(key);
   if (decoders === undefined) {
@@ -343,7 +412,7 @@ export async function decodeWithCodecs(input, codecs, sizes) {
     rebuilt.set(key, decoders);
   }
   let bytes = input;
-  for (let i = 0; i < decoders.length; i++) bytes = await decoders[i].decode(bytes, sizes[i]);
+  for (let i = 0; i < decoders.length; i++) bytes = await decoders[i].decode(bytes, sizes[i], choices);
   return bytes;
 }
 
@@ -357,7 +426,7 @@ export async function decodeWithCodecs(input, codecs, sizes) {
 export function reviveZarrError(data) {
   if (data.name === 'ZarrFormatError') return new ZarrFormatError(data.message);
   if (data.name === 'ZarrUnsupportedError') return new ZarrUnsupportedError(data.feature, data.message);
-  return genericError(data);
+  return fromWire(data);
 }
 
 /**

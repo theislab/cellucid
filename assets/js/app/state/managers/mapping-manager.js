@@ -34,6 +34,11 @@
  * is one step of a larger publication, and the interface refreshes from the
  * dataset-publication path once the whole dataset is in place.
  *
+ * A dataset is published before its gene list is read (`var-axis.js`
+ * `listPublishedGenes`). A change waits for that list first
+ * (`applyDataMapping`), so every change replaces, and rolls back to, an
+ * installed gene list.
+ *
  * @module state/managers/mapping-manager
  */
 
@@ -53,8 +58,9 @@ import {
 } from '../../../data/data-mapping-candidates.js';
 import { layoutEmbeddingRef } from '../../../data/dataset-mapping.js';
 import { representationName } from '../../../data/representation-names.js';
-import { createDatasetFieldLoadSupersededError } from './field/loading.js';
+import { cellsSteady, trackCellWork } from '../../../data/open-cells-work.js';
 import { sameJson } from '../../utils/same-json.js';
+import { cancelled, isCancellation } from '../../../utils/abort.js';
 
 /** Where the current mapping came from. */
 export const MAPPING_ORIGINS = Object.freeze(['default', 'best_guess', 'session', 'user', 'notebook']);
@@ -121,6 +127,9 @@ export class DataStateMappingMethods {
    * }} publication
    */
   publishDatasetMapping({ mapping, candidates, origin }) {
+    // Each publication is another dataset (or none): a change asked of the
+    // one before never lands on it (`applyDataMapping`).
+    this._mappingPublication = (this._mappingPublication ?? 0) + 1;
     if (mapping === null) {
       this.dataMapping = null;
       this._mappingCandidates = null;
@@ -149,6 +158,57 @@ export class DataStateMappingMethods {
     this._mappingPublicationOrigin = origin;
     this._unusableEmbeddings = new Map();
     this._resetMappingGroups();
+  }
+
+  /**
+   * A new candidate catalog of the dataset shown, its choices the same: its
+   * cells grown or cut in place (`app/open-cells-resize.js`: the same arrays,
+   * listed at the cells open now, an `obsp` graph's shape the open count), or
+   * the catalog completed after the first view with what the matrices'
+   * values tell (whether each holds counts: `app/main.js`
+   * `completePublishedMapping`). The mapping in use and what was found
+   * unusable stay; a choice made or restored is never changed by it.
+   *
+   * One default follows what the values tell: a matrix the mapping reads as
+   * log1p only because the file records `uns['log1p']` (the default, not
+   * chosen nor restored) whose stored values refute the record
+   * (`log1pRefuted`, `defaultLog1p`) is read as stored from then on, as a
+   * person setting Values to As stored would (`applyDataMapping`). A catalog
+   * that has not read the values (a resize's, before it is completed) never
+   * sets it back.
+   *
+   * @param {Object} candidates
+   */
+  adoptMappingCandidates(candidates) {
+    if (this.dataMapping === null) return;
+    if (candidates === null || candidates.kind !== ANNDATA_KIND) {
+      throw new TypeError('A data-mapping candidate catalog must be of kind "anndata".');
+    }
+    const before = this._mappingCandidates;
+    this._mappingCandidates = candidates;
+    const origin = this._mappingOrigin;
+    const refuted = (candidates.log1pRefuted ?? []).map(entry => entry.matrix).filter(matrix => Object.hasOwn(this.dataMapping.log1p, matrix));
+    if (refuted.length > 0 && (origin === 'default' || origin === 'best_guess') && before != null && sameJson(this.dataMapping.log1p, before.defaults.log1p)) {
+      const log1p = Object.fromEntries(Object.entries(this.dataMapping.log1p).filter(([matrix]) => !refuted.includes(matrix)));
+      void this.applyDataMapping({ ...this.dataMapping, log1p }, { origin }).catch(error => {
+        if (!isCancellation(error)) console.warn('[DataState] The expression matrices could not be read as stored:', error);
+      });
+    }
+    this.emit('mapping:choices-changed');
+  }
+
+  /**
+   * The matrices whose stored values refute the file's `uns['log1p']`, each
+   * read as stored for it (`log1pRefuted`: the matrix, the largest value
+   * read, its dtype and the cell total its log1p undone implies), while the
+   * mapping takes the default log1p; [] otherwise.
+   *
+   * @returns {Array<{matrix: string, value: number, dtype: string, total: number|null}>}
+   */
+  getLog1pRefuted() {
+    const candidates = this.getMappingCandidates();
+    if (candidates === null || this.dataMapping === null) return [];
+    return sameJson(this.dataMapping.log1p, candidates.defaults.log1p) ? (candidates.log1pRefuted ?? []) : [];
   }
 
   /**
@@ -226,6 +286,19 @@ export class DataStateMappingMethods {
         )
       );
     });
+  }
+
+  /**
+   * Why the dataset reads genes from `raw` rather than `X`
+   * (`defaultExpression`: `raw-more-genes`, `x-scaled`), while the mapping
+   * still reads the default matrix; null otherwise.
+   *
+   * @returns {string|null}
+   */
+  getExpressionReason() {
+    const candidates = this.getMappingCandidates();
+    if (candidates === null || this.dataMapping === null) return null;
+    return sameJson(this.dataMapping.expression, candidates.defaults.expression) ? (candidates.expressionReason ?? null) : null;
   }
 
   /**
@@ -553,10 +626,12 @@ export class DataStateMappingMethods {
    *
    * The transaction belongs to the dataset it was asked of. Once another
    * dataset (or none) is published, at any await, it stops with the
-   * superseded error (`createDatasetFieldLoadSupersededError`, an
-   * `AbortError`): nothing more is published, and nothing is rolled back,
+   * a `superseded` cancellation (`utils/abort.js`): nothing more is published, and nothing is rolled back,
    * because everything it would restore belonged to the dataset that is gone,
-   * and writing it now would land in the one that replaced it.
+   * and writing it now would land in the one that replaced it. It is work on
+   * the open cells: it starts after a change of them under way (a
+   * progressive opening's step), on the cells open then, and holds the next
+   * one until it ends.
    *
    * @param {Object} next - A DataMapping of the loaded dataset's kind.
    * @param {{origin: 'session'|'user'|'notebook'}} options
@@ -565,22 +640,54 @@ export class DataStateMappingMethods {
   async applyDataMapping(next, { origin }) {
     requireOrigin(origin);
     const canonical = validateDataMapping(next, { label: 'Requested data mapping' });
+    // The dataset it was asked of: one published meanwhile supersedes it.
+    const publication = this._mappingPublication;
+    const requirePublished = () => {
+      if (this._mappingPublication !== publication) throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
+    };
+    // The gene list shown is installed first (`var-axis.js`): a change
+    // replaces, and rolls back to, an installed list. A gene list that could
+    // not be read can still be replaced by another one.
+    await this.whenGenesListed().catch(error => {
+      if (error !== this.getGeneListFailure()) throw error;
+    });
+    requirePublished();
     const refusal = this.describeDataMappingRefusal(canonical);
     if (refusal !== null) throw new RangeError(refusal);
-    const generation = this.getDatasetGeneration();
-    const isCurrent = () => this.getDatasetGeneration() === generation;
-    const requireCurrent = () => {
-      if (!isCurrent()) throw createDatasetFieldLoadSupersededError();
-    };
 
-    while (this._mappingChangeLock) {
-      await this._mappingChangeLock;
+    // A change reads what the cells open now hold (positions, a gene list,
+    // a graph): it is work on the open cells (`data/open-cells-work.js`). It
+    // starts once no change of the open cells is under way (a progressive
+    // opening's step, which supersedes the loads of the cells before it),
+    // and the next one waits for it to end.
+    for (;;) {
+      while (this._mappingChangeLock) {
+        await this._mappingChangeLock;
+      }
+      const steady = cellsSteady();
+      if (steady === null) break;
+      await steady;
     }
-    requireCurrent();
+    requirePublished();
+    // From here no change of the open cells commits until this one ends:
+    // the generation names the dataset and the cells it reads.
+    const generation = this.getDatasetGeneration();
+    const requireCurrent = () => {
+      if (this.getDatasetGeneration() !== generation) throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
+    };
     let unlock = null;
     this._mappingChangeLock = new Promise(resolve => {
       unlock = resolve;
     });
+    return trackCellWork(this._applyLockedDataMapping(canonical, origin, requireCurrent, unlock));
+  }
+
+  /**
+   * The steps of `applyDataMapping`, holding its lock (released by `unlock`
+   * when they end).
+   * @private
+   */
+  async _applyLockedDataMapping(canonical, origin, requireCurrent, unlock) {
     const releases = [];
     try {
       const dimensionManager = this.dimensionManager;

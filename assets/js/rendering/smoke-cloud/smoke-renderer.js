@@ -142,49 +142,75 @@ function requireVector3(value, owner) {
 }
 
 /**
- * What a GPU density build read: the positions (published arrays are never
- * written), the parameters, and copies of the arrays a caller may rewrite in
- * place (colours, visibility, outlier quantiles), with the volume it made.
+ * What a GPU density build read, kept without a copy: the parameters, the
+ * arrays by weak reference (a later build reads the same arrays or another
+ * build is due; nothing here keeps a replaced array alive), and how many
+ * times their owner had handed the colours and the visibility out for
+ * writing (`options.writes`, from `getSmokeDensitySource`), so an array
+ * rewritten in place is told from the one built. Positions and outlier
+ * quantiles are never written once published. A build whose caller names no
+ * writes is never answered from the last.
  */
 export function captureSmokeInputs(positions, options, textureInfo, summary) {
   const visibility = options.visibility ?? null;
   return {
-    positions,
+    positions: referenceOf(positions),
     dimension: options.dimension,
     gridSize: options.gridSize,
     gamma: options.gamma,
-    colors: options.colors.slice(),
-    alpha: visibility === null ? null : visibility.alpha.slice(),
-    outlierQuantiles: visibility?.outlierQuantiles?.slice() ?? null,
+    colors: referenceOf(options.colors ?? null),
+    alpha: referenceOf(visibility?.alpha ?? null),
+    outlierQuantiles: referenceOf(visibility?.outlierQuantiles ?? null),
     outlierThreshold: visibility?.outlierThreshold ?? null,
+    layerColors: layerColorsKey(options),
+    writes: writesOf(options),
     textureInfo,
     summary,
   };
 }
 
-function sameBytes(a, b) {
-  if (a === null || b === null) return a === b;
-  if (a.constructor !== b.constructor || a.length !== b.length) return false;
-  const left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-  const right = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-  for (let index = 0; index < left.length; index++) {
-    if (left[index] !== right[index]) return false;
+/** The lower layers' colours a volume was built with, as one comparable string (a new background rebuilds it). */
+function layerColorsKey(options) {
+  const layerColors = options.layerColors ?? null;
+  return layerColors === null ? null : `${Array.from(layerColors.zero)}/${Array.from(layerColors.unread)}`;
+}
+
+function referenceOf(array) {
+  return array === null ? null : new WeakRef(array);
+}
+
+function isReferenceTo(reference, array) {
+  return reference === null ? array === null : array !== null && reference.deref() === array;
+}
+
+/** The caller's write counts of the colours and the visibility, or null. */
+function writesOf(options) {
+  const writes = options.writes ?? null;
+  if (writes === null) return null;
+  if (!Number.isSafeInteger(writes.colors) || !Number.isSafeInteger(writes.alpha)) {
+    throw new TypeError('Smoke density writes must count the colours and the visibility writes.');
   }
-  return true;
+  return { colors: writes.colors, alpha: writes.alpha };
 }
 
 /** Whether a build of `positions` and `options` would read exactly what `built` read. */
 export function sameSmokeInputs(built, positions, options) {
   const visibility = options.visibility ?? null;
+  const writes = writesOf(options);
   return (
-    built.positions === positions
+    writes !== null
+    && built.writes !== null
+    && built.writes.colors === writes.colors
+    && built.writes.alpha === writes.alpha
+    && isReferenceTo(built.positions, positions)
     && built.dimension === options.dimension
     && built.gridSize === options.gridSize
     && Object.is(built.gamma, options.gamma)
     && Object.is(built.outlierThreshold, visibility?.outlierThreshold ?? null)
-    && sameBytes(built.colors, options.colors ?? null)
-    && sameBytes(built.alpha, visibility?.alpha ?? null)
-    && sameBytes(built.outlierQuantiles, visibility?.outlierQuantiles ?? null)
+    && built.layerColors === layerColorsKey(options)
+    && isReferenceTo(built.colors, options.colors ?? null)
+    && isReferenceTo(built.alpha, visibility?.alpha ?? null)
+    && isReferenceTo(built.outlierQuantiles, visibility?.outlierQuantiles ?? null)
   );
 }
 
@@ -727,43 +753,9 @@ export class SmokeRenderer {
     this._assertMutableLifecycle('publish a volume');
     this._convergePendingDirectResources('Smoke volume publication');
     const gl = this.gl;
-    if (
-      volumeDesc === null ||
-      typeof volumeDesc !== 'object' ||
-      Array.isArray(volumeDesc) ||
-      Object.getPrototypeOf(volumeDesc) !== Object.prototype ||
-      Object.keys(volumeDesc).sort().join(',') !==
-        'boundsMax,boundsMin,data,gridSize'
-    ) {
-      throw new TypeError(
-        'SmokeRenderer volume descriptor must contain exactly boundsMax, boundsMin, data, and gridSize.'
-      );
-    }
-    if (!(volumeDesc.data instanceof Float32Array)) {
-      throw new TypeError('SmokeRenderer volume data must be a Float32Array.');
-    }
-    if (!Number.isInteger(volumeDesc.gridSize) || volumeDesc.gridSize < 8) {
-      throw new RangeError(
-        'SmokeRenderer volume gridSize must be an integer of at least 8.'
-      );
-    }
-    const boundsMin = requireVector3(
-      volumeDesc.boundsMin,
-      'SmokeRenderer boundsMin'
-    );
-    const boundsMax = requireVector3(
-      volumeDesc.boundsMax,
-      'SmokeRenderer boundsMax'
-    );
-    for (let axis = 0; axis < 3; axis++) {
-      if (boundsMin[axis] >= boundsMax[axis]) {
-        throw new RangeError(
-          `SmokeRenderer boundsMin[${axis}] must be smaller than boundsMax[${axis}].`
-        );
-      }
-    }
-
+    // Checks the record (`requireSmokeVolume`) before it allocates anything.
     const nextTextureInfo = createDensityTexture3D(gl, volumeDesc);
+    const { boundsMin, boundsMax } = volumeDesc;
     const previousTexture = this.textureInfo?.texture ?? null;
     this.textureInfo = nextTextureInfo;
     this._builtInputs = null;
@@ -794,6 +786,11 @@ export class SmokeRenderer {
     );
   }
 
+  /**
+   * Build the density volume of `positions`. `options` are the density
+   * builder's (`buildDensityTextureGPU`) and `writes`, the caller's write
+   * counts of the colours and the visibility (`captureSmokeInputs`).
+   */
   buildVolumeGPU(positions, options = {}) {
     this._assertMutableLifecycle('build a density volume');
     this._convergePendingDirectResources(
@@ -830,7 +827,9 @@ export class SmokeRenderer {
     let summary = null;
 
     try {
-      candidate = buildDensityTextureGPU(gl, positions, options);
+      const densityOptions = { ...options };
+      delete densityOptions.writes;
+      candidate = buildDensityTextureGPU(gl, positions, densityOptions);
       if (candidate === null) {
         const gridSize = Object.hasOwn(options, 'gridSize')
           ? options.gridSize
@@ -853,8 +852,6 @@ export class SmokeRenderer {
         if (
           typeof candidate !== 'object'
           || Array.isArray(candidate)
-          || Object.keys(candidate).sort().join(',') !==
-            'boundsMax,boundsMin,gridSize,is3D,texture'
           || !candidate.texture
           || !Number.isInteger(candidate.gridSize)
           || candidate.gridSize < 8

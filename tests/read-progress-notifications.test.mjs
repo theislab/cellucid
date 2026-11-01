@@ -1,7 +1,7 @@
 /**
- * Long AnnData reads are shown in one place: `showReadProgress` turns the
- * read activity the reader worker reports into progress notifications. A
- * gene index is one of those reads (kind `index`); nothing else shows it.
+ * The reads a person waits for that nothing else shows are one notification:
+ * `showReadProgress` turns the read activity the reader worker reports into
+ * one progress notification in plain words, gone when the reads end.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -32,8 +32,8 @@ function fakeNotifications() {
       calls.push(['progress', id, message, percent]);
       return id;
     },
-    updateProgress(id, percent, { message }) {
-      calls.push(['update', id, message, percent]);
+    updateProgress(id, percent, { message } = {}) {
+      if (message !== undefined) calls.push(['update', id, message, percent]);
     },
     complete(id, message) {
       calls.push(['complete', id, message]);
@@ -44,6 +44,10 @@ function fakeNotifications() {
     dismiss(id) {
       calls.push(['dismiss', id]);
     },
+    error(message) {
+      calls.push(['error', message]);
+    },
+    hasNotification: () => true,
   };
 }
 
@@ -56,42 +60,55 @@ const base = {
   detail: null,
 };
 
-test('a gene index is shown with its progress, from its first long report to its end', () => {
+test('the reads nothing else shows are one notification, in plain words, gone when they end', () => {
   const log = fakeLog();
   const notifications = fakeNotifications();
   const stop = showReadProgress({ log, notifications });
-  const index = { ...base, id: 7, kind: 'index', label: 'Sparse X index, indexed by gene' };
-  log.record({ ...index, status: 'running', elapsedMs: 100, progress: { done: 1, total: 10 } });
-  assert.deepEqual(notifications.calls, [], 'a read shorter than a moment is not shown');
-  log.record({ ...index, status: 'running', elapsedMs: 900, progress: { done: 5, total: 10 } });
-  log.record({ ...index, status: 'running', elapsedMs: 1400, progress: { done: 8, total: 10 } });
-  log.record({ ...index, status: 'done', elapsedMs: 2000, bytesFetched: 4096, progress: { done: 10, total: 10 } });
+  const field = { ...base, id: 7, kind: 'field', label: "obs['cell_type'] of x.h5ad", bytesTotal: 4000 };
+  const graph = { ...base, id: 8, kind: 'graph', label: "obsp['connectivities']", bytesTotal: 6000 };
+  log.record({ ...field, status: 'running', elapsedMs: 10, bytesFetched: 1000 });
+  log.record({ ...graph, status: 'running', elapsedMs: 10, bytesFetched: 1000 });
+  log.record({ ...field, status: 'running', elapsedMs: 900, bytesFetched: 3000, remainingMs: 2000 });
+  log.record({ ...field, status: 'done', elapsedMs: 1200, bytesFetched: 4000 });
+  log.record({ ...graph, status: 'done', elapsedMs: 1500, bytesFetched: 6000 });
   assert.deepEqual(notifications.calls.map(call => call.slice(0, 2)), [
     ['progress', 'n1'],
     ['update', 'n1'],
-    ['complete', 'n1'],
+    ['update', 'n1'],
+    ['update', 'n1'],
+    ['dismiss', 'n1'],
   ]);
-  assert.equal(notifications.calls[0][3], 50);
-  assert.equal(notifications.calls[1][3], 80);
-  assert.match(notifications.calls[0][2], /^Reading Sparse X index, indexed by gene: 50%/);
-  assert.match(notifications.calls[2][2], /4\.0 KB read/);
+  assert.match(notifications.calls[0][2], /^Reading field cell_type · \S+ B of \S+ KB$/);
+  assert.match(notifications.calls[1][2], /^Reading field cell_type and the neighbour graph · \S+ KB of \S+ KB$/);
+  assert.match(notifications.calls[2][2], /^Reading field cell_type and the neighbour graph · \S+ KB of \S+ KB · .*2 s left$/);
+  assert.match(notifications.calls[3][2], /^Reading the neighbour graph · /);
+  assert.ok(notifications.calls.every(call => !/obs\[|obsp\[/.test(call[2] ?? '')), 'the reader\'s words stay in the console');
   stop();
-  log.record({ ...index, id: 8, status: 'running', elapsedMs: 5000 });
-  assert.equal(notifications.calls.length, 3, 'nothing is shown once stopped');
+  log.record({ ...field, id: 9, status: 'running', elapsedMs: 5000 });
+  assert.equal(notifications.calls.length, 5, 'nothing is shown once stopped');
 });
 
-test('a cancelled read is dismissed, a failed one says why, opening is never shown here', () => {
+test('a failed read leaves the card to what asked for it; an opening, a growth step, a job and background work are never shown here', () => {
   const log = fakeLog();
   const notifications = fakeNotifications();
-  showReadProgress({ log, notifications });
+  showReadProgress({ log, notifications, opening: { shows: activity => activity.label === 'shown by the opening' } });
   const genes = { ...base, kind: 'genes', label: '12 genes of X' };
   log.record({ ...genes, id: 1, status: 'running', elapsedMs: 800 });
   log.record({ ...genes, id: 1, status: 'cancelled', elapsedMs: 900 });
   log.record({ ...genes, id: 2, status: 'running', elapsedMs: 800 });
   log.record({ ...genes, id: 2, status: 'failed', elapsedMs: 900, detail: 'HTTP 503' });
-  log.record({ ...base, id: 3, kind: 'open', label: 'the structure of x.h5ad', status: 'running', elapsedMs: 5000 });
-  assert.deepEqual(notifications.calls.map(call => call[0]), ['progress', 'dismiss', 'progress', 'fail']);
-  assert.match(notifications.calls[3][2], /12 genes of X could not be read: HTTP 503/);
+  for (const quiet of [
+    { kind: 'open', label: 'the structure of x.h5ad' },
+    { kind: 'embedding', label: 'shown by the opening' },
+    { kind: 'embedding', label: "obsm['X_umap'] columns 0, 1, open cells 100–200 (embedding, cells added)" },
+    { kind: 'analysis', label: 'genes for differential expression' },
+    { kind: 'index', label: 'Sparse X index, indexed by gene', background: true },
+  ]) {
+    log.record({ ...base, id: 3, ...quiet, status: 'running', elapsedMs: 5000 });
+  }
+  // The failure is the caller's to say (an opening's, a field's, a job's):
+  // here the card only goes, so it is never said twice.
+  assert.deepEqual(notifications.calls.map(call => call[0]), ['progress', 'dismiss', 'progress', 'dismiss']);
 });
 
 test('the reader worker posts no progress event of its own: activity is the one channel', () => {

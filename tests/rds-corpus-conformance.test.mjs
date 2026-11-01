@@ -96,3 +96,44 @@ test('the monthly drift check knows the slots of every class slots.R records, an
   assert.match(workflow, /schedule:\n\s+- cron: "[^"]+ 1 \* \*"/, 'monthly');
   assert.match(workflow, /sh scripts\/rds-corpus\/drift\.sh Rscript/);
 });
+
+test('an R file compressed with zstd reads as the same object, whatever its frames', async () => {
+  // R 4.5's saveRDS(compress = "zstd") writes the serialization through a
+  // zstd stream. The R builds at hand (the project's R 4.5.3 and
+  // conda-forge's) are built without zstd, so these files are R's own
+  // uncompressed files compressed with zstd itself (libzstd, through
+  // Node): a frame without its size (as a stream writes it), with a
+  // checksum, and two frames in a row (a writer flushing).
+  const { zstdCompressSync, constants } = await import('node:zlib');
+  const { decompressed, readInOrder } = await import('../assets/js/formats/rds/index.js');
+  for (const plain of ['seurat5_none.rds', 'sce_none.rds']) {
+    const bytes = await read(`rds/${plain}`);
+    const half = bytes.length >> 1;
+    const variants = {
+      streamed: zstdCompressSync(bytes, { params: { [constants.ZSTD_c_contentSizeFlag]: 0 } }),
+      checksummed: zstdCompressSync(bytes, { params: { [constants.ZSTD_c_checksumFlag]: 1, [constants.ZSTD_c_compressionLevel]: 19 } }),
+      'two frames': Buffer.concat([zstdCompressSync(bytes.subarray(0, half)), zstdCompressSync(bytes.subarray(half))]),
+    };
+    for (const [variant, compressed] of Object.entries(variants)) {
+      const zstd = new Uint8Array(compressed);
+      const file = { size: zstd.length, read: async (offset, length) => zstd.subarray(offset, offset + length) };
+      const { pieces, compressions } = await decompressed(readInOrder(file, { pieceBytes: 4099 }));
+      const parts = [];
+      for await (const piece of pieces) parts.push(piece);
+      assert.deepEqual(compressions, ['zstd'], `${plain}, ${variant}`);
+      assert.deepEqual(new Uint8Array(Buffer.concat(parts)), bytes, `${plain}, ${variant}: the uncompressed file's bytes`);
+    }
+    // The whole reader, as a file of the corpus: the uncompressed file's expected values.
+    const name = plain.replace('_none', '_zstd');
+    const zstd = new Uint8Array(variants.streamed);
+    const expected = await json(`rds/${plain}.expected.json`);
+    await checkCorpusEntry({ paths: [...paths, `rds/${name}`], read: async path => (path === `rds/${name}` ? zstd.slice() : read(path)) }, 'rds', name, expected);
+    // A stream cut inside its frame is refused as damaged, not read short.
+    const cut = zstd.subarray(0, zstd.length - 9);
+    const file = { size: cut.length, read: async (offset, length) => cut.subarray(offset, offset + length) };
+    await assert.rejects((async () => {
+      const { pieces } = await decompressed(readInOrder(file, { pieceBytes: 4099 }));
+      for await (const piece of pieces) void piece;
+    })(), /zstd stream is damaged/);
+  }
+});

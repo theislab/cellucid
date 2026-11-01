@@ -74,6 +74,7 @@
 
 import { attachPlotlyHints, hidePlotlyNativeHints } from './plotly-hints.js';
 import { announceIfUpdated } from '../../app-code.js';
+import { versionedAssetUrl } from '../../asset-url.js';
 import { applyThemeToAllPlots, getPlotTheme, invalidatePlotThemeCache } from '../shared/plot-theme.js';
 
 // Keep Plotly charts in sync with the active CSS theme.
@@ -180,9 +181,8 @@ export function loadPlotly() {
   // Start loading
   plotlyLoadPromise = new Promise((resolve, reject) => {
     const script = document.createElement('script');
-    // Resolved through the page's import map, so the URL names the bytes
-    // (index.html, CELLUCID_MODULE_VERSIONS).
-    script.src = import.meta.resolve('../../../../external/plotly.min.js');
+    // At the URL naming its bytes (index.html, CELLUCID_MODULE_VERSIONS).
+    script.src = versionedAssetUrl('external/plotly.min.js');
     script.async = true;
 
     script.onload = () => {

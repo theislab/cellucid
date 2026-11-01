@@ -11,6 +11,8 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
+import { REST_MS, TOUCH_HOLD_MS } from '../../assets/js/app/ui/modules/cell-info.js';
 
 const DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
@@ -87,6 +89,20 @@ function cameraMotion(page) {
   });
 }
 
+/**
+ * Outlast the card's own timer of `delayMs` (the pointer's rest, a held
+ * press), armed before this call, and the frame it asks for: a page timer
+ * of the same delay armed after it runs after it by deadline order however
+ * late a runner fires timers, and a frame asked for then comes after the
+ * card's lookup. Whatever the timer would show is shown by then.
+ */
+async function outlastCardTimer(page, delayMs) {
+  await page.evaluate(
+    milliseconds => new Promise(resolve => setTimeout(() => requestAnimationFrame(() => resolve()), milliseconds)),
+    delayMs,
+  );
+}
+
 async function enable(page) {
   await page.locator('#cell-info-toggle').check();
 }
@@ -101,7 +117,7 @@ test('cell info is on by default; unticked, a hover shows nothing', async ({ pag
   const cell = await findCell(page);
   await page.mouse.move(cell.x - 10, cell.y - 10);
   await page.mouse.move(cell.x, cell.y, { steps: 3 });
-  await page.waitForTimeout(300);
+  await outlastCardTimer(page, REST_MS);
   await expect(page.locator('#cell-info-card')).toBeHidden();
 });
 
@@ -390,36 +406,99 @@ test.describe('touch', () => {
     await openDataset(page);
     await enable(page);
     const cell = await findCell(page);
-    const touch = (type, pointerId) => page.evaluate(({ x, y, type: kind, id }) => {
-      document.getElementById('glcanvas').dispatchEvent(new PointerEvent(kind, {
-        bubbles: true,
-        cancelable: true,
-        pointerType: 'touch',
-        pointerId: id,
-        isPrimary: true,
-        clientX: x,
-        clientY: y,
-      }));
-    }, { x: cell.x, y: cell.y, type, id: pointerId });
+    // The touch events of `types`, in order, dispatched in one task.
+    const touch = (types, pointerId) => page.evaluate(({ x, y, kinds, id }) => {
+      for (const kind of kinds) {
+        document.getElementById('glcanvas').dispatchEvent(new PointerEvent(kind, {
+          bubbles: true,
+          cancelable: true,
+          pointerType: 'touch',
+          pointerId: id,
+          isPrimary: true,
+          clientX: x,
+          clientY: y,
+        }));
+      }
+    }, { x: cell.x, y: cell.y, kinds: types, id: pointerId });
     const card = page.locator('#cell-info-card');
 
-    // A quick tap: no card.
-    await touch('pointerdown', 11);
-    await touch('pointerup', 11);
-    await page.waitForTimeout(700);
+    // A quick tap (its press and release in one task, so no runner holds
+    // the finger down past the hold): no card.
+    await touch(['pointerdown', 'pointerup'], 11);
+    await outlastCardTimer(page, TOUCH_HOLD_MS);
     await expect(card).toBeHidden();
 
     // A held press: the card, which stays after the finger lifts.
-    await touch('pointerdown', 12);
+    await touch(['pointerdown'], 12);
     await expect(card).toBeVisible();
     await expect(card.locator('.cell-info-value')).toHaveText(await expectedLabel(page, cell));
-    await touch('pointerup', 12);
-    await page.waitForTimeout(300);
+    await touch(['pointerup'], 12);
+    await outlastCardTimer(page, TOUCH_HOLD_MS);
     await expect(card).toBeVisible();
 
     // The next touch takes it away.
-    await touch('pointerdown', 13);
+    await touch(['pointerdown'], 13);
     await expect(card).toBeHidden();
-    await touch('pointerup', 13);
+    await touch(['pointerup'], 13);
   });
+});
+
+test('on a view of 250,000 cells or more the lookup is built off the main thread; a hover before it lands says so, then names the cell', async ({ page }) => {
+  test.setTimeout(180_000);
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  // The card off while the cells open: a card that is on asks for a large
+  // pane's tree itself, once the page is idle (`prepareCellPicking`), and a
+  // check after the opening found it built already on a slow runner (Web
+  // contracts run 41292953076, Linux WebKit: the check of the box took
+  // 370 ms). Off, nothing asks for it.
+  await page.locator('#cell-info-toggle').uncheck();
+  await loadSyntheticDataset(page, { pointCount: 300_000, pattern: 'uniform' });
+  const hasTree = () => page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    return viewer.getHPRenderer().hasSpatialIndex(viewer.getViewDimension('live'));
+  });
+  expect(await hasTree()).toBe(false);
+  const box = await page.locator('#glcanvas').boundingBox();
+  const x = box.x + box.width * 0.6;
+  const y = box.y + box.height * 0.5;
+  // The card switched on and the pointer over the plot in one task: the
+  // lookup there is not ready, says so, and asks the worker for the tree;
+  // nothing builds it on the main thread. Every word the card shows from
+  // here on is recorded with whether the tree had landed.
+  const atOnce = await page.evaluate(([px, py]) => {
+    const viewer = window._cellucidViewer;
+    const treeBuilt = () => viewer.getHPRenderer().hasSpatialIndex(viewer.getViewDimension('live'));
+    const value = document.querySelector('#cell-info-card .cell-info-value');
+    window.__cardValues = [];
+    new MutationObserver(() => {
+      window.__cardValues.push({ text: value.textContent, tree: treeBuilt() });
+    }).observe(value, { childList: true, characterData: true, subtree: true });
+    document.getElementById('cell-info-toggle').click();
+    document.getElementById('glcanvas').dispatchEvent(new PointerEvent('pointermove', {
+      bubbles: true, clientX: px, clientY: py, pointerType: 'mouse', pointerId: 1, isPrimary: true,
+    }));
+    const record = viewer.pickReadyCellRecordAtScreen(px, py);
+    return {
+      enabled: document.getElementById('cell-info-toggle').checked,
+      preparing: record !== null && record.preparing instanceof Promise,
+      tree: treeBuilt(),
+    };
+  }, [x, y]);
+  expect(atOnce).toEqual({ enabled: true, preparing: true, tree: false });
+  await page.mouse.move(x - 10, y - 10);
+  await page.mouse.move(x, y, { steps: 3 });
+  const card = page.locator('#cell-info-card');
+  await expect.poll(hasTree, { timeout: 60_000 }).toBe(true);
+  await expect(card.locator('.cell-info-value')).not.toHaveText('Preparing cell lookup…', { timeout: 30_000 });
+  // Until the tree landed the card said only that the lookup was being
+  // prepared (whether a frame found it not landed yet is the worker's
+  // speed); then it named the cell.
+  const shown = await page.evaluate(() => window.__cardValues);
+  expect(shown.filter(entry => !entry.tree).map(entry => entry.text))
+    .toEqual(shown.filter(entry => !entry.tree).map(() => 'Preparing cell lookup…'));
+  const record = await page.evaluate(([px, py]) => window._cellucidViewer.pickReadyCellRecordAtScreen(px, py), [x, y]);
+  expect(record === null || Number.isInteger(record.cellIndex)).toBe(true);
+  if (record !== null) await expect(card).toBeVisible();
 });

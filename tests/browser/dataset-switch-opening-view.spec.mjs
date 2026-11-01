@@ -149,9 +149,11 @@ test('a file opened after a 3D dataset with a close-up preset opens on its own e
   // Scanpy's colours: `cell_type` opens in the palette its file stores.
   await page.locator('#categorical-field').selectOption('cell_type', { force: true });
   await expect.poll(() => page.evaluate(() => {
-    const field = window._cellucidState.getActiveField();
-    if (field?.key !== 'cell_type' || !Array.isArray(field._categoryColors)) return null;
-    return field._categoryColors.map(color => `#${color
+    const state = window._cellucidState;
+    const field = state.getActiveField();
+    if (field?.key !== 'cell_type') return null;
+    // Each category's colour as the state gives it (`getColorForCategory`).
+    return field.categories.map((_, index) => `#${state.getColorForCategory(field, index)
       .map(channel => Math.round(channel * 255).toString(16).padStart(2, '0'))
       .join('')}`);
   })).toEqual(CELL_TYPE_COLORS);

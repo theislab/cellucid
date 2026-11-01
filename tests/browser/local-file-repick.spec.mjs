@@ -22,6 +22,7 @@ import { createByteReader } from '../../assets/js/formats/io/byte-reader.js';
 import { bytesByteSource } from '../../assets/js/formats/io/byte-source.js';
 import { openZipArchive } from '../../assets/js/formats/zip/index.js';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { keptStoreDirectories as keptStores } from './helpers/origin-storage.mjs';
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const H5AD = path.join(FIXTURES, 'current-ui-smoke.h5ad');
@@ -41,30 +42,6 @@ async function start(page) {
   await openCollapsedPanels(page);
   await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
   return errors;
-}
-
-/**
- * The directories this origin keeps converted stores in, or null where the
- * engine gives the page no origin-private file system (the store is then
- * kept in memory).
- */
-async function keptStores(page) {
-  return page.evaluate(async () => {
-    let root;
-    try {
-      root = await navigator.storage.getDirectory();
-    } catch {
-      return null;
-    }
-    const names = [];
-    try {
-      const parent = await root.getDirectoryHandle('cellucid-transcoded');
-      for await (const [name] of parent.entries()) names.push(name);
-    } catch {
-      return [];
-    }
-    return names.sort();
-  });
 }
 
 /** How many distinct notifications said the file is ready. */

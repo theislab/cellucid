@@ -10,9 +10,9 @@
  * @module state-serializer/filters
  */
 
-import { defaultCategoryColor } from '../../data/palettes.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { makeFieldId } from '../utils/field-constants.js';
+import { formatCountOf } from '../../utils/format-units.js';
 import {
   assertArray,
   assertBoolean,
@@ -27,9 +27,14 @@ import {
   indexCategoryPositions,
   requireMethod,
 } from '../session/schema-contract.js';
-import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
+import { requireExactKeys, requireKeys, requirePlainRecord } from '../../utils/exact-record.js';
+import {
+  forgetPendingCategoryState,
+  holdPendingCategoryState
+} from '../state/managers/field/pending-categories.js';
+import { throwIfAborted, isCancellation, onAbort } from '../../utils/abort.js';
+import { categoryRgbAt, checkCategoryState, defaultCategoryColors, hiddenCategoryCount } from '../utils/category-state.js';
 
-const COLOR_EPSILON = 1e-4;
 const RANGE_EPSILON = 1e-6;
 // The outlier filter lives with categorical fields: latent outlier quantiles
 // are computed only for categoricals, and the filter manager
@@ -52,6 +57,13 @@ const CONTINUOUS_KEYS = [
   'useFilterColorRange',
   'colormapId'
 ];
+/**
+ * Keys a continuous entry may leave out, each meaning its default. The
+ * writer always writes them. `zeroGray` (gray for zero) came after sessions
+ * written by 0.9.6, which have no such key: absent, it is off, as it is on a
+ * freshly loaded field.
+ */
+const CONTINUOUS_OPTIONAL_KEYS = ['zeroGray'];
 
 /**
  * Every field property that carries user filter/colour intent.
@@ -79,10 +91,12 @@ const RESET_FIELD_FILTER_PROPERTIES = [
   '_continuousColorRange',
   '_continuousFilter',
   '_filterEnabled',
+  '_missingVisible',
   '_outlierFilterEnabled',
   '_outlierThreshold',
   '_useFilterColorRange',
-  '_useLogScale'
+  '_useLogScale',
+  '_zeroGray'
 ];
 
 /**
@@ -97,6 +111,7 @@ function resetFieldFilterState(field) {
   for (const property of RESET_FIELD_FILTER_PROPERTIES) {
     delete field[property];
   }
+  forgetPendingCategoryState(field);
 }
 
 function requireRestoreSignal(options) {
@@ -110,12 +125,6 @@ function requireRestoreSignal(options) {
   return signal;
 }
 
-function throwIfAborted(signal) {
-  if (signal?.aborted !== true) return;
-  if (signal.reason instanceof Error) throw signal.reason;
-  throw new DOMException('Filter restore was aborted.', 'AbortError');
-}
-
 function assertRgb(color, context) {
   if (!Array.isArray(color) || color.length !== 3) {
     throw new TypeError(`${context} must be an RGB triplet.`);
@@ -127,16 +136,6 @@ function assertRgb(color, context) {
     }
   }
   return color;
-}
-
-function colorsEqual(a, b) {
-  assertRgb(a, 'Field category color');
-  assertRgb(b, 'Default category color');
-  return (
-    Math.abs(a[0] - b[0]) < COLOR_EPSILON
-    && Math.abs(a[1] - b[1]) < COLOR_EPSILON
-    && Math.abs(a[2] - b[2]) < COLOR_EPSILON
-  );
 }
 
 function assertRange(value, context) {
@@ -176,6 +175,9 @@ function categoryNameAt(field, categoryIndex, context) {
   return assertCategoryPrimitive(field.categories[categoryIndex], context);
 }
 
+/** A saved category of a text or boolean column that no open cell holds. */
+const CATEGORY_NOT_OPEN = -1;
+
 /**
  * Resolve one saved category name to its position in the current field.
  *
@@ -186,6 +188,15 @@ function categoryNameAt(field, categoryIndex, context) {
  * name that is gone is refused by name rather than applied to whichever
  * category now sits at the old position.
  *
+ * A text or boolean column (`field.discovered`), or a categorical coded by
+ * the categories its open cells hold (a dictionary larger than the open
+ * cells and than one request, `storedCategoryCount`), has as categories the
+ * labels its open cells hold: a name it lacks belongs to cells that are not open
+ * (a published starting view on a subsample, a session that hid a category
+ * the cells it was saved on no longer hold), and is `CATEGORY_NOT_OPEN`,
+ * held until such cells open (`pending-categories.js`). A stored dictionary
+ * that lacks the name is another dataset.
+ *
  * @param {object} field
  * @param {Map<string|number|boolean, number>} positions - `indexCategoryPositions(field.categories)`
  * @param {string|number|boolean} categoryName
@@ -195,6 +206,7 @@ function categoryNameAt(field, categoryIndex, context) {
 function resolveCategoryIndex(field, positions, categoryName, context) {
   const categoryIndex = positions.get(categoryName);
   if (categoryIndex === undefined) {
+    if (field.discovered === true) return CATEGORY_NOT_OPEN;
     throw new RangeError(
       `${context} names the category ${describeCategory(categoryName)}, `
       + `which "${field.key}" no longer has.`
@@ -260,49 +272,47 @@ function changedOutlierThreshold(field) {
 }
 
 function serializeCategoryFilter(field) {
+  // Colours and visibility as `utils/category-state.js` holds them, checked.
+  if (field._categoryColors !== undefined || field._categoryVisible !== undefined) checkCategoryState(field);
   const visibility = [];
-  if (field._categoryVisible !== undefined) {
-    requirePlainRecord(field._categoryVisible, `Category visibility for "${field.key}"`);
-    for (const [rawIndex, visible] of Object.entries(field._categoryVisible)) {
-      if (!/^(0|[1-9]\d*)$/.test(rawIndex)) {
-        throw new TypeError(`Category visibility index "${rawIndex}" must be canonical.`);
-      }
-      assertBoolean(visible, `Category visibility "${field.key}"[${rawIndex}]`);
-      if (visible === false) {
-        const categoryIndex = Number(rawIndex);
-        visibility.push({
+  if (field._categoryVisible !== undefined && hiddenCategoryCount(field._categoryVisible) > 0) {
+    for (let categoryIndex = 0; categoryIndex < field._categoryVisible.length; categoryIndex++) {
+      if (field._categoryVisible[categoryIndex] === 1) continue;
+      visibility.push({
+        categoryIndex,
+        categoryName: categoryNameAt(
+          field,
           categoryIndex,
-          categoryName: categoryNameAt(
-            field,
-            categoryIndex,
-            `Category visibility index ${categoryIndex}`
-          ),
-          visible
-        });
-      }
+          `Category visibility index ${categoryIndex}`
+        ),
+        visible: false
+      });
     }
   }
-  visibility.sort((a, b) => a.categoryIndex - b.categoryIndex);
+  // The cells without a category, hidden by the legend's Missing row: the
+  // category named null, last.
+  if (field._missingVisible === false) {
+    visibility.push({ categoryIndex: null, categoryName: null, visible: false });
+  }
 
   const colors = [];
   if (field._categoryColors !== undefined) {
-    assertArray(field._categoryColors, `Category colors for "${field.key}"`);
-    for (let categoryIndex = 0; categoryIndex < field._categoryColors.length; categoryIndex++) {
-      const color = field._categoryColors[categoryIndex];
-      if (color === undefined || color === null) continue;
-      assertRgb(color, `Category color "${field.key}"[${categoryIndex}]`);
+    const defaults = defaultCategoryColors(field);
+    const colorsOf = field._categoryColors;
+    for (let categoryIndex = 0; categoryIndex < field.categories.length; categoryIndex++) {
       // The default is a function of position (the file's palette, else
       // Cellucid's), so "changed" is measured against the position the colour
-      // is currently at. Only the change itself is carried across a rewritten
-      // file, and it is carried by name.
-      if (!colorsEqual(color, defaultCategoryColor(field, categoryIndex))) {
+      // is currently at, as drawn (its bytes). Only the change itself is
+      // carried across a rewritten file, and it is carried by name.
+      const at = categoryIndex * 3;
+      if (colorsOf[at] !== defaults[at] || colorsOf[at + 1] !== defaults[at + 1] || colorsOf[at + 2] !== defaults[at + 2]) {
         colors.push({
           categoryName: categoryNameAt(
             field,
             categoryIndex,
             `Category color index ${categoryIndex}`
           ),
-          color: [...color]
+          color: categoryRgbAt(field._categoryColors, categoryIndex)
         });
       }
     }
@@ -391,6 +401,12 @@ function serializeContinuousFilter(field) {
       field._useFilterColorRange,
       false,
       `Continuous useFilterColorRange for "${field.key}"`
+    ),
+    // Gray for zero is off by default: only turning it on is a change.
+    zeroGray: explicitBooleanChange(
+      field._zeroGray,
+      true,
+      `Continuous zeroGray for "${field.key}"`
     ),
     colormapId: explicitNullableColormap(
       field._colormapId,
@@ -494,17 +510,23 @@ function validateCategoryEntry(entry, field, fieldId) {
 
   const visibilityIndices = new Set();
   const resolvedVisibility = [];
+  // Saved categories no open cell holds, by name (`CATEGORY_NOT_OPEN`).
+  const pending = { visibility: [], colors: [] };
+  const pendingNames = { visibility: new Set(), colors: new Set() };
   for (const change of entry.visibility) {
     requireExactKeys(
       change,
       ['categoryName', 'visible'],
       `Category filter "${fieldId}" visibility change`
     );
-    assertCategoryPrimitive(
-      change.categoryName,
-      `Category filter "${fieldId}" visibility categoryName`
-    );
-    const categoryIndex = positions === null
+    // null names the cells without a category (the legend's Missing row).
+    if (change.categoryName !== null) {
+      assertCategoryPrimitive(
+        change.categoryName,
+        `Category filter "${fieldId}" visibility categoryName`
+      );
+    }
+    const categoryIndex = positions === null || change.categoryName === null
       ? change.categoryName
       : resolveCategoryIndex(
         field,
@@ -512,13 +534,21 @@ function validateCategoryEntry(entry, field, fieldId) {
         change.categoryName,
         `Category filter "${fieldId}" visibility change`
       );
+    if (change.visible !== false) {
+      throw new TypeError(`Category filter "${fieldId}" visibility changes must be explicit false values.`);
+    }
+    if (categoryIndex === CATEGORY_NOT_OPEN) {
+      if (pendingNames.visibility.has(change.categoryName)) {
+        throw new TypeError(`Category filter "${fieldId}" repeats a visibility category.`);
+      }
+      pendingNames.visibility.add(change.categoryName);
+      pending.visibility.push({ categoryName: change.categoryName, visible: change.visible });
+      continue;
+    }
     if (visibilityIndices.has(categoryIndex)) {
       throw new TypeError(`Category filter "${fieldId}" repeats a visibility category.`);
     }
     visibilityIndices.add(categoryIndex);
-    if (change.visible !== false) {
-      throw new TypeError(`Category filter "${fieldId}" visibility changes must be explicit false values.`);
-    }
     resolvedVisibility.push({ categoryIndex, visible: change.visible });
   }
 
@@ -542,11 +572,19 @@ function validateCategoryEntry(entry, field, fieldId) {
         change.categoryName,
         `Category filter "${fieldId}" color change`
       );
+    assertRgb(change.color, `Category filter "${fieldId}" color`);
+    if (categoryIndex === CATEGORY_NOT_OPEN) {
+      if (pendingNames.colors.has(change.categoryName)) {
+        throw new TypeError(`Category filter "${fieldId}" repeats a color category.`);
+      }
+      pendingNames.colors.add(change.categoryName);
+      pending.colors.push({ categoryName: change.categoryName, color: change.color });
+      continue;
+    }
     if (colorIndices.has(categoryIndex)) {
       throw new TypeError(`Category filter "${fieldId}" repeats a color category.`);
     }
     colorIndices.add(categoryIndex);
-    assertRgb(change.color, `Category filter "${fieldId}" color`);
     resolvedColors.push({ categoryIndex, color: change.color });
   }
 
@@ -561,11 +599,11 @@ function validateCategoryEntry(entry, field, fieldId) {
     throw new TypeError(`Category filter "${fieldId}" must contain an explicit change.`);
   }
   if (positions === null) return null;
-  return { visibility: resolvedVisibility, colors: resolvedColors };
+  return { visibility: resolvedVisibility, colors: resolvedColors, pending };
 }
 
 function validateContinuousEntry(entry, fieldId) {
-  requireExactKeys(entry, CONTINUOUS_KEYS, `Continuous filter "${fieldId}"`);
+  requireKeys(entry, CONTINUOUS_KEYS, CONTINUOUS_OPTIONAL_KEYS, `Continuous filter "${fieldId}"`);
   if (entry.kind !== 'continuous') {
     throw new TypeError(`Continuous filter "${fieldId}" must declare kind "continuous".`);
   }
@@ -577,6 +615,7 @@ function validateContinuousEntry(entry, fieldId) {
     entry.useFilterColorRange,
     `Continuous filter "${fieldId}" useFilterColorRange`
   );
+  if (Object.hasOwn(entry, 'zeroGray')) assertNullableBoolean(entry.zeroGray, `Continuous filter "${fieldId}" zeroGray`);
   assertNullableString(entry.colormapId, `Continuous filter "${fieldId}" colormapId`);
   if (
     entry.filterEnabled === null
@@ -584,6 +623,7 @@ function validateContinuousEntry(entry, fieldId) {
     && entry.colorRange === null
     && entry.useLogScale === null
     && entry.useFilterColorRange === null
+    && (entry.zeroGray ?? null) === null
     && entry.colormapId === null
   ) {
     throw new TypeError(`Continuous filter "${fieldId}" must contain an explicit change.`);
@@ -678,14 +718,10 @@ export function createFilterSerializer({ state }) {
     throwIfAborted(signal);
 
     const loadController = new AbortController();
-    const forwardCallerAbort = () => {
+    const stopForwarding = onAbort(signal, () => {
       if (loadController.signal.aborted) return;
-      loadController.abort(signal?.reason);
-    };
-    if (signal !== null) {
-      signal.addEventListener('abort', forwardCallerAbort, { once: true });
-      if (signal.aborted) forwardCallerAbort();
-    }
+      loadController.abort(signal.reason);
+    });
     // Outlier thresholds whose quantiles could not be got: the rest of the
     // session is restored, and these are named, never dropped silently.
     const unrestoredOutliers = new Map();
@@ -721,7 +757,7 @@ export function createFilterSerializer({ state }) {
                 if (loadController.signal.aborted) throw error;
                 unrestoredOutliers.set(
                   fieldIndex,
-                  error?.name === 'AbortError'
+                  isCancellation(error)
                     ? 'computing its outlier quantiles was cancelled'
                     : (error?.message ?? String(error))
                 );
@@ -740,7 +776,7 @@ export function createFilterSerializer({ state }) {
         }
       }));
     } finally {
-      signal?.removeEventListener('abort', forwardCallerAbort);
+      stopForwarding();
     }
     throwIfAborted(signal);
     const loadFailures = [];
@@ -787,10 +823,11 @@ export function createFilterSerializer({ state }) {
     }
 
     if (actions.some(action => action.entry.kind === 'category')) {
-      requireMethod(state, 'setVisibilityForCategory', 'Category filter restore owner');
-      requireMethod(state, 'setColorForCategory', 'Category filter restore owner');
+      requireMethod(state, 'setCategoryStates', 'Category filter restore owner');
     }
 
+    /** @type {Array<{fieldKey: string, count: number}>} */
+    const categoriesNotOpen = [];
     state.beginBatch();
     try {
       // A session bundle is the complete field-filter state, not a patch: every
@@ -808,21 +845,24 @@ export function createFilterSerializer({ state }) {
       for (const { field, fieldIndex, source, entry, resolved } of actions) {
         throwIfAborted(signal);
         if (entry.kind === 'category') {
-          // Positions resolved from the saved names, never the saved positions.
+          // Positions resolved from the saved names, never the saved
+          // positions; every change of a field applied at once (each
+          // per-category array copied once, `utils/category-state.js`).
+          const visibility = [];
           for (const change of resolved.visibility) {
-            state.setVisibilityForCategory(
-              field,
-              change.categoryIndex,
-              change.visible
-            );
+            if (change.categoryIndex === null) {
+              requireMethod(state, 'setMissingCategoryVisibility', 'Missing-value filter restore owner');
+              state.setMissingCategoryVisibility(field, change.visible);
+              continue;
+            }
+            visibility.push({ index: change.categoryIndex, visible: change.visible });
           }
-          for (const change of resolved.colors) {
-            state.setColorForCategory(
-              field,
-              change.categoryIndex,
-              [...change.color]
-            );
-          }
+          const colors = resolved.colors.map(change => ({ index: change.categoryIndex, rgb: [...change.color] }));
+          if (visibility.length > 0 || colors.length > 0) state.setCategoryStates(field, { visibility, colors });
+          // Categories of a text or boolean column no open cell holds: held
+          // until cells holding them open (`pending-categories.js`).
+          const held = holdPendingCategoryState(field, resolved.pending);
+          if (held > 0) categoriesNotOpen.push({ fieldKey: field.key, count: held });
           if (entry.filterEnabled !== null) {
             field._categoryFilterEnabled = entry.filterEnabled;
           }
@@ -853,6 +893,10 @@ export function createFilterSerializer({ state }) {
         if (entry.useFilterColorRange !== null) {
           field._useFilterColorRange = entry.useFilterColorRange;
         }
+        // Absent (a session written by 0.9.6) or null: off, the default.
+        if ((entry.zeroGray ?? null) !== null) {
+          field._zeroGray = entry.zeroGray;
+        }
         if (entry.colormapId !== null) {
           field._colormapId = entry.colormapId;
         }
@@ -876,7 +920,15 @@ export function createFilterSerializer({ state }) {
         { category: 'session', duration: 0 }
       );
     }
-    return { restored: actions.length, outliersNotRestored };
+    for (const { fieldKey, count } of categoriesNotOpen) {
+      getNotificationCenter().info(
+        `${formatCountOf(count, 'category', 'categories')} of "${fieldKey}" in this session `
+        + `${count === 1 ? "isn't" : "aren't"} among the open cells; `
+        + `${count === 1 ? 'its settings apply' : 'their settings apply'} when those cells open.`,
+        { category: 'session' }
+      );
+    }
+    return { restored: actions.length, outliersNotRestored, categoriesNotOpen };
   }
 
   return {

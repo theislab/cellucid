@@ -5,6 +5,7 @@ import {
   requirePointTransparency,
 } from '../assets/js/rendering/alpha-visibility.js';
 import {
+  colorArrayWrites,
   markSnapshotPublishedColors,
   transparencyEpoch,
   writableCellVisibilityMask,
@@ -28,6 +29,7 @@ import {
   releaseInactiveFieldsOverBudget,
   touchFieldResidency,
 } from '../assets/js/app/state/managers/field/residency.js';
+import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
 /**
  * Memory ownership contract for the per-cell view arrays.
@@ -116,6 +118,17 @@ test('colors handed to a snapshot are frozen even when no other context holds th
   assert.deepEqual(Array.from(writable), [1, 2, 3, 255]);
 });
 
+test('every colours write is counted on the array written, a copy starting its own count', () => {
+  const state = twoViewState();
+  const shared = state.colorsArray;
+  const written = writableColors(state);
+  assert.notStrictEqual(written, shared, 'the kept view still holds the shared array');
+  assert.equal(colorArrayWrites(shared), 0);
+  assert.equal(colorArrayWrites(written), 1);
+  writableColors(state);
+  assert.equal(colorArrayWrites(written), 2);
+});
+
 test('every transparency write moves the transparency epoch', () => {
   const state = twoViewState();
   const before = transparencyEpoch(state);
@@ -131,8 +144,8 @@ test('filtering the live view leaves a kept view sharing its transparency untouc
     kind: 'category',
     categories: ['a', 'b'],
     codes,
-    _categoryColors: [[1, 0, 0], [0, 1, 0]],
-    _categoryVisible: { 0: true, 1: false },
+    _categoryColors: colorsOf([[1, 0, 0], [0, 1, 0]]),
+    _categoryVisible: visibleOf([true, false]),
     _categoryFilterEnabled: true,
   };
   const transparency = new Uint8Array(4).fill(1);
@@ -158,7 +171,6 @@ test('filtering the live view leaves a kept view sharing its transparency untouc
     cellVisibilityMask: mask,
     colorsArray: colors,
     ensureCategoryMetadata: DataStateColorMethods.prototype.ensureCategoryMetadata,
-    _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     isOutlierFilterEnabledForActiveField: () => false,
     _updateActiveCategoryCounts: () => false,
     _pushColorsToViewer() { pushes += 1; },
@@ -175,12 +187,11 @@ test('filtering the live view leaves a kept view sharing its transparency untouc
   assert.deepEqual(Array.from(state.categoryTransparency), [1, 0, 1, 0]);
   assert.notStrictEqual(state.categoryTransparency, transparency);
   assert.deepEqual(Array.from(kept.categoryTransparency), [1, 1, 1, 1]);
-  // The alpha bytes of the shared colors moved to a live copy, which the live
-  // viewer is handed because it holds the state's colors by reference.
-  assert.notStrictEqual(state.colorsArray, colors);
+  // A filter writes the transparency alone: the colors both views share are
+  // neither copied nor written, and nothing is republished for them.
+  assert.strictEqual(state.colorsArray, colors);
   assert.deepEqual(Array.from(colors), new Array(16).fill(255));
-  assert.equal(state.colorsArray[7], 0);
-  assert.equal(pushes, 1);
+  assert.equal(pushes, 0);
   // The kept view also still shares the untouched mask.
   assert.strictEqual(state.cellVisibilityMask, kept.cellVisibilityMask);
 });
@@ -221,7 +232,7 @@ function countingState() {
     kind: 'category',
     categories: ['a', 'b'],
     codes,
-    _categoryVisible: { 0: true, 1: true },
+    _categoryVisible: visibleOf([true, true]),
   };
   const state = Object.assign(Object.create(FieldSummaryMethods.prototype), {
     pointCount: 4,

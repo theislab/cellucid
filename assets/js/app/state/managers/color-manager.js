@@ -13,11 +13,11 @@ import {
   COLOR_PICKER_PALETTE,
   CONTINUOUS_COLORMAPS,
   DEFAULT_COLORMAP_ID,
-  defaultCategoryColor,
   getCssStopsForColormap
 } from '../../../data/palettes.js';
 import { NEUTRAL_GRAY_UINT8 } from '../core/constants.js';
 import { requireCategoryCodesInInventory } from './category-codes.js';
+import { checkCategoryState, labelsChecked, markLabelsChecked } from '../../utils/category-state.js';
 import {
   computeCentroidsForDimension,
   computeCentroidsForDimensionInSlices,
@@ -35,11 +35,11 @@ import {
 import { BaseManager } from '../core/base-manager.js';
 import { colorOutlierMethods } from './color-outliers.js';
 import {
-  recordAlphaBytesMirror,
-  writableColorAlphaBytes,
   writableColors,
 } from './per-cell-array-ownership.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
+import { BENEATH_ALPHA_BYTE } from '../../../rendering/alpha-visibility.js';
+import { isColumnForm } from '../../../data/column-forms.js';
 
 /**
  * One range scan per continuous values array.
@@ -74,6 +74,18 @@ function scanContinuousValues(values) {
   return scan;
 }
 
+/** A gene sample as a legend model carries it: its counts, or null. */
+function geneSampleOfLegend(sample) {
+  return sample === null ? null : Object.freeze({ cells: sample.cells, of: sample.of });
+}
+
+/** The legend's gray for zero (`updateLegendState`). */
+function zeroGrayOfLegend(field, stats, gene, scale) {
+  const applies = gene && stats.min >= 0;
+  const enabled = field._zeroGray === true;
+  return Object.freeze({ enabled, applies, drawn: applies && (scale === 'log' || enabled) });
+}
+
 function requireBoolean(value, context) {
   if (typeof value !== 'boolean') {
     throw new TypeError(`${context} must be exactly true or false.`);
@@ -81,6 +93,13 @@ function requireBoolean(value, context) {
   return value;
 }
 
+/**
+ * A continuous field as colours and statistics read it: its values a
+ * Float32Array or Float64Array (a field's own values always are,
+ * `field/loading.js`), or, for a gene shown on the cells read so far, the
+ * sparse form of those cells (`showPartialVarField`, `data/column-forms.js`):
+ * the colour kernels read either.
+ */
 function requireContinuousField(field) {
   if (
     field === null
@@ -93,6 +112,7 @@ function requireContinuousField(field) {
   if (
     !(field.values instanceof Float32Array)
     && !(field.values instanceof Float64Array)
+    && !isColumnForm(field.values)
   ) {
     throw new TypeError('Continuous field values must be a Float32Array or Float64Array.');
   }
@@ -133,22 +153,6 @@ function requireColormap(colormapId) {
   return colormap;
 }
 
-function requireRgb(color, context) {
-  if (!Array.isArray(color) || color.length !== 3) {
-    throw new TypeError(`${context} must be an RGB triplet.`);
-  }
-  for (let channel = 0; channel < color.length; channel++) {
-    if (
-      !Number.isFinite(color[channel])
-      || color[channel] < 0
-      || color[channel] > 1
-    ) {
-      throw new RangeError(`${context} channels must be finite values from 0 through 1.`);
-    }
-  }
-  return color;
-}
-
 function requireCategoryField(field) {
   if (
     field === null
@@ -160,6 +164,9 @@ function requireCategoryField(field) {
   ) {
     throw new TypeError('Category color operations require a nonempty category field.');
   }
+  // Checked once per list (`labelsChecked`): a list is replaced, or
+  // forgotten when a label is renamed in place.
+  if (labelsChecked(field.categories)) return field;
   const categories = new Set();
   for (let index = 0; index < field.categories.length; index++) {
     const category = field.categories[index];
@@ -177,14 +184,23 @@ function requireCategoryField(field) {
     }
     categories.add(category);
   }
+  markLabelsChecked(field.categories);
   return field;
 }
 
+/**
+ * The colour domain of a continuous field: its values' range, or the colour
+ * range when it follows the filter; on a log scale the positive part of it.
+ * A diverging colormap (RdBu, Seismic, …) on a linear scale whose domain
+ * spans 0 is centred there, `±max(|min|, |max|)`, so its neutral middle is
+ * 0 and not the midpoint of the range (`centered`).
+ */
 function computeContinuousDomain(field, meta, useLog) {
   const useFilterRange = field._useFilterColorRange;
   const baseDomain = useFilterRange ? meta.colorRange : meta.stats;
   let domainMin = baseDomain.min;
   let domainMax = baseDomain.max;
+  let centered = false;
 
   if (useLog) {
     const positive = meta.positiveStats;
@@ -201,13 +217,19 @@ function computeContinuousDomain(field, meta, useLog) {
       domainMin = positive.min;
       domainMax = positive.min;
     }
+  } else if (domainMin < 0 && domainMax > 0 && requireColormap(field._colormapId).diverging) {
+    const reach = Math.max(-domainMin, domainMax);
+    domainMin = -reach;
+    domainMax = reach;
+    centered = true;
   }
 
   return {
     min: domainMin,
     max: domainMax,
     scale: useLog ? 'log' : 'linear',
-    usingFilter: useFilterRange
+    usingFilter: useFilterRange,
+    centered
   };
 }
 
@@ -364,6 +386,14 @@ export class DataStateColorMethods {
       useLogScale = requireBoolean(field._useLogScale, 'Continuous log scale');
     }
 
+    // Gray for zero: off unless a person turned it on (`setContinuousZeroGray`).
+    let zeroGray;
+    if (field._zeroGray === undefined) {
+      zeroGray = false;
+    } else {
+      zeroGray = requireBoolean(field._zeroGray, 'Continuous gray for zero');
+    }
+
     const colormapId = field._colormapId === undefined
       ? DEFAULT_COLORMAP_ID
       : field._colormapId;
@@ -394,6 +424,7 @@ export class DataStateColorMethods {
     field._continuousColorRange = colorRange;
     field._positiveStats = positiveStats;
     field._useLogScale = useLogScale;
+    field._zeroGray = zeroGray;
     field._colormapId = colormapId;
     field._filterEnabled = filterEnabled;
 
@@ -411,123 +442,85 @@ export class DataStateColorMethods {
   }
 
   /**
-   * Write every cell's color for a continuous field: RGB from the field's
-   * colormap and domain, alpha from the current transparency, in one pass.
+   * Whether gray for zero (`_zeroGray`, the legend's switch) changes how
+   * `field` is drawn: a gene (`expression`) with no negative value. Data
+   * with negative values (scaled expression) has no such floor, nor has an
+   * obs field: a zero there is a value.
+   *
+   * @param {Object} field
+   * @param {boolean} expression
+   * @returns {boolean}
    */
-  updateColorsContinuous(field) {
-    const domain = this.getContinuousColorDomain(field);
+  _zeroGrayApplies(field, expression) {
+    return expression && this.ensureContinuousMetadata(field).stats.min >= 0;
+  }
+
+  /**
+   * Write every cell's color for a continuous field: RGB from the field's
+   * colormap and domain, opaque, in one pass (visibility is the
+   * transparency's alone).
+   *
+   * A gene's 0 is a value: by default it takes the colour scale's lowest
+   * colour, as every other value takes its own. With gray for zero on
+   * (`_zeroGray`, `setContinuousZeroGray`), a gene's cells that do not
+   * express it -- its zeros, most cells of most genes -- are drawn in the
+   * neutral no-value gray instead, beneath the coloured cells, so the
+   * colormap shows only where it is expressed. That floor is the gene's
+   * zero, from the data, never the colour range: a range moved up (to
+   * follow a filter of "≥ 1") clamps the cells at and below its minimum to
+   * the lowest colour, as scanpy's `vmin` does, so the expressing cells at
+   * the bound keep their colour. It applies to genes with no negative value
+   * only (`_zeroGrayApplies`). On a log scale a 0 has no logarithm and is
+   * gray either way.
+   *
+   * @param {Object} field
+   * @param {{expression?: boolean, readRows?: number|null}} [options] -
+   *   `expression`: the field is a gene's (default: the shown field is one);
+   *   `readRows`: its cells from there on are not read (a gene's cells read
+   *   so far), beside the gene sample's
+   */
+  updateColorsContinuous(field, { expression = this.activeFieldSource === 'var', readRows = null } = {}) {
+    const scale = this.getContinuousColorDomain(field);
+    // On a log scale the non-positive cells are gray already: no floor
+    // beyond that.
+    const floored = field._zeroGray === true && scale.scale === 'linear' && this._zeroGrayApplies(field, expression)
+      ? { ...scale, neutralAtOrBelow: 0 }
+      : scale;
+    // A gene read for a sample of the open cells has no value on the others
+    // (`getGeneSample`): they are drawn as not read, whatever the column
+    // holds there (a dense column cannot tell them from a missing value).
+    const sample = this._isGeneField(field) ? this.getGeneSample?.() ?? null : null;
+    const read = Math.min(sample === null ? this.pointCount : sample.cells, readRows ?? this.pointCount);
+    const domain = read === this.pointCount ? floored : { ...floored, readRows: read };
     const colormap = requireColormap(field._colormapId);
     const n = this.pointCount;
     if (
       !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
-      || !(this.categoryTransparency instanceof Uint8Array)
-      || this.categoryTransparency.length !== n
     ) {
-      throw new TypeError('Continuous coloring requires complete color and transparency buffers.');
+      throw new TypeError('Continuous coloring requires a complete color buffer.');
     }
     writeContinuousColors(
       writableColors(this),
       field.values,
-      this.categoryTransparency,
       domain,
       colormap
     );
   }
 
-  // Sync alpha from categoryTransparency to packed RGBA colorsArray
-  _syncColorsAlpha() {
-    const n = this.pointCount;
-    const alpha = this.categoryTransparency;
-    if (
-      !(this.colorsArray instanceof Uint8Array)
-      || this.colorsArray.length !== n * 4
-      || !(alpha instanceof Uint8Array)
-      || alpha.length !== n
-    ) {
-      throw new TypeError('Color alpha synchronization requires complete typed buffers.');
-    }
-    const published = this.colorsArray;
-    const colors = writableColorAlphaBytes(this);
-    for (let i = 0, j = 3; i < n; i++, j += 4) {
-      const value = alpha[i];
-      if (value > 1) {
-        throw new RangeError(`Transparency value ${i} must be exactly 0 or 1.`);
-      }
-      colors[j] = value * 255;
-    }
-    recordAlphaBytesMirror(colors, alpha);
-    if (colors !== published && String(this.activeViewId) === 'live') {
-      // The live viewer and renderer hold the state's colors by reference;
-      // a copy-on-write moved the state to a new array, so it is republished.
-      // A snapshot's renderer reads its alpha from its own R8 texture only.
-      this._pushColorsToViewer();
-    }
-  }
-
+  /**
+   * Make a categorical field's colours, visibility and filter switch where
+   * it has none (its default colours, every category shown, filtering on),
+   * and check them: each array once (`category-state.js`).
+   */
   ensureCategoryMetadata(field) {
     requireCategoryField(field);
-    const categories = field.categories;
-    const numCats = categories.length;
-    let categoryColors;
-    if (field._categoryColors === undefined) {
-      categoryColors = new Array(numCats);
-      for (let i = 0; i < numCats; i++) {
-        categoryColors[i] = defaultCategoryColor(field, i);
-      }
-    } else {
-      if (
-        !Array.isArray(field._categoryColors)
-        || field._categoryColors.length !== numCats
-      ) {
-        throw new TypeError('Category colors must contain one RGB triplet per category.');
-      }
-      for (let i = 0; i < numCats; i++) {
-        requireRgb(field._categoryColors[i], `Category color ${i}`);
-      }
-      categoryColors = field._categoryColors;
-    }
-
-    let categoryVisible;
-    if (field._categoryVisible === undefined) {
-      categoryVisible = {};
-      for (let i = 0; i < numCats; i++) {
-        categoryVisible[i] = true;
-      }
-    } else {
-      if (
-        field._categoryVisible === null
-        || typeof field._categoryVisible !== 'object'
-        || Array.isArray(field._categoryVisible)
-      ) {
-        throw new TypeError('Category visibility must be an indexed object.');
-      }
-      const visibilityKeys = Object.keys(field._categoryVisible);
-      if (
-        visibilityKeys.length !== numCats
-        || visibilityKeys.some((key, index) => key !== String(index))
-      ) {
-        throw new TypeError('Category visibility must contain every category index exactly once.');
-      }
-      for (let i = 0; i < numCats; i++) {
-        requireBoolean(field._categoryVisible[i], `Category visibility ${i}`);
-      }
-      categoryVisible = field._categoryVisible;
-    }
-
-    let categoryFilterEnabled;
+    checkCategoryState(field);
     if (field._categoryFilterEnabled === undefined) {
-      categoryFilterEnabled = true;
+      field._categoryFilterEnabled = true;
     } else {
-      categoryFilterEnabled = requireBoolean(
-        field._categoryFilterEnabled,
-        'Category filter enabled'
-      );
+      requireBoolean(field._categoryFilterEnabled, 'Category filter enabled');
     }
-
-    field._categoryColors = categoryColors;
-    field._categoryVisible = categoryVisible;
-    field._categoryFilterEnabled = categoryFilterEnabled;
   }
 
   updateColorsCategorical(field) {
@@ -552,12 +545,13 @@ export class DataStateColorMethods {
   }
 
   /**
-   * Write every cell's category color (hidden categories with alpha 0).
+   * Write every cell's category color (hidden categories in gray), opaque but
+   * for the missing value's grey, drawn beneath (`BENEATH_ALPHA_BYTE`).
    * Visibility is not written: every caller recomputes it next
-   * (`computeGlobalVisibility`), which publishes the transparency and the
-   * alpha bytes from the mask and every filter, so a transparency written
-   * here would be overwritten before anything read it (and would withdraw
-   * the visibility result the pass can reuse).
+   * (`computeGlobalVisibility`), which publishes the transparency from the
+   * mask and every filter, so a transparency written here would be
+   * overwritten before anything read it (and would withdraw the visibility
+   * result the pass can reuse).
    *
    * @param {object} field Category field with resolved colors and visibility.
    */
@@ -579,26 +573,24 @@ export class DataStateColorMethods {
     // holds the missing-value color.
     const rgbaBytes = new Uint8Array((numCats + 1) * 4);
     for (let code = 0; code <= numCats; code++) {
-      let r, g, b, alpha;
+      let r, g, b;
+      // A missing value's grey is drawn beneath the categorized cells.
+      let layer = 255;
       if (code === numCats) {
         r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
-        alpha = 1;
-      } else if (!catVisible[code]) {
+        layer = BENEATH_ALPHA_BYTE;
+      } else if (catVisible[code] === 0) {
         r = g = b = 128; // gray in uint8
-        alpha = 0;
       } else {
-        // Convert from 0-1 float to 0-255 uint8
-        const c = catColors[code];
-        r = Math.round(c[0] * 255);
-        g = Math.round(c[1] * 255);
-        b = Math.round(c[2] * 255);
-        alpha = 1;
+        r = catColors[code * 3];
+        g = catColors[code * 3 + 1];
+        b = catColors[code * 3 + 2];
       }
       const j = code * 4;
       rgbaBytes[j] = r;
       rgbaBytes[j + 1] = g;
       rgbaBytes[j + 2] = b;
-      rgbaBytes[j + 3] = alpha * 255;
+      rgbaBytes[j + 3] = layer;
     }
     // Byte-identical words in both views, so platform byte order is moot.
     const rgbaWords = new Uint32Array(rgbaBytes.buffer);
@@ -851,13 +843,17 @@ export class DataStateColorMethods {
 
     const viewKey = options.viewId;
     this.centroidCount = centroids.length;
-    const allowLabels = true;
+    // A label element a category only while the view shows labels
+    // (`_syncCentroidLabelsShown` makes them when they turn on): a field of a
+    // million categories made a million elements on every switch and
+    // filter, shown or not (7-11 s of the page at 10M cells).
+    const allowLabels = this.viewer?.getCentroidFlags?.(String(viewKey))?.labels === true;
 
     this.centroidPositions = new Float32Array(this.centroidCount * 3);
     this.centroidColors = new Uint8Array(this.centroidCount * 4); // RGBA uint8
 
     this.centroidLabels = [];
-    if (allowLabels && this.labelLayer) this._removeLabelsForView(viewKey);
+    if (this.labelLayer) this._removeLabelsForView(viewKey);
 
     // Pre-compute counts so centroids/labels respect visibility immediately
     // Only compute and save counts when building for the active view, as
@@ -884,12 +880,11 @@ export class DataStateColorMethods {
       this.centroidPositions[3 * i + 2] = nativeDim >= 3 ? pos[2] : 0;
 
       const idx = catIndexByName.get(c.category);
-      const color = catColors[idx];
-      // Convert float 0-1 to uint8 0-255, RGBA format
+      // RGBA bytes: the category's colour, opaque.
       const colBase = i * 4;
-      this.centroidColors[colBase] = Math.round(color[0] * 255);
-      this.centroidColors[colBase + 1] = Math.round(color[1] * 255);
-      this.centroidColors[colBase + 2] = Math.round(color[2] * 255);
+      this.centroidColors[colBase] = catColors[idx * 3];
+      this.centroidColors[colBase + 1] = catColors[idx * 3 + 1];
+      this.centroidColors[colBase + 2] = catColors[idx * 3 + 2];
       this.centroidColors[colBase + 3] = 255; // full alpha
 
       // Store 3D position for labels
@@ -913,6 +908,15 @@ export class DataStateColorMethods {
     }
   }
 
+  /** Whether `field` is a gene: one of the var fields of the state or of a kept view. @private */
+  _isGeneField(field) {
+    if ((this.varData?.fields ?? []).includes(field)) return true;
+    for (const context of this.viewContexts?.values?.() ?? []) {
+      if ((context?.varData?.fields ?? []).includes(field)) return true;
+    }
+    return false;
+  }
+
   updateLegendState(field) {
     if (
       field === null
@@ -931,6 +935,9 @@ export class DataStateColorMethods {
       return {
         kind: 'continuous',
         stats: meta.stats,
+        // The smallest and largest positive values: a log scale's domain,
+        // and the range a log-spaced filter slider covers.
+        positiveStats: meta.positiveStats,
         filter: meta.filter,
         scale: colorDomain.scale,
         logEnabled: field._useLogScale === true,
@@ -943,8 +950,17 @@ export class DataStateColorMethods {
           min: colorbarMin,
           max: colorbarMax,
           usingFilter: colorDomain.usingFilter,
-          scale: colorDomain.scale
-        }
+          scale: colorDomain.scale,
+          centered: colorDomain.centered
+        },
+        // A gene read for a sample of the open cells (`field/gene-sample.js`):
+        // the others are gray, not read; a legend (and a figure's) says so.
+        geneSample: this._isGeneField(field) ? geneSampleOfLegend(this.getGeneSample?.() ?? null) : null,
+        // Gray for zero: the switch (`enabled`), whether it changes this
+        // field (`applies`: a gene with no negative value), and whether its
+        // zeros are drawn gray now (`drawn`: the switch on a linear scale,
+        // or a log scale, where 0 has no logarithm).
+        zeroGray: zeroGrayOfLegend(field, meta.stats, this._isGeneField(field), colorDomain.scale)
       };
     }
     this.ensureCategoryMetadata(field);
@@ -1036,6 +1052,26 @@ export class DataStateColorMethods {
     const meta = this.ensureContinuousMetadata(field);
     if (enabled) computeContinuousDomain(field, meta, true);
     field._useLogScale = enabled;
+    this.updateColorsContinuous(field);
+    this._pushColorsToViewer();
+    this._syncActiveContext();
+  }
+
+  /**
+   * Gray for zero on or off for a continuous field (the legend's switch):
+   * on, a gene's zeros are drawn in the theme's gray beneath the expressing
+   * cells; off (the default), in the colour scale's lowest colour
+   * (`updateColorsContinuous`).
+   *
+   * @param {number} fieldIndex
+   * @param {boolean} enabled
+   */
+  setContinuousZeroGray(fieldIndex, enabled) {
+    const { field } = this.getContinuousFieldRef(fieldIndex);
+    requireContinuousField(field);
+    requireBoolean(enabled, 'Continuous gray for zero');
+    this.ensureContinuousMetadata(field);
+    field._zeroGray = enabled;
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();

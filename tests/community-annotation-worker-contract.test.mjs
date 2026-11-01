@@ -90,10 +90,11 @@ test('worker exposes only the exact current route inventory', async () => {
   assert.deepEqual(await responseJson(response), {
     status: 'ok',
     service: 'Cellucid GitHub Auth',
-    contractVersion: 1,
+    contractVersion: 2,
     endpoints: [
       '/auth/login',
       '/auth/callback',
+      '/auth/revoke',
       '/auth/user',
       '/auth/installations',
       '/auth/installation-repos',
@@ -329,6 +330,9 @@ test('OAuth flows own independent cookies in both callback orders', async () => 
     return new Response(
       JSON.stringify({
         access_token: `oauth-token-${body.code}`,
+        expires_in: 28_800,
+        refresh_token: 'refresh-token',
+        refresh_token_expires_in: 15_897_600,
         scope: '',
         token_type: 'bearer',
       }),
@@ -415,6 +419,9 @@ test('OAuth denial and success flows remain isolated in both orders', async () =
     return new Response(
       JSON.stringify({
         access_token: `oauth-token-${body.code}`,
+        expires_in: 28_800,
+        refresh_token: 'refresh-token',
+        refresh_token_expires_in: 15_897_600,
         scope: '',
         token_type: 'bearer',
       }),
@@ -699,11 +706,10 @@ test('OAuth owner corruption expiry replay and upstream failure are target-isola
           'GitHub sign-in outcome is unknown. Start a new sign-in; do not retry this callback.',
         fetch: async () =>
           new Response(
+            // A token that never expires: a GitHub App without "Expire user
+            // authorization tokens" is refused.
             JSON.stringify({
               access_token: 'oauth-token',
-              expires_in: 28_800,
-              refresh_token: 'refresh-token',
-              refresh_token_expires_in: 15_897_600,
               scope: '',
               token_type: 'bearer',
             }),
@@ -730,6 +736,9 @@ test('OAuth owner corruption expiry replay and upstream failure are target-isola
         return new Response(
           JSON.stringify({
             access_token: `oauth-token-${body.code}`,
+            expires_in: 28_800,
+            refresh_token: 'refresh-token',
+            refresh_token_expires_in: 15_897_600,
             scope: '',
             token_type: 'bearer',
           }),
@@ -900,6 +909,9 @@ test('OAuth state and callback token exchange use one exact flow', async () => {
     return new Response(
       JSON.stringify({
         access_token: 'oauth-token',
+        expires_in: 28_800,
+        refresh_token: 'refresh-token',
+        refresh_token_expires_in: 15_897_600,
         scope: '',
         token_type: 'bearer',
       }),
@@ -930,11 +942,14 @@ test('OAuth state and callback token exchange use one exact flow', async () => {
     assert.equal(
       appLocation.hash,
       '#x=%2f&x=%2F&space=%20&bare&tail=%FF' +
-        '&cellucid_github_auth=1&cellucid_github_token=oauth-token'
+        '&cellucid_github_auth=1&cellucid_github_token=oauth-token' +
+        '&cellucid_github_token_expires_in=28800'
     );
     const fragment = new URLSearchParams(appLocation.hash.slice(1));
     assert.equal(fragment.get('cellucid_github_auth'), '1');
     assert.equal(fragment.get('cellucid_github_token'), 'oauth-token');
+    assert.equal(fragment.get('cellucid_github_token_expires_in'), '28800');
+    assert.doesNotMatch(appLocation.hash, /refresh/, 'the refresh token never leaves the worker');
     assert.equal(fragment.get('cellucid_github_error'), null);
     assert.equal(
       `${appLocation.origin}${appLocation.pathname}${appLocation.search}`,
@@ -1049,7 +1064,7 @@ test('OAuth redirect preserves a sole empty fragment component', async () => {
   );
 });
 
-test('OAuth rejects expiring token documents required by a misconfigured GitHub App', async () => {
+test('OAuth refuses a token that never expires (a GitHub App without token expiration)', async () => {
   const login = await worker.fetch(
     request(
       '/auth/login?return_to=' +
@@ -1068,9 +1083,6 @@ test('OAuth rejects expiring token documents required by a misconfigured GitHub 
     new Response(
       JSON.stringify({
         access_token: 'oauth-token',
-        expires_in: 28_800,
-        refresh_token: 'refresh-token',
-        refresh_token_expires_in: 15_897_600,
         scope: '',
         token_type: 'bearer',
       }),
@@ -2026,6 +2038,63 @@ test('GitHub fork listing accepts only newest-first bounded pages', async () => 
       assert.equal(rejected.status, 400);
     }
     assert.equal(upstreamUrls.length, 1);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('Sign out revokes the token at GitHub with the app\'s own credentials; the token never reaches the page again', async () => {
+  const previousFetch = globalThis.fetch;
+  const asked = [];
+  let answer = 204;
+  globalThis.fetch = async (url, options) => {
+    asked.push({ url: String(url), options });
+    return new Response(null, { status: answer });
+  };
+  try {
+    const revoke = () => worker.fetch(
+      request('/auth/revoke', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer user-token', Origin: 'https://app.example' },
+      }),
+      ENV
+    );
+    const response = await revoke();
+    assert.equal(response.status, 204);
+    assert.equal(response.headers.get('access-control-allow-origin'), 'https://app.example');
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(await response.text(), '');
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].url, 'https://api.github.com/applications/client-id/token');
+    assert.equal(asked[0].options.method, 'DELETE');
+    assert.equal(asked[0].options.headers.Authorization, `Basic ${btoa('client-id:client-secret')}`);
+    assert.deepEqual(parseExactJson(asked[0].options.body), { access_token: 'user-token' });
+
+    // A token GitHub no longer knows (expired, revoked already) is gone too.
+    for (const status of [404, 422]) {
+      answer = status;
+      assert.equal((await revoke()).status, 204, `HTTP ${status}`);
+    }
+    answer = 500;
+    assert.equal((await revoke()).status, 502);
+
+    // No token, or another origin: nothing is asked of GitHub.
+    const before = asked.length;
+    const anonymous = await worker.fetch(
+      request('/auth/revoke', { method: 'POST', headers: { Origin: 'https://app.example' } }),
+      ENV
+    );
+    assert.equal(anonymous.status, 401);
+    const foreign = await worker.fetch(
+      request('/auth/revoke', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer user-token', Origin: 'https://attacker.example' },
+      }),
+      ENV
+    );
+    assert.equal(foreign.status, 403);
+    assert.equal((await worker.fetch(request('/auth/revoke', { method: 'GET' }), ENV)).status, 405);
+    assert.equal(asked.length, before);
   } finally {
     globalThis.fetch = previousFetch;
   }

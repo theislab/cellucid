@@ -777,8 +777,13 @@ export class DataSourceManager {
             );
           }
           source.disconnect();
-        } else if (typeof source.onDeactivate === 'function') {
-          source.onDeactivate();
+        } else {
+          if (typeof source.onDeactivate === 'function') source.onDeactivate();
+          // One rule for every source: a dataset no longer shown keeps only
+          // what opens it again (its file, its link, its cells). Its reader
+          // closes; its next read reopens it (`AnnDataFileSource.suspend`).
+          const shown = publication.previousDatasetId === null ? null : source.getAnnDataSource?.(publication.previousDatasetId) ?? null;
+          shown?.suspend();
         }
       } catch (error) {
         errors.push(error);
@@ -1019,6 +1024,27 @@ export class DataSourceManager {
       sessionUrl: sourceDescriptor.sessionUrl,
       sourceType,
     };
+  }
+
+  /**
+   * The dataset shown, its cells grown or cut in place
+   * (`app/open-cells-resize.js`): the same dataset of the same source, its
+   * metadata (cell count) as the source now states it. A new selection
+   * revision, since what was derived from the earlier cells (marker caches)
+   * no longer holds.
+   *
+   * @param {DatasetMetadata} metadata
+   */
+  adoptResizedMetadata(metadata) {
+    if (!this.activeSource || !this.activeDatasetId) {
+      throw new Error('No dataset is shown to resize.');
+    }
+    validateDatasetIdentity(metadata, this.activeDatasetId, readSourceType(this.activeSource, 'Active data source'));
+    if (metadata.id !== this.activeIdentityId) {
+      throw new Error(`A dataset resized in place keeps its identity "${this.activeIdentityId}", not "${metadata.id}".`);
+    }
+    this.activeDatasetMetadata = metadata;
+    this._selectionRevision += 1;
   }
 
   /**

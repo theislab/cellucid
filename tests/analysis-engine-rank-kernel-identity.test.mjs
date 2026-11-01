@@ -134,6 +134,13 @@ function referenceMannWhitneyU(group1, group2) {
   return { statistic, pValue, pValueMethod, u1, u2 };
 }
 
+/** Within `tolerance` of `expected`, relative to its size or to `floor`, whichever is larger. */
+function assertRelative(actual, expected, tolerance, label, floor = Number.MIN_VALUE) {
+  if (Object.is(actual, expected)) return;
+  const relative = Math.abs(actual - expected) / Math.max(Math.abs(expected), floor);
+  assert.ok(relative <= tolerance, `${label}: ${actual} vs ${expected} (relative ${relative})`);
+}
+
 /** Welch moments by definition: sample mean, then sample variance about it. */
 function referenceMoments(values) {
   const n = values.length;
@@ -310,13 +317,12 @@ test('sample moments equal the two-pass definition and drive Welch unchanged', (
       referenceA.mean, referenceA.variance, n1,
       referenceMoments(group2).mean, referenceMoments(group2).variance, n2
     );
+    // welchTTest subtracts the means less one pivot (the first value, audit
+    // NS-14): the definition's numbers to their last bits.
     const actual = welchTTest(group1, group2);
-    for (const key of ['statistic', 'pValue', 'df']) {
-      assert.ok(
-        Object.is(actual[key], expected[key]),
-        `trial ${trial} welch ${key}: ${actual[key]} !== ${expected[key]}`
-      );
-    }
+    assertRelative(actual.statistic, expected.statistic, 1e-12, `trial ${trial} welch statistic`, 1);
+    assertRelative(actual.df, expected.df, 1e-12, `trial ${trial} welch df`);
+    assertRelative(actual.pValue, expected.pValue, 1e-9, `trial ${trial} welch p`);
     assert.ok(Object.is(momentsB.mean, referenceMoments(group2).mean));
   }
 
@@ -337,9 +343,10 @@ test("Welch's t-test wrapper reports the same statistic, p and Cohen's d", () =>
       referenceA.mean, referenceA.variance, group1.length,
       referenceB.mean, referenceB.variance, group2.length
     );
-    assert.ok(Object.is(displayed.statistic, core.statistic), `trial ${trial} t`);
-    assert.ok(Object.is(displayed.pValue, core.pValue), `trial ${trial} p`);
-    assert.ok(Object.is(displayed.df, core.df), `trial ${trial} df`);
+    // The wrapper subtracts the means less one pivot (audit NS-14).
+    assertRelative(displayed.statistic, core.statistic, 1e-12, `trial ${trial} t`, 1);
+    assertRelative(displayed.pValue, core.pValue, 1e-9, `trial ${trial} p`);
+    assertRelative(displayed.df, core.df, 1e-12, `trial ${trial} df`);
 
     const n1 = group1.length;
     const n2 = group2.length;
@@ -349,7 +356,8 @@ test("Welch's t-test wrapper reports the same statistic, p and Cohen's d", () =>
     const expectedD = pooledStd > 0
       ? (referenceA.mean - referenceB.mean) / pooledStd
       : (referenceA.mean === referenceB.mean ? 0 : null);
-    assert.ok(Object.is(displayed.effectSize, expectedD), `trial ${trial} cohen d`);
+    if (expectedD === null) assert.equal(displayed.effectSize, null, `trial ${trial} cohen d`);
+    else assertRelative(displayed.effectSize, expectedD, 1e-12, `trial ${trial} cohen d`, 1);
   }
 });
 
@@ -471,11 +479,16 @@ test('differential expression reports the same numbers through the operation han
             referenceA.mean, referenceA.variance, groupAValues.length,
             referenceB.mean, referenceB.variance, groupBValues.length
           );
-      assert.ok(Object.is(result.pValue, expected.pValue), `trial ${trial} ${method} p`);
-      assert.ok(
-        Object.is(result.statistic, expected.statistic),
-        `trial ${trial} ${method} statistic`
-      );
+      if (method === 'wilcox') {
+        assert.ok(Object.is(result.pValue, expected.pValue), `trial ${trial} ${method} p`);
+        assert.ok(Object.is(result.statistic, expected.statistic), `trial ${trial} ${method} statistic`);
+      } else {
+        // Welch's sums of squares add the zeros' terms in one product (O(nnz),
+        // audit NS-2): t to its last bits; p through the incomplete beta,
+        // whose continued fraction stops within 1e-10.
+        assertRelative(result.statistic, expected.statistic, 1e-12, `trial ${trial} ${method} statistic`);
+        assertRelative(result.pValue, expected.pValue, 1e-9, `trial ${trial} ${method} p`);
+      }
       assert.equal(result.nA, groupAValues.length);
       assert.equal(result.nB, groupBValues.length);
     }
@@ -632,6 +645,8 @@ test('signature median scores and their statistics equal the sort-based definiti
   analysis.dataLayer = {
     state: { pointCount },
     readGeneColumns: async () => columns,
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells: pageIds => pageIds.map(pageId => ({ pageId, pageName: 'Page A', cellIndices })),
     performCacheCleanup() {},
   };

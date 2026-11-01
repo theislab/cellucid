@@ -15,6 +15,13 @@
  *   dataset's filter pipeline, the chunk's filter mask, its decoded size and
  *   what it is for messages (`hdf5/filters.js`).
  *
+ * A message may name decoders (`choices`, by key: `decoder-choice.js`) for
+ * a family with several. With `check`, its first chunk is also
+ * decoded with each family's reference decoder and the bytes compared; a
+ * named decoder that gives other bytes, or throws where the reference
+ * decodes, is reported (`dropped`, its keys) and the reference's bytes are
+ * used.
+ *
  * Work on decoded values (`runOnDecodeWorker`) is `{id, kind: 'run', module,
  * name, args, context}`: the reply is `{id, output}`, `output` the value the
  * module's function returned, every typed array in it transferred. A context
@@ -26,13 +33,56 @@
 
 import { decodeWithCodecs } from '../zarr/codecs/pipeline.js';
 import { unfilter } from '../hdf5/filters.js';
-import { errorData } from './decode-pool.js';
+import { toWire } from '../../utils/error-wire.js';
+import { DECODERS, familyOfKey } from './decoder-choice.js';
 
 /** @param {{kind: string, description: Object, input: Uint8Array}} task */
-function decode({ kind, description, input }) {
-  if (kind === 'zarr') return decodeWithCodecs(input, description.codecs, description.sizes);
-  if (kind === 'hdf5') return unfilter(input, description.filters, description.mask, description.chunkBytes, description.label);
+function decode({ kind, description, input }, choices) {
+  if (kind === 'zarr') return decodeWithCodecs(input, description.codecs, description.sizes, choices);
+  if (kind === 'hdf5') return unfilter(input, description.filters, description.mask, description.chunkBytes, description.label, choices);
   throw new TypeError(`A decode worker cannot decode '${kind}' chunks.`);
+}
+
+/** `choices` with every key's family reference decoder in its place, or null when they are those already. */
+function referenceOf(choices) {
+  if (choices === null || choices === undefined) return null;
+  let differs = false;
+  const reference = {};
+  for (const [key, decoder] of Object.entries(choices)) {
+    reference[key] = DECODERS[familyOfKey(key)]?.[0] ?? decoder;
+    differs ||= reference[key] !== decoder;
+  }
+  return differs ? reference : null;
+}
+
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Decode one task with the decoders `choices` names: a decoder that throws
+ * where the reference decodes, or (with `check`) gives other bytes, has its
+ * keys added to `dropped`, and the reference's bytes are returned.
+ */
+async function decodeChosen(task, choices, check, dropped) {
+  const reference = referenceOf(choices);
+  if (reference === null) return decode(task, choices);
+  let output;
+  try {
+    output = await decode(task, choices);
+  } catch (error) {
+    // The reference's own error, when it fails too, is the chunk's.
+    const referenceBytes = await decode(task, reference);
+    for (const key of Object.keys(choices)) if (choices[key] !== reference[key]) dropped.add(key);
+    return referenceBytes;
+  }
+  if (!check) return output;
+  const expected = await decode(task, reference);
+  if (sameBytes(output, expected)) return output;
+  for (const key of Object.keys(choices)) if (choices[key] !== reference[key]) dropped.add(key);
+  return expected;
 }
 
 /** Contexts of work tasks, by key. */
@@ -73,32 +123,34 @@ self.addEventListener('message', async event => {
       const output = await run(task);
       self.postMessage({ id: task.id, output }, [...transferablesOf(output)]);
     } catch (error) {
-      self.postMessage({ id: task.id, error: errorData(error) });
+      self.postMessage({ id: task.id, error: toWire(error) });
     }
     return;
   }
+  const choices = task.choices ?? null;
+  const dropped = new Set();
   if (Array.isArray(task.items)) {
     const transfer = [];
-    const results = await Promise.all(task.items.map(async item => {
+    const results = await Promise.all(task.items.map(async (item, index) => {
       try {
-        const output = await decode({ ...item, input: task.input.subarray(item.start, item.end) });
+        const output = await decodeChosen({ ...item, input: task.input.subarray(item.start, item.end) }, choices, task.check === true && index === 0, dropped);
         // A view of the shared input cannot go back alone: it is copied out.
         const own = output.buffer === task.input.buffer ? output.slice() : output;
         transfer.push(own.buffer);
         return { output: own };
       } catch (error) {
-        return { error: errorData(error) };
+        return { error: toWire(error) };
       }
     }));
-    self.postMessage({ id: task.id, results }, transfer);
+    self.postMessage({ id: task.id, results, dropped: [...dropped] }, transfer);
     return;
   }
   try {
-    const output = await decode(task);
+    const output = await decodeChosen(task, choices, task.check === true, dropped);
     // A view of a buffer this worker owns (it was made here, or is the input
     // the reader transferred): the whole buffer goes back with it.
-    self.postMessage({ id: task.id, output }, [output.buffer]);
+    self.postMessage({ id: task.id, output, dropped: [...dropped] }, [output.buffer]);
   } catch (error) {
-    self.postMessage({ id: task.id, error: errorData(error) });
+    self.postMessage({ id: task.id, error: toWire(error) });
   }
 });

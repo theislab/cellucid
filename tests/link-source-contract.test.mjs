@@ -236,6 +236,34 @@ test('one linked file is its dataset, under the id it states', async t => {
   source.disconnect();
 });
 
+test('a link opened again asks its host again: the version it opens is the host\'s now, never an earlier opening\'s', async t => {
+  silenceNotifications(t);
+  const { requests } = serveFixtureHost(t, { prefix: WEB, root: FIXTURES });
+  // The host's validators, which a rewrite of the file changes.
+  let modified = 'Mon, 26 Oct 2026 10:00:00 GMT';
+  const served = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const response = await served(input, init);
+    const headers = new Headers(response.headers);
+    headers.set('Last-Modified', modified);
+    return new Response(response.body, { status: response.status, headers });
+  };
+  const open = async () => {
+    const source = new LinkDataSource();
+    await source.connect(`${WEB}ready.h5ad`);
+    source.disconnect();
+  };
+  await open();
+  const probes = () => requests.filter(request => request.method === 'HEAD').length;
+  const first = probes();
+  await open();
+  assert.equal(probes(), first + 1, 'opened again, the file is probed again');
+  // Rewritten on the host: the next opening's probe reads its new version.
+  modified = 'Tue, 27 Oct 2026 10:00:00 GMT';
+  await open();
+  assert.equal(probes(), first + 2);
+});
+
 test('a linked Zarr store folder and a zipped one open in place', async t => {
   silenceNotifications(t);
   serveFixtureHost(t, { prefix: WEB, root: FIXTURES });

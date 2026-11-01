@@ -61,6 +61,13 @@ test('a camera jump keeps drawing until the adaptive LOD reaches its level, then
       }
       await frames(1);
     }
+    // Start close in, so the far jump below crosses many levels: the ladder
+    // is fixed counts (draw-order.js `lodLadder`), and from the default
+    // framing of 60,000 cells the adaptive floor is only two levels down.
+    const close = structuredClone(viewer.getViewCameraState('live'));
+    close.orbit.radius *= 0.25;
+    close.orbit.targetRadius = close.orbit.radius;
+    viewer.setViewCameraState('live', close);
     await settled();
     const nearLevel = viewer.getCurrentLODLevel('live');
 

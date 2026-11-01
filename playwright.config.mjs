@@ -56,6 +56,10 @@ export default defineConfig({
     },
     video: 'off',
     viewport: { width: 1440, height: 1000 },
+    // A deployed page registers the code cache (service-worker.js), whose
+    // requests a spec's `page.route` cannot see. Specs run without it; the
+    // spec of the code cache itself allows it (code-cache.spec.mjs).
+    serviceWorkers: 'block',
   },
   projects: [
     {

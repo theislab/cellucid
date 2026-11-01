@@ -114,65 +114,6 @@
   text-decoration: underline;
 }
 
-.dataset-card-details {
-  margin-top: var(--space-0-5);
-  border-top: var(--border-width-1) solid var(--color-border-light);
-}
-
-.dataset-card-details > .disclosure-header {
-  padding-block: var(--space-1);
-}
-
-.dataset-card-details > .disclosure-header > .disclosure-title {
-  font-size: var(--type-label);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-secondary);
-}
-
-/* Label and value side by side; a long value (a citation, an address)
-   wraps under itself. */
-.dataset-card-facts {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  column-gap: var(--space-2);
-  row-gap: var(--space-1);
-  margin: 0;
-  font-size: var(--type-hint);
-  line-height: var(--leading-normal);
-}
-
-.dataset-card-facts > dt {
-  color: var(--color-text-tertiary);
-}
-
-.dataset-card-facts > dd {
-  margin: 0;
-  min-width: 0;
-  color: var(--color-text-primary);
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
-}
-
-/* A value of several facts (what was not read) takes the whole width under
-   its label, each fact on its own line. */
-.dataset-card-facts > .dataset-card-facts-wide {
-  grid-column: 1 / -1;
-}
-
-.dataset-card-facts > dd > div + div {
-  margin-top: var(--space-0-5);
-}
-
-.dataset-card-facts a {
-  color: var(--color-text-link);
-  text-decoration: none;
-}
-
-.dataset-card-facts a:hover {
-  color: var(--color-text-link-hover);
-  text-decoration: underline;
-}
-
 /* ------------------------------------------------------------------------
    Open… and its menu
    --------------------------------------------------------------------- */
@@ -314,6 +255,73 @@
   flex: none;
 }
 
+/* A connection's address on one line: the host and the last part of its
+   path, cut with an ellipsis; the whole address is its title. */
+.connection-address {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* What is kept in this browser (ui/modules/kept-stores-line.js): its
+   summary on one line beside Manage… (short by construction,
+   `summarizeKeptStores`; the whole of it in its title and in Manage…). */
+.kept-stores-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.kept-stores-summary {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.kept-stores-row > .btn {
+  flex: none;
+}
+
+/* ------------------------------------------------------------------------
+   Cells to open (ui/modules/subsample-control.js)
+   --------------------------------------------------------------------- */
+
+/* Apply, Open all cells and Copy link on one row at the narrowest panel,
+   under the settings they apply. */
+.subsample-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: var(--space-1-5);
+  min-width: 0;
+  margin-top: var(--control-block-gap);
+}
+
+/* The line on the cells open, a row below the buttons or the settings. */
+.subsample-status:not(:empty) {
+  margin-top: var(--control-row-gap);
+}
+
+.subsample-actions[hidden] {
+  display: none;
+}
+
+.subsample-actions > .btn {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+/* Genes read for (ui/modules/gene-read-control.js): its one status line
+   (the chosen step's cells and cost, or how far a read is) never wraps. */
+.gene-read-status {
+  white-space: nowrap;
+}
+
 /* What to do about a sign-in that did not finish (an administrator's approval). */
 .connection-help {
   flex: 0 1 auto;
@@ -363,4 +371,80 @@
    app's code could not load (ui/core/code-load-watch.js). */
 #data-source-status.error {
   color: var(--color-danger-text);
+}
+
+/* ------------------------------------------------------------------------
+   The Session panel's collapsible sections (ui/modules/session-sections.js):
+   Subsampling and Data mapping. A section heading whose button opens its
+   content (the sidebar's inline disclosure), with its (i) beside it; while
+   collapsed the header says what it holds in one line (`.disclosure-desc`),
+   which the open content says instead.
+   --------------------------------------------------------------------- */
+
+.session-disclosure-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-disclosure > .disclosure-header-row {
+  gap: var(--space-1);
+}
+
+/* The header is the heading's own text: no row padding, the heading's type,
+   and as tall as an option row (--control-row-min: compact with a mouse, a
+   fingertip's row on a coarse pointer, as every disclosure header is).
+   Collapsed, the summary takes a line of its own under the title, whole
+   (however narrow the panel: never cut, never hidden). */
+.session-disclosure .disclosure-header {
+  min-height: var(--control-row-min);
+  padding: 0;
+  column-gap: var(--space-1-5);
+  row-gap: 0;
+  flex-wrap: wrap;
+  font: inherit;
+}
+
+.session-disclosure .disclosure-header[aria-expanded="false"] > .disclosure-desc {
+  display: block;
+  order: 1;
+  flex-basis: 100%;
+  overflow: visible;
+  white-space: normal;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+}
+
+.session-disclosure .disclosure-header[aria-expanded="false"] > .disclosure-desc:empty {
+  display: none;
+}
+
+.session-disclosure .disclosure-title,
+.session-disclosure .disclosure-header[aria-expanded="true"] > .disclosure-title {
+  flex: none;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-semibold);
+}
+
+
+.session-disclosure .disclosure-header[aria-expanded="true"] > .disclosure-desc {
+  display: none;
+}
+
+.session-disclosure .disclosure-desc {
+  font-weight: var(--font-weight-regular);
+}
+
+.session-disclosure .disclosure-header:hover,
+.session-disclosure > .disclosure-header-row:hover {
+  background: transparent;
+}
+
+/* The content's blocks start a row below the heading, as a block's do. */
+.session-disclosure > .disclosure-content {
+  padding: var(--control-row-gap) 0 0;
+}
+
+.session-disclosure > .disclosure-content > :first-child {
+  margin-top: 0;
 }

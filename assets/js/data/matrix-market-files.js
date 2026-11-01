@@ -3,13 +3,27 @@
  * feature and barcode lists, in a folder on this computer or in a listing on
  * a host (a GEO series). Names only; nothing is read.
  *
- * A matrix `<prefix>matrix.mtx[.gz]` (or `count_matrix`, `DGE`) takes the
- * lists of its own prefix (`GSM5008737_RNA_3P-features.tsv.gz`): the
- * uploads of GEO, where every sample's three files share one prefix. When
+ * A matrix `<prefix><word>.mtx[.gz]` takes the lists of its own prefix
+ * (`GSM5008737_RNA_3P-matrix.mtx.gz` with
+ * `GSM5008737_RNA_3P-features.tsv.gz`): the uploads of GEO, where every
+ * sample's three files share one prefix. The word is what the producer
+ * named the matrix (`matrix`, `count_matrix`, `DGE`, or any last word of
+ * the name: GEO's `GSE158055_covid19_counts.mtx.gz`); kb-python's
+ * `cells_x_genes.mtx` and alevin-fry's `quants_mat.mtx` name their lists
+ * after themselves and are paired by the transcoder. When
  * its own prefix has no list of a kind, a shorter prefix ending at a
  * separator (`_`, `-`, `.`) is tried (`GSE1_RNA_matrix.mtx.gz` with
  * `GSE1_barcodes.tsv.gz`, a CITE-seq upload sharing its cells), but never
  * one that has a matrix of its own: those lists are that matrix's.
+ *
+ * The sci-RNA-seq3 uploads of the Cao and Shendure labs name theirs
+ * otherwise (GEO GSE119945, GSE186069, GSE228590): a matrix
+ * `<prefix>gene_count[.<part>].mtx.gz` -- GSE119945's is `.txt.gz`,
+ * MatrixMarket by its content -- with `<prefix>cell_annotat(e|ion)[.<part>].csv.gz`,
+ * a table of the cells (a header, then each cell's name and its columns),
+ * and `<prefix>gene_annotat(e|ion)[.<part>].csv.gz` (`gene_id`,
+ * `gene_type`, `gene_short_name`), the gene list shared by every part
+ * when it names none (`CAO_MATRIX`).
  *
  * The result names, for every matrix, its lists or what is wrong: a list
  * missing (with the names that would have been taken), or two lists where
@@ -24,11 +38,21 @@
 const COMPRESSIONS = Object.freeze(['.gz', '', '.bz2', '.xz']);
 
 /** Feature and barcode list names after the prefix, in order of preference. */
-export const FEATURE_LISTS = Object.freeze(['features.tsv', 'genes.tsv', 'features.txt', 'genes.txt', 'all_genes.csv']);
-export const CELL_LISTS = Object.freeze(['barcodes.tsv', 'barcodes.txt', 'cell_metadata.csv']);
+export const FEATURE_LISTS = Object.freeze(['features.tsv', 'genes.tsv', 'features.txt', 'genes.txt', 'all_genes.csv', 'gene.tsv']);
+export const CELL_LISTS = Object.freeze(['barcodes.tsv', 'barcodes.txt', 'cell_metadata.csv', 'cell.tsv']);
 
-const MATRIX_NAME = /^(.*?)(count_matrix|matrix|DGE)\.mtx(\.gz|\.bz2|\.xz)?$/i;
+/**
+ * A matrix's name: its prefix, then its word (the known words first, so
+ * `…_count_matrix` keeps `count_matrix`; else its last word), then `.mtx`.
+ */
+const MATRIX_NAME = /^(.*?)(count_matrix|matrix|DGE|[^_.\-]+)\.mtx(\.gz|\.bz2|\.xz)?$/i;
+/** Matrices whose producer names their lists after them (`transcode/matrix-market.js` pairs them). */
+const SELF_NAMED = /^(cells_x_genes|quants_mat)\.mtx(\.gz|\.bz2|\.xz)?$/i;
 const SEPARATOR = /[_.-]/;
+/** A sci-RNA-seq3 matrix: its prefix, its part (`.run_13`, or none), then `.mtx` or `.txt`. */
+const CAO_MATRIX = /^(.*?)gene_count(\.[^.]+)?\.(mtx|txt)(\.gz|\.bz2|\.xz)?$/i;
+/** A sci-RNA-seq3 table: its prefix, `cell` or `gene`, its part. */
+const CAO_LIST = /^(.*?)(cell|gene)_annotat(?:e|ion)(\.[^.]+)?\.(csv|tsv)(\.gz|\.bz2|\.xz)?$/i;
 
 /** The folder and file name of one path. */
 function splitPath(path) {
@@ -70,11 +94,17 @@ export function matrixMarketFileSets(paths) {
   const sets = [];
   const problems = [];
   for (const [folder, names] of byFolder) {
+    // The sci-RNA-seq3 matrices with both their tables beside them, and a
+    // `.txt` one without them (which no other rule takes) refused by name.
+    const cao = caoSets(folder, names);
+    sets.push(...cao.sets);
+    problems.push(...cao.problems);
+    const taken = new Set([...cao.sets, ...cao.problems].map(set => set.matrix.slice(folder.length)));
     // Every matrix of this folder, by its prefix (lower case).
     const matrices = new Map();
     for (const name of names.values()) {
       const match = MATRIX_NAME.exec(name);
-      if (match === null) continue;
+      if (match === null || SELF_NAMED.test(name) || taken.has(name)) continue;
       const key = match[1].toLowerCase();
       if (!matrices.has(key)) matrices.set(key, []);
       matrices.get(key).push(name);
@@ -155,9 +185,64 @@ function problem(matrix, prefix, missing, ambiguous, message) {
   return { matrix, prefix, missing, ambiguous, message };
 }
 
+/**
+ * The sci-RNA-seq3 sets of one folder (`CAO_MATRIX`): each matrix with
+ * the cells' table of its part and the genes' table of its part, else the
+ * one without a part. A `.mtx` matrix lacking either is left to the
+ * general rule; a `.txt` one, which only this rule makes a matrix, is a
+ * problem naming the tables it lacks.
+ *
+ * @param {string} folder
+ * @param {Map<string, string>} names - Lower-case name to name
+ * @returns {{sets: Array<Object>, problems: Array<Object>}}
+ */
+function caoSets(folder, names) {
+  const found = [];
+  const problems = [];
+  const lists = [];
+  for (const name of names.values()) {
+    const match = CAO_LIST.exec(name);
+    if (match !== null) {
+      lists.push({ name, prefix: match[1].toLowerCase(), kind: match[2].toLowerCase(), part: (match[3] ?? '').toLowerCase() });
+    }
+  }
+  for (const name of names.values()) {
+    const match = CAO_MATRIX.exec(name);
+    if (match === null) continue;
+    const prefix = match[1];
+    const part = (match[2] ?? '').toLowerCase();
+    const listOf = kind => {
+      const own = lists.filter(list => list.kind === kind && list.prefix === prefix.toLowerCase());
+      return (own.find(list => list.part === part) ?? (part === '' ? null : own.find(list => list.part === ''))) ?? null;
+    };
+    const cells = listOf('cell');
+    const features = listOf('gene');
+    if (cells === null || features === null) {
+      if (match[3].toLowerCase() !== 'txt') continue;
+      const missing = [
+        ...(features === null ? [`${prefix}gene_annotate${match[2] ?? ''}.csv.gz`] : []),
+        ...(cells === null ? [`${prefix}cell_annotate${match[2] ?? ''}.csv.gz`] : []),
+      ];
+      problems.push(problem(`${folder}${name}`, prefix, missing, [],
+        `${name} has no ${missing.join(' and no ')} beside it, so its ${missing.length === 2 ? 'rows and columns are' : features === null ? 'features are' : 'cells are'} not named. ` +
+        `Download the missing file${missing.length === 2 ? 's' : ''} from where the matrix came from, put ${missing.length === 2 ? 'them' : 'it'} beside the matrix, and open the folder with Open… › Folder….`));
+      continue;
+    }
+    found.push({
+      matrix: `${folder}${name}`,
+      prefix: `${prefix}${match[2] === undefined ? '' : `${match[2].slice(1)}_`}`,
+      features: `${folder}${features.name}`,
+      cells: `${folder}${cells.name}`,
+      shared: { features: [], cells: [] },
+    });
+  }
+  return { sets: found, problems };
+}
+
 /** Whether a name is a MatrixMarket matrix this module groups. */
 export function isMatrixMarketMatrix(name) {
-  return MATRIX_NAME.test(splitPath(name).name);
+  const leaf = splitPath(name).name;
+  return (MATRIX_NAME.test(leaf) && !SELF_NAMED.test(leaf)) || CAO_MATRIX.test(leaf);
 }
 
 /**

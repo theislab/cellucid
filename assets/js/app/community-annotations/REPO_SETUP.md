@@ -298,7 +298,11 @@ otherwise leave an older same-route deployment looking compatible.
 This worker is an **auth and bounded data proxy**:
 
 - `/auth/login` starts the GitHub OAuth flow for the **Cellucid GitHub App**
-- `/auth/callback` completes OAuth state and PKCE validation
+- `/auth/callback` completes OAuth state and PKCE validation and hands the
+  page an expiring user token (8 hours) and its lifetime; the refresh token
+  stays in the worker, unused
+- `/auth/revoke` revokes a token at GitHub with the app's credentials
+  (**Sign out**)
 - `/auth/user`, `/auth/installations`, `/auth/installation-repos` expose minimal “who am I” + “which repos did I install the app on” queries
 - `/api/repos/*` proxies the repository requests used by Cellucid to
   `api.github.com/repos/*`
@@ -327,7 +331,12 @@ Compared to Personal Access Tokens, the GitHub App model:
 Cellucid is designed so your GitHub credentials and tokens are not casually exposed:
 
 - The Cellucid UI never asks you to paste a token (no PAT handling in the UI).
-- The OAuth access token is stored only in `sessionStorage` (cleared when the tab closes).
+- The OAuth access token expires after 8 hours (GitHub's user tokens with
+  expiration). It is stored with its expiry only in the tab's `sessionStorage`:
+  a reload keeps the sign-in until it expires, then it is forgotten. Browsers
+  write `sessionStorage` to the profile on disk for session restore, which is
+  why the token is short-lived. **Sign out** revokes it at GitHub through the
+  worker and forgets it.
 - All GitHub REST calls are sent through the worker using `Authorization: Bearer <token>`.
 - The worker uses `ALLOWED_ORIGINS` as an exact browser CORS allowlist.
 - Before OAuth or any token-bearing request, the UI verifies the Worker's exact

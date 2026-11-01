@@ -6,6 +6,8 @@ import {
   startCloudNoiseGenerationGPU,
 } from '../assets/js/rendering/smoke-cloud/gpu-noise-generator.js';
 
+import { until } from './helpers/until.mjs';
+
 function createManualScheduler() {
   const queue = [];
   let maximumPending = 0;
@@ -118,11 +120,11 @@ function createNoiseGl() {
     SAMPLE_ALPHA_TO_COVERAGE: 0x809E,
     SAMPLE_COVERAGE: 0x80A0,
     SCISSOR_TEST: 0x0C11,
-    SIGNALED: 0x9119,
+    ALREADY_SIGNALED: 0x911A,
     STATIC_DRAW: 0x88E4,
     STENCIL_TEST: 0x0B90,
     SYNC_GPU_COMMANDS_COMPLETE: 0x9117,
-    SYNC_STATUS: 0x9114,
+    SYNC_FLUSH_COMMANDS_BIT: 0x1,
     TEXTURE_2D: 0x0DE1,
     TEXTURE_3D: 0x806F,
     TEXTURE_BINDING_2D: 0x8069,
@@ -136,7 +138,7 @@ function createNoiseGl() {
     UNSIGNED_BYTE: 0x1401,
     VERTEX_ARRAY_BINDING: 0x85B5,
     VERTEX_SHADER: 0x8B31,
-    UNSIGNALED: 0x9118,
+    TIMEOUT_EXPIRED: 0x911B,
     VIEWPORT: 0x0BA2,
 
     activeTexture(value) {
@@ -266,15 +268,16 @@ function createNoiseGl() {
       return fence;
     },
     flush() {},
-    getSyncParameter(fence, parameter) {
-      assert.equal(parameter, gl.SYNC_STATUS);
+    clientWaitSync(fence, flags, timeout) {
+      assert.equal(flags, gl.SYNC_FLUSH_COMMANDS_BIT, 'every poll flushes (gl-utils.js fenceHasPassed)');
+      assert.equal(timeout, 0, 'a poll never waits');
       const remaining = fences.get(fence);
       assert.notEqual(remaining, undefined, 'only a live fence is polled');
       if (remaining > 0) {
         fences.set(fence, remaining - 1);
-        return gl.UNSIGNALED;
+        return gl.TIMEOUT_EXPIRED;
       }
-      return gl.SIGNALED;
+      return gl.ALREADY_SIGNALED;
     },
     drawArrays() {
       const attachment = framebufferAttachments.get(drawFramebuffer) ?? null;
@@ -957,9 +960,9 @@ test('default GPU noise scheduling falls back when animation-frame cancellation 
       32,
     );
     const firstSettlement = first.completion.catch(() => {});
-    await new Promise(resolve => setTimeout(resolve, 5));
+    // Its first step runs on a timer, never on a frame.
+    await until(() => first._phase !== 'initialize', 'the first step on a timer');
     assert.equal(frameRequests, 0);
-    assert.notEqual(first._phase, 'initialize');
     first.cancel();
     await firstSettlement;
 
@@ -981,9 +984,9 @@ test('default GPU noise scheduling falls back when animation-frame cancellation 
       32,
     );
     const secondSettlement = second.completion.catch(() => {});
-    await new Promise(resolve => setTimeout(resolve, 5));
+    // Its first step runs on a timer, never on a frame.
+    await until(() => second._phase !== 'initialize', 'the first step on a timer');
     assert.equal(frameRequests, 0);
-    assert.notEqual(second._phase, 'initialize');
     second.cancel();
     await secondSettlement;
   } finally {
@@ -1058,9 +1061,8 @@ test('hidden fallback survives a throwing frame canceller and its stale frame st
     assert.equal(typeof visibilityListener, 'function');
     documentStub.hidden = true;
     assert.doesNotThrow(() => visibilityListener());
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await until(() => transaction._phase !== 'initialize', 'the hidden page\'s step on a timer');
     const phaseAfterTimeout = transaction._phase;
-    assert.notEqual(phaseAfterTimeout, 'initialize');
     frameCallback();
     assert.equal(transaction._phase, phaseAfterTimeout);
     assert.equal(frameCancellationAttempts, 1);

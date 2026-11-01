@@ -327,6 +327,30 @@ test('damaged streams fail with where they failed', async () => {
   await assert.rejects(readHeader(XdrReader.ofStream(split(version, version.length))), /version 4/);
 });
 
+test('a character vector or list is held as its elements arrive, never at the length it declares', async () => {
+  // A long-vector length (2^32) with one element present: refused as a
+  // truncated file, never an array of the declared length (which no
+  // JavaScript array can be, and which a compressed file of a few megabytes
+  // could otherwise ask for).
+  const strings = new Writer().header(3).flags(16).int(-1).int(1).int(0).chars('x').result();
+  await assert.rejects(parse(strings), error => error instanceof RdsFormatError, 'a character vector');
+  const list = new Writer().header(3).flags(19).int(-1).int(1).int(0).flags(13).int(1).int(7).result();
+  await assert.rejects(
+    parse(list, { plan: { dropByName: () => () => false } }),
+    error => error instanceof RdsFormatError,
+    'a list whose elements wait for their names'
+  );
+  // Byte code declares a count of shared expressions it never needs.
+  const closure = new Writer().header(3)
+    .flags(3, { tag: true }).int(253).flags(2, { tag: true }).symbol('x').int(251).nil()
+    .flags(21).int(0x7fffffff)
+    .flags(13).int(2).int(12).int(1)
+    .int(0).nil()
+    .result();
+  const opened = await parse(closure);
+  assert.equal(opened.kind, 'opaque', 'code is read and passed over');
+});
+
 test('doubles become text as as.character() writes them', () => {
   assert.equal(formatRealAsR(1), '1');
   assert.equal(formatRealAsR(0.1), '0.1');

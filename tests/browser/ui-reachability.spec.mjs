@@ -28,6 +28,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -141,9 +142,24 @@ async function auditScope(page, scope) {
         offenders.push(`${name}: off screen at (${Math.round(x)}, ${Math.round(y)})`);
         continue;
       }
+      // An ancestor's overflow clips only what it contains: a fixed-position
+      // element (a notification card, kept inside an open modal's document
+      // so it is not inert there: `modal-background-owner.js`) escapes every
+      // ancestor up to the one that is its containing block (a transform, a
+      // filter, a backdrop filter, perspective or paint containment).
+      const containsFixed = style => style.transform !== 'none' || style.perspective !== 'none'
+        || style.filter !== 'none' || (style.backdropFilter ?? style.webkitBackdropFilter ?? 'none') !== 'none'
+        || /\b(paint|layout|strict|content)\b/.test(style.contain)
+        || /\b(transform|perspective|filter)\b/.test(style.willChange);
+      let escapingFixed = getComputedStyle(element).position === 'fixed';
       let clipper = null;
       for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
         const style = getComputedStyle(node);
+        if (escapingFixed && !containsFixed(style)) {
+          if (style.position === 'fixed') escapingFixed = true;
+          continue;
+        }
+        escapingFixed = style.position === 'fixed';
         if (style.overflowX === 'visible' && style.overflowY === 'visible') continue;
         const area = node.getBoundingClientRect();
         if (x < area.left - 1 || x > area.right + 1 || y < area.top - 1 || y > area.bottom + 1) {
@@ -197,10 +213,18 @@ async function dismissNotifications(page) {
   await expect(page.locator('#notification-center .notification')).toHaveCount(0);
 }
 
+/**
+ * The opening is over (`waitForPageAtRest`), so what it still had to say is
+ * not said over a surface under audit, after the cards were dismissed (a
+ * card stood in the confirm dialog on WebKit, Web contracts run 41213981681).
+ */
+const openingDone = page => waitForPageAtRest(page, { timeout: 60_000 });
+
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await openingDone(page);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await dismissNotifications(page);
@@ -212,17 +236,34 @@ async function setSheetOpen(page, open) {
   if (!isPhone(page)) return;
   const hidden = await page.locator('#sidebar').evaluate(sidebar => sidebar.classList.contains('hidden'));
   if (hidden === open) {
-    await page.locator('#sidebar-toggle').click();
+    // Open from the bar at the foot of the screen (a phone's closed panel);
+    // ✕ (#sidebar-toggle) closes it.
+    await page.locator(open ? '#phone-sheet-bar' : '#sidebar-toggle').click();
     await expect(page.locator('#sidebar')).toHaveClass(open ? /^(?!.*\bhidden\b)/ : /\bhidden\b/);
+    // The sheet rises from the bar; what it shows is final once that is over.
+    await expect.poll(() => page.locator('#sidebar').evaluate(sidebar => sidebar.getAnimations().length)).toBe(0);
   }
 }
 
 async function openEverySidebarPanel(page) {
-  await page.evaluate(() => {
+  // Lists in a panel render once it shows, on its `<details>`' `toggle`
+  // (`ui/core/visibility-gate.js`), a queued task: every one has run once a
+  // sentinel `<details>` opened after them has had its own (same task
+  // source, in order).
+  await page.evaluate(async () => {
     for (const details of document.querySelectorAll('#sidebar details')) details.open = true;
+    const sentinel = document.createElement('details');
+    sentinel.hidden = true;
+    document.body.append(sentinel);
+    const toggled = new Promise(resolve => sentinel.addEventListener('toggle', resolve, { once: true }));
+    sentinel.open = true;
+    await toggled;
+    sentinel.remove();
   });
   // Every closed disclosure outside the analysis modes, which open one at a
-  // time and are walked separately.
+  // time and are walked separately. A header shows its region in its click
+  // (`bindDisclosure`); an exclusive group (Figure export's sections)
+  // closes the others, so a few rounds open what can be open at once.
   for (let round = 0; round < 3; round += 1) {
     const opened = await page.evaluate(() => {
       let count = 0;
@@ -237,7 +278,6 @@ async function openEverySidebarPanel(page) {
       return count;
     });
     if (opened === 0) break;
-    await page.waitForTimeout(100);
   }
 }
 
@@ -256,17 +296,13 @@ for (const layout of LAYOUTS) {
       for (const mode of ANALYSIS_MODES) {
         const header = page.locator(`#analysis-header-${mode}`);
         await header.scrollIntoViewIfNeeded();
-        // The previous mode fills in its results asynchronously, which moves
-        // every header below it. A click aimed while that content is still
-        // growing lands where the header was; wait until it holds still.
-        await expect.poll(async () => {
-          const before = await header.boundingBox();
-          await page.waitForTimeout(150);
-          const after = await header.boundingBox();
-          return before !== null && after !== null && before.y === after.y;
-        }).toBe(true);
         if ((await header.getAttribute('aria-expanded')) !== 'true') await header.click();
         await expect(header).toHaveAttribute('aria-expanded', 'true');
+        // A mode fills in asynchronously, `aria-busy` until it has settled
+        // (`_claimBusy`, base-analysis-ui.js), and moves every header below
+        // it while it grows: its controls are walked, and the next header
+        // clicked, once it is done.
+        await expect(page.locator(`#analysis-panel-${mode}`)).not.toHaveAttribute('aria-busy', 'true', { timeout: 30_000 });
         await page.evaluate(region => {
           for (const inner of document.querySelectorAll(
             `#${region} .disclosure-header[aria-expanded="false"]`,
@@ -342,10 +378,14 @@ for (const layout of LAYOUTS) {
       });
       await page.locator('#analysis-header-genesPanel').scrollIntoViewIfNeeded();
       await page.locator('#analysis-header-genesPanel').click();
+      // The window is sized from the row: copied once the row has filled in.
+      await expect(page.locator('#analysis-panel-genesPanel')).not.toHaveAttribute('aria-busy', 'true', { timeout: 30_000 });
       await page.locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
         .click({ force: true });
       const analysisWindow = page.locator('#floating-panels-root .analysis-window-frame');
       await expect(analysisWindow).toHaveCount(1);
+      // Its copy of the analysis fills in too (`aria-busy` until it has).
+      await expect(analysisWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 30_000 });
       await setSheetOpen(page, false);
       await dismissNotifications(page);
       await expectReachable(
@@ -381,6 +421,7 @@ for (const layout of LAYOUTS) {
       await page.keyboard.press('Escape');
       await expect(page.locator('#welcome-modal')).toBeHidden();
       await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+      await openingDone(page);
       await dismissNotifications(page);
 
       await page.evaluate(() => document.getElementById('license-link').click());
@@ -481,6 +522,7 @@ for (const layout of LAYOUTS) {
       await page.addInitScript(workerOrigin => {
         window.__CELLUCID_GITHUB_WORKER_ORIGIN__ = workerOrigin;
         sessionStorage.setItem('cellucid:github-app-auth:session', JSON.stringify({
+          expiresAt: 4102444800000,
           token: 'reachability-token',
           user: { id: 4242, login: 'tester' },
         }));
@@ -496,9 +538,9 @@ for (const layout of LAYOUTS) {
         body: JSON.stringify({
           status: 'ok',
           service: 'Cellucid GitHub Auth',
-          contractVersion: 1,
+          contractVersion: 2,
           endpoints: [
-            '/auth/login', '/auth/callback', '/auth/user', '/auth/installations',
+            '/auth/login', '/auth/callback', '/auth/revoke', '/auth/user', '/auth/installations',
             '/auth/installation-repos', '/cap/lookup-cells', '/api/repos/*',
           ],
         }),

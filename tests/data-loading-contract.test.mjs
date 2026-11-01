@@ -37,13 +37,13 @@ function contentSecurityPolicyDirectives(html) {
   );
 }
 
-test('the page CSP grants no code evaluation, WebAssembly included', () => {
+test('the page CSP lets the WebAssembly decoders compile and grants no JavaScript evaluation', () => {
   const scriptSources = contentSecurityPolicyDirectives(indexHtml).get('script-src');
 
   assert.ok(scriptSources, 'CSP must define script-src');
   assert.ok(
-    !scriptSources.includes("'wasm-unsafe-eval'"),
-    "script-src must not grant 'wasm-unsafe-eval': the app compiles no WebAssembly"
+    scriptSources.includes("'wasm-unsafe-eval'"),
+    "script-src must grant 'wasm-unsafe-eval': the readers compile the WebAssembly decoders (assets/wasm/codecs.wasm)"
   );
   assert.ok(
     !scriptSources.includes("'unsafe-eval'"),
@@ -138,6 +138,7 @@ function currentObsFields({
         kind: 'category',
         fieldIndex: continuous.length + position,
         palette: null,
+        discovered: false,
         outlierQuantilesPath,
         ...field,
       })),
@@ -150,7 +151,7 @@ function currentGeneList({ names = ['Gene A'] } = {}) {
   return {
     n_points: 2,
     fields: names.map((key, gene) => ({ key, kind: 'continuous', path: `var/${gene}` })),
-    geneNames: { source: null, filledFromIndex: 0, renamed: [] },
+    geneNames: { source: null, filledFromIndex: 0, renamed: [], ids: null },
   };
 }
 
@@ -171,6 +172,7 @@ test('the adapter\'s field lists check into one descriptor per field', () => {
       codesDtype: 'uint8',
       codesMissingValue: 255,
       palette: null,
+      discovered: false,
       outlierQuantilesPath: 'outliers/0/1',
     },
   ]);
@@ -198,7 +200,7 @@ test('field lists in any other form are refused: extra members, centroids, mis-i
   misplaced.fields[1] = { ...misplaced.fields[1], path: 'var/X/index/1' };
   assert.throws(() => checkGeneList(misplaced), /continuous gene at \{list\}\/1/);
   assert.throws(
-    () => checkGeneList({ ...currentGeneList(), geneNames: { source: null, filledFromIndex: 1, renamed: [] } }),
+    () => checkGeneList({ ...currentGeneList(), geneNames: { source: null, filledFromIndex: 1, renamed: [], ids: null } }),
     /filledFromIndex must count genes/
   );
   assert.throws(
@@ -296,6 +298,7 @@ test('direct AnnData field lists use the exact explicit-absence outlier state', 
         codesDtype: 'uint8',
         codesMissingValue: 255,
         palette: null,
+        discovered: false,
         outlierQuantilesPath: null,
       },
     ],
@@ -313,7 +316,7 @@ test('direct AnnData field lists use the exact explicit-absence outlier state', 
 
   const rawVar = await adapter.getGeneList();
   assert.equal(Object.hasOwn(rawVar, 'var_gene_id_column'), false);
-  assert.deepEqual(rawVar.geneNames, { source: null, filledFromIndex: 0, renamed: [] });
+  assert.deepEqual(rawVar.geneNames, { source: null, filledFromIndex: 0, renamed: [], ids: null });
   const checkedVar = checkGeneList(rawVar);
   assert.deepEqual(
     checkedVar.fields,
@@ -399,3 +402,41 @@ test('category labels the writers publish are valid at any length', async () => 
   assert.equal(StateValidator.validateCategoryLabel('L'.repeat(300)), true);
 });
 
+
+test('a categorical coded by the categories its open cells hold carries how many its file stores', async t => {
+  const manager = getDataSourceManager();
+  const originalActiveSource = manager.activeSource;
+  const originalActiveDatasetId = manager.activeDatasetId;
+  let storedCategoryCount = 1_203_456;
+  manager.activeSource = {
+    datasetId: 'present-current',
+    getType: () => 'anndata',
+    getAdapter: () => ({
+      async getObsFieldData() {
+        return {
+          kind: 'category',
+          data: Uint8Array.from([0, 1]).buffer,
+          dtype: 'uint8',
+          missingValue: 255,
+          categories: ['BC7', 'BC9'],
+          palette: [[1, 0, 0], [0, 1, 0]],
+          storedCategoryCount,
+        };
+      },
+    }),
+  };
+  manager.activeDatasetId = 'present-current';
+  t.after(() => {
+    manager.activeSource = originalActiveSource;
+    manager.activeDatasetId = originalActiveDatasetId;
+  });
+  const field = checkObsFields(currentObsFields({
+    continuous: [],
+    outlierQuantilesPath: null,
+    categorical: [{ key: 'barcode', categories: null, codesDtype: null, codesMissingValue: null }],
+  })).fields[0];
+  const result = await loadObsFieldData('anndata://present-current/obs', field);
+  assert.deepEqual([result.categories, result.storedCategoryCount], [['BC7', 'BC9'], 1_203_456]);
+  storedCategoryCount = 1;
+  await assert.rejects(loadObsFieldData('anndata://present-current/obs', field), /storedCategoryCount must be a whole number of at least its categories/);
+});

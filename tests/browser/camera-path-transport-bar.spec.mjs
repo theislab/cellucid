@@ -246,6 +246,12 @@ test('keyframe list editing is keyboard operable, rejects bad durations, and kee
   await duration.press('Tab');
   await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
     .toHaveValue('2.5');
+  // A decimal comma reads as a point in every engine and locale; the box
+  // shows it back with a point.
+  await page.locator('.cinematic-duration-input[data-pair-index="0"]').fill('1,5');
+  await page.locator('.cinematic-duration-input[data-pair-index="0"]').press('Tab');
+  await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
+    .toHaveValue('1.5');
 
   const setAll = page.locator('#cinematic-set-all-duration');
   await setAll.fill('0');
@@ -254,7 +260,7 @@ test('keyframe list editing is keyboard operable, rejects bad durations, and kee
   expect(await setAll.evaluate(input => input.validationMessage))
     .toMatch(/at least 0\.1 seconds/);
   await expect(page.locator('.cinematic-duration-input[data-pair-index="0"]'))
-    .toHaveValue('2.5');
+    .toHaveValue('1.5');
 
   // Rename is a real button: Enter starts editing, Enter commits, and focus
   // returns to the renamed keyframe's label after the list rebuilds.

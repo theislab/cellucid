@@ -16,14 +16,14 @@
  * for, and a URL of any other dataset is refused.
  */
 
+import { cellPriorityOf } from './cell-priority.js';
 import { getDataSourceManager } from './data-source-manager.js';
 import { ANNDATA_SOURCE_TYPE } from './anndata-file-source.js';
 import { parseMappingGraphPath } from './data-mapping-candidates.js';
 import {
   getMetadataLoadSignal,
-  throwIfMetadataAborted,
-  waitForMetadata,
 } from './metadata-load-contract.js';
+import { throwIfAborted, awaitWithSignal } from '../utils/abort.js';
 
 const candidateAnnDataBindings = new WeakMap();
 
@@ -138,18 +138,57 @@ function requireCandidateAnnDataSource(url, candidateSource) {
       `"${parsed.datasetId}".`
     );
   }
+  currentAdapterOf(directSource, parsed.datasetId);
+  return Object.freeze({
+    parsed,
+    source: directSource,
+  });
+}
+
+/**
+ * The adapter a candidate's direct source reads through now: an opening grown
+ * or cut in place (`AnnDataFileSource.reopenCells`) replaces the adapter and
+ * keeps the source, so a binding names the source and asks it each time,
+ * never holding an adapter that was let go.
+ */
+function currentAdapterOf(directSource, datasetId) {
   const adapter = directSource.getAdapter();
   if (adapter === null || typeof adapter !== 'object') {
     throw new Error(
       `Candidate direct AnnData adapter is unavailable for dataset ` +
-      `"${parsed.datasetId}".`
+      `"${datasetId}".`
     );
   }
-  return Object.freeze({
-    adapter,
-    parsed,
-    source: directSource,
-  });
+  return adapter;
+}
+
+/**
+ * Which of a dataset's cells its source opened (`cell-identity.js`): a
+ * subsample's, or every cell; null when the dataset is not read by a direct
+ * AnnData source (a synthetic scene).
+ *
+ * @param {string} url - The dataset's `anndata://` base
+ * @param {Object|null} [candidateBinding] - A staged candidate (`createCandidateAnnDataBinding`)
+ * @returns {import('./cell-identity.js').CellIdentity|null}
+ */
+export function anndataCellIdentity(url, candidateBinding = null) {
+  if (parseAnnDataUrl(url) === null) return null;
+  const { source } = getAnnDataBinding(url, candidateBinding);
+  return typeof source.getCellIdentity === 'function' ? source.getCellIdentity() : null;
+}
+
+/**
+ * The priority of the open cells of an AnnData URL (`cell-priority.js`),
+ * from the cells its source opened; null when the URL is not an AnnData one.
+ *
+ * @param {string} url
+ * @param {Object|null} [candidateBinding]
+ * @returns {Readonly<{seed: number|null, originals: Uint32Array|null}>|null}
+ */
+export function anndataCellPriority(url, candidateBinding = null) {
+  if (parseAnnDataUrl(url) === null) return null;
+  const { source } = getAnnDataBinding(url, candidateBinding);
+  return typeof source.getCellSubset === 'function' ? cellPriorityOf(source.getCellSubset()) : null;
 }
 
 /**
@@ -198,7 +237,7 @@ function getAnnDataBinding(url, candidateBinding) {
   }
   // The owner was parsed from the binding's dataset base; the path a caller
   // names belongs to the request, exactly as for an active binding.
-  return { adapter: owner.adapter, source: owner.source, parsed };
+  return { adapter: currentAdapterOf(owner.source, owner.parsed.datasetId), source: owner.source, parsed };
 }
 
 /**
@@ -280,6 +319,20 @@ export async function anndataLoadPoints(
 }
 
 /**
+ * The cell-order digest of one embedding of an AnnData source over the open
+ * cells, by its route below the dataset (`obsm/{obsm}/{cols}`,
+ * `getCellOrderDigest`).
+ *
+ * @param {string} url - Explicit direct AnnData URL
+ * @param {{signal?: AbortSignal|null}} [options] - Cancels what is read for it
+ * @returns {Promise<string>}
+ */
+export async function anndataCellOrderDigest(url, options = {}, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getCellOrderDigest(parsed.path, { signal: options.signal ?? null });
+}
+
+/**
  * Load one vector field from an AnnData source, by its URL: the route
  * `vectors/{vector}/{vcols}/{embedding}/{ecols}`.
  *
@@ -315,9 +368,22 @@ export function anndataGetMappingCandidates(
     options,
     'Direct AnnData data-mapping catalog'
   );
-  throwIfMetadataAborted(signal, 'Direct AnnData data-mapping catalog loading');
+  throwIfAborted(signal);
   const { adapter } = getAnnDataBinding(url, candidateBinding);
   return adapter.getMappingCandidates();
+}
+
+/**
+ * The data-mapping candidate catalog of an AnnData source completed with what
+ * its matrices' values tell (whether each holds counts), read after the
+ * first view (`BaseAnnDataAdapter.completeMappingCandidates`).
+ *
+ * @param {string} url - Explicit direct AnnData URL
+ * @returns {Promise<Object>}
+ */
+export function anndataCompleteMappingCandidates(url, candidateBinding = null) {
+  const { adapter } = getAnnDataBinding(url, candidateBinding);
+  return adapter.completeMappingCandidates();
 }
 
 /**
@@ -335,16 +401,10 @@ export function anndataGetObsFields(
     options,
     'Direct AnnData obs field list'
   );
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData obs field list loading'
-  );
+  throwIfAborted(signal);
   const { adapter } = getAnnDataBinding(url, candidateBinding);
   const fields = adapter.getObsFields();
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData obs field list loading'
-  );
+  throwIfAborted(signal);
   return fields;
 }
 
@@ -364,20 +424,10 @@ export async function anndataGetGeneList(
     options,
     'Direct AnnData gene list'
   );
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData gene list loading'
-  );
+  throwIfAborted(signal);
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
-  const geneList = await waitForMetadata(
-    adapter.getGeneList(parsed.path),
-    signal,
-    'Direct AnnData gene list loading'
-  );
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData gene list loading'
-  );
+  const geneList = await awaitWithSignal(adapter.getGeneList(parsed.path), signal);
+  throwIfAborted(signal);
   return geneList;
 }
 
@@ -415,7 +465,8 @@ export async function anndataLoadObsField(
  * Load one gene's values from an AnnData source, by its URL: `var/{g}` for
  * the file's own gene list, or `var/{axis}/{names}/{g}` for a mapped one.
  * @param {string} url - Explicit direct AnnData URL of the gene
- * @param {{signal?: AbortSignal|null}} [options] - Cancels the read
+ * @param {{signal?: AbortSignal|null, onPartial?: ((values: Float32Array, cells: number) => void)|null}} [options] -
+ *   Cancels the read; `onPartial` hears the gene on more cells as they are read (`getGeneValues`)
  * @returns {Promise<Float32Array>}
  */
 export async function anndataLoadGeneValues(
@@ -428,7 +479,100 @@ export async function anndataLoadGeneValues(
     signal: options.signal ?? null,
     owner: options.owner ?? null,
     key: options.key ?? null,
+    onPartial: options.onPartial ?? null,
   });
+}
+
+/**
+ * Rows `[start, end)` of the open cells of one dataset part, by its URL --
+ * what an opening grown in place appends (`app/open-cells-resize.js`) and
+ * an analysis's first pass reads on the first cells of priority order:
+ * `kind` `embedding` (`obsm/{i}/{cols}`, `options.dimension`), `vectors`
+ * (`vectors/...`, `options.dimension`), `obs` (`obs`, `options.key` and
+ * the field's loaded `options.categories`) or `gene` (`var/...`). Each is,
+ * bit for bit, the whole read's rows (`BaseAnnDataAdapter`, "Rows of the
+ * open cells").
+ *
+ * @param {'embedding'|'vectors'|'obs'|'gene'} kind
+ * @param {string} url
+ * @param {[number, number]} rows
+ * @param {{signal?: AbortSignal|null, owner?: string|null, dimension?: number, key?: string,
+ *   categories?: ReadonlyArray<string|number|boolean>|null}} [options]
+ * @param {Object|null} [candidateBinding]
+ */
+export async function anndataLoadRows(kind, url, rows, options = {}, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  const signal = options.signal ?? null;
+  if (kind === 'embedding') return adapter.getEmbeddingRows(parsed.path, options.dimension, rows, { signal });
+  if (kind === 'vectors') return adapter.getVectorRows(parsed.path, options.dimension, rows, { signal });
+  if (kind === 'obs') return adapter.getObsFieldRows(options.key, rows, { categories: options.categories ?? null, signal });
+  if (kind === 'gene') return adapter.getGeneValueRows(parsed.path, rows, { signal, owner: options.owner ?? null });
+  throw new TypeError(`No rows of a dataset part of kind '${String(kind)}'.`);
+}
+
+/**
+ * What reading the gene at `url` costs now (`getGeneReadPlan`), or null
+ * when the source cannot tell.
+ *
+ * @param {string} url - Explicit direct AnnData URL of the gene
+ * @returns {Promise<Object|null>}
+ */
+export async function anndataGeneReadPlan(url, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getGeneReadPlan?.(parsed.path) ?? null;
+}
+
+/**
+ * The gene sample of the gene at `url` (`getGeneSample`): `{cells, of}` when
+ * its matrix's genes are read for the first open cells only, else null.
+ *
+ * @param {string} url
+ * @returns {Promise<{cells: number, of: number}|null>}
+ */
+export async function anndataGeneSampleOf(url, candidateBinding = null) {
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  return adapter.getGeneSample?.(parsed.path) ?? null;
+}
+
+/**
+ * What reading the matrix of the gene at `url` for the first `target` open
+ * cells costs beyond the gene sample (`getGeneSampleCost`), or null.
+ *
+ * @param {string} url
+ * @param {number} target
+ * @param {{geneTime?: {ms: number, spentBytes: number, spentRequests?: number}|null}} [options]
+ */
+export async function anndataGeneSampleCost(url, target, options = {}) {
+  const { adapter, parsed } = getAnnDataBinding(url, null);
+  return adapter.getGeneSampleCost?.(parsed.path, target, options) ?? null;
+}
+
+/**
+ * Read the matrix of the gene at `url` for the first `target` open cells
+ * (`growGeneSample`).
+ *
+ * @param {string} url
+ * @param {number} target
+ * @param {{signal?: AbortSignal|null, onStep?: Function|null, topUp?: boolean}} [options]
+ */
+export async function anndataGrowGeneSample(url, target, options = {}) {
+  const { adapter, parsed } = getAnnDataBinding(url, null);
+  if (typeof adapter.growGeneSample !== 'function') return null;
+  return adapter.growGeneSample(parsed.path, target, options);
+}
+
+/**
+ * The open cells genes are read for in the AnnData dataset behind `url`
+ * (`geneSample`), or null (every open cell, or no dataset open there).
+ *
+ * @param {string} url
+ */
+export function anndataGeneSample(url) {
+  try {
+    return getAnnDataBinding(url, null).adapter.geneSample?.() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -475,7 +619,7 @@ export async function anndataLoadGeneSparse(
  * gene, whichever costs less (`getGeneCellSubset`).
  * @param {ReadonlyArray<string>} urls - Gene URLs of one matrix
  * @param {ArrayLike<number>} cells - Distinct cell positions
- * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] - `signal`
+ * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options] - `signal`
  *   cancels the read; `owner` is the job it is for
  * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
  */
@@ -493,7 +637,7 @@ export async function anndataLoadGeneCellSubset(
   return adapter.getGeneCellSubset(
     bindings.map(binding => binding.parsed.path),
     cells,
-    { signal: options.signal ?? null, owner: options.owner ?? null }
+    { signal: options.signal ?? null, owner: options.owner ?? null, runGenes: options.runGenes ?? null }
   );
 }
 
@@ -567,7 +711,7 @@ export async function anndataDeliverGeneColumns(urls, delivery, options = {}, ca
  * @param {ReadonlyArray<string>} urls
  * @param {ArrayLike<number>} cells
  * @param {Object} delivery
- * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+ * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options]
  * @returns {Promise<{bytes: number}>}
  */
 export async function anndataDeliverGeneCellSubset(urls, cells, delivery, options = {}, candidateBinding = null) {
@@ -580,7 +724,7 @@ export async function anndataDeliverGeneCellSubset(urls, cells, delivery, option
     bindings.map(binding => binding.parsed.path),
     cells,
     delivery,
-    { signal: options.signal ?? null, owner: options.owner ?? null }
+    { signal: options.signal ?? null, owner: options.owner ?? null, runGenes: options.runGenes ?? null }
   );
 }
 
@@ -646,10 +790,7 @@ export async function anndataLoadConnectivity(
       'Direct AnnData connectivity payload options.signal is required'
     );
   }
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData connectivity payload loading'
-  );
+  throwIfAborted(signal);
   const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
   if (typeof adapter.getConnectivityEdges !== 'function') {
     throw new TypeError(
@@ -662,16 +803,36 @@ export async function anndataLoadConnectivity(
   const edgeOptions = obspIndex === null
     ? { signal }
     : { signal, key: requireMappedObspKey(adapter, obspIndex) };
-  const edges = await waitForMetadata(
-    adapter.getConnectivityEdges(edgeOptions),
-    signal,
-    'Direct AnnData connectivity payload loading'
-  );
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData connectivity payload loading'
-  );
+  const edges = await awaitWithSignal(adapter.getConnectivityEdges(edgeOptions), signal);
+  throwIfAborted(signal);
   return edges;
+}
+
+/**
+ * Some open cells' neighbours in a neighbour graph of an AnnData source (the
+ * file's own, `obsp`, or a mapped one, `obsp/{p}`), read from the file by
+ * row (`BaseAnnDataAdapter.getConnectivityRows`): the k-NN tool's frontier.
+ *
+ * @param {string} url - Explicit direct AnnData URL of the graph
+ * @param {Uint32Array} cells - Distinct open cells
+ * @param {{signal: AbortSignal}} options
+ * @returns {Promise<{offsets: Uint32Array, neighbors: Uint32Array}>}
+ */
+export async function anndataLoadConnectivityRows(url, cells, options, candidateBinding = null) {
+  const signal = getMetadataLoadSignal(options, 'Direct AnnData connectivity rows');
+  if (signal === null) {
+    throw new TypeError('Direct AnnData connectivity rows options.signal is required');
+  }
+  throwIfAborted(signal);
+  const { adapter, parsed } = getAnnDataBinding(url, candidateBinding);
+  if (typeof adapter.getConnectivityRows !== 'function') {
+    throw new TypeError('Direct AnnData adapters are required to implement getConnectivityRows()');
+  }
+  const obspIndex = parseMappingGraphPath(parsed.path);
+  const rowOptions = obspIndex === null
+    ? { signal, cells }
+    : { signal, cells, key: requireMappedObspKey(adapter, obspIndex) };
+  return awaitWithSignal(adapter.getConnectivityRows(rowOptions), signal);
 }
 
 /**
@@ -690,29 +851,18 @@ export async function anndataGetConnectivitySummary(
     options,
     'Direct AnnData connectivity summary'
   );
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData connectivity summary loading'
-  );
+  throwIfAborted(signal);
   const { adapter, source, parsed } = getAnnDataBinding(url, candidateBinding);
   const obspIndex = parseMappingGraphPath(parsed.path);
   if (obspIndex !== null) {
-    return waitForMetadata(
-      adapter.getMappedConnectivitySummary(obspIndex, { signal }),
-      signal,
-      'Direct AnnData connectivity summary loading'
-    );
+    return awaitWithSignal(adapter.getMappedConnectivitySummary(obspIndex, { signal }), signal);
   }
   if (typeof source.getConnectivitySummary !== 'function') {
     throw new TypeError(
       'Direct AnnData sources are required to implement getConnectivitySummary()'
     );
   }
-  const summary = await waitForMetadata(
-    source.getConnectivitySummary({ signal }),
-    signal,
-    'Direct AnnData connectivity summary loading'
-  );
+  const summary = await awaitWithSignal(source.getConnectivitySummary({ signal }), signal);
   if (summary === null) {
     return null;
   }
@@ -739,16 +889,10 @@ export function anndataGetDatasetIdentity(
     options,
     'Direct AnnData dataset identity'
   );
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData dataset identity loading'
-  );
+  throwIfAborted(signal);
   const { adapter } = getAnnDataBinding(url, candidateBinding);
   const identity = adapter.getMetadata();
-  throwIfMetadataAborted(
-    signal,
-    'Direct AnnData dataset identity loading'
-  );
+  throwIfAborted(signal);
   return identity;
 }
 

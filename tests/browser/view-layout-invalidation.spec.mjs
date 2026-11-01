@@ -69,10 +69,17 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
     const state = window._cellucidState;
     const viewer = window._cellucidViewer;
     const renderer = viewer.getHPRenderer();
-    const frames = count => new Promise(resolve => {
-      const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
-      requestAnimationFrame(step);
-    });
+    // At rest: the frame loop has settled and every view drew its final
+    // geometry (its tree built in the worker and adopted), so a culled frame
+    // of it has been drawn; a count of frames is no proof of that where a
+    // tree takes longer to land than the frames do.
+    const rest = async () => {
+      for (let frame = 0; frame < 1800; frame++) {
+        if (viewer.getFrameScheduleState().settled && viewer.isPresentedGeometrySettled()) return;
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      }
+      throw new Error(`The views never came to rest: ${JSON.stringify(viewer.getFrameScheduleState())}`);
+    };
     const snapshotId = viewer.getSnapshotViews()[0].id;
     const dimension = state.getViewDimensionLevel(snapshotId);
     const slot = state.getViewLayoutKey(snapshotId);
@@ -85,7 +92,7 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
     };
     const firstPositionOf = viewId => viewer.getCellPosition(0, viewId).x;
 
-    await frames(6);
+    await rest();
     const before = viewCache(snapshotId);
     const slotX = firstPositionOf(snapshotId);
 
@@ -100,7 +107,7 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
       liveLayoutKey: viewer.getViewLayoutKey('live'),
       liveX: firstPositionOf('live'),
     };
-    await frames(6);
+    await rest();
     const rebuilt = viewCache(snapshotId);
 
     await state.showDefaultRepresentation(snapshotId, dimension);
@@ -111,15 +118,15 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
     };
 
     // The live view switches the same way.
-    await frames(4);
+    await rest();
     await state.setViewRepresentation('live', 'mirror', { followsDefault: false });
     const live = {
       layoutKey: viewer.getViewLayoutKey('live'),
       x: firstPositionOf('live'),
     };
-    await frames(4);
+    await rest();
     await state.showDefaultRepresentation('live', dimension);
-    await frames(2);
+    await rest();
 
     return {
       afterReturn,

@@ -14,12 +14,12 @@ import {
   DataSourceErrorCode,
   resolveUrl,
 } from './data-source.js';
-import { createMetadataAbortError } from './metadata-load-contract.js';
 import {
   AnnDataCatalog,
   CATALOG_FILENAME,
   fetchAnnDataCatalog,
 } from './sources/anndata-catalog.js';
+import { cancel, cancelled } from '../utils/abort.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -107,7 +107,7 @@ export class LocalDemoDataSource {
       owner.controller !== this._catalogController ||
       owner.revision !== this._catalogRevision
     ) {
-      throw createMetadataAbortError('Sample catalog generation');
+      throw cancelled('superseded', 'Sample catalog generation was superseded.');
     }
   }
 
@@ -339,7 +339,7 @@ export class LocalDemoDataSource {
     const previousController = this._catalogController;
     this._catalogController = new AbortController();
     this._catalogRevision += 1;
-    previousController.abort(new Error('Sample catalog cache was refreshed'));
+    cancel(previousController, 'superseded', 'The sample catalog was refreshed.');
     this._catalogInFlight = null;
     this._datasetsInFlight = null;
     if (this._catalog !== null) {

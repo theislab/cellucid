@@ -18,6 +18,7 @@ import test from 'node:test';
 import {
   GenesPanelController,
   POOLED_GROUP_ID,
+  groupsInGeneSample,
 } from '../assets/js/app/analysis/genes-panel/genes-panel-controller.js';
 import { MARKER_OPTIONS } from '../assets/js/app/analysis/options/marker-options.js';
 
@@ -167,4 +168,64 @@ test('a run without two columns or without a group to test is refused with its r
   const pooledPair = plan({ smallGroups: 'pool' }, { T: 300, DC: 9, Mast: 4 });
   assert.equal(pooledPair.blocker, null);
   assert.deepEqual(tested(pooledPair), ['T', 'Other small groups (2)']);
+});
+
+// Genes read for a sample of the open cells (the walk of 2026-10-31: "15
+// skipped" of 50 cell types on a CELLxGENE atlas, with no reason given):
+// a group is counted among the sample, and a result says each group's cells
+// among it of its cells in every open cell, and that a group is skipped for
+// too few sampled cells.
+globalThis.HTMLElement ??= class HTMLElement {};
+const { describeSkippedGroups } = await import('../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js');
+
+test('a marker run on a gene sample records each group\'s cells among it of its cells, and why a group is skipped', async () => {
+  // 20 open cells; genes are read for the first 12. T: cells 0-9, B: 10-17, NK: 18-19.
+  const codes = Uint8Array.from({ length: 20 }, (_, i) => (i < 10 ? 0 : i < 18 ? 1 : 2));
+  const sample = { cells: 12, of: 20 };
+  const controller = Object.create(GenesPanelController.prototype);
+  controller._closed = false;
+  controller._getCacheIdentity = () => ({ key: 'gene-sample' });
+  controller._cache = { setIdentity() {}, get: () => ({ groups: [] }) };
+  controller.dataLayer = {
+    state: { pointCount: 20, getGeneSample: () => sample, varFieldLoader: null },
+    ensureObsFieldLoaded: async () => ({ kind: 'category', codes, categories: ['T', 'B', 'NK'] }),
+    getGeneKeys: async () => ['G1', 'G2'],
+    resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+  };
+  const options = optionsWith({ smallGroups: 'skip', minCells: 3 }, { T: 10, B: 8, NK: 2 });
+  const { metadata } = await controller.runAnalysis({ options });
+  // Among the 12 cells genes are read for, B has 2 of its 8: skipped, for
+  // too few sampled cells (every open cell would test it).
+  assert.deepEqual(metadata.geneSample.groups, [{ name: 'T', used: 10, of: 10 }, { name: 'B', used: 2, of: 8 }]);
+  assert.deepEqual(metadata.skippedGroups, [{ name: 'B', cells: 2 }]);
+  assert.equal(describeSkippedGroups(metadata, 3).text, '1 skipped: too few sampled cells');
+  assert.match(describeSkippedGroups(metadata, 3).title, /B \(2 of 8\)/);
+});
+
+test('a skipped group is said to be skipped for too few sampled cells when every open cell would test it', () => {
+  const geneSample = { cells: 6_320, of: 584_944, groups: [
+    { name: 'AT1', used: 412, of: 39_000 },
+    { name: 'ionocyte', used: 3, of: 1_523 },
+    { name: 'brush cell', used: 1, of: 6 },
+  ] };
+  const both = describeSkippedGroups({ skippedGroups: [{ name: 'ionocyte', cells: 3 }, { name: 'brush cell', cells: 1 }], geneSample }, 10);
+  assert.equal(both.text, '2 skipped (1 for too few sampled cells)');
+  assert.equal(both.title, 'Fewer than 10 cells among the 6,320 of 584,944 open cells that genes are read for, not tested (kept in the rest): '
+    + 'ionocyte (3 of 1,523), brush cell (1 of 6). Read genes for more cells (Session › Subsampling: Genes read for), then run again to test them on more cells.');
+  assert.equal(describeSkippedGroups({ skippedGroups: [{ name: 'ionocyte', cells: 3 }], geneSample }, 10).text, '1 skipped: too few sampled cells');
+  // Every open cell's genes read: as before.
+  const whole = describeSkippedGroups({ skippedGroups: [{ name: 'NK cell', cells: 4 }], geneSample: null }, 10);
+  assert.deepEqual(whole, { text: '1 skipped', title: 'Fewer than 10 cells, not tested (kept in the rest): NK cell (4)' });
+  assert.equal(describeSkippedGroups({ skippedGroups: [], geneSample }, 10), null);
+});
+
+test('a pooled column counts its members\' cells in every open cell', () => {
+  const columns = [
+    { groupName: 'T', count: 30, members: [0] },
+    { groupName: 'Other small groups (2)', count: 3, members: [2, 3] },
+  ];
+  assert.deepEqual(groupsInGeneSample(columns, [{ code: 0, count: 300 }, { code: 2, count: 9 }, { code: 3, count: 4 }]), [
+    { name: 'T', used: 30, of: 300 },
+    { name: 'Other small groups (2)', used: 3, of: 13 },
+  ]);
 });

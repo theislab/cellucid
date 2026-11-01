@@ -6,8 +6,9 @@
  *   and every case that cannot be paired, each with what to do;
  * - the GEO provider grouping a series' listings (its folder and its
  *   `filelist.txt`) into samples with no request beyond the two listings,
- *   reading `_RAW.tar` members from their samples' folders with the sizes
- *   the file list states (no probe), and refusing an incomplete sample by
+ *   reading `_RAW.tar` members from their samples' folders, each probed
+ *   when it opens for its size and the validators that version it (the
+ *   listings name no file's content), and refusing an incomplete sample by
  *   the file it lacks;
  * - a sample's files, prefixed and read from a host, opening exactly as the
  *   same files in a folder on this computer;
@@ -131,6 +132,22 @@ function bytesRoute(bytes) {
   };
 }
 
+/**
+ * A host stating a file of `size` bytes, written at `modified`: the probe's
+ * HEAD and range reads answered with zeros, each saying its size and date.
+ */
+function statedRoute(size, modified) {
+  return (url, init) => {
+    const headers = { 'Last-Modified': modified, 'Accept-Ranges': 'bytes' };
+    if (init.method === 'HEAD') {
+      return { status: 206, headers: { ...headers, 'Content-Length': String(size), 'Content-Range': `bytes 0-${size - 1}/${size}` } };
+    }
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers?.Range ?? '');
+    const last = Math.min(size - 1, Number(end));
+    return { status: 206, headers: { ...headers, 'Content-Range': `bytes ${start}-${last}/${size}` }, body: new Uint8Array(last + 1 - Number(start)) };
+  };
+}
+
 const SERIES = 'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE164nnn/GSE164378/suppl/';
 const sampleFolder = sample => `https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM5008nnn/${sample}/suppl/`;
 const SERIES_LISTING = `<pre><a href="/geo/series/GSE164nnn/GSE164378/">Parent Directory</a>
@@ -151,15 +168,18 @@ const FILE_LIST = [
   'File\tGSM5008740_seurat.rds.gz\t01/06/2021 21:08:18\t5550\tRDS',
 ].join('\n');
 
-test('GEO groups a series\' samples from its two listings alone, and opens one from its sample folder with the stated sizes', async t => {
+test('GEO groups a series\' samples from its two listings alone, and opens one from its sample folder, each file probed for its version', async t => {
   assert.equal(geoSupplementaryUrl('GSM5008737'), sampleFolder('GSM5008737'));
   assert.deepEqual(parseGeoFileList(FILE_LIST).map(file => [file.name, file.size, file.sample]).slice(0, 2), [
     ['GSM5008737_RNA_3P-barcodes.tsv.gz', 683095, 'GSM5008737'],
     ['GSM5008737_RNA_3P-features.tsv.gz', 233354, 'GSM5008737'],
   ]);
-  const calls = installFetch(t, url => {
+  const stated = new Map(parseGeoFileList(FILE_LIST).map(file => [`${sampleFolder(file.sample)}${file.name}`, file.size]));
+  let matrixWritten = 'Mon, 04 Jan 2021 09:05:23 GMT';
+  const calls = installFetch(t, (url, init) => {
     if (url === SERIES) return { status: 200, text: SERIES_LISTING };
     if (url === `${SERIES}filelist.txt`) return { status: 200, text: FILE_LIST };
+    if (stated.has(url)) return statedRoute(stated.get(url), url.endsWith('-matrix.mtx.gz') ? matrixWritten : 'Mon, 04 Jan 2021 09:05:23 GMT')(url, init);
     return null;
   });
   // No link names a dataset: the choices, the incomplete sample named apart.
@@ -174,15 +194,36 @@ test('GEO groups a series\' samples from its two listings alone, and opens one f
 
   calls.length = 0;
   const opened = await geo.open('GSE164378/GSM5008737_RNA_3P-matrix.mtx.gz');
-  assert.deepEqual(calls.map(call => call.url), [SERIES, `${SERIES}filelist.txt`], 'sizes come from the file list: no probe');
+  // The listings name no file's content: every file of the sample is probed
+  // for its version, all at once, the listed sizes notwithstanding.
+  assert.deepEqual(calls.slice(0, 2).map(call => call.url), [SERIES, `${SERIES}filelist.txt`]);
+  assert.deepEqual(
+    [...new Set(calls.slice(2).map(call => call.url))].sort(),
+    [...opened.files.files.values()].map(file => file.url).sort(),
+    'one round of probes, one per file'
+  );
   assert.equal(opened.files.id, 'geo:GSE164378:GSM5008737_RNA_3P-matrix.mtx.gz');
   assert.deepEqual(opened.files.format, { format: 'mtx', layout: 'folder' });
-  assert.deepEqual([...opened.files.files].map(([name, file]) => [name, file.url, file.size]), [
-    ['GSM5008737_RNA_3P-matrix.mtx.gz', `${sampleFolder('GSM5008737')}GSM5008737_RNA_3P-matrix.mtx.gz`, 1125353463],
-    ['GSM5008737_RNA_3P-features.tsv.gz', `${sampleFolder('GSM5008737')}GSM5008737_RNA_3P-features.tsv.gz`, 233354],
-    ['GSM5008737_RNA_3P-barcodes.tsv.gz', `${sampleFolder('GSM5008737')}GSM5008737_RNA_3P-barcodes.tsv.gz`, 683095],
+  assert.deepEqual([...opened.files.files].map(([name, file]) => [name, file.url, file.size, file.identity]), [
+    ['GSM5008737_RNA_3P-matrix.mtx.gz', `${sampleFolder('GSM5008737')}GSM5008737_RNA_3P-matrix.mtx.gz`, 1125353463,
+      { kind: 'remote', key: 'geo:GSE164378:GSM5008737_RNA_3P-matrix.mtx.gz:GSM5008737_RNA_3P-matrix.mtx.gz', version: 'written:1125353463 modified:Mon, 04 Jan 2021 09:05:23 GMT' }],
+    ['GSM5008737_RNA_3P-features.tsv.gz', `${sampleFolder('GSM5008737')}GSM5008737_RNA_3P-features.tsv.gz`, 233354,
+      { kind: 'remote', key: 'geo:GSE164378:GSM5008737_RNA_3P-matrix.mtx.gz:GSM5008737_RNA_3P-features.tsv.gz', version: 'written:233354 modified:Mon, 04 Jan 2021 09:05:23 GMT' }],
+    ['GSM5008737_RNA_3P-barcodes.tsv.gz', `${sampleFolder('GSM5008737')}GSM5008737_RNA_3P-barcodes.tsv.gz`, 683095,
+      { kind: 'remote', key: 'geo:GSE164378:GSM5008737_RNA_3P-matrix.mtx.gz:GSM5008737_RNA_3P-barcodes.tsv.gz', version: 'written:683095 modified:Mon, 04 Jan 2021 09:05:23 GMT' }],
   ]);
   assert.equal(opened.title, 'GSE164378 / GSM5008737_RNA_3P-matrix.mtx.gz');
+  // Opened again unchanged: the same versions. The matrix replaced on GEO
+  // (the same size, written later): its version changes, the lists' do not.
+  const versionsOf = set => [...set.files.files.values()].map(file => file.identity.version);
+  const again = await geo.open('GSE164378/GSM5008737_RNA_3P-matrix.mtx.gz');
+  assert.deepEqual(versionsOf(again), versionsOf(opened));
+  matrixWritten = 'Tue, 05 Jan 2021 10:00:00 GMT';
+  const replaced = await geo.open('GSE164378/GSM5008737_RNA_3P-matrix.mtx.gz');
+  assert.notEqual(versionsOf(replaced)[0], versionsOf(opened)[0]);
+  assert.deepEqual(versionsOf(replaced).slice(1), versionsOf(opened).slice(1));
+  assert.equal(replaced.files.files.get('GSM5008737_RNA_3P-matrix.mtx.gz').lastModified, matrixWritten,
+    'every read of it must say the date its version names');
 
   // Mixed naming: the antibody sample's list is genes.tsv.gz.
   const adt = await geo.open('GSE164378/GSM5008738_ADT_3P-matrix.mtx.gz');
@@ -198,13 +239,14 @@ test('GEO groups a series\' samples from its two listings alone, and opens one f
     geo.open('GSE164378/GSM5008737_RNA_3P-barcodes.tsv.gz'),
     /not a dataset Cellucid opens on its own\. Open a MatrixMarket sample by its matrix: geo:GSE164378\/GSM5008737_RNA_3P-matrix\.mtx\.gz/
   );
-  // A gzipped R object in the archive opens from its sample folder, its size stated.
+  // A gzipped R object in the archive opens from its sample folder, probed for its version.
   calls.length = 0;
   const rds = await geo.open('GSE164378/GSM5008740_seurat.rds.gz');
   assert.equal(rds.file.resource.url, `https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM5008nnn/GSM5008740/suppl/GSM5008740_seurat.rds.gz`);
   assert.equal(rds.file.resource.size, 5550);
+  assert.equal(rds.file.resource.identity.version, 'written:5550 modified:Mon, 04 Jan 2021 09:05:23 GMT');
   assert.deepEqual(rds.file.format, { format: 'rds', layout: 'file' });
-  assert.equal(calls.length, 2, 'the listings only');
+  assert.ok(calls.slice(2).every(call => call.url === rds.file.resource.url), 'the listings, then its probe');
 });
 
 test('GEO pairs a series folder\'s own triplet, probing the three sizes together when it opens', async t => {
@@ -415,15 +457,17 @@ test('a MatrixMarket matrix of several feature types opens as one modality per t
   const genes = opened.root.get('mod/Gene Expression/X');
   const peakVar = opened.root.get('mod/Peaks/var');
   assert.deepEqual([...await peakVar.get(peakVar.attrs._index).read()], ['chr1:1-100', 'chr1:200-300', 'chr2:5-50']);
+  // The store keeps its cells in priority order: row r is cell positions[r].
+  const positions = await opened.root.get('obs/cellucid_original_position').read();
   const dense = async (node, nFeatures) => {
     const indptr = await node.get('indptr').read();
     const indices = await node.get('indices').read();
     const data = await node.get('data').read();
     const out = Array.from({ length: 4 }, () => new Array(nFeatures).fill(0));
     if (node.attrs['encoding-type'] === 'csr_matrix') {
-      for (let cell = 0; cell < 4; cell++) for (let k = indptr[cell]; k < indptr[cell + 1]; k++) out[cell][indices[k]] = data[k];
+      for (let row = 0; row < 4; row++) for (let k = indptr[row]; k < indptr[row + 1]; k++) out[positions[row]][indices[k]] = data[k];
     } else {
-      for (let f = 0; f < nFeatures; f++) for (let k = indptr[f]; k < indptr[f + 1]; k++) out[indices[k]][f] = data[k];
+      for (let f = 0; f < nFeatures; f++) for (let k = indptr[f]; k < indptr[f + 1]; k++) out[positions[indices[k]]][f] = data[k];
     }
     return out;
   };
@@ -440,12 +484,10 @@ test('a cell table\'s clustering columns are categories even when their labels a
     assert.ok(isClusteringColumn(name), name);
   }
   for (const name of ['n_counts', 'percent.mt', 'clustered_score_x', 'UMAP_1']) assert.ok(!isClusteringColumn(name), name);
-  const table = {
-    names: ['barcode', 'Cluster', 'leiden', 'n_counts'],
-    columns: [['A', 'B', 'C'], ['2', '10', '2'], ['0', '1', '1'], ['100', '250', '75']],
-    rows: 3,
-  };
-  const { columns } = joinTable(table, ['A', 'B', 'C']);
+  const { readTable } = await import('../assets/js/data/anndata/transcode/tables.js');
+  const bytes = new TextEncoder().encode('barcode,Cluster,leiden,n_counts\nA,2,0,100\nB,10,1,250\nC,2,1,75\n');
+  const table = await readTable({ size: bytes.length, read: async (offset, length) => bytes.subarray(offset, offset + length) }, { cells: ['A', 'B', 'C'] });
+  const { columns } = joinTable(table, 3);
   const byName = Object.fromEntries(columns.map(entry => [entry.name, entry.column]));
   assert.equal(byName.Cluster.kind, 'categorical');
   assert.deepEqual(byName.Cluster.categories, ['2', '10'], 'numeric labels in numeric order');
@@ -464,8 +506,38 @@ test('a cell table longer than the engine\'s argument limit is read whole', asyn
   for (let i = 0; i < rows; i++) lines.push(`C${i}-1,${i % 97},${-(i % 89)}`);
   const bytes = new TextEncoder().encode(`${lines.join('\n')}\n`);
   const reader = { size: bytes.length, read: async (offset, length) => bytes.subarray(offset, offset + length) };
-  const table = await readTable(reader);
+  const cells = Array.from({ length: rows }, (_, i) => `C${i}-1`);
+  const table = await readTable(reader, { cells });
   assert.equal(table.rows, rows);
   assert.deepEqual(table.names, ['Barcode', 'UMAP-1', 'UMAP-2']);
-  assert.equal(table.columns[1][rows - 1], String((rows - 1) % 97));
+  assert.equal(table.numbers[1][rows - 1], (rows - 1) % 97);
+  assert.equal(table.rowOf[rows - 1], rows - 1);
+});
+
+test('a GEO matrix stored as text, or an archive, is refused saying what to do, a named one before anything is read', async t => {
+  // GSE131907: a 208k-cell matrix written out as text, and a data-frame .rds.
+  const series = 'https://ftp.ncbi.nlm.nih.gov/geo/series/GSE131nnn/GSE131907/suppl/';
+  const listing = `<pre><a href="GSE131907_Lung_Cancer_raw_UMI_matrix.txt.gz">GSE131907_Lung_Cancer_raw_UMI_matrix.txt.gz</a> 2019-06-01 10:00  1.1G
+<a href="GSE131907_Lung_Cancer_cell_annotation.txt.gz">GSE131907_Lung_Cancer_cell_annotation.txt.gz</a> 2019-06-01 10:00  2.0M
+<a href="GSE131907_TCR_clones.tar.gz">GSE131907_TCR_clones.tar.gz</a> 2019-06-01 10:00  9.0M</pre>`;
+  const calls = installFetch(t, url => {
+    if (url === series) return { status: 200, text: listing };
+    return null;
+  });
+  await assert.rejects(geo.open('GSE131907'), error => {
+    assert.match(error.message, /has no supplementary file Cellucid opens/);
+    assert.match(error.message, /GSE131907_Lung_Cancer_raw_UMI_matrix\.txt\.gz is a matrix stored as text/);
+    assert.match(error.message, /sc\.read_text\(path\)/);
+    assert.match(error.message, /data\.table::fread\(path\)/);
+    assert.match(error.message, /cellucid\.prepare\(path, format="h5ad", data=adata\)/);
+    assert.match(error.message, /GSE131907_TCR_clones\.tar\.gz is an archive/);
+    assert.doesNotMatch(error.message, /cell_annotation\.txt\.gz is a matrix/);
+    return true;
+  });
+  calls.length = 0;
+  await assert.rejects(geo.open('GSE131907/GSE131907_Lung_Cancer_raw_UMI_matrix.txt.gz'), error => {
+    assert.match(error.message, /^GEO GSE131907: GSE131907_Lung_Cancer_raw_UMI_matrix\.txt\.gz is a matrix stored as text/);
+    return true;
+  });
+  assert.deepEqual(calls, [], 'refused from its name: nothing asked of the host');
 });

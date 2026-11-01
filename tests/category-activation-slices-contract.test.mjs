@@ -12,6 +12,7 @@ import {
   createShownCellVisibilityMask,
   writableCellVisibilityMask,
 } from '../assets/js/app/state/managers/per-cell-array-ownership.js';
+import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
 /**
  * Activating a category field of a large dataset does its dataset-length
@@ -130,19 +131,19 @@ test('category counts read from the totals equal a count of the cells, filtered 
       kind: 'category',
       categories,
       codes,
-      _categoryVisible: Object.fromEntries(categories.map((_, k) => [k, true])),
+      _categoryVisible: visibleOf(categories.map(() => true)),
       _categoryFilterEnabled: true,
-      _categoryColors: categories.map(() => [0.5, 0.5, 0.5]),
+      _categoryColors: colorsOf(categories.map(() => [0.5, 0.5, 0.5])),
     };
     const state = countState(n, field);
     await prepareCategoryTotals(codes, categories.length, { sliceMs: 0, yieldToMacrotask: immediately });
     for (const hidden of [[], [2], [0, 5], [1, 2, 3, 4]]) {
-      field._categoryVisible = Object.fromEntries(categories.map((_, k) => [k, !hidden.includes(k)]));
+      field._categoryVisible = visibleOf(categories.map((_, k) => !hidden.includes(k)));
       state.computeGlobalVisibility();
       // The visibility itself, cell by cell (the mask shows every cell).
       for (let i = 0; i < n; i++) {
         const want = codes[i] >= categories.length || !hidden.includes(codes[i]) ? 1 : 0;
-        if (state.categoryTransparency[i] !== want || state.colorsArray[i * 4 + 3] !== want * 255) {
+        if (state.categoryTransparency[i] !== want || state.colorsArray[i * 4 + 3] !== 255) {
           assert.fail(`${Codes.name} cell ${i}: visibility ${state.categoryTransparency[i]}, expected ${want}`);
         }
       }
@@ -154,7 +155,7 @@ test('category counts read from the totals equal a count of the cells, filtered 
     // A mask that hides cells: the counts come from the cells again.
     const mask = writableCellVisibilityMask(state);
     for (let i = 0; i < n; i += 3) mask[i] = 0;
-    field._categoryVisible = Object.fromEntries(categories.map((_, k) => [k, k !== 1]));
+    field._categoryVisible = visibleOf(categories.map((_, k) => k !== 1));
     state.computeGlobalVisibility();
     const counts = state.computeCategoryCountsForField(field);
     assert.deepEqual(counts.visible, tally(codes, state.categoryTransparency, categories.length).visible);

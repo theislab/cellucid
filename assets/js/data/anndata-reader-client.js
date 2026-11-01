@@ -31,16 +31,30 @@
  */
 
 import { getTransferLog } from './transfer-log.js';
-import { onAbort } from '../formats/io/abort.js';
+import { onAbort, abortReason, cancelled, isCancellation } from '../utils/abort.js';
+import { progressiveRequest } from './opening-cost.js';
 import { getReadActivityLog } from './read-activity-log.js';
 import { setSourceRequestConcurrency } from './fetch-scheduler.js';
-import { holdTranscodedStore, removeTranscodedStore } from './anndata/transcode/space.js';
+import { requestOfOpenCells, requireCellSubsetRequest, takeCellSubsetRequest } from './cell-subset-policy.js';
+import { THIS_TAB, holdTranscodedStore, letGoTranscodedStore, removeTranscodedStore } from './anndata/transcode/space.js';
+import { getOpeningProgress } from './opening-progress.js';
+import { wholeReadNote } from './whole-read-notice.js';
 import { DataSourceError, DataSourceErrorCode } from './data-source.js';
 import { EmbeddingLoadError, MappingLoadError } from './data-mapping-candidates.js';
 import { DataMappingError } from './data-mapping.js';
-import { confirmSourceUnreadable, onSourceAccessRevoked, resolveSourceAccess } from './sources/access.js';
+import { confirmSourceUnreadable, confirmSourceVersion, onSourceAccessRevoked, resolveSourceAccess } from './sources/access.js';
 import { annDataReaderWorkerScript } from '../../workers/scripts.js';
 import { startWorker } from '../workers/worker-script.js';
+import { workerFailureReason } from '../workers/worker-failure.js';
+import { hostRequesterPort } from '../formats/io/host-fetch.js';
+import { byteRangeCachePort } from './byte-range-cache.js';
+import { connectMemoryWorker } from './memory-budget.js';
+import { hostLinkSeed, hostOf, rememberHostLink, rememberHostPace } from './host-link-memory.js';
+import { realmHosts } from '../formats/io/hosts.js';
+import { PieceReceiver } from '../utils/large-arrays.js';
+import { copyTypedArray } from './sparse-column-index.js';
+import { columnFormOf, noteColumnForm } from './column-forms.js';
+import { fromWire } from '../utils/error-wire.js';
 
 /** Error details as a record that crosses to the worker. */
 function plainDetails(details) {
@@ -67,14 +81,33 @@ let workerFactory = createDefaultWorker;
 let spareWorker = null;
 /** Ends the spare when the page is left, while nothing has adopted it. */
 let sparePageHide = null;
+/** Whether the spare's script failed before anything adopted it (it heard `error` and never spoke). */
+let spareFailed = false;
+/** Hears the spare's first message and its failure, until it is adopted. */
+let spareListener = null;
 
-/** The spare worker, now owned by the caller, or null. */
+/**
+ * The spare worker, now owned by the caller, or null. A spare whose script
+ * failed to load (a page that outlived its deploy) is ended, not adopted:
+ * the caller starts a worker of its own, so its first request is never
+ * posted to a worker that will not answer.
+ */
 function takeSpareWorker() {
   const worker = spareWorker;
+  const failed = spareFailed;
   spareWorker = null;
+  spareFailed = false;
   if (sparePageHide !== null) {
     window.removeEventListener('pagehide', sparePageHide);
     sparePageHide = null;
+  }
+  if (worker !== null && spareListener !== null) {
+    worker.removeEventListener?.('error', spareListener);
+    spareListener = null;
+  }
+  if (failed) {
+    worker?.terminate?.();
+    return null;
   }
   return worker;
 }
@@ -92,10 +125,90 @@ function takeSpareWorker() {
 export function prewarmAnnDataReaderWorker() {
   if (spareWorker !== null) return;
   spareWorker = workerFactory();
+  spareFailed = false;
+  // Heard from its start: a script that fails to load fires `error` before
+  // anything adopts the spare, and is then not adopted (`takeSpareWorker`).
+  spareListener = event => {
+    event?.preventDefault?.();
+    spareFailed = true;
+  };
+  spareWorker.addEventListener?.('error', spareListener);
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-    sparePageHide = () => releaseSpareAnnDataReaderWorker();
+    // Into the back/forward cache, the page (and its spare) is frozen as it
+    // is and may come back: only a page really left lets the spare go.
+    sparePageHide = event => {
+      if (event?.persisted !== true) releaseSpareAnnDataReaderWorker();
+    };
     window.addEventListener('pagehide', sparePageHide);
   }
+}
+
+/**
+ * Reader workers asked to leave that have not said they left (`{event:
+ * 'left'}`), each with the closer of its channel to the page's byte range
+ * cache, until the application is torn down (`retireAnnDataReaderWorkers`).
+ * @type {Map<Worker, () => void>}
+ */
+const leavingWorkers = new Map();
+/** Whether the application is torn down: a worker is then ended at once. */
+let readersRetired = false;
+
+/**
+ * End a reader worker that read files: it is asked to leave (`{leave:
+ * true}`: it stops its reads, makes the writes of what it keeps of its
+ * files, `formats/io/kept-parts.js`, and ends itself), so not even the piece
+ * it was writing is lost with it, as it may be when a worker is ended from
+ * outside; one that cannot be asked, or asked once the
+ * application is torn down, is ended at once.
+ *
+ * Its channel to the page's byte range cache (`closeRange`) stays open while
+ * it leaves: the ranges it fetched last reach the page as messages (`keep`)
+ * still queued when it is asked, and a channel closed then drops them. The
+ * worker ends the channel after them (`endRangeCachePort`); a worker ended
+ * from outside has its channel closed with it.
+ *
+ * @param {Worker} worker
+ * @param {(() => void)|null} [closeRange]
+ */
+function endWorker(worker, closeRange = null) {
+  const endNow = () => {
+    leavingWorkers.delete(worker);
+    worker.terminate?.();
+    closeRange?.();
+  };
+  if (readersRetired) {
+    endNow();
+    return;
+  }
+  leavingWorkers.set(worker, () => closeRange?.());
+  worker.addEventListener?.('message', event => {
+    if (event.data?.event !== 'left') return;
+    leavingWorkers.delete(worker);
+    // Ended by the worker already (`{end: true}`); closing again is nothing.
+    closeRange?.();
+  });
+  try {
+    worker.postMessage({ leave: true });
+  } catch {
+    endNow();
+  }
+}
+
+/**
+ * The application is torn down (`app/main.js`): it waits for no reader, since
+ * one that never answers (a worker whose thread is stuck) would hold the
+ * teardown and its memory for the page's life. Every worker still leaving is
+ * ended from outside now, giving up what it had not yet kept of its files,
+ * with its range channel, and every one ended from here on is ended at once.
+ */
+export function retireAnnDataReaderWorkers() {
+  readersRetired = true;
+  for (const [worker, closeRange] of leavingWorkers) {
+    worker.terminate?.();
+    closeRange();
+  }
+  leavingWorkers.clear();
+  releaseSpareAnnDataReaderWorker();
 }
 
 /** End the spare reader worker, if one waits. */
@@ -127,11 +240,6 @@ const nextTask = (() => {
   return callback => setTimeout(callback, 0);
 })();
 
-/** Why a cancelled call stopped: its signal's reason, else an AbortError. */
-function abortReason(signal) {
-  return signal.reason ?? new DOMException('The read was cancelled.', 'AbortError');
-}
-
 /**
  * Replace how reader workers are created (tests run the same handler
  * in-process); `null` restores the module worker.
@@ -147,79 +255,64 @@ export function setAnnDataReaderWorkerFactory(factory) {
   workerFactory = factory ?? createDefaultWorker;
 }
 
-const ERROR_TYPES = {
-  RangeError,
-  TypeError,
-  SyntaxError,
+/** A gene column's array of its own for one more caller of the gene. */
+const copiedColumn = column => copyTypedArray(column.constructor, column, 'Gene column');
+
+/** A dense gene column the worker answered (`{column, form}`), its sparse form noted beside it. */
+const notedColumn = ({ column, form }) => noteColumnForm(column, form);
+
+/** The reader's own error classes, rebuilt as themselves (`utils/error-wire.js`). */
+/**
+ * Listeners of a matrix read after its map (`anndata/transcode/matrix-market.js`),
+ * in every reader: `{client, event: 'genes-arriving', cells, bytes, of}`
+ * as a pass over the matrix begins (how far it is: its read activity), then
+ * `{client, event: 'genes-arrived', sample, cellSubset}` once the open
+ * cells were read again on the store it made, or with `error` when it
+ * failed.
+ *
+ * @type {Set<(message: Object) => void>}
+ */
+const matrixShareListeners = new Set();
+
+/**
+ * Hear every reader's matrix read after its map (`matrixShareListeners`).
+ *
+ * @param {(message: Object) => void} listener
+ * @returns {() => void} Stops hearing
+ */
+export function onMatrixShare(listener) {
+  matrixShareListeners.add(listener);
+  return () => matrixShareListeners.delete(listener);
+}
+
+// A pace a host was found to bear, learnt here or by a reader worker (told
+// over the hosts channel), is kept for later visits (`host-link-memory.js`).
+realmHosts.watchPace((origin, paceMs) => rememberHostPace(origin, paceMs));
+
+const READER_ERROR_CLASSES = {
+  DataSourceError: record => new DataSourceError(record.message, record.code, record.sourceType ?? null, record.details ?? {}),
+  EmbeddingLoadError: record => {
+    const error = new EmbeddingLoadError(record.key, record.columns ?? [], record.reason);
+    error.message = record.message;
+    return error;
+  },
+  MappingLoadError: record => new MappingLoadError(record.key, record.reason, record.message),
+  DataMappingError: record => new DataMappingError(record.code, record.message),
 };
 
 /**
- * Rebuild an error the worker serialized, with its original class.
+ * Rebuild an error the worker sent (`toWire`), with its class, kind, code
+ * and cause: a refusal for size raised as a plain error is the data
+ * source's `TOO_LARGE`.
  *
  * @param {Object} record
  * @returns {Error}
  */
 export function rebuildReaderError(record) {
-  if (record === null || typeof record !== 'object') {
-    return new Error(String(record));
+  if (record?.code === DataSourceErrorCode.TOO_LARGE && record.name !== 'DataSourceError' && !isCancellation(record)) {
+    return fromWire({ ...record, name: 'DataSourceError', sourceType: null, details: { bytes: record.bytes } }, READER_ERROR_CLASSES);
   }
-  const cause = record.cause === undefined ? undefined : rebuildReaderError(record.cause);
-  const options = cause === undefined ? undefined : { cause };
-  let error;
-  switch (record.name) {
-    case 'DataSourceError':
-      error = new DataSourceError(
-        record.message,
-        record.code,
-        record.sourceType ?? null,
-        record.details ?? {}
-      );
-      break;
-    case 'EmbeddingLoadError':
-      error = new EmbeddingLoadError(record.key, record.columns ?? [], record.reason);
-      error.message = record.message;
-      break;
-    case 'MappingLoadError':
-      error = new MappingLoadError(record.key, record.reason, record.message);
-      break;
-    case 'DataMappingError':
-      error = new DataMappingError(record.code, record.message);
-      break;
-    case 'AggregateError':
-      error = new AggregateError(
-        (record.errors ?? []).map(rebuildReaderError),
-        record.message,
-        options
-      );
-      break;
-    default: {
-      if (record.code === 'TOO_LARGE') {
-        error = new DataSourceError(
-          record.message,
-          DataSourceErrorCode.TOO_LARGE,
-          null,
-          { bytes: record.bytes }
-        );
-        break;
-      }
-      const ErrorType = ERROR_TYPES[record.name] ?? Error;
-      error = new ErrorType(record.message, options);
-      if (!(record.name in ERROR_TYPES) && record.name !== 'Error') {
-        error.name = record.name;
-      }
-    }
-  }
-  if (cause !== undefined && error.cause === undefined) {
-    Object.defineProperty(error, 'cause', {
-      value: cause,
-      configurable: true,
-      writable: true,
-    });
-  }
-  for (const key of ['code', 'key', 'reason', 'bytes', 'details']) {
-    if (record[key] !== undefined && error[key] === undefined) error[key] = record[key];
-  }
-  return error;
+  return fromWire(record, READER_ERROR_CLASSES);
 }
 
 /**
@@ -232,10 +325,15 @@ export class AnnDataReaderClient {
     this._pending = new Map();
     this._snapshot = null;
     this._closed = false;
+    /** Ends the worker's channel to the page's byte range cache (`byte-range-cache.js`). */
+    this._closeRangeCache = null;
+    /** The worker's memory channel (`memory-budget.js` `connectMemoryWorker`), while a worker runs. */
+    this._memory = null;
     this._obsFields = new Map();
     this._obsInfo = new Map();
     this._varNames = new Map();
     this._onPageHide = null;
+    this._onHidden = null;
     this._source = null;
     this._reopening = null;
     /**
@@ -267,41 +365,127 @@ export class AnnDataReaderClient {
     if (this._closed) throw new Error('No AnnData file is open. Call open() first.');
     if (this._worker !== null) return this._worker;
     const worker = takeSpareWorker() ?? workerFactory();
-    worker.onmessage = event => this._receive(event.data);
+    // The page's memory state goes first, so the worker's budgets are the
+    // page's from its first request; its reports come back (`memory-budget.js`).
+    this._memory = connectMemoryWorker(worker);
+    // Whether the worker ever spoke: one that never did and reports an
+    // error is a script that did not load, not a stray error of a live one.
+    let heard = false;
+    worker.onmessage = event => {
+      heard = true;
+      this._receive(event.data);
+    };
     // A sign-out drops the targets the worker holds (`sources/access.js`).
     this._stopAccessRevokes ??= onSourceAccessRevoked(ref => {
       this._worker?.postMessage({ sourceAccessRevoked: ref });
     });
     worker.onerror = event => {
       event?.preventDefault?.();
-      this._failAll(new Error(
-        `The AnnData reader stopped: ${event?.message ?? 'unknown error'}`
-      ));
+      if (this._worker !== worker) return;
+      if (!heard) {
+        // Its script failed to load (a page that outlived its deploy, a
+        // module this browser cannot run): nothing posted to it will be
+        // answered. It is retired, every call waiting on it fails saying
+        // so, and the next call starts a new worker.
+        this._retireWorker(new Error(
+          `The AnnData reader could not start (${workerFailureReason(event)}). ` +
+          'Reload the page; if Cellucid was just updated, the reload loads the new version.'
+        ));
+        return;
+      }
+      // A stray error in a live worker (a timer, a port's handler): it goes
+      // on answering, so the reads waiting on it are not failed for it.
+      console.error('[AnnDataReaderClient] The reader worker reported an error:', event?.message ?? event);
+    };
+    // A reply that cannot be read here lost one call's answer, and which
+    // call cannot be told: every call waiting fails rather than waits forever.
+    worker.onmessageerror = () => {
+      if (this._worker !== worker) return;
+      this._failAll(new Error('A reply of the AnnData reader could not be read; ask again.'));
     };
     this._worker = worker;
+    // A notebook widget's viewer reads its host through the page
+    // (`formats/io/host-fetch.js`): the worker is handed a port to it before
+    // its first request.
+    const hostPort = hostRequesterPort();
+    if (hostPort !== null) worker.postMessage({ hostRequesterPort: hostPort }, [hostPort]);
+    // The bytes of remote files the page keeps (`data/byte-range-cache.js`):
+    // a worker opening a file another one read fetches none of them again.
+    const range = byteRangeCachePort();
+    if (range !== null) {
+      worker.postMessage({ rangeCachePort: range.port }, [range.port]);
+      this._closeRangeCache = range.close;
+    }
     // A worker outlives its document unless it is ended: once the page is
     // left, one still reading the file (a background gene index) fails its
     // reads, and in WebKit holds the next page's file reads waiting behind
-    // its own. So leaving the page ends the worker; a page restored from the
-    // back/forward cache reopens the same file on its next request.
+    // its own. So leaving the page ends the worker. A page put in the
+    // back/forward cache (`persisted`) is frozen with its worker and may come
+    // back as it was: the worker is kept, so the reads under way (the gene
+    // shown, a growth step, a job) go on when the person returns, and
+    // nothing is reported as stopped. While frozen it holds its kept stores
+    // as another tab of the same dataset would.
     if (this._onPageHide === null && typeof window !== 'undefined' &&
         typeof window.addEventListener === 'function') {
-      this._onPageHide = () => this._suspend();
+      this._onPageHide = event => {
+        if (event?.persisted !== true) this._suspend();
+      };
       window.addEventListener('pagehide', this._onPageHide);
+    }
+    // A page hidden (another tab, a minimised window, a phone's app switch)
+    // may be discarded without another event: the worker has what it
+    // fetched held by the disk now (`formats/io/kept-parts.js`).
+    if (this._onHidden === null && typeof document !== 'undefined' &&
+        typeof document.addEventListener === 'function') {
+      this._onHidden = () => {
+        if (document.visibilityState === 'hidden') this._worker?.postMessage({ flushKeptParts: true });
+      };
+      document.addEventListener('visibilitychange', this._onHidden);
     }
     return worker;
   }
 
   _receive(message) {
+    if (message?.event === 'memory') {
+      // What the worker's caches keep, an allocation it was refused or
+      // granted, what it let go (`memory-budget.js`).
+      this._memory?.receive(message);
+      return;
+    }
     if (message?.event === 'transcoded') {
-      // A complete store is kept for the tab's life; an unfinished one is
-      // removed if this reader closes before it completes.
+      // A complete store is kept for the tab's life (the worker lets its
+      // own hold go once told this page holds it), until a newer one
+      // replaces it (a larger matrix share: let go, and removed when
+      // nobody holds it); an unfinished one is removed if this reader
+      // closes before it completes.
       if (message.state === 'complete') {
         this._unfinishedStores.delete(message.directory);
-        holdTranscodedStore(message.directory);
+        const worker = this._worker;
+        void holdTranscodedStore(message.directory).then(() => worker?.postMessage({ storeHeld: message.directory }));
+      } else if (message.state === 'replaced') {
+        void letGoTranscodedStore(message.directory);
       } else {
         this._unfinishedStores.add(message.directory);
       }
+      return;
+    }
+    if (message?.event === 'genes-arriving' || message?.event === 'genes-arrived') {
+      // A matrix read after its map (`anndata/transcode/matrix-market.js`):
+      // a pass over it began, or the open cells were read again on the store
+      // it made (their gene sample now), or it failed.
+      if (message.event === 'genes-arrived' && message.error === undefined) {
+        this._setGeneSample(message.sample ?? null);
+        if (this._snapshot?.cellSubset != null && message.cellSubset != null) this._snapshot.cellSubset.genes = message.cellSubset.genes ?? null;
+      }
+      const { event, ...rest } = message;
+      for (const listener of matrixShareListeners) listener({ client: this, event, ...rest, ...(message.error === undefined ? {} : { error: rebuildReaderError(message.error) }) });
+      return;
+    }
+    if (message?.event === 'whole-read') {
+      // Up front, before the file is read: it cannot be read in parts, how
+      // much is read, and what becomes of it (or that an earlier read's
+      // store opens instead).
+      getOpeningProgress().notice(wholeReadNote(message));
       return;
     }
     if (message?.event === 'choose') {
@@ -344,6 +528,15 @@ export class AnnDataReaderClient {
       });
       return;
     }
+    if (message?.event === 'source-version') {
+      // Before a reader files what it kept under the version opened: whether
+      // the provider says the version still holds (`sources/access.js`).
+      const worker = this._worker;
+      confirmSourceVersion(message.ref).then(holds => {
+        worker?.postMessage({ sourceVersion: message.request, holds });
+      });
+      return;
+    }
     if (message?.event === 'activity') {
       // What one read operation fetched and decoded, for the read activity
       // log and the console.
@@ -354,12 +547,39 @@ export class AnnDataReaderClient {
     if (message?.event === 'link') {
       const { event: _event, ...measurement } = message;
       this._link = Object.freeze(measurement);
+      // What the host delivered, kept for the next opening's sizing (`host-link-memory.js`).
+      rememberHostLink(this._linkHost, measurement);
+      return;
+    }
+    if (message?.event === 'piece') {
+      // A piece of an array of the reply that follows (`utils/large-arrays.js`):
+      // copied into its array at once, so pieces never pile up.
+      const pending = this._pending.get(message.id);
+      if (pending !== undefined) {
+        try {
+          (pending.pieces ??= new PieceReceiver()).receive(message);
+        } catch (error) {
+          this._pending.delete(message.id);
+          pending.reject(error);
+        }
+      }
+      return;
+    }
+    if (message?.event === 'partial') {
+      // A gene on more cells, before its reply (`getMatrixColumn`'s `onPartial`).
+      const pending = this._pending.get(message.id);
+      if (pending?.onPartial) pending.onPartial((pending.pieces ?? new PieceReceiver()).resolve(message));
       return;
     }
     if (message?.event === 'transfer') {
       if (typeof message.retrying === 'string') {
         // A request made again after a transient failure.
         getTransferLog().retrying(message.url, message.retrying);
+        return;
+      }
+      if (message.waiting !== undefined) {
+        // A wait the host named (its request budget, a Retry-After), or its end (null).
+        getTransferLog().waiting(message.url, typeof message.waiting === 'string' ? message.waiting : null);
         return;
       }
       if (message.arriving === true) {
@@ -379,8 +599,19 @@ export class AnnDataReaderClient {
     const pending = this._pending.get(message?.id);
     if (pending === undefined) return;
     this._pending.delete(message.id);
-    if (message.error !== undefined) pending.reject(rebuildReaderError(message.error));
-    else pending.resolve(message.result);
+    if (message.error !== undefined) {
+      pending.reject(rebuildReaderError(message.error));
+      return;
+    }
+    let result;
+    try {
+      // Every reply is resolved: an array posted in pieces stands in it as a placeholder.
+      result = (pending.pieces ?? new PieceReceiver()).resolve(message.result);
+    } catch (error) {
+      pending.reject(error);
+      return;
+    }
+    pending.resolve(result);
   }
 
   _failAll(error) {
@@ -393,36 +624,108 @@ export class AnnDataReaderClient {
     return this._callWith({}, method, ...args);
   }
 
-  /** End the worker when the page is left, keeping what reopens the file. */
+  /** End the worker when the page is left (not into the back/forward cache): its requests end as `page-left` cancellations. */
   _suspend() {
+    this._endWorker(cancelled('page-left', 'The page was left; its AnnData reads were ended.'));
+  }
+
+  /**
+   * The dataset is no longer shown (another source is): end the worker and
+   * everything it holds -- the open store, the gene indexes, the caches, its
+   * decode workers -- keeping only what opens exactly the same cells again
+   * (the file, the link, the cells: `_source`). The worker leaves as on
+   * `close()` (`endWorker`: what it keeps of its files is completed first).
+   * The next request reopens it (`_callWith`), reading what this browser
+   * keeps of it (kept parts, kept gene indexes, the page's fetched ranges)
+   * before any byte from the network. Requests under way end as
+   * cancellations.
+   */
+  suspend() {
+    if (this._closed) return;
+    this._endWorker(cancelled('closed', 'The dataset is no longer shown; its reader was closed.'));
+  }
+
+  /**
+   * Retire a worker that cannot answer (its script failed to load): ended
+   * from outside, every call waiting on it failed with `error`, and the next
+   * call starts a new one (reopening the file, `_callWith`).
+   * @private
+   */
+  _retireWorker(error) {
     const worker = this._worker;
     if (worker === null) return;
     this._worker = null;
     this._reopening = null;
-    this._failAll(new Error('The page was left; the AnnData request was ended'));
+    this._failAll(error);
     worker.terminate?.();
+    this._takeRangeCacheClose()?.();
+    this._releaseMemoryChannel();
+  }
+
+  /** @private */
+  _endWorker(reason) {
+    const worker = this._worker;
+    if (worker === null) return;
+    this._worker = null;
+    this._reopening = null;
+    this._failAll(reason);
+    endWorker(worker, this._takeRangeCacheClose());
+    this._releaseMemoryChannel();
+  }
+
+  /**
+   * Let the worker give back its caches of `level` (`memory-budget.js`
+   * `releaseResidentMemory`): another dataset opens beside this one. Nothing
+   * in use goes; reads in flight finish.
+   *
+   * @param {'caches'|'all'} level
+   * @param {string} reason
+   */
+  releaseCaches(level, reason) {
+    if (this._closed || this._worker === null) return;
+    this._worker.postMessage({ memoryRelease: level, reason });
+  }
+
+  /** @private */
+  _releaseMemoryChannel() {
+    const memory = this._memory;
+    this._memory = null;
+    memory?.disconnect();
   }
 
   /**
    * `_call`, handing the worker the buffers in `transfer`; `signal` cancels
    * the call (here at once, and in the worker by a cancel message).
    */
-  _callWith({ transfer = [], signal = null }, method, ...args) {
+  _callWith({ transfer = [], signal = null, onPartial = null }, method, ...args) {
     if (this._worker === null && method !== 'open' && this._source !== null && !this._closed) {
-      // The page came back from the back/forward cache: open the file again.
-      this._reopening ??= this._post([], null, 'open', [this._source]);
-      return this._reopening.then(() => this._post(transfer, signal, method, args));
+      // The reader was ended (the dataset no longer shown, the page back from
+      // the back/forward cache): open the file again, asking its source for
+      // its version before anything kept of it is used (`resumed`).
+      if (this._reopening === null) {
+        const reopening = this._post([], null, 'open', [{ ...this._source, resumed: true }]);
+        this._reopening = reopening;
+        // A failed reopen is not kept: its worker, with no file open in it,
+        // is let go, and the next call opens the file again.
+        reopening.catch(error => {
+          if (this._reopening !== reopening) return;
+          this._reopening = null;
+          this._endWorker(error);
+        });
+      }
+      return this._reopening.then(() => this._post(transfer, signal, method, args, onPartial));
     }
-    return this._post(transfer, signal, method, args);
+    return this._post(transfer, signal, method, args, onPartial);
   }
 
-  _post(transfer, signal, method, args) {
+  _post(transfer, signal, method, args, onPartial = null) {
     if (signal?.aborted) return Promise.reject(abortReason(signal));
     const worker = this._ensureWorker();
     const id = this._nextId++;
     return new Promise((resolve, reject) => {
       let detach = () => {};
       this._pending.set(id, {
+        onPartial,
         resolve: value => {
           detach();
           resolve(value);
@@ -464,17 +767,80 @@ export class AnnDataReaderClient {
    *   `choose`: asks the person which object of a file holding several to
    *   open (an `.rda` of several Seurat objects); resolves to its index
    * @returns {Promise<{name: string, format: string, layout: string, zarrVersion: 2|3|null,
-   *   conversion: import('./anndata/transcode/session.js').Conversion|null}>}
+   *   conversion: import('./anndata/transcode/session.js').Conversion|null, notes: string[]}>}
    *   `conversion`: for a format read once into this browser (`.rds`, a
-   *   MatrixMarket folder), where it is kept and what was not read
+   *   MatrixMarket folder), where it is kept and what was not read;
+   *   `notes`: what the reader left out of the dataset, and why (a column
+   *   it cannot read, `AnnDataReader.notes`)
    */
   async open(source, { expect = null, fromLink = false, choose = null } = {}) {
     this._choose = choose;
     // The log follows the dataset being opened, from its first read.
     getReadActivityLog().clear();
+    // Which cells to open: the next opening's request, else the tab's
+    // (`cell-subset-policy.js`); one that does not name exact cells (a
+    // session's) may open a first view and grow (`progressive-open.js`).
+    const requested = takeCellSubsetRequest();
+    const cellSubset = requested.mode === 'kept' ? requested : { ...requested, progressive: progressiveRequest() };
     const request = { source, expect, fromLink };
-    const snapshot = await this._call('open', request);
-    this._source = request;
+    this._linkHost = hostOf(source);
+    // The page's tab: a store kept for one tab only is reopened by it alone.
+    // What the host delivered on earlier visits sizes the opening until its
+    // own reads measure more, and the pace it bore spaces its requests
+    // here too (a provider's own requests: `host-link-memory.js`).
+    const hostLink = hostLinkSeed(this._linkHost);
+    if (hostLink?.paceMs > 0) realmHosts.seedPace(this._linkHost, hostLink.paceMs);
+    const snapshot = await this._call('open', { ...request, cellSubset, tab: THIS_TAB, hostLink });
+    this._adoptSnapshot(request, snapshot);
+    return {
+      name: snapshot.name,
+      format: snapshot.format,
+      layout: snapshot.layout,
+      zarrVersion: snapshot.zarrVersion,
+      conversion: snapshot.conversion ?? null,
+      notes: snapshot.notes ?? [],
+      cellSubset: snapshot.cellSubset ?? null,
+    };
+  }
+
+  /**
+   * Read the open dataset again in this reader's worker with the cells
+   * `cellSubset` asks for (a cell subset request, `cell-subset-policy.js`;
+   * the caller's own, never the next opening's): the worker reads the
+   * same source through the store it holds -- its structure, chunk indexes,
+   * decoded chunks and measured link stay -- and the new reading takes over
+   * what the open one built that the new cells keep (the gene indexes of the
+   * rows both share: raising a subsample of the same method and seed reads
+   * only the new cells, lowering it reads none). `signal` stops it, and the
+   * dataset open before stays.
+   *
+   * @param {{cellSubset: Object, signal?: AbortSignal|null}} options
+   * @returns {Promise<Object|null>} The cells now open (`cellSubset`)
+   */
+  async reopenCells({ cellSubset: requested, signal = null }) {
+    this._requireOpen();
+    const cellSubset = requireCellSubsetRequest(requested);
+    const request = { source: this._source.source, expect: this._source.expect, fromLink: this._source.fromLink };
+    // A live worker reads again through the source it holds; only a worker
+    // started anew (the one before was ended) is sent the source.
+    const sent = this._worker === null ? request : { ...request, source: null, heldSource: true };
+    const snapshot = await this._callWith({ signal }, 'open', { ...sent, cellSubset, tab: THIS_TAB, reopen: true, hostLink: hostLinkSeed(this._linkHost) });
+    this._adoptSnapshot(request, snapshot);
+    return snapshot.cellSubset ?? null;
+  }
+
+  /**
+   * Take the snapshot of an opening, and remember how to open exactly the
+   * same cells again: a worker the page ended (the back/forward cache) is
+   * reopened with them. @private
+   */
+  _adoptSnapshot(request, snapshot) {
+    const subset = snapshot.cellSubset ?? null;
+    this._source = {
+      ...request,
+      cellSubset: requestOfOpenCells(subset),
+      tab: THIS_TAB,
+    };
     // The page's download scheduler runs as many background reads at once
     // as this source answers (`fetch-scheduler.js`).
     if (snapshot.requestConcurrency !== undefined) setSourceRequestConcurrency(snapshot.requestConcurrency);
@@ -482,15 +848,47 @@ export class AnnDataReaderClient {
     this._snapshot = Object.freeze({
       ...snapshot,
       obsKeys: Object.freeze([...snapshot.obsKeys]),
-      varNames: Object.freeze([...snapshot.varNames]),
     });
-    return {
-      name: snapshot.name,
-      format: snapshot.format,
-      layout: snapshot.layout,
-      zarrVersion: snapshot.zarrVersion,
-      conversion: snapshot.conversion ?? null,
-    };
+  }
+
+  /**
+   * Which cells the open dataset presents (`anndata/subsample-plan.js`,
+   * `AnnDataReader.cellSubset`): `{nObs, kept, spec, autoFit, reproduced,
+   * keptValues, note}`, `kept` null when every cell is open; null before
+   * a dataset is open.
+   */
+  get cellSubset() {
+    return this._snapshot?.cellSubset ?? null;
+  }
+
+  /**
+   * Whether the last reading took over the store of the reading before it
+   * (the same version of the same bytes: `anndata-reader-worker.js`
+   * `sameVersion`): only then may the cells both show stay shown.
+   */
+  get sameVersion() {
+    return this._snapshot?.sameVersion === true;
+  }
+
+  /**
+   * How a subsample represents a categorical obs field against every cell
+   * (`AnnDataReader.subsampleRepresentation`); null when every cell is open.
+   *
+   * @param {string} key
+   */
+  subsampleRepresentation(key) {
+    return this._call('subsampleRepresentation', key);
+  }
+
+  /**
+   * How much of the neighbour graph `obsp[key]` the open subsample keeps,
+   * once it was read (`AnnDataReader.subsampleGraphShare`): `{kept, of}`,
+   * or null.
+   *
+   * @param {string} key
+   */
+  subsampleGraphShare(key) {
+    return this._call('subsampleGraphShare', key);
   }
 
   /**
@@ -503,7 +901,7 @@ export class AnnDataReaderClient {
    *   title: string|null, cellucid: Object|null}>}
    */
   describe(source, { signal = null, expect = null } = {}) {
-    return this._callWith({ signal }, 'describe', { source, expect });
+    return this._callWith({ signal }, 'describe', { source, expect, tab: THIS_TAB });
   }
 
   get nObs() {
@@ -531,11 +929,11 @@ export class AnnDataReaderClient {
 
   /**
    * The link the open dataset is read over, as last measured:
-   * `{latencyMs, bytesPerMs, backgroundConcurrency, protocol}` (a local
-   * source: latency 0, and its decode rate in bytes per ms), or null before
-   * the first measurement.
+   * `{latencyMs, loadedLatencyMs, bytesPerMs, backgroundConcurrency, protocol}`
+   * (a local source: latency 0, and its decode rate in bytes per ms), or
+   * null before the first measurement.
    *
-   * @returns {Readonly<{latencyMs: number|null, bytesPerMs: number|null,
+   * @returns {Readonly<{latencyMs: number|null, loadedLatencyMs?: number|null, bytesPerMs: number|null,
    *   backgroundConcurrency: number, protocol: string|null}>|null}
    */
   linkMeasurement() {
@@ -546,10 +944,6 @@ export class AnnDataReaderClient {
     return [...(this._snapshot?.obsKeys ?? [])];
   }
 
-  get varNames() {
-    return [...(this._snapshot?.varNames ?? [])];
-  }
-
   get hasExpressionMatrix() {
     return this._snapshot?.hasExpressionMatrix === true;
   }
@@ -558,9 +952,15 @@ export class AnnDataReaderClient {
     return !this._closed && this._snapshot?.isOpen === true;
   }
 
-  probeMapping() {
+  /**
+   * What the data-mapping catalog lists of the file (`reader.probeMapping`);
+   * `counts: false` reads no matrix value (the opening's description).
+   *
+   * @param {{counts?: boolean}} [options]
+   */
+  probeMapping(options = {}) {
     this._requireOpen();
-    return this._call('probeMapping');
+    return this._call('probeMapping', options);
   }
 
   /**
@@ -629,12 +1029,30 @@ export class AnnDataReaderClient {
    * @param {string} key
    * @param {ReadonlyArray<number>} columns
    * @param {boolean} normalize
-   * @param {{signal?: AbortSignal|null}} [options]
-   * @returns {Promise<import('./embedding-payload.js').EmbeddingPayload>}
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null}} [options] -
+   *   `rows`: only rows `[start, end)` of the open cells, in the frame the
+   *   embedding is shown in (`EmbeddingPayloads.embedding`)
+   * @returns {Promise<Object>} `{positions, transform, bounds, unplacedCount,
+   *   unplacedNames}` (`AnnDataReader.readEmbedding`): NaN positions for the
+   *   cells it does not place, counted, the first named
    */
-  readEmbedding(key, columns, normalize, { signal = null } = {}) {
+  readEmbedding(key, columns, normalize, { signal = null, rows = null } = {}) {
     this._requireOpen();
-    return this._callWith({ signal }, 'readEmbedding', key, [...columns], normalize);
+    return this._callWith({ signal }, 'readEmbedding', key, [...columns], normalize, ...(rows === null ? [] : [[rows[0], rows[1]]]));
+  }
+
+  /**
+   * The cell-order digest of one embedding over the open cells, from the
+   * reader worker (`EmbeddingPayloads.cellOrderDigest`, `cell-order-digest.js`).
+   *
+   * @param {string} key
+   * @param {ReadonlyArray<number>} columns
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<string>}
+   */
+  readCellOrderDigest(key, columns, { signal = null } = {}) {
+    this._requireOpen();
+    return this._callWith({ signal }, 'readCellOrderDigest', key, [...columns]);
   }
 
   /**
@@ -645,10 +1063,11 @@ export class AnnDataReaderClient {
    * @param {ReadonlyArray<number>} columns
    * @param {{key: string, columns: ReadonlyArray<number>}} embedding
    * @param {boolean} normalize
-   * @param {{signal?: AbortSignal|null}} [options]
-   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number}>}
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null}} [options] -
+   *   `rows`: only rows `[start, end)` of the open cells
+   * @returns {Promise<{vectors: Float32Array, maxMagnitude: number, unplacedCount: number, unplacedNames: string[]}>}
    */
-  readVectorField(key, columns, embedding, normalize, { signal = null } = {}) {
+  readVectorField(key, columns, embedding, normalize, { signal = null, rows = null } = {}) {
     this._requireOpen();
     return this._callWith(
       { signal },
@@ -656,7 +1075,8 @@ export class AnnDataReaderClient {
       key,
       [...columns],
       { key: embedding.key, columns: [...embedding.columns] },
-      normalize
+      normalize,
+      ...(rows === null ? [] : [[rows[0], rows[1]]])
     );
   }
 
@@ -670,6 +1090,38 @@ export class AnnDataReaderClient {
   readVarFlags(axis, column) {
     this._requireOpen();
     return this._call('readVarFlags', axis, column);
+  }
+
+  /**
+   * Columns of one `obsm` array, row-major, as stored
+   * (`AnnDataReader.readObsmColumns`): an export writes the embeddings
+   * themselves, not what the view drew.
+   *
+   * @param {string} key
+   * @param {ReadonlyArray<number>} columns
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, cells?: ArrayLike<number>|null}} [options] - `rows`:
+   *   `[start, end)` of the open cells; `cells`: listed open cells alone,
+   *   in their order; every open cell when both are null
+   * @returns {Promise<Float32Array|Float64Array>}
+   */
+  readObsmColumns(key, columns, { signal = null, rows = null, cells = null } = {}) {
+    this._requireOpen();
+    const listed = cells === null ? null : Uint32Array.from(cells);
+    return this._callWith({ signal, transfer: listed === null ? [] : [listed.buffer] }, 'readObsmColumns', key, Array.from(columns), rows, listed);
+  }
+
+  /**
+   * The obs names of the open cells, in order (`AnnDataReader.readObsNames`):
+   * every one, rows `[start, end)` of the open cells, or the open cells
+   * `cells` lists, in its order (read in the stored order).
+   * @param {{rows?: [number, number]|null, cells?: ArrayLike<number>|null}} [options]
+   * @returns {Promise<string[]>}
+   */
+  readObsNames({ rows = null, cells = null } = {}) {
+    this._requireOpen();
+    if (cells === null) return this._call('readObsNames', rows);
+    const positions = Uint32Array.from(cells);
+    return this._callWith({ transfer: [positions.buffer] }, 'readObsNames', null, positions);
   }
 
   async readVarNames(axis, column) {
@@ -694,11 +1146,115 @@ export class AnnDataReaderClient {
    *   it carries is cancelled. `owner`: the job the read is for, if any.
    *   `key`: the shared load the read is for, which a job may join later
    *   (`data/read-activity-log.js`, `adopt`); the request's activity carries
-   *   the keys of every read it serves.
+   *   the keys of every read it serves. `onPartial(column, cells)`: while
+   *   the gene index of a matrix indexed in segments is built, the gene on
+   *   the first `cells` open cells (a sample of them), the rest not read,
+   *   each time it has more (`AnnDataReader.getMatrixColumn`): its sparse
+   *   form when smaller (`column-forms.js`, `readRows` = `cells`), else a
+   *   column of every open cell, NaN on the rest (the caller owns a dense
+   *   column; a form is shared, and never written).
+   *   `rows` (`[start, end)` of the open cells): the gene on those cells
+   *   only, reading what they need; batched with the reads of the same rows.
+   *   The column comes with its sparse form noted (`columnFormOf`).
    * @returns {Promise<Float32Array>}
    */
-  getMatrixColumn(element, index, { signal = null, owner = null, key = null } = {}) {
-    return this._queueGeneRead('dense', element, index, signal, owner, key);
+  getMatrixColumn(element, index, { signal = null, owner = null, key = null, onPartial = null, rows = null } = {}) {
+    return this._queueGeneRead('dense', element, index, signal, owner, key, onPartial, rows);
+  }
+
+  /**
+   * What reading a gene of one matrix costs now (`AnnDataReader.geneReadPlan`):
+   * whether it is stored cell by cell, what the first gene reads, and where
+   * the index it builds can be kept.
+   *
+   * @param {string} element
+   * @returns {Promise<Object>}
+   */
+  geneReadPlan(element) {
+    this._requireOpen();
+    return this._call('geneReadPlan', element);
+  }
+
+  /**
+   * The open cells genes are read for (`AnnDataReader.geneSample`):
+   * `{cells, of, fit}`, or null when every open cell's are. It is the part
+   * of the opening that changes while it is open (`growGeneSample`), and it
+   * is kept current on the opening's cell subset (`cellSubset.genes`), so a
+   * request for the same cells (`requestOfOpenCells`) reads genes for the
+   * same ones.
+   *
+   * @returns {Readonly<{cells: number, of: number, fit: Object|null}>|null}
+   */
+  get geneSample() {
+    return this._snapshot?.cellSubset?.genes ?? null;
+  }
+
+  /** The gene sample is now `sample`. @private */
+  _setGeneSample(sample) {
+    const subset = this._snapshot?.cellSubset ?? null;
+    if (subset === null) return;
+    // In place: the open cells (and their identity, made once per opening)
+    // are the same; only the cells genes are read for grew.
+    subset.genes = sample === null ? null : Object.freeze({ ...sample });
+  }
+
+  /**
+   * The gene sample a gene of `element` is read for
+   * (`AnnDataReader.geneSampleOf`): `{cells, of}`, or null when its genes
+   * are read for every open cell.
+   *
+   * @param {string} element
+   * @returns {Promise<{cells: number, of: number}|null>}
+   */
+  geneSampleOf(element) {
+    this._requireOpen();
+    if (this.geneSample === null) return Promise.resolve(null);
+    return this._call('geneSampleOf', element);
+  }
+
+  /**
+   * What reading genes of `element` for the first `target` open cells costs
+   * beyond the gene sample (`AnnDataReader.geneSampleCost`), or null.
+   *
+   * @param {string} element
+   * @param {number} target
+   * @param {{geneTime?: {ms: number, spentBytes: number, spentRequests?: number}|null}} [options]
+   */
+  geneSampleCost(element, target, options = {}) {
+    this._requireOpen();
+    return this._call('geneSampleCost', element, target, options);
+  }
+
+  /**
+   * Read genes of `element` for the first `target` open cells
+   * (`AnnDataReader.growGeneSample`), a segment at a time; `onStep(sample,
+   * cells)` after each, the sample kept current here (`geneSample`). What is
+   * read stays when `signal` stops the rest.
+   *
+   * @param {string} element
+   * @param {number} target
+   * @param {{signal?: AbortSignal|null, gene?: number, onStep?: ((sample: Object|null, cells: number) => void)|null, topUp?: boolean}} [options]
+   * @returns {Promise<Object|null>} The gene sample now
+   */
+  async growGeneSample(element, target, { signal = null, gene = 0, onStep = null, topUp = false } = {}) {
+    this._requireOpen();
+    let sample;
+    try {
+      sample = await this._callWith({
+        signal,
+        onPartial: step => {
+          this._setGeneSample(step.sample ?? null);
+          onStep?.(step.sample ?? null, step.cells);
+        },
+      }, 'growGeneSample', element, target, gene, topUp);
+    } catch (error) {
+      // Stopped or failed part way: what the reader read stays, and a step's
+      // word may have been on its way as it stopped.
+      this._setGeneSample(await this._call('geneSampleNow').catch(() => this.geneSample));
+      throw error;
+    }
+    this._setGeneSample(sample ?? null);
+    return sample ?? null;
   }
 
   /**
@@ -719,11 +1275,11 @@ export class AnnDataReaderClient {
   }
 
   /** Queue one gene read for the next task's batch. @private */
-  _queueGeneRead(form, element, index, signal, owner = null, key = null) {
+  _queueGeneRead(form, element, index, signal, owner = null, key = null, onPartial = null, rows = null) {
     this._requireOpen();
     if (signal?.aborted) return Promise.reject(abortReason(signal));
     return new Promise((resolve, reject) => {
-      const read = { form, element, gene: index, owner, key, signal, resolve, reject, settled: false, batch: null, stopWaiting: null };
+      const read = { form, element, gene: index, owner, key, signal, onPartial, rows: rows === null ? null : [rows[0], rows[1]], resolve, reject, settled: false, batch: null, stopWaiting: null };
       read.stopWaiting = onAbort(signal, () => this._cancelGeneRead(read));
       this._geneReads.push(read);
       if (this._geneReads.length === 1) nextTask(() => this._sendGeneReads());
@@ -759,7 +1315,7 @@ export class AnnDataReaderClient {
     this._geneReads = [];
     const byRequest = new Map();
     for (const read of reads) {
-      const key = `${read.form}\u0000${read.element}\u0000${read.owner ?? ''}`;
+      const key = `${read.form}\u0000${read.element}\u0000${read.owner ?? ''}\u0000${read.rows ?? ''}`;
       let group = byRequest.get(key);
       if (group === undefined) {
         group = [];
@@ -768,7 +1324,7 @@ export class AnnDataReaderClient {
       group.push(read);
     }
     for (const group of byRequest.values()) {
-      const { form, element, owner } = group[0];
+      const { form, element, owner, rows } = group[0];
       const keys = [...new Set(group.map(read => read.key).filter(key => key !== null))];
       const batch = { controller: new AbortController(), wanted: group.length };
       const genes = [];
@@ -783,27 +1339,47 @@ export class AnnDataReaderClient {
         }
         readers.push(read);
       }
+      // A gene someone waits to see on more cells as they are read
+      // (`onPartial`): the cells read so far as a column, its sparse form
+      // when smaller (`column-forms.js`). The first of its callers still
+      // waiting takes what the worker posted (transferred, no one else holds
+      // it); each other one a copy of a dense column, or the same form (a
+      // form is never written).
+      const progressive = form === 'dense' && rows === null && group.some(read => read.onPartial !== null);
+      const onPartial = !progressive ? null : ({ position, column, cells }) => {
+        let taken = false;
+        for (const read of readersOf.get(genes[position]) ?? []) {
+          if (read.settled || read.onPartial === null) continue;
+          read.onPartial(taken && ArrayBuffer.isView(column) ? copiedColumn(column) : column, cells);
+          taken = true;
+        }
+      };
       let request;
       try {
         this._requireOpen();
-        const options = { signal: batch.controller.signal };
+        const options = { signal: batch.controller.signal, onPartial };
         if (form === 'sparse') {
           request = this._callWith(options, 'getMatrixColumnsSparse', element, genes, owner);
         } else {
           // A gene alone keeps its own request (and its own name in the read
           // activity log).
-          request = genes.length === 1
-            ? this._callWith(options, 'getMatrixColumn', element, genes[0], owner, keys).then(column => [column])
-            : this._callWith(options, 'getMatrixColumns', element, genes, owner, keys);
+          // A read of some cells names them (`rows`) last.
+          const tail = rows === null ? [] : [rows];
+          // Each column comes with its sparse form, noted beside it here.
+          request = (genes.length === 1
+            ? this._callWith(options, 'getMatrixColumn', element, genes[0], owner, keys, progressive, ...tail).then(answer => [answer])
+            : this._callWith(options, 'getMatrixColumns', element, genes, owner, keys, progressive, ...tail)
+          ).then(answers => answers.map(notedColumn));
         }
       } catch (error) {
         request = Promise.reject(error);
       }
       // The first caller of a gene takes the transferred arrays; any other
-      // caller of the same gene gets its own copy.
+      // caller of the same gene gets its own copy (a dense column's with the
+      // same form noted: it holds the same values).
       const copy = form === 'sparse'
-        ? column => ({ length: column.length, indices: column.indices.slice(), values: column.values.slice() })
-        : column => new Float32Array(column);
+        ? column => ({ length: column.length, indices: copiedColumn(column.indices), values: copiedColumn(column.values) })
+        : column => noteColumnForm(copiedColumn(column), columnFormOf(column));
       request.then(
         columns => {
           genes.forEach((gene, position) => {
@@ -830,21 +1406,37 @@ export class AnnDataReaderClient {
    */
   getMatrixColumns(element, genes, { signal = null } = {}) {
     this._requireOpen();
-    return this._callWith({ signal }, 'getMatrixColumns', element, Array.from(genes));
+    return this._callWith({ signal }, 'getMatrixColumns', element, Array.from(genes)).then(answers => answers.map(notedColumn));
   }
 
   /**
-   * The non-zero genes of cells of one matrix.
+   * The non-zero genes of many cells of one matrix, handed to `onPart` part
+   * by part as each arrives (`AnnDataReader.readMatrixRows`): one read for
+   * every cell, the next part read while this one is handed out.
    *
    * @param {string} element
    * @param {ReadonlyArray<number>} cells
-   * @param {{signal?: AbortSignal|null}} [options]
-   * @returns {Promise<Array<{genes: Int32Array, values: Float32Array}>>}
+   * @param {{signal?: AbortSignal|null, onPart: (part: {first: number, count: number, pointers: Float64Array, genes: Int32Array, values: Float32Array}) => void}} options
+   * @returns {Promise<{cells: number, entries: number}>}
    */
-  getMatrixRows(element, cells, { signal = null } = {}) {
+  readMatrixRows(element, cells, { signal = null, onPart }) {
     this._requireOpen();
     const positions = Uint32Array.from(cells);
-    return this._callWith({ signal, transfer: [positions.buffer] }, 'getMatrixRows', element, positions);
+    return this._callWith({ signal, transfer: [positions.buffer], onPartial: onPart }, 'readMatrixRows', element, positions);
+  }
+
+  /**
+   * What `readMatrixRows` of these cells costs now, before it is read
+   * (`AnnDataReader.matrixRowsCost`): bytes, requests and time, or null.
+   *
+   * @param {string} element
+   * @param {ArrayLike<number>} cells
+   * @returns {Promise<{cells: number, bytes: number, keptBytes: number, requests: number, ms: number|null}|null>}
+   */
+  matrixRowsCost(element, cells) {
+    this._requireOpen();
+    const positions = Uint32Array.from(cells);
+    return this._callWith({ transfer: [positions.buffer] }, 'matrixRowsCost', element, positions);
   }
 
   /**
@@ -855,11 +1447,11 @@ export class AnnDataReaderClient {
    * @param {string} element
    * @param {ArrayLike<number>} cells - Distinct cell positions
    * @param {ArrayLike<number>} genes - Distinct gene positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options] -
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options] -
    *   `owner`: the job the read is for
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
    */
-  getMatrixCellSubset(element, cells, genes, { signal = null, owner = null } = {}) {
+  getMatrixCellSubset(element, cells, genes, { signal = null, owner = null, runGenes = null } = {}) {
     this._requireOpen();
     const cellPositions = Uint32Array.from(cells);
     const genePositions = Uint32Array.from(genes);
@@ -869,7 +1461,8 @@ export class AnnDataReaderClient {
       element,
       cellPositions,
       genePositions,
-      owner
+      owner,
+      runGenes
     );
   }
 
@@ -938,10 +1531,10 @@ export class AnnDataReaderClient {
    * @param {ArrayLike<number>} cells - Distinct cell positions
    * @param {ArrayLike<number>} genes - Distinct gene positions
    * @param {Object} delivery - `requireRunDelivery`
-   * @param {{signal?: AbortSignal|null, owner?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, runGenes?: number|null}} [options]
    * @returns {Promise<{bytes: number}>}
    */
-  deliverMatrixCellSubset(element, cells, genes, delivery, { signal = null, owner = null } = {}) {
+  deliverMatrixCellSubset(element, cells, genes, delivery, { signal = null, owner = null, runGenes = null } = {}) {
     this._requireOpen();
     const cellPositions = Uint32Array.from(cells);
     const genePositions = Uint32Array.from(genes);
@@ -952,7 +1545,8 @@ export class AnnDataReaderClient {
       cellPositions,
       genePositions,
       owner,
-      delivery
+      delivery,
+      runGenes
     );
   }
 
@@ -991,16 +1585,31 @@ export class AnnDataReaderClient {
 
   /**
    * One obs field's values (`AnnDataReader.getObsField`), the same object
-   * until it is released.
+   * until it is released. `rows` (`[start, end)` of the open cells) reads
+   * only those rows, a payload of its own that is not kept.
+   *
+   * A text or boolean column arrives coded (`discovered: true`, the worker's
+   * `codeDiscoveredColumn`): under `categories`, the ones it was coded with
+   * before (null the first time), with any label these cells add. A
+   * categorical with more categories than open cells arrives coded by the
+   * ones its open cells hold (`present`: `{count, stored, colors}`,
+   * `AnnDataReader._readPresentCategorical`), every one found before kept.
    *
    * @param {string} key
-   * @param {{signal?: AbortSignal|null}} [options]
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, categories?: ReadonlyArray<string|boolean>|null}} [options]
    */
-  async getObsField(key, { signal = null } = {}) {
+  async getObsField(key, { signal = null, rows = null, categories = null } = {}) {
     this._requireOpen();
+    const codedUnder = categories === null ? null : [...categories];
+    if (rows !== null) {
+      const field = await this._callWith({ signal }, 'getObsField', key, [rows[0], rows[1]], codedUnder);
+      return field.dtype === 'categorical'
+        ? { ...field, categories: Object.freeze(field.categories) }
+        : field;
+    }
     const cached = this._obsFields.get(key);
     if (cached !== undefined) return cached;
-    const field = await this._callWith({ signal }, 'getObsField', key);
+    const field = await this._callWith({ signal }, 'getObsField', key, null, codedUnder);
     const known = this._obsFields.get(key);
     if (known !== undefined) return known;
     if (field.dtype === 'categorical') {
@@ -1014,6 +1623,8 @@ export class AnnDataReaderClient {
       const { codes, ordered } = field;
       const result = {
         dtype: 'categorical',
+        ...(field.discovered === true ? { discovered: true } : {}),
+        ...(field.present === undefined ? {} : { present: field.present }),
         codes,
         categories,
         ordered,
@@ -1081,6 +1692,21 @@ export class AnnDataReaderClient {
     return this._callWith({ signal }, 'getConnectivityEdges', key);
   }
 
+  /**
+   * Some open cells' neighbours in `obsp[key]`, read from the file by row
+   * in the reader worker (`AnnDataReader.getConnectivityRows`); null when
+   * the file has no such matrix.
+   *
+   * @param {string} key
+   * @param {Uint32Array} cells - Distinct open cells
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{offsets: Uint32Array, neighbors: Uint32Array}|null>}
+   */
+  getConnectivityRows(key, cells, { signal = null } = {}) {
+    this._requireOpen();
+    return this._callWith({ signal }, 'getConnectivityRows', key, cells);
+  }
+
   getDatasetMetadata() {
     this._requireOpen();
     return this._call('getDatasetMetadata');
@@ -1099,9 +1725,22 @@ export class AnnDataReaderClient {
     }
   }
 
+  /**
+   * The closer of the worker's channel to the page's byte range cache, now
+   * the caller's (`endWorker`: it closes once the worker has left), or null.
+   * @private
+   */
+  _takeRangeCacheClose() {
+    const close = this._closeRangeCache;
+    this._closeRangeCache = null;
+    return close ?? null;
+  }
+
   close() {
     if (this._closed) return;
     this._closed = true;
+    const closeRange = this._takeRangeCacheClose();
+    this._releaseMemoryChannel();
     this._clearMirrors();
     this._snapshot = null;
     const worker = this._worker;
@@ -1115,10 +1754,15 @@ export class AnnDataReaderClient {
       window.removeEventListener('pagehide', this._onPageHide);
       this._onPageHide = null;
     }
-    this._failAll(new Error('The AnnData file was closed; the request was superseded'));
+    if (this._onHidden !== null) {
+      document.removeEventListener('visibilitychange', this._onHidden);
+      this._onHidden = null;
+    }
+    this._failAll(cancelled('closed', 'The AnnData file was closed.'));
     this._stopAccessRevokes?.();
     this._stopAccessRevokes = null;
-    worker?.terminate?.();
+    if (worker !== null) endWorker(worker, closeRange);
+    else closeRange?.();
     // A pass the worker did not finish leaves its directory: removed once
     // the stopped worker has let it go.
     for (const directory of this._unfinishedStores) void removeTranscodedStore(directory);

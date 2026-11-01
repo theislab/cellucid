@@ -2,7 +2,14 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
-import { VECTOR_DATASET, listVectorDataset } from './helpers/vector-catalog.mjs';
+import { sceneQuietness } from './helpers/frame-scheduling.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
+import {
+  VECTOR_DATASET,
+  expectVelocityBuilt,
+  listVectorDataset,
+  watchVelocityBuild,
+} from './helpers/vector-catalog.mjs';
 import {
   PROJECTILE_MIN_CHARGE_SECONDS,
 } from '../../assets/js/rendering/projectiles.js';
@@ -1514,6 +1521,14 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
+  // The opening is over before its publications are counted: the name
+  // shows with the first frame, and the gene list, read after it, is listed
+  // by refreshing the interface, which publishes the active view again
+  // (`genes:listed`, ui-coordinator.js). On a slow runner that came after
+  // the counters were installed (Web contracts run 41269083996, Windows
+  // Firefox: one publication counted before smoke mode began).
+  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', { timeout: 120_000 });
+  await page.evaluate(() => window._cellucidState.whenGenesListed());
   await page.evaluate(() => {
     const state = window._cellucidState;
     const viewer = window._cellucidViewer;
@@ -1610,7 +1625,9 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
     hasText: 'Volumetric smoke stopped rendering, so the view is back in Points.',
   });
   await expect(runtimeNotifications).toHaveCount(1);
-  await page.waitForTimeout(500);
+  // The fallback is over (its one layout publication made above) once the
+  // scene has settled and stays undrawn: no later frame can try smoke again.
+  await expect.poll(() => sceneQuietness(page), { timeout: 30_000 }).toBe('quiet');
   await expect(runtimeNotifications).toHaveCount(1);
   expect(browserErrors).toEqual([]);
 
@@ -2225,10 +2242,9 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
     const gl = canvas.getContext('webgl2');
     return Array.from(gl.getParameter(gl.COLOR_CLEAR_VALUE));
   });
+  await watchVelocityBuild(page);
   await page.locator('#velocity-overlay-enabled').check();
-  await expect(
-    page.getByText('Velocity overlay ready', { exact: true }),
-  ).toBeVisible();
+  await expectVelocityBuilt(page);
 
   const endpoints = [
     ['#velocity-speed', '5'],
@@ -2324,14 +2340,15 @@ test('recoloring and position changes retain the published filter generation', a
         'live',
         2,
       );
-      const admissionLevels = membership?.admissionLevels ?? null;
-      const lodLevel = membership?.lodLevel ?? -1;
+      // Null membership is full detail; otherwise the LodMembership
+      // admission test (rendering/high-perf/renderer-contracts.js).
+      const admitted = index => membership === null || (
+        membership.admissionLevels === null
+          ? index < membership.count
+          : membership.admissionLevels[index] <= membership.lodLevel
+      );
       return [0, 1].map(index => (
-        alpha[index] >= Math.fround(2.5 / 255) &&
-        (
-          admissionLevels === null ||
-          admissionLevels[index] <= lodLevel
-        )
+        alpha[index] >= Math.fround(2.5 / 255) && admitted(index)
       ) ? 1 : 0);
     };
 
@@ -2449,6 +2466,14 @@ test('spatial-index construction failures settle every owned notification', asyn
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  // No tree is built, and none is on its way: the projectiles' request
+  // joins a build already under way (`_requestSpatialIndex`), which this
+  // spec's failure cannot reach, and it then lands whole.
+  await waitForPageAtRest(page);
+  expect(await page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    return viewer.getHPRenderer().hasSpatialIndex(viewer.getViewDimension('live'));
+  })).toBe(false);
 
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
@@ -2477,7 +2502,7 @@ test('spatial-index construction failures settle every owned notification', asyn
   });
   await expect(page.locator('.notification-loading')).toHaveCount(0);
   await expect(page.locator('.notification-error')).toContainText(
-    '2D Quadtree failed: synthetic spatial-index construction failure',
+    'Cellucid could not prepare drawing and cell lookup: synthetic spatial-index construction failure',
   );
   const webglError = await page.locator('#glcanvas').evaluate(canvas => (
     canvas.getContext('webgl2').getError()

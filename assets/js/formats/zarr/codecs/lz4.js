@@ -1,101 +1,64 @@
 /**
- * LZ4 block decompression, and the numcodecs `LZ4` framing (a 4-byte
- * little-endian decoded size, then one LZ4 block). Blosc's `lz4` and `lz4hc`
- * streams are plain LZ4 blocks.
+ * LZ4 blocks, decoded by lz4 1.10.0 itself compiled to WebAssembly
+ * (`io/wasm-codecs.js`): the numcodecs `LZ4` framing (a 4-byte
+ * little-endian decoded size, then one LZ4 block) and block framings that
+ * hold several (hdf5plugin's LZ4 filter, `hdf5/filters.js`).
  *
- * The output is allocated once at the size the caller expects, and every
- * literal run and match is checked against both buffers before it is copied:
- * a malformed block is refused, never read or written out of bounds. Short
- * literal runs and matches are copied sixteen and eight bytes at a time when
- * the block's output region has room past them (what follows overwrites the
- * extra bytes); nothing is ever written outside that region.
+ * Each block must fill the bytes its framing gives it exactly; the decoder
+ * reads and writes nothing outside the block and its output, so a malformed
+ * block is refused, never read or written out of bounds. Where the decode
+ * pool measured the JavaScript decoder faster (`io/decoder-choice.js`,
+ * family `lz4`), that one decodes (`javascript/lz4.js`).
  *
  * @module formats/zarr/codecs/lz4
  */
 
 import { ZarrFormatError } from '../errors.js';
-import { BLOCK_COPY_BYTES, copyMatch } from '../../io/lz-match.js';
+import { WasmCodecError, wasmCodecs } from '../../io/wasm-codecs.js';
+import { decoderFor } from '../../io/decoder-choice.js';
+import { lz4DecodeBlockInto, numcodecsLz4Decode as numcodecsLz4InJavaScript } from './javascript/lz4.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
 function corrupt(detail) {
   return new ZarrFormatError(`LZ4 data is corrupt: ${detail}.`);
 }
 
+/** The codec error of an LZ4 decode, as the Zarr error it is. */
+function asFormatError(error) {
+  if (!(error instanceof WasmCodecError)) return error;
+  return corrupt(`a block does not decode to its size (${error.code})`);
+}
+
 /**
- * Decode one LZ4 block into `output[outputStart, outputEnd)`, which it must
- * fill exactly.
+ * Blocks of one buffer into one output of `total` bytes: each segment
+ * `{at, stored, start, size}` is `input[at, at + stored)`, an LZ4 block
+ * that fills `output[start, start + size)` exactly, or those bytes as they
+ * are when `stored === size`.
  *
  * @param {Uint8Array} input
- * @param {Uint8Array} output
- * @param {number} [outputStart]
- * @param {number} [outputEnd]
+ * @param {Array<{at: number, stored: number, start: number, size: number}>} segments
+ * @param {number} total
+ * @param {Object<string, string>|null} [choices] - The decoders a decode task names
+ * @returns {Promise<Uint8Array>}
  */
-export function lz4DecodeBlockInto(input, output, outputStart = 0, outputEnd = output.length) {
-  const inputEnd = input.length;
-  const inputView = new DataView(input.buffer, input.byteOffset, input.length);
-  const view = new DataView(output.buffer, output.byteOffset, output.length);
-  let i = 0;
-  let o = outputStart;
-  for (;;) {
-    if (i >= inputEnd) throw corrupt('the block ends without its final literals');
-    const token = input[i++];
-    let literals = token >>> 4;
-    if (literals === 15) {
-      let byte;
-      do {
-        if (i >= inputEnd) throw corrupt('a literal length is truncated');
-        byte = input[i++];
-        literals += byte;
-      } while (byte === 255);
+export async function lz4DecodeBlocks(input, segments, total, choices = null) {
+  if (decoderFor('lz4', total, choices) === 'js') {
+    const output = new Uint8Array(total);
+    for (const { at, stored, start, size } of segments) {
+      if (at < 0 || stored < 0 || at + stored > input.length || start < 0 || size < 0 || start + size > total) {
+        throw corrupt('a block does not decode to its size (a block lies outside its buffers)');
+      }
+      if (stored === size) output.set(input.subarray(at, at + stored), start);
+      else lz4DecodeBlockInto(input.subarray(at, at + stored), output, start, start + size);
     }
-    if (i + literals > inputEnd || o + literals > outputEnd) throw corrupt('a literal run exceeds its bounds');
-    if (literals <= 16 && i + 16 <= inputEnd && o + 16 <= outputEnd) {
-      // Sixteen bytes, those past the run overwritten by what follows it.
-      view.setInt32(o, inputView.getInt32(i, true), true);
-      view.setInt32(o + 4, inputView.getInt32(i + 4, true), true);
-      view.setInt32(o + 8, inputView.getInt32(i + 8, true), true);
-      view.setInt32(o + 12, inputView.getInt32(i + 12, true), true);
-    } else if (literals > 32) {
-      output.set(input.subarray(i, i + literals), o);
-    } else {
-      for (let k = 0; k < literals; k++) output[o + k] = input[i + k];
-    }
-    i += literals;
-    o += literals;
-    if (i === inputEnd) break;
-    if (i + 2 > inputEnd) throw corrupt('a match offset is truncated');
-    const offset = input[i] | (input[i + 1] << 8);
-    i += 2;
-    if (offset === 0 || offset > o - outputStart) throw corrupt('a match offset reaches before the output');
-    let length = token & 15;
-    if (length === 15) {
-      let byte;
-      do {
-        if (i >= inputEnd) throw corrupt('a match length is truncated');
-        byte = input[i++];
-        length += byte;
-      } while (byte === 255);
-    }
-    length += 4;
-    const stop = o + length;
-    if (stop > outputEnd) throw corrupt('a match exceeds the output');
-    if (offset >= 8 && length < BLOCK_COPY_BYTES && stop + 8 <= outputEnd) {
-      // Eight bytes at a time, possibly past the match's end (bytes the rest
-      // of the block overwrites): a source at least eight bytes back is
-      // already written, so this also repeats a pattern of eight or more.
-      let from = o - offset;
-      do {
-        view.setInt32(o, view.getInt32(from, true), true);
-        view.setInt32(o + 4, view.getInt32(from + 4, true), true);
-        o += 8;
-        from += 8;
-      } while (o < stop);
-    } else {
-      copyMatch(output, view, o, offset, length);
-    }
-    o = stop;
+    return output;
   }
-  if (o !== outputEnd) throw corrupt(`it decodes to ${formatCountOf(o - outputStart, 'byte')}, not ${outputEnd - outputStart}`);
+  const codecs = await wasmCodecs();
+  try {
+    return codecs.lz4Blocks(input, segments, total);
+  } catch (error) {
+    throw asFormatError(error);
+  }
 }
 
 /**
@@ -104,9 +67,10 @@ export function lz4DecodeBlockInto(input, output, outputStart = 0, outputEnd = o
  *
  * @param {Uint8Array} input
  * @param {number|null} expectedSize
- * @returns {Uint8Array}
+ * @param {Object<string, string>|null} [choices] - The decoders a decode task names
+ * @returns {Promise<Uint8Array>}
  */
-export function numcodecsLz4Decode(input, expectedSize) {
+export async function numcodecsLz4Decode(input, expectedSize, choices = null) {
   if (input.length < 4) throw corrupt('the size header is truncated');
   const size = (input[0] | (input[1] << 8) | (input[2] << 16) | (input[3] << 24)) >>> 0;
   if (expectedSize !== null && size !== expectedSize) {
@@ -114,7 +78,12 @@ export function numcodecsLz4Decode(input, expectedSize) {
   }
   // LZ4 expands at most 255:1 (a 255-byte length extension per byte).
   if (size > (input.length - 4) * 255 + 16) throw corrupt(`it declares more bytes than LZ4 can encode in ${input.length}`);
-  const output = new Uint8Array(size);
-  if (size > 0) lz4DecodeBlockInto(input.subarray(4), output);
-  return output;
+  if (size === 0) return new Uint8Array(0);
+  if (decoderFor('lz4', size, choices) === 'js') return numcodecsLz4InJavaScript(input, expectedSize);
+  const codecs = await wasmCodecs();
+  try {
+    return codecs.lz4Block(input.subarray(4), size);
+  } catch (error) {
+    throw asFormatError(error);
+  }
 }

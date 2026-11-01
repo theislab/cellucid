@@ -33,6 +33,7 @@
  * Each particle: position (vec3), velocity cache (vec3), age (float), cell index (uint)
  */
 import { FOG_GLSL } from '../../shaders/fog-shaders.js';
+import { LINEAR_TEXEL_GLSL } from '../../linear-texture.js';
 
 export const PARTICLE_UPDATE_VS = `#version 300 es
 precision highp float;
@@ -55,18 +56,17 @@ uniform float u_turbulence;
 uniform bool u_forceRespawn;
 uniform float u_velocityBlend;
 
-// Velocity field texture
-uniform sampler2D u_velocityTex;
-uniform int u_velocityTexWidth;
-
-// Cell position texture (for spawning)
-uniform sampler2D u_positionTex;
-uniform int u_positionTexWidth;
-
-// Spawn table texture (visibility-filtered indices)
-uniform highp usampler2D u_spawnTableTex;
-uniform int u_spawnTableWidth;
+// Per-cell linear textures (rendering/linear-texture.js), each with its
+// layout: velocity field, cell positions (for spawning) and the spawn table
+// (visibility-filtered indices).
+uniform highp sampler2DArray u_velocityTex;
+uniform ivec2 u_velocityLayout;
+uniform highp sampler2DArray u_positionTex;
+uniform ivec2 u_positionLayout;
+uniform highp usampler2DArray u_spawnTableTex;
+uniform ivec2 u_spawnTableLayout;
 uniform int u_spawnTableSize;
+${LINEAR_TEXEL_GLSL}
 
 // Transform feedback outputs
 out vec3 v_position;
@@ -185,23 +185,15 @@ uint sampleSpawnIndex(inout uint seed) {
 
   float r = rand01(seed);
   int flatIdx = clamp(int(floor(r * float(size))), 0, size - 1);
-  int y = flatIdx / u_spawnTableWidth;
-  int x = flatIdx - y * u_spawnTableWidth;
-  return texelFetch(u_spawnTableTex, ivec2(x, y), 0).r;
+  return texelFetch(u_spawnTableTex, linearTexel(flatIdx, u_spawnTableLayout), 0).r;
 }
 
 vec3 fetchCellPosition(uint cellIndex) {
-  int idx = int(cellIndex);
-  int y = idx / u_positionTexWidth;
-  int x = idx - y * u_positionTexWidth;
-  return texelFetch(u_positionTex, ivec2(x, y), 0).rgb;
+  return texelFetch(u_positionTex, linearTexel(int(cellIndex), u_positionLayout), 0).rgb;
 }
 
 vec3 fetchVelocity(uint cellIndex) {
-  int idx = int(cellIndex);
-  int y = idx / u_velocityTexWidth;
-  int x = idx - y * u_velocityTexWidth;
-  return texelFetch(u_velocityTex, ivec2(x, y), 0).rgb;
+  return texelFetch(u_velocityTex, linearTexel(int(cellIndex), u_velocityLayout), 0).rgb;
 }
 
 void main() {
@@ -400,10 +392,11 @@ uniform float u_cometStretch; // Velocity-based elongation amount
 // Velocity normalization
 uniform float u_invMaxMagnitude;
 
-// Visibility texture
-uniform highp usampler2D u_alphaTex;
-uniform int u_alphaTexWidth;
+// Visibility texture (a linear texture, rendering/linear-texture.js)
+uniform highp usampler2DArray u_alphaTex;
+uniform ivec2 u_alphaLayout;
 uniform bool u_useAlphaTex;
+${LINEAR_TEXEL_GLSL}
 
 ${FOG_GLSL}
 // Outputs to fragment shader
@@ -416,11 +409,8 @@ out vec3 v_velocity;
 out float v_pointSize;
 
 float fetchAlpha(uint cellIndex) {
-  if (!u_useAlphaTex || u_alphaTexWidth <= 0) return 1.0;
-  int idx = int(cellIndex);
-  int y = idx / u_alphaTexWidth;
-  int x = idx - y * u_alphaTexWidth;
-  return float(texelFetch(u_alphaTex, ivec2(x, y), 0).r);
+  if (!u_useAlphaTex) return 1.0;
+  return float(texelFetch(u_alphaTex, linearTexel(int(cellIndex), u_alphaLayout), 0).r);
 }
 
 void main() {

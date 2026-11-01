@@ -21,6 +21,7 @@ import {
 } from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
 import { createInProcessFigureExportWorker } from './helpers/figure-export-worker-in-process.mjs';
 import { setFigureExportWorkerFactory } from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
+import { allocateInMemory, copyLargeArray, isMemoryBacked } from '../assets/js/utils/large-arrays.js';
 
 const figureExportRoot = new URL('../assets/js/app/ui/modules/figure-export/', import.meta.url);
 const source = path => readFile(new URL(path, figureExportRoot), 'utf8');
@@ -202,6 +203,11 @@ test('where the worker cannot draw, the point passes run on the page and everyth
       }),
       error => error instanceof RangeError && /dimension must be exactly 1, 2, or 3/.test(error.message)
     );
+    // So is the description of the context the passes draw with.
+    await assert.rejects(
+      session.request('rasterContext', { antialias: 1 }),
+      error => error instanceof TypeError && /exact antialiasing boolean/.test(error.message)
+    );
     session.close();
     assert.equal(figureExportRasterizesOnPage(), true);
     assert.deepEqual(
@@ -274,6 +280,7 @@ test('a requested depth sort is honoured above 200,000 points', () => {
     positions,
     dimension: 3,
     colors,
+    colorAlpha: 'layer',
     renderState: { mvpMatrix: IDENTITY, viewportWidth: 100, viewportHeight: 100 },
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     sortByDepth: true,
@@ -334,6 +341,7 @@ test('vector point markup leaves as Blob parts with the bytes of one string', as
     positions,
     dimension: 2,
     colors,
+    colorAlpha: 'layer',
     renderState,
     plotRect,
     radiusPx: 1.5,
@@ -411,6 +419,42 @@ test('a worker error keeps its class and message', async () => {
       error => error instanceof RangeError && /dimension must be exactly 1, 2, or 3/.test(error.message)
     );
     session.close();
+  } finally {
+    setFigureExportWorkerFactory(null);
+  }
+});
+
+test('positions larger than one ArrayBuffer reach the worker in pieces, never cloned whole', async () => {
+  const worker = createInProcessFigureExportWorker();
+  setFigureExportWorkerFactory(() => worker);
+  try {
+    const plain = Float32Array.from([0, 0, 0, 0.5, 0.5, 0.5, -0.25, 0.1, -0.5]);
+    // A WebAssembly memory's array, as the page holds positions past the cap.
+    const positions = copyLargeArray(plain);
+    const backed = allocateInMemory(Float32Array, plain.length);
+    backed.set(plain);
+    assert.equal(isMemoryBacked(backed), true);
+    const options = positions => ({
+      camera: true,
+      positions,
+      dimension: 3,
+      transparency: null,
+      lodMembership: null,
+      renderState: { mvpMatrix: IDENTITY, viewMatrix: IDENTITY, viewportWidth: 100, viewportHeight: 100 },
+      crop: null,
+      normTransform: null,
+    });
+    const session = openFigureExportWorkerSession();
+    const fromMemory = await requestVisibleBounds(session, options(backed));
+    session.close();
+    const direct = await requestVisibleBounds(openFigureExportWorkerSession(), options(positions));
+    assert.deepEqual(fromMemory, direct);
+    const pieces = worker.requests.filter(message => message.piece !== undefined);
+    assert.equal(pieces.length, 1, 'one piece');
+    assert.ok(worker.requests.every(message => message.uploads === undefined ||
+      message.uploads.every(([, array]) => !ArrayBuffer.isView(array) || !isMemoryBacked(array))));
+    const request = worker.requests.find(message => message.op === 'visibleBounds');
+    assert.deepEqual(request.uploads[0][1], { arrayPieces: 0 }, 'the upload names its pieces');
   } finally {
     setFigureExportWorkerFactory(null);
   }

@@ -52,6 +52,8 @@ function analysisOfFixture(generation) {
     state: { pointCount: CELLS },
     getAvailableVariables: type => (type === 'gene_expression' ? GENES.map(key => ({ key })) : []),
     getDatasetGeneration: () => generation,
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells: pageIds => pageIds.map(pageId => ({
       pageId,
       pageName: 'All cells',
@@ -109,7 +111,9 @@ for (const [name, expected] of Object.entries(REFERENCE.score_genes)) {
     assert.deepEqual(set.genes, expected.genes);
     assert.ok(set.controlGenes.length > 0);
     assert.ok(set.controlGenes.every(gene => !expected.genes.includes(gene)));
-    assert.equal(reads.length, 1, 'every needed gene is read once, together');
+    // Each needed gene once: the set's genes, then its controls, each a
+    // batch when the run's memory holds them (it does here).
+    assert.deepEqual(reads, [expected.genes, set.controlGenes], 'every needed gene is read once, the set then its controls');
     const [page] = set.pages;
     assert.equal(page.scores.length, CELLS);
     for (let cell = 0; cell < CELLS; cell++) {

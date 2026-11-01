@@ -34,15 +34,18 @@
  * @module data/data-layer
  */
 
+import { isContinuousValues } from '../../../data/continuous-values.js';
 import { LRUCache } from '../shared/lru-cache.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { SharedWork, abortReasonOf, throwIfAborted } from '../../jobs/cancellable-job.js';
-import { getMemoryMonitor } from '../shared/memory-monitor.js';
+import { abortReason, throwIfAborted, SharedWork, cancel, onAbort } from '../../../utils/abort.js';
 import {
   isRestOfPageId,
+  isDerivedPageId,
   getBasePageIdFromRestOf,
-  getRestOfPageName
+  getRestOfPageName,
+  parseSamplePageId
 } from '../shared/page-derivation-utils.js';
+import { priorityPrefix } from '../../../data/cell-priority.js';
 import { setOwnDataProperty } from '../../../utils/exact-record.js';
 import {
   isCategoricalCodes,
@@ -55,7 +58,10 @@ import {
   waitForAvailableSlot
 } from '../shared/concurrency-utils.js';
 import { formatDuration, formatCountOf } from '../../../utils/format-units.js';
+import { cellsSteady } from '../../../data/open-cells-work.js';
 import { isCellList } from '../../utils/cell-set.js';
+import { registerResidentHolder, residencyBudgetBytes } from '../../../data/memory-budget.js';
+import { failureText } from '../../../utils/errors.js';
 
 // =============================================================================
 // PARALLEL LOADING
@@ -71,8 +77,20 @@ import { isCellList } from '../../utils/cell-set.js';
 
 
 /** An expression matrix (`X`, `raw`, `layer:<key>`) as results name it. */
-function matrixName(matrix) {
-  return matrix.startsWith('layer:') ? `layers['${matrix.slice('layer:'.length)}']` : matrix;
+/**
+ * A matrix as an analysis names it: `X`, `raw`, `layers['counts']`, with
+ * `· counts, not normalised` when it holds counts (Data mapping's
+ * `expressionHoldsCounts`): a fold change on counts is not normalised by
+ * each cell's depth.
+ */
+function matrixName(matrix, counts = false) {
+  const name = matrix.startsWith('layer:') ? `layers['${matrix.slice('layer:'.length)}']` : matrix;
+  return counts ? `${name} · counts, not normalised` : name;
+}
+
+/** Whether the expression menu says `matrix` holds counts. */
+function countsIn(menu, matrix) {
+  return menu?.find(choice => choice.value === matrix)?.counts === true;
 }
 
 /**
@@ -181,6 +199,59 @@ export function excludeMissingCategoricalValues(pageData) {
  * @param {ArrayLike<number>} rawValues - The field's per-cell values or codes
  * @returns {(new (length: number) => ArrayLike<number>)|null}
  */
+/**
+ * A page's values of a gene read as its entries (`SparseColumn`: `indices`
+ * ascending, every other cell zero), at the page's cells `from` to `to`: the
+ * values the gene's dense column holds there, bit for bit, so nothing as long
+ * as every open cell is made.
+ *
+ * A page's cells ascend too, so each is found by galloping forward from
+ * where the one before it was found: a merge walk (O(cells + entries)) when
+ * the page is dense in the entries, a binary search per cell (O(cells ·
+ * log entries)) when it is sparse, and never worse than either. A cell
+ * below the one before it starts again from the first entry.
+ *
+ * @param {{length: number, indices: ArrayLike<number>, values: Float32Array}} column
+ * @param {ArrayLike<number>} cellIndices
+ * @param {Float32Array} out
+ * @param {number} from
+ * @param {number} to
+ * @param {number} cursor - Where the entries were left (`0` to start)
+ * @returns {number} Where the entries are left, for the next slice
+ */
+export function gatherSparseColumn(column, cellIndices, out, from, to, cursor) {
+  const { indices, values } = column;
+  const entries = indices.length;
+  let previous = from > 0 ? cellIndices[from - 1] : -1;
+  for (let i = from; i < to; i++) {
+    const cell = cellIndices[i];
+    if (cell < previous) cursor = 0;
+    previous = cell;
+    let low = cursor;
+    if (low < entries && indices[low] < cell) {
+      // Gallop: double the step until an entry at or past the cell, then
+      // search the last step's span.
+      let step = 1;
+      let high = low + 1;
+      while (high < entries && indices[high] < cell) {
+        low = high;
+        step *= 2;
+        high = low + step;
+      }
+      if (high > entries) high = entries;
+      low += 1;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (indices[middle] < cell) low = middle + 1;
+        else high = middle;
+      }
+    }
+    cursor = low;
+    out[i] = low < entries && indices[low] === cell ? values[low] : 0;
+  }
+  return cursor;
+}
+
 function continuousPageValueStorage(kind, rawValues) {
   if (kind === 'category') return null;
   if (!ArrayBuffer.isView(rawValues) || rawValues instanceof DataView) return null;
@@ -188,18 +259,26 @@ function continuousPageValueStorage(kind, rawValues) {
 }
 
 /**
- * Byte budget of the page-data cache. Entry count alone does not bound it: one
- * entry holds a variable's values for every page it was read for, which is
- * 8 MB for a two-million-cell page of Float32 expression, so a hundred entries
- * could otherwise pin well over a gigabyte.
+ * Byte budget of the page-data cache: the device's `analysisPages` residency
+ * share (`data/memory-budget.js`; 256 MiB of an 8 GiB device), read at every
+ * write so a refused allocation elsewhere lowers it. Entry count alone does
+ * not bound it: one entry holds a variable's values for every page it was
+ * read for, which is 8 MB for a two-million-cell page of Float32 expression.
+ * The page cell lists the data layer made (`_heldPageCellBytes`) count
+ * against the same budget.
+ *
+ * @returns {number}
  */
-const PAGE_DATA_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+function pageDataCacheBytes() {
+  return residencyBudgetBytes('analysisPages');
+}
 
 /**
  * Bytes of per-cell values one cached `getDataForPages` result holds. Cell
- * index arrays are not counted: they are the page membership snapshots every
- * result for the same page shares. A plain array is counted at 8 bytes a slot,
- * and a record without values at none.
+ * lists are not counted here: they are the page memberships every result for
+ * the same page shares, counted once beside the entries
+ * (`DataLayer._heldPageCellBytes`). A plain array is counted at 8 bytes a
+ * slot, and a record without values at none.
  *
  * @param {Array<{values: ArrayLike<unknown>}>} pageData
  * @returns {number}
@@ -349,8 +428,9 @@ function finalizeDigest(lanes) {
  *   `cellIndices` array (null when disabled or absent), and that array's length
  * @property {number} count - How many cells the union holds
  * @property {ArrayLike<number>} cells - The union as stored, for walking only
- * @property {number[]} indices - The exact, deduplicated, ascending union,
- *   built on first read
+ * @property {Uint32Array} indices - The exact, deduplicated, ascending union
+ *   (a cell list), built on first read; shared, never written
+ * @property {Uint32Array|null} built - `indices` once read, else null
  * @property {string|null} digestName - Page name the digest was folded with
  * @property {string|null} digest - `pageId:digest`, or null until computed
  */
@@ -373,40 +453,52 @@ function isAscendingIndexList(list, total) {
   return true;
 }
 
+/** The cell list of no cells, shared (never written: it has no elements). */
+const EMPTY_CELLS = new Uint32Array(0);
+
 /**
  * The deduplicated, ascending union of several cell-index lists, as its size
- * now and its indices on first use.
+ * now and its cell list (`Uint32Array`) on first use.
  *
  * A single list that is already strictly ascending is the union itself — a
  * category highlight, a lasso, a host's selection all are — so its size is
- * its length and its indices are copied into an array only when a reader asks
- * for them: the page selectors ask for counts on every highlight change, and
- * copying a 5,000,000-cell selection into an array for a count cost 85 ms of
- * that change. Several lists, or an unordered one, are united through a
- * dataset-sized membership mask scanned in index order, which is linear and
- * runs no comparator. Lists carrying anything other than safe integers inside
- * the dataset (a page left over from before a reload) keep the general
- * set-and-sort union, so they are reported exactly as before.
+ * its length and it is its own cell list, never copied: the page selectors
+ * ask for counts on every highlight change, and a 5,000,000-cell selection
+ * copied into an array for a count cost 85 ms of that change. Several lists,
+ * or an unordered one, are united through a dataset-sized membership mask
+ * scanned in index order into a cell list sized by the count, which is
+ * linear and runs no comparator. Lists carrying indices past the dataset's
+ * end (a page left over from before a reload) keep a sort-based union, so
+ * they are reported as they are and the fetch rejects them loudly.
+ *
+ * Every page membership is a `Uint32Array` (4 bytes a cell, transferable),
+ * never a JavaScript number array: at 10 million cells an `Array.from` of
+ * one cost 0.3 s and 40–80 MB per read.
  *
  * @param {ArrayLike<number>[]} lists
  * @param {number|undefined} pointCount
- * @returns {{count: number, cells: ArrayLike<number>, indices: () => number[]}}
+ * @returns {{count: number, cells: ArrayLike<number>, indices: () => Uint32Array}}
  *   `cells`: the union as stored (the one list itself, uncopied), for readers
  *   that only walk it (the page digest)
  */
 function sortedUnionOf(lists, pointCount) {
-  if (lists.length === 0) return { count: 0, cells: [], indices: () => [] };
+  if (lists.length === 0) return { count: 0, cells: EMPTY_CELLS, indices: () => EMPTY_CELLS };
   const total = Number.isSafeInteger(pointCount) && pointCount > 0
     ? pointCount
     : 0;
   const single = lists.length === 1 ? lists[0] : null;
-  if (
-    single !== null &&
+  if (single instanceof Uint32Array && isCellList(single, total)) {
     // A Uint32Array is one of integers: a cell list is proven once
     // (`isCellList`), not walked again on every highlight change.
-    (single instanceof Uint32Array ? isCellList(single, total) : isAscendingIndexList(single, total))
-  ) {
-    return { count: single.length, cells: single, indices: () => Array.from(single) };
+    return { count: single.length, cells: single, indices: () => single };
+  }
+  if (single !== null && isAscendingIndexList(single, total)) {
+    let built = null;
+    return {
+      count: single.length,
+      cells: single,
+      indices: () => (built ??= Uint32Array.from(single))
+    };
   }
 
   const mask = new Uint8Array(total);
@@ -414,10 +506,11 @@ function sortedUnionOf(lists, pointCount) {
   for (const list of lists) {
     for (let i = 0; i < list.length; i++) {
       const index = list[i];
-      if (!Number.isSafeInteger(index) || index < 0 || index >= total) {
-        const union = new Set();
-        for (const each of lists) for (const value of each) union.add(value);
-        const sorted = Array.from(union).sort((a, b) => a - b);
+      if (!Number.isSafeInteger(index) || index < 0 || index > 0xffffffff) {
+        throw new RangeError(`A cell index must be an integer in [0, 2^32 - 1]; got ${String(index)}`);
+      }
+      if (index >= total) {
+        const sorted = new Uint32Array(new Set(lists.flatMap(each => Array.from(each)))).sort();
         return { count: sorted.length, cells: sorted, indices: () => sorted };
       }
       if (mask[index] === 0) {
@@ -426,11 +519,9 @@ function sortedUnionOf(lists, pointCount) {
       }
     }
   }
-  // Appended rather than preallocated, so the array stays packed: every
-  // per-cell consumer reads it without hole checks.
-  const union = [];
-  for (let index = 0; union.length < count; index++) {
-    if (mask[index] !== 0) union.push(index);
+  const union = new Uint32Array(count);
+  for (let index = 0, write = 0; write < count; index++) {
+    if (mask[index] !== 0) union[write++] = index;
   }
   return { count, cells: union, indices: () => union };
 }
@@ -505,7 +596,7 @@ export function computeCategoryGroupingDigest(codes) {
  * @property {string} pageName - Human-readable page name
  * @property {VariableInfo} variableInfo - Information about the variable
  * @property {(string|number)[]} values - Decoded values for each cell
- * @property {number[]} cellIndices - Original cell indices in the dataset
+ * @property {Uint32Array} cellIndices - The page's open cell positions, ascending (shared: read only)
  * @property {number} cellCount - Total number of cells in this page data
  */
 
@@ -521,8 +612,10 @@ export function computeCategoryGroupingDigest(codes) {
  * @typedef {Object} DataLayerOptions
  * @property {boolean} [enableCache=true] - Enable LRU caching
  * @property {number} [cacheSize=100] - Maximum page-data cache entries
- * @property {number} [cacheMaxBytes=268435456] - Page-data cache budget for the
- *   bytes of cached per-cell values (256 MiB)
+ * @property {number|(() => number)} [cacheMaxBytes] - Page-data cache budget for
+ *   the bytes of cached per-cell values and page cell lists; by default the
+ *   `analysisPages` share of the memory model (`residencyBudgetBytes`), read
+ *   whenever the cache is trimmed
  * @property {number} [cacheMaxAge=0] - Cache entry max age in ms (0 = no expiration)
  * @property {boolean} [enableDedup=true] - Enable request deduplication
  * @property {boolean} [enablePrefetch=false] - Enable prefetching
@@ -673,7 +766,7 @@ export class DataLayer {
     const {
       enableCache = true,
       cacheSize = 100,
-      cacheMaxBytes = PAGE_DATA_CACHE_MAX_BYTES,
+      cacheMaxBytes = pageDataCacheBytes,
       cacheMaxAge = 0,
       enableDedup = true,
       enablePrefetch = false,
@@ -708,13 +801,15 @@ export class DataLayer {
     this._obsFieldIndexByKey = null;
 
     // LRU cache for page data (if enabled), bounded by entries and by the
-    // bytes of the per-cell values it holds.
+    // bytes of the per-cell values it holds and the page cell lists made for
+    // them.
     this._dataCache = enableCache
       ? new LRUCache({
         maxSize: cacheSize,
         maxAge: cacheMaxAge,
         maxBytes: cacheMaxBytes,
-        sizeOf: pageDataValueBytes
+        sizeOf: pageDataValueBytes,
+        heldBytes: () => this._heldPageCellBytes()
       })
       : null;
 
@@ -733,6 +828,20 @@ export class DataLayer {
      */
     this._matrixHandles = new Map();
     this._destroyed = false;
+    // Genes read for more of the open cells (`gene-sample.js`, Genes read
+    // for): every gene's values changed, so what was computed from them is
+    // of another load, as when the mapping changes; work under way on the
+    // earlier cells is let go at its next check.
+    this._geneSampleCells = state?.getGeneSample?.()?.cells ?? null;
+    this._onGeneSample = ({ sample } = {}) => {
+      const cells = sample?.cells ?? null;
+      if (cells === this._geneSampleCells || this._destroyed) return;
+      this._geneSampleCells = cells;
+      this._datasetGeneration += 1;
+      this._matrixHandles.clear();
+      this.clearAllCaches();
+    };
+    state?.on?.('gene-sample:changed', this._onGeneSample);
     this._destroyPromise = null;
 
     // Prefetch queue
@@ -751,7 +860,7 @@ export class DataLayer {
     // the values its key describes: the two used to be built by separate
     // traversals with an `await` between them, so a membership change in that
     // window was cached under the version it no longer matched.
-    /** @type {Map<string, {hash: string, indices: number[]}>} */
+    /** @type {Map<string, {hash: string, indices?: Uint32Array, membership?: PageMembershipRecord}>} */
     this._pageIndexSnapshots = new Map();
 
     // Each page's exact membership and digest, recorded with the structure
@@ -762,11 +871,13 @@ export class DataLayer {
     // Notification center reference
     this._notifications = enableNotifications ? getNotificationCenter() : null;
 
-    // Memory monitor integration for automatic cleanup under memory pressure
-    this._instanceId = `data-layer-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-    this._memoryMonitor = getMemoryMonitor();
-    this._memoryMonitor.registerCleanupHandler(this._instanceId, () => {
-      this._handleMemoryCleanup();
+    // The memory model counts the page values and page cell lists kept
+    // (the `analysisPages` share) and trims them, oldest first, when the
+    // share shrinks or the page is hidden (`data/memory-budget.js`).
+    this._stopCounting = registerResidentHolder('analysisPages', {
+      label: 'analysis page values',
+      bytes: () => this._keptPageBytes(),
+      trim: budget => this._trimKeptPages(budget),
     });
 
     // Initialize page version tracking
@@ -833,49 +944,40 @@ export class DataLayer {
   }
 
   /**
-   * Handle memory cleanup triggered by MemoryMonitor
-   * Clears caches to free memory under pressure
+   * What the page values and page cell lists kept hold, in bytes.
+   * @returns {number}
    * @private
    */
-  _handleMemoryCleanup() {
-    const beforeMemory = this.estimateMemoryUsage();
-    this._cacheGeneration += 1;
-    // A retained index set is per page rather than per cached entry, so it is
-    // small — but after a prune it can be the only thing still holding one.
-    this._pageIndexSnapshots.clear();
-    this._pageMemberships.clear();
+  _keptPageBytes() {
+    return (this._dataCache?.getStats().bytes ?? 0) + this._heldPageCellBytes();
+  }
 
-    // Prune data cache (remove oldest entries)
+  /**
+   * Let kept page values go, least recently used first, until they and the
+   * page cell lists hold no more than `budget` bytes; at 0 the page
+   * memberships and their index sets go too (made again by the next read).
+   * Reads in flight finish and are delivered.
+   *
+   * @param {number} budget
+   * @returns {string|null} What was let go, in words
+   * @private
+   */
+  _trimKeptPages(budget) {
+    let released = 0;
     if (this._dataCache) {
-      // Clear half the cache to free memory while preserving recent data
-      const targetSize = Math.floor(this._options.cacheSize / 2);
-      while (this._dataCache.size() > targetSize) {
-        // LRU cache automatically removes oldest entries
-        const keys = Array.from(this._dataCache.keys());
-        if (keys.length > 0) {
-          this._dataCache.delete(keys[0]);
-        } else {
-          break;
-        }
+      for (const key of [...this._dataCache.keys()]) {
+        if (this._keptPageBytes() <= budget) break;
+        this._dataCache.delete(key);
+        released++;
       }
     }
-
-    // Clear pending requests that are stale
-    if (this._pendingRequests) {
-      this._pendingRequests.clear();
+    if (budget === 0 && (this._pageIndexSnapshots.size > 0 || this._pageMemberships.size > 0)) {
+      this._cacheGeneration += 1;
+      this._pageIndexSnapshots.clear();
+      this._pageMemberships.clear();
+      released++;
     }
-
-    // Clear prefetch queue
-    this._prefetchQueue = [];
-    if (this._prefetchTimeout) {
-      clearTimeout(this._prefetchTimeout);
-      this._prefetchTimeout = null;
-    }
-
-    const afterMemory = this.estimateMemoryUsage();
-    const freedMB = (parseFloat(beforeMemory.megabytes) - parseFloat(afterMemory.megabytes)).toFixed(2);
-
-    console.debug(`[DataLayer] Memory cleanup: freed ~${freedMB}MB (bulk cache cleared, data cache pruned to 50%)`);
+    return released === 0 ? null : 'values read for analysis pages';
   }
 
   // ===========================================================================
@@ -1028,6 +1130,9 @@ export class DataLayer {
     if (typeof this.state?.getHighlightPageColor !== 'function') {
       throw new TypeError('DataLayer state.getHighlightPageColor is required');
     }
+    // A sample of a page is drawn in its page's colour.
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) return this.getPageColor(sample.baseId);
     const color = this.state.getHighlightPageColor(pageId);
     if (color !== null && (typeof color !== 'string' || color.length === 0)) {
       throw new TypeError('DataLayer page color must be a non-empty string or null');
@@ -1057,6 +1162,13 @@ export class DataLayer {
   getPageInfo(pageId) {
     if (!pageId) return null;
 
+    // A sample of a page (`progressive-cells.js`) is its page, on fewer cells.
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) {
+      const base = this.getPageInfo(sample.baseId);
+      return base === null ? null : { id: pageId, name: base.name, derived: { kind: 'sample', baseId: sample.baseId, m: sample.m } };
+    }
+
     if (isRestOfPageId(pageId)) {
       const baseId = getBasePageIdFromRestOf(pageId);
       const basePage = baseId ? (this.getPages().find(p => p.id === baseId) || null) : null;
@@ -1083,6 +1195,8 @@ export class DataLayer {
   getCellCountForPageId(pageId) {
     if (!pageId) return 0;
 
+    if (parseSamplePageId(pageId) !== null) return this.getCellIndicesForPage(pageId).length;
+
     if (isRestOfPageId(pageId)) {
       const baseId = getBasePageIdFromRestOf(pageId);
       const total = this.state?.pointCount || 0;
@@ -1097,10 +1211,50 @@ export class DataLayer {
   }
 
   /**
-   * Get cell indices for a specific page
+   * The first `m` of the open cells in their priority order
+   * (`data/cell-priority.js`): a uniform random sample of them, as a
+   * membership test (`priorityPrefix`). A progressive analysis takes its
+   * first pass on it (`shared/progressive-cells.js`).
+   *
+   * @param {number} m
+   * @returns {ReturnType<typeof priorityPrefix>}
+   */
+  cellSample(m) {
+    const priority = this.state?.cellPriority;
+    const n = this.state?.pointCount || 0;
+    const kept = this._cellSampleMemo;
+    if (kept !== undefined && kept.priority === priority && kept.n === n && kept.m === m) return kept.prefix;
+    const prefix = priorityPrefix(priority, n, m);
+    this._cellSampleMemo = { priority, n, m, prefix };
+    return prefix;
+  }
+
+  /**
+   * A number naming the open cells' priority, for page versions: equal for
+   * the same priority object, different for any other.
+   * @private
+   */
+  _cellPriorityGeneration() {
+    const priority = this.state?.cellPriority;
+    this._priorityGenerations ??= new WeakMap();
+    if (priority === null || typeof priority !== 'object') return 0;
+    let generation = this._priorityGenerations.get(priority);
+    if (generation === undefined) {
+      this._priorityGenerationCounter = (this._priorityGenerationCounter ?? 0) + 1;
+      generation = this._priorityGenerationCounter;
+      this._priorityGenerations.set(priority, generation);
+    }
+    return generation;
+  }
+
+  /**
+   * The cells of a page, as a cell list: a `Uint32Array` of open cell
+   * positions, ascending, each once. A base page's is its membership,
+   * shared with every read of it (and, for a page of one group, the group's
+   * own list): callers read it and never write it.
    *
    * @param {string} pageId - Page identifier
-   * @returns {number[]} Array of cell indices
+   * @returns {Uint32Array}
    *
    * @example
    * const cellIndices = dataLayer.getCellIndicesForPage('page1');
@@ -1111,32 +1265,29 @@ export class DataLayer {
       throw new TypeError('pageId must be exact non-empty text');
     }
 
+    // Derived "sample" page: the base page's cells among the first `m` of
+    // the open cells' priority order.
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) {
+      return this.cellSample(sample.m).filter(this.getCellIndicesForPage(sample.baseId));
+    }
+
     // Derived "rest-of" page: complement of base page indices
     if (isRestOfPageId(pageId)) {
       const baseId = getBasePageIdFromRestOf(pageId);
-      if (!baseId) return [];
+      if (!baseId) return EMPTY_CELLS;
 
       const total = this.state?.pointCount || 0;
       if (!Number.isFinite(total) || total <= 0) {
         debugWarn('DataLayer', `Cannot compute derived page indices without pointCount (pageId=${pageId})`);
-        return [];
+        return EMPTY_CELLS;
       }
 
+      // One merge walk of the base page's cell list against every cell.
       const baseIndices = this.getCellIndicesForPage(baseId);
-      if (!baseIndices || baseIndices.length === 0) {
-        // Rest-of empty base page => all cells
-        const all = new Array(total);
-        for (let i = 0; i < total; i++) all[i] = i;
-        return all;
-      }
-
-      const complementCount = Math.max(0, total - baseIndices.length);
-      if (complementCount === 0) return [];
-
-      const complement = new Array(complementCount);
+      const complement = new Uint32Array(Math.max(0, total - baseIndices.length));
       let write = 0;
       let basePtr = 0;
-
       for (let i = 0; i < total; i++) {
         if (basePtr < baseIndices.length && baseIndices[basePtr] === i) {
           basePtr++;
@@ -1144,7 +1295,6 @@ export class DataLayer {
         }
         complement[write++] = i;
       }
-
       return complement;
     }
 
@@ -1153,8 +1303,38 @@ export class DataLayer {
       throw new Error(`Page not found: ${pageId}`);
     }
 
-    // A fresh array, as before: callers own what this returns.
-    return this._getPageMembership(page).indices.slice();
+    return this._getPageMembership(page).indices;
+  }
+
+  /**
+   * Bytes of the page cell lists the data layer made and holds — unions of
+   * several groups, "rest of" complements, first-pass samples — each once,
+   * however many cached results share it. A group's own list is the
+   * highlight's, not counted here.
+   *
+   * @returns {number}
+   * @private
+   */
+  _heldPageCellBytes() {
+    const groupLists = new Set();
+    for (const record of this._pageMemberships.values()) {
+      for (const group of record.groups) {
+        if (group?.cellIndices) groupLists.add(group.cellIndices);
+      }
+    }
+    const counted = new Set();
+    let bytes = 0;
+    const add = list => {
+      if (!ArrayBuffer.isView(list) || groupLists.has(list) || counted.has(list)) return;
+      counted.add(list);
+      bytes += list.byteLength;
+    };
+    for (const record of this._pageMemberships.values()) {
+      add(record.cells);
+      add(record.built);
+    }
+    for (const snapshot of this._pageIndexSnapshots.values()) add(snapshot.indices);
+    return bytes;
   }
 
   /**
@@ -1220,7 +1400,6 @@ export class DataLayer {
       if (active !== null) lists.push(active);
     }
     const union = sortedUnionOf(lists, this.state?.pointCount);
-    let indices = null;
     const record = {
       page,
       groups,
@@ -1228,10 +1407,12 @@ export class DataLayer {
       structure,
       count: union.count,
       cells: union.cells,
+      /** @type {Uint32Array|null} `indices` once read */
+      built: null,
       // Materialised on first read and kept: a count or a digest never builds it.
       get indices() {
-        indices ??= union.indices();
-        return indices;
+        this.built ??= union.indices();
+        return this.built;
       },
       digestName: null,
       digest: null,
@@ -1356,6 +1537,10 @@ export class DataLayer {
    * @returns {Promise<{ fieldIndex: number, values: ArrayLike<number>, wasLoaded: boolean }>}
    */
   async ensureGeneExpressionLoaded(geneKey, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { silent = true, signal = null, priority = 'normal' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene load signal must be an AbortSignal or null');
@@ -1413,6 +1598,10 @@ export class DataLayer {
    * @returns {Promise<{fieldIndex: number, values: Float32Array|{length: number, indices: Uint32Array, values: Float32Array}, owned: boolean}>}
    */
   async readGeneColumn(geneKey, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene read signal must be an AbortSignal or null');
@@ -1483,7 +1672,7 @@ export class DataLayer {
     const mapping = this.state.getDataMapping?.() ?? null;
     const mapped = mapping?.expression ?? null;
     const menu = mapped === null ? null : (this.state.getMappingGroupChoices?.('expression') ?? null);
-    const choices = [{ value: 'mapped', label: mapped === null ? 'Mapped' : `Mapped (${matrixName(mapped)})` }];
+    const choices = [{ value: 'mapped', label: mapped === null ? 'Mapped' : `Mapped (${matrixName(mapped, countsIn(menu, mapped))})` }];
     if (menu === null) {
       return {
         choices,
@@ -1492,7 +1681,7 @@ export class DataLayer {
     }
     for (const choice of menu) {
       if (choice.value !== null && choice.value !== mapped && choice.usable) {
-        choices.push({ value: choice.value, label: choice.label });
+        choices.push({ value: choice.value, label: choice.label, counts: choice.counts === true });
       }
     }
     return { choices, reason: null };
@@ -1517,7 +1706,7 @@ export class DataLayer {
     if (choice === undefined) {
       throw new RangeError(`This dataset has no expression matrix ${String(matrix)} to read`);
     }
-    return { matrix, read: matrix, label: matrixName(matrix) };
+    return { matrix, read: matrix, label: matrixName(matrix, choice.counts === true) };
   }
 
   /**
@@ -1552,6 +1741,31 @@ export class DataLayer {
       this._matrixHandles.set(key, opened);
     }
     return opened;
+  }
+
+  /**
+   * The open cells genes of `matrix` (an analysis's "Expression matrix",
+   * `resolveExpressionMatrix`) are read for: `{cells, of}`, open cells
+   * `[0, cells)`, when its genes are read for a sample of them
+   * (`state/managers/field/gene-sample.js`); null when every open cell's
+   * are. An analysis that reads genes computes on its cells below `cells`
+   * (`shared/gene-sample-cells.js`) and says so.
+   *
+   * @param {string} [matrix='mapped']
+   * @returns {Promise<{cells: number, of: number}|null>}
+   */
+  async geneCellsOf(matrix = 'mapped') {
+    const expression = this.resolveExpressionMatrix(matrix).read;
+    // Asked of the source each time, never the page's last note of it: an
+    // analysis that took every cell for read would read the others' rows.
+    if (expression === null) {
+      const sample = await this.state.refreshGeneSample();
+      return sample === null ? null : { cells: sample.cells, of: sample.of };
+    }
+    const { handle } = await this._openMatrix(expression);
+    const descriptor = handle.fields[0] ?? null;
+    if (descriptor === null || typeof handle.loader?.geneSampleOf !== 'function') return null;
+    return handle.loader.geneSampleOf(descriptor);
   }
 
   /**
@@ -1594,17 +1808,39 @@ export class DataLayer {
   }
 
   /**
+   * Whether the source reads genes of `matrix` in some cells here
+   * (`readGeneCellSubset`), for genes it reads (`isGeneDeliverable`): an
+   * AnnData source does; a run decides by it before its first read.
+   *
+   * @param {string} [matrix='mapped']
+   * @returns {boolean}
+   */
+  readsGeneCellSubsets(matrix = 'mapped') {
+    if (matrix !== 'mapped' && this.resolveExpressionMatrix(matrix).read !== null) {
+      return typeof this.state?.readMatrixCellSubset === 'function';
+    }
+    return typeof this.state?.readVarCellSubset === 'function' &&
+      typeof this.state.varFieldLoader?.readCellSubset === 'function';
+  }
+
+  /**
    * Some genes' values in some cells, read by cell or by gene, whichever
    * costs less (see DataState.readVarCellSubset); null when the source
    * cannot.
    *
    * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
    * @param {ArrayLike<number>} cellIndices - Distinct cell positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options] -
-   *   `owner`: the job the read is for; `matrix` as `readGeneColumn`
+   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string, runGenes?: number|null}} [options] -
+   *   `owner`: the job the read is for; `matrix` as `readGeneColumn`;
+   *   `runGenes`: the genes the read's run has still to read of these cells,
+   *   this read's included (the source prices its routes over the run)
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
    */
   async readGeneCellSubset(geneKeys, cellIndices, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const matrix = options.matrix ?? 'mapped';
     const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
     if (expression !== null) {
@@ -1619,6 +1855,7 @@ export class DataLayer {
       const signal = options.signal ?? null;
       const block = await this.state.readMatrixCellSubset(opened.handle, genes, cellIndices, {
         owner: options.owner ?? null,
+        runGenes: options.runGenes ?? null,
         signal: signal === null
           ? this._fieldLoadLifecycle.signal
           : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
@@ -1638,10 +1875,23 @@ export class DataLayer {
     const signal = options.signal ?? null;
     return this.state.readVarCellSubset(fieldIndices, cellIndices, {
       owner: options.owner ?? null,
+      runGenes: options.runGenes ?? null,
       signal: signal === null
         ? this._fieldLoadLifecycle.signal
         : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
     });
+  }
+
+  /**
+   * Hold the gene sample still before a run reads genes (`DataState.holdGeneSample`):
+   * a growth filling the gene time stops and settles, so the run's sample
+   * is the one that stays and its reads are never let go as of another load.
+   * Null when nothing is to be waited for.
+   *
+   * @returns {Promise<void>|null}
+   */
+  holdGeneSample() {
+    return this.state?.holdGeneSample?.() ?? null;
   }
 
   /**
@@ -1716,6 +1966,10 @@ export class DataLayer {
    * @returns {Promise<{bytes: number[]}>}
    */
   async deliverGeneColumns(geneKeys, delivery, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
     if (signal !== null && !(signal instanceof AbortSignal)) {
       throw new TypeError('Gene delivery signal must be an AbortSignal or null');
@@ -1757,11 +2011,16 @@ export class DataLayer {
    * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
    * @param {ArrayLike<number>} cellIndices - Distinct cell positions
    * @param {Object} delivery
-   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string, runGenes?: number|null}} [options] -
+   *   `runGenes` as `readGeneCellSubset`
    * @returns {Promise<{bytes: number}>}
    */
   async deliverGeneCellSubset(geneKeys, cellIndices, delivery, options = {}) {
-    const { signal = null, owner = null, matrix = 'mapped' } = options;
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
+    const { signal = null, owner = null, matrix = 'mapped', runGenes = null } = options;
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
     const readSignal = signal === null
@@ -1777,7 +2036,7 @@ export class DataLayer {
         if (gene === undefined) throw geneNotInMatrixError(geneKey, opened.label);
         return gene;
       });
-      delivered = await this.state.deliverMatrixCellSubset(opened.handle, genes, cellIndices, delivery, { owner, signal: readSignal });
+      delivered = await this.state.deliverMatrixCellSubset(opened.handle, genes, cellIndices, delivery, { owner, runGenes, signal: readSignal });
     } else {
       const indexOf = this._getGeneFieldIndexMap();
       const fieldIndices = geneKeys.map(geneKey => {
@@ -1785,7 +2044,7 @@ export class DataLayer {
         if (typeof fieldIndex !== 'number') throw new Error(`[DataLayer] Gene not found: ${geneKey}`);
         return fieldIndex;
       });
-      delivered = await this.state.deliverVarCellSubset(fieldIndices, cellIndices, delivery, { owner, signal: readSignal });
+      delivered = await this.state.deliverVarCellSubset(fieldIndices, cellIndices, delivery, { owner, runGenes, signal: readSignal });
     }
     this._requireCurrentDatasetGeneration(datasetGeneration);
     return delivered;
@@ -1806,6 +2065,10 @@ export class DataLayer {
    * @returns {Promise<Array<ArrayLike<number>|{length: number, indices: Uint32Array, values: Float32Array}>>}
    */
   async readGeneColumns(geneKeys, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     if (!Array.isArray(geneKeys)) {
       throw new TypeError('Gene column keys must be an array');
     }
@@ -1831,51 +2094,53 @@ export class DataLayer {
     }
     const datasetGeneration = this._datasetGeneration;
     const owner = new AbortController();
-    registerInvalidationCleanup?.(() => owner.abort());
-    const stopReads = () => owner.abort(abortReasonOf(signal));
-    signal?.addEventListener('abort', stopReads, { once: true });
-    const requireCurrent = () => {
-      throwIfAborted(signal);
-      this._requireCurrentDatasetGeneration(datasetGeneration);
-      if (owner.signal.aborted || (isCurrent !== undefined && !isCurrent())) {
-        throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
-      }
-    };
-    requireCurrent();
-    const columns = new Array(geneKeys.length);
-    const inFlight = new Set();
-    const tasks = [];
-    const maxInFlight = Math.max(1, geneKeys.length);
-    for (let index = 0; index < geneKeys.length; index++) {
-      await waitForAvailableSlot(inFlight, maxInFlight);
-      requireCurrent();
-      const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner, matrix })
-        .then(({ values }) => {
-          columns[index] = values;
-        });
-      tasks.push(task);
-      trackSettlement(inFlight, task);
-    }
+    registerInvalidationCleanup?.(() => cancel(owner, 'superseded', 'The gene column request is no longer current.'));
+    const stopReads = onAbort(signal, () => owner.abort(abortReason(signal)));
+    // Removed however the request ends: the caller's signal may outlive it.
     try {
-      await Promise.all(tasks);
-    } catch (error) {
-      // Whether the request still owned its reads is decided before this
-      // catch stops the others: aborting `owner` here is the read failure's
-      // own cleanup, not an ownership change, and must not hide the failure.
-      const lostOwnership = owner.signal.aborted || (isCurrent !== undefined && !isCurrent());
-      owner.abort();
-      await Promise.allSettled(tasks);
-      throwIfAborted(signal);
-      this._requireCurrentDatasetGeneration(datasetGeneration);
-      if (lostOwnership) {
-        throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
+      const requireCurrent = () => {
+        throwIfAborted(signal);
+        this._requireCurrentDatasetGeneration(datasetGeneration);
+        if (owner.signal.aborted || (isCurrent !== undefined && !isCurrent())) {
+          throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
+        }
+      };
+      requireCurrent();
+      const columns = new Array(geneKeys.length);
+      const inFlight = new Set();
+      const tasks = [];
+      const maxInFlight = Math.max(1, geneKeys.length);
+      for (let index = 0; index < geneKeys.length; index++) {
+        await waitForAvailableSlot(inFlight, maxInFlight);
+        requireCurrent();
+        const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner, matrix })
+          .then(({ values }) => {
+            columns[index] = values;
+          });
+        tasks.push(task);
+        trackSettlement(inFlight, task);
       }
-      throw error;
+      try {
+        await Promise.all(tasks);
+      } catch (error) {
+        // Whether the request still owned its reads is decided before this
+        // catch stops the others: aborting `owner` here is the read failure's
+        // own cleanup, not an ownership change, and must not hide the failure.
+        const lostOwnership = owner.signal.aborted || (isCurrent !== undefined && !isCurrent());
+        cancel(owner, 'superseded', 'Another read of the request failed: its reads stop.');
+        await Promise.allSettled(tasks);
+        throwIfAborted(signal);
+        this._requireCurrentDatasetGeneration(datasetGeneration);
+        if (lostOwnership) {
+          throw this._createAnalysisDataInvalidationError('an analysis request ownership change');
+        }
+        throw error;
+      }
+      requireCurrent();
+      return columns;
     } finally {
-      signal?.removeEventListener('abort', stopReads);
+      stopReads();
     }
-    requireCurrent();
-    return columns;
   }
 
   /**
@@ -1883,14 +2148,14 @@ export class DataLayer {
    * page's distinct cell indices in ascending order (shared: read only).
    *
    * @param {string[]} pageIds
-   * @returns {Array<{pageId: string, pageName: string, cellIndices: ArrayLike<number>}>}
+   * @returns {Array<{pageId: string, pageName: string, cellIndices: Uint32Array}>}
    */
   getPageCells(pageIds) {
     if (!Array.isArray(pageIds)) {
       throw new TypeError('Page cell IDs must be an array');
     }
     this.refreshPageVersions(
-      Array.from(new Set(pageIds)).filter(id => !isRestOfPageId(id))
+      Array.from(new Set(pageIds)).filter(id => !isDerivedPageId(id))
     );
     return pageIds.map(pageId => {
       const pageInfo = this.getPageInfo(pageId);
@@ -1935,6 +2200,10 @@ export class DataLayer {
    *   missing code with `missingCategoryCode`); callers must not modify it.
    */
   async ensureObsFieldLoaded(obsKey, options = {}) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     const { silent = true, signal = null } = options;
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
@@ -2025,6 +2294,10 @@ export class DataLayer {
    * }
    */
   async getDataForPages(options) {
+    // The open cells being changed in place: read on the cells after it
+    // (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Page-data fetch options must be an object');
     }
@@ -2066,7 +2339,7 @@ export class DataLayer {
     // Without refreshing page versions, cached results can become stale and plots lag behind
     // (e.g., a newly created page remains "empty" in analysis until another page change occurs).
     const uniquePageIds = Array.from(new Set(pageIds));
-    this.refreshPageVersions(uniquePageIds.filter(id => !isRestOfPageId(id)));
+    this.refreshPageVersions(uniquePageIds.filter(id => !isDerivedPageId(id)));
 
     // Check cache first (if enabled)
     if (this._dataCache && !noCache) {
@@ -2200,11 +2473,24 @@ export class DataLayer {
       });
     }
 
+    // A gene the views do not show is read as its entries for these pages
+    // (`readGeneColumn`), never installed as a column of every open cell:
+    // what a page reads costs the gene's stored values and the page's cells.
+    let sparseGene = null;
     try {
-      await this._ensureFieldLoaded(field, fieldIndex, source, {
-        signal,
-        owner: options.owner ?? null
-      });
+      if (source === 'var' && !(field.loaded && field.values) && typeof this.state.readVarSparseColumn === 'function') {
+        const read = await this.readGeneColumn(variableKey, { signal, owner: options.owner ?? null });
+        if (ArrayBuffer.isView(read.values)) {
+          // Loaded meanwhile: the field's own array.
+        } else {
+          sparseGene = read.values;
+        }
+      } else {
+        await this._ensureFieldLoaded(field, fieldIndex, source, {
+          signal,
+          owner: options.owner ?? null
+        });
+      }
     } finally {
       if (loadingNotificationId && notifications) {
         // Ensure notification is visible for minimum duration
@@ -2223,14 +2509,16 @@ export class DataLayer {
     this._requireCurrentDatasetGeneration(datasetGeneration);
 
     // Get values array
-    const rawValues = field.kind === 'category'
-      ? requireAnalysisCategoryCodes(field.codes, variableKey)
-      : field.values;
+    const rawValues = sparseGene !== null
+      ? sparseGene.values
+      : field.kind === 'category'
+        ? requireAnalysisCategoryCodes(field.codes, variableKey)
+        : field.values;
     const missingCode = field.kind === 'category'
       ? missingCategoryCode(rawValues)
       : null;
 
-    if (!rawValues || rawValues.length === 0) {
+    if (!rawValues || (sparseGene === null && rawValues.length === 0)) {
       throw new Error(`No values are available for field: ${variableKey}`);
     }
 
@@ -2263,7 +2551,7 @@ export class DataLayer {
           variableInfo: { ...variableInfo },
           values,
           ...categoricalRecord,
-          cellIndices: [],
+          cellIndices: EMPTY_CELLS,
           cellCount: 0
         });
         continue;
@@ -2285,6 +2573,30 @@ export class DataLayer {
         ? []
         : new ValueStorage(cellIndices.length);
       let position = 0;
+      if (sparseGene !== null) {
+        requireIndicesWithin(cellIndices, sparseGene.length, variableKey);
+        // In slices, handing the event loop back as the dense branch does.
+        const yieldIfSliceSpent = createSlicedYield();
+        let cursor = 0;
+        for (let from = 0; from < cellIndices.length; from += 0x10000) {
+          const to = Math.min(cellIndices.length, from + 0x10000);
+          cursor = gatherSparseColumn(sparseGene, cellIndices, values, from, to, cursor);
+          const pending = yieldIfSliceSpent();
+          if (pending !== undefined) {
+            await pending;
+            this._requireCurrentDatasetGeneration(datasetGeneration);
+          }
+        }
+        results.push({
+          pageId,
+          pageName: pageInfo.name,
+          variableInfo: { ...variableInfo, categories: undefined },
+          values,
+          cellIndices,
+          cellCount: values.length
+        });
+        continue;
+      }
       // A typed continuous field is gathered in one tight loop: its values are
       // numbers by type, and the page's indices are checked against the field
       // once per index set (a page's index array is shared by every variable
@@ -2532,6 +2844,17 @@ export class DataLayer {
   _computePageHash(pageId) {
     const lanes = createDigestLanes();
 
+    const sample = parseSamplePageId(pageId);
+    if (sample !== null) {
+      // A sample of a page is determined by its base page's version, the
+      // sample size and the priority it is taken in.
+      foldDigestText(lanes, this._getPageVersion(sample.baseId));
+      foldDigestNumber(lanes, sample.m);
+      foldDigestNumber(lanes, this._cellPriorityGeneration());
+      foldDigestNumber(lanes, this.state?.pointCount || 0);
+      return `${pageId}:${finalizeDigest(lanes)}`;
+    }
+
     if (isRestOfPageId(pageId)) {
       // A derived "rest of" page is the exact complement of its base page
       // within the dataset, so its identity is fully determined by the base
@@ -2569,7 +2892,7 @@ export class DataLayer {
    * a caller can never be handed a set the current cache key does not cover.
    *
    * @param {string} pageId - Page ID
-   * @returns {number[]} The page's exact, deduplicated, ascending index set
+   * @returns {Uint32Array} The page's exact, deduplicated, ascending index set
    * @private
    */
   _getVersionedCellIndices(pageId) {
@@ -2620,7 +2943,7 @@ export class DataLayer {
 
     // Derived pages are not stored in the version map; their exact version is
     // derived from the base page's version on demand.
-    if (isRestOfPageId(pageId)) {
+    if (isDerivedPageId(pageId)) {
       return this._computePageHash(pageId);
     }
 
@@ -2651,7 +2974,7 @@ export class DataLayer {
     if (!this._pageVersions) return;
 
     const idsToRefresh = (pageIds || this.getPages().map(p => p.id))
-      .filter(id => !isRestOfPageId(id));
+      .filter(id => !isDerivedPageId(id));
 
     for (const pageId of idsToRefresh) {
       const oldHash = this._pageVersions.get(pageId);
@@ -2895,10 +3218,10 @@ export class DataLayer {
           : null;
       if (
         fieldData.kind === 'continuous' &&
-        !(rawFieldValues instanceof Float32Array)
+        !isContinuousValues(rawFieldValues)
       ) {
         throw new TypeError(
-          `Continuous observation field "${fieldKey}" must load as Float32Array`
+          `Continuous observation field "${fieldKey}" must load as Float32Array or Float64Array`
         );
       }
       if (
@@ -2964,7 +3287,8 @@ export class DataLayer {
       for (const pageId of pageIds) {
         const cellIndices = result.pageData[pageId].cellIndices;
         if (fieldData.kind === 'continuous') {
-          const pageValues = new Float32Array(cellIndices.length);
+          // The field's own width: an exact integer column stays exact.
+          const pageValues = new rawFieldValues.constructor(cellIndices.length);
           for (let i = 0; i < cellIndices.length; i++) {
             pageValues[i] = rawFieldValues[cellIndices[i]];
           }
@@ -3048,7 +3372,7 @@ export class DataLayer {
     } catch (error) {
       // Fail notification on error
       if (notificationId && this._notifications) {
-        this._notifications.fail(notificationId, `Failed to load observation fields: ${error.message}`);
+        this._notifications.fail(notificationId, `Failed to load observation fields: ${failureText(error)}`);
       }
       throw error;
     }
@@ -3203,6 +3527,7 @@ export class DataLayer {
   destroy() {
     if (this._destroyPromise != null) return this._destroyPromise;
     this._destroyed = true;
+    this.state?.off?.('gene-sample:changed', this._onGeneSample);
     this._fieldLoadLifecycle.abort(
       this._createAnalysisDataInvalidationError(
         'DataLayer destruction'
@@ -3210,29 +3535,17 @@ export class DataLayer {
     );
     this._datasetGeneration += 1;
     this._cacheGeneration += 1;
-    // Stop background admission immediately. Cache contents remain owned by
-    // a running memory-pressure handler until unregister drains below, but no
-    // timer may start new work against the terminal generation.
+    // Stop background admission immediately: no timer may start new work
+    // against the terminal generation.
     this._prefetchQueue = [];
     if (this._prefetchTimeout !== null) {
       clearTimeout(this._prefetchTimeout);
       this._prefetchTimeout = null;
     }
+    // The memory model stops counting (and trimming) these caches.
+    this._stopCounting();
 
-    const memoryMonitor = this._memoryMonitor;
-    const instanceId = this._instanceId;
-    this._destroyPromise = Promise.resolve().then(async () => {
-      let unregisterError = null;
-      if (memoryMonitor && instanceId) {
-        try {
-          await memoryMonitor.unregisterCleanupHandler(instanceId);
-        } catch (error) {
-          unregisterError = error;
-        }
-      }
-
-      // A running memory-pressure handler may still own these caches. Clear
-      // them only after unregisterCleanupHandler() has drained that owner.
+    this._destroyPromise = Promise.resolve().then(() => {
       if (this._dataCache) {
         this._dataCache.clear();
       }
@@ -3243,10 +3556,8 @@ export class DataLayer {
       }
 
       this._notifications = null;
-      this._memoryMonitor = null;
 
       console.debug('[DataLayer] Instance destroyed');
-      if (unregisterError !== null) throw unregisterError;
     });
     void this._destroyPromise.catch(() => {});
     return this._destroyPromise;

@@ -106,6 +106,20 @@ export function requireCategoryCodes(codes, categories, expectedLength, context)
   return codes;
 }
 
+/**
+ * Require the values of a stored continuous field: one float32 per open
+ * cell, NaN where a cell has none.
+ */
+function requireStoredValues(values, pointCount, context) {
+  if (!(values instanceof Float32Array)) {
+    throw new TypeError(`${context} values must be a Float32Array`);
+  }
+  if (!Number.isSafeInteger(pointCount) || values.length !== pointCount) {
+    throw new TypeError(`${context} values must hold one value per open cell`);
+  }
+  return values;
+}
+
 export class UserDefinedFieldsRegistry extends BaseRegistry {
   constructor() {
     super();
@@ -297,6 +311,66 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     // materialize values without bloating the serialized template.
     this._fields.set(id, template);
     return { id, field: { ...template } };
+  }
+
+  /**
+   * Register a user-defined continuous field that holds its own values: a
+   * column a notebook pushed (`setField`). Unlike a continuous alias, nothing
+   * can derive these values again, so the template keeps them and a session
+   * stores them (`user-defined/values/<id>`).
+   *
+   * @param {object} options
+   * @param {string} options.key
+   * @param {Float32Array} options.values - One value per open cell, NaN for none
+   * @param {{type: string}} options.operation - What made it (`notebook-push`)
+   * @param {object} state - DataState
+   * @returns {{id: string, field: object}}
+   */
+  createStoredContinuous(options, state) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Stored continuous field options must be an object');
+    }
+    const { key, values, operation } = options;
+    StateValidator.validateFieldKey(key);
+    requireStoredValues(values, state?.pointCount, 'Stored continuous field');
+    requireNullableRecord(operation, 'Stored continuous field operation');
+    const id = generateId('user_obs_value');
+    const template = {
+      key,
+      kind: FieldKind.CONTINUOUS,
+      values,
+      loaded: true,
+      _loadingPromise: null,
+
+      _isUserDefined: true,
+      _isDeleted: false,
+      _isPurged: false,
+      _userDefinedId: id,
+      _fieldSource: FieldSource.OBS,
+      _sourceField: null,
+      _operation: operation,
+      _createdAt: Date.now(),
+    };
+    this._fields.set(id, template);
+    return { id, field: { ...template } };
+  }
+
+  /**
+   * Replace the values of a stored continuous field (a notebook pushed the
+   * same key again).
+   *
+   * @param {string} id
+   * @param {Float32Array} values
+   * @param {object} state - DataState
+   */
+  replaceStoredValues(id, values, state) {
+    const field = this._fields.get(id);
+    if (!field || field.kind !== FieldKind.CONTINUOUS || field._sourceField !== null) {
+      throw new Error(`User-defined field "${id}" does not hold its own values`);
+    }
+    requireStoredValues(values, state?.pointCount, `Stored continuous field "${id}"`);
+    field.values = values;
+    field.loaded = true;
   }
 
   /**
@@ -839,8 +913,10 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       }
 
       if (kind === FieldKind.CONTINUOUS) {
-        // Continuous aliases: metadata-only, values are materialized by copying from source fields.
-        result.push({
+        // A continuous alias is metadata only: its values are copied from its
+        // source field. A stored field (no source) names the length and type
+        // of the values its own chunk holds (`user-defined/values/<id>`).
+        const record = {
           id,
           source,
           kind,
@@ -850,7 +926,15 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
           sourceField: field._sourceField,
           operation: field._operation,
           createdAt: field._createdAt
-        });
+        };
+        if (field._sourceField === null) {
+          if (!(field.values instanceof Float32Array)) {
+            throw new TypeError(`User-defined field "${id}" must hold its values before session capture`);
+          }
+          record.valuesLength = field.values.length;
+          record.valuesType = 'Float32Array';
+        }
+        result.push(record);
         continue;
       }
 
@@ -993,12 +1077,26 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       }
 
       if (kind === FieldKind.CONTINUOUS) {
+        const stored = Object.hasOwn(item, 'valuesType');
+        if (stored) {
+          if (item.sourceField !== null || item.valuesType !== 'Float32Array') {
+            throw new TypeError(`User-defined session item ${itemIndex} stores Float32Array values and has no source`);
+          }
+          if (!Number.isSafeInteger(item.valuesLength) || item.valuesLength < 1) {
+            throw new TypeError(`User-defined session item ${itemIndex} has invalid valuesLength`);
+          }
+        } else if (item.sourceField === null) {
+          throw new TypeError(`User-defined session item ${itemIndex} is a continuous alias without a source`);
+        }
         const field = {
           key: item.key,
           kind: FieldKind.CONTINUOUS,
           values: null,
           loaded: false,
           _loadingPromise: null,
+          // A stored field's values arrive with its `user-defined/values`
+          // chunk, which is checked against this length.
+          ...(stored ? { _valuesLengthHint: item.valuesLength } : {}),
 
           _isUserDefined: true,
           _isDeleted: item.isDeleted,

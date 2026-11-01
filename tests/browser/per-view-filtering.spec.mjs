@@ -125,11 +125,13 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
       { DataStateFilterMethods },
       { viewContextCoreMethods },
       { createViewerHostCommandHandlers },
+      { createCellIdentity },
     ] = await Promise.all([
       import('/assets/js/app/state/managers/color-manager.js'),
       import('/assets/js/app/state/managers/filter-manager.js'),
       import('/assets/js/app/state/managers/view-context-core.js'),
       import('/assets/js/app/viewer-host-command-handler.js'),
+      import('/assets/js/data/cell-identity.js'),
     ]);
 
     const pointCount = 4;
@@ -168,7 +170,6 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
       setCellVisibility: DataStateFilterMethods.prototype.setCellVisibility,
       computeGlobalVisibility:
         DataStateFilterMethods.prototype.computeGlobalVisibility,
-      _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
       _applyOverlaysToFields() {},
       _injectUserDefinedFields() {},
       _ensureActiveSelectionNotDeleted() {},
@@ -204,6 +205,10 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
       viewer,
       refreshUi() {},
       reportDataMapping: async () => false,
+      getCellIdentity: () => createCellIdentity({ nObs: state.pointCount }),
+      getShownHostDataset: () => 'example',
+      results: { answer() {} },
+      getHostLabel: () => 'Python',
     });
     const sequence = [];
     const record = label => {
@@ -458,9 +463,9 @@ test('a kept view shares per-cell memory until it writes, and its writes never r
       keptIsActive: keptId !== 'live',
       transparencyShared: kept.categoryTransparency === live.categoryTransparency,
       maskShared: kept.cellVisibilityMask === live.cellVisibilityMask,
-      // The kept view's colors are its own array (one copy, which the
-      // viewer keeps by reference).
-      colorsOwn: kept.colorsArray !== live.colorsArray,
+      // The kept view's colors are the live array until either view is
+      // recoloured: a filter writes visibility only, never colours.
+      colorsShared: kept.colorsArray === live.colorsArray,
       types: [
         kept.categoryTransparency.constructor.name,
         kept.cellVisibilityMask.constructor.name,
@@ -473,7 +478,7 @@ test('a kept view shares per-cell memory until it writes, and its writes never r
     keptIsActive: true,
     transparencyShared: true,
     maskShared: true,
-    colorsOwn: true,
+    colorsShared: true,
     types: ['Uint8Array', 'Uint8Array', 'Uint8Array'],
     noOutlierCopy: true,
   });
@@ -491,11 +496,13 @@ test('a kept view shares per-cell memory until it writes, and its writes never r
     return {
       transparencyCopied: kept.categoryTransparency !== live.categoryTransparency,
       maskStillShared: kept.cellVisibilityMask === live.cellVisibilityMask,
+      colorsCopied: kept.colorsArray !== live.colorsArray,
     };
   });
   expect(diverged).toEqual({
     transparencyCopied: true,
     maskStillShared: true,
+    colorsCopied: true,
   });
 
   // The live view, selected again, is exactly what it was.

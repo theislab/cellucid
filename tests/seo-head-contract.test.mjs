@@ -30,6 +30,7 @@
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -157,11 +158,12 @@ test('the structured data describes the web app truthfully', () => {
   assert.equal('citation' in JSON_LD, false);
 });
 
-test('the Content-Security-Policy allows exactly the import map and the JSON-LD block', () => {
+test('the Content-Security-Policy allows exactly the import map, the boot script and the JSON-LD block', () => {
   const policy = only(/<meta http-equiv="Content-Security-Policy" content="([\s\S]*?)" \/>/g, INDEX, 'CSP');
   const hashes = [...policy.matchAll(/'sha256-([A-Za-z0-9+/=]+)'/g)].map(match => match[1]);
   const importMap = only(/^[ \t]*<script type="importmap">([\s\S]*?)<\/script>/gm, INDEX, 'import map');
-  const expected = [importMap, JSON_LD_TEXT].map(text => createHash('sha256').update(text, 'utf8').digest('base64'));
+  const boot = only(/^[ \t]*<script id="cellucid-page-boot">([\s\S]*?)<\/script>/gm, INDEX, 'boot script');
+  const expected = [importMap, boot, JSON_LD_TEXT].map(text => createHash('sha256').update(text, 'utf8').digest('base64'));
   assert.deepEqual(
     hashes,
     expected,
@@ -169,13 +171,40 @@ test('the Content-Security-Policy allows exactly the import map and the JSON-LD 
   );
 });
 
-test('the Content-Security-Policy adds only Google sign-in and its file picker to scripts and frames', () => {
+test('the Content-Security-Policy adds only Google Analytics, sign-in and its file picker to scripts, by exact path, and frames', () => {
   const policy = only(/<meta http-equiv="Content-Security-Policy" content="([\s\S]*?)" \/>/g, INDEX, 'CSP');
   const directive = name => only(new RegExp(`\\b${name} ([^;]+);`, 'g'), policy, name).trim().split(/\s+/);
+  // By path, never a whole host: a Google host also serves scripts anyone
+  // can publish there (Tag Manager containers, JSONP endpoints).
   assert.deepEqual(
     directive('script-src').filter(source => !source.startsWith("'sha256-")),
-    ["'self'", 'https://www.googletagmanager.com', 'https://accounts.google.com', 'https://apis.google.com']
+    [
+      "'self'",
+      // The WebAssembly decoders compile (assets/wasm/codecs.wasm); no JavaScript is evaluated.
+      "'wasm-unsafe-eval'",
+      'https://www.googletagmanager.com/gtag/',
+      'https://accounts.google.com/gsi/',
+      'https://apis.google.com/js/api.js',
+      'https://apis.google.com/_/scs/',
+    ]
   );
+  // Every script the app loads from Google is one those paths allow.
+  const google = readFileSync(new URL('../assets/js/data/sources/auth/google.js', import.meta.url), 'utf8');
+  const gaInit = readFileSync(new URL('../assets/js/app/ui/core/ga-init.js', import.meta.url), 'utf8');
+  const loaded = [
+    ...[...google.matchAll(/_SCRIPT_URL = '([^']+)'/g)].map(match => match[1]),
+    /`(https:\/\/www\.googletagmanager\.com\/gtag\/js)\?id=/.exec(gaInit.replace(/\s+/g, ''))?.[1],
+  ];
+  assert.equal(loaded.length, 3);
+  for (const url of loaded) {
+    assert.ok(
+      directive('script-src').some(source => (source.endsWith('/') ? url.startsWith(source) : url === source)),
+      `${url} is allowed by the policy`
+    );
+  }
+  assert.deepEqual(directive('form-action'), ["'none'"]);
+  assert.deepEqual(directive('object-src'), ["'none'"]);
+  assert.deepEqual(directive('base-uri'), ["'none'"]);
   assert.deepEqual(
     directive('frame-src'),
     ["'self'", 'https://accounts.google.com', 'https://docs.google.com', 'https://drive.google.com']
@@ -248,7 +277,7 @@ test('the 404 page is the site design, links home, to the docs, GitHub and citin
   // The standalone pages' stylesheet, the app's theme bootstrap and the brand
   // card, nothing else.
   assert.match(NOT_FOUND, /<html lang="en" data-theme="light" data-viewer-background="studio">/);
-  assert.match(NOT_FOUND, /<link rel="stylesheet" href="\/assets\/css\/page\.css" \/>/);
+  assert.match(NOT_FOUND, /<link rel="stylesheet" href="\/assets\/css\/page\.css\?v=[0-9a-f]{12}" \/>/);
   const scripts = [...NOT_FOUND.matchAll(/<script\b([^>]*)>/g)].map(match => match[1]);
   assert.equal(scripts.length, 1);
   assert.match(scripts[0], /^ src="\/assets\/js\/app\/ui\/core\/theme-init\.js\?v=[0-9a-f]{12}"$/);
@@ -271,7 +300,7 @@ test('the 404 page is the site design, links home, to the docs, GitHub and citin
   // It ships with the build: inventoried, so its bytes are in the build id.
   const inventory = JSON.parse(await read('cellucid-web-assets.json'));
   assert.ok(inventory.assets.some(asset => asset.path === '404.html'));
-  assert.match(await read('assets/css/page.css'), /@import 'layouts\/_page\.css' layer\(layouts\);/);
+  assert.match(await read('assets/css/page.css'), /@import 'layouts\/_page\.css\?v=[0-9a-f]{12}' layer\(layouts\);/);
 });
 
 test('llms.txt introduces the project and links to the documentation', () => {

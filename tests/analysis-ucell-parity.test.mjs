@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { createUcellContext, ucellAddGenes, ucellFinish } from '../assets/js/app/analysis/compute/ucell.js';
+import { createUcellContext, ucellAddGenes, ucellContextBytesPerCell, ucellFinish } from '../assets/js/app/analysis/compute/ucell.js';
 
 const REFERENCE = JSON.parse(readFileSync(new URL('./fixtures/analysis/scanpy-reference.json', import.meta.url), 'utf8'));
 const { var_names: GENES, X } = REFERENCE.data;
@@ -81,13 +81,17 @@ function definitionScore(cell, members, maxRank) {
     }
     return greater + (equal + 1) / 2;
   };
+  // The UCell package's u_stat: max rank at most the genes, ranks at or past
+  // it count as it, normalised by the range S·maxRank − S(S+1)/2.
+  const cap = Math.min(maxRank, row.length);
   let sum = 0;
   for (const s of members) {
     const rank = rankOf(UNION[s]);
-    sum += rank > maxRank ? maxRank + 1 : rank;
+    sum += rank >= cap ? cap : rank;
   }
   const size = members.length;
-  return 1 - (sum - (size * (size + 1)) / 2) / (size * maxRank);
+  const fewest = (size * (size + 1)) / 2;
+  return 1 - (sum - fewest) / (size * cap - fewest);
 }
 
 for (const [name, expected] of Object.entries(REFERENCE.ucell)) {
@@ -125,4 +129,38 @@ test('a set gene without a value leaves its cell unscored; an entry outside the 
     () => createUcellContext({ cellCount: 2, setValues: new Float32Array(3), setGeneCount: 2, geneCount: 3, sets: [[0]], maxRank: 3 }),
     TypeError,
   );
+});
+
+test('a UCell context holds ucellContextBytesPerCell(S) bytes a cell', () => {
+  for (const [cellCount, S] of [[1, 1], [7, 3], [40, 20]]) {
+    const context = createUcellContext({ cellCount, setValues: new Float32Array(cellCount * S), setGeneCount: S, geneCount: S + 2, sets: [[0]], maxRank: 5 });
+    const held = Object.values(context).filter(ArrayBuffer.isView).reduce((sum, array) => sum + array.byteLength, 0);
+    assert.equal(held, cellCount * ucellContextBytesPerCell(S));
+  }
+});
+
+test('UCell scores 0 with no set gene within the max rank and 1 for the top genes; a NaN set value orders last', () => {
+  // One cell of five genes: set genes 3 and 4 hold the two lowest values.
+  const values = [[5, 4, 3, 1, 0.5]];
+  const context = createUcellContext({
+    cellCount: 1, setValues: Float32Array.of(1, 0.5, 5, 4), setGeneCount: 4, geneCount: 5, sets: [[0, 1], [2, 3]], maxRank: 3,
+  });
+  ucellAddGenes(context, { pointers: Uint32Array.of(0, 1, 2, 3, 4, 5), cells: new Uint32Array(5), values: Float32Array.from(values[0]) });
+  const [bottom, top] = ucellFinish(context);
+  assert.equal(bottom, 0, 'no set gene within the max rank: 0, as UCell (the 2021 form gave (S − 1) / (2 maxRank))');
+  assert.equal(top, 1);
+  // A max rank past the genes is the gene count, as UCell caps it.
+  const capped = createUcellContext({ cellCount: 1, setValues: new Float32Array(2), setGeneCount: 2, geneCount: 4, sets: [[0, 1]], maxRank: 1500 });
+  assert.equal(capped.maxRank, 4);
+  // A set too long for the max rank has no score range.
+  assert.throws(
+    () => createUcellContext({ cellCount: 1, setValues: new Float32Array(3), setGeneCount: 3, geneCount: 10, sets: [[0, 1, 2]], maxRank: 2 }),
+    /must exceed half/
+  );
+  // NaN among a cell's set values sorts after every value, whichever engine sorts.
+  const withNaN = createUcellContext({
+    cellCount: 1, setValues: Float32Array.of(NaN, 2, 1, NaN, 3), setGeneCount: 5, geneCount: 8, sets: [[1, 2, 4]], maxRank: 8,
+  });
+  assert.deepEqual([...withNaN.sorted].slice(0, 3), [1, 2, 3]);
+  assert.ok(Number.isNaN(withNaN.sorted[3]) && Number.isNaN(withNaN.sorted[4]));
 });

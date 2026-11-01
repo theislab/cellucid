@@ -15,6 +15,7 @@
 
 import { createColumnStoreFactory } from './sparse-column-index.js';
 import { residencyBudgetBytes } from './memory-budget.js';
+import { holdLock, makeRoomForRetry, roomToMake } from './anndata/transcode/space.js';
 
 const INDEX_DIRECTORY = 'cellucid-column-index';
 /**
@@ -80,20 +81,14 @@ export async function openIndexFiles(names, environment = globalThis) {
   const storage = environment?.navigator?.storage;
   const locks = environment?.navigator?.locks;
   if (typeof storage?.getDirectory !== 'function') return null;
+  let releaseLock = () => {};
   try {
     const root = await storage.getDirectory();
     const parent = await root.getDirectoryHandle(INDEX_DIRECTORY, { create: true });
     await removeAbandonedIndexes(parent, locks);
     const directory = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    let releaseLock = () => {};
-    if (typeof locks?.request === 'function') {
-      await new Promise(acquired => {
-        locks.request(lockName(directory), () => new Promise(release => {
-          releaseLock = release;
-          acquired();
-        }));
-      });
-    }
+    // Refused, it rejects, and the index stays in memory (null).
+    releaseLock = await holdLock(locks, lockName(directory));
     const folder = await parent.getDirectoryHandle(directory, { create: true });
     const handles = {};
     for (const name of names) {
@@ -111,8 +106,36 @@ export async function openIndexFiles(names, environment = globalThis) {
     };
     return handles;
   } catch {
+    // What was made of the directory is swept once its lock goes.
+    releaseLock();
     return null;
   }
+}
+
+/**
+ * The bytes this origin may still store (`navigator.storage.estimate()`:
+ * its quota less its usage), or null when the browser does not say. Given
+ * `needed`, the bytes of a gene index about to be built (live work, which
+ * comes before every copy kept only to spare later work): when they do not
+ * fit, the kept copies no open tab holds count as free, the cheapest to make
+ * again first (gene index runs before converted stores and downloads:
+ * `anndata/transcode/space.js` `makeRoom`), and with `makeRoom` they are
+ * removed for it (the index is being placed; a plan asked ahead removes
+ * nothing).
+ *
+ * @param {Object} [environment]
+ * @param {number} [needed]
+ * @param {{makeRoom?: boolean}} [options]
+ * @returns {Promise<number|null>}
+ */
+export async function diskFreeBytes(environment = globalThis, needed = 0, { makeRoom = false } = {}) {
+  const storage = environment?.navigator?.storage;
+  if (typeof storage?.estimate !== 'function') return null;
+  const { quota, usage } = await storage.estimate();
+  if (!Number.isFinite(quota) || !Number.isFinite(usage)) return null;
+  const free = Math.max(0, quota - usage);
+  if (!(needed > free)) return free;
+  return free + await (makeRoom ? makeRoomForRetry(environment, needed - free) : roomToMake(environment, needed - free));
 }
 
 /**
@@ -124,5 +147,6 @@ export function createWorkerColumnStoreFactory() {
   return createColumnStoreFactory({
     memoryBudgetBytes: columnIndexMemoryBudget(),
     openDiskFiles: names => openIndexFiles(names),
+    diskFreeBytes: (needed, options) => diskFreeBytes(globalThis, needed, options),
   });
 }

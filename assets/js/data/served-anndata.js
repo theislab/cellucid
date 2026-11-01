@@ -11,7 +11,7 @@
  * `anndata` is
  *
  *     {
- *       file: {url, kind, layout: 'file'|'zip'|'folder', size?, files?},
+ *       file: {url, kind, layout: 'file'|'zip'|'folder', size?, etag?, files?},
  *       defaults: {embedding1d?, embedding2d?, embedding3d?, knn?, modality?,
  *                  expression?, geneIdColumn?, latentKey?, vectorFieldDefault?,
  *                  obsKeys?, normalizeEmbeddings?, centroidMinPoints?}
@@ -24,13 +24,24 @@
  * `base-anndata-adapter.js`).
  *
  * A folder that is not a Zarr store (a MatrixMarket folder, a Cell Ranger
- * `outs/`) lists its files, `files: [{path, size}]`, because a browser cannot
- * list a folder; each is read at `<url><path>` (`loadRemoteFileSet`). A Zarr
- * store folder lists nothing: its consolidated metadata names its keys.
+ * `outs/`) lists its files, `files: [{path, size, etag}]`, because a browser
+ * cannot list a folder; each is read at `<url><path>` (`loadRemoteFileSet`).
+ * A Zarr store folder lists nothing: its consolidated metadata names its
+ * keys, and its version is that metadata's validator (`http.js` `version()`).
  *
  * `file.url` is the store's route relative to the server's base URL (the
  * server cannot know the address a browser reaches it by: a tunnel, a proxy).
- * `size` is given for a file and absent for a folder. Each default the server
+ * `size` and `etag` are given for a file and absent for a folder: `etag` is
+ * the strong validator the server answers the file's bytes with, read from
+ * the file when the list is asked for (its size, modification and
+ * status-change times, and inode where the platform has one), so a file
+ * rewritten in place or replaced has a new one. It is the version of the
+ * file's identity: what this browser keeps of a served file -- a kept gene
+ * index, a converted store; never its bytes (`keptParts: false`, below:
+ * a copy of a file on this machine spares no download) -- is filed under it
+ * and kept for later visits, and a changed file is a new version, never read into
+ * what was kept of the old one; a response with another `ETag` is refused
+ * (`httpByteSource`). Each default the server
  * states is passed to the AnnData data source as `options.defaults`, and on to
  * the adapter, and overrides the store's own `uns['cellucid']` defaults; one
  * it does not state follows the store's, else the adapter's own rule.
@@ -46,9 +57,10 @@ import { createAnnDataFileSource } from './anndata-file-source.js';
 import { inputFormat, isInputFormatId, layoutsOf } from './input-formats.js';
 import { getTransferLog } from './transfer-log.js';
 import { isPlainRecord, requireExactKeys } from '../utils/exact-record.js';
+import { linkIdentity } from './sources/link-credentials.js';
 
 const ROUTE_PREFIX = '_cellucid/anndata/';
-const FILE_KEYS = Object.freeze(['url', 'kind', 'layout', 'size']);
+const FILE_KEYS = Object.freeze(['url', 'kind', 'layout', 'size', 'etag']);
 const FOLDER_KEYS = Object.freeze(['url', 'kind', 'layout']);
 const LISTED_FOLDER_KEYS = Object.freeze(['url', 'kind', 'layout', 'files']);
 
@@ -58,6 +70,19 @@ function requireLaunchDefaults(value, label) {
   } catch (error) {
     throw new TypeError(`${label}: ${error?.message ?? error}`, { cause: error });
   }
+}
+
+/**
+ * A strong entity tag (RFC 9110 §8.8.3): a quoted string of visible
+ * characters, never a weak one (`W/"…"`), which names one exact version.
+ */
+const STRONG_ETAG = /^"[\x21\x23-\x7e\x80-\xff]*"$/;
+
+function requireStrongEtag(value, label) {
+  if (typeof value !== 'string' || !STRONG_ETAG.test(value)) {
+    throw new TypeError(`${label} must be the file's strong ETag, a quoted string`);
+  }
+  return value;
 }
 
 function requireRoute(value, layout, label) {
@@ -92,7 +117,7 @@ function requireRoute(value, layout, label) {
 
 /**
  * The files of a served folder: canonical relative paths, each once, with
- * exact sizes.
+ * exact sizes and strong ETags.
  */
 function requireListedFiles(value, label) {
   if (!Array.isArray(value) || value.length === 0) {
@@ -100,8 +125,8 @@ function requireListedFiles(value, label) {
   }
   const seen = new Set();
   return Object.freeze(value.map((entry, index) => {
-    requireExactKeys(entry, ['path', 'size'], `${label}[${index}]`);
-    const { path, size } = entry;
+    requireExactKeys(entry, ['path', 'size', 'etag'], `${label}[${index}]`);
+    const { path, size, etag } = entry;
     if (
       typeof path !== 'string' ||
       path.length === 0 ||
@@ -115,7 +140,7 @@ function requireListedFiles(value, label) {
     if (!Number.isSafeInteger(size) || size < 0) {
       throw new TypeError(`${label}[${index}].size must be the file's exact byte length`);
     }
-    return Object.freeze({ path, size });
+    return Object.freeze({ path, size, etag: requireStrongEtag(etag, `${label}[${index}].etag`) });
   }));
 }
 
@@ -144,6 +169,7 @@ export function requireServedAnnData(value, label) {
   if (sized && (!Number.isSafeInteger(file.size) || file.size < 1)) {
     throw new TypeError(`${label}.file.size must be the file's exact positive byte length`);
   }
+  const etag = sized ? requireStrongEtag(file.etag, `${label}.file.etag`) : null;
   const { route, name } = requireRoute(file.url, layout, `${label}.file.url`);
   return Object.freeze({
     file: Object.freeze({
@@ -152,6 +178,7 @@ export function requireServedAnnData(value, label) {
       kind,
       layout,
       size: sized ? file.size : null,
+      etag,
       files: listed ? requireListedFiles(file.files, `${label}.file.files`) : null,
     }),
     defaults: requireLaunchDefaults(value.defaults, `${label}.defaults`),
@@ -160,8 +187,9 @@ export function requireServedAnnData(value, label) {
 
 /**
  * What identifies one served store's open: the server, the dataset id and
- * the store's route and size. A listing that declares the same key declares
- * the same store, so an open of it stands.
+ * the store's route, size and ETag (each listed file's). A listing that
+ * declares the same key declares the same version of the same store, so an
+ * open of it stands; a file rewritten since is opened again.
  *
  * @param {string} serverUrl
  * @param {{id: string, anndata: Object}} dataset
@@ -169,12 +197,27 @@ export function requireServedAnnData(value, label) {
  */
 export function servedStoreKey(serverUrl, dataset) {
   const { file } = dataset.anndata;
-  return JSON.stringify([serverUrl, dataset.id, file.route, file.size, file.files]);
+  return JSON.stringify([serverUrl, dataset.id, file.route, file.size, file.etag, file.files]);
+}
+
+/**
+ * What a served store's identity is filed under: the server (its address
+ * without credentials) and the dataset's id there, so two servers serving
+ * the same id are two files, and what is kept of one never stands for, or
+ * replaces, the other's.
+ */
+function servedKey(serverUrl, dataset, sourceType) {
+  return `${sourceType}:${linkIdentity(serverUrl)}:${dataset.id}`;
 }
 
 /**
  * Where one served store's bytes are, as this browser reaches the server:
- * its URL and the remote file the reader reads in place.
+ * its URL and the remote file the reader reads in place, its identity's
+ * version the file's ETag (a Zarr folder's is read from its metadata). Its
+ * parts are not kept in this browser (`keptParts: false`,
+ * `formats/io/kept-parts.js`): the server reads the data beside it (on this
+ * machine, or a kernel's), so a copy spares nothing, and a store a server
+ * makes from an object in memory is named by a tag new for every run.
  */
 function servedResource(serverUrl, dataset, sourceType) {
   const { file } = dataset.anndata;
@@ -185,10 +228,12 @@ function servedResource(serverUrl, dataset, sourceType) {
       url,
       size: file.size,
       name: file.name,
+      etag: file.etag,
+      keptParts: false,
       identity: Object.freeze({
         kind: 'remote',
-        key: `${sourceType}:${dataset.id}`,
-        version: `size:${file.size}`,
+        key: servedKey(serverUrl, dataset, sourceType),
+        version: file.etag,
       }),
     },
   };
@@ -199,17 +244,19 @@ function servedResource(serverUrl, dataset, sourceType) {
  * read at `<folder url><path>` (`{files, rootName}`, the shape of a picked
  * folder).
  */
-function servedFileSet(url, dataset, sourceType) {
+function servedFileSet(serverUrl, url, dataset, sourceType) {
   const { file } = dataset.anndata;
   return {
-    files: new Map(file.files.map(({ path, size }) => [path, Object.freeze({
+    files: new Map(file.files.map(({ path, size, etag }) => [path, Object.freeze({
       url: new URL(path.split('/').map(encodeURIComponent).join('/'), url).href,
       size,
       name: path.split('/').at(-1),
+      etag,
+      keptParts: false,
       identity: Object.freeze({
         kind: 'remote',
-        key: `${sourceType}:${dataset.id}:${path}`,
-        version: `size:${size}`,
+        key: `${servedKey(serverUrl, dataset, sourceType)}:${path}`,
+        version: etag,
       }),
     })])),
     rootName: file.name,
@@ -220,10 +267,10 @@ function servedFileSet(url, dataset, sourceType) {
  * The reader's source for one served store: a remote file, a Zarr folder
  * URL, or a folder of remote files.
  */
-function servedSource(url, resource, dataset, sourceType) {
+function servedSource(serverUrl, url, resource, dataset, sourceType) {
   const { file } = dataset.anndata;
-  if (file.files !== null) return servedFileSet(url, dataset, sourceType);
-  return file.layout === 'folder' ? { url, name: file.name } : { file: resource };
+  if (file.files !== null) return servedFileSet(serverUrl, url, dataset, sourceType);
+  return file.layout === 'folder' ? { url, name: file.name, keptParts: false } : { file: resource };
 }
 
 /**
@@ -249,7 +296,7 @@ export async function describeServedAnnData({ serverUrl, dataset, sourceType, si
   const { url, resource } = servedResource(serverUrl, dataset, sourceType);
   const client = new AnnDataReaderClient();
   try {
-    const source = servedSource(url, resource, dataset, sourceType);
+    const source = servedSource(serverUrl, url, resource, dataset, sourceType);
     const described = await client.describe(source, { signal, expect: { format: file.kind, layout: file.layout } });
     const own = requireCellucidFileMetadata(described.cellucid, sourceType);
     return Object.freeze({
@@ -299,9 +346,9 @@ export async function openServedAnnData({ serverUrl, dataset, sourceType }) {
   };
   try {
     if (file.files !== null) {
-      await source.loadRemoteFileSet(servedFileSet(url, dataset, sourceType), options);
+      await source.loadRemoteFileSet(servedFileSet(serverUrl, url, dataset, sourceType), options);
     } else if (file.layout === 'folder') {
-      await source.loadRemoteFolder({ url, name: file.name }, options);
+      await source.loadRemoteFolder({ url, name: file.name, keptParts: false }, options);
     } else {
       await source.loadFile(resource, options);
     }

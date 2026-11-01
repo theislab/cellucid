@@ -3,6 +3,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  rm,
   symlink,
   writeFile,
 } from 'node:fs/promises';
@@ -10,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import test from 'node:test';
+import test, { after } from 'node:test';
 
 import {
   assertPortableAssetPath,
@@ -22,9 +23,23 @@ import {
   isRuntimeCacheAssetPath,
   listSourceControlledAssets,
   serializeWebAssetInventory,
-  stalePageScripts,
-  stampPageScripts,
+  namesItsBytes,
+  renderPageBoot,
+  stalePages,
+  stampedStylesheets,
+  stampPage,
 } from '../scripts/generate-web-asset-inventory.mjs';
+import { buildPageBundle } from '../scripts/build-page-bundle.mjs';
+
+// Every temporary folder a test makes, removed once the file's tests are done.
+const madeFolders = [];
+after(() => Promise.all(madeFolders.map(folder => rm(folder, { recursive: true, force: true }))));
+
+async function temporaryFolder(prefix) {
+  const folder = await mkdtemp(join(tmpdir(), prefix));
+  madeFolders.push(folder);
+  return folder;
+}
 
 test('web asset paths use one Windows-portable root-relative grammar', () => {
   for (const path of [
@@ -113,7 +128,7 @@ test('runtime cache policy excludes only the deploy-only social preview', async 
     assert.equal(isRuntimeCacheAssetPath(path), true, path);
   }
 
-  const rootDir = await mkdtemp(join(tmpdir(), 'cellucid-web-inventory-'));
+  const rootDir = await temporaryFolder('cellucid-web-inventory-');
   await assert.rejects(
     buildWebAssetInventory({
       rootDir,
@@ -198,7 +213,7 @@ test('deploy-only social metadata retains its exact public image URL', async () 
 });
 
 test('web inventory binds exact bytes to the single index build id', async () => {
-  const rootDir = await mkdtemp(join(tmpdir(), 'cellucid-web-inventory-'));
+  const rootDir = await temporaryFolder('cellucid-web-inventory-');
   await mkdir(join(rootDir, 'assets', 'js'), { recursive: true });
   await writeFile(
     join(rootDir, 'index.html'),
@@ -216,6 +231,7 @@ test('web inventory binds exact bytes to the single index build id', async () =>
   await writeFile(join(rootDir, 'terms.html'), '<!doctype html><title>Terms</title>\n');
   await writeFile(join(rootDir, 'accessibility.html'), '<!doctype html><title>Accessibility</title>\n');
   await writeFile(join(rootDir, 'site.webmanifest'), '{}\n');
+  await writeFile(join(rootDir, 'service-worker.js'), '// code cache\n');
 
   const inventory = await buildWebAssetInventory({
     rootDir,
@@ -228,6 +244,7 @@ test('web inventory binds exact bytes to the single index build id', async () =>
       'favicon.ico',
       'index.html',
       'privacy.html',
+      'service-worker.js',
       'site.webmanifest',
       'terms.html',
     ],
@@ -249,6 +266,7 @@ test('web inventory binds exact bytes to the single index build id', async () =>
       'favicon.ico',
       'index.html',
       'privacy.html',
+      'service-worker.js',
       'site.webmanifest',
       'terms.html',
     ]
@@ -286,6 +304,7 @@ test('web inventory binds exact bytes to the single index build id', async () =>
         'favicon.ico',
         'index.html',
         'privacy.html',
+        'service-worker.js',
         'site.webmanifest',
         'terms.html',
       ],
@@ -367,7 +386,7 @@ test(
   'inventory CLI identity resolves an equivalent symlinked script path',
   { skip: process.platform === 'win32' },
   async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), 'cellucid-inventory-cli-'));
+    const rootDir = await temporaryFolder('cellucid-inventory-cli-');
     const realDir = join(rootDir, 'real');
     const aliasDir = join(rootDir, 'alias');
     await mkdir(realDir);
@@ -403,7 +422,7 @@ test('a page names every script by its bytes, and its policy allows exactly its 
     '<script type="application/ld+json">{"a": 1}</script>',
     '</head><body><script type="module" src="assets/js/app/main.js"></script></body>',
   ].join('\n');
-  const stamped = stampPageScripts({ html, pagePath: 'index.html', versions });
+  const stamped = stampPage({ html, pagePath: 'index.html', versions });
 
   const map = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(stamped)[1]);
   assert.deepEqual(map, {
@@ -425,10 +444,10 @@ test('a page names every script by its bytes, and its policy allows exactly its 
     `default-src 'self'; script-src 'self' https://cdn.example 'sha256-${sha256Base64(mapText)}' `
       + `'sha256-${sha256Base64('{"a": 1}')}'; style-src 'self'`
   );
-  assert.equal(stampPageScripts({ html: stamped, pagePath: 'index.html', versions }), stamped);
+  assert.equal(stampPage({ html: stamped, pagePath: 'index.html', versions }), stamped);
 
   // A page below the root keys its map relative to its own folder.
-  const nested = stampPageScripts({
+  const nested = stampPage({
     html: '<script type="importmap"></script><script type="module" src="/assets/js/app/main.js"></script>',
     pagePath: 'assets/auth/callback.html',
     versions,
@@ -441,19 +460,19 @@ test('a page that runs modules declares its one import map before them, and name
   const versions = new Map([['assets/js/app/main.js', 'aaaaaaaaaaaa']]);
   const module = '<script type="module" src="assets/js/app/main.js"></script>';
   assert.throws(
-    () => stampPageScripts({ html: module, pagePath: 'index.html', versions }),
+    () => stampPage({ html: module, pagePath: 'index.html', versions }),
     /exactly one <script type="importmap">/
   );
   assert.throws(
-    () => stampPageScripts({ html: `${module}<script type="importmap"></script>`, pagePath: 'index.html', versions }),
+    () => stampPage({ html: `${module}<script type="importmap"></script>`, pagePath: 'index.html', versions }),
     /import map before its first module script/
   );
   assert.throws(
-    () => stampPageScripts({ html: '<script type="importmap"></script>', pagePath: 'index.html', versions }),
+    () => stampPage({ html: '<script type="importmap"></script>', pagePath: 'index.html', versions }),
     /runs no ES module/
   );
   assert.throws(
-    () => stampPageScripts({
+    () => stampPage({
       html: '<script type="importmap"></script><script type="module" src="assets/js/gone.js"></script>',
       pagePath: 'index.html',
       versions,
@@ -462,19 +481,175 @@ test('a page that runs modules declares its one import map before them, and name
   );
 });
 
-test('every shipped page names the current bytes of every script it loads', async () => {
+test('a stylesheet names what it imports and uses by their bytes, and a page preloads every stylesheet it needs', async () => {
+  const rootDir = await temporaryFolder('cellucid-web-styles-');
+  await mkdir(join(rootDir, 'assets', 'css', 'parts'), { recursive: true });
+  await mkdir(join(rootDir, 'assets', 'fonts'), { recursive: true });
+  const write = (path, text) => writeFile(join(rootDir, ...path.split('/')), text);
+  await write('assets/fonts/face.woff2', 'font bytes');
+  await write('assets/css/parts/_a.css', "/* url('../nowhere.png') is a comment */\n@font-face { src: url('../../fonts/face.woff2?v=000000000000') format('woff2'); }\n");
+  await write('assets/css/parts/_index.css', "@import '_a.css';\n");
+  await write('assets/css/main.css', "@layer base;\n@import 'parts/_index.css' layer(base);\nbody { background: url(data:image/png;base64,AAAA); }\n");
+  const paths = ['assets/css/main.css', 'assets/css/parts/_index.css', 'assets/css/parts/_a.css', 'assets/fonts/face.woff2'];
+  const version = text => createHash('sha256').update(text).digest('hex').slice(0, 12);
+
+  const stamped = await stampedStylesheets({ rootDir, paths });
+  const a = stamped.get('assets/css/parts/_a.css');
+  assert.match(a, new RegExp(`url\\('\\.\\./\\.\\./fonts/face\\.woff2\\?v=${version('font bytes')}'\\) format`));
+  assert.match(a, /url\('\.\.\/nowhere\.png'\) is a comment/, 'a comment is not a reference');
+  const index = stamped.get('assets/css/parts/_index.css');
+  assert.equal(index, `@import '_a.css?v=${version(a)}';\n`, 'a stylesheet names its import by the import\'s stamped bytes');
+  const main = stamped.get('assets/css/main.css');
+  assert.match(main, new RegExp(`@import 'parts/_index\\.css\\?v=${version(index)}' layer\\(base\\);`));
+  assert.match(main, /url\(data:image\/png;base64,AAAA\)/, 'a data URL is not a file');
+
+  const versions = new Map(paths.map(path => [path, version(stamped.get(path) ?? 'font bytes')]));
+  const html = [
+    '<head>',
+    '  <link rel="preload" href="assets/fonts/face.woff2" as="font" type="font/woff2" crossorigin />',
+    '  <link rel="preload" as="style" href="assets/css/stale.css?v=000000000000" />',
+    '  <link rel="stylesheet" href="assets/css/main.css" />',
+    '</head>',
+  ].join('\n');
+  const page = stampPage({ html, pagePath: 'index.html', versions, stylesheets: stamped });
+  assert.equal(page, [
+    '<head>',
+    `  <link rel="preload" href="assets/fonts/face.woff2?v=${versions.get('assets/fonts/face.woff2')}" as="font" type="font/woff2" crossorigin />`,
+    `  <link rel="preload" as="style" href="assets/css/parts/_index.css?v=${versions.get('assets/css/parts/_index.css')}" />`,
+    `  <link rel="preload" as="style" href="assets/css/parts/_a.css?v=${versions.get('assets/css/parts/_a.css')}" />`,
+    `  <link rel="stylesheet" href="assets/css/main.css?v=${versions.get('assets/css/main.css')}" />`,
+    '</head>',
+  ].join('\n'));
+  assert.equal(stampPage({ html: page, pagePath: 'index.html', versions, stylesheets: stamped }), page);
+
+  await write('assets/css/parts/_b.css', "@import '../gone.css';\n");
+  await assert.rejects(
+    stampedStylesheets({ rootDir, paths: [...paths, 'assets/css/parts/_b.css'] }),
+    /_b\.css names a file that is not a shipped asset: \.\.\/gone\.css/
+  );
+});
+
+test('a page with a boot script starts its sources on this machine and its bundle anywhere else', () => {
+  const versions = new Map([['assets/js/app/main.js', 'aaaaaaaaaaaa']]);
+  const page = { entry: 'assets/page/main.ABCDEFGH.js', preload: ['assets/page/chunk.IJKLMNOP.js'] };
+  const html = '<head><script type="importmap"></script><script id="cellucid-page-boot"></script></head>';
+  const stamped = stampPage({ html, pagePath: 'index.html', versions, page });
+  const boot = /<script id="cellucid-page-boot">([\s\S]*?)<\/script>/.exec(stamped)[1];
+  assert.equal(boot, renderPageBoot(page));
+  assert.match(boot, /\["localhost","127\.0\.0\.1","\[::1\]"\]\.includes\(location\.hostname\)/);
+  assert.match(boot, /"assets\/page\/main\.ABCDEFGH\.js",\s*"assets\/page\/chunk\.IJKLMNOP\.js"/);
+  assert.match(boot, /thisMachine \? "assets\/js\/app\/main\.js" : bundle\[0\]/);
+  assert.throws(
+    () => stampPage({ html, pagePath: 'index.html', versions }),
+    /boot script, so it needs the page bundle/
+  );
+  assert.throws(
+    () => stampPage({
+      html: '<script id="cellucid-page-boot"></script><script type="importmap"></script>',
+      pagePath: 'index.html',
+      versions,
+      page,
+    }),
+    /import map before its first module script/
+  );
+
+  // Run in a page of either kind: what it preloads, what it imports, and the
+  // code cache it registers once the page has loaded.
+  const run = hostname => {
+    const appended = [];
+    const imported = [];
+    const registered = [];
+    const listeners = new Map();
+    const windowListeners = new Map();
+    const scope = {
+      location: { hostname },
+      document: {
+        baseURI: `https://${hostname}/`,
+        readyState: 'loading',
+        createElement: () => ({}),
+        head: { append: element => appended.push(element) },
+        addEventListener: (type, listener) => listeners.set(type, listener),
+        querySelector: () => ({ content: '2026-10-29.0123abcd' }),
+      },
+      window: { dispatchEvent() {}, addEventListener: (type, listener) => windowListeners.set(type, listener) },
+      navigator: {
+        serviceWorker: {
+          register: url => {
+            registered.push(url);
+            return new Promise(() => {});
+          },
+        },
+      },
+      performance: { getEntriesByType: () => [] },
+      URL,
+      CustomEvent: class {},
+      importModule: url => {
+        imported.push(url);
+        return Promise.resolve();
+      },
+    };
+    new Function(...Object.keys(scope), boot.replace('import(entry)', 'importModule(entry)'))(...Object.values(scope));
+    assert.deepEqual(imported, [], 'nothing is imported before the document is parsed');
+    listeners.get('DOMContentLoaded')();
+    windowListeners.get('load')?.();
+    return { preloaded: appended.map(link => `${link.rel} ${link.href}`), imported, registered };
+  };
+  assert.deepEqual(run('localhost'), {
+    preloaded: [],
+    imported: ['https://localhost/assets/js/app/main.js'],
+    registered: [],
+  });
+  assert.deepEqual(run('www.cellucid.com'), {
+    preloaded: ['modulepreload assets/page/main.ABCDEFGH.js', 'modulepreload assets/page/chunk.IJKLMNOP.js'],
+    imported: ['https://www.cellucid.com/assets/page/main.ABCDEFGH.js'],
+    registered: ['service-worker.js?build=2026-10-29.0123abcd'],
+  });
+});
+
+test('only a worker or page bundle names its bytes by its file name', () => {
+  for (const path of [
+    'assets/workers/decode-worker.0123456789ab.js',
+    'assets/workers/decode-worker.0123456789ab.js.map',
+    'assets/page/main.ABCDEFGH.js',
+    'assets/page/chunk.ABCD2345.js.map',
+  ]) {
+    assert.equal(namesItsBytes(path), true, path);
+  }
+  for (const path of [
+    'assets/workers/scripts.js',
+    'assets/js/app/main.js',
+    'assets/js/app/main.ABCDEFGH.js',
+    'assets/page/main.js',
+    'assets/css/main.css',
+  ]) {
+    assert.equal(namesItsBytes(path), false, path);
+  }
+});
+
+test('every shipped page and stylesheet names the current bytes of every file it loads', async () => {
   const rootDir = fileURLToPath(new URL('..', import.meta.url));
   const paths = await listSourceControlledAssets(rootDir);
+  const stylesheets = await stampedStylesheets({ rootDir, paths });
+  for (const [path, text] of stylesheets) {
+    assert.equal(
+      await readFile(join(rootDir, ...path.split('/')), 'utf8'),
+      text,
+      `${path}: regenerate with \`node scripts/generate-web-asset-inventory.mjs\`.`
+    );
+  }
+  const page = await buildPageBundle({ rootDir });
   assert.deepEqual(
-    (await stalePageScripts({ rootDir, paths })).map(page => page.pagePath),
+    (await stalePages({ rootDir, paths, stylesheets, page })).map(stale => stale.pagePath),
     [],
     'regenerate with `node scripts/generate-web-asset-inventory.mjs`.'
   );
-  // The app's import map lists every shipped script, at its inventory digest.
+  // The app's import map lists every shipped script whose name does not
+  // already name its bytes, at its inventory digest.
   const inventory = JSON.parse(await readFile(join(rootDir, 'cellucid-web-assets.json'), 'utf8'));
   const index = await readFile(join(rootDir, 'index.html'), 'utf8');
   const { imports } = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(index)[1]);
-  const scripts = inventory.assets.filter(asset => asset.path.startsWith('assets/') && asset.path.endsWith('.js'));
+  const scripts = inventory.assets.filter(asset =>
+    asset.path.startsWith('assets/') && asset.path.endsWith('.js') && !namesItsBytes(asset.path));
   assert.ok(scripts.some(asset => asset.path === 'assets/js/app/main.js'));
   assert.deepEqual(
     imports,

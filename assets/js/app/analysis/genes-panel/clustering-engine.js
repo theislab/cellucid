@@ -36,6 +36,7 @@ import {
   condensedRowRanges
 } from '../compute/hierarchical-clustering.js';
 import { analysisWorkerCount } from '../shared/performance-config.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 import { DEFAULTS, ANALYSIS_PHASES } from './constants.js';
 
 /**
@@ -156,12 +157,6 @@ export class ClusteringEngine {
       throw new TypeError('[ClusteringEngine] matrix with numeric values is required');
     }
 
-    const throwIfAborted = () => {
-      if (signal?.aborted) {
-        throw new DOMException('Request aborted', 'AbortError');
-      }
-    };
-
     const { values, nRows, nCols } = matrix;
     if (!Number.isSafeInteger(nRows) || nRows < 1 || !Number.isSafeInteger(nCols) || nCols < 1) {
       throw new RangeError('[ClusteringEngine] matrix dimensions must be positive integers');
@@ -212,7 +207,7 @@ export class ClusteringEngine {
       };
     }
 
-    throwIfAborted();
+    throwIfAborted(signal);
     if (onProgress) {
       onProgress({
         phase: ANALYSIS_PHASES.CLUSTERING,
@@ -239,7 +234,7 @@ export class ClusteringEngine {
         )
         : null
     ]);
-    throwIfAborted();
+    throwIfAborted(signal);
 
     if (onProgress) {
       onProgress({

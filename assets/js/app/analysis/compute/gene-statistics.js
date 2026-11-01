@@ -4,23 +4,27 @@
  * Single-cell expression is mostly zeros: the median gene of a 562,000-cell
  * atlas is non-zero in 0.2 % of its cells. Every statistic the analyses report
  * is a function of the non-zero values and of how many zeros each group holds,
- * so the kernels here walk the non-zero entries only and account for the zeros
- * in closed form — and give exactly the numbers a walk over every cell gives:
+ * so the kernels here walk the non-zero entries only, O(nnz), and account for
+ * the zeros in closed form:
  *
- * - A sum is unchanged by adding zeros (a running sum that starts at +0 never
- *   becomes -0, and `s + 0 === s` bit for bit), so the non-zero entries summed
- *   in cell order are the sum of every cell in cell order, and a mean is the
- *   same double.
  * - Every zero ties with every other zero: they are one rank block whose size
  *   is the zero count, placed between the negative and the positive values.
  *   Rank sums and the tie term are therefore fed the same blocks in the same
  *   ascending order a pass over every cell feeds them, and rank sums are exact
  *   (integers or halves far below 2^53), so a rank test's statistic and
- *   probability are the same doubles.
- * - A centred sum of squares adds `(0 - mean) ** 2` for each zero. Where the
- *   result must equal a pass over every cell in cell order (the two-sample
- *   test), the zeros' terms are added at their positions; the one-vs-rest
- *   marker kernel adds them per group in one product.
+ *   probability are the doubles a pass over every cell gives.
+ * - A sum is compensated (Neumaier's improved Kahan summation, in cell
+ *   order), and adding a zero leaves the running sum and its compensation as
+ *   they are, so the non-zero entries summed in cell order give the very sum
+ *   of every cell, and a mean is the same double as `math-utils.js` `mean`
+ *   over the dense values, accurate to the last bit or two. Expression is
+ *   pivoted at 0, where its zeros are (the Detailed view's tests of obs
+ *   fields pivot at their first value: `math-utils.js` `centredMoments`).
+ * - A centred sum of squares is `Σ(v − mean)²` over the non-zero entries plus
+ *   the zeros' `zeros · mean²` in one product, where adding it cell by cell
+ *   was as many roundings as there are zeros: the dense two-pass sum to its
+ *   last bits (summation order). A constant sample's is exactly 0 and its
+ *   mean its value, as `math-utils.js` `centredMoments` gives.
  *
  * A gene is handed to a kernel as a *sample*: `{length, indices, values}`, the
  * stored entries of a vector of `length` values, `indices` strictly ascending
@@ -200,7 +204,9 @@ function describeSample(sample, owner) {
   let nonFinite = 0;
   let nonZero = 0;
   let sum = 0;
+  let compensation = 0;
   let minimum = Infinity;
+  let maximum = -Infinity;
   let previous = -1;
   for (let k = 0; k < indices.length; k++) {
     const position = indices[k];
@@ -213,13 +219,19 @@ function describeSample(sample, owner) {
     }
     if (value === 0) continue;
     nonZero++;
-    sum += value;
+    const total = sum + value;
+    compensation += Math.abs(sum) >= Math.abs(value) ? (sum - total) + value : (value - total) + sum;
+    sum = total;
     if (value < minimum) minimum = value;
+    if (value > maximum) maximum = value;
   }
   const n = length - nonFinite;
   const zeros = n - nonZero;
+  // Every measured value the same: the mean is that value, the spread none.
+  const constant = zeros === n || (zeros === 0 && minimum === maximum);
+  const mean = n === 0 ? NaN : constant ? (zeros === n ? 0 : minimum) : (sum + compensation) / n;
   if (zeros > 0 && minimum > 0) minimum = 0;
-  return { n, zeros, nonZero, sum, minimum };
+  return { n, zeros, nonZero, mean, constant, minimum };
 }
 
 /**
@@ -239,28 +251,49 @@ function nonZeroValues(sample, count) {
 }
 
 /**
- * Two-pass centred sum of squares of a sample's finite values about `mean`,
- * every term added in position order — the zeros' `(0 - mean) ** 2` at their
- * own positions — so it is the very sum a pass over the dense values gives.
+ * A sample's centred sum of squares about its mean (see the module header):
+ * over its non-zero entries plus the zeros in one product, O(nnz); exactly 0
+ * for a constant sample.
  *
  * @param {GeneSample} sample
- * @param {number} mean
+ * @param {{zeros: number, mean: number, constant: boolean}} described - `describeSample`
+ * @returns {number}
  */
-function centredSumOfSquares(sample, mean) {
-  const { length, indices, values } = sample;
-  const zeroTerm = (0 - mean) ** 2;
-  let sumSquares = 0;
-  let position = 0;
-  for (let k = 0; k < indices.length; k++) {
-    const stored = indices[k];
-    for (; position < stored; position++) sumSquares += zeroTerm;
-    position = stored + 1;
+function sampleSumOfSquares(sample, described) {
+  return described.constant ? 0 : sumOfSquaresAbout(sample.values, described.zeros, described.mean);
+}
+
+/**
+ * `Σ(v − mean)²` over the non-zero finite entries of `values` and `zeros`
+ * zeros (`zeros · mean²`, one rounding).
+ *
+ * @param {Float32Array|Float64Array} values
+ * @param {number} zeros
+ * @param {number} mean
+ * @returns {number}
+ */
+export function sumOfSquaresAbout(values, zeros, mean) {
+  let squares = 0;
+  for (let k = 0; k < values.length; k++) {
     const value = values[k];
-    if (!Number.isFinite(value)) continue;
-    sumSquares += (value - mean) ** 2;
+    if (value === 0 || !Number.isFinite(value)) continue;
+    squares += (value - mean) ** 2;
   }
-  for (; position < length; position++) sumSquares += zeroTerm;
-  return sumSquares;
+  return squares + zeros * (mean * mean);
+}
+
+/**
+ * A gene column's moments over every cell (`shared/gene-moments-cache.js`):
+ * the mean and centred sum of squares of its finite values (exactly 0 for a
+ * constant column, which then has no z-score), its non-zero finite values
+ * and its finite values (`n`).
+ *
+ * @param {GeneSample} sample
+ * @returns {{mean: number, m2: number, nonZero: number, n: number}}
+ */
+export function columnMoments(sample) {
+  const described = describeSample(sample, 'Gene column');
+  return { mean: described.mean, m2: sampleSumOfSquares(sample, described), nonZero: described.nonZero, n: described.n };
 }
 
 // ============================================================================
@@ -350,9 +383,11 @@ function feedTwoSampleBlocks(sampleA, sampleB, a, b, sums) {
  * Differential expression of one gene between two samples: means, the
  * fraction of each with a non-zero value (%), a log2 fold change, a score
  * (rank-sum z or Welch t), AUROC (Wilcoxon) and a probability — under the
- * default options exactly the numbers the same test gives over the dense
- * finite values of each group (`mannWhitneyU`, `welchTTest` and `mean` in
- * math-utils). `statistic` is the test's own: min(U1, U2), or t.
+ * default options the numbers the same test gives over the dense finite
+ * values of each group (`mannWhitneyU`, `welchTTest` and `mean` in
+ * math-utils): the means and the rank test's exactly, Welch's t to the last
+ * bits of its sums of squares' order. `statistic` is the test's own:
+ * min(U1, U2), or t.
  *
  * @param {GeneSample} sampleA
  * @param {GeneSample} sampleB
@@ -387,8 +422,8 @@ export function twoSampleDifferential(sampleA, sampleB, method, options = {}) {
       nB
     };
   }
-  const meanA = a.sum / nA;
-  const meanB = b.sum / nB;
+  const meanA = a.mean;
+  const meanB = b.mean;
   const log2FoldChange = foldChangeOfMeans(meanA, meanB, Math.min(a.minimum, b.minimum), foldChange);
 
   let pValue;
@@ -404,9 +439,7 @@ export function twoSampleDifferential(sampleA, sampleB, method, options = {}) {
     const comparison = rankSumComparison(sums.rankSumA, nA, nB, sums.tieTerm, pConvention);
     ({ pValue, score, auroc } = comparison);
   } else {
-    const m2A = centredSumOfSquares(sampleA, meanA);
-    const m2B = centredSumOfSquares(sampleB, meanB);
-    const test = welchComparison(meanA, m2A, nA, meanB, m2B, nB, method);
+    const test = welchComparison(meanA, sampleSumOfSquares(sampleA, a), nA, meanB, sampleSumOfSquares(sampleB, b), nB, method);
     statistic = test.score;
     score = test.score;
     pValue = test.pValue;
@@ -512,7 +545,13 @@ const LOG1P_FOLD_CHANGE_EPSILON = 1e-9;
  *   shifted when values are negative);
  * - `log1p`: of the means taken back from log1p (scanpy's `logfoldchanges`):
  *   `log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9))`, expm1 in the base the data
- *   was logged with (`uns['log1p']['base']`, natural when null).
+ *   was logged with (`uns['log1p']['base']`, natural when null). Where
+ *   float64 cannot hold that ratio or its terms (a mean above ~709 natural
+ *   log units overflows expm1, as when a file records log1p over values that
+ *   are not logged), the same quantity is taken in log space, so the result
+ *   is the formula's finite value, never ±Infinity; it is NaN only where
+ *   the formula itself is (terms of opposite sign, or a zero term, from
+ *   negative means).
  *
  * @param {number} meanA
  * @param {number} meanB
@@ -522,12 +561,30 @@ const LOG1P_FOLD_CHANGE_EPSILON = 1e-9;
 export function foldChangeOfMeans(meanA, meanB, minimum, foldChange) {
   if (foldChange.mode === 'log1p') {
     const scale = foldChange.base == null ? 1 : Math.log(foldChange.base);
-    return Math.log2(
-      (Math.expm1(meanA * scale) + LOG1P_FOLD_CHANGE_EPSILON) /
-      (Math.expm1(meanB * scale) + LOG1P_FOLD_CHANGE_EPSILON)
-    );
+    const a = meanA * scale;
+    const b = meanB * scale;
+    const termA = Math.expm1(a) + LOG1P_FOLD_CHANGE_EPSILON;
+    const termB = Math.expm1(b) + LOG1P_FOLD_CHANGE_EPSILON;
+    const ratio = termA / termB;
+    // scanpy's value wherever float64 holds it (two negative terms included).
+    if (ratio > 0 && ratio < Infinity) return Math.log2(ratio);
+    if (!(termA > 0) || !(termB > 0)) return NaN;
+    return (logExpm1PlusEpsilon(a, termA) - logExpm1PlusEpsilon(b, termB)) / Math.LN2;
   }
   return log2FoldChangeOfMeans(meanA, meanB, minimum, foldChange.pseudocount);
+}
+
+/**
+ * ln(expm1(y) + ε) for y > 0 without forming expm1(y) when it overflows:
+ * ln(e^y − 1 + ε) = y + ln1p((ε − 1)·e^−y).
+ *
+ * @param {number} y
+ * @param {number} term - expm1(y) + ε as float64 computed it
+ * @returns {number}
+ */
+function logExpm1PlusEpsilon(y, term) {
+  if (term < Infinity) return Math.log(term);
+  return y + Math.log1p((LOG1P_FOLD_CHANGE_EPSILON - 1) * Math.exp(-y));
 }
 
 export const P_CONVENTIONS = Object.freeze(['exact', 'normal', 'normal_tie']);
@@ -541,7 +598,9 @@ export const TEST_METHODS = Object.freeze(['wilcox', 'ttest', 'ttest_overestim_v
  * the `normal` convention, as scanpy's default `tie_correct=False`). AUROC is
  * `U / (n·m)`. The p-value is the convention's: `exact` (exact when both
  * sides are under 50 and untied, else normal with tie and continuity
- * correction, as R and SciPy), `normal` / `normal_tie` (`2Φ(−|z|)`, scanpy).
+ * correction, as R `wilcox.test`; SciPy `mannwhitneyu` gives it with
+ * `method='exact'` below 50, its `auto` being exact only up to 8 values),
+ * `normal` / `normal_tie` (`2Φ(−|z|)`, scanpy).
  *
  * @param {number} rankSum - Rank sum of the group (ranks 1-based, ties averaged)
  * @param {number} n - Group size
@@ -650,8 +709,11 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
 
   const nonFinite = new Uint32Array(groupCount);
   const nonZero = new Uint32Array(groupCount);
+  // Each group's compensated sum (as `describeSample`'s).
   const sumIn = new Float64Array(groupCount);
-  let sumAll = 0;
+  const compensationIn = new Float64Array(groupCount);
+  // Each group's smallest non-zero value (the shift of a stored fold change).
+  const minimumIn = new Float64Array(groupCount).fill(Infinity);
   let nonZeroAll = 0;
   let minimumNonZero = Infinity;
 
@@ -663,24 +725,12 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
   let tabulated = wilcox;
   let counts = context.countsByValue;
 
-  // The whole column's moments over every cell, grouped or not
-  // (`shared/gene-moments-cache.js`): the same pass, for free.
-  let columnSum = 0;
-  let columnSumSq = 0;
-  let columnNonZero = 0;
-  let columnNonFinite = 0;
   let previous = -1;
   for (let k = 0; k < indices.length; k++) {
     const cell = indices[k];
     if (cell <= previous || cell >= sample.length) throw sampleOrderError('Marker gene');
     previous = cell;
     const value = values[k];
-    if (!Number.isFinite(value)) columnNonFinite++;
-    else if (value !== 0) {
-      columnNonZero++;
-      columnSum += value;
-      columnSumSq += value * value;
-    }
     const group = cellGroupIndex[cell];
     if (group < 0) continue;
     if (!Number.isFinite(value)) {
@@ -690,9 +740,12 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
     if (value === 0) continue;
     nonZero[group]++;
     nonZeroAll++;
-    sumIn[group] += value;
-    sumAll += value;
+    const running = sumIn[group];
+    const total = running + value;
+    compensationIn[group] += Math.abs(running) >= Math.abs(value) ? (running - total) + value : (value - total) + running;
+    sumIn[group] = total;
     if (value < minimumNonZero) minimumNonZero = value;
+    if (value < minimumIn[group]) minimumIn[group] = value;
     if (tabulated) {
       const row = valueIndex.numberOf(value);
       if (row === -1) {
@@ -723,8 +776,11 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
   }
   const restMode = reference < 0;
   for (let g = 0; g < groupCount; g++) nOut[g] = restMode ? nAll - nIn[g] : nIn[reference];
-  // Minimum over every measured cell, for the shift of a stored fold change.
+  // The minimum of the compared cells shifts a stored fold change, as in
+  // differential expression (`twoSampleDifferential`): every measured cell
+  // for a group against the rest, the two groups against a reference.
   const minAll = zerosAll > 0 ? Math.min(minimumNonZero, 0) : minimumNonZero;
+  const minimumOf = g => (zeros[g] > 0 ? Math.min(minimumIn[g], 0) : minimumIn[g]);
 
   const pValues = new Float64Array(groupCount).fill(NaN);
   const scores = new Float32Array(groupCount).fill(NaN);
@@ -738,8 +794,11 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
   const meanIn = new Float64Array(groupCount).fill(NaN);
   const meanOut = new Float64Array(groupCount).fill(NaN);
   for (let g = 0; g < groupCount; g++) {
-    if (nIn[g] > 0) meanIn[g] = sumIn[g] / nIn[g];
+    if (nIn[g] > 0) meanIn[g] = (sumIn[g] + compensationIn[g]) / nIn[g];
   }
+  // The rest of each group in rest mode: every other group's measured cells,
+  // merged (`restMoments`), never all cells less the group.
+  const rest = restMode ? restMoments(nIn, meanIn, null) : null;
   for (let g = 0; g < groupCount; g++) {
     const nA = nIn[g];
     const nB = nOut[g];
@@ -748,20 +807,23 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
       percentInGroup[g] = (nonZero[g] / nA) * 100;
     }
     if (nB > 0) {
-      meanOut[g] = restMode ? (sumAll - sumIn[g]) / nB : meanIn[reference];
+      meanOut[g] = restMode ? rest.mean[g] : meanIn[reference];
       meanOutGroup[g] = meanOut[g];
       percentOutGroup[g] = restMode
         ? ((nonZeroAll - nonZero[g]) / nB) * 100
         : percentInGroup[reference];
     }
     if (nA > 0 && nB > 0) {
-      log2FoldChange[g] = foldChangeOfMeans(meanIn[g], meanOut[g], minAll, foldChange);
+      const minimum = restMode ? minAll : Math.min(minimumOf(g), minimumOf(reference));
+      log2FoldChange[g] = foldChangeOfMeans(meanIn[g], meanOut[g], minimum, foldChange);
     }
   }
 
   const result = {
     nAll,
-    column: { sum: columnSum, sumSq: columnSumSq, nonZero: columnNonZero, n: sample.length - columnNonFinite },
+    // The whole column's moments over every cell, grouped or not
+    // (`shared/gene-moments-cache.js`), for the module score.
+    column: columnMoments(sample),
     pValues,
     scores,
     auroc,
@@ -777,37 +839,26 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
   const testable = g => tested[g] === 1 && g !== reference && nIn[g] >= minPerSide && nOut[g] >= minPerSide;
 
   if (!wilcox) {
-    // Centred second moments: each group about its mean, and all grouped
-    // cells about theirs, over the non-zero entries plus each zero's term.
-    const meanAll = nAll > 0 ? sumAll / nAll : 0;
+    // Centred second moments: each group about its mean, over the non-zero
+    // entries plus each zero's term in one product. The rest's is merged
+    // from the other groups' (`restMoments`), so a dominant group with a
+    // wide spread never leaves a tight rest as the residue of a subtraction.
     const m2In = new Float64Array(groupCount);
-    let m2All = 0;
     for (let k = 0; k < indices.length; k++) {
       const group = cellGroupIndex[indices[k]];
       if (group < 0) continue;
       const value = values[k];
       if (value === 0 || !Number.isFinite(value)) continue;
       m2In[group] += (value - meanIn[group]) ** 2;
-      m2All += (value - meanAll) ** 2;
     }
-    m2All += zerosAll * meanAll ** 2;
     for (let g = 0; g < groupCount; g++) {
       if (nIn[g] > 0) m2In[g] += zeros[g] * meanIn[g] ** 2;
     }
+    const restM2 = restMode ? restMoments(nIn, meanIn, m2In).m2 : null;
     for (let g = 0; g < groupCount; g++) {
       if (!testable(g)) continue;
-      const nA = nIn[g];
-      const nB = nOut[g];
-      let m2Out;
-      if (restMode) {
-        const betweenM2 = (meanIn[g] - meanOut[g]) ** 2 * nA * nB / nAll;
-        m2Out = m2All - m2In[g] - betweenM2;
-        const m2Scale = Math.max(1, Math.abs(m2All), Math.abs(m2In[g]), Math.abs(betweenM2));
-        if (m2Out < 0 && m2Out >= -32 * Number.EPSILON * m2Scale) m2Out = 0;
-      } else {
-        m2Out = m2In[reference];
-      }
-      const test = welchComparison(meanIn[g], m2In[g], nA, meanOut[g], m2Out, nB, method);
+      const m2Out = restMode ? restM2[g] : m2In[reference];
+      const test = welchComparison(meanIn[g], m2In[g], nIn[g], meanOut[g], m2Out, nOut[g], method);
       scores[g] = test.score;
       pValues[g] = test.pValue;
     }
@@ -900,6 +951,65 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
     pValues[g] = comparison.pValue;
   }
   return result;
+}
+
+/**
+ * Each group's rest — every other group's measured cells — as one sample's
+ * size, mean and (with `m2`) centred sum of squares, merged from the groups'
+ * own by Chan's pairwise rule (`M2 = M2a + M2b + δ² · na · nb / n`, every
+ * term non-negative): the groups before it merged in order, those after it
+ * merged in reverse, and the two merged. O(groups) for all of them, and no
+ * subtraction of a group from the whole, which cancels when the group holds
+ * most cells and the rest is tight.
+ *
+ * @param {Uint32Array} n - Each group's measured cells
+ * @param {Float64Array} mean - Each group's mean (NaN for an empty group)
+ * @param {Float64Array|null} m2 - Each group's centred sum of squares
+ * @returns {{mean: Float64Array, m2: Float64Array}} NaN for a group with no rest
+ */
+function restMoments(n, mean, m2) {
+  const groupCount = n.length;
+  const withSquares = m2 !== null;
+  // before[g]: groups 0..g-1 merged; after[g]: groups g..G-1 merged.
+  const beforeN = new Float64Array(groupCount + 1);
+  const beforeMean = new Float64Array(groupCount + 1);
+  const beforeM2 = new Float64Array(groupCount + 1);
+  const afterN = new Float64Array(groupCount + 1);
+  const afterMean = new Float64Array(groupCount + 1);
+  const afterM2 = new Float64Array(groupCount + 1);
+  const merge = (nA, meanA, m2A, nB, meanB, m2B, into, at) => {
+    if (nB === 0) {
+      into[0][at] = nA; into[1][at] = meanA; into[2][at] = m2A;
+      return;
+    }
+    if (nA === 0) {
+      into[0][at] = nB; into[1][at] = meanB; into[2][at] = m2B;
+      return;
+    }
+    const total = nA + nB;
+    const delta = meanB - meanA;
+    into[0][at] = total;
+    into[1][at] = meanA + delta * (nB / total);
+    into[2][at] = withSquares ? m2A + m2B + delta * delta * (nA * nB / total) : 0;
+  };
+  const before = [beforeN, beforeMean, beforeM2];
+  const after = [afterN, afterMean, afterM2];
+  for (let g = 0; g < groupCount; g++) {
+    merge(beforeN[g], beforeMean[g], beforeM2[g], n[g], mean[g], withSquares ? m2[g] : 0, before, g + 1);
+  }
+  for (let g = groupCount - 1; g >= 0; g--) {
+    merge(n[g], mean[g], withSquares ? m2[g] : 0, afterN[g + 1], afterMean[g + 1], afterM2[g + 1], after, g);
+  }
+  const restMean = new Float64Array(groupCount).fill(NaN);
+  const restM2 = new Float64Array(groupCount).fill(NaN);
+  const out = [new Float64Array(1), new Float64Array(1), new Float64Array(1)];
+  for (let g = 0; g < groupCount; g++) {
+    merge(beforeN[g], beforeMean[g], beforeM2[g], afterN[g + 1], afterMean[g + 1], afterM2[g + 1], out, 0);
+    if (out[0][0] === 0) continue;
+    restMean[g] = out[1][0];
+    restM2[g] = out[2][0];
+  }
+  return { mean: restMean, m2: restM2 };
 }
 
 /**

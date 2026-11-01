@@ -12,11 +12,9 @@ import {
   DataSourceError,
   DataSourceErrorCode,
 } from './data-source.js';
-import {
-  createDatasetReloadSupersededError,
-} from './dataset-lifecycle-errors.js';
 import { createAnnDataFileSource } from './anndata-file-source.js';
 import { fileFormatOfName, filePickerAccept, folderFormatOfPaths, openableNamesText } from './input-formats.js';
+import { cancelled, cancel } from '../utils/abort.js';
 
 /** The folders Cellucid opens, as a message names them: "a .zarr folder, a Cell Ranger outs/ folder or …". */
 function folderKinds() {
@@ -75,7 +73,7 @@ export class LocalUserDirDataSource {
 
   /** @private */
   _createSupersededSelectionError() {
-    return createDatasetReloadSupersededError(
+    return cancelled('superseded',
       'This local data selection was superseded by a newer selection.'
     );
   }
@@ -131,7 +129,7 @@ export class LocalUserDirDataSource {
    */
   async _adopt(candidateSource, load, describe) {
     const selectionEpoch = ++this._selectionEpoch;
-    this._reading?.abort();
+    cancel(this._reading, 'superseded', 'A newer local selection replaced this one.');
     const reading = new AbortController();
     this._reading = reading;
     let adopted = false;
@@ -164,7 +162,9 @@ export class LocalUserDirDataSource {
   /**
    * Open one file: an `.h5ad` or a `.zarr.zip`, as its name says and its
    * content confirms. Its dataset id is the one it states
-   * (`uns['cellucid']['id']`), else `<format>_<file name>`.
+   * (`uns['cellucid']['id']`), else `<format>_<file name>_<structure>`
+   * (`defaultDatasetIdOf`: two files of one name holding other data are
+   * two datasets).
    * @param {File} file
    * @returns {Promise<DatasetMetadata>}
    */
@@ -190,7 +190,8 @@ export class LocalUserDirDataSource {
    * Open one store folder, chosen with a folder picker or dropped: every
    * file below it, each with its path inside the folder
    * (`webkitRelativePath`). Its dataset id is the one it states
-   * (`uns['cellucid']['id']`), else `<format>_<folder name>`.
+   * (`uns['cellucid']['id']`), else `<format>_<folder name>_<structure>`
+   * (`defaultDatasetIdOf`).
    * @param {FileList|File[]} files
    * @returns {Promise<DatasetMetadata>}
    */
@@ -290,7 +291,7 @@ export class LocalUserDirDataSource {
    */
   clear() {
     this._selectionEpoch += 1;
-    this._reading?.abort();
+    cancel(this._reading, 'closed', 'The local selection was cleared.');
     this._reading = null;
     this._cleanup();
     this._adoptionEpoch += 1;
@@ -304,20 +305,13 @@ export class LocalUserDirDataSource {
     this.clear();
   }
 
-  /**
-   * Another source is shown: the file stays open (the user may switch back),
-   * and the reader's computed caches are freed.
-   */
-  onDeactivate() {
-    this._annDataSource?.clearCaches?.();
-  }
-
   /** A chosen file is immutable once read: there is nothing to refresh. */
   async refresh() {}
 
   /**
-   * Local files cannot be reopened from saved state: the browser asks the
-   * user to choose them again.
+   * Local files cannot be reopened from saved state by the source: the
+   * person chooses them again, or, where the browser kept a handle of one,
+   * reopens it with a click (`app/local-file-handles.js`).
    * @returns {boolean}
    */
   requiresManualReconnect() {

@@ -201,20 +201,24 @@ def score_genes_references(adata) -> dict:
 
 
 def ucell_references(adata) -> dict:
-    """UCell scores in numpy: each cell's genes ranked by value, highest
-    first, ties averaged (``rankdata``); ranks above ``max_rank`` count as
-    ``max_rank + 1``; score ``1 - (sum(ranks) - S(S+1)/2) / (S * max_rank)``."""
+    """UCell scores in numpy, as the UCell package's ``u_stat`` computes them
+    (R/HelperFunctions.R, UCell 2.x): each cell's genes ranked by value,
+    highest first, ties averaged (``rankdata``); ``max_rank`` at most the
+    gene count; ranks at or above it count as ``max_rank``; score
+    ``1 - (sum(ranks) - S(S+1)/2) / (S * max_rank - S(S+1)/2)``."""
     X = np.asarray(adata.X, dtype=np.float64)
     columns = [list(adata.var_names).index(g) for g in SIGNATURE_GENES]
     s = len(columns)
     out = {}
     for max_rank in (10, 30, adata.n_vars):
+        cap = min(max_rank, adata.n_vars)
         ranks = np.apply_along_axis(lambda row: stats.rankdata(-row, method='average'), 1, X)
         picked = ranks[:, columns]
-        picked = np.where(picked > max_rank, max_rank + 1, picked)
-        u = picked.sum(axis=1) - s * (s + 1) / 2
+        picked = np.where(picked >= cap, cap, picked)
+        fewest = s * (s + 1) / 2
+        u = picked.sum(axis=1) - fewest
         out[f'max_rank_{max_rank}'] = {'genes': SIGNATURE_GENES, 'max_rank': int(max_rank),
-                                       'scores': _floats(1 - u / (s * max_rank))}
+                                       'scores': _floats(1 - u / (s * cap - fewest))}
     return out
 
 
@@ -264,7 +268,8 @@ def composition_and_dotplot_references(adata) -> dict:
     cell counts per type and unit (units in sample, then condition order;
     a sample in two conditions is two units), and per type SciPy on the
     per-unit values: Welch's t (``ttest_ind(equal_var=False)``) or one-way
-    ANOVA (``f_oneway``) on logit proportions ``(count + 0.5) / (total + 1)``
+    ANOVA (``f_oneway``) on logit pseudo-proportions as propeller takes them
+    (``(count + 0.5) / rowSums(count + 0.5)``: the total plus 0.5 a type)
     and on CLR (pseudocount 0.5); Wilcoxon (``mannwhitneyu``: exact when both
     sides are under 50 and untied, else asymptotic with continuity
     correction, as R) or ``kruskal`` on proportions; BH
@@ -312,7 +317,9 @@ def composition_and_dotplot_references(adata) -> dict:
     def transformed(counts, method):
         totals = counts.sum(axis=0)
         if method == 'logit':
-            p = (counts + 0.5) / (totals + 1)
+            # propeller (speckle getTransformedProps): over the types with cells.
+            present = int((counts.sum(axis=1) > 0).sum())
+            p = (counts + 0.5) / (totals + 0.5 * present)
             return np.log(p / (1 - p))
         if method == 'clr':
             logs = np.log(counts + 0.5)

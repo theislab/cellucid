@@ -13,7 +13,19 @@
  * @module data/anndata/views/view-nodes
  */
 
-import { compareNames, isGroup, normalizeSelection, pathParts, selectionSize } from '../../../formats/store.js';
+import { compareNames, isGroup, loadBelow, loadSpecsOf, normalizeSelection, pathParts, selectionSize } from '../../../formats/store.js';
+import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
+import { sharedOnce } from '../../../utils/abort.js';
+
+/** An array of `length` elements of the kind of `values` (a typed array, or an Array of strings). */
+function arrayLike(values, length, label) {
+  return ArrayBuffer.isView(values) ? allocateTypedArray(values.constructor, length, label) : new Array(length);
+}
+
+/** Elements `[from, to)` of `values` as an array of their own. */
+function sliceOf(values, from, to, label) {
+  return ArrayBuffer.isView(values) ? copyTypedArray(values.constructor, values.subarray(from, to), label) : values.slice(from, to);
+}
 
 /**
  * The encoding attributes anndata writes for one encoding:
@@ -37,35 +49,61 @@ export function joinPath(parent, name) {
 
 /**
  * A group presented with other attributes and children. `children` maps each
- * name to a function making the child (made once, on first access). A view
- * of a store root passes `close`, which closes the real store when the
- * reader is done with the view. `extra` adds properties that are not part of
- * the store model (a root's `modalities`, `views/modalities.js`).
+ * name to a function making the child (made once, on first access); it may
+ * be a function returning that map, called on the group's first navigation:
+ * a view whose children are named by real groups (`sources`) lists them only
+ * once those are loaded. A view of a store root passes `close`, which closes
+ * the real store when the reader is done with the view (with the reason
+ * the store's reads still under way stop with). `extra` adds
+ * properties that are not part of the store model (a root's `modalities`,
+ * `views/modalities.js`).
+ *
+ * The view is loaded (`formats/store.js`, `Group.load`) when every real
+ * group it is made from is: `sources`, by default `real`. Its `load` loads
+ * them, then its children the paths reach (`loadBelow`); a child made from
+ * a real group lists and makes its own children only once loaded, so a view
+ * reads nothing of a real group before a load asks for it.
  */
-export function viewGroup({ path, attrs, children, real = null, ownAttributes = [], close = null, extra = null }) {
+export function viewGroup({ path, attrs, children, real = null, sources = real === null ? [] : [real], ownAttributes = [], close = null, extra = null }) {
   const made = new Map();
-  const names = [...children.keys()].sort(compareNames);
+  let named = null;
+  const childMap = () => {
+    named ??= typeof children === 'function' ? children() : children;
+    return named;
+  };
+  let names = null;
   const frozenAttrs = Object.freeze({ ...attrs });
   const group = {
     kind: 'group',
     path,
     name: path === '/' ? '' : path.slice(path.lastIndexOf('/') + 1),
     attrs: frozenAttrs,
+    get loaded() {
+      return sources.every(source => source.loaded);
+    },
+    load(paths = [''], options = {}) {
+      return loadBelow(group, loadSpecsOf(paths), options, (depth, own) => Promise.all(
+        sources.map(source => source.load([{ path: '', depth }], own))
+      ));
+    },
     attributeType(name) {
       return real !== null && !ownAttributes.includes(name) ? real.attributeType(name) : null;
     },
-    keys: () => [...names],
+    keys() {
+      names ??= [...childMap().keys()].sort(compareNames);
+      return [...names];
+    },
     has(name) {
       const parts = pathParts(name);
       if (parts.length === 0) return false;
-      if (parts.length === 1) return children.has(parts[0]);
+      if (parts.length === 1) return childMap().has(parts[0]);
       const first = group.get(parts[0]);
       return isGroup(first) && first.has(parts.slice(1).join('/'));
     },
     get(name) {
       const parts = pathParts(name);
       if (parts.length === 0) return group;
-      const make = children.get(parts[0]);
+      const make = childMap().get(parts[0]);
       if (make === undefined) return null;
       if (!made.has(parts[0])) made.set(parts[0], make());
       const node = made.get(parts[0]);
@@ -78,11 +116,17 @@ export function viewGroup({ path, attrs, children, real = null, ownAttributes = 
   return Object.freeze(group);
 }
 
-/** An array presented with added attributes and, optionally, other values. */
-export function viewArray(real, { attrs = {}, dtype = real.dtype, shape = real.shape, read = null, path = real.path }) {
+/**
+ * An array presented with added attributes and, optionally, other values.
+ * `labels`: an integer column whose values are labels, not quantities (a
+ * clustering of a format with no categorical type: `isClusteringColumn`),
+ * read as categories found among the open cells (`AnnDataReader.getObsField`).
+ */
+export function viewArray(real, { attrs = {}, dtype = real.dtype, shape = real.shape, read = null, path = real.path, labels = false }) {
   const ownAttributes = Object.keys(attrs);
   return Object.freeze({
     kind: 'array',
+    labels,
     path,
     name: path.slice(path.lastIndexOf('/') + 1),
     attrs: Object.freeze({ ...real.attrs, ...attrs }),
@@ -124,7 +168,7 @@ export function memberArray(compound, field) {
       if (width === null) return values;
       const [first, last] = selection?.[1] ?? [0, width];
       if (first === 0 && last === width) return values;
-      const selected = new values.constructor((end - start) * (last - first));
+      const selected = arrayLike(values, (end - start) * (last - first), path);
       for (let row = 0; row < end - start; row++) {
         for (let column = first; column < last; column++) {
           selected[row * (last - first) + column - first] = values[row * width + column];
@@ -170,7 +214,7 @@ export function transposedArray(real, { path = real.path, attrs = {} } = {}) {
       const nRows = rows[1] - rows[0];
       const nColumns = columns[1] - columns[0];
       if (nRows <= 1 || nColumns <= 1) return values;
-      const transposed = new values.constructor(nRows * nColumns);
+      const transposed = arrayLike(values, nRows * nColumns, path);
       for (let column = 0; column < nColumns; column++) {
         const offset = column * nRows;
         for (let row = 0; row < nRows; row++) transposed[row * nColumns + column] = values[offset + row];
@@ -222,20 +266,19 @@ export function rowWindowArray(real, { start, count, path = real.path, attrs = {
  * is computed until the first read.
  *
  * @param {{path: string, dtype: Object, shape: number[], compute: (options: Object) => Promise<ArrayLike<unknown>>,
- *   attrs?: Object, storedBytes?: ((options: Object) => Promise<number|null>)|null}} definition
+ *   attrs?: Object, storedBytes?: ((options: Object) => Promise<number|null>)|null, wideIntegers?: boolean}} definition
  * @returns {Object}
  */
-export function computedArray({ path, dtype, shape, compute, attrs = {}, storedBytes = null }) {
-  let values = null;
-  const all = options => {
-    if (values === null) {
-      values = compute(options);
-      values.catch(() => { values = null; });
-    }
-    return values;
-  };
+export function computedArray({ path, dtype, shape, compute, computeRows = null, attrs = {}, storedBytes = null, wideIntegers = false }) {
+  // Computed once, shared by every read asking meanwhile: it stops only
+  // once every one of them withdrew (`sharedOnce`).
+  const all = sharedOnce(compute);
   return Object.freeze({
     kind: 'array',
+    // Integers wider than 16 bits presented as float64 (to hold NaN where a
+    // cell has none): read exactly, as the integer column they are
+    // (`values.js` `exactIntegersNeedFloat64`).
+    wideIntegers,
     path,
     name: path.slice(path.lastIndexOf('/') + 1),
     attrs: Object.freeze({ ...attrs }),
@@ -247,17 +290,32 @@ export function computedArray({ path, dtype, shape, compute, attrs = {}, storedB
     storedBytes: async (_selection, options) => (storedBytes === null ? null : storedBytes(options)),
     async read(selection, options) {
       const pairs = normalizeSelection(shape, selection, path);
+      // Some rows, not computed whole yet: only those rows (a subsample's
+      // runs read this way read only the stored rows they hold).
+      if (!all.asked() && computeRows !== null && shape.length >= 1 && (pairs[0][0] > 0 || pairs[0][1] < shape[0])) {
+        const [r0, r1] = pairs[0];
+        const rows = await computeRows(options, r0, r1);
+        const width = shape.slice(1).reduce((product, extent) => product * extent, 1);
+        if (shape.length === 1 || (pairs[1][0] === 0 && pairs[1][1] === shape[1])) return rows;
+        const [, [c0, c1]] = pairs;
+        const out = arrayLike(rows, (r1 - r0) * (c1 - c0), path);
+        let at = 0;
+        for (let row = 0; row < r1 - r0; row++) {
+          for (let column = c0; column < c1; column++) out[at++] = rows[row * width + column];
+        }
+        return out;
+      }
       const whole = await all(options);
       if (shape.length === 0) return Array.isArray(whole) || ArrayBuffer.isView(whole) ? whole[0] : whole;
       if (shape.length === 1) {
-        return whole.slice(pairs[0][0], pairs[0][1]);
+        return sliceOf(whole, pairs[0][0], pairs[0][1], path);
       }
       const width = shape.slice(1).reduce((product, extent) => product * extent, 1);
       if (shape.length === 2 && pairs[1][0] === 0 && pairs[1][1] === shape[1]) {
-        return whole.slice(pairs[0][0] * width, pairs[0][1] * width);
+        return sliceOf(whole, pairs[0][0] * width, pairs[0][1] * width, path);
       }
       if (shape.length !== 2) throw new RangeError(`${path}: a computed array is read by rows, or rows and columns.`);
-      const out = new whole.constructor(selectionSize(pairs));
+      const out = arrayLike(whole, selectionSize(pairs), path);
       const [[r0, r1], [c0, c1]] = pairs;
       let at = 0;
       for (let row = r0; row < r1; row++) {
@@ -300,7 +358,7 @@ export function columnWindowMatrix(matrix, { start, count, path }) {
     real: matrix,
     attrs: { ...matrix.attrs, shape: [Number(shape[0]), count] },
     ownAttributes: ['shape'],
-    children: new Map(matrix.keys().map(key => [key, () => matrix.get(key)])),
+    children: () => new Map(matrix.keys().map(key => [key, () => matrix.get(key)])),
     extra: { columnWindow: Object.freeze({ matrix, start, count }) },
   });
 }

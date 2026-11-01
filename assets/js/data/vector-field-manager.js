@@ -20,9 +20,11 @@ import {
 } from './anndata-provider.js';
 import { ANNDATA_KIND } from './data-mapping.js';
 import { resolveVectorBinding } from './data-mapping-candidates.js';
-import { markProvenFiniteFloat32Array } from '../rendering/position-layout.js';
+import { markProvenCellRows } from '../rendering/unplaced-positions.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { cellsSteady, trackCellWork } from './open-cells-work.js';
+import { cancelled } from '../utils/abort.js';
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -164,7 +166,11 @@ export class VectorFieldManager {
       this._bindings.set(fieldId, bound);
     }
 
-    /** @type {Map<string, Map<string, Promise<object>>>} */
+    /**
+     * Loads under way, by field and layout, with the open cell count each
+     * reads for: a load is shared only by callers of the same cells.
+     * @type {Map<string, Map<string, {cells: number, promise: Promise<object>}>>}
+     */
     this._loading = new Map();
 
     /** Owns every download this manager starts; aborted by dispose(). */
@@ -177,7 +183,7 @@ export class VectorFieldManager {
    */
   dispose() {
     this._lifetime.abort(
-      new DOMException('The vector-field manager was replaced.', 'AbortError')
+      cancelled('closed', 'The vector-field manager was replaced.')
     );
   }
 
@@ -239,7 +245,9 @@ export class VectorFieldManager {
    *
    * @param {string} fieldId
    * @param {string} layoutKey
-   * @returns {Promise<{ vectors: Float32Array, components: 1|2|3, cellCount: number, maxMagnitude: number }>}
+   * @returns {Promise<{ vectors: Float32Array, components: 1|2|3, cellCount: number, maxMagnitude: number, unplacedCount: number, unplacedNames: ReadonlyArray<string> }>}
+   *   `unplacedCount`: the cells without a vector (NaN components), the
+   *   first named in `unplacedNames`
    */
   async loadField(fieldId, layoutKey) {
     const id = requireNonEmptyString(
@@ -250,6 +258,10 @@ export class VectorFieldManager {
       layoutKey,
       'VectorFieldManager layoutKey'
     );
+    // The open cells being changed in place: read for the cells after it
+    // (`open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
     if (this._lifetime.signal.aborted) throw this._lifetime.signal.reason;
     const entry = this._fields.get(id);
     if (entry === undefined) {
@@ -267,18 +279,20 @@ export class VectorFieldManager {
       perField = new Map();
       this._loading.set(id, perField);
     }
+    const cells = this.dimensionManager.nCells;
     const activeLoad = perField.get(key);
-    if (activeLoad !== undefined) {
-      return activeLoad;
+    if (activeLoad !== undefined && activeLoad.cells === cells) {
+      return activeLoad.promise;
     }
 
-    const promise = this._loadExactField(id, entry, key, dim);
-    perField.set(key, promise);
+    const promise = trackCellWork(this._loadExactField(id, entry, key, dim));
+    const own = { cells, promise };
+    perField.set(key, own);
     try {
       return await promise;
     } finally {
-      perField.delete(key);
-      if (perField.size === 0) {
+      if (perField.get(key) === own) perField.delete(key);
+      if (perField.size === 0 && this._loading.get(id) === perField) {
         this._loading.delete(id);
       }
     }
@@ -308,9 +322,8 @@ export class VectorFieldManager {
       currentBinding.adapter !== binding.adapter ||
       currentBinding.source !== binding.source
     ) {
-      throw new Error(
-        `VectorFieldManager.loadField: direct AnnData ownership changed while loading field "${id}".`
-      );
+      // Read for a dataset (or open cells) no longer shown: superseded.
+      throw cancelled('superseded', `The vector field "${id}" was read for a dataset no longer shown.`);
     }
     if (
       !(positions instanceof Float32Array) ||
@@ -322,7 +335,7 @@ export class VectorFieldManager {
       );
     }
     const cellCount = positions.length / dimension;
-    const { vectors, maxMagnitude } = payload ?? {};
+    const { vectors, maxMagnitude, unplacedCount, unplacedNames } = payload ?? {};
     if (!(vectors instanceof Float32Array)) {
       throw new Error(
         'VectorFieldManager.loadField: an AnnData vector payload must be a Float32Array.'
@@ -339,15 +352,23 @@ export class VectorFieldManager {
         `VectorFieldManager.loadField: field "${id}" must carry a finite non-negative largest magnitude.`
       );
     }
-    // Checked finite and scaled where it was read; shared read-only with the
+    if (!Number.isSafeInteger(unplacedCount) || unplacedCount < 0 || !Array.isArray(unplacedNames)) {
+      throw new Error(
+        `VectorFieldManager.loadField: field "${id}" must state the cells it has no vector for.`
+      );
+    }
+    // Checked and scaled where it was read (every component finite, or a
+    // cell's every component NaN: no vector); shared read-only with the
     // adapter's cache.
-    markProvenFiniteFloat32Array(vectors);
+    markProvenCellRows(vectors);
 
     return Object.freeze({
       vectors,
       components: dimension,
       cellCount,
       maxMagnitude,
+      unplacedCount,
+      unplacedNames,
     });
   }
 }

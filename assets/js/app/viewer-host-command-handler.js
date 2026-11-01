@@ -1,10 +1,18 @@
 /**
  * Apply authenticated host commands (Python, R) to the current browser-owned
  * state.
+ *
+ * Every cell a command names is an original position (a row of the
+ * dataset's `obs`, `data/viewer-protocol.js`); the handlers find the open
+ * cells among them with the dataset's cell identity. A cell the open
+ * subsample does not hold is left out: a highlight of the open ones, a pushed
+ * column without a value there.
  */
 
 import { requireCellList } from './utils/cell-set.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { categoricalStorageForCount } from '../data/categorical-storage-contract.js';
+import { NOTEBOOK_PUSH_OPERATION } from './viewer-host-results.js';
 
 function requireMethod(owner, key, label) {
   if (
@@ -17,42 +25,72 @@ function requireMethod(owner, key, label) {
   return owner[key].bind(owner);
 }
 
+const HANDLER_OPTIONS = Object.freeze([
+  'state', 'viewer', 'refreshUi', 'reportDataMapping', 'getCellIdentity', 'getShownHostDataset', 'results',
+  'getHostLabel',
+]);
+
 /**
  * @param {{
  *   state: Object,
  *   viewer: Object,
  *   refreshUi: () => void,
  *   reportDataMapping: (report: {origin: 'notebook', requestId: string, mapping: Object}) => Promise<boolean>,
+ *   getCellIdentity: () => import('../data/cell-identity.js').CellIdentity,
+ *   getShownHostDataset: () => string|null,
+ *   results: ReturnType<typeof import('./viewer-host-results.js').createViewerHostResults>,
+ *   getHostLabel: () => string|null,
  * }} options
  *   `reportDataMapping` answers a `setDataMapping` command with the mapping
- *   the viewer shows once it is applied.
+ *   the viewer shows once it is applied; `results` answers `setField` and
+ *   `setGeneSet`; `getHostLabel` names the host ("Python",
+ *   "Jupyter", "R") in the label of a highlight it did not name;
+ *   `getShownHostDataset` names the host's dataset the viewer shows, or null
+ *   while the person has another one open, when a command that names cells
+ *   (`highlight`, `setVisibility`, `setField`) or is answered by a result
+ *   (`setGeneSet`) is refused.
  */
 export function createViewerHostCommandHandlers(options) {
   if (
     options === null ||
     typeof options !== 'object' ||
     Array.isArray(options) ||
-    Object.keys(options).length !== 4 ||
-    !Object.hasOwn(options, 'state') ||
-    !Object.hasOwn(options, 'viewer') ||
-    !Object.hasOwn(options, 'refreshUi') ||
-    !Object.hasOwn(options, 'reportDataMapping')
+    Object.keys(options).length !== HANDLER_OPTIONS.length ||
+    !HANDLER_OPTIONS.every(key => Object.hasOwn(options, key))
   ) {
     throw new TypeError(
-      'Viewer host command handlers require exactly state, viewer, refreshUi, and reportDataMapping'
+      `Viewer host command handlers require exactly ${HANDLER_OPTIONS.join(', ')}`
     );
   }
-  if (typeof options.refreshUi !== 'function') {
-    throw new TypeError('Viewer host command refreshUi must be a function');
+  for (const key of ['refreshUi', 'reportDataMapping', 'getCellIdentity', 'getShownHostDataset', 'getHostLabel']) {
+    if (typeof options[key] !== 'function') {
+      throw new TypeError(`Viewer host command ${key} must be a function`);
+    }
   }
-  if (typeof options.reportDataMapping !== 'function') {
-    throw new TypeError('Viewer host command reportDataMapping must be a function');
-  }
-  const { state, viewer, refreshUi, reportDataMapping } = options;
+  const {
+    state, viewer, refreshUi, reportDataMapping, getCellIdentity, getShownHostDataset, results, getHostLabel,
+  } = options;
 
-  function handleHighlight(cells, color) {
+  /** Refuse a command that names cells while another dataset is open. */
+  function requireHostDataset(command) {
+    if (getShownHostDataset() !== null) return;
+    const host = getHostLabel() ?? 'the host';
+    throw new Error(
+      `The viewer shows a dataset ${host} did not open, so ${command} names none of its cells; ` +
+      `open ${host}'s dataset again in the viewer, or show the viewer again.`
+    );
+  }
+
+  /** The open cells among `cells` (original positions), in subset positions. */
+  function openCells(cells, label) {
+    const identity = getCellIdentity();
+    const { positions } = identity.fromOriginal(cells);
+    return requireCellList(positions, state.pointCount, label);
+  }
+
+  function handleHighlight(cells, color, label) {
     if (color === null) {
-      if (cells !== null) {
+      if (cells !== null || label !== null) {
         throw new TypeError(
           'Viewer host clear-highlight names no cells'
         );
@@ -69,13 +107,15 @@ export function createViewerHostCommandHandlers(options) {
     if (!(cells instanceof Uint32Array) || cells.length === 0) {
       throw new TypeError('Viewer host highlight cells must be a non-empty cell list');
     }
-    // The binary frame's cells, ascending already: checked against this
-    // dataset and used as they are, uncopied.
-    const cellList = requireCellList(
-      cells,
-      state.pointCount,
-      'Viewer host highlight cells'
-    );
+    requireHostDataset('the highlight');
+    // The binary frame's cells, ascending already: the open ones among them,
+    // checked against this dataset.
+    const cellList = openCells(cells, 'Viewer host highlight cells');
+    if (cellList.length === 0) {
+      throw new Error(
+        `None of the ${formatCountOf(cells.length, 'cell')} to highlight is open in this subsample`
+      );
+    }
     if (
       typeof color !== 'string' ||
       !/^#[0-9a-fA-F]{6}$/.test(color)
@@ -122,7 +162,7 @@ export function createViewerHostCommandHandlers(options) {
       'Viewer host highlight command'
     )({
       type: 'annotation',
-      label: `Python selection (${formatCountOf(cellList.length, 'cell')})`,
+      label: label ?? `${getHostLabel() ?? 'Notebook'} selection (${formatCountOf(cellList.length, 'cell')})`,
       cellIndices: cellList
     });
     if (group === null || typeof group !== 'object') {
@@ -130,6 +170,53 @@ export function createViewerHostCommandHandlers(options) {
         'Viewer host highlight command could not publish its selection'
       );
     }
+  }
+
+  /**
+   * A field the notebook pushed: a categorical by `upsertUserDefinedCategoricalField`,
+   * a continuous by `upsertUserDefinedContinuousField`, each under its key.
+   * A field of that key the notebook did not push is never replaced.
+   */
+  function setField(message) {
+    requireHostDataset(`the pushed column "${message.key}"`);
+    const identity = getCellIdentity();
+    if (message.nObs !== identity.nOriginal) {
+      throw new Error(
+        `The pushed column "${message.key}" has ${formatCountOf(message.nObs, 'cell')} and this dataset ` +
+        `${formatCountOf(identity.nOriginal, 'cell')}: it belongs to another dataset`
+      );
+    }
+    const operation = { type: NOTEBOOK_PUSH_OPERATION };
+    if (message.kind === 'continuous') {
+      const values = identity.openValues(message, Float32Array, NaN);
+      const { fieldId } = requireMethod(state, 'upsertUserDefinedContinuousField', 'Viewer host set-field command')({
+        key: message.key,
+        values,
+        operation,
+      });
+      return { kind: 'continuous', id: fieldId };
+    }
+    const fields = requireMethod(state, 'getFields', 'Viewer host set-field command')() ?? [];
+    const existing = fields.find(field => field?._isDeleted !== true && field?.key === message.key);
+    if (existing !== undefined && existing._operation?.type !== NOTEBOOK_PUSH_OPERATION) {
+      throw new Error(`A field named "${message.key}" exists already; push the column under another key`);
+    }
+    const storage = categoricalStorageForCount(message.categories.length, `The pushed column "${message.key}"`);
+    const ArrayType = storage.TypedArrayClass;
+    const sourceMissing = 2 ** (8 * message.values.BYTES_PER_ELEMENT) - 1;
+    const codes = identity.openValues(message, ArrayType, storage.missingValue);
+    if (sourceMissing !== storage.missingValue) {
+      for (let index = 0; index < codes.length; index++) {
+        if (codes[index] === sourceMissing) codes[index] = storage.missingValue;
+      }
+    }
+    const { fieldIndex } = requireMethod(state, 'upsertUserDefinedCategoricalField', 'Viewer host set-field command')({
+      key: message.key,
+      categories: [...message.categories],
+      codes,
+      meta: { _operation: operation },
+    });
+    return { kind: 'categorical', id: fields[fieldIndex]._userDefinedId };
   }
 
   async function handleMessage(message) {
@@ -158,7 +245,7 @@ export function createViewerHostCommandHandlers(options) {
         }
         const matches = [];
         for (let index = 0; index < fields.length; index++) {
-          if (fields[index]?.key === message.field) {
+          if (fields[index]?.key === message.field && fields[index]?._isDeleted !== true) {
             matches.push(index);
           }
         }
@@ -193,11 +280,15 @@ export function createViewerHostCommandHandlers(options) {
       }
 
       case 'setVisibility':
+        requireHostDataset('the visibility command');
         requireMethod(
           state,
           'setCellVisibility',
           'Viewer host set-visibility command'
-        )(message.cells, message.visible);
+        )(
+          message.cells === null ? null : openCells(message.cells, 'Viewer host set-visibility cells'),
+          message.visible
+        );
         return;
 
       case 'setDataMapping': {
@@ -228,6 +319,22 @@ export function createViewerHostCommandHandlers(options) {
           'Viewer host reset-camera command'
         )();
         return;
+
+      case 'setField': {
+        const made = setField(message);
+        refreshUi();
+        results.answer(message.requestId, made.kind, made.id);
+        return;
+      }
+
+      case 'setGeneSet': {
+        // Its answer is a result, and no result describes another dataset.
+        requireHostDataset(`the gene set "${message.name}"`);
+        const entry = requireMethod(state, 'getDerivedResults', 'Viewer host set-gene-set command')()
+          .upsertNotebookGeneSet({ name: message.name, description: message.description, genes: message.genes });
+        results.answer(message.requestId, 'geneSet', entry.id);
+        return;
+      }
 
       default:
         return;

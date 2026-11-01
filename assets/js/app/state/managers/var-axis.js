@@ -15,13 +15,34 @@
  *   by), and the gene is reported as dropped;
  * - every other gene is unloaded: the new list loads on demand.
  *
- * `varAxisGeneration` counts replacements; anything computed from gene values
+ * `getVarAxisGeneration()` counts replacements; anything computed from gene values
  * belongs to the generation it was computed in.
+ *
+ * A dataset is published before its gene list (`beginGeneListing`): the first
+ * view never waits for gene names. Its gene list is pending until
+ * `listPublishedGenes` -- run right after the first view -- has read the
+ * names its mapping names the genes by (the var index unless a var column
+ * was chosen) and installed the list. Everything that lists or names genes
+ * shows that they are loading (`areGenesPending`) and updates on
+ * `genes:listed`; everything that needs them (a session, an export, a
+ * mapping change) waits (`whenGenesListed`).
  *
  * @module state/managers/var-axis
  */
 
 import { getFieldRegistry } from '../../utils/field-registry.js';
+import { loadGeneList } from '../../../data/data-loaders.js';
+import { cellsSteady, trackCellWork } from '../../../data/open-cells-work.js';
+import { formatCountOf } from '../../../utils/format-units.js';
+import { cancelled } from '../../../utils/abort.js';
+
+/**
+ * Each gene field of a replaced gene list, to its gene's field on the list
+ * that replaced it (`locateVarField`): a choice made on the old list follows
+ * its gene to the new one.
+ * @type {WeakMap<object, object>}
+ */
+const varFieldSuccessors = new WeakMap();
 
 /** The per-gene state a person chose, carried over by name. */
 const GENE_INTENT_KEYS = Object.freeze([
@@ -30,6 +51,7 @@ const GENE_INTENT_KEYS = Object.freeze([
   '_continuousColorRange',
   '_useFilterColorRange',
   '_useLogScale',
+  '_zeroGray',
 ]);
 
 /** The finite min and max of one gene's values, or null when it has none. */
@@ -75,6 +97,150 @@ function requireLoader(loader) {
 }
 
 export class DataStateVarAxisMethods {
+  /**
+   * Begin the gene list of a dataset just published (`hasGenes`), or say a
+   * published dataset (or none) has no gene list to wait for. Called where
+   * the dataset is published, with an empty var inventory: a listing of an
+   * earlier dataset still under way is superseded (its waiters reject), and
+   * the new one is pending until `listPublishedGenes` installs it.
+   *
+   * @param {boolean} hasGenes
+   */
+  beginGeneListing(hasGenes) {
+    const previous = this._geneListing ?? null;
+    if (previous !== null && previous.state === 'pending') {
+      previous.state = 'superseded';
+      previous.reject(cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.'));
+    }
+    if (hasGenes !== true) {
+      this._geneListing = null;
+      return;
+    }
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    // A failure is reported where it happens; waiting is optional.
+    promise.catch(() => {});
+    this._geneListing = { promise, resolve, reject, state: 'pending', failure: null, started: false };
+  }
+
+  /**
+   * Whether the published dataset's gene names are still being read: its
+   * gene list is empty until they are (`listPublishedGenes`).
+   * @returns {boolean}
+   */
+  areGenesPending() {
+    return this._geneListing?.state === 'pending';
+  }
+
+  /**
+   * Why the published dataset's gene list could not be read, or null.
+   * @returns {Error|null}
+   */
+  getGeneListFailure() {
+    return this._geneListing?.failure ?? null;
+  }
+
+  /**
+   * Resolves once the published dataset's gene list is installed (at once
+   * when it is, or when the dataset has none); rejects with its failure, or
+   * when the dataset is replaced first.
+   * @returns {Promise<void>}
+   */
+  whenGenesListed() {
+    const listing = this._geneListing ?? null;
+    if (listing === null || listing.state === 'listed') return Promise.resolve();
+    return listing.promise;
+  }
+
+  /**
+   * Read and install the gene list of the published dataset, once: the list
+   * is read, checked against the gene count the identity published and
+   * installed, and `genes:listed` is emitted (with `{failure}` when it
+   * fails). It is work on the open cells
+   * (`data/open-cells-work.js`): a change of the open cells waits for it,
+   * and it waits for one under way. Resolves when installed (or superseded
+   * by another dataset); rejects with the failure, which stays readable
+   * (`getGeneListFailure`).
+   *
+   * @returns {Promise<void>}
+   */
+  async listPublishedGenes() {
+    const listing = this._geneListing ?? null;
+    if (listing === null || listing.state !== 'pending' || listing.started) return this.whenGenesListed();
+    listing.started = true;
+    const current = () => this._geneListing === listing && listing.state === 'pending';
+    const steady = cellsSteady();
+    if (steady !== null) await steady;
+    if (!current()) return undefined;
+    const runtime = this._requireMappingRuntime();
+    const expected = this.describeMappingVarCount({ ...this.dataMapping });
+    const work = loadGeneList(`${runtime.getBaseUrl()}var`, {});
+    trackCellWork(work);
+    try {
+      const geneList = await work;
+      if (!current()) return undefined;
+      if (geneList.n_points !== this.pointCount || geneList.fields.length !== expected) {
+        throw new Error(
+          `The gene list read has ${formatCountOf(geneList.fields.length, 'gene')} of ` +
+          `${formatCountOf(geneList.n_points, 'cell')}; the dataset opened with ` +
+          `${formatCountOf(expected, 'gene')} of ${formatCountOf(this.pointCount, 'cell')}.`
+        );
+      }
+      this._installListedGenes(geneList);
+    } catch (error) {
+      if (!current()) return undefined;
+      listing.state = 'failed';
+      listing.failure = error instanceof Error ? error : new Error(String(error));
+      listing.reject(listing.failure);
+      this.emit('genes:listed', { failure: listing.failure });
+      throw listing.failure;
+    }
+    listing.state = 'listed';
+    listing.resolve();
+    this.emit('genes:listed', { failure: null });
+    return undefined;
+  }
+
+  /**
+   * Install the read gene list of the published dataset. Nothing was
+   * coloured by a gene, renamed or restored while it was pending: no view
+   * changes.
+   * @private
+   */
+  _installListedGenes(geneList) {
+    this.initVarData(geneList);
+    this.applyFieldOverlays();
+    for (const viewId of this.viewContexts.keys()) {
+      if (viewId === this.activeViewId) continue;
+      this.viewContexts.get(viewId).varData = this._cloneVarData(this.varData);
+    }
+    getFieldRegistry().invalidate();
+  }
+
+  /**
+   * Where the gene of `field` is on the gene list in use: `field`'s own
+   * position, or -- when the list it was read from was replaced since (a
+   * data mapping applied, by a person or because the values refuted a
+   * default) -- the position of the same gene on the list in use, found as a
+   * coloured view's gene is (by position on the same var axis, by name on
+   * another). -1 when the list in use has no such gene.
+   *
+   * @param {object} field - A gene field of this list or of one it replaced
+   * @returns {number}
+   */
+  locateVarField(field) {
+    const fields = this.varData?.fields ?? [];
+    for (let current = field; current !== undefined; current = varFieldSuccessors.get(current)) {
+      const index = fields.indexOf(current);
+      if (index >= 0) return index;
+    }
+    return -1;
+  }
+
   /**
    * How many times the var axis was replaced since the dataset was published.
    * @returns {number}
@@ -180,6 +346,7 @@ export class DataStateVarAxisMethods {
       loader: this.varFieldLoader,
       cache: new Map(this._varFieldDataCache),
       generation: this.getVarAxisGeneration(),
+      listing: this._geneListing ?? null,
       views: new Map([...this.viewContexts.keys()].map(viewId => {
         const view = viewId === this.activeViewId ? this : this.viewContexts.get(viewId);
         return [viewId, {
@@ -191,6 +358,7 @@ export class DataStateVarAxisMethods {
       })),
     };
 
+    const replaced = this.varData?.fields ?? [];
     return {
       dropped,
       commit: () => {
@@ -207,7 +375,20 @@ export class DataStateVarAxisMethods {
               : { mode: 'gene', index, intentFrom: entry.field };
           },
         });
+        // A gene chosen on the replaced list and still being read (a choice
+        // under way) follows its gene to this one, found as a coloured
+        // view's gene is.
+        const published = this.varData.fields;
+        const publishedByKey = new Map(published.map((field, index) => [field.key, index]));
+        replaced.forEach((field, position) => {
+          const index = field?._isUserDefined === true
+            ? publishedByKey.get(field.key)
+            : resolve({ position, field, key: field._originalKey ?? field.key });
+          if (index !== undefined && published[index] !== undefined) varFieldSuccessors.set(field, published[index]);
+        });
         this._varAxisGeneration = previous.generation + 1;
+        // A gene list that could not be read is replaced by this one.
+        if (previous.listing?.state === 'failed') this._geneListing = null;
         this.emit('var-axis:changed', {
           generation: this._varAxisGeneration,
           dropped: [...dropped],
@@ -221,6 +402,7 @@ export class DataStateVarAxisMethods {
         for (const [key, value] of previous.cache) this._varFieldDataCache.set(key, value);
         this._restoreViewsVarState(previous.views);
         this._varAxisGeneration = previous.generation;
+        this._geneListing = previous.listing;
         this.emit('var-axis:changed', { generation: previous.generation, dropped: [] });
       },
     };

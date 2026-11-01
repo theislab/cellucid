@@ -982,13 +982,15 @@ test('the data mapping sits at the bottom of the Session panel and stays out of 
     html.indexOf('id="session-section"'),
     html.indexOf('</details>', html.indexOf('id="session-section"'))
   );
-  // Its own heading, after the Session file block and last in the panel.
+  // Its own collapsible section (collapsed by default, a summary in its
+  // header), after Session file and Subsampling, last in the panel.
   const sessionFile = session.indexOf('id="session-state-controls"');
+  const subsampling = session.indexOf('id="reading-section"');
   const mapping = session.indexOf('id="data-mapping-controls"');
-  assert.ok(sessionFile >= 0 && mapping > sessionFile, 'Data mapping follows Session file');
+  assert.ok(sessionFile >= 0 && subsampling > sessionFile && mapping > subsampling, 'Data mapping follows Session file and Subsampling');
   assert.match(
     session.slice(mapping),
-    /<h3 class="section-title" id="data-mapping-title">Data mapping<\/h3>[\s\S]*data-info-tip="data-mapping"[\s\S]*<div id="data-mapping-root" data-state-serializer-skip="true"><\/div>\s*<\/div>\s*<\/div>\s*$/
+    /<h3 class="section-title session-disclosure-heading">\s*<button type="button" class="disclosure-header" id="data-mapping-toggle" aria-expanded="false" aria-controls="data-mapping-body">\s*<span class="disclosure-title" id="data-mapping-title">Data mapping<\/span>\s*<span class="disclosure-desc" id="data-mapping-summary"><\/span>[\s\S]*data-info-tip="data-mapping"[\s\S]*<div class="disclosure-content" id="data-mapping-body" hidden>\s*<div id="data-mapping-root" data-state-serializer-skip="true"><\/div>\s*<\/div>\s*<\/div>\s*<\/div>\s*$/
   );
   assert.doesNotMatch(
     html.slice(html.indexOf('id="dataset-facts"'), html.indexOf('id="open-data-controls"')),
@@ -1027,6 +1029,7 @@ test('a grid export draws each view with the embedding it shows', async () => {
     lodMembership: null,
     drawOrder: null,
     lodSizeMultiplier: 1,
+    pointLayers: { readSizeMultiplier: 1, readEveryLevel: true },
     renderState: {
       antialias: true,
       backdrop: {
@@ -1114,7 +1117,7 @@ test('an Apply that another dataset supersedes writes nothing into the panel tha
   // The transaction is under way when another dataset is published: the
   // state refuses to finish it with its superseded error.
   panel.state.applyDataMapping = async () => {
-    panel.state._datasetGeneration += 1;
+    panel.controls.datasetPublished();
     const error = new Error('Field loading was superseded by a replacement dataset generation.');
     error.name = 'AbortError';
     throw error;
@@ -1123,6 +1126,22 @@ test('an Apply that another dataset supersedes writes nothing into the panel tha
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.doesNotMatch(panel.status().textContent, /superseded/);
   assert.notEqual(panel.status().dataset.tone, 'danger');
-  // The panel is not left busy: it applies again.
+  // The panel is not left busy: a change staged on the new dataset applies.
+  panel.row('t-SNE').querySelector('.data-mapping-default').dispatch('click');
   assert.equal(panel.apply.disabled, false);
+});
+
+test('an Apply whose open cells grow meanwhile is still this dataset\'s: it says it was applied', async t => {
+  const panel = mountPanel(t);
+  panel.row('t-SNE').querySelector('.data-mapping-default').dispatch('click');
+  // A progressive opening's step (cells grown in place) supersedes loads,
+  // not the dataset: the panel reports the outcome.
+  panel.state.applyDataMapping = async () => {
+    panel.state._datasetGeneration += 1;
+    return true;
+  };
+  panel.apply.dispatch('click');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(panel.status().dataset.tone, 'success');
+  assert.equal(panel.status().textContent, 'Applied.');
 });

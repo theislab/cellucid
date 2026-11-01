@@ -18,6 +18,7 @@
  */
 
 import { whileWaitingOnPerson } from '../../../utils/person-wait.js';
+import { abortReason, cancel, cancelled, onAbort } from '../../../utils/abort.js';
 
 /**
  * @typedef {Object} SignInStep
@@ -72,7 +73,7 @@ export class SignInSteps {
    */
   request({ account, kind, text, action, act, ready = null, signal = null }) {
     if (typeof act !== 'function') throw new TypeError('A sign-in step needs act().');
-    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
     let step = [...this._steps.values()].find(item => item.account === account && item.kind === kind) ?? null;
     if (step === null) {
       step = {
@@ -108,20 +109,16 @@ export class SignInSteps {
     const current = step;
     const promise = new Promise((resolve, reject) => {
       const waiter = { resolve, reject, signal, stop: null };
-      if (signal !== null) {
-        const onAbort = () => {
-          current.waiters.delete(waiter);
-          reject(signal.reason);
-          // Nobody waits any more: the step goes.
-          if (current.waiters.size === 0 && this._steps.get(current.id) === current && !current.working) {
-            this._end(current);
-            this._publish();
-          }
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-        waiter.stop = () => signal.removeEventListener('abort', onAbort);
-      }
       current.waiters.add(waiter);
+      waiter.stop = onAbort(signal, () => {
+        current.waiters.delete(waiter);
+        reject(abortReason(signal));
+        // Nobody waits any more: the step goes.
+        if (current.waiters.size === 0 && this._steps.get(current.id) === current && !current.working) {
+          this._end(current);
+          this._publish();
+        }
+      });
     });
     this._publish();
     return whileWaitingOnPerson(promise);
@@ -148,6 +145,14 @@ export class SignInSteps {
     // to read about it, and how the next attempt differs.
     const offerAgain = error => {
       step.working = false;
+      // Everyone who waited left during the attempt: nobody is left to sign
+      // in for, so the step goes (and what its attempt still listens on, a
+      // popup's channel, closes with it) instead of staying on screen.
+      if (step.waiters.size === 0) {
+        if (this._steps.get(id) === step) this._end(step);
+        this._publish();
+        return;
+      }
       step.problem = error?.message ?? String(error);
       step.help = validHelp(error?.help);
       step.retryAction = typeof error?.retryAction === 'string' && error.retryAction.trim() !== '' ? error.retryAction : null;
@@ -190,7 +195,7 @@ export class SignInSteps {
    * @param {number} id
    */
   dismiss(id) {
-    this._reject(id, new DOMException('Sign-in was dismissed.', 'AbortError'));
+    this._reject(id, cancelled('user', 'Sign-in was dismissed.'));
   }
 
   /** @returns {SignInStep[]} */
@@ -220,7 +225,7 @@ export class SignInSteps {
   /** @private The step goes; whatever its attempts still listen for stops. */
   _end(step) {
     this._steps.delete(step.id);
-    step.ended.abort(new DOMException('The sign-in step ended.', 'AbortError'));
+    cancel(step.ended, 'closed', 'The sign-in step ended.');
   }
 
   /** @private */

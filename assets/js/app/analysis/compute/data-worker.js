@@ -45,6 +45,7 @@ import {
   missingCategoryCode
 } from '../../../data/categorical-storage-contract.js';
 import { createUcellContext, ucellAddGenes, ucellFinish, ucellSetValues } from './ucell.js';
+import { toWire } from '../../../utils/error-wire.js';
 
 // ============================================================================
 // Worker Pool State
@@ -207,7 +208,7 @@ function setMarkerContext(payload) {
  * Statistics of a batch of genes for every tested group of the marker
  * context against its reference (`groupMarkers`), packed gene-major: gene
  * `k`'s value for group `g` is at `k * groupCount + g`, `nAll` holds each
- * gene's measured grouped cells, and `moments` each gene's `sum, sumSq,
+ * gene's measured grouped cells, and `moments` each gene's `mean, m2,
  * nonZero, n` over every cell (four numbers a gene).
  *
  * `columns` are the genes in every cell: dense Float32Arrays, or samples of
@@ -315,8 +316,8 @@ function computeMarkerGenes(payload) {
     packed.nIn.set(result.nIn, at);
     packed.nOut.set(result.nOut, at);
     packed.nAll[gene] = result.nAll;
-    const { sum, sumSq, nonZero, n } = result.column;
-    packed.moments.set([sum, sumSq, nonZero, n], gene * 4);
+    const { mean, m2, nonZero, n } = result.column;
+    packed.moments.set([mean, m2, nonZero, n], gene * 4);
   }
   return packed;
 }
@@ -434,7 +435,7 @@ function answer(requestId, run) {
   try {
     result = run();
   } catch (error) {
-    self.postMessage({ requestId, success: false, error: error.message });
+    self.postMessage({ requestId, success: false, error: toWire(error) });
     return;
   }
   self.postMessage({ requestId, success: true, result }, resultBuffers(result));
@@ -464,7 +465,7 @@ self.onmessage = function(e) {
     const { delivery, ...rest } = payload;
     takeDelivery(delivery).then(
       delivered => answer(requestId, () => (delivered === null ? { lost: true } : runTask(type, { ...rest, ...delivered }))),
-      error => self.postMessage({ requestId, success: false, error: error.message })
+      error => self.postMessage({ requestId, success: false, error: toWire(error) })
     );
     return;
   }

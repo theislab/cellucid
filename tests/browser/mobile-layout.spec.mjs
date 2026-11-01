@@ -10,7 +10,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { expectFloatingSettled } from './helpers/panels.mjs';
+import { expectFloatingSettled, openPhoneSheet } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -29,7 +29,7 @@ function topmostAt(page, selectorAtPoint) {
   }, selectorAtPoint);
 }
 
-test('a phone can close the full-screen sidebar and reach the plot', async ({
+test('a phone starts with the plot, and the panel opens from its peek bar and closes back to it', async ({
   page,
 }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
@@ -38,12 +38,34 @@ test('a phone can close the full-screen sidebar and reach the plot', async ({
     'Current UI fixture',
   );
 
+  // The plot comes first: the panel waits as one bar at the foot of the
+  // screen, naming the dataset, and covers nothing of the first frame.
   const sidebar = page.locator('#sidebar');
   const toggle = page.locator('#sidebar-toggle');
-  await expect(sidebar).not.toHaveClass(/\bhidden\b/);
-  await expect(toggle).toHaveAttribute('aria-label', 'Hide sidebar');
-
+  const bar = page.locator('#phone-sheet-bar');
+  await expect(sidebar).toHaveClass(/\bhidden\b/);
+  await expect(bar).toBeVisible();
+  await expect(bar).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('#phone-sheet-name')).toHaveText('Current UI fixture');
   const viewport = page.viewportSize();
+  const barBox = await bar.boundingBox();
+  expect(barBox.y + barBox.height).toBeLessThanOrEqual(viewport.height + 0.5);
+  expect(barBox.height).toBeGreaterThanOrEqual(44);
+  expect(barBox.height).toBeLessThan(viewport.height / 8);
+  await expect.poll(
+    () => topmostAt(page, { selector: '#glcanvas', at: 'viewport-center' }),
+    { message: 'the plot is reachable from the first frame' },
+  ).toBe(true);
+  expect(await topmostAt(page, { selector: '#phone-sheet-bar', at: 'element' }), 'nothing covers the bar').toBe(true);
+
+  // A tap opens the panel full screen, with its close control on screen.
+  await bar.click();
+  await expect(sidebar).not.toHaveClass(/\bhidden\b/);
+  await expect(bar).toBeHidden();
+  await expect(toggle).toHaveAttribute('aria-label', 'Hide sidebar');
+  // The sheet rises from the bar: where its control and content sit is
+  // final, and read at one moment, once that is over.
+  await expect.poll(() => sidebar.evaluate(element => element.getAnimations().length)).toBe(0);
   const openBox = await toggle.boundingBox();
   expect(openBox.x).toBeGreaterThanOrEqual(0);
   expect(openBox.y).toBeGreaterThanOrEqual(0);
@@ -65,18 +87,28 @@ test('a phone can close the full-screen sidebar and reach the plot', async ({
   });
   expect(firstContentTop).toBeGreaterThanOrEqual(openBox.y + openBox.height);
 
+  // Closed, it is the peek bar again, and the tab remembers which (a reload
+  // of the tab opens the panel as it was left; never in the address).
   await toggle.click();
   await expect(sidebar).toHaveClass(/\bhidden\b/);
-  await expect(toggle).toHaveAttribute('aria-label', 'Show sidebar');
-  await expect.poll(
-    () => topmostAt(page, { selector: '#glcanvas', at: 'viewport-center' }),
-    { message: 'the plot is reachable once the sidebar is closed' },
-  ).toBe(true);
-
-  await toggle.click();
+  await expect(bar).toBeVisible();
+  await bar.click();
   await expect(sidebar).not.toHaveClass(/\bhidden\b/);
-  const reopenedBox = await toggle.boundingBox();
-  expect(reopenedBox.x + reopenedBox.width).toBeLessThanOrEqual(viewport.width);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
+  expect(new URL(page.url()).search).not.toMatch(/sheet|sidebar/);
+});
+
+test('an upward swipe on the peek bar opens the panel', async ({ page }) => {
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  const bar = await page.locator('#phone-sheet-bar').boundingBox();
+  const x = bar.x + bar.width / 2;
+  const y = bar.y + bar.height / 2;
+  await page.locator('#phone-sheet-bar').dispatchEvent('pointerdown', { clientX: x, clientY: y, pointerType: 'touch', isPrimary: true });
+  await page.locator('#phone-sheet-bar').dispatchEvent('pointerup', { clientX: x, clientY: y - 60, pointerType: 'touch', isPrimary: true });
+  await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
 });
 
 test('a phone gets fingertip-sized icon controls', async ({ page }) => {
@@ -88,6 +120,7 @@ test('a phone gets fingertip-sized icon controls', async ({ page }) => {
   // covers.
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openPhoneSheet(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
@@ -154,6 +187,7 @@ test('a screen without hover shows the controls that wait for one', async ({
   // good; the plot toolbar was invisible until hovered.
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openPhoneSheet(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
@@ -174,6 +208,7 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
   // returned early for every touch pointer.
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openPhoneSheet(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
@@ -184,6 +219,13 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
   // Close the full-screen sidebar so the panel has room to move.
   await page.locator('#sidebar-toggle').click();
   await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
+  // The panel's bar shows at the foot of the screen, and the floating panel
+  // is moved clear of it: the way back to the panel stays in reach.
+  const barTop = (await page.locator('#phone-sheet-bar').boundingBox()).y;
+  await expect.poll(async () => {
+    const box = await panel.boundingBox();
+    return box.y + box.height <= barTop + 0.5;
+  }).toBe(true);
 
   const before = await panel.boundingBox();
   await page.evaluate(() => {
@@ -206,8 +248,12 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
     for (let step = 1; step <= 6; step++) fire('pointermove', step * 4, step * -25);
     fire('pointerup', 24, -150);
   });
-  await expect.poll(async () => (await panel.boundingBox()).y)
-    .toBeLessThan(before.y - 100);
+  // It moves up by the drag, as far as the top margin (8 px) lets it: the
+  // panel, kept above the panel's bar at the foot of the screen, may start
+  // less than the drag's 150 px from the top.
+  expect(before.y).toBeGreaterThan(8 + 40);
+  await expect.poll(async () => Math.round((await panel.boundingBox()).y))
+    .toBe(Math.round(Math.max(8, before.y - 150)));
   expect(await page.evaluate(() => getComputedStyle(
     document.querySelector('#shortcuts-section > summary'),
   ).touchAction)).toBe('none');
@@ -218,6 +264,7 @@ test('a swipe that starts on a notification still reaches the sidebar menu', asy
 }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openPhoneSheet(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
@@ -263,7 +310,7 @@ test('a swipe that starts on a notification still reaches the sidebar menu', asy
     .toBeGreaterThan(before);
 });
 
-test('the full-screen menu closes before the first dataset has loaded', async ({
+test('the full-screen menu opens and closes before the first dataset has loaded', async ({
   page,
 }) => {
   // Hold every export request, so the first dataset cannot finish loading
@@ -277,13 +324,15 @@ test('the full-screen menu closes before the first dataset has loaded', async ({
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   const sidebar = page.locator('#sidebar');
-  await expect(sidebar).not.toHaveClass(/\bhidden\b/);
+  await expect(sidebar).toHaveClass(/\bhidden\b/);
   await expect(page.locator('#dataset-name')).not.toHaveText(
     'Current UI fixture',
   );
+  await page.locator('#phone-sheet-bar').tap();
+  await expect(sidebar).not.toHaveClass(/\bhidden\b/);
   await page.locator('#sidebar-toggle').tap();
   await expect(sidebar).toHaveClass(/\bhidden\b/);
-  await page.locator('#sidebar-toggle').tap();
+  await page.locator('#phone-sheet-bar').tap();
   await expect(sidebar).not.toHaveClass(/\bhidden\b/);
   releaseCatalog();
   await expect(page.locator('#dataset-name')).toHaveText(
@@ -296,6 +345,7 @@ test('the selection bar hides while the full-screen menu is open', async ({
 }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  await openPhoneSheet(page);
   const bar = page.locator('#select-bar');
   await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
   await expect(bar).toBeHidden();

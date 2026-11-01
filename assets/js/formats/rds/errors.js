@@ -6,7 +6,7 @@
  *   an item never read). `slot` names where in the object it happened
  *   (`@assays$RNA@counts@x`), when that is known.
  * - `RdsUnsupportedError`: a valid stream uses something this reader does not
- *   read (ASCII or native-binary serialization, zstd compression, an ALTREP
+ *   read (ASCII or native-binary serialization, an ALTREP
  *   class of a package). `feature` names it, and the message says what to do.
  *
  * @module formats/rds/errors

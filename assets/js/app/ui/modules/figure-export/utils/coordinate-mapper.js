@@ -68,7 +68,7 @@ export function denormalizeXY(x, y, transform) {
  * @param {Float32Array|null} options.positions - normalized positions (n*dimension)
  * @param {1|2|3} options.dimension - components per position
  * @param {Uint8Array|null} [options.transparency] - per-point visibility (0 or 1)
- * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
  * @param {number} [options.viewportWidth]
  * @param {number} [options.viewportHeight]
@@ -183,7 +183,7 @@ export function computeVisibleRealBounds({
  * @param {Float32Array|null} options.positions - normalized positions (n*dimension)
  * @param {1|2|3} options.dimension - components per position
  * @param {Uint8Array|null} [options.transparency] - per-point visibility (0 or 1)
- * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
  * @param {Float32Array} options.viewMatrix
  * @param {number} [options.viewportWidth]

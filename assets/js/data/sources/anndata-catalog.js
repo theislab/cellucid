@@ -55,7 +55,10 @@ import {
   requireCellucidFileMetadata,
 } from '../anndata-cellucid-metadata.js';
 import { describeRemoteFile } from './remote-file.js';
-import { SharedWork } from '../../app/jobs/cancellable-job.js';
+import { getProviderRegistry } from './registry.js';
+import { afterWholeFileOpened, downloadReason, keptCopyOf, wholeFileOf } from '../whole-download.js';
+import { formatBytes } from '../../utils/format-units.js';
+import { SharedWork, abortReason, isCancellation, cancel, onAbort } from '../../utils/abort.js';
 import { ANNDATA_SOURCE_TYPE, createAnnDataFileSource } from '../anndata-file-source.js';
 import { fileFormatOfName, folderFormatOfName, openableNamesText, titleOfName } from '../input-formats.js';
 import { getTransferLog } from '../transfer-log.js';
@@ -247,6 +250,48 @@ export async function fetchAnnDataCatalog(baseUrl, sourceType, signal, { askOnce
  * The datasets of one catalog: listed from their files' metadata, opened one
  * at a time when chosen, and released when another is shown.
  */
+
+
+/**
+ * The providers whose catalog entries an opening asks for the entry's
+ * version: those that name a file's or a folder's content (GitHub: the
+ * commit that last wrote it; Hugging Face: its LFS hash or git tree), which
+ * a plain request to the entry's address cannot see.
+ */
+const CONTENT_NAMING_PROVIDERS = new Set(['gh', 'hf']);
+
+/**
+ * An entry's source as its provider opens it (`providers/github.js`,
+ * `providers/huggingface.js`), or null when its address belongs to no
+ * provider that names content. A file: `{file}` (or the copy downloaded
+ * whole, for a host that serves no part); a folder: `{url, name, version,
+ * key}`.
+ */
+async function providerSourceOf(entry, signal) {
+  let resolved;
+  try {
+    resolved = getProviderRegistry().resolve(entry.url);
+  } catch {
+    return null;
+  }
+  if (!CONTENT_NAMING_PROVIDERS.has(resolved.provider.id)) return null;
+  const opened = await resolved.provider.open(resolved.value, { signal });
+  if (entry.form.layout === 'folder') {
+    const store = opened?.store ?? null;
+    if (store === null) return null;
+    return {
+      url: store.url,
+      name: entry.name,
+      ...(typeof store.version === 'string' ? { version: store.version } : {}),
+      ...(typeof store.key === 'string' ? { key: store.key } : {}),
+    };
+  }
+  const described = opened?.file ?? null;
+  if (described?.resource == null) return null;
+  if (described.transport !== 'download') return { file: described.resource };
+  return { file: await wholeFileOf(described.resource, { format: entry.form.format, signal }) };
+}
+
 export class AnnDataCatalog {
   /**
    * @param {Object} options
@@ -261,7 +306,13 @@ export class AnnDataCatalog {
     this.catalog = catalog;
     this._sourceType = sourceType;
     this._sourceName = sourceName;
-    /** @type {Map<string, SharedWork>} Remote file descriptions by id */
+    /**
+     * @type {Map<string, SharedWork>} Remote file descriptions by id, while
+     * each is being made: the listing and an opening under way at once share
+     * one, and every later reader source describes its file again, so its
+     * version is the host's at that opening, never one an earlier opening
+     * or listing read.
+     */
     this._resources = new Map();
     /** @type {Map<string, Promise<{source: Object, metadata: Object, transfer: Object}>>} */
     this._opened = new Map();
@@ -297,33 +348,62 @@ export class AnnDataCatalog {
   }
 
   /**
-   * The source the reader opens for one entry: the remote file (described
-   * once, with its size) or the store folder. The listing and an opening
+   * The source the reader opens for one entry: the remote file (described,
+   * with its size and version, by the opening or listing that asks for it)
+   * or the store folder. The listing and an opening under way at once
    * may both wait for one description: each stops waiting with its own
    * signal, and the description stops only when none waits any more (a
    * listing abandoned because another sample failed leaves an opening's
-   * description running).
+   * description running). A file on a host that serves only whole files is
+   * downloaded by an opening, never by a listing (`listing`), which reads
+   * only what an earlier opening kept of it.
    * @private
    */
-  async _readerSource(entry, signal) {
+  async _readerSource(entry, signal, { listing = false } = {}) {
+    // An opening of an entry its provider names by content (a catalog on
+    // GitHub or Hugging Face) asks the provider, as a link to it does: the
+    // same identity whichever way the dataset is reached, and a version
+    // that names its content (else nothing of it would be kept across
+    // visits). A listing never asks a provider (one request each).
+    const routed = listing ? null : await providerSourceOf(entry, signal);
+    if (routed !== null) return routed;
     if (entry.form.layout === 'folder') return { url: entry.url, name: entry.name };
     let described = this._resources.get(entry.id);
     if (described === undefined || described.abandoned) {
       const work = new SharedWork(workSignal => describeRemoteFile({
         url: entry.url,
-        id: entry.id,
+        // Filed under its address, as a link to the file is (`providers/http.js`):
+        // a dataset id names a dataset in this catalog, not where its bytes are.
+        id: `url:${encodeURIComponent(entry.url)}`,
         name: entry.name,
         attribution: { title: nameOfPath(entry.path), url: entry.url },
         signal: workSignal,
       }));
       this._resources.set(entry.id, work);
-      work.promise.catch(() => {
+      const made = () => {
         if (this._resources.get(entry.id) === work) this._resources.delete(entry.id);
-      });
+      };
+      work.promise.then(made, made);
       described = work;
     }
-    const { resource } = await described.join(signal);
-    return { file: resource };
+    const { resource, transport } = await described.join(signal);
+    if (transport !== 'download') return { file: resource };
+    // A host that serves no part of the file. The listing reads only what
+    // an earlier opening kept of it, never the whole file; an opening
+    // downloads it whole, once (`whole-download.js`), saying so up front.
+    if (!listing) return { file: await wholeFileOf(resource, { format: entry.form.format, signal }) };
+    const kept = await keptCopyOf(resource, { format: entry.form.format });
+    if (kept !== null) return { file: kept };
+    throw explainedFailure(
+      `${resource.compression === undefined ? `${new URL(entry.url).host} serves ${entry.path}` : `${entry.path} can be read`} ` +
+      `only whole (${downloadReason(resource, 'its host')}), so the ` +
+      `catalog cannot read what it holds without downloading all of it (${formatBytes(resource.size)}). Open the ` +
+      `file by its own link, which downloads it once and keeps it, or host the catalog where parts of files are ` +
+      'served (GitHub, Zenodo, Hugging Face, a static web server).',
+      DataSourceErrorCode.UNSUPPORTED,
+      this._sourceType,
+      { datasetId: entry.id, url: entry.url }
+    );
   }
 
   /**
@@ -375,7 +455,7 @@ export class AnnDataCatalog {
           try {
             const listed = await this._listedFromOpen(entry);
             if (listed !== null) return listed;
-            const source = await this._readerSource(entry, entrySignal);
+            const source = await this._readerSource(entry, entrySignal, { listing: true });
             const described = await client.describe(source, { signal: entrySignal, expect: entry.form });
             const file = requireCellucidFileMetadata(described.cellucid, ANNDATA_SOURCE_TYPE);
             this._requireAgreeingId(entry, file.id);
@@ -389,7 +469,7 @@ export class AnnDataCatalog {
               }),
             });
           } catch (error) {
-            if (error?.name === 'AbortError') throw error;
+            if (isCancellation(error)) throw error;
             throw new DataSourceError(
               `Dataset '${entry.id}' (${entry.path}) cannot be listed: ${error?.message ?? error}`,
               error?.code ?? DataSourceErrorCode.INVALID_FORMAT,
@@ -433,7 +513,10 @@ export class AnnDataCatalog {
       id: entry.id,
       name: metadata.name,
       description: source.getAdapter().getFileMetadata().description ?? '',
-      stats: Object.freeze({ n_cells: metadata.stats.n_cells, n_genes: metadata.stats.n_genes }),
+      // The listing describes the file: every cell of it, as the entries
+      // not open are described, even while a subsample of it is open (the
+      // picker says the open cells of it: `dataset-controls.js`).
+      stats: Object.freeze({ n_cells: source.getCellSubset?.()?.nObs ?? metadata.stats.n_cells, n_genes: metadata.stats.n_genes }),
     });
   }
 
@@ -457,6 +540,8 @@ export class AnnDataCatalog {
       throw new TypeError('A catalog open signal must be an AbortSignal or null.');
     }
     const entry = this._entry(datasetId);
+    // A caller that no longer wants it starts nothing.
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
     let opening = this._opened.get(datasetId);
     let wanted = opening === undefined ? undefined : this._wanted.get(opening);
     if (opening === undefined || wanted.controller.signal.aborted) {
@@ -468,9 +553,7 @@ export class AnnDataCatalog {
       this._wanted.set(current, wanted);
       const settle = () => {
         wanted.settled = true;
-        for (const [callerSignal, onAbort] of wanted.callers) {
-          callerSignal.removeEventListener('abort', onAbort);
-        }
+        for (const stopWaiting of wanted.callers.values()) stopWaiting();
         wanted.callers.clear();
       };
       current.then(settle, () => {
@@ -480,17 +563,15 @@ export class AnnDataCatalog {
     }
     if (signal === null) {
       wanted.always = true;
-    } else if (!wanted.settled) {
+    } else if (!wanted.settled && !wanted.callers.has(signal)) {
       const state = wanted;
-      const onAbort = () => {
+      const stopWaiting = onAbort(signal, () => {
         state.callers.delete(signal);
         if (!state.settled && !state.always && state.callers.size === 0) {
           state.controller.abort(signal.reason);
         }
-      };
-      state.callers.set(signal, onAbort);
-      if (signal.aborted) onAbort();
-      else signal.addEventListener('abort', onAbort, { once: true });
+      });
+      state.callers.set(signal, stopWaiting);
     }
     return opening;
   }
@@ -521,6 +602,7 @@ export class AnnDataCatalog {
           await source.loadRemoteFolder(readerSource, options);
         } else {
           await source.loadFile(readerSource.file, options);
+          await afterWholeFileOpened([readerSource.file], source.describeStorage()?.conversion ?? null);
         }
       } catch (error) {
         throw this._namedOpenFailure(entry, error);
@@ -547,7 +629,7 @@ export class AnnDataCatalog {
    * @private
    */
   _namedOpenFailure(entry, error) {
-    if (!(error instanceof Error) || error.name === 'AbortError') return error;
+    if (!(error instanceof Error) || isCancellation(error)) return error;
     const first = error instanceof AggregateError && error.errors[0] instanceof Error
       ? error.errors[0]
       : error;
@@ -591,7 +673,7 @@ export class AnnDataCatalog {
       this._settled.delete(datasetId);
       // Released while still opening: it stops where it is.
       const wanted = this._wanted.get(opening);
-      if (wanted !== undefined && !wanted.settled) wanted.controller.abort();
+      if (wanted !== undefined && !wanted.settled) cancel(wanted.controller, 'closed', 'The dataset was released while opening.');
       opening.then(
         ({ source, transfer }) => {
           // An opening still under way when it was released settles here.

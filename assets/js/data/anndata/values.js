@@ -17,6 +17,7 @@
  * @module data/anndata/values
  */
 
+import { HOST_LITTLE_ENDIAN } from '../../formats/io/byte-order.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
 import { elementBytes } from './elements.js';
 
@@ -74,6 +75,75 @@ export async function* readRowSlabs(array, rowStart, rowEnd, { columns = null, .
   }
 }
 
+/**
+ * Rows `[rowStart, rowEnd)` of an array in slabs, in whatever order the
+ * store reads them fastest: a view's array presenting rows in another order
+ * than stored (a subsample's priority order, `views/cell-subset.js`
+ * `readInSourceOrder`) hands them out in the stored order, each slab's rows
+ * wherever they belong; any other array slab by slab (`readRowSlabs`). For
+ * a reader that puts every row in its place (`readConvertedRange`): one in
+ * which the order matters (a sum, `forEachObsmRowSlab`) reads
+ * `readRowSlabs`.
+ *
+ * Each slab is `{values, runs}`: its value rows `[runs.offsets[r],
+ * runs.offsets[r + 1])` are rows `runs.starts[r]` on (`scatterRows`); or,
+ * read row by row (a view's whole rows in their file order,
+ * `cell-subset.js` `rowWaves`), `runs` is `{rows}`: value row `i` is row
+ * `rows[i]` (`slabRows` counts either).
+ *
+ * @param {import('../../formats/store.js').StoreNode & {read: Function, shape: number[]}} array
+ * @param {number} rowStart
+ * @param {number} rowEnd
+ * @param {{columns?: [number, number]|null, signal?: AbortSignal|null, activity?: Object|null}} [options]
+ * @returns {AsyncGenerator<{values: any, runs: {count: number, starts: ArrayLike<number>, offsets: ArrayLike<number>}}>}
+ */
+export async function* readRowsInStoreOrder(array, rowStart, rowEnd, { columns = null, ...readOptions } = {}) {
+  if (typeof array.readInSourceOrder !== 'function') {
+    for await (const slab of readRowSlabs(array, rowStart, rowEnd, { columns, ...readOptions })) {
+      yield { values: slab.values, runs: { count: 1, starts: [slab.rowStart], offsets: [0, slab.rowEnd - slab.rowStart] } };
+    }
+    return;
+  }
+  if (rowEnd <= rowStart) return;
+  const selection = columns === null ? [[rowStart, rowEnd]] : [[rowStart, rowEnd], columns];
+  if (readOptions.activity && typeof array.storedBytes === 'function') {
+    array.storedBytes(selection, readOptions).then(bytes => readOptions.activity.expect(bytes), () => {});
+  }
+  yield* array.readInSourceOrder(selection, readOptions);
+}
+
+/** How many value rows a slab's `runs` (`readRowsInStoreOrder`) hold. */
+export function slabRowCount(runs) {
+  return runs.rows !== undefined ? runs.rows.length : runs.offsets[runs.count];
+}
+
+/**
+ * Rows of `source` (`width` elements a row) put where a slab's `runs` say
+ * (`readRowsInStoreOrder`: runs, or a row a value row), into `output`
+ * holding rows from `origin` on.
+ */
+export function scatterRows(source, width, runs, output, origin) {
+  if (runs.rows !== undefined) {
+    const rows = runs.rows;
+    if (width === 1) {
+      for (let i = 0; i < rows.length; i++) output[rows[i] - origin] = source[i];
+      return;
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const at = (rows[i] - origin) * width;
+      for (let j = 0; j < width; j++) output[at + j] = source[i * width + j];
+    }
+    return;
+  }
+  for (let r = 0; r < runs.count; r++) {
+    const from = runs.offsets[r] * width;
+    const to = runs.offsets[r + 1] * width;
+    const at = (runs.starts[r] - origin) * width;
+    if (to - from > 32 && ArrayBuffer.isView(source) && ArrayBuffer.isView(output)) output.set(source.subarray(from, to), at);
+    else for (let i = from; i < to; i++) output[at + i - from] = source[i];
+  }
+}
+
 function lengthMismatch(label) {
   return new Error(`${label} payload length does not match its metadata`);
 }
@@ -85,9 +155,8 @@ function lengthMismatch(label) {
  * few tens of milliseconds this way. The word order is the host's (the
  * typed array holds host-order values).
  */
-const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
-const LOW_WORD = LITTLE_ENDIAN ? 0 : 1;
-const HIGH_WORD = LITTLE_ENDIAN ? 1 : 0;
+const LOW_WORD = HOST_LITTLE_ENDIAN ? 0 : 1;
+const HIGH_WORD = HOST_LITTLE_ENDIAN ? 1 : 0;
 
 function is64BitIntegers(values) {
   return values instanceof BigInt64Array || values instanceof BigUint64Array;
@@ -167,8 +236,48 @@ export function writeInt32(values, output, offset, label) {
   }
 }
 
+/**
+ * A writer (`readConvertedRange`) of positions along an axis of `bound`
+ * entries as int32: each must be an integer in `[0, bound)`, else the read is
+ * refused, never narrowed. 64-bit integers go through their words.
+ *
+ * @param {number} bound
+ * @returns {(values: ArrayLike<number|bigint>, output: Int32Array, offset: number, label: string) => void}
+ */
+export function axisPositionWriter(bound) {
+  const outside = (label, raw) => new Error(`${label} ${String(raw)} is outside axis bounds [0, ${bound})`);
+  return (values, output, offset, label) => {
+    const length = values.length;
+    if (is64BitIntegers(values)) {
+      const words = wordsOf(values);
+      const signed = values instanceof BigInt64Array;
+      for (let i = 0; i < length; i++) {
+        const value = valueOfWords(words, i, signed);
+        if (!(value >= 0 && value < bound)) throw outside(label, values[i]);
+        output[offset + i] = value;
+      }
+      return;
+    }
+    // Integers already (a graph's or matrix's int32 indices): a bound check each.
+    if (values instanceof Int32Array || values instanceof Uint32Array || values instanceof Int16Array ||
+        values instanceof Uint16Array || values instanceof Int8Array || values instanceof Uint8Array) {
+      for (let i = 0; i < length; i++) {
+        const value = values[i];
+        if (!(value >= 0 && value < bound)) throw outside(label, value);
+        output[offset + i] = value;
+      }
+      return;
+    }
+    for (let i = 0; i < length; i++) {
+      const value = Number(values[i]);
+      if (!(value >= 0 && value < bound) || !Number.isInteger(value)) throw outside(label, values[i]);
+      output[offset + i] = value;
+    }
+  };
+}
+
 /** Write `values` as exact numbers (64-bit integers checked against the safe range). */
-function writeExactNumbers(values, output, offset, label) {
+export function writeExactNumbers(values, output, offset, label) {
   const length = values.length;
   if (is64BitIntegers(values)) {
     const words = wordsOf(values);
@@ -193,7 +302,8 @@ function writeExactNumbers(values, output, offset, label) {
 
 /**
  * Rows `[start, end)` of a one-dimensional array, written slab by slab with
- * `write(values, output, offset, label)` into one output allocated once.
+ * `write(values, output, offset, label)` into one output allocated once,
+ * in the order the store reads them fastest (`readRowsInStoreOrder`).
  *
  * @template T
  * @param {Object} array
@@ -207,9 +317,17 @@ function writeExactNumbers(values, output, offset, label) {
  */
 export async function readConvertedRange(array, start, end, OutputType, label, write, options = {}) {
   const output = allocateTypedArray(OutputType, end - start, label);
-  for await (const slab of readRowSlabs(array, start, end, options)) {
-    if (!slab.values || slab.values.length !== slab.rowEnd - slab.rowStart) throw lengthMismatch(label);
-    write(slab.values, output, slab.rowStart - start, label);
+  for await (const { values, runs } of readRowsInStoreOrder(array, start, end, options)) {
+    const rows = slabRowCount(runs);
+    if (!values || values.length !== rows) throw lengthMismatch(label);
+    if (runs.rows === undefined && runs.count === 1) {
+      write(values, output, runs.starts[0] - start, label);
+      continue;
+    }
+    // Rows in the store's order: converted together, then put in place.
+    const converted = allocateTypedArray(OutputType, rows, label);
+    write(values, converted, 0, label);
+    scatterRows(converted, 1, runs, output, start);
   }
   return output;
 }
@@ -226,6 +344,43 @@ export async function readFloat32(array, start, end, label, options = {}) {
     return values;
   }
   return readConvertedRange(array, start, end, Float32Array, label, writeFloat32, options);
+}
+
+/**
+ * Write `values` into a float64 `output` at `offset`: exact for every
+ * integer up to 2^53 (64-bit integers through their words), the nearest
+ * double beyond.
+ */
+function writeFloat64(values, output, offset) {
+  if (ArrayBuffer.isView(values) && !is64BitIntegers(values)) {
+    output.set(values, offset);
+    return;
+  }
+  const numbers = asNumbers(values, 'Values');
+  for (let i = 0; i < numbers.length; i++) output[offset + i] = Number(numbers[i]);
+}
+
+/**
+ * Whether the values of an integer dtype need float64 to be held exactly:
+ * float32 holds every integer up to 2^24 exactly, so 8- and 16-bit integers
+ * fit it, and wider ones may not (cell or donor ids, deep cells' counts);
+ * so does a view presenting such integers as float64 (a MuData modality's
+ * column placed on the cells, `wideIntegers`).
+ */
+export function exactIntegersNeedFloat64(array) {
+  const kind = array?.dtype?.kind;
+  return ((kind === 'int' || kind === 'uint') && array.dtype.bytes > 2) || array?.wideIntegers === true;
+}
+
+/**
+ * Rows `[start, end)` of a one-dimensional numeric array as the values a
+ * continuous field holds: an integer dtype wider than 16 bits as float64,
+ * so every integer up to 2^53 stays exact (`exactIntegersNeedFloat64`);
+ * every other numeric dtype as float32 (`readFloat32`).
+ */
+export async function readContinuous(array, start, end, label, options = {}) {
+  if (!exactIntegersNeedFloat64(array)) return readFloat32(array, start, end, label, options);
+  return readConvertedRange(array, start, end, Float64Array, label, writeFloat64, options);
 }
 
 /** Rows `[start, end)` of a one-dimensional integer array as int32. */
@@ -257,8 +412,25 @@ export async function readIntegers(array, start, end, label, options = {}) {
 export async function readNumbers(array, start, end, label, options = {}) {
   const values = await array.read([[start, end]], options);
   if (!values || values.length !== end - start) throw lengthMismatch(label);
-  if (values instanceof BigInt64Array || values instanceof BigUint64Array) return Float64Array.from(values, Number);
-  return values;
+  return asNumbers(values, label);
+}
+
+/**
+ * Values read from a store as numbers: 64-bit integers (BigInts) as their
+ * nearest doubles through their words (never a BigInt per element), every
+ * other typed array as read.
+ *
+ * @param {ArrayLike<number|bigint>} values
+ * @param {string} label
+ * @returns {ArrayLike<number>}
+ */
+export function asNumbers(values, label) {
+  if (!is64BitIntegers(values)) return values;
+  const numbers = allocateTypedArray(Float64Array, values.length, label);
+  const words = wordsOf(values);
+  const signed = values instanceof BigInt64Array;
+  for (let i = 0; i < values.length; i++) numbers[i] = valueOfWords(words, i, signed);
+  return numbers;
 }
 
 /** Rows `[start, end)` exactly as stored (typed array, strings, 0/1 booleans). */

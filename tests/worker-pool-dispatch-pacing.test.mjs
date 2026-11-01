@@ -50,7 +50,7 @@ test('a task clones at most its budget; the next dispatch waits for its own task
   const task = (id, payload, transfer) => {
     const settled = {};
     settled.promise = new Promise((resolve, reject) => Object.assign(settled, { resolve, reject }));
-    return { settled, task: { type: 'T', payload, requestId: id, resolve: settled.resolve, reject: settled.reject, timeout: 1000, signal: null, transfer } };
+    return { settled, task: { type: 'T', payload, requestId: id, resolve: settled.resolve, reject: settled.reject, signal: null, transfer } };
   };
   const a = task('a', { values: big }, false);
   const b = task('b', { values: big }, false);

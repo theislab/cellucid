@@ -28,6 +28,7 @@
  * @module ui/modules/render-controls
  */
 
+import { lodLadder } from '../../../rendering/high-perf/draw-order.js';
 import { parseFiniteNumberInRange } from '../../utils/number-utils.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { formatDecimal } from '../components/display-format.js';
@@ -132,16 +133,26 @@ const VIEWER_METHODS = Object.freeze([
   'setShaderQuality',
   'setAdaptiveLOD',
   'setForceLOD',
+  'getLODLevelCount',
   'setFrustumCulling',
+  'onFullDetailFrameCost',
+  'onPerformanceSettingsChanged',
+  'measureFullDetailFrameCost',
+  'verifyFullDetailFrameCost',
+  'onPresentedViewStateChanged',
   'setAntialiasing',
   'getAntialiasing',
   'isAntialiasingAvailable'
 ]);
 
 
-/** The forced-LOD slider range, matching `index.html` and the renderer. */
+/**
+ * The forced-LOD slider's lowest value (-1: Auto). Its highest is the last
+ * level of the ladder of the cells shown (`rendering/high-perf/draw-order.js`
+ * `lodLadder`: fixed counts, so its length follows the cell count), set
+ * whenever the slider is shown or touched (`syncForcedLodRange`).
+ */
 const FORCED_LOD_MINIMUM = -1;
-const FORCED_LOD_MAXIMUM = 17;
 
 function assertMethod(owner, method, label) {
   if (typeof owner[method] !== 'function') {
@@ -191,12 +202,10 @@ function assertForcedLodControl(control, label) {
   assertEventControl(control, label);
   if (
     control.min !== String(FORCED_LOD_MINIMUM)
-    || control.max !== String(FORCED_LOD_MAXIMUM)
     || control.step !== '1'
   ) {
     throw new TypeError(
-      `${label} requires exact range attributes min="${FORCED_LOD_MINIMUM}", `
-      + `max="${FORCED_LOD_MAXIMUM}", step="1".`
+      `${label} requires exact range attributes min="${FORCED_LOD_MINIMUM}", step="1".`
     );
   }
   return assertForcedLodLevel(control.value, label);
@@ -207,11 +216,9 @@ function assertForcedLodLevel(value, label) {
   if (
     !Number.isInteger(level)
     || level < FORCED_LOD_MINIMUM
-    || level > FORCED_LOD_MAXIMUM
   ) {
     throw new RangeError(
-      `${label} must be an integer from ${FORCED_LOD_MINIMUM} `
-      + `through ${FORCED_LOD_MAXIMUM}.`
+      `${label} must be an integer from ${FORCED_LOD_MINIMUM} on.`
     );
   }
   return level;
@@ -414,7 +421,8 @@ export function initRenderControls(options) {
     hpLodForceDisplay,
     hpFrustumCullingCheckbox,
     hpAntialiasCheckbox,
-    hpAntialiasStatus
+    hpAntialiasStatus,
+    hpPerformanceStatus
   } = dom;
 
   assertEventControl(backgroundSelect, 'Viewer background selector');
@@ -431,6 +439,7 @@ export function initRenderControls(options) {
   assertToggleControl(hpFrustumCullingCheckbox, 'Frustum culling toggle');
   assertToggleControl(hpAntialiasCheckbox, 'Antialiasing toggle');
   assertDisplay(hpAntialiasStatus, 'hpAntialiasStatus');
+  assertDisplay(hpPerformanceStatus, 'hpPerformanceStatus');
   assertContainer(hpLodForceContainer, 'Forced LOD level row');
   assertDisplay(hpLodForceDisplay, 'hpLodForceDisplay');
   assertForcedLodControl(hpLodForceInput, 'Forced LOD level slider');
@@ -852,6 +861,9 @@ export function initRenderControls(options) {
       viewerPublished = true;
       document.documentElement.dataset.viewerBackground = next;
       currentBackground = next;
+      // Smoke's colours of the cells with no value or not read are made
+      // from the background (`rendering/read-cell-layer.js`).
+      markSmokeDirty();
     } catch (error) {
       backgroundSelect.value = currentBackground;
       const rollbackFailures = [];
@@ -947,8 +959,32 @@ export function initRenderControls(options) {
     return level < 0 ? 'Auto' : String(level);
   }
 
+  // The slider reaches the last level of the cells shown; the renderer
+  // draws a level past it as the last (full detail).
+  function syncForcedLodRange() {
+    hpLodForceInput.max = String(Math.max(0, viewer.getLODLevelCount() - 1));
+  }
+
+  /**
+   * The forced-level slider's range for a dataset of `cellCount` cells, set
+   * as it is published and before any saved state is replayed (a session's
+   * level must find its level there, not the previous dataset's range).
+   */
+  function applyDatasetLodRange(cellCount) {
+    if (!Number.isSafeInteger(cellCount) || cellCount <= 0) {
+      throw new RangeError('The forced-level range requires one positive safe integer cell count.');
+    }
+    hpLodForceInput.max = String(lodLadder(cellCount).length - 1);
+  }
+
+  // The row stays where it is while level of detail is off, unavailable
+  // and saying why: the page turns level of detail on and off by itself
+  // (`onFullDetailFrameCost` below), and a row that appeared and went with
+  // it moved every control under it 40 px at a time the GPU decided.
   function syncForcedLodUi() {
-    hpLodForceContainer.hidden = !acceptedLodEnabled;
+    syncForcedLodRange();
+    hpLodForceInput.disabled = !acceptedLodEnabled;
+    hpLodForceContainer.title = acceptedLodEnabled ? '' : 'Turn Level of detail (LOD) on to force a level.';
     hpLodForceDisplay.textContent = formatForcedLodLevel(
       assertForcedLodLevel(hpLodForceInput.value, 'Forced LOD level')
     );
@@ -988,11 +1024,12 @@ export function initRenderControls(options) {
     }
   });
 
-  listen(hpFrustumCullingCheckbox, 'change', () => {
+  listen(hpFrustumCullingCheckbox, 'change', event => {
+    noteOwnPerformanceChoice(event);
     const requestedEnabled = hpFrustumCullingCheckbox.checked;
     const previousEnabled = acceptedFrustumEnabled;
     try {
-      viewer.setFrustumCulling(requestedEnabled);
+      ownPerformanceCall(() => viewer.setFrustumCulling(requestedEnabled));
       acceptedFrustumEnabled = requestedEnabled;
     } catch (error) {
       hpFrustumCullingCheckbox.checked = previousEnabled;
@@ -1000,13 +1037,14 @@ export function initRenderControls(options) {
     }
   });
 
-  listen(hpLodEnabledCheckbox, 'change', () => {
+  listen(hpLodEnabledCheckbox, 'change', event => {
+    noteOwnPerformanceChoice(event);
     const requestedEnabled = hpLodEnabledCheckbox.checked;
     const previousEnabled = acceptedLodEnabled;
     const previousForcedValue = acceptedForcedLodValue;
     let featurePublished = false;
     try {
-      viewer.setAdaptiveLOD(requestedEnabled);
+      ownPerformanceCall(() => viewer.setAdaptiveLOD(requestedEnabled));
       featurePublished = true;
       // Enabling starts from adaptive mode. Disabling already resets the
       // renderer's global force level as part of the atomic toggle.
@@ -1019,7 +1057,7 @@ export function initRenderControls(options) {
       const failures = [error];
       if (featurePublished) {
         try {
-          viewer.setAdaptiveLOD(previousEnabled);
+          ownPerformanceCall(() => viewer.setAdaptiveLOD(previousEnabled));
           if (previousEnabled) {
             viewer.setForceLOD(
               assertForcedLodLevel(previousForcedValue, 'Forced LOD level')
@@ -1044,6 +1082,9 @@ export function initRenderControls(options) {
     }
   });
 
+  listen(hpLodForceInput, 'pointerdown', syncForcedLodRange);
+  listen(hpLodForceInput, 'focus', syncForcedLodRange);
+
   listen(hpLodForceInput, 'input', () => {
     const previousForcedValue = acceptedForcedLodValue;
     try {
@@ -1061,10 +1102,189 @@ export function initRenderControls(options) {
     }
   });
 
-  // The forced-LOD row is meaningless while adaptive LOD is off — the renderer
-  // ignores the global forced level in that state — and markup cannot express
-  // "hidden unless the checkbox beside me is on".
+  // The forced-LOD row means nothing while adaptive LOD is off -- the
+  // renderer ignores the global forced level in that state -- so it is
+  // unavailable then (`syncForcedLodUi`), never removed.
   syncForcedLodUi();
+
+  // ---------------------------------------------------------------------------
+  // Level of detail and culling, turned on when they are needed
+  //
+  // Both are off until drawing every cell is measured too slow for
+  // interaction on this device (`rendering/full-detail-frame-cost.js`: the
+  // GPU's share of a frame of every cell proven over the interactive
+  // budget); then both are turned on and the frames drawn with them measured
+  // (`verifyFullDetailFrameCost`): proven faster, they stay and the tip says
+  // why; measured no faster, or closer than the browser can time, they go
+  // off again for this framing (no automatic choice may make a frame
+  // slower), the tip says which, and the next framing (the view moved and
+  // settled) is measured afresh. The measurement, not a cell count or the
+  // dimension, decides (level of detail is left off only where the ladder
+  // has no reduced level, culling where every cell is in view: neither can
+  // draw fewer there, so such a framing is not measured at all,
+  // `nothing-fewer`). A person's own change to either box is a choice: from
+  // then on the page leaves both as they are. A caller of the viewer that
+  // sets either itself (a benchmark configuration, a notebook, a test) makes
+  // the choice of that opening: its later reports are left alone, and the
+  // next opening is measured as any.
+  // Every measurement the viewer starts (a dataset's cells published, grown
+  // or cut, another representation, a restored context, a new framing) is
+  // said first (`measuring`): what this page turned on goes off then, and the
+  // measurement turns it on and verifies it again, as at the first opening.
+  // Its basis changed: kept unverified, it could make frames slower.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * A measured frame time (`full-detail-frame-cost.js` bounds): one number
+   * when the instrument resolved it to the millisecond, else the range the
+   * frame lies in.
+   */
+  function formatFrameMilliseconds({ lo, hi }) {
+    const [low, high] = [Math.round(lo), Math.round(hi)];
+    return low === high ? `${low} ms` : `${low}–${high} ms`;
+  }
+
+  let ownPerformanceChoice = false;
+  let automaticPerformance = null;
+  // The opening a caller of the viewer set level of detail or culling in.
+  let callerPerformanceOpening = null;
+  // Calls of this module's own (a box's change, its rollback), told apart
+  // from a caller's (`onPerformanceSettingsChanged`).
+  let ownPerformanceCalls = 0;
+  // Waiting for the next framing (a camera that moved and settled, another
+  // focused pane) after a choice that gained nothing: then measured afresh.
+  let stopWaitingForFraming = null;
+
+  function noteOwnPerformanceChoice(event) {
+    // Only a person's click is trusted; a session or this module replaying
+    // a state dispatches its own change events.
+    if (event.isTrusted !== true) return;
+    ownPerformanceChoice = true;
+    automaticPerformance = null;
+    hpPerformanceStatus.textContent = '';
+    stopWaiting();
+  }
+
+  function setPerformanceBox(checkbox, enabled) {
+    if (checkbox.checked === enabled) return false;
+    checkbox.checked = enabled;
+    checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+    return checkbox.checked === enabled;
+  }
+
+  function stopWaiting() {
+    if (stopWaitingForFraming !== null) stopWaitingForFraming();
+    stopWaitingForFraming = null;
+  }
+
+  function waitForNextFraming() {
+    stopWaiting();
+    stopWaitingForFraming = viewer.onPresentedViewStateChanged(({ reason }) => {
+      if (reason !== 'camera-settled' && reason !== 'focus') return;
+      stopWaiting();
+      if (!destroyed && !ownPerformanceChoice) viewer.measureFullDetailFrameCost();
+    });
+  }
+
+  function notify(message) {
+    try {
+      getNotificationCenter().info(message, { category: 'rendering' });
+    } catch (error) {
+      console.error('[RenderControls] The level-of-detail notice was not delivered:', error);
+    }
+  }
+
+  function ownPerformanceCall(call) {
+    ownPerformanceCalls += 1;
+    try {
+      return call();
+    } finally {
+      ownPerformanceCalls -= 1;
+    }
+  }
+
+  const stopFollowingCallerPerformance = viewer.onPerformanceSettingsChanged(({ opening }) => {
+    if (destroyed || ownPerformanceCalls > 0) return;
+    // Set by a caller: this opening's choice is made. What this page turned
+    // on stays recorded, so the next opening still turns it off; the
+    // framing this page waited for is not measured.
+    callerPerformanceOpening = opening;
+    hpPerformanceStatus.textContent = '';
+    stopWaiting();
+  });
+
+  const stopFollowingFrameCost = viewer.onFullDetailFrameCost(event => {
+    if (destroyed || ownPerformanceChoice || event.opening === callerPerformanceOpening) return;
+    if (event.kind === 'measuring') {
+      // A new measurement: no framing of the last to wait for, and this
+      // page's own choice off, so the frames of every cell are measured.
+      stopWaiting();
+      if (automaticPerformance === null) return;
+      if (automaticPerformance.lod) setPerformanceBox(hpLodEnabledCheckbox, false);
+      if (automaticPerformance.culling) setPerformanceBox(hpFrustumCullingCheckbox, false);
+      automaticPerformance = null;
+      hpPerformanceStatus.textContent = '';
+      return;
+    }
+    if (event.kind === 'nothing-fewer') {
+      // Nothing here could draw fewer cells (no reduced level, every cell
+      // in view): not measured; the next framing (a zoom that leaves cells
+      // out) is looked at afresh.
+      waitForNextFraming();
+      return;
+    }
+    if (event.kind === 'too-slow') {
+      const turned = [];
+      // Levels of detail only where the ladder has a reduced level: below its
+      // first count every level is every cell (`lodLadder`), and only culling
+      // can draw fewer.
+      if (viewer.getLODLevelCount() > 1 && setPerformanceBox(hpLodEnabledCheckbox, true)) {
+        turned.push('level of detail');
+      }
+      // Culling only where a cell of the frames measured may lie outside its
+      // view (`cullable`): with every cell in view it culls nothing.
+      if (event.cullable && setPerformanceBox(hpFrustumCullingCheckbox, true)) turned.push('frustum culling');
+      if (turned.length === 0) {
+        waitForNextFraming();
+        return;
+      }
+      // What this page turned on for the opening, with what it turned on at an
+      // earlier answer of the same opening (a representation measured afresh).
+      automaticPerformance = Object.freeze({
+        lod: automaticPerformance?.lod === true || turned.includes('level of detail'),
+        culling: automaticPerformance?.culling === true || turned.includes('frustum culling'),
+        turned: Object.freeze(turned),
+        budgetMilliseconds: event.budgetMilliseconds,
+      });
+      hpPerformanceStatus.textContent = `A frame of every cell took ${formatFrameMilliseconds(event.frame)} here; `
+        + `measuring ${turned.join(' and ')}.`;
+      // Kept only if its frames are measured faster (`verified`).
+      viewer.verifyFullDetailFrameCost();
+      return;
+    }
+    if (event.kind !== 'verified' || automaticPerformance === null) return;
+    const before = formatFrameMilliseconds(event.fullFrame);
+    const after = formatFrameMilliseconds(event.frame);
+    const turned = automaticPerformance.turned;
+    if (event.verdict === 'faster') {
+      const measured = `a frame of every cell took ${before} on this device, `
+        + `over the ${Math.round(automaticPerformance.budgetMilliseconds)} ms that keeps moving the view smooth, and ${after} with ${turned.join(' and ')}`;
+      hpPerformanceStatus.textContent = `Turned on for this dataset: ${measured}. Turn either off to draw every cell.`;
+      notify(`${turned.length === 2 ? 'Level of detail and frustum culling are' : `${turned[0][0].toUpperCase()}${turned[0].slice(1)} is`} on: ${measured}. Render settings › Performance can turn them off.`);
+      return;
+    }
+    // No automatic choice may make a frame slower, and one not proven faster
+    // may: off again, for this framing, saying which it was (measured no
+    // faster, or closer than this browser's timing can tell apart); the
+    // next framing is measured afresh.
+    if (automaticPerformance.lod) setPerformanceBox(hpLodEnabledCheckbox, false);
+    if (automaticPerformance.culling) setPerformanceBox(hpFrustumCullingCheckbox, false);
+    automaticPerformance = null;
+    hpPerformanceStatus.textContent = `Every cell drawn: ${turned.join(' and ')} measured ${after} a frame against ${before} without, `
+      + (event.verdict === 'not-faster' ? 'no faster here' : 'closer than this browser can time')
+      + '. Measured again when the view moves.';
+    waitForNextFraming();
+  });
 
   // ---------------------------------------------------------------------------
   // Antialiasing
@@ -1236,6 +1456,7 @@ export function initRenderControls(options) {
     applyPointSizeFromSlider,
     applyAutomaticPointSize,
     applyDatasetAntialiasing,
+    applyDatasetLodRange,
     applyViewDimensionAntialiasing,
     pointSizeSliderPositionForCellCount,
     pointSizeToSlider: pointSizeToSliderPosition,
@@ -1259,6 +1480,9 @@ export function initRenderControls(options) {
       destroyed = true;
       renderModeChangeHandler = null;
       domLifecycle.abort();
+      stopFollowingFrameCost();
+      stopFollowingCallerPerformance();
+      stopWaiting();
       smokeDirty = false;
       committedSmokeRebuildQueued = false;
       if (smokeRebuildTimeout !== null) {

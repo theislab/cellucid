@@ -20,7 +20,9 @@ function createFakeGl() {
   const gl = {
     NO_ERROR: 0,
     MAX_TEXTURE_SIZE: 0x0D33,
-    TEXTURE_BINDING_2D: 0x8069,
+    MAX_ARRAY_TEXTURE_LAYERS: 0x88FF,
+    TEXTURE_BINDING_2D_ARRAY: 0x8C1D,
+    TEXTURE_2D_ARRAY: 0x8C1A,
     UNPACK_ALIGNMENT: 0x0CF5,
     PIXEL_UNPACK_BUFFER: 0x88EC,
     PIXEL_UNPACK_BUFFER_BINDING: 0x88EF,
@@ -64,7 +66,8 @@ function createFakeGl() {
       if (binding === texture) binding = null;
     },
     bindTexture(target, texture) {
-      assert.equal(target, gl.TEXTURE_2D);
+      // Packed per-cell textures are linear textures (2D arrays).
+      assert.equal(target, gl.TEXTURE_2D_ARRAY);
       if (texture !== null && !textures.has(texture)) {
         throw new TypeError('binding unknown texture');
       }
@@ -76,7 +79,8 @@ function createFakeGl() {
     },
     getParameter(parameter) {
       if (parameter === gl.MAX_TEXTURE_SIZE) return 4;
-      if (parameter === gl.TEXTURE_BINDING_2D) return binding;
+      if (parameter === gl.MAX_ARRAY_TEXTURE_LAYERS) return 256;
+      if (parameter === gl.TEXTURE_BINDING_2D_ARRAY) return binding;
       if (parameter === gl.UNPACK_ALIGNMENT) return unpackAlignment;
       if (parameter === gl.PIXEL_UNPACK_BUFFER_BINDING) {
         return pixelUnpackBuffer;
@@ -97,20 +101,25 @@ function createFakeGl() {
       unpackAlignment = value;
     },
     texParameteri() {},
-    texImage2D(...args) {
+    texStorage3D(...args) {
       uploads.push({
         kind: 'allocate',
         args,
         pixelUnpackBuffer
       });
     },
-    texSubImage2D(...args) {
+    // (target, level, x, y, layer, width, rows, depth, format, type, data, srcOffset)
+    texSubImage3D(...args) {
       if (gl.failUpload) {
         throw new Error('synthetic packed-texture upload failure');
       }
+      const [, , , , , width, rows, , format, , data, srcOffset = 0] = args;
+      const components = format === gl.RGB ? 3 : format === gl.RG ? 2 : format === gl.RGBA ? 4 : 1;
       uploads.push({
         kind: 'row',
         args,
+        width,
+        values: data.subarray(srcOffset, srcOffset + width * rows * components),
         pixelUnpackBuffer
       });
     },
@@ -162,7 +171,7 @@ test('a packed texture of the same shape is rewritten in place without reading t
   );
   assert.deepEqual(gl._state.deleted, []);
   assert.deepEqual(
-    gl._state.uploads.slice(-2).map(entry => [...entry.args[8]]),
+    gl._state.uploads.slice(-2).map(entry => [...entry.values]),
     [[6, 7, 8, 9], [10]]
   );
 });
@@ -171,7 +180,7 @@ test('a new shape allocates once, reads the error queue once, and leaves the rep
   const gl = createFakeGl();
   const priorPixelUnpackBuffer = { id: 'prior-pixel-unpack-buffer' };
   const first = publish(gl, null, [1, 2, 3]);
-  gl.bindTexture(gl.TEXTURE_2D, first.texture);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, first.texture);
   gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, priorPixelUnpackBuffer);
 
   const second = publish(gl, first, [1, 2, 3, 4, 5]);
@@ -192,10 +201,10 @@ test('a new shape allocates once, reads the error queue once, and leaves the rep
 test('a refused allocation is deleted and the replaced texture stays published', () => {
   const gl = createFakeGl();
   const first = publish(gl, null, [1, 2, 3]);
-  gl.bindTexture(gl.TEXTURE_2D, first.texture);
-  const texImage2D = gl.texImage2D;
-  gl.texImage2D = (...args) => {
-    texImage2D(...args);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, first.texture);
+  const texStorage3D = gl.texStorage3D;
+  gl.texStorage3D = (...args) => {
+    texStorage3D(...args);
     gl.raise(0x0505);
   };
 
@@ -213,7 +222,7 @@ test('an upload failure deletes the candidate and restores the unpack state', ()
   const gl = createFakeGl();
   const existing = publish(gl, null, [1, 2]);
   const priorPixelUnpackBuffer = { id: 'prior-pixel-unpack-buffer' };
-  gl.bindTexture(gl.TEXTURE_2D, existing.texture);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, existing.texture);
   gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, priorPixelUnpackBuffer);
   gl.failUpload = true;
 
@@ -264,7 +273,7 @@ test('a packed uint table is shaped for its capacity and keeps its storage when 
     texture: null,
     allocationCheck: 'now',
   });
-  assert.deepEqual([full.width, full.height], [4, 2]);
+  assert.deepEqual([full.plan.width, full.plan.rows, full.plan.layers], [4, 2, 1]);
 
   const partial = createOrUpdatePackedUintTexture(gl, {
     capacity: 6,
@@ -279,7 +288,7 @@ test('a packed uint table is shaped for its capacity and keeps its storage when 
   assert.deepEqual(
     gl._state.uploads
       .filter(entry => entry.kind === 'row')
-      .map(entry => entry.args[4]),
+      .map(entry => entry.width),
     [4, 2, 3],
   );
   assert.throws(
@@ -337,4 +346,15 @@ test('an allocation checked by its caller reads nothing, so several share one re
     }),
     /allocationCheck must be exactly 'now' or 'caller'/,
   );
+});
+
+test('a packed texture holds more items than MAX_TEXTURE_SIZE squared, in layers', () => {
+  // MAX_TEXTURE_SIZE 4 caps a 2D texture at 16 items; a linear texture of
+  // 4-texel rows stacks them in layers of 4 rows.
+  const gl = createFakeGl();
+  const values = Array.from({ length: 37 }, (_, index) => index + 0.5);
+  const texture = publish(gl, null, values);
+  assert.deepEqual([texture.plan.width, texture.plan.rowsPerLayer, texture.plan.layers], [4, 4, 3]);
+  const written = gl._state.uploads.filter(entry => entry.kind === 'row').flatMap(entry => [...entry.values]);
+  assert.deepEqual(written, values);
 });

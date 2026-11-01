@@ -6,7 +6,7 @@ import { publishWebBuildVersion } from '../assets/js/app/ui/core/build-version.j
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
 
-function createDocument(buildIds, versions = ['0.9.5']) {
+function createDocument(buildIds, versions = ['0.9.6']) {
   const output = { textContent: '', title: '' };
   const versionOutput = { textContent: '', title: '' };
   const metas = {

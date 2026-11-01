@@ -66,7 +66,6 @@ function makePublicationHarness(viewId) {
         .call(this);
     },
     _syncActiveContext() {},
-    _syncColorsAlpha() {},
     _updateActiveCategoryCounts() {},
     buildCentroidsForField() {},
     clearCentroids() {},

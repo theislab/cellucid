@@ -33,6 +33,7 @@ import {
 import { computeCentroidsForDimension } from '../assets/js/app/registries/user-defined-fields/centroids.js';
 import { getCategoryColor } from '../assets/js/data/palettes.js';
 import { loadsAsReader } from './helpers/dimension-loads.mjs';
+import { colorsOf, rgbListOf, visibleListOf, visibleOf } from './helpers/category-state.mjs';
 
 const RED = [1, 0, 0];
 const GREEN = [0, 1, 0];
@@ -40,25 +41,27 @@ const BLUE = [0, 0, 1];
 const GREY = [0.5, 0.5, 0.5];
 
 test('a view carries its colours and hidden categories through each edit, by category', () => {
-  const state = { colors: [RED, GREEN, BLUE, GREY], visible: { 0: true, 1: false, 2: true, 3: false } };
+  const state = { colors: colorsOf([RED, GREEN, BLUE, GREY]), visible: visibleOf([true, false, true, false]) };
+  const plain = carried => ({ colors: rgbListOf({ _categoryColors: carried.colors }), visible: visibleListOf({ _categoryVisible: carried.visible }) });
+  const asDrawn = rgbList => rgbListOf({ _categoryColors: colorsOf(rgbList) });
 
   // Delete 'b' into a new 'unassigned': a, c, d keep theirs.
   const deleted = carryCategoryStateThroughDelete(
     buildDeleteToUnassignedTransform(['a', 'b', 'c', 'd'], 1, { unassignedLabel: 'unassigned' }),
     state
   );
-  assert.deepEqual(deleted, {
-    colors: [RED, BLUE, GREY, [...getCategoryColor(3)]],
-    visible: { 0: true, 1: true, 2: false, 3: true },
+  assert.deepEqual(plain(deleted), {
+    colors: asDrawn([RED, BLUE, GREY, [...getCategoryColor(3)]]),
+    visible: [true, true, false, true],
   });
   // Into the existing 'unassigned' (index 3): it keeps its own.
   const intoExisting = carryCategoryStateThroughDelete(
     buildDeleteToUnassignedTransform(['a', 'b', 'c', 'unassigned'], 0, { unassignedLabel: 'unassigned' }),
     state
   );
-  assert.deepEqual(intoExisting, {
-    colors: [GREEN, BLUE, GREY],
-    visible: { 0: false, 1: true, 2: false },
+  assert.deepEqual(plain(intoExisting), {
+    colors: asDrawn([GREEN, BLUE, GREY]),
+    visible: [false, true, false],
   });
 
   // Merge 'a' (dragged) into 'b': the merged category has a's colour and is
@@ -69,18 +72,19 @@ test('a view carries its colours and hidden categories through each edit, by cat
     1,
     state
   );
-  assert.deepEqual(merged, {
-    colors: [RED, BLUE, GREY],
-    visible: { 0: true, 1: true, 2: false },
+  assert.deepEqual(plain(merged), {
+    colors: asDrawn([RED, BLUE, GREY]),
+    visible: [true, true, false],
   });
 
   // Another list: by label; a new label gets its palette colour, shown.
   assert.deepEqual(
-    carryCategoryStateByCategory(['a', 'b', 'c', 'd'], ['d', 'x', 'b'], state),
-    { colors: [GREY, [...getCategoryColor(1)], GREEN], visible: { 0: false, 1: true, 2: false } }
+    plain(carryCategoryStateByCategory(['a', 'b', 'c', 'd'], ['d', 'x', 'b'], state)),
+    { colors: asDrawn([GREY, [...getCategoryColor(1)], GREEN]), visible: [false, true, false] }
   );
   // Nothing is shared with the state carried from.
-  assert.notEqual(merged.colors[0], RED);
+  assert.notEqual(merged.colors, state.colors);
+  assert.notEqual(merged.visible, state.visible);
 });
 
 const POINTS = 8;
@@ -190,9 +194,9 @@ test('a category deleted in the live view reaches the kept view, which then comp
   assertSharesDefinition(state, id, 'delete in the live view');
   const copies = copiesOf(state, id);
   assert.deepEqual(copies.live.categories, ['a', 'c', 'unassigned']);
-  assert.deepEqual(copies.snap_1._categoryColors[0], RED);
-  assert.deepEqual(copies.snap_1._categoryVisible, { 0: true, 1: false, 2: true });
-  assert.deepEqual(copies.live._categoryVisible, { 0: true, 1: true, 2: true });
+  assert.deepEqual(rgbListOf(copies.snap_1)[0], RED);
+  assert.deepEqual(visibleListOf(copies.snap_1), [true, false, true]);
+  assert.deepEqual(visibleListOf(copies.live), [true, true, true]);
   // The kept view was drawn again: its centroids are the new categories'.
   const snapContext = state.viewContexts.get('snap_1');
   assert.equal(snapContext.centroidPositions.length / 3, 3);
@@ -221,7 +225,7 @@ test('a category merged in a kept view leaves the live copy its own colours, by 
   assertSharesDefinition(state, id, 'merge in the kept view');
   const copies = copiesOf(state, id);
   assert.deepEqual(copies.snap_1.categories, ['merged a + b', 'c']);
-  assert.deepEqual(copies.live._categoryColors[1], BLUE);
+  assert.deepEqual(rgbListOf(copies.live)[1], BLUE);
   // Selecting the live view again draws it from the new codes.
   state.setActiveView('live');
   state.setActiveField(fieldIndex);
@@ -239,7 +243,7 @@ test('a consensus column rebuilt in place reaches every view, which keeps its co
   });
   assertSharesDefinition(state, id, 'consensus rebuilt');
   const copies = copiesOf(state, id);
-  assert.deepEqual(copies.snap_1._categoryColors[0], GREEN);
+  assert.deepEqual(rgbListOf(copies.snap_1)[0], GREEN);
   assert.deepEqual(copies.snap_1.centroidsByLayout.get('X_umap_2d').map(c => c.category), ['c', 'a', 'z']);
   assert.equal(state.centroidPositions.length / 3, 3);
 });

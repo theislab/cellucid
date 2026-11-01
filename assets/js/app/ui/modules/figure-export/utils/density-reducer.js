@@ -32,10 +32,13 @@ import { createMulberry32 } from '../../../../utils/random-utils.js';
 import { requirePositionArray } from '../../../../../rendering/position-layout.js';
 import { assertCropRect01, cropRect01ToPx } from './crop.js';
 import {
-  assertLodMembership,
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
 } from './lod-membership.js';
+import {
+  lodMembershipAdmits,
+  requireLodMembership,
+} from '../../../../../rendering/high-perf/renderer-contracts.js';
 
 /**
  * @typedef {object} ReducedViewportPoints
@@ -172,7 +175,7 @@ function apportionDensitySlots(
  * @param {1|2|3} options.dimension - components per position
  * @param {Uint8Array|null} options.colors - n*4
  * @param {Uint8Array|null} [options.transparency] - n (0 or 1)
- * @param {import('./lod-membership.js').LodMembership|null} [options.lodMembership]
+ * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
  * @param {Uint8Array|null} [options.highlightArray] - exact renderer highlight bytes
  * @param {number[]|Uint32Array|null} [options.highlightedIndices] - complete unique sparse highlight IDs
  * @param {{ mvpMatrix: Float32Array; viewportWidth: number; viewportHeight: number }} options.renderState
@@ -226,8 +229,12 @@ export function reducePointsByDensity({
       'Figure-export density maxScanPoints must be null or a positive safe integer.'
     );
   }
-  assertLodMembership(lodMembership, {
+  // The viewer's record (preview) or a figure's own copy (export): both
+  // `LodMembership`, the preview's without `indices` when the level is the
+  // first `count` cells.
+  requireLodMembership(lodMembership, {
     pointCount: sourcePointCount,
+    owner: 'Figure-export density LOD membership',
   });
   if (
     highlightArray !== null &&
@@ -274,8 +281,10 @@ export function reducePointsByDensity({
       sparseHighlightIds.add(pointIndex);
     }
   }
+  // Candidate `k` is cell `admittedIndices[k]`, or cell `k` (every cell, or
+  // a level's first `count` cells).
   const admittedIndices = lodMembership?.indices ?? null;
-  const candidateCount = admittedIndices?.length ?? n;
+  const candidateCount = lodMembership === null ? n : Math.min(n, lodMembership.count);
   const primaryScanCount = maxScanPoints === null
     ? candidateCount
     : Math.min(candidateCount, maxScanPoints);
@@ -289,8 +298,6 @@ export function reducePointsByDensity({
   const scanRemainderStep = primaryScanCount === 0
     ? 0
     : candidateCount % primaryScanCount;
-  const randomAdmissionLevels = lodMembership?.admissionLevels ?? null;
-  const randomAdmissionLevel = lodMembership?.lodLevel ?? -1;
   const viewportW = Math.max(1, renderState.viewportWidth || 1);
   const viewportH = Math.max(1, renderState.viewportHeight || 1);
   const mvp = renderState.mvpMatrix;
@@ -321,11 +328,7 @@ export function reducePointsByDensity({
     highlightArray === null ? null : new Uint32Array(cellCount);
   const stridedHighlightIds =
     sparseHighlightIds !== null &&
-    primaryScanCount < candidateCount &&
-    (
-      lodMembership === null ||
-      randomAdmissionLevels !== null
-    )
+    primaryScanCount < candidateCount
       ? new Set()
       : null;
   let visibleTotal = 0;
@@ -357,7 +360,7 @@ export function reducePointsByDensity({
     if (isHighlighted && stridedHighlightIds !== null) {
       stridedHighlightIds.add(i);
     }
-    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
     let a = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (a < 0) a = 0;
     else if (a > 1) a = 1;
@@ -408,24 +411,19 @@ export function reducePointsByDensity({
   }
 
   // A capped preview scans a regular K-prefix stride, then visits only sparse
-  // highlighted IDs that the stride missed. Random admission bytes are used
-  // for these H points only; sequential export remains prefix-only.
+  // highlighted IDs that the stride missed, admitted by the level's own test
+  // (`lodMembershipAdmits`) for these H points only; sequential export
+  // remains prefix-only.
   if (stridedHighlightIds !== null) {
     for (const i of sparseHighlightIds) {
       if (stridedHighlightIds.has(i)) continue;
       supplementalScanCount++;
-      if (
-        i >= n ||
-        (
-          randomAdmissionLevels !== null &&
-          randomAdmissionLevels[i] > randomAdmissionLevel
-        )
-      ) {
+      if (i >= n || !lodMembershipAdmits(lodMembership, i)) {
         continue;
       }
       const rawAlpha = transparency
         ? (transparency[i] ?? 1.0)
-        : (colors[i * 4 + 3] / 255);
+        : 1.0;
       let a = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
       if (a < 0) a = 0;
       else if (a > 1) a = 1;
@@ -589,7 +587,7 @@ export function reducePointsByDensity({
     const isHighlighted =
       highlightArray !== null &&
       highlightArray[i] >= MIN_VISIBLE_ALPHA_BYTE;
-    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : (colors[i * 4 + 3] / 255);
+    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
     let a = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (a < 0) a = 0;
     else if (a > 1) a = 1;
@@ -680,16 +678,13 @@ export function reducePointsByDensity({
       if (
         stridedHighlightIds.has(i) ||
         i >= n ||
-        (
-          randomAdmissionLevels !== null &&
-          randomAdmissionLevels[i] > randomAdmissionLevel
-        )
+        !lodMembershipAdmits(lodMembership, i)
       ) {
         continue;
       }
       const rawAlpha = transparency
         ? (transparency[i] ?? 1.0)
-        : (colors[i * 4 + 3] / 255);
+        : 1.0;
       let a = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
       if (a < 0) a = 0;
       else if (a > 1) a = 1;

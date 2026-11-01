@@ -13,7 +13,7 @@ import {
 } from './browser-test-ports.mjs';
 
 const REPOSITORY_ROOT = fileURLToPath(new URL('../', import.meta.url));
-const PLAYWRIGHT_CLI = fileURLToPath(
+export const PLAYWRIGHT_CLI = fileURLToPath(
   import.meta.resolve('@playwright/test/cli')
 );
 const SHARD_PATTERN = /^(?<current>[1-9][0-9]*)\/(?<total>[1-9][0-9]*)$/;
@@ -151,7 +151,8 @@ export function parseBoundedShardArguments(arguments_) {
   return Object.freeze({ project, shard: `${current}/${total}`, headed });
 }
 
-function environmentWithoutForcedColour(environment) {
+/** A child's environment with colour off, so its output reads as plain text. */
+export function environmentWithoutForcedColour(environment) {
   const childEnvironment = { ...environment, NO_COLOR: '1' };
   delete childEnvironment.FORCE_COLOR;
   return childEnvironment;

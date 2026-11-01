@@ -13,8 +13,21 @@
  *
  * The peak is the store plus one slab. The store lives in memory (segmented
  * typed arrays, so no single-buffer maximum applies) when it fits the memory
- * budget, otherwise in the origin-private file system (OPFS, disk-backed),
- * and if neither can hold it, columns are answered by scanning.
+ * budget, otherwise in the origin-private file system (OPFS, disk-backed)
+ * when the site's storage quota has room for it, and if neither can hold it,
+ * columns are answered by scanning: the reason goes out with the progress
+ * and each scan is announced (`onUnindexedScan`), never a silent wait. How
+ * a matrix will be indexed, and so what its first gene costs, is known before
+ * anything is read (`sparseIndexPlan`, `createColumnStoreFactory().plan`).
+ *
+ * A build asked for by genes (not ahead of need) stops when every gene it
+ * was for withdrew (`column(…, {signal})`) before any gene was served from
+ * it: its reads are let go, those still queued never sent, what it kept is
+ * released, and the next gene starts a new build. Once a gene was served
+ * (at the end of pass 1), the build goes on whoever waits: its work is paid. A matrix
+ * presented as a subsample's kept rows (`views/cell-subset.js`) is indexed
+ * as the smaller matrix it is: over the kept rows only, reading only the
+ * stored chunks that hold them.
  *
  * A gene asked for while the index builds is never a dead wait: its column is
  * extracted from the slabs the build reads anyway, starting at the slab after
@@ -40,8 +53,13 @@
  */
 
 import { REMOTE_POLICY } from '../formats/io/byte-source.js';
-import { recordAllocationFailure } from './memory-budget.js';
-import { formatCountOf } from '../utils/format-units.js';
+import { roundTripBytesOf } from '../formats/io/link.js';
+import { recordAllocationFailure, recordAllocationSuccess } from './memory-budget.js';
+import { allocateLargeArray } from '../utils/large-arrays.js';
+import { formatBytes, formatCountOf } from '../utils/format-units.js';
+import { matchesChecksum } from '../formats/io/page-checks.js';
+import { readWhole, requireHeld, writeAt } from '../formats/io/sync-access.js';
+import { cancelled, onAbort } from '../utils/abort.js';
 
 /**
  * How long one part of a background index's synchronous work runs before the
@@ -55,9 +73,12 @@ const INDEX_SLICE_MS = 2;
 export const SEGMENT_ELEMENTS = 2 ** 27;
 
 /**
- * Allocate one typed array, reporting a refused allocation with the bytes it
- * needed and what it was for, and to the memory budgets
- * (`memory-budget.js`, `recordAllocationFailure`).
+ * Allocate one typed array, larger than one `ArrayBuffer` where the engine
+ * caps it (`allocateLargeArray`: a WebAssembly memory then), reporting a
+ * refused allocation with the bytes it needed and what it was for, and to the
+ * memory model (`memory-budget.js`, `recordAllocationFailure`); a granted one
+ * is evidence the model hears of while a refusal lowers the allowance
+ * (`recordAllocationSuccess`).
  *
  * @template T
  * @param {new (length: number) => T} ArrayType
@@ -66,12 +87,13 @@ export const SEGMENT_ELEMENTS = 2 ** 27;
  * @returns {T}
  */
 export function allocateTypedArray(ArrayType, length, label) {
+  let array;
   try {
-    return new ArrayType(length);
+    array = allocateLargeArray(ArrayType, length);
   } catch (error) {
     if (!(error instanceof RangeError)) throw error;
     const bytes = length * ArrayType.BYTES_PER_ELEMENT;
-    // The memory budgets of this thread take the refusal as their signal.
+    // The memory model takes the refusal as its signal, in every thread.
     recordAllocationFailure(bytes);
     const failure = new RangeError(
       `${label} needs ${formatCountOf(bytes, 'byte')}, more memory than ` +
@@ -81,6 +103,19 @@ export function allocateTypedArray(ArrayType, length, label) {
     failure.bytes = bytes;
     throw failure;
   }
+  recordAllocationSuccess(length * ArrayType.BYTES_PER_ELEMENT);
+  return array;
+}
+
+/**
+ * A copy of `values` (a typed array or an array of numbers) as an
+ * `ArrayType` (`allocateTypedArray`): what `ArrayType.from(values)` makes, at
+ * any size the page can hold.
+ */
+export function copyTypedArray(ArrayType, values, label) {
+  const out = allocateTypedArray(ArrayType, values.length, label);
+  out.set(values);
+  return out;
 }
 
 function allocateSegments(ArrayType, length, label) {
@@ -125,8 +160,8 @@ function addFloat32(current, value) {
  * @returns {SparseColumn}
  */
 export function sparseColumnOf(rows, values, count, length) {
-  let indices = new Uint32Array(count);
-  let sums = new Float32Array(count);
+  let indices = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+  let sums = allocateTypedArray(Float32Array, count, 'Gene column values');
   let kept = 0;
   let entry = 0;
   while (entry < count) {
@@ -149,8 +184,12 @@ export function sparseColumnOf(rows, values, count, length) {
     }
   }
   if (kept < count) {
-    indices = indices.slice(0, kept);
-    sums = sums.slice(0, kept);
+    const keptIndices = allocateTypedArray(Uint32Array, kept, 'Gene column cells');
+    const keptSums = allocateTypedArray(Float32Array, kept, 'Gene column values');
+    keptIndices.set(indices.subarray(0, kept));
+    keptSums.set(sums.subarray(0, kept));
+    indices = keptIndices;
+    sums = keptSums;
   }
   return { length, indices, values: sums };
 }
@@ -165,8 +204,8 @@ export function sparseColumnOf(rows, values, count, length) {
 export function sparseColumnOfDense(dense) {
   let count = 0;
   for (let row = 0; row < dense.length; row++) if (dense[row] !== 0) count++;
-  const indices = new Uint32Array(count);
-  const values = new Float32Array(count);
+  const indices = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+  const values = allocateTypedArray(Float32Array, count, 'Gene column values');
   let at = 0;
   for (let row = 0; row < dense.length; row++) {
     const value = dense[row];
@@ -184,6 +223,8 @@ export function sparseColumnOfDense(dense) {
  * views when the range lies in one segment, else copies.
  */
 function segmentedRange(rowSegments, valueSegments, start, end) {
+  // An empty range of a store with no entries has no segment to view.
+  if (end === start) return { rows: new Uint32Array(0), values: new Float32Array(0) };
   const segment = Math.floor(start / SEGMENT_ELEMENTS);
   const offset = start - segment * SEGMENT_ELEMENTS;
   if (offset + (end - start) <= rowSegments[segment].length) {
@@ -192,8 +233,8 @@ function segmentedRange(rowSegments, valueSegments, start, end) {
       values: valueSegments[segment].subarray(offset, offset + end - start),
     };
   }
-  const rows = new Uint32Array(end - start);
-  const values = new Float32Array(end - start);
+  const rows = allocateTypedArray(Uint32Array, end - start, 'Gene column cells');
+  const values = allocateTypedArray(Float32Array, end - start, 'Gene column values');
   for (let entry = start; entry < end; entry++) {
     const at = Math.floor(entry / SEGMENT_ELEMENTS);
     rows[entry - start] = rowSegments[at][entry - at * SEGMENT_ELEMENTS];
@@ -273,7 +314,7 @@ class MemorySparseStore {
   }
 
   column(column) {
-    const result = new Float32Array(this.nRows);
+    const result = allocateTypedArray(Float32Array, this.nRows, 'Gene column');
     let entry = this._columnStart[column];
     const end = this._columnStart[column + 1];
     while (entry < end) {
@@ -296,6 +337,15 @@ class MemorySparseStore {
     const end = this._columnStart[column + 1];
     const { rows, values } = segmentedRange(this._rows, this._values, start, end);
     return sparseColumnOf(rows, values, end - start, this.nRows);
+  }
+
+  /** What a gene index kept in this browser holds of this store (`KeptParts`). */
+  keptParts() {
+    return keptPartsOf('sparse', this, [
+      keptArray('columnStart', [this._columnStart]),
+      keptArray('rows', this._rows),
+      keptArray('values', this._values),
+    ]);
   }
 
   dispose() {
@@ -335,7 +385,7 @@ async function readValuesAt(positions, count, readValues, visit) {
  * The cost model that decides between reading genes' value ranges and
  * reading every value once, in bytes of transfer over the link as measured
  * (`formats/io/link.js`): a request costs a round trip (`roundTripBytes`,
- * bandwidth x latency), requests run `concurrency` at once, and value ranges
+ * bandwidth x latency), requests run `shapingConcurrency` at once, and value ranges
  * closer than the link's merge gap are fetched as one request. Value ranges
  * cost their stored (compressed) bytes, as the file holds them. The genes
  * asked for in the same task are weighed together: when their ranges would
@@ -346,18 +396,13 @@ async function readValuesAt(positions, count, readValues, visit) {
  * host's prior (`REMOTE_POLICY`), whose merge gap is a round trip's worth
  * shared by the requests in flight.
  *
- * @typedef {{mergeGapBytes: number, roundTripBytes: number|null, concurrency: number}} RequestCosts
+ * @typedef {{mergeGapBytes: number, roundTripBytes: number|null, shapingConcurrency: number}} RequestCosts
  */
 const PRIOR_COSTS = Object.freeze({
   mergeGapBytes: REMOTE_POLICY.mergeGapBytes,
   roundTripBytes: null,
-  concurrency: REMOTE_POLICY.concurrency,
+  shapingConcurrency: REMOTE_POLICY.concurrency,
 });
-
-/** The bytes one round trip is worth on a link (`RequestCosts`). */
-function roundTripBytesOf(costs) {
-  return costs.roundTripBytes ?? costs.mergeGapBytes * costs.concurrency;
-}
 
 /** Entries per read when every value is read once, all reads asked at once. A scheduling choice. */
 const WHOLE_VALUES_STEP = 1 << 20;
@@ -386,7 +431,7 @@ function rangedCost(positions, count, storedBytesPerEntry, costs) {
     }
     if (i < count && positions[i] - positions[i - 1] > requestGapEntries) requests++;
   }
-  return Math.ceil(requests / costs.concurrency) * roundTripBytesOf(costs) + span * storedBytesPerEntry;
+  return Math.ceil(requests / costs.shapingConcurrency) * roundTripBytesOf(costs) + span * storedBytesPerEntry;
 }
 
 /** Resolves on a later task, after every read asked for in this one. */
@@ -418,15 +463,20 @@ function rowFrom(pointers, nRows, position, row) {
 }
 
 /**
- * The structure of a sparse column store in memory: the entry positions of
- * every column, without the values, which are read on demand
+ * The structure of a sparse column store: the entry positions of every
+ * column, without the values, which are read on demand
  * (`readValues(start, end)`), and the row pointers that place each entry in
  * its row. For a matrix read over a link slower than a disk: a gene fetches
  * only the ranges its entries occupy. Genes spread over much of the matrix (common
  * ones, or many at once) would fetch most values anyway, so they read them
  * all once (`_wholeValues`), and every later gene is answered from memory.
+ *
+ * Where the positions are is the subclass's: in memory, written by the
+ * index's pass (`MemorySparseStructure`), or in a gene index kept in this
+ * browser from an earlier opening (`KeptSparseStructure`: held in memory
+ * once read whole, else read in runs of genes asked for together).
  */
-class MemorySparseStructure {
+class SparseStructure {
   /**
    * @param {number} nRows
    * @param {number} nCols
@@ -458,45 +508,27 @@ class MemorySparseStructure {
     /** @type {Array<{start: number, end: number, values: Float32Array}>} Values the pass read whole, by entry range, ascending */
     this._kept = [];
     this._keptEntries = 0;
-    this._next = allocateTypedArray(Float64Array, nCols, `${label} column cursor`);
-    this._next.set(columnStart.subarray(0, nCols));
-    // Entry positions: exact to 2^32 entries in 32 bits, beyond that in 64.
-    const PositionArray = nnz <= 0xffffffff ? Uint32Array : Float64Array;
-    this._positions = allocateSegments(PositionArray, nnz, `${label} entry positions`);
-    this.kind = 'memory';
-    this.bytes = columnStart.byteLength + rowPointers.byteLength + nnz * PositionArray.BYTES_PER_ELEMENT;
+    /**
+     * Every value, by entry range (ascending, covering every entry), once
+     * all are held: bought with the first gene (`adopt`) or read whole
+     * since (`_readWholeValues`). A structure that holds them is kept with
+     * them (`keptParts`), so a later opening reads none again.
+     * @type {Array<{start: number, end: number, values: Float32Array}>|null}
+     */
+    this._valueRanges = null;
+    /** Told once every value is held after the structure was built (`_readWholeValues`): it may be kept again, with them. */
+    this.onValuesHeld = null;
+    this.bytes = columnStart.byteLength + rowPointers.byteLength;
   }
 
-  writeSlab(slab, indices, label) {
-    const { rowStart, rowEnd, pointers, pointerOffset, entryStart } = slab;
-    const next = this._next;
-    const end = this._columnStart;
-    const nCols = this.nCols;
-    const single = this._positions.length === 1 ? this._positions[0] : null;
-    // A slab's rows hold one run of entries.
-    const to = pointers[pointerOffset + rowEnd - rowStart] - entryStart;
-    for (let entry = pointers[pointerOffset] - entryStart; entry < to; entry++) {
-      const column = indices[entry];
-      if (!(column >= 0 && column < nCols) || next[column] >= end[column + 1]) {
-        throw new Error(`${label} changed while it was read; reopen the file`);
-      }
-      const destination = next[column]++;
-      if (single !== null) {
-        single[destination] = entryStart + entry;
-      } else {
-        const segment = Math.floor(destination / SEGMENT_ELEMENTS);
-        this._positions[segment][destination - segment * SEGMENT_ELEMENTS] = entryStart + entry;
-      }
-    }
-  }
-
-  finish(label) {
-    for (let column = 0; column < this.nCols; column++) {
-      if (this._next[column] !== this._columnStart[column + 1]) {
-        throw new Error(`${label} changed while it was read; reopen the file`);
-      }
-    }
-    this._next = null;
+  /**
+   * The entry positions of entries `[start, start + count)` of the column
+   * order, ascending within a column: every entry of column `_column` (a
+   * kept copy checks each column's piece whole). @abstract
+   * @returns {Promise<Float64Array>|Float64Array}
+   */
+  _positionsOf(_start, _count, _column) {
+    throw new Error('A sparse structure says where its positions are.');
   }
 
   /**
@@ -515,6 +547,8 @@ class MemorySparseStructure {
     this._rangedSpent += spentBytes;
     this.bytes += this._keptEntries * 4;
     if (this._keptEntries === this._nnz && this._nnz > 0) {
+      // Every value bought with the first gene: held now, kept with the structure.
+      this._valueRanges = this._kept;
       this._wholeValues = this._readWholeValues();
       this._wholeValues.catch(() => { this._wholeValues = null; });
     }
@@ -538,7 +572,7 @@ class MemorySparseStructure {
   }
 
   async column(column) {
-    const result = new Float32Array(this.nRows);
+    const result = allocateTypedArray(Float32Array, this.nRows, 'Gene column');
     const { rows, values, count } = await this._entries(column);
     for (let i = 0; i < count; i++) result[rows[i]] = addFloat32(result[rows[i]], values[i]);
     return result;
@@ -556,18 +590,16 @@ class MemorySparseStructure {
    */
   async _entries(column) {
     const start = this._columnStart[column];
-    const count = this._columnStart[column + 1] - start;
-    if (count === 0) return { rows: new Uint32Array(0), values: new Float64Array(0), count };
-    const rows = new Uint32Array(count);
-    const values = new Float64Array(count);
-    const positions = new Float64Array(count);
+    const stored = this._columnStart[column + 1] - start;
+    if (stored === 0) return { rows: new Uint32Array(0), values: new Float64Array(0), count: 0 };
+    const positions = await this._positionsOf(start, stored, column);
+    const count = positions.length;
+    const rows = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+    const values = allocateTypedArray(Float64Array, count, 'Gene column values');
     const pointers = this._rowPointers;
     let row = 0;
     for (let i = 0; i < count; i++) {
-      const at = start + i;
-      const segment = Math.floor(at / SEGMENT_ELEMENTS);
-      const position = this._positions[segment][at - segment * SEGMENT_ELEMENTS];
-      positions[i] = position;
+      const position = positions[i];
       if (pointers[row + 1] <= position) row = rowFrom(pointers, this.nRows, position, row);
       rows[i] = row;
     }
@@ -635,7 +667,7 @@ class MemorySparseStructure {
         const range = { start, end, values: null };
         ranges.push(range);
         reads.push(this._readValues(start, end).then(read => {
-          range.values = read instanceof Float32Array ? read : Float32Array.from(read);
+          range.values = read instanceof Float32Array ? read : copyTypedArray(Float32Array, read, 'Gene column values');
         }));
       }
     };
@@ -648,13 +680,155 @@ class MemorySparseStructure {
     await Promise.all(reads);
     this.bytes += (this._nnz - this._keptEntries) * 4;
     this._kept = [];
+    const heldBefore = this._valueRanges !== null;
+    this._valueRanges = ranges;
+    // Read whole after the structure was built (and kept without them).
+    if (!heldBefore) this.onValuesHeld?.();
     return ranges;
   }
 
   dispose() {
-    this._positions = [];
     this._rowPointers = null;
     this._wholeValues = null;
+    this._valueRanges = null;
+    this.onValuesHeld = null;
+  }
+}
+
+/** The structure of a sparse column store, its positions in memory, written by the index's pass. */
+class MemorySparseStructure extends SparseStructure {
+  constructor(nRows, nCols, columnStart, rowPointers, readValues, storedValueBytes, costs, label) {
+    super(nRows, nCols, columnStart, rowPointers, readValues, storedValueBytes, costs, label);
+    const nnz = this._nnz;
+    this._next = allocateTypedArray(Float64Array, nCols, `${label} column cursor`);
+    this._next.set(columnStart.subarray(0, nCols));
+    // Entry positions: exact to 2^32 entries in 32 bits, beyond that in 64.
+    const PositionArray = nnz <= 0xffffffff ? Uint32Array : Float64Array;
+    this._positions = allocateSegments(PositionArray, nnz, `${label} entry positions`);
+    this.kind = 'memory';
+    this.bytes += nnz * PositionArray.BYTES_PER_ELEMENT;
+  }
+
+  writeSlab(slab, indices, label) {
+    const { rowStart, rowEnd, pointers, pointerOffset, entryStart } = slab;
+    const next = this._next;
+    const end = this._columnStart;
+    const nCols = this.nCols;
+    const single = this._positions.length === 1 ? this._positions[0] : null;
+    // A slab's rows hold one run of entries.
+    const to = pointers[pointerOffset + rowEnd - rowStart] - entryStart;
+    for (let entry = pointers[pointerOffset] - entryStart; entry < to; entry++) {
+      const column = indices[entry];
+      if (!(column >= 0 && column < nCols) || next[column] >= end[column + 1]) {
+        throw new Error(`${label} changed while it was read; reopen the file`);
+      }
+      const destination = next[column]++;
+      if (single !== null) {
+        single[destination] = entryStart + entry;
+      } else {
+        const segment = Math.floor(destination / SEGMENT_ELEMENTS);
+        this._positions[segment][destination - segment * SEGMENT_ELEMENTS] = entryStart + entry;
+      }
+    }
+  }
+
+  finish(label) {
+    for (let column = 0; column < this.nCols; column++) {
+      if (this._next[column] !== this._columnStart[column + 1]) {
+        throw new Error(`${label} changed while it was read; reopen the file`);
+      }
+    }
+    this._next = null;
+  }
+
+  _positionsOf(start, count) {
+    const positions = allocateTypedArray(Float64Array, count, 'Gene column entry positions');
+    for (let i = 0; i < count; i++) {
+      const at = start + i;
+      const segment = Math.floor(at / SEGMENT_ELEMENTS);
+      positions[i] = this._positions[segment][at - segment * SEGMENT_ELEMENTS];
+    }
+    return positions;
+  }
+
+  /**
+   * What is kept of it for a later opening: its entry positions alone
+   * (`structure`: a gene's values are read from the file then), or, once
+   * every value is held (`_valueRanges`), each gene's rows and values
+   * (`sparse`), so a later opening reads a gene from the kept copy alone
+   * and downloads none of what was bought. The rows and values are made a
+   * piece at a time as they are written, in the column order of the
+   * positions: no second copy of the store is held.
+   */
+  keptParts() {
+    const ranges = this._valueRanges;
+    if (ranges === null) {
+      return keptPartsOf('structure', this, [
+        keptArray('columnStart', [this._columnStart]),
+        keptArray('positions', this._positions),
+      ]);
+    }
+    const nnz = this._nnz;
+    const nCols = this.nCols;
+    const nRows = this.nRows;
+    const columnStart = this._columnStart;
+    const pointers = this._rowPointers;
+    const positionAt = at => {
+      const segment = Math.floor(at / SEGMENT_ELEMENTS);
+      return this._positions[segment][at - segment * SEGMENT_ELEMENTS];
+    };
+    // Entries `[at, at + count)` of the column order, each mapped by
+    // `map(position, column, restart)`; a column's positions ascend, so its
+    // walk goes forward from where it began (`restart` at a column's first).
+    const pieces = function* pieces(map, ArrayType) {
+      const perPiece = KEPT_PIECE_BYTES / ArrayType.BYTES_PER_ELEMENT;
+      let column = 0;
+      for (let at = 0; at < nnz; at += perPiece) {
+        const count = Math.min(perPiece, nnz - at);
+        const out = allocateTypedArray(ArrayType, count, 'A kept gene index piece');
+        for (let i = 0; i < count; i++) {
+          const entry = at + i;
+          let restart = false;
+          while (columnStart[column + 1] <= entry) {
+            column++;
+            restart = true;
+          }
+          out[i] = map(positionAt(entry), entry === columnStart[column] || restart || i === 0);
+        }
+        yield new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+      }
+    };
+    let row = 0;
+    const rowOf = (position, restart) => {
+      if (restart) row = pointers[1] > position ? 0 : rowFrom(pointers, nRows, position, 0);
+      else if (pointers[row + 1] <= position) row = rowFrom(pointers, nRows, position, row);
+      return row;
+    };
+    let r = 0;
+    const valueOf = (position, restart) => {
+      if (restart) {
+        let low = 0;
+        let high = ranges.length;
+        while (low < high) {
+          const middle = (low + high) >>> 1;
+          if (ranges[middle].end <= position) low = middle + 1;
+          else high = middle;
+        }
+        r = low;
+      }
+      while (ranges[r].end <= position) r++;
+      return ranges[r].values[position - ranges[r].start];
+    };
+    return keptPartsOf('sparse', this, [
+      keptArray('columnStart', [columnStart]),
+      { name: 'rows', type: 'u32', length: nnz, pieces: () => pieces(rowOf, Uint32Array) },
+      { name: 'values', type: 'f32', length: nnz, pieces: () => pieces(valueOf, Float32Array) },
+    ]);
+  }
+
+  dispose() {
+    super.dispose();
+    this._positions = [];
   }
 }
 
@@ -685,7 +859,7 @@ class MemoryDenseStore {
   finish() {}
 
   column(column) {
-    const result = new Float32Array(this.nRows);
+    const result = allocateTypedArray(Float32Array, this.nRows, 'Gene column');
     let written = 0;
     let at = column * this.nRows;
     while (written < this.nRows) {
@@ -702,6 +876,10 @@ class MemoryDenseStore {
 
   sparseColumn(column) {
     return sparseColumnOfDense(this.column(column));
+  }
+
+  keptParts() {
+    return keptPartsOf('dense', this, [keptArray('values', this._values)]);
   }
 
   dispose() {
@@ -741,7 +919,7 @@ export class DiskSparseStore {
       Math.floor(DISK_BUFFER_BUDGET_ENTRIES / DISK_GROUP_BUFFER_ENTRIES)
     ));
     this._groupOf = allocateTypedArray(Uint32Array, nCols, `${label} column groups`);
-    this._groupStart = new Uint32Array(groups + 1);
+    this._groupStart = allocateTypedArray(Uint32Array, groups + 1, `${label} group starts`);
     let group = 0;
     for (let column = 0; column < nCols; column++) {
       while (group < groups - 1 && columnStart[column] >= ((group + 1) * nnz) / groups) {
@@ -759,6 +937,9 @@ export class DiskSparseStore {
     }));
     handles.rows.truncate(nnz * 4);
     handles.values.truncate(nnz * 4);
+    // Sized as asked, or refused as the disk being full (`formats/io/sync-access.js`).
+    requireHeld(handles.rows, nnz * 4);
+    requireHeld(handles.values, nnz * 4);
     this.kind = 'disk';
     this.bytes = columnStart.byteLength + this._written.byteLength +
       groups * DISK_GROUP_BUFFER_ENTRIES * 12;
@@ -797,12 +978,12 @@ export class DiskSparseStore {
     const first = this._groupStart[group];
     const width = this._groupStart[group + 1] - first;
     // Counting sort by column, stable in row order.
-    const counts = new Uint32Array(width + 1);
+    const counts = allocateTypedArray(Uint32Array, width + 1, 'Gene group column counts');
     for (let i = 0; i < buffer.length; i++) counts[buffer.columns[i] - first + 1]++;
     for (let c = 0; c < width; c++) counts[c + 1] += counts[c];
     const cursor = counts.slice(0, width);
-    const rows = new Uint32Array(buffer.length);
-    const values = new Float32Array(buffer.length);
+    const rows = allocateTypedArray(Uint32Array, buffer.length, 'Gene group cells');
+    const values = allocateTypedArray(Float32Array, buffer.length, 'Gene group values');
     for (let i = 0; i < buffer.length; i++) {
       const at = cursor[buffer.columns[i] - first]++;
       rows[at] = buffer.rows[i];
@@ -814,8 +995,8 @@ export class DiskSparseStore {
       if (end === start) continue;
       const column = first + c;
       const position = (this._columnStart[column] + this._written[column]) * 4;
-      this._handles.rows.write(rows.subarray(start, end), { at: position });
-      this._handles.values.write(values.subarray(start, end), { at: position });
+      writeAt(this._handles.rows, rows.subarray(start, end), position);
+      writeAt(this._handles.values, values.subarray(start, end), position);
       this._written[column] += end - start;
     }
     buffer.length = 0;
@@ -837,12 +1018,12 @@ export class DiskSparseStore {
   column(column) {
     const start = this._columnStart[column];
     const count = this._columnStart[column + 1] - start;
-    const result = new Float32Array(this.nRows);
+    const result = allocateTypedArray(Float32Array, this.nRows, 'Gene column');
     if (count === 0) return result;
-    const rows = new Uint32Array(count);
-    const values = new Float32Array(count);
-    this._handles.rows.read(rows, { at: start * 4 });
-    this._handles.values.read(values, { at: start * 4 });
+    const rows = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+    const values = allocateTypedArray(Float32Array, count, 'Gene column values');
+    readWhole(this._handles.rows, rows, start * 4);
+    readWhole(this._handles.values, values, start * 4);
     for (let index = 0; index < count; index++) {
       result[rows[index]] = addFloat32(result[rows[index]], values[index]);
     }
@@ -852,13 +1033,22 @@ export class DiskSparseStore {
   sparseColumn(column) {
     const start = this._columnStart[column];
     const count = this._columnStart[column + 1] - start;
-    const rows = new Uint32Array(count);
-    const values = new Float32Array(count);
+    const rows = allocateTypedArray(Uint32Array, count, 'Gene column cells');
+    const values = allocateTypedArray(Float32Array, count, 'Gene column values');
     if (count > 0) {
-      this._handles.rows.read(rows, { at: start * 4 });
-      this._handles.values.read(values, { at: start * 4 });
+      readWhole(this._handles.rows, rows, start * 4);
+      readWhole(this._handles.values, values, start * 4);
     }
     return sparseColumnOf(rows, values, count, this.nRows);
+  }
+
+  keptParts() {
+    const nnz = this._columnStart[this.nCols];
+    return keptPartsOf('sparse', this, [
+      keptArray('columnStart', [this._columnStart]),
+      keptFile('rows', this._handles.rows, nnz * 4),
+      keptFile('values', this._handles.values, nnz * 4),
+    ]);
   }
 
   dispose() {
@@ -877,6 +1067,8 @@ export class DiskDenseStore {
     this._handles = handles;
     this._handle = handles.values;
     this._handle.truncate(nRows * nCols * 4);
+    // Sized as asked, or refused as the disk being full (`formats/io/sync-access.js`).
+    requireHeld(this._handle, nRows * nCols * 4);
     this.kind = 'disk';
     this.bytes = 0;
   }
@@ -884,10 +1076,10 @@ export class DiskDenseStore {
   writeRows(rowStart, rowEnd, block) {
     const nCols = this.nCols;
     const height = rowEnd - rowStart;
-    const run = new Float32Array(height);
+    const run = allocateTypedArray(Float32Array, height, 'Gene column run');
     for (let column = 0; column < nCols; column++) {
       for (let row = 0; row < height; row++) run[row] = block[row * nCols + column];
-      this._handle.write(run, { at: (column * this.nRows + rowStart) * 4 });
+      writeAt(this._handle, run, (column * this.nRows + rowStart) * 4);
     }
   }
 
@@ -896,13 +1088,17 @@ export class DiskDenseStore {
   }
 
   column(column) {
-    const result = new Float32Array(this.nRows);
-    this._handle.read(result, { at: column * this.nRows * 4 });
+    const result = allocateTypedArray(Float32Array, this.nRows, 'Gene column');
+    readWhole(this._handle, result, column * this.nRows * 4);
     return result;
   }
 
   sparseColumn(column) {
     return sparseColumnOfDense(this.column(column));
+  }
+
+  keptParts() {
+    return keptPartsOf('dense', this, [keptFile('values', this._handle, this.nRows * this.nCols * 4)]);
   }
 
   dispose() {
@@ -911,47 +1107,628 @@ export class DiskDenseStore {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Gene indexes kept in this browser (`anndata/kept-column-index.js`)
+// ---------------------------------------------------------------------------
+
+/** Bytes one piece of a kept array is written in (a scheduling choice: the reader thread takes other work between pieces). */
+const KEPT_PIECE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * @typedef {Object} KeptArray
+ * @property {string} name - `columnStart`, `positions`, `rows` or `values`
+ * @property {'f64'|'u32'|'f32'} type
+ * @property {number} length - Elements
+ * @property {() => Iterable<Uint8Array>} pieces - Its bytes, in order, a piece at a time
+ *
+ * @typedef {Object} KeptParts
+ * @property {'structure'|'sparse'|'dense'} layout - Entry positions to read
+ *   values from the file (`structure`), or the entries' rows and values
+ *   (`sparse`), or every value (`dense`)
+ * @property {number} nRows
+ * @property {number} nCols
+ * @property {number} nnz - Stored entries (`nRows * nCols` for `dense`)
+ * @property {Float64Array|null} columnStart - Where each gene's entries
+ *   start (`sparse`, `structure`): every per-gene array is stored a gene
+ *   after another, each gene's piece checksummed apart
+ * @property {KeptArray[]} arrays
+ *
+ * What a built column store keeps in this browser for a later opening of
+ * the same rows of the same file (`keptParts()` of every store): its arrays,
+ * little-endian as every engine holds them, each a piece at a time so a
+ * store held on disk is never read into memory whole.
+ */
+
+const KEPT_TYPES = Object.freeze({ f64: Float64Array, u32: Uint32Array, f32: Float32Array });
+
+function keptTypeOf(array) {
+  if (array instanceof Float64Array) return 'f64';
+  if (array instanceof Uint32Array) return 'u32';
+  if (array instanceof Float32Array) return 'f32';
+  throw new TypeError('A kept gene index holds float64, uint32 or float32 arrays.');
+}
+
+/** One array of a store in memory (its segments, one after another) as a `KeptArray`. */
+function keptArray(name, segments) {
+  return {
+    name,
+    type: keptTypeOf(segments[0] ?? new Float32Array(0)),
+    length: segments.reduce((sum, segment) => sum + segment.length, 0),
+    *pieces() {
+      for (const segment of segments) {
+        const bytes = new Uint8Array(segment.buffer, segment.byteOffset, segment.byteLength);
+        for (let at = 0; at < bytes.length; at += KEPT_PIECE_BYTES) yield bytes.subarray(at, Math.min(bytes.length, at + KEPT_PIECE_BYTES));
+      }
+    },
+  };
+}
+
+/** One float32 or uint32 file of a store on disk (a synchronous access handle) as a `KeptArray`. */
+function keptFile(name, handle, byteLength) {
+  return {
+    name,
+    type: name === 'rows' ? 'u32' : 'f32',
+    length: byteLength / 4,
+    *pieces() {
+      for (let at = 0; at < byteLength; at += KEPT_PIECE_BYTES) {
+        const piece = new Uint8Array(Math.min(KEPT_PIECE_BYTES, byteLength - at));
+        yield readWhole(handle, piece, at);
+      }
+    },
+  };
+}
+
+function keptPartsOf(layout, store, arrays) {
+  return {
+    layout,
+    nRows: store.nRows,
+    nCols: store.nCols,
+    nnz: layout === 'dense' ? store.nRows * store.nCols : store._columnStart[store.nCols],
+    columnStart: layout === 'dense' ? null : store._columnStart,
+    arrays,
+  };
+}
+
+/**
+ * The error a kept gene index fails a read with when what it holds is not
+ * what its manifest and the file say (damaged on disk): the index is let go
+ * and built again (`RowMajorColumnIndex`), and the kept copy removed.
+ */
+function keptDamage(label, what) {
+  const error = new Error(`The gene index of ${label} kept in this browser is damaged (${what}); it is built again.`);
+  error.code = 'KEPT_INDEX_DAMAGED';
+  return error;
+}
+
+/** Elements `[start, start + count)` of one kept per-gene array, as its type (not checked: `checkedPiece`). */
+async function readKeptElements(kept, name, start, count) {
+  const { type, read } = kept.arrays[name];
+  const Type = KEPT_TYPES[type];
+  if (count === 0) return new Type(0);
+  const bytes = await read(start * Type.BYTES_PER_ELEMENT, count * Type.BYTES_PER_ELEMENT);
+  if (bytes.length !== count * Type.BYTES_PER_ELEMENT) throw keptDamage(kept.label, `${name} is short`);
+  if (bytes.byteOffset % Type.BYTES_PER_ELEMENT === 0) return new Type(bytes.buffer, bytes.byteOffset, count);
+  const aligned = copyTypedArray(Uint8Array, bytes, `The kept ${name}`);
+  return new Type(aligned.buffer, aligned.byteOffset, count);
+}
+
+/**
+ * Gene `column`'s piece of one kept per-gene array, checked against the
+ * CRC-32 written when it was kept (`KeptStore.checks`), so a damaged piece
+ * is never served.
+ */
+function checkedPiece(kept, name, column, piece) {
+  if (!matchesChecksum(new Uint8Array(piece.buffer, piece.byteOffset, piece.byteLength), kept.checks[name][column])) {
+    throw keptDamage(kept.label, `the ${name} of gene ${column} do not match their checksum`);
+  }
+  return piece;
+}
+
+/**
+ * Bytes between two pieces of a kept copy that one read still covers: a
+ * read of the origin-private file system costs about a millisecond before
+ * its first byte (measured: 60,000 reads of a gene's piece, a 10M-cell
+ * index, 70 s in Chromium on an M1 Pro), in which a disk delivers about a
+ * mebibyte. A scheduling choice, measured.
+ */
+const KEPT_READ_GAP_BYTES = 1 << 20;
+
+/**
+ * What reading kept copies whole has cost in this thread: what a kept copy
+ * is priced at against building its index again (`keptReadMs`). Only reads
+ * of at least a piece (`KEPT_PIECE_BYTES`) count, where the time before the
+ * first byte is a small part of the read.
+ */
+const keptLoads = { bytes: 0, ms: 0 };
+
+/** What reading `bytes` of a kept copy is priced at, in ms, from the reads measured in this thread; null until one is. */
+function keptReadMs(bytes) {
+  return keptLoads.ms > 0 ? bytes * keptLoads.ms / keptLoads.bytes : null;
+}
+
+/**
+ * The reads of one kept copy's per-gene arrays (`positions`, `rows`,
+ * `values`), each gene's piece checked the first time it is served
+ * (`checkedPiece`):
+ *
+ * - held whole once loaded (`prepare`): one read of each array, made when
+ *   the first gene is asked for (or the index is wanted ahead of need) and
+ *   the memory kept for gene indexes holds it, as it would hold the index
+ *   built again; every gene from then on is a copy out of memory, exactly
+ *   as from an index built in this opening. Counted in the index's `bytes`
+ *   (the memory model's gene-index share) from the moment it is read;
+ * - until then, and when that memory does not hold it (it stands for a
+ *   store on disk then), the pieces asked for in one task are read
+ *   together, one read per run of pieces less than `KEPT_READ_GAP_BYTES`
+ *   apart: an analysis asks for its genes many at once, so it reads the
+ *   copy in long sequential ranges, never a read per gene (a 10M-cell
+ *   revisit's differential expression read each gene's piece on its own:
+ *   71.7 s against 16.0 s from the index built in memory).
+ */
+class KeptReads {
+  /**
+   * @param {KeptStore} kept
+   * @param {string[]} names - The per-gene arrays a gene reads
+   * @param {{fits: (bytes: number) => boolean, onHeld: (bytes: number) => void}} memory - `fits`: whether
+   *   the memory kept for gene indexes holds `bytes` more now; `onHeld`: told the bytes it holds change by
+   */
+  constructor(kept, names, { fits, onHeld }) {
+    this._kept = kept;
+    this._names = names;
+    this._fits = fits;
+    this._onHeld = onHeld;
+    /** @type {Record<string, ArrayBufferView>} The arrays held whole, once loaded, by name */
+    this._held = {};
+    /** @type {Record<string, Uint8Array>} The genes whose held piece was checked, by array */
+    this._checked = {};
+    /** @type {Array<Object>|null} Pieces asked for in this task */
+    this._pending = null;
+    /** @type {Promise<void>|null} */
+    this._load = null;
+    this._decided = false;
+    this._disposed = false;
+    /** Bytes held in memory (being read or read). */
+    this.heldBytes = 0;
+    /** Bytes of the per-gene arrays, whole. */
+    this.bytes = names.reduce((sum, name) => sum + kept.nnz * KEPT_TYPES[kept.arrays[name].type].BYTES_PER_ELEMENT, 0);
+  }
+
+  /** Read the arrays whole when the memory for gene indexes holds them (once; idempotent). */
+  prepare() {
+    if (this._decided || this._disposed) return;
+    this._decided = true;
+    if (this.bytes === 0 || !this._fits(this.bytes)) return;
+    this._hold(this.bytes);
+    const started = performance.now();
+    this._load = Promise.all(this._names.map(name => readKeptElements(this._kept, name, 0, this._kept.nnz))).then(arrays => {
+      if (this._disposed) return;
+      if (this.bytes >= KEPT_PIECE_BYTES) {
+        keptLoads.bytes += this.bytes;
+        keptLoads.ms += performance.now() - started;
+      }
+      const checked = this._names.map(() => allocateTypedArray(Uint8Array, this._kept.nCols, 'Kept gene index checked genes'));
+      this._names.forEach((name, i) => {
+        this._held[name] = arrays[i];
+        this._checked[name] = checked[i];
+      });
+    }).catch(() => {
+      // Refused (memory) or failed (a short copy): genes are read in runs,
+      // and a damaged piece is found by the gene that reads it.
+      if (!this._disposed) this._hold(-this.heldBytes);
+    });
+  }
+
+  /**
+   * Gene `column`'s piece of array `name`, elements `[start, start + count)`
+   * (every element of the gene), checked.
+   * @returns {Promise<ArrayBufferView>}
+   */
+  piece(name, column, start, count) {
+    let held;
+    try {
+      held = this.held(name, column, start, count);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (held !== null) return Promise.resolve(held);
+    return new Promise((resolve, reject) => {
+      if (this._pending === null) {
+        this._pending = [];
+        nextTask().then(() => this._readPending());
+      }
+      this._pending.push({ name, column, start, count, resolve, reject });
+    });
+  }
+
+  /**
+   * Gene `column`'s piece of array `name` from the arrays held whole, checked
+   * (throws when damaged), or null while they are not held: what an index
+   * built in the opening answers at once, answered at once.
+   * @returns {ArrayBufferView|null}
+   */
+  held(name, column, start, count) {
+    const held = this._held[name];
+    if (held === undefined) {
+      if (count === 0) return new KEPT_TYPES[this._kept.arrays[name].type](0);
+      this.prepare();
+      return null;
+    }
+    const piece = held.subarray(start, start + count);
+    if (count === 0) return piece;
+    const checked = this._checked[name];
+    if (checked[column] === 0) {
+      checkedPiece(this._kept, name, column, piece);
+      checked[column] = 1;
+    }
+    return piece;
+  }
+
+  /** The pieces asked for in one task: one read per run of them, by array. @private */
+  _readPending() {
+    const pending = this._pending;
+    this._pending = null;
+    pending.sort((a, b) => (a.name === b.name ? a.start - b.start : (a.name < b.name ? -1 : 1)));
+    for (let first = 0; first < pending.length;) {
+      const { name, start } = pending[first];
+      const gap = KEPT_READ_GAP_BYTES / KEPT_TYPES[this._kept.arrays[name].type].BYTES_PER_ELEMENT;
+      let end = start + pending[first].count;
+      let last = first + 1;
+      while (last < pending.length && pending[last].name === name && pending[last].start <= end + gap) {
+        end = Math.max(end, pending[last].start + pending[last].count);
+        last++;
+      }
+      const run = pending.slice(first, last);
+      readKeptElements(this._kept, name, start, end - start).then(elements => {
+        for (const item of run) {
+          try {
+            item.resolve(checkedPiece(this._kept, name, item.column, elements.subarray(item.start - start, item.start - start + item.count)));
+          } catch (error) {
+            item.reject(error);
+          }
+        }
+      }, error => {
+        for (const item of run) item.reject(error);
+      });
+      first = last;
+    }
+  }
+
+  /** @private */
+  _hold(bytes) {
+    this.heldBytes += bytes;
+    this._onHeld(bytes);
+  }
+
+  dispose() {
+    this._disposed = true;
+    this._held = {};
+    this._checked = {};
+    this.heldBytes = 0;
+  }
+}
+
+/**
+ * @typedef {Object} KeptStore
+ * @property {'structure'|'sparse'|'dense'} layout
+ * @property {number} nRows - The rows it was built over (an opening may use its first rows only)
+ * @property {number} nCols
+ * @property {number} nnz
+ * @property {Float64Array|null} columnStart - Read at once (`sparse`, `structure`)
+ * @property {Float64Array|null} rowPointers - The row pointers of the rows the
+ *   opening keeps, checked against the file's (`sparse`, `structure`)
+ * @property {Record<string, {type: string, read: (offset: number, length: number) => Promise<Uint8Array>}>} arrays
+ * @property {Record<string, Uint32Array>} checks - The CRC-32 of each gene's
+ *   piece of every per-gene array (`positions`, `rows`, `values`), by name
+ * @property {string} label
+ * @property {() => void} release - Let the kept copy go (the lock this reader holds on it)
+ * @property {() => void} discard - Remove the kept copy (it is damaged)
+ */
+
+/**
+ * The structure of a sparse column store kept in this browser: the column
+ * starts and row pointers in memory, each gene's entry positions from the
+ * kept copy (`KeptReads`: held whole once read when memory holds them, as
+ * the structure built by the pass holds them), its values from the file as
+ * that structure reads them. Over its first `nRows` rows only when the
+ * opening keeps fewer rows than it was built over (its entries are then the
+ * first `entries` of the file's: rows are stored in order).
+ */
+class KeptSparseStructure extends SparseStructure {
+  constructor(kept, { nRows, rowPointers, readValues, storedValueBytes, costs, label, fits }) {
+    super(nRows, kept.nCols, kept.columnStart, rowPointers, readValues, storedValueBytes, costs, label);
+    this._keptCopy = kept;
+    this._reads = new KeptReads(kept, ['positions'], { fits, onHeld: bytes => { this.bytes += bytes; } });
+    // The entries of the rows open: a prefix of every column's.
+    this._nnz = rowPointers[nRows];
+    this._storedValueBytes = storedValueBytes.then(bytes => (bytes > 0 ? bytes : this._nnz * 4), () => this._nnz * 4);
+    this.kind = 'kept';
+  }
+
+  /** Bytes of the kept copy a gene reads from (`keptReadMs`). */
+  get keptBytes() {
+    return this._reads.bytes;
+  }
+
+  /** Hold the kept copy in memory when it fits (`KeptReads`). */
+  prepare() {
+    this._reads.prepare();
+  }
+
+  async _positionsOf(start, count, column) {
+    const read = await this._reads.piece('positions', column, start, count);
+    const limit = this._nnz;
+    const positions = allocateTypedArray(Float64Array, count, 'Gene column entry positions');
+    let open = 0;
+    for (let i = 0; i < count; i++) {
+      const position = read[i];
+      if (!(position >= (i === 0 ? 0 : positions[i - 1] + 1)) || position >= this._keptCopy.nnz) {
+        throw keptDamage(this._label, 'an entry position is out of order');
+      }
+      positions[i] = position;
+      if (position < limit) open = i + 1;
+    }
+    return open === count ? positions : positions.subarray(0, open);
+  }
+
+  dispose() {
+    super.dispose();
+    this._reads.dispose();
+    this._keptCopy?.release();
+    this._keptCopy = null;
+  }
+}
+
+/** A sparse column store kept in this browser: each gene's rows and values from the kept copy (`KeptReads`). */
+class KeptSparseStore {
+  constructor(kept, { nRows, fits }) {
+    this.nRows = nRows;
+    this.nCols = kept.nCols;
+    this._kept = kept;
+    this._columnStart = kept.columnStart;
+    this.kind = 'kept';
+    // The kept copy's column starts, and its row pointers where it holds
+    // them in memory (a structure kept with them: a row each).
+    this.bytes = kept.columnStart.byteLength + (ArrayBuffer.isView(kept.rowPointers) ? kept.rowPointers.byteLength : 0);
+    this._reads = new KeptReads(kept, ['rows', 'values'], { fits, onHeld: bytes => { this.bytes += bytes; } });
+  }
+
+  /** Bytes of the kept copy a gene reads from (`keptReadMs`). */
+  get keptBytes() {
+    return this._reads.bytes;
+  }
+
+  /** Hold the kept copy in memory when it fits (`KeptReads`). */
+  prepare() {
+    this._reads.prepare();
+  }
+
+  /**
+   * One column's entries on the rows open, checked: at once from the copy
+   * held whole (its rows checked once), else a promise of them. @private
+   */
+  _entries(column) {
+    const start = this._columnStart[column];
+    const count = this._columnStart[column + 1] - start;
+    const rows = this._reads.held('rows', column, start, count);
+    const values = rows === null ? null : this._reads.held('values', column, start, count);
+    if (values !== null) {
+      // Held: what the rows open are is found once (they never change).
+      this._openCounts ??= allocateTypedArray(Float64Array, this.nCols, 'Kept gene index open entries').fill(-1);
+      if (this._openCounts[column] < 0) this._openCounts[column] = this._open(rows, count);
+      return { rows, values, count: this._openCounts[column] };
+    }
+    return Promise.all([
+      this._reads.piece('rows', column, start, count),
+      this._reads.piece('values', column, start, count),
+    ]).then(([read, readValues]) => ({ rows: read, values: readValues, count: this._open(read, count) }));
+  }
+
+  /** How many of a gene's entries lie on the rows open, its rows checked. @private */
+  _open(rows, count) {
+    let open = 0;
+    for (let i = 0; i < count; i++) {
+      if (!(rows[i] < this._kept.nRows) || (i > 0 && rows[i] < rows[i - 1])) throw keptDamage(this._kept.label, 'a row is out of order');
+      if (rows[i] < this.nRows) open = i + 1;
+    }
+    return open;
+  }
+
+  column(column) {
+    const dense = ({ rows, values, count }) => {
+      const result = allocateTypedArray(Float32Array, this.nRows, 'Gene column');
+      for (let i = 0; i < count; i++) result[rows[i]] = addFloat32(result[rows[i]], values[i]);
+      return result;
+    };
+    const entries = this._entries(column);
+    return entries instanceof Promise ? entries.then(dense) : dense(entries);
+  }
+
+  sparseColumn(column) {
+    const sparse = ({ rows, values, count }) => sparseColumnOf(rows, values, count, this.nRows);
+    const entries = this._entries(column);
+    return entries instanceof Promise ? entries.then(sparse) : sparse(entries);
+  }
+
+  dispose() {
+    this._reads.dispose();
+    this._kept?.release();
+    this._kept = null;
+  }
+}
+
+/** A dense column store kept in this browser: each gene's values on the rows open, from the kept copy (`KeptReads`). */
+class KeptDenseStore {
+  constructor(kept, { nRows, fits }) {
+    this.nRows = nRows;
+    this.nCols = kept.nCols;
+    this._kept = kept;
+    this.kind = 'kept';
+    this.bytes = 0;
+    this._reads = new KeptReads(kept, ['values'], { fits, onHeld: bytes => { this.bytes += bytes; } });
+  }
+
+  /** Bytes of the kept copy a gene reads from (`keptReadMs`). */
+  get keptBytes() {
+    return this._reads.bytes;
+  }
+
+  /** Hold the kept copy in memory when it fits (`KeptReads`). */
+  prepare() {
+    this._reads.prepare();
+  }
+
+  column(column) {
+    // The gene's whole piece (checked), the open rows kept of it: a copy
+    // out of the copy held whole, at once; else read, and copied unless the
+    // piece owns its buffer (one read with other genes' pieces is shared).
+    const start = column * this._kept.nRows;
+    const held = this._reads.held('values', column, start, this._kept.nRows);
+    if (held !== null) return held.slice(0, this.nRows);
+    return this._reads.piece('values', column, start, this._kept.nRows).then(values =>
+      (values.byteOffset === 0 && values.length === this.nRows && values.length === values.buffer.byteLength / 4 ? values : values.slice(0, this.nRows)));
+  }
+
+  sparseColumn(column) {
+    const dense = this.column(column);
+    return dense instanceof Promise ? dense.then(sparseColumnOfDense) : sparseColumnOfDense(dense);
+  }
+
+  dispose() {
+    this._reads.dispose();
+    this._kept?.release();
+    this._kept = null;
+  }
+}
+
+/**
+ * The store an index starts from when its gene index is kept in this
+ * browser (`RowMajorColumnIndex`, `kept`), over the opening's first `nRows`
+ * rows of those it was built over.
+ *
+ * @param {KeptStore} kept
+ * @param {{nRows: number, rowPointers?: Float64Array|null, readValues?: Function, storedValueBytes?: Promise<number|null>,
+ *   costs?: () => RequestCosts, label: string, fits: (bytes: number) => boolean}} context - `rowPointers`: the open
+ *   rows' (a structure); `fits`: whether the memory kept for gene indexes holds `bytes` more now (`KeptReads`)
+ */
+function openKeptStore(kept, context) {
+  if (kept.layout === 'structure') return new KeptSparseStructure(kept, context);
+  if (kept.layout === 'sparse') return new KeptSparseStore(kept, context);
+  return new KeptDenseStore(kept, context);
+}
+
+/**
+ * Whether an error is the disk refusing to grow a file (the origin's storage
+ * quota, or a full disk).
+ */
+function isDiskFull(error) {
+  return error?.name === 'QuotaExceededError' || /quota|no space/i.test(error?.message ?? '');
+}
+
 /**
  * Where a column store is kept: in memory when it fits `memoryBudgetBytes`,
- * on disk when `openDiskFiles` can provide files, in memory regardless when
- * the disk cannot, and nowhere (columns are scanned) when nothing can hold it.
+ * on disk when `openDiskFiles` can provide files and the disk has room for
+ * it, in memory regardless when the disk cannot, and nowhere when nothing can
+ * hold it. Then `store` is null and `refusal` says why, in words a person
+ * reads (`… needs 32 GB: more than …`): columns are answered by scanning,
+ * and the person is told so.
  *
  * @param {Object} options
  * @param {number} options.memoryBudgetBytes - A residency policy, not a limit
  * @param {((names: string[]) => Promise<Object|null>)|null} [options.openDiskFiles]
  *   Synchronous access handles by name, or null when there is no disk.
+ * @param {((needed: number, options: {makeRoom: boolean}) => Promise<number|null>)|null} [options.diskFreeBytes] - The
+ *   bytes this origin may still store (its quota less its usage) for a
+ *   store of `needed` bytes, counting what it may free for it (removed
+ *   with `makeRoom`, as the store is placed), or null when the browser does
+ *   not say.
  */
-export function createColumnStoreFactory({ memoryBudgetBytes, openDiskFiles = null }) {
+export function createColumnStoreFactory({ memoryBudgetBytes, openDiskFiles = null, diskFreeBytes = null }) {
   const inMemory = create => {
     try {
-      return create();
+      return { store: create(), failure: null };
     } catch (error) {
       if (error?.code !== 'TOO_LARGE') throw error;
-      return null;
+      return { store: null, failure: error };
     }
   };
+  /** Where `bytes` would be kept, without making anything: what `place` will do (`makeRoom`: as it does). */
+  const plan = async (bytes, { makeRoom = false } = {}) => {
+    if (bytes <= memoryBudgetBytes) return { kind: 'memory', refusal: null };
+    if (openDiskFiles === null) {
+      return { kind: null, refusal: refusalOf(bytes, 'this browser gives this page no disk storage') };
+    }
+    const free = diskFreeBytes === null ? null : await diskFreeBytes(bytes, { makeRoom }).catch(() => null);
+    if (free !== null && free < bytes) {
+      return {
+        kind: null,
+        refusal: refusalOf(bytes, `${formatBytes(free)} of disk storage is left to this site`),
+      };
+    }
+    return { kind: 'disk', refusal: null };
+  };
+  const refusalOf = (bytes, disk) =>
+    `the gene index needs ${formatBytes(bytes)}: more than the ${formatBytes(memoryBudgetBytes)} ` +
+    `of memory this browser keeps for it, and ${disk}`;
+  /**
+   * Make a store of `bytes` with `create` (memory) or `createDisk(files)`.
+   * @returns {Promise<{store: Object|null, refusal: string|null}>}
+   */
+  const place = async (bytes, names, create, createDisk) => {
+    const planned = await plan(bytes, { makeRoom: true });
+    if (planned.kind === 'memory') {
+      const { store } = inMemory(create);
+      if (store !== null) return { store, refusal: null };
+    }
+    // Over the budget (or refused by the browser within it): the disk.
+    let disk = planned.refusal;
+    if (disk === null) {
+      const files = openDiskFiles === null ? null : await openDiskFiles(names);
+      if (files === null) {
+        disk = refusalOf(bytes, 'the browser could not open disk storage for it');
+      } else {
+        try {
+          return { store: createDisk(files), refusal: null };
+        } catch (error) {
+          for (const name of names) {
+            try { files[name].close(); } catch { /* already closed */ }
+          }
+          files.release?.();
+          if (!isDiskFull(error)) throw error;
+          disk = refusalOf(bytes, `the disk refused it (${error.message})`);
+        }
+      }
+    }
+    // No disk either: memory regardless, when the browser allows it.
+    const { store, failure } = inMemory(create);
+    if (store !== null) return { store, refusal: null };
+    return { store: null, refusal: `${disk}; ${failure.message}` };
+  };
   return {
-    async sparse(nRows, nCols, columnStart, label) {
+    plan,
+    /** The memory a store may take before it goes to disk. */
+    memoryBudgetBytes,
+    /**
+     * The same placement with `bytes` of memory: an index built in parts
+     * (`anndata/prefix-column-index.js`) gives each part what the parts
+     * before it left.
+     */
+    withMemoryBudget: bytes => createColumnStoreFactory({ memoryBudgetBytes: bytes, openDiskFiles, diskFreeBytes }),
+    sparse(nRows, nCols, columnStart, label) {
       const bytes = columnStart[nCols] * 8 + nCols * 16;
-      const create = () => new MemorySparseStore(nRows, nCols, columnStart, label);
-      if (bytes <= memoryBudgetBytes) {
-        const store = inMemory(create);
-        if (store !== null) return store;
-      }
-      const files = openDiskFiles === null ? null : await openDiskFiles(['rows', 'values']);
-      if (files !== null) return new DiskSparseStore(nRows, nCols, columnStart, files, label);
-      return inMemory(create);
+      return place(
+        bytes,
+        ['rows', 'values'],
+        () => new MemorySparseStore(nRows, nCols, columnStart, label),
+        files => new DiskSparseStore(nRows, nCols, columnStart, files, label)
+      );
     },
-    async dense(nRows, nCols, label) {
-      const bytes = nRows * nCols * 4;
-      const create = () => new MemoryDenseStore(nRows, nCols, label);
-      if (bytes <= memoryBudgetBytes) {
-        const store = inMemory(create);
-        if (store !== null) return store;
-      }
-      const files = openDiskFiles === null ? null : await openDiskFiles(['values']);
-      if (files !== null) return new DiskDenseStore(nRows, nCols, files);
-      return inMemory(create);
+    dense(nRows, nCols, label) {
+      return place(
+        nRows * nCols * 4,
+        ['values'],
+        () => new MemoryDenseStore(nRows, nCols, label),
+        files => new DiskDenseStore(nRows, nCols, files)
+      );
     },
   };
 }
@@ -1004,6 +1781,62 @@ function* denseSlabs(nRows, rowsPerSlab) {
   }
 }
 
+/** The error a build stops with when no gene waits for it any more. */
+function stoppedError(label) {
+  const stopped = cancelled('superseded', `Indexing ${label} stopped: no gene waits for it any more`);
+  stopped.indexStopped = true;
+  return stopped;
+}
+
+/**
+ * How a sparse row-major matrix is indexed (`RowMajorColumnIndex`), decided
+ * before anything is read, so its cost can be told before the first gene:
+ *
+ * - pass 1 reads every row pointer and column index (and every value too
+ *   when values are not read on demand, while a gene waits);
+ * - the indices pass 1 reads are kept for what follows when they fit
+ *   `retainIndicesBytes` (beside the store pass 2 fills, read ahead); kept
+ *   indices are narrowed to the smallest type holding a column (a matrix of
+ *   up to 65,536 genes keeps 2 bytes an entry, not 4); read ahead, the values
+ *   a waiting gene made pass 1 read are kept too when every value fits beside
+ *   them (`keepsValues`);
+ * - over a link slower than a disk (`valuesOnDemand`) with the indices kept,
+ *   the index is their structure (`MemorySparseStructure`, `structureBytes`
+ *   resident: a position per entry and the row pointers) and there is no
+ *   second pass; when the values are stored in chunks read whole
+ *   (`valuesInWholeChunks`: compressed or filtered) and every value fits
+ *   beside the kept indices (`buysValues`), a gene that waits makes the pass
+ *   read every slab's values beside its indices, in the same round trip, and
+ *   they are kept: the first gene was priced with them (`subsample-plan.js`
+ *   `firstGeneReadCost`), and each later gene would otherwise read the
+ *   chunks its entries lie in, a round trip or more each (on a CELLxGENE
+ *   atlas, a gene sample's third gene: 316 requests);
+ * - otherwise pass 2 reads the row pointers again, the indices unless kept,
+ *   and the values unless kept, into a column store of `storeBytes`
+ *   (`createColumnStoreFactory` places it: memory, disk, or nowhere).
+ *
+ * @param {{nnz: number, nCols: number, nRows?: number, valuesOnDemand: boolean, retainIndicesBytes: number, valuesInWholeChunks?: boolean}} matrix
+ * @returns {{passes: 1|2, keepsIndices: boolean, keepsValues: boolean, buysValues: boolean, KeptIndex: Function, keepBudget: number, storeBytes: number, structureBytes: number}}
+ */
+export function sparseIndexPlan({ nnz, nCols, nRows = 0, valuesOnDemand, retainIndicesBytes, valuesInWholeChunks = false }) {
+  const KeptIndex = nCols <= 0x100 ? Uint8Array : (nCols <= 0x10000 ? Uint16Array : Uint32Array);
+  const storeBytes = nnz * 8 + nCols * 16;
+  // What pass 1 keeps for pass 2 shares the index budget with the store
+  // pass 2 fills (8 bytes an entry): together they never exceed it.
+  const keepBudget = Math.max(0, retainIndicesBytes - (valuesOnDemand ? 0 : storeBytes));
+  const keepsIndices = nnz * KeptIndex.BYTES_PER_ELEMENT <= keepBudget;
+  return {
+    passes: valuesOnDemand && keepsIndices ? 1 : 2,
+    keepsIndices,
+    KeptIndex,
+    keepBudget,
+    keepsValues: !valuesOnDemand && keepsIndices && nnz * (KeptIndex.BYTES_PER_ELEMENT + 4) <= keepBudget,
+    buysValues: valuesOnDemand && valuesInWholeChunks && keepsIndices && nnz * (KeptIndex.BYTES_PER_ELEMENT + 4) <= keepBudget,
+    storeBytes,
+    structureBytes: nnz * (nnz <= 0xffffffff ? 4 : 8) + (nRows + 1 + nCols + 1) * 8,
+  };
+}
+
 /**
  * Columns of one row-major matrix, built in the background and served
  * progressively.
@@ -1015,7 +1848,9 @@ export class RowMajorColumnIndex {
    * @param {number} options.nRows
    * @param {number} options.nCols
    * @param {number} [options.nnz] - Sparse only
-   * Every reader returns a promise of the values read from the store.
+   * Every reader returns a promise of the values read from the store; the
+   * index's own reads get `{signal}`, which aborts when the build stops (a
+   * read already sent is let go; one still queued is never sent).
    * @param {(start: number, end: number) => Promise<ArrayLike<number|bigint>>} [options.readRowPointers]
    * @param {(start: number, end: number) => Promise<ArrayLike<number|bigint>>} [options.readIndices]
    * @param {(start: number, end: number) => Promise<Float32Array>} [options.readValues]
@@ -1025,6 +1860,10 @@ export class RowMajorColumnIndex {
    *   and read each gene's values as it is asked for (a matrix read over a
    *   link slower than a disk); the indices are kept within
    *   `retainIndicesBytes` to build it
+   * @param {boolean} [options.valuesInWholeChunks] - With `valuesOnDemand`:
+   *   the values are stored in chunks read whole (compressed or filtered), so
+   *   a waiting gene's pass reads them all beside the indices when they fit
+   *   (`sparseIndexPlan` `buysValues`)
    * @param {() => Promise<number|null>} [options.valuesStoredBytes] - With
    *   `valuesOnDemand`: the stored (compressed) bytes of every value, which
    *   weigh reading genes' value ranges against reading every value once
@@ -1035,6 +1874,37 @@ export class RowMajorColumnIndex {
    * @param {(waited: boolean) => Promise<void>} [options.yieldControl] - Called between
    *   parts of the work, with whether a read waits for the index
    * @param {(event: Object) => void} [options.onProgress]
+   * @param {(reads: {indices: Array<[number, number]>, values: Array<[number, number]>}) => void} [options.onSecondPass] -
+   *   Called as pass 2 starts, with the entry ranges of the indices and values
+   *   it reads (the row pointers are read whole)
+   * @param {(work: {entries: number, ms: number}) => void} [options.onWork] -
+   *   Called once a pass builds the index, with the entries it indexed and
+   *   the milliseconds of its own work (its parts, the structure filled, a
+   *   dense slab placed: not the reads it waited for)
+   * @param {(build: Promise<void>) => void} [options.onBuild] - Called as each
+   *   build starts (the first, and one started again after a stop), with its
+   *   promise
+   * @param {(reason: string) => ((error: Error|null) => void)|null} [options.onUnindexedScan] -
+   *   Called as each scan of a matrix that has no index starts (nothing could
+   *   hold it: `reason` says why), so the scan is shown as the read it is;
+   *   returns what to call when the scan ends
+   * @param {KeptStore|null} [options.kept] - The index of these rows kept in
+   *   this browser from an earlier opening (`anndata/kept-column-index.js`):
+   *   the index is built from the start, and nothing is read but genes. When
+   *   a read finds it damaged, it is removed (`discard`) and the index is
+   *   built as if nothing were kept (and `onBuilt` told, so it is kept
+   *   again).
+   * @param {(store: Object) => void} [options.onBuilt] -
+   *   Called once the index is built by a pass (not one started from `kept`,
+   *   until that is found damaged), with its store, whose `keptParts()` it
+   *   may keep for a later opening; and again with the same store once a
+   *   structure built without its values holds every value (a later gene
+   *   read them whole): what it keeps then holds the values too
+   * @param {(() => number|null)|null} [options.rebuildMs] - What building the
+   *   index by a pass is priced at now, in ms (null: not priced): a kept
+   *   index whose reading is priced higher (`keptReadMs`, measured in this
+   *   thread) is let go at its first gene and the index built instead (and
+   *   not kept again: the kept copy stays for a later opening to price)
    * @param {string} [options.label]
    */
   constructor(options) {
@@ -1046,7 +1916,6 @@ export class RowMajorColumnIndex {
     this._requests = new Map();
     this._build = null;
     this._disposed = false;
-    this._failure = null;
     this._scanning = null;
     this._retired = false;
     this._filling = null;
@@ -1058,7 +1927,91 @@ export class RowMajorColumnIndex {
     this._done = 0;
     /** Entries one part of a slab's work handles (`_sliced`), from its measured rate. */
     this._sliceEntries = 1 << 16;
+    /** Milliseconds of the build's own work so far (`onWork`): its parts, the structure filled, a dense slab placed. */
+    this._workMs = 0;
+    /** Whether the index was asked for ahead of need (`start({ahead: true})`): it is then built whoever waits. */
+    this._ahead = false;
+    /** Set when the last gene waiting for a build asked for on demand withdrew: the build stops. */
+    this._stopping = false;
+    /** The stop that waits one round trip for another gene (`_withdraw`). */
+    this._stopTimer = null;
+    /** @type {AbortController|null} The current build's reads */
+    this._abort = null;
+    /** Whether a gene was served from the current build: it then never stops. */
+    this._served = false;
+    /** Why no store could hold the index, once that is known (`phase` `unindexed`). */
+    this.unindexedReason = null;
     this.phase = 'idle';
+    /** Whether a store built here is told to `onBuilt` (not one built because its kept copy costs more to read). */
+    this._keepsBuilt = true;
+    /** Whether a kept index was priced against building it (`_keptReady`). */
+    this._keptPriced = false;
+    const kept = options.kept ?? null;
+    if (kept !== null) {
+      this._store = openKeptStore(kept, {
+        nRows: this.nRows,
+        rowPointers: kept.rowPointers,
+        readValues: options.readValues,
+        storedValueBytes: Promise.resolve().then(() => options.valuesStoredBytes?.() ?? null),
+        costs: () => this._costs(),
+        label: this._label,
+        // Held whole when it fits what a store built here would be placed in memory within.
+        fits: bytes => bytes <= (options.storeFactory?.memoryBudgetBytes ?? 0),
+      });
+      this._store._storedValueBytes?.catch?.(() => {});
+      this._columnStart = kept.columnStart;
+      this._keptCopy = kept;
+      this.phase = 'ready';
+      // Built: `start` has nothing to do.
+      this._build = Promise.resolve();
+    }
+  }
+
+  /**
+   * Read one column from the built store; a kept index found damaged is
+   * let go and removed, and the column is read as from an index never kept
+   * (the next build). @private
+   */
+  _fromStore(read, column, options) {
+    const store = this._store;
+    return Promise.resolve().then(() => store[read](column)).catch(error => {
+      if (error?.code !== 'KEPT_INDEX_DAMAGED' || this._store !== store) throw error;
+      console.warn(`[RowMajorColumnIndex] ${error.message}`);
+      this._keptCopy?.discard();
+      this._letGoKept();
+      return read === 'column' ? this.column(column, options) : this.sparseColumn(column, options);
+    });
+  }
+
+  /** Let go of the kept index this index started from: the next gene builds it. @private */
+  _letGoKept() {
+    this._keptCopy = null;
+    this._store.dispose();
+    this._store = null;
+    this._columnStart = null;
+    this._build = null;
+    this.phase = 'idle';
+  }
+
+  /**
+   * Whether the index is built, a kept one priced first, at its first gene
+   * (or when it is wanted ahead of need): reading it is priced at the rate
+   * kept copies were read in this thread (`keptReadMs`), building it at
+   * `rebuildMs`. One priced higher is let go and the index built instead,
+   * not kept again (the kept copy stays: a later opening prices it again);
+   * one priced lower, or not priced, is read. @private
+   */
+  _keptReady() {
+    if (this.phase === 'ready' && this._store?.kind === 'kept' && !this._keptPriced) {
+      this._keptPriced = true;
+      const keptMs = keptReadMs(this._store.keptBytes);
+      const rebuildMs = this._options.rebuildMs?.() ?? null;
+      if (keptMs !== null && rebuildMs !== null && keptMs > rebuildMs) {
+        this._letGoKept();
+        this._keepsBuilt = false;
+      }
+    }
+    return this.phase === 'ready';
   }
 
   /** Whether a sparse matrix's values stay in the file until a gene needs them. */
@@ -1072,7 +2025,7 @@ export class RowMajorColumnIndex {
     if (link === null || !link.measured) return PRIOR_COSTS;
     // Requests that really run at once: an HTTP/1.1 host runs six of the
     // many dispatched to it until it is shown to multiplex.
-    return { mergeGapBytes: link.mergeGapBytes, roundTripBytes: link.roundTripBytes, concurrency: link.shapingConcurrency ?? link.concurrency };
+    return { mergeGapBytes: link.mergeGapBytes, roundTripBytes: link.roundTripBytes, shapingConcurrency: link.shapingConcurrency ?? link.concurrency };
   }
 
   /**
@@ -1083,7 +2036,7 @@ export class RowMajorColumnIndex {
   _slabsAhead() {
     const link = this._options.link?.() ?? null;
     const slabBytes = (this._options.slabEntries ?? (1024 * 1024)) * 4;
-    const running = link?.backgroundConcurrency ?? link?.concurrency ?? PRIOR_COSTS.concurrency;
+    const running = link?.backgroundConcurrency ?? link?.concurrency ?? PRIOR_COSTS.shapingConcurrency;
     const filling = link?.measured && link.roundTripBytes !== null
       ? Math.ceil(link.roundTripBytes / slabBytes) + 1
       : running;
@@ -1095,35 +2048,150 @@ export class RowMajorColumnIndex {
     return this._store?.kind ?? null;
   }
 
-  /** Start building in the background (idempotent); resolves when built. */
-  start() {
+  /**
+   * Start building in the background (idempotent); resolves when built.
+   * `ahead`: the index is wanted ahead of need (`prepareMatrix`), and is
+   * built whoever waits; otherwise the build is for the genes asked for, and
+   * stops when the last of them withdraws (`column(…, {signal})`): a person
+   * who cancels the only gene a slow scan was for stops its transfer. A
+   * stopped build goes on at the next gene from where it stopped: the slabs
+   * pass 1 counted are kept (`_pass1`), never read again. A failed one
+   * starts over.
+   */
+  start({ ahead = false } = {}) {
+    if (ahead) {
+      this._ahead = true;
+      // A kept index wanted ahead of need is read whole now, as one built would be.
+      if (this._keptReady() && this._store?.kind === 'kept') this._store.prepare();
+    }
     if (this._build === null) {
-      this._build = this._run().catch(error => {
-        this._failure = error;
+      this._abort = new AbortController();
+      const build = this._run().catch(error => {
+        if (this._build === build && (error?.indexStopped === true || this._stopping)) {
+          this._reset({ keepPass: true });
+          // A gene asked for while the build stopped starts the next one.
+          if (this._requests.size > 0 && !this._disposed) this.start();
+          throw stoppedError(this._label);
+        }
+        // The genes waiting for this build fail with it; the next gene asked
+        // for starts a new build, so a read that failed once (a dropped
+        // connection, a host that stopped answering for a while) is made
+        // again then, never answered by this failure.
+        if (this._build === build) this._reset();
         for (const request of this._requests.values()) request.reject(error);
         this._requests.clear();
         throw error;
       });
+      this._build = build;
       // A background failure reaches callers through their requests.
       this._build.catch(() => {});
+      this._options.onBuild?.(build);
     }
     return this._build;
   }
 
+  /** The options of the index's own reads: the current build's signal. @private */
+  _reads() {
+    return { signal: this._abort?.signal ?? null };
+  }
+
   /**
-   * One column as a dense float32 vector.
+   * Forget a stopped or failed build: the next gene starts a new one, from
+   * where pass 1 stopped when `keepPass` (a build stopped because nobody
+   * waited any more: what it counted is sound), else from the start (a
+   * failure: what it counted may be what failed). @private
+   */
+  _reset({ keepPass = false } = {}) {
+    this._releaseBuildState();
+    if (!keepPass) this._releasePass();
+    this._filling?.dispose();
+    this._filling = null;
+    this._build = null;
+    this._abort = null;
+    this._stopping = false;
+    this._served = false;
+    this._columnStart = null;
+    // A pass kept goes on from where it is (its share counts as done).
+    const pass = this._pass1 ?? null;
+    const nnz = this._options.nnz ?? 0;
+    this._done = pass === null || nnz === 0 ? 0 : pass.nextEntry / (pass.slabs !== null ? nnz : 2 * nnz);
+    this.phase = 'idle';
+  }
+
+  /**
+   * Let go of what pass 2 holds of pass 1 (the indices and values pass 1
+   * kept for it): a build that stopped or failed keeps none of it. @private
+   */
+  _releaseBuildState() {
+    this._retainedIndices = null;
+    this._retainedValues = null;
+  }
+
+  /** Let go of pass 1's counted slabs (`_pass1`) and the values it read whole for waiting genes. @private */
+  _releasePass() {
+    this._pass1 = null;
+    this._besideKept = [];
+    this._besideSpent = 0;
+  }
+
+  /**
+   * One waiting gene withdrew (its caller's signal aborted): it stops being
+   * extracted once nobody else waits for it, and a build no one waits for any
+   * more, not asked for ahead, stops. @private
+   */
+  _withdraw(request) {
+    request.waiters--;
+    if (request.waiters > 0 || this._requests.get(request.column) !== request) return;
+    this._requests.delete(request.column);
+    // A build asked for on demand, or a scan of a matrix with no index,
+    // stops: its reads stop now, those queued are never sent. Only while
+    // nothing was served from it: once a gene was (at the end of pass 1),
+    // the work it paid for is the index's, and the build goes on.
+    if (this._requests.size === 0 && this._stoppable()) {
+      // Not at once: one round trip of the link later (none for a local
+      // file). A gene asked for instead of the one withdrawn (a person picks
+      // another) reaches the index within it and joins the pass under way,
+      // its reads in flight kept; stopping saves only what the link moves
+      // after that, and stopping at once would have cost the next gene those
+      // reads again.
+      clearTimeout(this._stopTimer);
+      const graceMs = this._options.link?.()?.latencyMs ?? 0;
+      const stop = () => {
+        this._stopTimer = null;
+        if (this._requests.size > 0 || !this._stoppable()) return;
+        this._stopping = true;
+        this._abort?.abort(stoppedError(this._label));
+      };
+      if (graceMs > 0) this._stopTimer = setTimeout(stop, graceMs);
+      else stop();
+    }
+    this._releaseIfRetired();
+  }
+
+  /** Whether a build or scan stops when nobody waits for it (see `_withdraw`). @private */
+  _stoppable() {
+    const building = !this._ahead && this._build !== null && this.phase === 'counting' && !this._served;
+    const scanning = this.phase === 'unindexed' && this._scanning !== null;
+    return building || scanning;
+  }
+
+  /**
+   * One column as a dense float32 vector. `signal` withdraws this caller:
+   * its promise rejects with the abort reason, and when it was the last
+   * caller waiting for the index, a build asked for on demand stops.
    *
    * @param {number} column
+   * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Float32Array>}
    */
-  column(column) {
+  column(column, { signal = null } = {}) {
     if (!Number.isSafeInteger(column) || column < 0 || column >= this.nCols) {
       return Promise.reject(new RangeError(`Column index ${column} is out of bounds`));
     }
-    if (this._failure !== null) return Promise.reject(this._failure);
-    if (this.phase === 'ready') {
-      return Promise.resolve(this._store.column(column));
+    if (this._keptReady()) {
+      return this._fromStore('column', column, { signal });
     }
+    if (signal?.aborted) return Promise.reject(signal.reason);
     const restartScan = this.phase === 'unindexed';
     let request = this._requests.get(column);
     if (request === undefined) {
@@ -1138,14 +2206,36 @@ export class RowMajorColumnIndex {
         promise,
         resolve,
         reject,
-        values: new Float32Array(this.nRows),
+        values: allocateTypedArray(Float32Array, this.nRows, 'Gene column'),
         rowsSeen: 0,
+        waiters: 0,
       };
       this._requests.set(column, request);
     }
-    if (restartScan) this._scanWhileRequested().catch(error => request.reject(error));
+    request.waiters++;
+    // A gene asked for while a stop waits its grace keeps the pass going.
+    clearTimeout(this._stopTimer);
+    this._stopTimer = null;
+    if (restartScan) this._scanForRequests();
     else this.start();
-    return request.promise;
+    if (signal === null) return request.promise;
+    const entry = request;
+    return new Promise((resolve, reject) => {
+      const stopWaiting = onAbort(signal, () => {
+        this._withdraw(entry);
+        reject(signal.reason);
+      });
+      entry.promise.then(
+        values => {
+          stopWaiting();
+          resolve(values);
+        },
+        error => {
+          stopWaiting();
+          reject(error);
+        }
+      );
+    });
   }
 
   /**
@@ -1153,14 +2243,14 @@ export class RowMajorColumnIndex {
    * it is built, else extracted from the passes under way as `column` is.
    *
    * @param {number} column
+   * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<SparseColumn>}
    */
-  sparseColumn(column) {
-    if (this.phase === 'ready' && this._failure === null &&
-        Number.isSafeInteger(column) && column >= 0 && column < this.nCols) {
-      return Promise.resolve(this._store.sparseColumn(column));
+  sparseColumn(column, options = {}) {
+    if (Number.isSafeInteger(column) && column >= 0 && column < this.nCols && this._keptReady()) {
+      return this._fromStore('sparseColumn', column, options);
     }
-    return this.column(column).then(sparseColumnOfDense);
+    return this.column(column, options).then(sparseColumnOfDense);
   }
 
   /**
@@ -1175,9 +2265,14 @@ export class RowMajorColumnIndex {
     return start === null ? null : start[column + 1] - start[column];
   }
 
-  /** Bytes the built store holds in memory (null until it is built; 0 on disk). */
+  /** Bytes the built store holds in memory (null until it is built; 0 on disk; a kept one's column starts and row pointers). */
   get storeBytes() {
-    return this.phase === 'ready' ? (this._store.kind === 'memory' ? this._store.bytes : 0) : null;
+    return this.phase === 'ready' ? (this._store.kind === 'disk' ? 0 : this._store.bytes) : null;
+  }
+
+  /** Whether the index was kept in this browser from an earlier opening (not built by a pass here). */
+  get kept() {
+    return this.phase === 'ready' && this._store?.kind === 'kept';
   }
 
   /** The share of the build still to do, 0 once it is built. */
@@ -1203,8 +2298,11 @@ export class RowMajorColumnIndex {
   dispose() {
     if (this._disposed) return;
     this._disposed = true;
+    clearTimeout(this._stopTimer);
+    this._stopTimer = null;
     this._store?.dispose();
     this._store = null;
+    this._releasePass();
     // A store still being filled is released too (its disk files removed).
     this._filling?.dispose();
     this._filling = null;
@@ -1230,6 +2328,7 @@ export class RowMajorColumnIndex {
     if (this._disposed) {
       throw new Error(`${this._label} was released; the request was superseded`);
     }
+    if (this._stopping) throw stoppedError(this._label);
   }
 
   /**
@@ -1249,6 +2348,7 @@ export class RowMajorColumnIndex {
       work({ ...slab, rowStart: row, rowEnd: end, pointerOffset: pointerOffset + row - rowStart });
       const entries = pointers[pointerOffset + end - rowStart] - pointers[pointerOffset + row - rowStart];
       const elapsed = performance.now() - started;
+      this._workMs += elapsed;
       if (entries > 0 && elapsed > 0) {
         this._sliceEntries = Math.max(1, Math.round(entries * INDEX_SLICE_MS / elapsed));
       }
@@ -1257,9 +2357,12 @@ export class RowMajorColumnIndex {
     }
   }
 
-  /** The requests waiting at this slab boundary, by column. */
+  /**
+   * The requests waiting at this slab boundary, by column. A stopping build
+   * serves none: a gene asked for meanwhile is served whole by the next.
+   */
   _active() {
-    return this._requests.size === 0 ? null : new Map(this._requests);
+    return this._requests.size === 0 || this._stopping ? null : new Map(this._requests);
   }
 
   /** Count the rows one slab gave each active request; resolve complete ones. */
@@ -1269,6 +2372,7 @@ export class RowMajorColumnIndex {
       request.rowsSeen += rows;
       if (request.rowsSeen >= this.nRows && this._requests.get(request.column) === request) {
         this._requests.delete(request.column);
+        this._served = true;
         request.resolve(request.values);
       }
     }
@@ -1276,11 +2380,18 @@ export class RowMajorColumnIndex {
   }
 
   _resolveFromStore() {
+    // The build's own work, per entry indexed (what a share weighs a pass by: `onWork`).
+    const entries = this._options.layout === 'dense' ? this.nRows * this.nCols : this._options.nnz;
+    if (entries > 0 && this._workMs > 0) this._options.onWork?.({ entries, ms: this._workMs });
+    this._workMs = 0;
+    if (this._requests.size > 0) this._served = true;
     for (const request of this._requests.values()) {
       request.resolve(this._store.column(request.column));
     }
     this._requests.clear();
     this._releaseIfRetired();
+    // A store built here (never one kept) may be kept for a later opening.
+    if (!this._disposed && this._keepsBuilt) this._options.onBuilt?.(this._store);
   }
 
   async _run() {
@@ -1294,11 +2405,11 @@ export class RowMajorColumnIndex {
     const rowsPerSlab = Math.max(1, Math.floor(slabEntries / Math.max(1, nCols)));
     this.phase = 'indexing';
     await this._checkpoint();
-    const store = await storeFactory.dense(nRows, nCols, this._label);
+    const { store, refusal } = await storeFactory.dense(nRows, nCols, this._label);
     this._filling = store;
     await this._checkpoint();
     if (store === null) {
-      await this._becomeUnindexed();
+      await this._becomeUnindexed(refusal);
       return;
     }
     await this._denseScan(store, rowsPerSlab);
@@ -1312,13 +2423,14 @@ export class RowMajorColumnIndex {
   /** One pass over a dense matrix: into `store` (or none), extracting requests. */
   async _denseScan(store, rowsPerSlab) {
     const { nRows, nCols, readRows } = this._options;
-    const slabs = withReadAhead(denseSlabs(nRows, rowsPerSlab), slab => readRows(slab.rowStart, slab.rowEnd));
+    const slabs = withReadAhead(denseSlabs(nRows, rowsPerSlab), slab => readRows(slab.rowStart, slab.rowEnd, this._reads()));
     for await (const { item: { rowStart, rowEnd }, data: block } of slabs) {
       if (store === null && this._requests.size === 0) break;
       const active = this._active();
       if (block.length !== (rowEnd - rowStart) * nCols) {
         throw new Error(`${this._label} row slab does not match its selection`);
       }
+      const placing = performance.now();
       if (store !== null) store.writeRows(rowStart, rowEnd, block);
       if (active !== null) {
         for (const request of active.values()) {
@@ -1329,33 +2441,64 @@ export class RowMajorColumnIndex {
         }
         this._account(active, rowEnd - rowStart);
       }
+      this._workMs += performance.now() - placing;
       this._progress(rowEnd, nRows);
       await this._checkpoint();
     }
   }
 
   /**
-   * No store could be made (no memory, no disk): columns are answered by
-   * scanning the matrix, one pass per batch of waiting genes.
+   * No store could be made (`reason`: what it needs and why nothing could
+   * hold it): columns are answered by scanning the matrix, one pass per batch
+   * of waiting genes. Never silently: the phase and the reason go out with
+   * the progress, and each scan is announced (`onUnindexedScan`).
+   *
+   * @param {string} reason
    */
-  async _becomeUnindexed() {
+  async _becomeUnindexed(reason) {
+    this.unindexedReason = reason;
     this.phase = 'unindexed';
-    if (this._requests.size > 0) await this._scanWhileRequested();
+    this._options.onProgress?.({ kind: 'transpose', label: this._label, phase: 'unindexed', reason, done: 0, total: 0 });
+    if (this._requests.size > 0) this._scanForRequests();
   }
 
+  /** Scan for the genes waiting; a scan's failure reaches them. @private */
+  _scanForRequests() {
+    this._scanWhileRequested().catch(error => {
+      for (const request of this._requests.values()) request.reject(error);
+      this._requests.clear();
+    });
+  }
+
+  /**
+   * Scan the matrix while genes wait: each pass is announced as the read it
+   * is, and stops (its reads let go) once every gene it was for withdrew; a
+   * gene asked for meanwhile is served whole by the next pass.
+   */
   _scanWhileRequested() {
     this._scanning ??= (async () => {
       try {
         while (this._requests.size > 0) {
-          if (this._options.layout === 'dense') {
-            const slabEntries = this._options.slabEntries ?? (1024 * 1024);
-            await this._denseScan(null, Math.max(1, Math.floor(slabEntries / Math.max(1, this.nCols))));
-          } else {
-            await this._sparseScan(null);
+          this._stopping = false;
+          this._abort = new AbortController();
+          const ended = this._options.onUnindexedScan?.(this.unindexedReason) ?? (() => {});
+          try {
+            if (this._options.layout === 'dense') {
+              const slabEntries = this._options.slabEntries ?? (1024 * 1024);
+              await this._denseScan(null, Math.max(1, Math.floor(slabEntries / Math.max(1, this.nCols))));
+            } else {
+              await this._sparseScan(null);
+            }
+          } catch (error) {
+            ended(error);
+            if (this._stopping || error?.indexStopped === true) continue;
+            throw error;
           }
+          ended(null);
         }
       } finally {
         this._scanning = null;
+        this._stopping = false;
       }
     })();
     return this._scanning;
@@ -1365,24 +2508,28 @@ export class RowMajorColumnIndex {
    * Row slabs of the sparse matrix: rows `[rowStart, rowEnd)`, their entries
    * `[entryStart, entryEnd)`, and the validated pointers they index.
    */
-  async *_rowSlabs() {
+  async *_rowSlabs(fromRow = 0, fromEntry = 0) {
     const { nRows, nnz, readRowPointers } = this._options;
     const slabEntries = this._options.slabEntries ?? (1024 * 1024);
     const pointerSlab = Math.max(1, Math.min(nRows, 1 << 18));
     const label = this._label;
-    let previousPointer = 0;
-    for (let row = 0; row < nRows;) {
-      const pointerEnd = Math.min(nRows, row + pointerSlab);
-      const raw = await readRowPointers(row, pointerEnd + 1);
+    let previousPointer = fromEntry;
+    for (let row = fromRow; row < nRows;) {
+      // Pointer windows end at multiples of `pointerSlab` whatever row they
+      // start at, so slabs from a slab boundary (a pass going on where it
+      // stopped) are the slabs a pass from row 0 makes: pass 2 finds each
+      // slab of pass 1 by its number.
+      const pointerEnd = Math.min(nRows, (Math.floor(row / pointerSlab) + 1) * pointerSlab);
+      const raw = await readRowPointers(row, pointerEnd + 1, this._reads());
       if (raw.length !== pointerEnd + 1 - row) {
         throw new Error(`${label} indptr slab does not match its selection`);
       }
-      const pointers = new Float64Array(raw.length);
+      const pointers = allocateTypedArray(Float64Array, raw.length, `${label} indptr`);
       for (let index = 0; index < raw.length; index++) {
         const pointer = toCount(raw[index], `${label} indptr`);
         if (index === 0 && pointer !== previousPointer) {
           throw new Error(
-            row === 0 ? `${label} indptr must start at zero` : `${label} indptr must be monotonic`
+            row === 0 ? `${label} indptr must start at zero` : (row === fromRow ? `${label} changed while it was read; reopen the file` : `${label} indptr must be monotonic`)
           );
         }
         if (index > 0 && pointer < pointers[index - 1]) {
@@ -1422,7 +2569,7 @@ export class RowMajorColumnIndex {
     const { rowStart, rowEnd, pointers, pointerOffset, entryStart } = slab;
     const requests = [...active.values()];
     // A dense lookup (column -> waiting request) keeps the entry loop flat.
-    this._lookup ??= new Int32Array(this.nCols).fill(-1);
+    this._lookup ??= allocateTypedArray(Int32Array, this.nCols, 'Gene lookup').fill(-1);
     const lookup = this._lookup;
     requests.forEach((request, index) => { lookup[request.column] = index; });
     try {
@@ -1451,7 +2598,7 @@ export class RowMajorColumnIndex {
   async _extractOnDemand(active, slab, indices) {
     const { rowStart, rowEnd, pointers, pointerOffset, entryStart } = slab;
     const requests = [...active.values()];
-    this._lookup ??= new Int32Array(this.nCols).fill(-1);
+    this._lookup ??= allocateTypedArray(Int32Array, this.nCols, 'Gene lookup').fill(-1);
     const lookup = this._lookup;
     requests.forEach((request, index) => { lookup[request.column] = index; });
     let count = 0;
@@ -1459,7 +2606,7 @@ export class RowMajorColumnIndex {
     let rows = new Uint32Array(64);
     let owners = new Int32Array(64);
     const grow = (array, Type) => {
-      const next = new Type(array.length * 2);
+      const next = allocateTypedArray(Type, array.length * 2, `${this._label} entries`);
       next.set(array);
       return next;
     };
@@ -1495,38 +2642,127 @@ export class RowMajorColumnIndex {
     const slabEntries = slab.entryEnd - entryStart;
     const perEntry = await this._storedBytesPerEntry();
     const cost = count === 0 ? 0 : rangedCost(positions, count, perEntry, this._costs());
-    if (count > 0 && cost >= slabEntries * perEntry) {
-      const read = await this._options.readValues(entryStart, slab.entryEnd);
-      const values = read instanceof Float32Array ? read : Float32Array.from(read);
+    const beside = this._beside?.get(entryStart) ?? null;
+    this._beside?.delete(entryStart);
+    if (beside !== null || (count > 0 && cost >= slabEntries * perEntry)) {
+      const read = await (beside ?? this._options.readValues(entryStart, slab.entryEnd, this._reads()));
+      if (read.length !== slabEntries) throw new Error(`${this._label} payload slab does not match its selection`);
+      const values = read instanceof Float32Array ? read : copyTypedArray(Float32Array, read, `${this._label} values`);
       this._besideKept.push({ start: entryStart, end: slab.entryEnd, values });
       for (let i = 0; i < count; i++) visit(i, values[positions[i] - entryStart]);
     } else {
       this._besideSpent += cost;
-      await readValuesAt(positions, count, this._options.readValues, visit);
+      await readValuesAt(positions, count, (from, to) => this._options.readValues(from, to, this._reads()), visit);
     }
     this._account(active, rowEnd - rowStart);
+  }
+
+  /**
+   * Whether a slab's values are read beside its indices, not after them: a
+   * gene is waiting (its values are wanted from this slab), values are read
+   * on demand (a link slower than a disk), and the slab's values whole cost
+   * no more bytes than one round trip of the link moves -- the round trip
+   * they save. On a 40,000-cell file over 150 ms at 5 MB/s, a 1 % subsample's
+   * first gene read pointers, indices, then values: three round trips where
+   * two do. Only a round trip at the pass's end is saved: a slab's waiting
+   * values asked for after its indices arrive while the slabs after it are
+   * read, so a slab is read with its values only when the indices still to
+   * read after it take less than a round trip (counted at the values' stored
+   * bytes an entry). Before, every slab was: a 40,000-cell CSR `.h5ad`'s
+   * first gene over every cell read 35.4 MB where 28.4 MB do. Values stored
+   * in chunks read whole are read beside every slab when the plan buys them
+   * (`sparseIndexPlan` `buysValues`): the first gene was priced with them,
+   * and no later gene then reads one. @private
+   */
+  _valuesBeside(slab) {
+    if (this._options.valuesOnDemand !== true || this._active() === null) return false;
+    // Every value bought with the first gene (`sparseIndexPlan` `buysValues`).
+    if (this._pass1?.plan.buysValues === true) return true;
+    const roundTripBytes = this._costs().roundTripBytes ?? 0;
+    // Float32 until the stored size is known (a promise is no number: weighing it read every slab as too large).
+    const perEntry = this._perEntryBytes ?? 4;
+    const after = Math.max(0, this._options.nnz - slab.entryEnd);
+    return (slab.entryEnd - slab.entryStart) * perEntry <= roundTripBytes && after * perEntry < roundTripBytes;
   }
 
   /** Stored bytes of one value (`valuesStoredBytes` over the entries; float32 when unknown). @private */
   _storedBytesPerEntry() {
     this._perEntry ??= Promise.resolve()
       .then(() => this._options.valuesStoredBytes?.() ?? null)
-      .then(bytes => (bytes > 0 ? bytes / this._options.nnz : 4), () => 4);
+      .then(bytes => (bytes > 0 ? bytes / this._options.nnz : 4), () => 4)
+      .then(perEntry => {
+        // Known from now on without waiting (`_valuesBeside` weighs a slab as its read is asked for).
+        this._perEntryBytes = perEntry;
+        return perEntry;
+      });
     return this._perEntry;
+  }
+
+  /**
+   * Pass 1's state from its first slab: the column counts, the plan, what
+   * it keeps of each slab (indices, values a waiting gene made it read, the
+   * slab and its row pointers for the structure), and the row and entry it
+   * goes on from. Values read whole for waiting genes (`_besideKept`) are
+   * the pass's too. @private
+   */
+  _newPass1() {
+    const { nRows, nCols, nnz } = this._options;
+    const label = this._label;
+    const plan = sparseIndexPlan({
+      nnz,
+      nCols,
+      valuesOnDemand: this._options.valuesOnDemand === true,
+      retainIndicesBytes: this._options.retainIndicesBytes ?? 0,
+      valuesInWholeChunks: this._options.valuesInWholeChunks === true,
+    });
+    const retained = plan.keepsIndices ? [] : null;
+    // The slabs whose indices are kept, to place them in the structure, and
+    // the row pointers that place each entry in its row.
+    const slabs = this._options.valuesOnDemand === true && retained !== null ? [] : null;
+    this._besideKept = [];
+    this._besideSpent = 0;
+    return {
+      // A column holds at most one entry per row, so Uint32 counts suffice
+      // (rows are a uint32 axis); the offsets themselves are Float64 (exact
+      // to 2^53 entries).
+      counts: allocateTypedArray(Uint32Array, nCols, `${label} column counts`),
+      plan,
+      retained,
+      // Values read in this pass for a waiting gene are kept for pass 2 too
+      // (float32, as the store holds them) when every value fits the budget
+      // beside the kept indices (`plan.keepsValues`), so no slab is decoded
+      // twice; the slabs' entry ranges are recorded, so what pass 2 reads is
+      // known exactly before it starts (`onSecondPass`).
+      keptValues: [],
+      slabEntryStarts: [],
+      slabs,
+      rowPointers: slabs === null ? null : allocateTypedArray(Float64Array, nRows + 1, `${label} row pointers`),
+      nextRow: 0,
+      nextEntry: 0,
+    };
   }
 
   async _runSparse() {
     const { nRows, nCols, nnz, readIndices, readValues, storeFactory } = this._options;
     const label = this._label;
+    // A slab whose values are read beside its indices (`_valuesBeside`): a
+    // gene waits, and its values whole cost no more than the round trip
+    // reading them after the indices would.
+    this._beside = new Map();
     const readSlabIndices = async slab => {
-      const indices = await readIndices(slab.entryStart, slab.entryEnd);
+      if (this._valuesBeside(slab)) {
+        const values = readValues(slab.entryStart, slab.entryEnd, this._reads());
+        values.catch(() => {});
+        this._beside.set(slab.entryStart, values);
+      }
+      const indices = await readIndices(slab.entryStart, slab.entryEnd, this._reads());
       if (indices.length !== slab.entryEnd - slab.entryStart) {
         throw new Error(`${label} indices slab does not match its selection`);
       }
       return indices;
     };
     const readSlabValues = async slab => {
-      const values = await readValues(slab.entryStart, slab.entryEnd);
+      const values = await readValues(slab.entryStart, slab.entryEnd, this._reads());
       if (values.length !== slab.entryEnd - slab.entryStart) {
         throw new Error(`${label} payload slab does not match its selection`);
       }
@@ -1538,62 +2774,55 @@ export class RowMajorColumnIndex {
     // indices read here are kept for pass 2 when they fit
     // `retainIndicesBytes`, so pass 2 reads only the values.
     this.phase = 'counting';
-    // A column holds at most one entry per row, so Uint32 counts suffice
-    // (rows are a uint32 axis); the offsets themselves are Float64 (exact
-    // to 2^53 entries).
-    const counts = allocateTypedArray(Uint32Array, nCols, `${label} column counts`);
-    // Kept indices are narrowed to the smallest type holding a column (a
-    // matrix of up to 65,536 genes keeps 2 bytes an entry, not 4).
-    const KeptIndex = nCols <= 0x100 ? Uint8Array : (nCols <= 0x10000 ? Uint16Array : Uint32Array);
-    // What pass 1 keeps for pass 2 shares the index budget with the store
-    // pass 2 fills (8 bytes an entry): together they never exceed it.
-    const onDemandStructure = this._options.valuesOnDemand === true;
-    const keepBudget = Math.max(0, (this._options.retainIndicesBytes ?? 0) -
-      (onDemandStructure ? 0 : nnz * 8 + nCols * 16));
-    const retained = nnz * KeptIndex.BYTES_PER_ELEMENT <= keepBudget ? [] : null;
-    // Values read in this pass for a waiting gene are kept for pass 2 too
-    // (float32, as the store holds them) within the same budget, so no slab
-    // is decoded twice.
-    const keptValues = [];
-    let keptBytes = retained === null ? 0 : nnz * KeptIndex.BYTES_PER_ELEMENT;
-    let slabNumber = -1;
     const onDemand = this._options.valuesOnDemand === true;
-    // The slabs whose indices are kept, to place them in the structure, and
-    // the row pointers that place each entry in its row.
-    const slabs = onDemand && retained !== null ? [] : null;
-    const rowPointers = slabs === null ? null : allocateTypedArray(Float64Array, nRows + 1, `${label} row pointers`);
+    // What pass 1 has counted so far, slab by whole slab (`_pass1`): a build
+    // that stopped (every gene it was for withdrew) keeps it, and the next
+    // build goes on from the first slab not counted, so a gene asked for
+    // after a cancelled one, or instead of it, never reads a counted slab
+    // again.
+    const pass = this._pass1 ??= this._newPass1();
+    const { counts, plan, retained, keptValues, slabEntryStarts, slabs, rowPointers } = pass;
+    const KeptIndex = plan.KeptIndex;
     // Over a link slower than a disk, slabs are read as many at once as
     // requests run, so the link stays full; a waiting gene's values are
     // fetched beside them, without holding up the next slab.
     const extractions = [];
     let extractionFailure = null;
-    /** Slabs whose values were read whole for waiting genes, and the bytes of the ranges read for them. */
-    this._besideKept = [];
-    this._besideSpent = 0;
     // As many slabs ahead as fill the link's bandwidth-delay product (one
     // round trip's worth of bytes), and no more than background reads run.
     const slabsAhead = onDemand ? this._slabsAhead() : 1;
-    for await (const { item: slab, data: indices } of withReadAhead(this._rowSlabs(), readSlabIndices, slabsAhead)) {
+    for await (const { item: slab, data: indices } of withReadAhead(this._rowSlabs(pass.nextRow, pass.nextEntry), readSlabIndices, slabsAhead)) {
       if (extractionFailure !== null) throw extractionFailure;
-      slabNumber++;
       const active = this._active();
       const integral = indices instanceof Int32Array || indices instanceof Uint32Array ||
         indices instanceof Uint16Array || indices instanceof Uint8Array ||
         indices instanceof Int16Array || indices instanceof Int8Array;
-      await this._sliced(slab, part => {
-        const from = part.pointers[part.pointerOffset] - part.entryStart;
-        const to = part.pointers[part.pointerOffset + part.rowEnd - part.rowStart] - part.entryStart;
-        for (let index = from; index < to; index++) {
-          const column = indices[index];
-          if (!(column >= 0 && column < nCols) || (!integral && !Number.isInteger(column))) {
-            throw new RangeError(
-              `Sparse matrix column index ${column} at entry ${slab.entryStart + index} is outside its ` +
-              `${nCols}-column shape`
-            );
+      // The entries counted of this slab: a stop between its parts takes
+      // them back, so what the pass keeps is whole slabs only.
+      let counted = 0;
+      try {
+        await this._sliced(slab, part => {
+          const from = part.pointers[part.pointerOffset] - part.entryStart;
+          const to = part.pointers[part.pointerOffset + part.rowEnd - part.rowStart] - part.entryStart;
+          for (let index = from; index < to; index++) {
+            const column = indices[index];
+            if (!(column >= 0 && column < nCols) || (!integral && !Number.isInteger(column))) {
+              throw new RangeError(
+                `Sparse matrix column index ${column} at entry ${slab.entryStart + index} is outside its ` +
+                `${nCols}-column shape`
+              );
+            }
+            counts[column]++;
           }
-          counts[column]++;
-        }
-      });
+          counted = to;
+        });
+      } catch (error) {
+        const from = slab.pointers[slab.pointerOffset] - slab.entryStart;
+        for (let index = from; index < counted; index++) counts[indices[index]]--;
+        throw error;
+      }
+      const slabNumber = slabEntryStarts.length;
+      slabEntryStarts.push(slab.entryStart);
       if (retained !== null) retained.push(indices instanceof KeptIndex ? indices : KeptIndex.from(indices));
       if (slabs !== null) {
         slabs.push(slab);
@@ -1601,6 +2830,8 @@ export class RowMajorColumnIndex {
           rowPointers[row] = slab.pointers[slab.pointerOffset + row - slab.rowStart];
         }
       }
+      pass.nextRow = slab.rowEnd;
+      pass.nextEntry = slab.entryEnd;
       if (active !== null) {
         if (onDemand) {
           const extraction = this._extractOnDemand(active, slab, indices);
@@ -1608,17 +2839,24 @@ export class RowMajorColumnIndex {
           extractions.push(extraction);
         } else {
           const values = await readSlabValues(slab);
+          const extracting = performance.now();
           this._extract(active, slab, indices, values);
-          if (keptBytes + values.length * 4 <= keepBudget) {
-            keptValues[slabNumber] = values instanceof Float32Array ? values : Float32Array.from(values);
-            keptBytes += values.length * 4;
+          this._workMs += performance.now() - extracting;
+          if (plan.keepsValues) {
+            keptValues[slabNumber] = values instanceof Float32Array ? values : copyTypedArray(Float32Array, values, `${this._label} values`);
           }
         }
       }
-      this._progress(slab.entryEnd, onDemand ? nnz : 2 * nnz);
+      // One pass when the structure is built from the indices kept here,
+      // else a second pass follows (the store is filled from the matrix).
+      this._progress(slab.entryEnd, slabs !== null ? nnz : 2 * nnz);
       await this._checkpoint();
     }
     await Promise.all(extractions);
+    // Pass 1 is whole: what follows starts from its counts.
+    this._pass1 = null;
+    // Values read beside a slab no gene waited for in the end are let go.
+    this._beside.clear();
     const columnStart = allocateTypedArray(Float64Array, nCols + 1, `${label} column index`);
     for (let column = 0; column < nCols; column++) {
       columnStart[column + 1] = columnStart[column] + counts[column];
@@ -1633,13 +2871,19 @@ export class RowMajorColumnIndex {
       storedValueBytes.catch(() => {});
       const structure = new MemorySparseStructure(nRows, nCols, columnStart, rowPointers, readValues, storedValueBytes, () => this._costs(), label);
       this._filling = structure;
+      const filling = performance.now();
       slabs.forEach((slab, index) => {
         structure.writeSlab(slab, retained[index], label);
         retained[index] = null;
       });
       structure.finish(label);
+      this._workMs += performance.now() - filling;
       structure.adopt(this._besideKept, this._besideSpent);
       this._besideKept = [];
+      // Values read whole by a later gene: the structure is kept again, with them.
+      structure.onValuesHeld = () => {
+        if (!this._disposed && this._keepsBuilt && this._store === structure) this._options.onBuilt?.(structure);
+      };
       this._filling = null;
       this._store = structure;
       this.phase = 'ready';
@@ -1651,15 +2895,28 @@ export class RowMajorColumnIndex {
     // same slabs. Without any store, scanning repeats while genes wait.
     this.phase = 'indexing';
     await this._checkpoint();
-    const store = await storeFactory.sparse(nRows, nCols, columnStart, label);
+    const { store, refusal } = await storeFactory.sparse(nRows, nCols, columnStart, label);
     this._filling = store;
     await this._checkpoint();
     if (store === null) {
-      await this._becomeUnindexed();
+      await this._becomeUnindexed(refusal);
       return;
     }
     this._retainedIndices = retained;
     this._retainedValues = keptValues;
+    // What pass 2 reads, exactly: the row pointers, the indices unless pass 1
+    // kept them, and the values of every slab whose values it did not keep.
+    const valueRanges = [];
+    for (let slab = 0; slab < slabEntryStarts.length; slab++) {
+      if (keptValues[slab] !== undefined) continue;
+      const start = slabEntryStarts[slab];
+      const end = slab + 1 < slabEntryStarts.length ? slabEntryStarts[slab + 1] : nnz;
+      if (end === start) continue;
+      const last = valueRanges.at(-1);
+      if (last !== undefined && last[1] === start) last[1] = end;
+      else valueRanges.push([start, end]);
+    }
+    this._options.onSecondPass?.({ indices: retained === null && nnz > 0 ? [[0, nnz]] : [], values: valueRanges });
     await this._sparseScan(store);
     this._retainedIndices = null;
     this._retainedValues = null;
@@ -1684,8 +2941,8 @@ export class RowMajorColumnIndex {
       const keptValues = retainedValues?.[number] ?? null;
       if (keptValues !== null) retainedValues[number] = null;
       return Promise.all([
-        kept ?? readIndices(slab.entryStart, slab.entryEnd),
-        keptValues ?? readValues(slab.entryStart, slab.entryEnd),
+        kept ?? readIndices(slab.entryStart, slab.entryEnd, this._reads()),
+        keptValues ?? readValues(slab.entryStart, slab.entryEnd, this._reads()),
       ]);
     });
     for await (const { item: slab, data: [indices, values] } of slabs) {

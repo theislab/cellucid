@@ -12,19 +12,19 @@ import { rgbToCss, COLOR_PICKER_PALETTE } from '../../../data/palettes.js';
 import { BaseManager } from '../core/base-manager.js';
 import { requireCategoryCodesInInventory } from './category-codes.js';
 import {
-  alphaBytesMirror,
   cellVisibilityMaskWrites,
   isAllShownCellVisibilityMask,
-  recordAlphaBytesMirror,
   requireBinaryCellVisibilityMask,
   transparencyArrayWrites,
   transparencyEpoch,
   writableCellVisibilityMask,
-  writableColorAlphaBytes,
   writableNeutralColors,
   writableTransparency,
 } from './per-cell-array-ownership.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
+import { requireOutlierQuantiles } from './color-outliers.js';
+import { formatBound } from '../../../utils/format-units.js';
+import { categoryRgbAt, hiddenCategoryCount, withCategoriesVisible, withCategoryChanges, withCategoryColor, withCategoryVisibility } from '../../utils/category-state.js';
 
 function requireCategoryFieldAndIndex(field, index) {
   if (
@@ -60,11 +60,109 @@ function requireRgb(color) {
   }
 }
 
-export function isContinuousFilterFullRange(filter, stats) {
+function isContinuousFilterFullRange(filter, stats) {
   return (
     filter.min === stats.min
     && filter.max === stats.max
   );
+}
+
+/*
+ * Every filter applies until it is removed, whatever a view is coloured by
+ * (owner decision 2026-10-28): a gene's range filter and a categorical
+ * field's outlier filter hide cells exactly as an obs range or category
+ * filter does, after the view is coloured by another field. The Active
+ * filters list shows each, the visibility pass applies each, and "Visible
+ * cells" analyses read that visibility. These three predicates are the one
+ * definition of "this field has a filter" every consumer reads.
+ */
+
+/**
+ * Whether a continuous field (obs or gene) has a range filter that hides
+ * cells when it is enabled: narrower than the field's range.
+ *
+ * @param {object} field
+ * @returns {boolean}
+ */
+export function hasRangeFilter(field) {
+  return Boolean(
+    field
+    && field._isDeleted !== true
+    && field.kind === 'continuous'
+    && field._continuousStats
+    && field._continuousFilter
+    && !isContinuousFilterFullRange(field._continuousFilter, field._continuousStats)
+  );
+}
+
+/**
+ * A categorical field's outlier threshold: 1 keeps every cell.
+ *
+ * @param {object} field
+ * @returns {number}
+ */
+export function outlierThresholdOf(field) {
+  return field?._outlierThreshold != null ? field._outlierThreshold : 1.0;
+}
+
+/**
+ * Whether a categorical field has an outlier filter that hides cells when it
+ * is enabled: its quantiles are got and its threshold is below 1.
+ *
+ * @param {object} field
+ * @returns {boolean}
+ */
+export function hasOutlierFilter(field) {
+  return Boolean(
+    field
+    && field._isDeleted !== true
+    && field.kind === 'category'
+    && field.outlierQuantiles
+    && field.outlierQuantiles.length > 0
+    && outlierThresholdOf(field) < 0.9999
+  );
+}
+
+/**
+ * The fields of an inventory with a filter by `has`, with their indices.
+ * Read on every filter-list render and visibility pass; a gene inventory is
+ * walked once per call.
+ *
+ * @param {object|null} inventory - `obsData` or `varData`
+ * @param {(field: object) => boolean} has
+ * @returns {Array<{field: object, index: number}>}
+ */
+function fieldsWith(inventory, has) {
+  const fields = inventory?.fields;
+  const out = [];
+  if (!Array.isArray(fields)) return out;
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    if (field && typeof field === 'object' && has(field)) out.push({ field, index });
+  }
+  return out;
+}
+
+/**
+ * The genes whose range filter hides cells, with their indices in `varData`.
+ *
+ * @param {object|null} varData
+ * @returns {Array<{field: object, index: number}>}
+ */
+export function rangeFilteredVarFields(varData) {
+  return fieldsWith(varData, hasRangeFilter);
+}
+
+/** What the filter list and the legend call the cells of a categorical field without a category. */
+export const MISSING_LABEL = 'Missing';
+
+/**
+ * A range filter's bounds as the filter list and figure provenance state
+ * them: as every range bound is written (`formatBound`), so a bound typed or
+ * set by a slider reads exactly as applied.
+ */
+function rangeText(filter) {
+  return `${formatBound(filter.min)} – ${formatBound(filter.max)}`;
 }
 
 function parseExactFilterId(filterId) {
@@ -94,15 +192,19 @@ function parseExactFilterId(filterId) {
  * Structured filter rows of one view: the active view (DataState itself) or
  * a stored view context. Every consumer - the Active filters list, the view
  * label, figure-export provenance - derives from this one definition, so a
- * view's filters never depend on whether it happens to be focused.
+ * view's filters never depend on whether it happens to be focused, nor on
+ * which field it is coloured by: every range, category, gene and outlier
+ * filter is listed until it is removed.
  *
- * @param {{obsData: object|null, varData: object|null, activeFieldSource: string|null,
- *   activeFieldIndex: number, activeVarFieldIndex: number}} view
+ * @param {{obsData: object|null, varData: object|null}} view
+ * @param {{geneSampled?: boolean}} [options] - `geneSampled`: genes are read for a
+ *   sample of the open cells (`gene-sample.js`), whose others a gene's range keeps
  */
-export function collectViewFilters(view) {
+export function collectViewFilters(view, { geneSampled = false } = {}) {
   if (!view.obsData || !view.obsData.fields) return [];
   const fields = view.obsData.fields;
   const filters = [];
+  const disabled = enabled => (enabled ? '' : ' (disabled)');
 
   for (let fi = 0; fi < fields.length; fi++) {
     const field = fields[fi];
@@ -111,40 +213,36 @@ export function collectViewFilters(view) {
     const key = field.key || `Field ${fi + 1}`;
 
     // Continuous field filter
-    if (field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
-      const stats = field._continuousStats;
-      const filter = field._continuousFilter;
-      const fullRange = isContinuousFilterFullRange(filter, stats);
-      if (!fullRange) {
-        const enabled = field._filterEnabled !== false; // default true
-        const disabledSuffix = enabled ? '' : ' (disabled)';
-        filters.push({
-          id: `obs-continuous-${fi}`,
-          type: 'continuous',
-          source: 'obs',
-          fieldIndex: fi,
-          fieldKey: key,
-          enabled: enabled,
-          text: `${key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
-        });
-      }
+    if (hasRangeFilter(field)) {
+      const enabled = field._filterEnabled !== false; // default true
+      filters.push({
+        id: `obs-continuous-${fi}`,
+        type: 'continuous',
+        source: 'obs',
+        fieldIndex: fi,
+        fieldKey: key,
+        enabled: enabled,
+        text: `${key}: ${rangeText(field._continuousFilter)}${disabled(enabled)}`
+      });
     }
-    
+
     // Categorical field hidden categories
     if (field.kind === 'category') {
       const categories = field.categories || [];
-      const visibleMap = field._categoryVisible || {};
+      const visible = field._categoryVisible;
       const hiddenNames = [];
-      for (let i = 0; i < categories.length; i++) {
-        const name = String(categories[i]);
-        const isVisible = visibleMap[i] !== false;
-        if (!isVisible) hiddenNames.push(name);
+      // Only a field that hides some category is walked.
+      if (visible !== undefined && hiddenCategoryCount(visible) > 0) {
+        for (let i = 0; i < categories.length; i++) {
+          if (visible[i] === 0) hiddenNames.push(String(categories[i]));
+        }
       }
+      // Cells without a category, hidden by the legend's Missing row.
+      if (field._missingVisible === false) hiddenNames.push(MISSING_LABEL);
       if (hiddenNames.length > 0) {
         const enabled = field._categoryFilterEnabled !== false; // default true
         const preview = hiddenNames.slice(0, 4).join(', ');
         const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
-        const disabledSuffix = enabled ? '' : ' (disabled)';
         filters.push({
           id: `obs-category-${fi}`,
           type: 'category',
@@ -153,62 +251,41 @@ export function collectViewFilters(view) {
           fieldKey: key,
           enabled: enabled,
           hiddenCount: hiddenNames.length,
-          text: `${key}: hiding ${preview}${extra}${disabledSuffix}`
+          text: `${key}: hiding ${preview}${extra}${disabled(enabled)}`
         });
       }
-      
+
       // Outlier filter
-      if (
-        view.activeFieldSource === 'obs'
-        && view.activeFieldIndex === fi
-        && field.outlierQuantiles
-        && field.outlierQuantiles.length
-      ) {
-        const threshold = field._outlierThreshold != null ? field._outlierThreshold : 1.0;
-        if (threshold < 0.9999) {
-          const enabled = field._outlierFilterEnabled !== false; // default true
-          const pct = Math.round(threshold * 100);
-          const disabledSuffix = enabled ? '' : ' (disabled)';
-          filters.push({
-            id: `obs-outlier-${fi}`,
-            type: 'outlier',
-            source: 'obs',
-            fieldIndex: fi,
-            fieldKey: key,
-            enabled: enabled,
-            text: `${key}: outlier ≤ ${pct}%${disabledSuffix}`
-          });
-        }
+      if (hasOutlierFilter(field)) {
+        const enabled = field._outlierFilterEnabled !== false; // default true
+        const pct = Math.round(outlierThresholdOf(field) * 100);
+        filters.push({
+          id: `obs-outlier-${fi}`,
+          type: 'outlier',
+          source: 'obs',
+          fieldIndex: fi,
+          fieldKey: key,
+          enabled: enabled,
+          text: `${key}: outlier ≤ ${pct}%${disabled(enabled)}`
+        });
       }
     }
   }
-  
-  // Var field (gene expression) filter
-  if (
-    view.activeFieldSource === 'var' &&
-    view.activeVarFieldIndex >= 0 &&
-    view.varData &&
-    view.varData.fields
-  ) {
-    const field = view.varData.fields[view.activeVarFieldIndex];
-    if (field && field._isDeleted !== true && field.kind === 'continuous' && field._continuousStats && field._continuousFilter) {
-      const stats = field._continuousStats;
-      const filter = field._continuousFilter;
-      const fullRange = isContinuousFilterFullRange(filter, stats);
-      if (!fullRange) {
-        const enabled = field._filterEnabled !== false; // default true
-        const disabledSuffix = enabled ? '' : ' (disabled)';
-        filters.push({
-          id: `var-continuous-${view.activeVarFieldIndex}`,
-          type: 'continuous',
-          source: 'var',
-          fieldIndex: view.activeVarFieldIndex,
-          fieldKey: field.key,
-          enabled: enabled,
-          text: `${field.key}: ${filter.min.toFixed(2)} – ${filter.max.toFixed(2)}${disabledSuffix}`
-        });
-      }
-    }
+
+  // Gene (var field) range filters; a gene read for a sample of the open
+  // cells (`geneSampled`) keeps the others (`publishFilteredVisibility`),
+  // and says so.
+  for (const { field, index } of rangeFilteredVarFields(view.varData)) {
+    const enabled = field._filterEnabled !== false; // default true
+    filters.push({
+      id: `var-continuous-${index}`,
+      type: 'continuous',
+      source: 'var',
+      fieldIndex: index,
+      fieldKey: field.key,
+      enabled: enabled,
+      text: `${field.key}: ${rangeText(field._continuousFilter)}${geneSampled ? ', cells not read kept' : ''}${disabled(enabled)}`
+    });
   }
 
   return filters;
@@ -216,43 +293,42 @@ export function collectViewFilters(view) {
 
 /*
  * Per-cell visibility kernels of `computeGlobalVisibility`. Each writes every
- * cell's visibility (exactly 0 or 1), the alpha byte of its packed color, and
- * returns how many cells it showed, in one pass. They are separate functions
- * so each is compiled for its own loop: inside one large method, a loop that
+ * cell's visibility (exactly 0 or 1) and returns how many cells it showed, in
+ * one pass. Visibility lives in the transparency alone: the renderer draws it
+ * from its R8 alpha texture, so the colors are never written for a filter.
+ * They are separate functions so each is compiled for its own loop: inside
+ * one large method, a loop that
  * had not run yet was optimized without type feedback and deoptimized on its
  * first real use (a 40 ms first outlier step at 562,000 cells).
  */
 
-function publishMaskVisibility(mask, transparency, colors, pointCount) {
+function publishMaskVisibility(mask, transparency, pointCount) {
   let shown = 0;
-  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+  for (let i = 0; i < pointCount; i++) {
     const visible = mask[i];
     transparency[i] = visible;
-    colors[j] = visible * 255;
     shown += visible;
   }
   return shown;
 }
 
-function publishCategoryVisibility(mask, filter, transparency, colors, pointCount) {
-  const { codes, visibleByCode, missingCode, spansDtype } = filter;
+function publishCategoryVisibility(mask, filter, transparency, pointCount) {
+  const { codes, visibleByCode, missingCode, missingVisible, spansDtype } = filter;
   let shown = 0;
   if (spansDtype) {
-    for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    for (let i = 0; i < pointCount; i++) {
       const visible = mask[i] === 0 ? 0 : visibleByCode[codes[i]];
       transparency[i] = visible;
-      colors[j] = visible * 255;
       shown += visible;
     }
     return shown;
   }
-  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+  for (let i = 0; i < pointCount; i++) {
     const code = codes[i];
     const visible = mask[i] === 0
       ? 0
-      : code === missingCode ? 1 : visibleByCode[code];
+      : code === missingCode ? missingVisible : visibleByCode[code];
     transparency[i] = visible;
-    colors[j] = visible * 255;
     shown += visible;
   }
   return shown;
@@ -263,35 +339,32 @@ function publishCategoryVisibility(mask, filter, transparency, colors, pointCoun
  * (`isAllShownCellVisibilityMask`): the mask is not read, so a cell's
  * visibility is its code's table entry.
  */
-function publishCategoryVisibilityUnmasked(filter, transparency, colors, pointCount) {
-  const { codes, visibleByCode, missingCode, spansDtype } = filter;
+function publishCategoryVisibilityUnmasked(filter, transparency, pointCount) {
+  const { codes, visibleByCode, missingCode, missingVisible, spansDtype } = filter;
   let shown = 0;
   if (spansDtype) {
-    for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+    for (let i = 0; i < pointCount; i++) {
       const visible = visibleByCode[codes[i]];
       transparency[i] = visible;
-      colors[j] = visible * 255;
       shown += visible;
     }
     return shown;
   }
-  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+  for (let i = 0; i < pointCount; i++) {
     const code = codes[i];
-    const visible = code === missingCode ? 1 : visibleByCode[code];
+    const visible = code === missingCode ? missingVisible : visibleByCode[code];
     transparency[i] = visible;
-    colors[j] = visible * 255;
     shown += visible;
   }
   return shown;
 }
 
-function publishOutlierVisibility(mask, outliers, threshold, transparency, colors, pointCount) {
+function publishOutlierVisibility(mask, outliers, threshold, transparency, pointCount) {
   let shown = 0;
-  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
+  for (let i = 0; i < pointCount; i++) {
     const q = outliers[i];
     const visible = q >= 0 && q > threshold ? 0 : mask[i];
     transparency[i] = visible;
-    colors[j] = visible * 255;
     shown += visible;
   }
   return shown;
@@ -301,13 +374,8 @@ function publishFilteredVisibility(
   mask,
   categoryFilters,
   continuousFilters,
-  varValues,
-  varMin,
-  varMax,
-  outliers,
-  outlierThreshold,
+  outlierFilters,
   transparency,
-  colors,
   pointCount
 ) {
   let shown = 0;
@@ -320,33 +388,32 @@ function publishFilteredVisibility(
       const filter = categoryFilters[cf];
       const code = filter.codes[i];
       if (
-        (filter.spansDtype || code !== filter.missingCode)
-        && filter.visibleByCode[code] === 0
+        filter.spansDtype || code !== filter.missingCode
+          ? filter.visibleByCode[code] === 0
+          : filter.missingVisible === 0
       ) {
         visible = false;
       }
     }
 
+    // Obs and gene ranges alike. A gene read for a sample of the cells
+    // (`readTo`, `gene-sample.js`) has no value past it: those cells are not
+    // judged by it, and stay.
     for (let cf = 0; visible && cf < continuousFilters.length; cf++) {
       const filter = continuousFilters[cf];
       const v = filter.values[i];
-      if (v !== v || v < filter.min || v > filter.max) visible = false;
+      if (i < filter.readTo && (v !== v || v < filter.min || v > filter.max)) visible = false;
     }
 
-    if (visible && varValues !== null) {
-      const v = varValues[i];
-      if (v !== v || v < varMin || v > varMax) visible = false;
-    }
-
-    // The outlier filter of the active field (only when it applies).
-    if (visible && outliers !== null) {
-      const q = outliers[i];
-      if (q >= 0 && q > outlierThreshold) visible = false;
+    // Each categorical field's outlier filter.
+    for (let of = 0; visible && of < outlierFilters.length; of++) {
+      const filter = outlierFilters[of];
+      const q = filter.quantiles[i];
+      if (q >= 0 && q > filter.threshold) visible = false;
     }
 
     const value = visible ? 1 : 0;
     transparency[i] = value;
-    colors[i * 4 + 3] = value * 255;
     shown += value;
   }
   return shown;
@@ -355,9 +422,9 @@ function publishFilteredVisibility(
 /*
  * Visibility results kept for reuse. A pass's result is a pure function of its
  * inputs: the cell mask (by identity and write count), each category filter's
- * codes (by identity) and per-code table (by value), each continuous filter's
- * values (by identity) and range, the active gene's filter, and the active
- * field's outlier quantiles and threshold. Each transparency array a pass wrote
+ * codes (by identity) and per-code table (by value), each range filter's
+ * values (by identity) and range (obs fields and genes), and each outlier
+ * filter's quantiles (by identity) and threshold. Each transparency array a pass wrote
  * carries those inputs and its write count; while the count stands the array
  * still holds that result, whichever view holds it now (a kept view never
  * writes an array it shares). Views with identical filters -- the kept views of
@@ -371,20 +438,25 @@ function sameVisibilityInputs(a, b) {
   if (
     a.mask !== b.mask
     || a.maskWrites !== b.maskWrites
-    || a.varValues !== b.varValues
-    || a.varMin !== b.varMin
-    || a.varMax !== b.varMax
-    || a.outliers !== b.outliers
-    || a.outlierThreshold !== b.outlierThreshold
     || a.categoryFilters.length !== b.categoryFilters.length
     || a.continuousFilters.length !== b.continuousFilters.length
+    || a.outlierFilters.length !== b.outlierFilters.length
   ) {
     return false;
+  }
+  for (let f = 0; f < a.outlierFilters.length; f++) {
+    const x = a.outlierFilters[f];
+    const y = b.outlierFilters[f];
+    if (x.quantiles !== y.quantiles || x.threshold !== y.threshold) return false;
   }
   for (let f = 0; f < a.categoryFilters.length; f++) {
     const x = a.categoryFilters[f];
     const y = b.categoryFilters[f];
-    if (x.codes !== y.codes || x.visibleByCode.length !== y.visibleByCode.length) {
+    if (
+      x.codes !== y.codes
+      || x.missingVisible !== y.missingVisible
+      || x.visibleByCode.length !== y.visibleByCode.length
+    ) {
       return false;
     }
     for (let code = 0; code < x.visibleByCode.length; code++) {
@@ -394,7 +466,7 @@ function sameVisibilityInputs(a, b) {
   for (let f = 0; f < a.continuousFilters.length; f++) {
     const x = a.continuousFilters[f];
     const y = b.continuousFilters[f];
-    if (x.values !== y.values || x.min !== y.min || x.max !== y.max) return false;
+    if (x.values !== y.values || x.min !== y.min || x.max !== y.max || x.readTo !== y.readTo) return false;
   }
   return true;
 }
@@ -461,11 +533,7 @@ export function recordUnfilteredVisibility(transparency, mask) {
     maskWrites: cellVisibilityMaskWrites(mask),
     categoryFilters: [],
     continuousFilters: [],
-    varValues: null,
-    varMin: 0,
-    varMax: 0,
-    outliers: null,
-    outlierThreshold: 1,
+    outlierFilters: [],
   }, mask.length);
 }
 
@@ -475,13 +543,6 @@ function recordVisibilityResult(transparency, inputs, shown) {
     writes: transparencyArrayWrites(transparency),
     shown,
   });
-}
-
-/** Each cell's alpha byte from its visibility (exactly 0 or 1). */
-function publishAlphaBytes(transparency, colors, pointCount) {
-  for (let i = 0, j = 3; i < pointCount; i++, j += 4) {
-    colors[j] = transparency[i] * 255;
-  }
 }
 
 export class DataStateFilterMethods {
@@ -538,55 +599,10 @@ export class DataStateFilterMethods {
     }
     requireBinaryCellVisibilityMask(this.cellVisibilityMask);
 
-    if (
-      this.activeFieldSource !== null
-      && this.activeFieldSource !== 'obs'
-      && this.activeFieldSource !== 'var'
-    ) {
-      throw new TypeError('Active field source must be exactly obs, var, or null.');
-    }
-    let activeVarField = null;
-    if (this.activeFieldSource === 'var') {
-      if (
-        !this.varData
-        || !Array.isArray(this.varData.fields)
-        || !Number.isSafeInteger(this.activeVarFieldIndex)
-        || this.activeVarFieldIndex < 0
-        || this.activeVarFieldIndex >= this.varData.fields.length
-      ) {
-        throw new TypeError('Active variable filter requires an exact current variable field.');
-      }
-      const candidate = this.varData.fields[this.activeVarFieldIndex];
-      if (!candidate || typeof candidate !== 'object' || candidate._isDeleted === true) {
-        throw new TypeError('Active variable filter field must be a visible field object.');
-      }
-      activeVarField = candidate;
-    }
-
-    const applyOutlierFilter = this.isOutlierFilterEnabledForActiveField();
-    if (typeof applyOutlierFilter !== 'boolean') {
-      throw new TypeError('Outlier filter state must be exactly true or false.');
-    }
-    // Numbers even when unused: the per-cell loop below is compiled with
-    // these as doubles, and a null would deoptimize it on every later call.
-    let outlierThreshold = 1;
-    let outliers = null;
-    if (applyOutlierFilter) {
-      outlierThreshold = this.getCurrentOutlierThreshold();
-      if (
-        !Number.isFinite(outlierThreshold)
-        || outlierThreshold < 0
-        || outlierThreshold > 1
-      ) {
-        throw new TypeError('Active outlier filtering requires an exact threshold.');
-      }
-      // The active field's own quantiles, proven -1 or within [0, 1] once
-      // per decoded array.
-      outliers = this.getActiveOutlierQuantiles();
-    }
-
     const categoryFilters = [];
     const continuousFilters = [];
+    // Every categorical field's outlier filter, whatever is coloured.
+    const outlierFilters = [];
 
     for (let f = 0; f < fields.length; f++) {
       const field = fields[f];
@@ -611,30 +627,27 @@ export class DataStateFilterMethods {
           index => `Category filter code ${index} is outside the category inventory.`
         );
         if (field._categoryFilterEnabled) {
-          const visibleMap = field._categoryVisible;
+          const shown = field._categoryVisible;
           // One byte per code, so the per-cell test is a single typed load.
           // For uint8 and uint16 codes the table spans every code the dtype
-          // can hold and the missing code reads 1 (never hidden). A uint32
-          // table spans the inventory only (2^32 bytes would not fit), and
-          // the missing code is tested by value. Every other code is proven
-          // inside the inventory above.
+          // can hold and the missing code reads whether cells without a
+          // category are shown (`_missingVisible`, the legend's Missing
+          // row). A uint32 table spans the inventory only (2^32 bytes would
+          // not fit), and the missing code is tested by value. Every other
+          // code is proven inside the inventory above.
           const missingCode = missingCategoryCode(field.codes);
           const spansDtype = missingCode <= 0xffff;
+          const missingVisible = field._missingVisible === false ? 0 : 1;
           const visibleByCode = new Uint8Array(spansDtype ? missingCode + 1 : numCats);
-          if (spansDtype) visibleByCode[missingCode] = 1;
-          let hasHidden = false;
-          for (let c = 0; c < numCats; c++) {
-            if (visibleMap[c]) {
-              visibleByCode[c] = 1;
-            } else {
-              hasHidden = true;
-            }
-          }
+          if (spansDtype) visibleByCode[missingCode] = missingVisible;
+          const hasHidden = missingVisible === 0 || hiddenCategoryCount(shown) > 0;
+          visibleByCode.set(shown);
           if (hasHidden) {
             categoryFilters.push({
               codes: field.codes,
               visibleByCode,
               missingCode,
+              missingVisible,
               spansDtype
             });
           }
@@ -654,41 +667,51 @@ export class DataStateFilterMethods {
             continuousFilters.push({
               values: field.values,
               min: filter.min,
-              max: filter.max
+              max: filter.max,
+              readTo: pointCount
             });
           }
         }
       } else if (field.kind !== 'category' && field.kind !== 'continuous') {
         throw new TypeError(`Observation field ${f} has an unsupported kind.`);
       }
+
+      if (hasOutlierFilter(field) && field._outlierFilterEnabled !== false) {
+        // The field's own quantiles, proven -1 or within [0, 1] once per
+        // decoded array.
+        const threshold = outlierThresholdOf(field);
+        if (!Number.isFinite(threshold) || threshold < 0) {
+          throw new TypeError(`The outlier threshold of "${field.key}" must be from 0 through 1.`);
+        }
+        outlierFilters.push({
+          quantiles: requireOutlierQuantiles(field.outlierQuantiles, pointCount),
+          threshold
+        });
+      }
     }
 
-    let activeVarFilterMin = 0;
-    let activeVarFilterMax = 0;
-    let activeVarFilterEnabled = false;
-    let activeVarValues = null;
-    if (activeVarField !== null) {
-      if (activeVarField.kind !== 'continuous') {
-        throw new TypeError('Active variable filtering requires a continuous field.');
+    // Every gene's range filter, whatever is coloured. A filtered gene's
+    // values stay resident (`field/residency.js`). A gene read for a sample
+    // of the open cells judges those cells only: the others keep showing.
+    const geneReadTo = this.getGeneSample?.()?.cells ?? pointCount;
+    for (const { field } of rangeFilteredVarFields(this.varData)) {
+      const metadata = this.ensureContinuousMetadata(field);
+      if (!field._filterEnabled) continue;
+      if (!ArrayBuffer.isView(field.values) || field.values.length !== pointCount) {
+        throw new TypeError(`The range filter of gene "${field.key}" needs its values of every open cell.`);
       }
-      const metadata = this.ensureContinuousMetadata(activeVarField);
-      if (activeVarField._filterEnabled) {
-        const stats = metadata.stats;
-        const filter = metadata.filter;
-        if (!isContinuousFilterFullRange(filter, stats)) {
-          activeVarFilterEnabled = true;
-          activeVarFilterMin = filter.min;
-          activeVarFilterMax = filter.max;
-          activeVarValues = activeVarField.values;
-        }
-      }
+      continuousFilters.push({
+        values: field.values,
+        min: metadata.filter.min,
+        max: metadata.filter.max,
+        readTo: geneReadTo
+      });
     }
 
     const hasAnyFilter =
       categoryFilters.length > 0 ||
       continuousFilters.length > 0 ||
-      activeVarFilterEnabled ||
-      applyOutlierFilter;
+      outlierFilters.length > 0;
 
     const cellVisibilityMask = this.cellVisibilityMask;
     const inputs = {
@@ -696,20 +719,13 @@ export class DataStateFilterMethods {
       maskWrites: cellVisibilityMaskWrites(cellVisibilityMask),
       categoryFilters,
       continuousFilters,
-      varValues: activeVarFilterEnabled ? activeVarValues : null,
-      varMin: activeVarFilterMin,
-      varMax: activeVarFilterMax,
-      outliers: applyOutlierFilter ? outliers : null,
-      outlierThreshold,
+      outlierFilters,
     };
-    const publishedColors = this.colorsArray;
     let transparency;
-    let colors;
     let shown;
     const reusable = findVisibilityResult(this, inputs);
     if (reusable !== null) {
-      // A view already holds this exact visibility: it is adopted, and only
-      // the alpha bytes of this view's colors are published from it.
+      // A view already holds this exact visibility: it is adopted.
       if (reusable.transparency === this.categoryTransparency) {
         transparency = reusable.transparency;
       } else {
@@ -717,81 +733,62 @@ export class DataStateFilterMethods {
         transparency.set(reusable.transparency);
         recordVisibilityResult(transparency, inputs, reusable.shown);
       }
-      if (alphaBytesMirror(this.colorsArray, transparency)) {
-        // The alpha bytes already are this visibility: nothing to write.
-        colors = this.colorsArray;
-      } else {
-        colors = writableColorAlphaBytes(this);
-        publishAlphaBytes(transparency, colors, pointCount);
-        recordAlphaBytesMirror(colors, transparency);
-      }
       shown = reusable.shown;
     } else {
-      // One pass writes each cell's visibility, the alpha byte of its packed
-      // color and the shown count; a mask entry, filter table or value is read
-      // once a cell. Every array is exactly `pointCount` long (checked above).
-      // Every branch below rewrites every entry; a kept view still sharing an
-      // array keeps the old one (per-cell-array-ownership.js).
+      // One pass writes each cell's visibility and the shown count; a mask
+      // entry, filter table or value is read once a cell. Every array is
+      // exactly `pointCount` long (checked above). Every branch below
+      // rewrites every entry; a kept view still sharing the array keeps the
+      // old one (per-cell-array-ownership.js).
       transparency = writableTransparency(this);
-      colors = writableColorAlphaBytes(this);
       if (!hasAnyFilter) {
         // Every mask entry is exactly 0 or 1, so with no filter active the
         // published visibility *is* the mask.
-        shown = publishMaskVisibility(cellVisibilityMask, transparency, colors, pointCount);
+        shown = publishMaskVisibility(cellVisibilityMask, transparency, pointCount);
       } else if (
         categoryFilters.length === 1 &&
         continuousFilters.length === 0 &&
-        !activeVarFilterEnabled &&
-        !applyOutlierFilter
+        outlierFilters.length === 0
       ) {
         // The commonest filter -- categories hidden on one field -- with the
         // per-code table read straight into the visibility: it holds exactly
         // the 0 or 1 the general loop writes, at half its cost.
         shown = isAllShownCellVisibilityMask(cellVisibilityMask)
-          ? publishCategoryVisibilityUnmasked(categoryFilters[0], transparency, colors, pointCount)
+          ? publishCategoryVisibilityUnmasked(categoryFilters[0], transparency, pointCount)
           : publishCategoryVisibility(
-            cellVisibilityMask, categoryFilters[0], transparency, colors, pointCount
+            cellVisibilityMask, categoryFilters[0], transparency, pointCount
           );
       } else if (
         categoryFilters.length === 0 &&
         continuousFilters.length === 0 &&
-        !activeVarFilterEnabled
+        outlierFilters.length === 1
       ) {
-        // The outlier slider alone.
+        // One outlier slider alone.
         shown = publishOutlierVisibility(
-          cellVisibilityMask, outliers, outlierThreshold, transparency, colors, pointCount
+          cellVisibilityMask,
+          outlierFilters[0].quantiles,
+          outlierFilters[0].threshold,
+          transparency,
+          pointCount
         );
       } else {
         shown = publishFilteredVisibility(
           cellVisibilityMask,
           categoryFilters,
           continuousFilters,
-          activeVarFilterEnabled ? activeVarValues : null,
-          activeVarFilterMin,
-          activeVarFilterMax,
-          applyOutlierFilter ? outliers : null,
-          outlierThreshold,
+          outlierFilters,
           transparency,
-          colors,
           pointCount
         );
       }
       recordVisibilityResult(transparency, inputs, shown);
-      recordAlphaBytesMirror(colors, transparency);
     }
 
-    if (colors !== publishedColors && String(this.activeViewId) === 'live') {
-      // The live viewer and renderer hold the state's colors by reference; a
-      // copy-on-write moved the state to a new array, so it is republished.
-      this._pushColorsToViewer();
-    }
     this.filteredCount = { shown, total: pointCount };
     // What `updateFilteredCount` would count from, so it can answer from here.
     this._filteredCountMemo = {
       transparency,
       epoch: transparencyEpoch(this),
-      outliers,
-      threshold: outlierThreshold,
       shown,
     };
     const centroidsChanged = this._updateActiveCategoryCounts();
@@ -816,7 +813,7 @@ export class DataStateFilterMethods {
   }
 
   getActiveFiltersStructured() {
-    return collectViewFilters(this);
+    return collectViewFilters(this, { geneSampled: (this.getGeneSample?.() ?? null) !== null });
   }
 
   toggleFilterEnabled(filterId, enabled) {
@@ -873,10 +870,8 @@ export class DataStateFilterMethods {
       }
     } else if (type === 'category') {
       this.ensureCategoryMetadata(field);
-      const categories = field.categories;
-      for (let i = 0; i < categories.length; i++) {
-        field._categoryVisible[i] = true;
-      }
+      withCategoriesVisible(field, true);
+      field._missingVisible = true;
       field._categoryFilterEnabled = true;
       this._reapplyCategoryColorsNoRecompute(field);
     } else {
@@ -917,14 +912,13 @@ export class DataStateFilterMethods {
     const categories = field.categories;
     const codes = field.codes;
     const catColors = field._categoryColors;
-    const catVisible = field._categoryVisible;
     const numCats = categories.length;
     if (
       (!Array.isArray(categories))
       || !isCategoricalCodes(codes)
       || codes.length !== n
-      || !Array.isArray(catColors)
-      || catColors.length !== numCats
+      || !(catColors instanceof Uint8Array)
+      || catColors.length !== numCats * 3
       || !(this.colorsArray instanceof Uint8Array)
       || this.colorsArray.length !== n * 4
       || !(this.categoryTransparency instanceof Uint8Array)
@@ -932,12 +926,9 @@ export class DataStateFilterMethods {
     ) {
       throw new TypeError('Category color refresh requires complete typed field buffers.');
     }
-    // The alpha bytes are left as the table wrote them: every caller recomputes
-    // visibility next (`reapplyCategoryColors`, `removeFilter`, `endBatch`),
-    // and `computeGlobalVisibility` publishes the alpha bytes from the new
-    // transparency. Syncing them here first was a dataset-length pass whose
-    // result was overwritten before anything read it; the GPU color stream's
-    // alpha byte is not read while the alpha texture carries visibility.
+    // Colors carry no visibility (their alpha byte is always 255): every
+    // caller recomputes the transparency next (`reapplyCategoryColors`,
+    // `removeFilter`, `endBatch`).
     this._writeCategoryColors(field);
     this._pushColorsToViewer();
   }
@@ -957,16 +948,14 @@ export class DataStateFilterMethods {
   getColorForCategory(field, idx) {
     requireCategoryFieldAndIndex(field, idx);
     this.ensureCategoryMetadata(field);
-    const color = field._categoryColors[idx];
-    requireRgb(color);
-    return [...color];
+    return categoryRgbAt(field._categoryColors, idx);
   }
 
   setColorForCategory(field, idx, color) {
     requireCategoryFieldAndIndex(field, idx);
     requireRgb(color);
     this.ensureCategoryMetadata(field);
-    field._categoryColors[idx] = [...color];
+    withCategoryColor(field, idx, color);
     if (this._batchMode) {
       this._batchDirty.colors = true;
       this._batchDirty.affectedFields.add(field);
@@ -981,10 +970,34 @@ export class DataStateFilterMethods {
       throw new TypeError('Category visibility must be exactly true or false.');
     }
     this.ensureCategoryMetadata(field);
-    field._categoryVisible[idx] = visible;
+    withCategoryVisibility(field, idx, visible);
     if (this._batchMode) {
       this._batchDirty.visibility = true;
       this._batchDirty.colors = true; // visibility changes affect color display
+      this._batchDirty.affectedFields.add(field);
+    } else {
+      this.reapplyCategoryColors(field);
+    }
+  }
+
+  /**
+   * Several categories' visibility and colours at once (a restored
+   * session's): each array copied once (`withCategoryChanges`), the field
+   * drawn again once.
+   *
+   * @param {Object} field
+   * @param {{visibility: Array<{index: number, visible: boolean}>, colors: Array<{index: number, rgb: number[]}>}} changes
+   */
+  setCategoryStates(field, changes) {
+    if (field === null || typeof field !== 'object' || field.kind !== 'category') {
+      throw new TypeError('Category filter operation requires a category field.');
+    }
+    for (const { rgb } of changes.colors) requireRgb(rgb);
+    this.ensureCategoryMetadata(field);
+    withCategoryChanges(field, changes);
+    if (this._batchMode) {
+      this._batchDirty.visibility = true;
+      this._batchDirty.colors = true;
       this._batchDirty.affectedFields.add(field);
     } else {
       this.reapplyCategoryColors(field);
@@ -1077,6 +1090,31 @@ export class DataStateFilterMethods {
     this.computeGlobalVisibility();
   }
 
+  /**
+   * Show or hide the cells of a categorical field that have no category
+   * (the legend's Missing row): a filter like a hidden category, kept in
+   * sessions.
+   *
+   * @param {object} field
+   * @param {boolean} visible
+   */
+  setMissingCategoryVisibility(field, visible) {
+    if (field === null || typeof field !== 'object' || field.kind !== 'category') {
+      throw new TypeError('Missing-value visibility belongs to a category field.');
+    }
+    if (typeof visible !== 'boolean') {
+      throw new TypeError('Missing-value visibility must be exactly true or false.');
+    }
+    this.ensureCategoryMetadata(field);
+    field._missingVisible = visible;
+    if (this._batchMode) {
+      this._batchDirty.visibility = true;
+      this._batchDirty.affectedFields.add(field);
+    } else {
+      this.computeGlobalVisibility();
+    }
+  }
+
   showAllCategories(field, { onlyAvailable = false } = {}) {
     if (typeof onlyAvailable !== 'boolean') {
       throw new TypeError('onlyAvailable must be exactly true or false.');
@@ -1097,10 +1135,8 @@ export class DataStateFilterMethods {
     ) {
       throw new TypeError('Available category counts must exactly match the category inventory.');
     }
-    for (let i = 0; i < categories.length; i++) {
-      if (available !== null && available[i] === 0) continue;
-      field._categoryVisible[i] = true;
-    }
+    withCategoriesVisible(field, true, available === null ? null : index => available[index] !== 0);
+    field._missingVisible = true;
     this.reapplyCategoryColors(field);
   }
 
@@ -1124,10 +1160,8 @@ export class DataStateFilterMethods {
     ) {
       throw new TypeError('Available category counts must exactly match the category inventory.');
     }
-    for (let i = 0; i < categories.length; i++) {
-      if (available !== null && available[i] === 0) continue;
-      field._categoryVisible[i] = false;
-    }
+    withCategoriesVisible(field, false, available === null ? null : index => available[index] !== 0);
+    field._missingVisible = false;
     this.reapplyCategoryColors(field);
   }
 
@@ -1138,8 +1172,8 @@ export class DataStateFilterMethods {
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = null;
     if (this.colorsArray) {
-      // Neutral gray RGB (left as it is when it already holds it); the alpha
-      // bytes are the visibility the pass below publishes.
+      // Neutral gray (left as it is when it already holds it); the
+      // visibility is the transparency the pass below publishes.
       writableNeutralColors(this);
     }
     if (!this.categoryTransparency || this.categoryTransparency.length !== this.pointCount) {
@@ -1161,12 +1195,13 @@ export class DataStateFilterMethods {
   /**
    * Snapshot payload for small multiples (Keep view).
    *
-   * `colors` is the kept view's own copy: the viewer and renderer keep it by
-   * reference and the new view context adopts it (it is never written again;
-   * a recolor of that view publishes a new array). `transparency` is the
-   * active view's array, lent for one synchronous publication
-   * (`publishSnapshotView`): the viewer copies it, and the new context shares
-   * it with this view until either one writes.
+   * `colors` is the active view's array itself: the viewer and renderer keep
+   * it by reference, the new view context adopts it, and from then on it is
+   * never written again (`markSnapshotPublishedColors`), so whichever view
+   * recolors first writes a copy and keeping a view copies nothing until the
+   * views diverge. `transparency` is the active view's array, lent for one
+   * synchronous publication (`publishSnapshotView`): the viewer copies it,
+   * and the new context shares it with this view until either one writes.
    */
   getSnapshotPayload() {
     const {
@@ -1181,7 +1216,7 @@ export class DataStateFilterMethods {
       label,
       fieldKey,
       fieldKind,
-      colors: this.colorsArray ? new Uint8Array(this.colorsArray) : null,
+      colors: this.colorsArray ?? null,
       transparency: this.categoryTransparency ?? null,
       centroidPositions: this.centroidPositions
         ? new Float32Array(this.centroidPositions)

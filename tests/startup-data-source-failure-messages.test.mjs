@@ -136,19 +136,19 @@ test('four distinct catalog failures no longer read as one network problem', () 
   );
   for (const sentence of sentences) {
     assert.match(sentence, /^Sample datasets could not be loaded/);
-    assert.match(sentence, /try again/i);
-    assert.doesNotMatch(
-      sentence,
-      /https:|CORS|gzip|JSON|HTTP|Error/,
-      'the notice names the cause, never the transport diagnostic'
-    );
+    assert.doesNotMatch(sentence, /https:|CORS|gzip|JSON|Error/, 'never the transport diagnostic or the address');
   }
-  // The wrong address is the one a `?sampleCatalog=` typo produces, and it
-  // must not send the user to check their network.
-  assert.match(sentences[0], /Check the address for a typo/);
+  // A host's answer is said by whose problem it is, as every source says it
+  // (`describeHostFault`): the host, its status, what to do.
+  assert.equal(sentences[0], 'Sample datasets could not be loaded: datasets.json was not found at catalog.cellucid.test '
+    + '(HTTP 404, not found): the link or record does not exist, or it moved. Check the link, or ask its owner.');
   assert.doesNotMatch(sentences[0], /Check your network/);
-  assert.match(sentences[1], /refused access/);
+  assert.match(sentences[1], /^Sample datasets could not be loaded: catalog\.cellucid\.test refused datasets\.json \(HTTP 403, forbidden\): .* the link's permissions/);
+  assert.match(sentences[2], /try again/i);
   assert.match(sentences[3], /not in a format Cellucid can read/);
+  assert.equal(describeDataSourceFailure('Sample datasets', 'could not be loaded', LOADER_FAILURES.serverError),
+    'Sample datasets could not be loaded: catalog.cellucid.test is not answering (HTTP 500, a server error) for '
+    + 'datasets.json: a problem on catalog.cellucid.test\'s side, not with the link or with Cellucid. It usually passes; try again later.');
 });
 
 test('the sentence never quotes the raw text; the notification keeps it as its Details', () => {

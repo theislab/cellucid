@@ -14,6 +14,7 @@ import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { LocalUserDirDataSource } from '../assets/js/data/local-user-source.js';
 import { defaultDatasetIdOf } from '../assets/js/data/input-formats.js';
 import { zippedStoreEntries } from './helpers/zarr-corpus.mjs';
+import { cancellationKind } from '../assets/js/utils/abort.js';
 
 const FIXTURES = new URL('./fixtures/cellucid-ready/', import.meta.url);
 
@@ -144,13 +145,13 @@ test('local selections expose a monotonic identity before asynchronous work', as
   assert.equal(source.datasetId, null);
 });
 
-test('a chosen file that states no id is named after its file, and keeps its provenance', async t => {
+test('a chosen file that states no id is named after its file and what it holds, and keeps its provenance', async t => {
   quiet(t);
   const source = new LocalUserDirDataSource();
   t.after(() => source.clear());
   const bytes = readFileSync(new URL('./browser/fixtures/data-mapping-full.zarr.zip', import.meta.url));
   const metadata = await source.loadFromFile(new File([bytes], 'portable.zarr.zip'));
-  assert.equal(metadata.id, 'zarr_portable', 'a store that states no id is named after its file');
+  assert.match(metadata.id, /^zarr_portable_[0-9a-f]{8}$/, 'a store that states no id is named after its file and its structure');
   assert.equal(metadata.name, 'portable');
   assert.equal(metadata.source.name, 'AnnData Zarr', 'named by the format its content shows');
   assert.equal(metadata.source.filename, 'portable.zarr.zip', 'the selected file is part of its provenance');
@@ -161,6 +162,24 @@ test('a chosen file that states no id is named after its file, and keeps its pro
   assert.equal(inner.describeStorage().zarrVersion, 2);
   assert.equal((await inner.getMetadata(source.datasetId)).source.name, 'AnnData Zarr',
     'the adopted inner source and local UI source must expose one identity');
+  // The same data again, under the same name: the same dataset.
+  const again = new LocalUserDirDataSource();
+  t.after(() => again.clear());
+  assert.equal((await again.loadFromFile(new File([bytes], 'portable.zarr.zip'))).id, metadata.id);
+});
+
+test('two files of one name holding other data are two datasets', async t => {
+  quiet(t);
+  const ids = [];
+  for (const fixture of ['data-mapping-full.h5ad', 'data-mapping-wide.h5ad', 'current-ui-smoke.h5ad']) {
+    const source = new LocalUserDirDataSource();
+    t.after(() => source.clear());
+    const bytes = readFileSync(new URL(`./browser/fixtures/${fixture}`, import.meta.url));
+    const { id } = await source.loadFromFile(new File([bytes], 'data.h5ad'));
+    assert.match(id, /^h5ad_data_[0-9a-f]{8}$/, fixture);
+    ids.push(id);
+  }
+  assert.equal(new Set(ids).size, ids.length, `every file its own id: ${ids.join(', ')}`);
 });
 
 test('a chosen file is read as what its content is, whatever its name says', async t => {
@@ -170,16 +189,19 @@ test('a chosen file is read as what its content is, whatever its name says', asy
   // An .h5ad's bytes under a .zip name: its HDF5 signature decides.
   const bytes = readFileSync(new URL('./browser/fixtures/data-mapping-full.h5ad', import.meta.url));
   const metadata = await source.loadFromFile(new File([bytes], 'misnamed.zip'));
-  assert.equal(metadata.id, 'h5ad_misnamed');
+  assert.match(metadata.id, /^h5ad_misnamed_[0-9a-f]{8}$/);
   assert.equal(source.getAnnDataSource().format, 'h5ad');
   assert.equal(source.getAnnDataSource().describeStorage().layout, 'file');
   await assert.rejects(source.loadFromFile(new File([bytes], 'notes.txt')), /Not a file Cellucid opens/);
 });
 
+/** The structure the fake candidates below hold: two cells, one gene. */
+const TWO_CELLS = Object.freeze({ nObs: 2, nVars: 1, varNames: ['g'] });
+
 for (const flow of [
   {
     name: 'H5AD',
-    expectedDatasetId: 'h5ad_newer',
+    expectedDatasetId: defaultDatasetIdOf('h5ad', 'newer.h5ad', TWO_CELLS),
     prototype: AnnDataFileSource.prototype,
     method: 'loadFile',
     createSelection(name) {
@@ -191,7 +213,7 @@ for (const flow of [
     async installCandidate(candidate, selection, options) {
       const file = selection;
       candidate.filename = file.name;
-      candidate.datasetId = options.datasetId ?? defaultDatasetIdOf('h5ad', file.name);
+      candidate.datasetId = options.datasetId ?? defaultDatasetIdOf('h5ad', file.name, TWO_CELLS);
       candidate._metadata = {
         id: candidate.datasetId,
         name: file.name,
@@ -205,7 +227,7 @@ for (const flow of [
   },
   {
     name: 'Zarr ZIP',
-    expectedDatasetId: 'zarr_newer',
+    expectedDatasetId: defaultDatasetIdOf('zarr', 'newer.zarr.zip', TWO_CELLS),
     prototype: AnnDataFileSource.prototype,
     method: 'loadFile',
     createSelection(name) {
@@ -217,7 +239,7 @@ for (const flow of [
     async installCandidate(candidate, selection, options) {
       const root = selection.name.replace(/\.zip$/i, '');
       candidate.filename = selection.name;
-      candidate.datasetId = options.datasetId ?? defaultDatasetIdOf('zarr', selection.name);
+      candidate.datasetId = options.datasetId ?? defaultDatasetIdOf('zarr', selection.name, TWO_CELLS);
       candidate._metadata = {
         id: candidate.datasetId,
         name: root,
@@ -297,10 +319,7 @@ for (const flow of [
       true,
       `older ${flow.name} load must report that a newer selection superseded it`
     );
-    assert.equal(
-      olderOutcome.reason?.code,
-      'CELLUCID_DATASET_RELOAD_SUPERSEDED'
-    );
+    assert.equal(cancellationKind(olderOutcome.reason), 'superseded');
   });
 }
 

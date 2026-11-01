@@ -6,6 +6,7 @@
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -18,6 +19,7 @@ import {
 } from '../assets/js/data/sources/anndata-catalog.js';
 import { serveFixtureHost } from './helpers/fixture-web-host.mjs';
 import { openableNamesText } from '../assets/js/data/input-formats.js';
+import { undoLater } from './helpers/teardown.mjs';
 
 const BASE = 'https://catalog.test/anndata/';
 const FIXTURES = new URL('./fixtures/cellucid-ready/', import.meta.url);
@@ -27,7 +29,7 @@ function quiet(t) {
   const { log, warn } = console;
   console.log = () => {};
   console.warn = () => {};
-  t.after(() => {
+  undoLater(t, () => {
     console.log = log;
     console.warn = warn;
   });
@@ -135,7 +137,7 @@ test('listing reads each file\'s metadata and uns only; choosing one opens it', 
   });
   const checked = await fetchAnnDataCatalog(BASE, 'local-demo', null);
   const owner = new AnnDataCatalog({ baseUrl: BASE, catalog: checked, sourceType: 'local-demo', sourceName: 'Samples' });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
   // The zipped store states the id 'tiny-ready' but is listed as 'packed'.
   await assert.rejects(
     owner.describe(null),
@@ -148,7 +150,7 @@ test('listing reads each file\'s metadata and uns only; choosing one opens it', 
     sourceType: 'local-demo',
     sourceName: 'Samples',
   });
-  t.after(() => single.close());
+  undoLater(t, () => single.close());
   host.requests.length = 0;
   const [summary] = await single.describe(null);
   assert.deepEqual(summary, {
@@ -190,7 +192,7 @@ test('a dataset being opened is listed from its opening, not read a second time'
     sourceType: 'local-demo',
     sourceName: 'Samples',
   });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
   const opening = owner.open('tiny-ready');
   const listing = owner.describe(null);
   const { metadata } = await opening;
@@ -230,7 +232,7 @@ test('a listing given up because another file failed leaves an opening of the sa
     }
     return served(input, init);
   };
-  t.after(() => {
+  undoLater(t, () => {
     globalThis.fetch = served;
   });
   const owner = new AnnDataCatalog({
@@ -242,7 +244,7 @@ test('a listing given up because another file failed leaves an opening of the sa
     sourceType: 'local-demo',
     sourceName: 'Samples',
   });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
   const listing = owner.describe(null);
   listing.catch(() => {});
   await reachedFile;
@@ -262,7 +264,7 @@ test('an .h5ad listed in a catalog is read in place with range requests', async 
     sourceType: 'link',
     sourceName: 'catalog.test',
   });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
   const [summary] = await owner.describe(null);
   assert.equal(summary.stats.n_cells, 6);
   const { metadata } = await owner.open('tiny-ready');
@@ -280,7 +282,7 @@ test('a file stating another id than its catalog entry is refused when opened', 
     sourceType: 'link',
     sourceName: 'catalog.test',
   });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
   await assert.rejects(owner.open('tiny-ready'), /lists other-id\.h5ad as dataset 'tiny-ready', but the file states the id\s+'other-dataset'/);
   assert.equal(owner.openedSource('tiny-ready'), null);
 });
@@ -297,7 +299,7 @@ test('the entries are listed from datasets.json itself, before any file is read'
     sourceType: 'local-demo',
     sourceName: 'Samples',
   });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
   assert.deepEqual(owner.entries(), [
     { id: 'tiny-ready', name: 'ready' },
     { id: 'other', name: 'cell atlas' },
@@ -314,7 +316,7 @@ test('an opening stops once no caller wants it, and stays once it has opened', a
     sourceType: 'local-demo',
     sourceName: 'Samples',
   });
-  t.after(() => owner.close());
+  undoLater(t, () => owner.close());
 
   // Two dataset changes want it; the first is replaced, the second is not.
   const first = new AbortController();
@@ -337,4 +339,129 @@ test('an opening stops once no caller wants it, and stays once it has opened', a
   await assert.rejects(stopped, error => error?.name === 'AbortError');
   const again = await owner.open('tiny-ready', new AbortController().signal);
   assert.equal(again.metadata.id, 'tiny-ready');
+});
+
+test('a catalog file on a host that serves only whole files is never downloaded by the listing; an opening downloads it', async t => {
+  quiet(t);
+  const bytes = new Uint8Array(readFileSync(new URL('ready.h5ad', FIXTURES)));
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input instanceof Request ? input.url : input);
+    const method = init.method ?? 'GET';
+    const range = init.headers?.Range ?? null;
+    requests.push({ url, method, range });
+    if (init.signal?.aborted) throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+    // Ranges ignored: every answer is the whole file.
+    const headers = { 'Content-Length': String(bytes.length), ETag: '"whole-1"' };
+    return new Response(method === 'HEAD' ? null : bytes.slice(), { status: 200, headers });
+  };
+  undoLater(t, () => { globalThis.fetch = original; });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'tiny-ready', path: 'ready.h5ad' }]), BASE, 'link'),
+    sourceType: 'link',
+    sourceName: 'catalog.test',
+  });
+  undoLater(t, () => owner.close());
+  await assert.rejects(owner.describe(null), error => /serves ready\.h5ad only whole .* cannot read what it holds without downloading all of it/.test(error.message));
+  // A whole download asks for no range; the probe's head read does (and stops).
+  const downloads = () => requests.filter(request => request.method === 'GET' && request.range === null).length;
+  const probes = () => requests.filter(request => request.method === 'HEAD').length;
+  // The probe reads the head once (and stops); no whole download follows.
+  assert.ok(downloads() <= 1, `${downloads()} whole GETs`);
+  const before = downloads();
+  const probed = probes();
+  const { metadata } = await owner.open('tiny-ready');
+  assert.equal(metadata.id, 'tiny-ready');
+  assert.equal(downloads(), before + 1, 'the opening downloads it, once');
+  assert.equal(probes(), probed + 1, 'the opening asks the host for its version again, never taking the listing\'s');
+});
+
+test('a listed file that changed on an ETag-less host after it was described fails as changed, and opening it again describes it anew', async t => {
+  quiet(t);
+  // Larger than the head read beside the probe: opening reads past it.
+  const bytes = new Uint8Array(readFileSync(new URL('./browser/fixtures/uint32-categories.h5ad', import.meta.url)));
+  let modified = 'Mon, 26 Oct 2026 10:00:00 GMT';
+  let probes = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const headers = { 'Last-Modified': modified, 'Accept-Ranges': 'bytes' };
+    if (!url.endsWith('/ready.h5ad')) return new Response(null, { status: 404 });
+    if ((init.method ?? 'GET') === 'HEAD') {
+      probes++;
+      return new Response(null, { status: 206, headers: { ...headers, 'Content-Length': String(bytes.length), 'Content-Range': `bytes 0-${bytes.length - 1}/${bytes.length}` } });
+    }
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers?.Range ?? init.headers?.get?.('Range') ?? '');
+    const last = Math.min(bytes.length - 1, Number(end));
+    return new Response(bytes.slice(Number(start), last + 1), { status: 206, headers: { ...headers, 'Content-Range': `bytes ${start}-${last}/${bytes.length}` } });
+  };
+  undoLater(t, () => {
+    globalThis.fetch = original;
+  });
+  const owner = new AnnDataCatalog({
+    baseUrl: BASE,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'uint32-categories', path: 'ready.h5ad' }]), BASE, 'link'),
+    sourceType: 'link',
+    sourceName: 'catalog.test',
+  });
+  undoLater(t, () => owner.close());
+  // Described (its probe and head), then replaced on the host before the
+  // rest of it is read.
+  const changing = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const answer = await changing(input, init);
+    if ((init.method ?? 'GET') !== 'HEAD' && probes > 0) modified = 'Tue, 27 Oct 2026 10:00:00 GMT';
+    return answer;
+  };
+  await assert.rejects(owner.open('uint32-categories'), /changed on the host/);
+  const described = probes;
+  globalThis.fetch = changing;
+  const { metadata } = await owner.open('uint32-categories');
+  assert.equal(metadata.id, 'uint32-categories');
+  assert.ok(probes > described, 'the file was described again');
+});
+
+test('a catalog on GitHub opens an entry as a link to it does: read at the commit that last wrote it, under the same identity; its listing asks GitHub\'s API nothing', async t => {
+  const base = 'https://raw.githubusercontent.com/lab/atlases/HEAD/catalog/';
+  const commit = 'c'.repeat(40);
+  const folderCommit = 'f'.repeat(40);
+  const original = globalThis.fetch;
+  undoLater(t, () => { globalThis.fetch = original; });
+  const asked = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    asked.push(`${url.host}${url.pathname}`);
+    if (url.host === 'api.github.com') {
+      const sha = url.searchParams.get('path') === 'catalog/atlas.zarr' ? folderCommit : commit;
+      return new Response(JSON.stringify([{ sha }]), { status: 200 });
+    }
+    // The file itself: 4 KiB, read in parts.
+    if ((init.method ?? 'GET') === 'HEAD') return new Response(null, { status: 200, headers: { 'Content-Length': '4096' } });
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(new Headers(init.headers ?? {}).get('Range') ?? 'bytes=0-0');
+    return new Response(new Uint8Array(Math.min(4096, Number(end) + 1) - Number(start)), { status: 206, headers: { 'Content-Range': `bytes ${start}-${Math.min(4095, Number(end))}/4096` } });
+  };
+  const owner = new AnnDataCatalog({
+    baseUrl: base,
+    catalog: validateAnnDataCatalog(catalog([{ id: 'atlas', path: 'atlas.h5ad' }, { id: 'store', path: 'atlas.zarr/' }]), base, 'link'),
+    sourceType: 'link',
+    sourceName: 'lab/atlases',
+  });
+  undoLater(t, () => owner.close());
+  const [file, folder] = owner.catalog.datasets;
+  const listed = await owner._readerSource(file, null, { listing: true });
+  assert.ok(asked.every(address => !address.startsWith('api.github.com')), 'a listing asks no provider');
+  assert.equal(listed.file.identity.key, `url:${encodeURIComponent(file.url)}`);
+  asked.length = 0;
+  const opened = await owner._readerSource(file, null);
+  const { default: github } = await import('../assets/js/data/sources/providers/github.js');
+  const linked = await github.open('lab/atlases/catalog/atlas.h5ad');
+  assert.deepEqual(opened.file.identity, linked.file.resource.identity, 'the identity of a gh: link to the same file');
+  assert.equal(opened.file.identity.version, `commit:${commit}`, 'a version that names its content: kept across visits');
+  assert.equal(opened.file.url, `https://raw.githubusercontent.com/lab/atlases/${commit}/catalog/atlas.h5ad`);
+  const store = await owner._readerSource(folder, null);
+  assert.equal(store.version, `commit:${folderCommit}`);
+  assert.equal(store.url, `https://raw.githubusercontent.com/lab/atlases/${folderCommit}/catalog/atlas.zarr/`);
+  assert.equal(typeof store.key, 'string');
 });

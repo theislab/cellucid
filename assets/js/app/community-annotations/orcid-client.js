@@ -13,6 +13,7 @@ import {
   parseOrcidPersonName,
 } from './profile-identifiers.js';
 import { parseExactJson } from './wire-contract.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 export const ORCID_RESPONSE_MAX_UTF8_BYTES = 256 * 1024;
 const ORCID_EXPANDED_SEARCH_MAX_RESULTS = 8;
@@ -32,14 +33,6 @@ function assertAbortSignalOrNull(signal) {
     throw new TypeError('ORCID request signal must be an AbortSignal or exact null');
   }
   return signal;
-}
-
-function throwIfAborted(signal) {
-  if (signal === null || !signal.aborted) return;
-  if (signal.reason !== undefined) throw signal.reason;
-  const error = new Error('ORCID request was cancelled');
-  error.name = 'AbortError';
-  throw error;
 }
 
 function createResponseError(message, code, cause = undefined) {

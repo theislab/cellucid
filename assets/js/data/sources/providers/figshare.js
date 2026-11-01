@@ -25,7 +25,13 @@
  *
  * The file's first read is made here, as the opening's second request (or
  * beside the item when the link names the file by id): it brings the first
- * signed link, and a bot challenge is said for what it is.
+ * signed link, and a bot challenge is said for what it is. It reads the
+ * file's head (`HEAD_BYTES`, what an `.h5ad` opens from) only when this
+ * browser keeps nothing of the file (`headBytesFor`): else one byte, and the
+ * head comes from what is kept when the version is the same, so a file is
+ * not downloaded again in part at every opening. Beside the item (a link
+ * naming the file by id, whose name the item tells) the head is read whole:
+ * 512 KiB take less time than the round trip a read after the item would.
  *
  * A published version of an item never changes, so its files need no check
  * for changes. Private links (`figshare.com/s/…`) have no public API and sit
@@ -35,11 +41,13 @@
  * @module data/sources/providers/figshare
  */
 
-import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
-import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
+import { DataSourceError, DataSourceErrorCode, hostFaultOfResponse } from '../../data-source.js';
+import { chooseOpenableFile, describeRemoteFile, headBytesFor, nextStepWithoutTheHost } from '../remote-file.js';
+import { fileFormatOfName } from '../../input-formats.js';
 import { requestJson } from '../api-request.js';
 import { registerSourceAccess } from '../access.js';
 import { HEAD_BYTES, headOfFile, readFileHead, statedLifetimeMs } from '../../../formats/io/byte-source.js';
+import { cancel } from '../../../utils/abort.js';
 
 const API = 'https://api.figshare.com/v2';
 const DOWNLOADER = 'https://ndownloader.figshare.com/files/';
@@ -127,7 +135,7 @@ function isChallenge(response) {
 function challengeRefusal(name) {
   return refusal(
     `Figshare's file host refused this browser with a bot check, so ${name} cannot be read here. ` +
-    'Try again in a minute, open it in another browser, or download it from Figshare and open it from your computer.',
+    `Try again in a minute, or open it in another browser. ${nextStepWithoutTheHost(name, fileFormatOfName(name))}`,
     DataSourceErrorCode.NETWORK_ERROR,
     { reason: 'bot-check' }
   );
@@ -144,6 +152,8 @@ async function signedRead(fileId, name, length, signal) {
   const read = await readFileHead(`${DOWNLOADER}${fileId}`, length, { signal });
   if (isChallenge(read.response)) throw challengeRefusal(name);
   const url = read.response.url;
+  const fault = hostFaultOfResponse(read.response, name, { url: `${DOWNLOADER}${fileId}`, fileId });
+  if (fault !== null) throw fault;
   if (read.response.status !== 206 || typeof url !== 'string' || url === '') {
     throw refusal(
       `Figshare did not send ${name} (HTTP ${read.response.status}). Try again in a minute.`,
@@ -208,11 +218,19 @@ export default Object.freeze({
   capabilities: Object.freeze({
     folders: false,
     private: 'none',
+    public: false,
     versions: true,
     write: false,
   }),
   match(input, { explicit = true } = {}) {
     return parseFigshare(input, explicit);
+  },
+  /**
+   * A private link (`figshare.com/s/<key>`) is its key: shown only as a
+   * private link, never its key. Any other value carries no access.
+   */
+  publicValue(value) {
+    return value.startsWith('private:') ? 'private:link' : value;
   },
   async open(value, { signal = null, onStep = null } = {}) {
     let parsed = parseFigshare(value);
@@ -250,15 +268,17 @@ export default Object.freeze({
     const earlySignal = signal === null ? early.signal : AbortSignal.any([signal, early.signal]);
     const headRead = fileId === null ? null : signedRead(fileId, `file ${fileId}`, HEAD_BYTES, earlySignal);
     headRead?.catch(() => {});
+    // The item names the version and checksum that open: asked of Figshare now.
     const answer = await requestJson(`${API}/articles/${id}${version === null ? '' : `/versions/${version}`}`, {
       label: `Figshare item ${id}`,
       signal,
+      cache: 'no-cache',
     }).catch(error => {
       early.abort(error);
       throw error;
     });
     if (!answer.ok) {
-      early.abort(new DOMException('The item could not be read.', 'AbortError'));
+      cancel(early, 'superseded', 'The item could not be read.');
       throw refusal(
         answer.status === 404
           ? `Figshare item ${id}${version === null ? '' : ` version ${version}`} does not exist or is not public.`
@@ -274,7 +294,7 @@ export default Object.freeze({
     const opened = Number.isSafeInteger(record.version) ? record.version : version;
     const byId = fileId === null ? null : files.find(file => String(file.id) === fileId) ?? null;
     if (fileId !== null && byId === null) {
-      early.abort(new DOMException('Another file is read instead.', 'AbortError'));
+      cancel(early, 'superseded', 'Another file is read instead.');
       throw refusal(`${where} has no file with id ${fileId}.`, DataSourceErrorCode.NOT_FOUND, { id, fileId });
     }
     const name = byId?.name ?? chooseOpenableFile(
@@ -284,12 +304,16 @@ export default Object.freeze({
       fileName => `figshare:${item(id, version, fileName)}`
     );
     const entry = byId ?? files.find(file => file.name === name);
+    // The item and the file's name, across versions: sessions and
+    // annotations follow a dataset to its next version; the version and
+    // checksum say which one is open.
+    const key = `figshare:${id}:${encodeURIComponent(name)}`;
     // The file's first read, here rather than in the reader (the same round
     // trip): it brings the signed link the reader reads from.
     onStep?.(`Reading the start of ${name} from Figshare`);
     let first;
     try {
-      first = await (headRead ?? signedRead(entry.id, name, HEAD_BYTES, signal));
+      first = await (headRead ?? signedRead(entry.id, name, await headBytesFor(key), signal));
     } catch (error) {
       if (signal?.aborted || error instanceof DataSourceError) {
         throw error instanceof DataSourceError && error.details?.reason === 'bot-check' ? challengeRefusal(name) : error;
@@ -304,15 +328,14 @@ export default Object.freeze({
     const title = typeof record.title === 'string' && record.title.trim() ? record.title.trim() : `Figshare ${id}`;
     const file = await describeRemoteFile({
       url: `${DOWNLOADER}${entry.id}`,
-      // The item and the file's name, across versions: sessions and
-      // annotations follow a dataset to its next version; the version and
-      // checksum say which one is open.
-      id: `figshare:${id}:${encodeURIComponent(name)}`,
+      id: key,
       name,
       title,
       size: Number.isSafeInteger(entry.size) ? entry.size : null,
       head,
-      version: `figshare:${id}v${opened ?? ''}:${entry.computed_md5 ?? ''}`,
+      // A validator only where Figshare states one (the version opened, the
+      // file's checksum): without either the file is known by its size alone.
+      version: opened == null && !entry.computed_md5 ? null : `figshare:${id}v${opened ?? ''}:${entry.computed_md5 ?? ''}`,
       attribution: {
         title,
         url: typeof record.figshare_url === 'string' ? record.figshare_url : `https://figshare.com/articles/${id}`,

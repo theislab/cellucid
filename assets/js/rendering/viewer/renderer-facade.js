@@ -12,6 +12,8 @@
  * `(renderer, getTerminalState)` pair it is called with.
  */
 
+import { copyLargeArray } from '../../utils/large-arrays.js';
+
 function createViewerDisposedError(methodName) {
   const error = new Error(
     `Viewer method "${methodName}" is unavailable after dispose(); ` +
@@ -66,7 +68,6 @@ export function createViewerRendererFacade(
   const guardedReadOnlyTargets = new WeakSet();
   const guardedReadOnlyBufferCopies = new WeakMap();
   const guardedReadOnlyDetachedCopies = new WeakMap();
-  const guardedLodMembershipCopies = new WeakMap();
   const READ_ONLY_RENDERER_OWNERS = new Set([
     'activeProgram',
     'buffers',
@@ -371,7 +372,7 @@ export function createViewerRendererFacade(
             value.byteOffset + value.byteLength
           ));
         } else {
-          copy = new value.constructor(value);
+          copy = copyLargeArray(value);
         }
         guardedReadOnlyBufferCopies.set(value, copy);
       }
@@ -940,42 +941,6 @@ export function createViewerRendererFacade(
     return valueProxy;
   };
 
-  const guardRendererMethodResult = (
-    value,
-    property,
-    ownerName
-  ) => {
-    if (
-      value !== null &&
-      (
-        property === 'getCurrentLodMembership' ||
-        property === 'getCurrentLodSequentialMembership'
-      )
-    ) {
-      let detached = guardedLodMembershipCopies.get(value);
-      if (detached === undefined) {
-        detached = Object.freeze({
-          ...value,
-          ...(value.admissionLevels instanceof Uint8Array
-            ? {
-                admissionLevels:
-                  new Uint8Array(value.admissionLevels),
-              }
-            : {}),
-          ...(value.indices instanceof Uint32Array
-            ? { indices: new Uint32Array(value.indices) }
-            : {}),
-          // generationToken is an inert frozen identity certificate. Preserve
-          // it so callers can compare generations without gaining mutable data.
-          generationToken: value.generationToken,
-        });
-        guardedLodMembershipCopies.set(value, detached);
-      }
-      return detached;
-    }
-    return guardValue(value, ownerName, true);
-  };
-
   const RawRendererConstructor = renderer.constructor;
   const rendererConstructorFacade = function RendererFacadeConstructor(
     ...args
@@ -1042,14 +1007,14 @@ export function createViewerRendererFacade(
           : function guardedRendererMethod(...args) {
               assertMutable(`Renderer method "${String(property)}"`);
               if (!isReaderMethodName(property)) onMutation();
-              return guardRendererMethodResult(
+              return guardValue(
                 Reflect.apply(
                   value,
                   target,
                   args.map(unwrapGuardedValue)
                 ),
-                property,
                 `Renderer method "${String(property)}" result`,
+                true
               );
             };
         if (!isPrivateMethod) {

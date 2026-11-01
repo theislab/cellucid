@@ -4,8 +4,9 @@ Three small AnnData files exercise how the browser chooses and changes the
 embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
 
 - ``data-mapping-guess.h5ad`` (and ``data-mapping-guess.zarr.zip``): no UMAP.
-  ``X_umap_old`` ranks first for the best guess but holds a NaN at cell 17, so
-  the guess skips it and shows ``X_tsne`` in 2D. ``obsm`` also holds a force
+  ``X_umap_old`` (float64) ranks first for the best guess but holds a value
+  past float32 at cell 17 (a NaN there would only leave that cell unplaced),
+  so the guess skips it and shows ``X_tsne`` in 2D. ``obsm`` also holds a force
   layout, a wide ``X_pca``, a DataFrame and a sparse array, which the panel
   lists as unusable with their reasons.
 - ``data-mapping-wide.h5ad``: only a wide ``X_pca`` (and a DataFrame), so the
@@ -24,7 +25,8 @@ embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
   duplicate and an empty value, a categorical ``feature_type`` and two columns
   that cannot name genes. ``X``, the layers ``counts`` and ``log1p``, and a
   ``raw`` with its own, wider var axis. ``X_scVI`` as a latent space, an
-  ``X_broken`` embedding with a NaN at cell 5, and vectors named the way
+  ``X_broken`` embedding (float64) with a value past float32 at cell 5, and
+  vectors named the way
   scVelo names them, each bound by default to the embedding it is named for:
   ``velocity_umap`` for ``X_umap``, ``velocity_tsne`` for ``X_tsne`` and
   ``velocity_pca``, as wide as ``X_pca``.
@@ -122,8 +124,8 @@ def base_anndata(rng: np.random.Generator) -> tuple[anndata.AnnData, np.ndarray]
 def guess_fixture() -> anndata.AnnData:
     rng = np.random.default_rng(20261019)
     adata, labels = base_anndata(rng)
-    umap_old = clustered(rng, labels, 2, 0.8)
-    umap_old[17, 1] = np.nan
+    umap_old = clustered(rng, labels, 2, 0.8).astype(np.float64)
+    umap_old[17, 1] = 1e300
     adata.obsm["X_umap_old"] = umap_old
     adata.obsm["X_tsne"] = clustered(rng, labels, 2, 1.0)
     adata.obsm["X_draw_graph_fa"] = clustered(rng, labels, 2, 1.5)
@@ -256,8 +258,8 @@ def full_fixture() -> anndata.AnnData:
     adata.obsm["X_tsne"] = clustered(rng, labels, 2, 1.0)
     adata.obsm["X_pca"] = clustered(rng, labels, 6, 1.2)
     adata.obsm["X_scVI"] = clustered(rng, labels, 10, 1.5)
-    broken = clustered(rng, labels, 2, 1.0)
-    broken[5, 0] = np.nan
+    broken = clustered(rng, labels, 2, 1.0).astype(np.float64)
+    broken[5, 0] = 1e300
     adata.obsm["X_broken"] = broken
     adata.obsm["velocity_umap"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
     adata.obsm["velocity_tsne"] = rng.normal(0.0, 0.3, size=(CELL_COUNT, 2)).astype(np.float32)
@@ -315,24 +317,26 @@ def float32_values(values: np.ndarray, *, label: str) -> np.ndarray:
     return narrowed
 
 
-def value_defect(values: np.ndarray) -> str | None:
-    """The first value of an array (rows are cells) that cannot be read, as the browser words it."""
+def value_defect(values: np.ndarray, what: str) -> str | None:
+    """Why an array (rows are cells) cannot be read, as the browser words it, or None.
+
+    A row holding NaN or an infinity is a cell the array does not place (no
+    value for it), never a defect; a placed cell's value past float32 is one,
+    and so is an array placing no cell (``what`` names a row's content).
+    """
     array = np.asarray(values)
     if array.dtype.kind not in "iuf":
         return "not a numeric array"
     if array.ndim == 1:
         array = array.reshape(-1, 1)
     with np.errstate(over="ignore", invalid="ignore"):
-        finite = np.isfinite(array)
-        if not finite.all():
-            row = int(np.argwhere(~finite)[0][0])
-            value = float(array[row][~finite[row]][0])
-            kind = "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
-            return f"{kind} at cell {row}"
+        placed = np.isfinite(array).all(axis=1)
         narrowed = array.astype(np.float32)
-        bad = ~np.isfinite(narrowed) | ((array != 0) & (narrowed == 0))
+        bad = placed[:, None] & (~np.isfinite(narrowed) | ((array != 0) & (narrowed == 0)))
         if bad.any():
             return f"not representable as float32 at cell {int(np.argwhere(bad)[0][0])}"
+    if array.shape[0] > 0 and not placed.any():
+        return f"every cell's {what} missing (NaN or infinite)"
     return None
 
 
@@ -522,11 +526,12 @@ def latent_expectations(adata: anndata.AnnData) -> dict:
     for key in usable_obsm_keys(adata):
         values = np.asarray(adata.obsm[key])
         values = values.reshape(-1, 1) if values.ndim == 1 else values
-        defect = value_defect(values)
+        defect = value_defect(values, "latent values are")
         if defect is not None:
             latent[key] = {"refused": defect}
             continue
-        values = float32_values(values, label=f"obsm[{key!r}]")
+        # A NaN row (a cell the latent space does not place) stays NaN.
+        values = values.astype(np.float32)
         outcomes: dict[str, str] = {}
         for field in fields:
             categorical = adata.obs[field].astype("category")
@@ -558,7 +563,7 @@ def vector_expectations(adata: anndata.AnnData) -> dict:
         whole = vector.shape[1] == dimension and vector_columns == tuple(range(dimension))
         if not (same_columns or whole):
             raise ValueError(f"{vector_key} cannot be bound to {embedding_key} at {vector_columns}")
-        if value_defect(embedding[:, embedding_columns]) or value_defect(vector[:, vector_columns]):
+        if not (np.isfinite(embedding[:, embedding_columns]).all() and np.isfinite(vector[:, vector_columns]).all()):
             raise ValueError(f"{vector_key} at {embedding_key} reads a value that is not finite")
         selected = embedding[:, embedding_columns].astype(np.float64)
         largest_range = float((selected.max(axis=0) - selected.min(axis=0)).max())

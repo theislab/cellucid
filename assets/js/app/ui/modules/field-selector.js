@@ -8,6 +8,7 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
+import { isCancellation, cancelled } from '../../../utils/abort.js';
 import { InlineEditor } from '../components/inline-editor.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
 import { CategoryBuilder } from '../category-builder.js';
@@ -23,18 +24,16 @@ import {
 import { syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
 import {
-  createDatasetFieldLoadSupersededError,
-  isDatasetFieldLoadSupersededError
-} from '../../state/managers/field/loading.js';
-import {
   createFieldInteractionOwner,
-  isFieldInteractionSupersededError
+  describeUnshownField,
+  unshownChoiceReason,
 } from './field-interaction-owner.js';
+import { useOpenCells } from '../../../data/open-cells-work.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 
 const NONE_FIELD_VALUE = '-1';
 const INIT_KEYS = new Set(['state', 'dom', 'dataSourceManager', 'callbacks']);
-const CALLBACK_KEYS = new Set(['onActiveFieldChanged']);
+const CALLBACK_KEYS = new Set(['onActiveFieldChanged', 'onChooseGeneNames']);
 const DOM_TYPES = new Map([
   ['categoricalSelect', 'HTMLSelectElement'],
   ['categoricalCopyBtn', 'HTMLButtonElement'],
@@ -432,10 +431,7 @@ export function initFieldSelector(options) {
     }
     interactionOwner.track(task);
     task.catch((error) => {
-      if (
-        isFieldInteractionSupersededError(error)
-        || isDatasetFieldLoadSupersededError(error)
-      ) {
+      if (isCancellation(error)) {
         return;
       }
       const exactError = requireError(error, 'Field selector UI task');
@@ -453,6 +449,24 @@ export function initFieldSelector(options) {
       throw new TypeError(
         'Field selector dataset generation must be a non-negative safe integer'
       );
+    }
+    return generation;
+  }
+
+  /**
+   * Take the generation of the cells open now as the one shown, without
+   * retiring the choice under way. A choice calls it once it holds the open
+   * cells (`useOpenCells`): the cells a progressive opening's step or Apply
+   * grew or cut before it are the ones it is shown on, not a reason to drop
+   * it (`synchronizeDatasetGeneration` would, at the next refresh).
+   *
+   * @returns {number}
+   */
+  function adoptDatasetGeneration() {
+    const generation = readDatasetGeneration();
+    if (generation !== adoptedDatasetGeneration) {
+      closeTransientInteractions();
+      adoptedDatasetGeneration = generation;
     }
     return generation;
   }
@@ -484,14 +498,6 @@ export function initFieldSelector(options) {
       ? state.getFields()
       : state.getVarFields();
     return Array.isArray(fields) && fields[index] === field;
-  }
-
-  function isIntentionalInteractionRetirement(error, token) {
-    return (
-      interactionOwner.isCurrent(token) === false
-      || isFieldInteractionSupersededError(error)
-      || isDatasetFieldLoadSupersededError(error)
-    );
   }
 
   function isCommunityAnnotationUiEnabled() {
@@ -920,39 +926,75 @@ export function initFieldSelector(options) {
     }
   }
 
+  /**
+   * Show obs field `idx` (-1 clears the colouring). A choice is work on the
+   * open cells (`data/open-cells-work.js`): one made while a progressive
+   * opening's step or Apply changes them starts on the cells after it, and
+   * no change commits under it. Whatever keeps it from being shown is said
+   * (`describeUnshownField`), except a newer choice, Cancel, or another
+   * dataset.
+   */
   function activateField(idx) {
     assertAlive();
     const index = requireSelectableIndex(idx, 'Field activation index');
     if (interactionOwner.isSuspended()) {
+      // The selects are put back to what is shown when the suspension ends
+      // (`acquireSessionOperation`'s release).
+      const reason = interactionOwner.suspensionReason();
+      getNotificationCenter().info(
+        index === -1
+          ? `The colouring is not cleared: ${reason}. Clear it again when that has ended.`
+          : describeUnshownField(getFieldForSource(FieldSource.OBS, index).field.key, reason),
+        { category: 'data' }
+      );
       return Promise.resolve(null);
     }
-    const datasetGeneration = synchronizeDatasetGeneration();
-    return interactionOwner.run(async token => {
-      syncCommunityAnnotationCacheContext({ dataSourceManager });
+    synchronizeDatasetGeneration();
+    return interactionOwner.run(token => useOpenCells(
+      () => activateFieldOnOpenCells(index, token),
+      token.signal
+    ));
+  }
 
-      if (index === -1) {
-        interactionOwner.assertCurrent(token);
-        const cleared = requireFieldInfo(
-          state.clearActiveField(),
-          null,
-          'Clear active field result'
-        );
-        forceDisableFieldSelects = false;
-        clearFieldSelections();
-        geneSelector.clearLocalSelectionUI();
-        geneSelector.updateGeneActionButtons(false);
-        updateFieldSelectDisabledStates();
-        callbacks.onActiveFieldChanged(cleared);
-        return cleared;
-      }
+  async function activateFieldOnOpenCells(index, token) {
+    const datasetGeneration = adoptDatasetGeneration();
+    syncCommunityAnnotationCacheContext({ dataSourceManager });
 
-      const { field } = getFieldForSource(FieldSource.OBS, index);
+    if (index === -1) {
+      interactionOwner.assertCurrent(token);
+      const cleared = requireFieldInfo(
+        state.clearActiveField(),
+        null,
+        'Clear active field result'
+      );
+      forceDisableFieldSelects = false;
+      clearFieldSelections();
       geneSelector.clearLocalSelectionUI();
-      geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
-      forceDisableFieldSelects = true;
+      geneSelector.updateGeneActionButtons(false);
       updateFieldSelectDisabledStates();
-      try {
-        await state.ensureFieldLoaded(index, {
+      callbacks.onActiveFieldChanged(cleared);
+      return cleared;
+    }
+
+    const { field } = getFieldForSource(FieldSource.OBS, index);
+    geneSelector.clearLocalSelectionUI();
+    geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
+    forceDisableFieldSelects = true;
+    updateFieldSelectDisabledStates();
+    try {
+      await state.ensureFieldLoaded(index, {
+        signal: token.signal
+      });
+      interactionOwner.assertCurrent(token);
+      if (
+        readDatasetGeneration() !== datasetGeneration
+        || state.getFields()?.[index] !== field
+      ) {
+        throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
+      }
+      if (field.kind === 'category') {
+        // The dataset-length part of the activation, in slices.
+        await state.prepareCategoryFieldActivation(field, {
           signal: token.signal
         });
         interactionOwner.assertCurrent(token);
@@ -960,53 +1002,54 @@ export function initFieldSelector(options) {
           readDatasetGeneration() !== datasetGeneration
           || state.getFields()?.[index] !== field
         ) {
-          throw createDatasetFieldLoadSupersededError();
-        }
-        if (field.kind === 'category') {
-          // The dataset-length part of the activation, in slices.
-          await state.prepareCategoryFieldActivation(field, {
-            signal: token.signal
-          });
-          interactionOwner.assertCurrent(token);
-          if (
-            readDatasetGeneration() !== datasetGeneration
-            || state.getFields()?.[index] !== field
-          ) {
-            throw createDatasetFieldLoadSupersededError();
-          }
-        }
-        const info = requireFieldInfo(
-          state.setActiveField(index),
-          field,
-          'Activate obs field result'
-        );
-        syncSelectsForField(index);
-        callbacks.onActiveFieldChanged(info);
-        return info;
-      } catch (error) {
-        if (isIntentionalInteractionRetirement(error, token)) {
-          return null;
-        }
-        const activationError = requireError(error, 'Obs field activation');
-        try {
-          syncFromState();
-        } catch (rollbackError) {
-          throw new AggregateError(
-            [
-              activationError,
-              requireError(rollbackError, 'Obs field activation rollback')
-            ],
-            'Obs field activation and UI rollback failed'
-          );
-        }
-        throw activationError;
-      } finally {
-        if (interactionOwner.isCurrent(token)) {
-          forceDisableFieldSelects = false;
-          updateFieldSelectDisabledStates();
+          throw cancelled('superseded', 'Field loading was superseded by a replacement dataset generation.');
         }
       }
-    });
+      const info = requireFieldInfo(
+        state.setActiveField(index),
+        field,
+        'Activate obs field result'
+      );
+      syncSelectsForField(index);
+      callbacks.onActiveFieldChanged(info);
+      return info;
+    } catch (error) {
+      if (isCancellation(error)) {
+        const reason = unshownChoiceReason(
+          interactionOwner,
+          token,
+          error,
+          readDatasetGeneration() === datasetGeneration
+            ? 'the dataset\'s fields changed while it was read'
+            : null
+        );
+        // Still the latest choice: the selects show what is shown again.
+        if (interactionOwner.isCurrent(token)) syncFromState();
+        if (reason !== null) {
+          getNotificationCenter().info(describeUnshownField(field.key, reason), { category: 'data' });
+        }
+        return null;
+      }
+      if (!interactionOwner.isCurrent(token)) return null;
+      const activationError = requireError(error, 'Obs field activation');
+      try {
+        syncFromState();
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [
+            activationError,
+            requireError(rollbackError, 'Obs field activation rollback')
+          ],
+          'Obs field activation and UI rollback failed'
+        );
+      }
+      throw activationError;
+    } finally {
+      if (interactionOwner.isCurrent(token)) {
+        forceDisableFieldSelects = false;
+        updateFieldSelectDisabledStates();
+      }
+    }
   }
 
   async function duplicateSelectedField(select, expectedKind) {
@@ -1056,13 +1099,11 @@ export function initFieldSelector(options) {
       }
       notifications.complete(
         notificationId,
-        `Created "${result.newKey}"`
+        `Created "${result.newKey}"`,
+        { announce: true }
       );
     } catch (error) {
-      if (
-        isDatasetFieldLoadSupersededError(error)
-        || isFieldInteractionSupersededError(error)
-      ) {
+      if (isCancellation(error)) {
         notifications.dismiss(notificationId);
         return;
       }
@@ -1103,7 +1144,9 @@ export function initFieldSelector(options) {
         );
         updateFieldSelectDisabledStates();
       },
-      onActivateField: idx => activateField(idx)
+      onActivateField: idx => activateField(idx),
+      onAdoptDatasetGeneration: adoptDatasetGeneration,
+      onChooseGeneNames: callbacks.onChooseGeneNames
     }
   });
   requireExactKeys(
@@ -1425,8 +1468,8 @@ export function initFieldSelector(options) {
     }
     assertAlive();
     const releaseOwner = retireCurrent
-      ? interactionOwner.acquireRetiringSuspension()
-      : interactionOwner.acquireSuspension();
+      ? interactionOwner.acquireRetiringSuspension('a saved view is being restored')
+      : interactionOwner.acquireSuspension('the view is being saved');
     let released = false;
     const release = () => {
       if (released) return;

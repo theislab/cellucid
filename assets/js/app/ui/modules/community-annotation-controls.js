@@ -95,6 +95,7 @@ import {
   workerPath,
 } from './community-annotation/github-error-classification.js';
 import { PLACES } from '../place-names.js';
+import { onAbort } from '../../../utils/abort.js';
 
 export function initCommunityAnnotationControls({
   state,
@@ -193,10 +194,7 @@ export function initCommunityAnnotationControls({
         'Active annotation sync owner must expose an AbortSignal'
       );
     }
-    const abort = () => controller.abort(signal.reason);
-    signal.addEventListener('abort', abort, { once: true });
-    if (signal.aborted) abort();
-    return () => signal.removeEventListener('abort', abort);
+    return onAbort(signal, () => controller.abort(signal.reason));
   }
 
   function endActiveSyncAbortScope(controller) {
@@ -234,12 +232,12 @@ export function initCommunityAnnotationControls({
     }
     if (activeSyncFatalMessage) {
       const err = new Error(activeSyncFatalMessage);
-      err.code = 'ANNOTATION_SYNC_ABORTED';
+      err.code = 'ANNOTATION_SYNC_STOPPED';
       throw err;
     }
     if (controller.signal.aborted) {
       const err = new Error(activeSyncAbortReason || 'Annotation sync aborted.');
-      err.code = 'ANNOTATION_SYNC_ABORTED';
+      err.code = 'ANNOTATION_SYNC_STOPPED';
       throw err;
     }
   }
@@ -1320,7 +1318,15 @@ export function initCommunityAnnotationControls({
 
   function disconnectGitHubAndAnnotationRepo({ datasetId = null, message = null, notify = 'error' } = {}) {
     disconnectAnnotationRepo({ datasetId, message: null });
-    githubAuth.signOut();
+    // Forgotten here at once; GitHub's revocation answers later. A sign-in
+    // GitHub could not revoke is said, never left silent.
+    void githubAuth.signOut().then(revoked => {
+      if (revoked) return;
+      notifications.warning(
+        'Signed out of GitHub here, but GitHub could not revoke the sign-in now: it stops working when it expires, within 8 hours.',
+        { category: 'annotation', duration: 8000 }
+      );
+    });
     const msg = message === null ? 'GitHub disconnected.' : message;
     if (
       typeof msg !== 'string' ||
@@ -1992,7 +1998,7 @@ export function initCommunityAnnotationControls({
     };
     const complete = (msg) => {
       if (quiet || trackerId == null) return;
-      notifications.complete(trackerId, msg);
+      notifications.complete(trackerId, msg, { announce: true });
     };
     const fail = (msg) => {
       if (quiet || trackerId == null) return;
@@ -2515,7 +2521,7 @@ export function initCommunityAnnotationControls({
           const workerCompatibilityFailure =
             isWorkerCompatibilityFailure(err);
 
-        if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
+        if (err?.code === 'ANNOTATION_SYNC_STOPPED') {
           syncError = msg;
           fail(msg);
           return { status: 'failed', error: msg, aborted: true };
@@ -3049,7 +3055,7 @@ export function initCommunityAnnotationControls({
           else if (extras.config.mode === 'direct' && extras.config.changed) parts.push('updated annotatable columns');
           if (mergesPrLabel) parts.push(mergesPrLabel);
           else if (extras.merges.mode === 'direct' && extras.merges.changed) parts.push('published merges');
-          notifications.complete(trackerId, parts.join(' • '));
+          notifications.complete(trackerId, parts.join(' • '), { announce: true });
           throwIfActiveSyncAborted(opAbort);
           commitRepoRefIfChanged();
           return;
@@ -3060,7 +3066,7 @@ export function initCommunityAnnotationControls({
         else if (extras.config.mode === 'direct' && extras.config.changed) bits.push('updated annotatable columns');
         if (mergesPrLabel) bits.push(mergesPrLabel);
         else if (extras.merges.mode === 'direct' && extras.merges.changed) bits.push('published merges');
-        notifications.complete(trackerId, bits.join(' • '));
+        notifications.complete(trackerId, bits.join(' • '), { announce: true });
         throwIfActiveSyncAborted(opAbort);
         commitRepoRefIfChanged();
       };
@@ -3108,7 +3114,7 @@ export function initCommunityAnnotationControls({
         return { status: 'failed', error: msg };
       }
 
-      if (err?.code === 'ANNOTATION_SYNC_ABORTED') {
+      if (err?.code === 'ANNOTATION_SYNC_STOPPED') {
         syncError = msg;
         notifications.fail(trackerId, msg);
         return { status: 'failed', error: msg };

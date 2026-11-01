@@ -1,6 +1,6 @@
 /**
- * Connectivity edges keep the graph on the CPU as loaded (plus its edges as
- * ordered records) and send each pane only its K shown edges, one 12-byte
+ * Connectivity edges keep the graph on the CPU as loaded (its forward
+ * adjacency) and send each pane only its K shown edges, one 12-byte
  * record each, with the endpoints' positions read on the GPU from one
  * position texture a geometry (rendering/connectivity-edge-layer.js).
  */
@@ -289,7 +289,7 @@ test('a filter re-selects the first K visible edges; the visible count is report
   const { layer, graph, runJobs, counts } = fake;
   layer.setVisibleTarget(100);
   const transparency = Uint8Array.from({ length: graph.nCells }, (_value, cell) => (cell % 3 === 0 ? 0 : 1));
-  layer.publishVisibility('live', { transparency, admissionLevels: null, lodLevel: -1 });
+  layer.publishVisibility('live', { transparency, lodMembership: null });
   const stats = layer.refresh('live');
   assert.equal(stats.current, true);
   const order = createConnectivityEdgeOrder(graph.nEdges);
@@ -322,12 +322,12 @@ test('a newer visibility supersedes a running count; every cell visible counts w
   runJobs();
   layer.setVisibleTarget(10);
   layer.publishVisibility('live', {
-    transparency: Uint8Array.from({ length: graph.nCells }, (_value, cell) => cell % 2), admissionLevels: null, lodLevel: -1,
+    transparency: Uint8Array.from({ length: graph.nCells }, (_value, cell) => cell % 2), lodMembership: null,
   });
   layer.refresh('live');
   assert.equal(jobs.length, 1);
   layer.publishVisibility('live', {
-    transparency: new Uint8Array(graph.nCells).fill(1), admissionLevels: null, lodLevel: -1,
+    transparency: new Uint8Array(graph.nCells).fill(1), lodMembership: null,
   });
   assert.equal(jobs.length, 0, 'the superseded count is cancelled');
   assert.equal(layer.refresh('live').visibleCount, graph.nEdges);
@@ -392,19 +392,30 @@ test('panes are independent; deleting a pane or clearing frees its GPU objects',
   assert.equal(fake.live.feedbacks.size, 0);
 });
 
-test('the graph is kept as the reader worker built it, records already in draw order', () => {
+test('the graph is kept as the reader worker built it: its forward adjacency, never rewritten', () => {
   const fake = setup({ edgeCount: 5000 });
   const { layer, graph, jobs } = fake;
-  const recordsBefore = graph.records.slice();
+  const partnersBefore = graph.partners.slice();
+  const strengthsBefore = graph.strengths.slice();
+  const offsetsBefore = graph.forwardOffsets.slice();
   // No background ordering: nothing is scheduled by publishing a graph.
   assert.equal(jobs.length, 0);
   layer.setVisibleTarget(5000);
   layer.refresh('live');
   layer.draw('live', FRAME);
-  assert.deepEqual(graph.records, recordsBefore, 'the records are never rewritten');
+  assert.deepEqual(graph.partners, partnersBefore, 'the partners are never rewritten');
+  assert.deepEqual(graph.strengths, strengthsBefore, 'the strengths are never rewritten');
+  assert.deepEqual(graph.forwardOffsets, offsetsBefore, 'the offsets are never rewritten');
   const memory = layer.describeMemory();
-  // 12 bytes of record and 8 of neighbours an edge, two offsets a cell.
-  assert.equal(memory.graphBytes, graph.nEdges * 20 + (graph.nCells + 1) * 8);
+  // A partner and a strength an edge (as the builder sized them), one offset
+  // a cell, and the source of every 128th edge.
+  assert.equal(
+    memory.graphBytes,
+    graph.partners.byteLength + graph.strengths.byteLength + (graph.nCells + 1) * 4 + (Math.ceil(graph.nEdges / 128) + 1) * 4,
+  );
+  assert.ok(graph.partners.byteLength + graph.strengths.byteLength <= graph.nEdges * 8 + 8 * graph.nCells);
+  // The selection's buffers grow with K, never with the graph.
+  assert.ok(memory.selectionBytes <= 5000 * 16 + (1 << 14) + 4096 * 4 * 4);
 });
 
 test('a new graph shows the default K, and a pane draws on its first frame without a refresh', () => {

@@ -1,15 +1,5 @@
-import {
-  DATASET_RELOAD_SUPERSEDED_CODE,
-  createDatasetReloadSupersededError,
-  isDatasetReloadSupersededError
-} from '../data/dataset-lifecycle-errors.js';
 import { requireExactObjectKeys } from '../utils/exact-record.js';
-
-export {
-  DATASET_RELOAD_SUPERSEDED_CODE,
-  createDatasetReloadSupersededError,
-  isDatasetReloadSupersededError
-};
+import { cancelled, isCancellation, cancel, onAbort } from '../utils/abort.js';
 
 function attachSecondaryFailure(primaryError, secondaryError) {
   if (
@@ -179,15 +169,12 @@ export async function stageDatasetPositionPayload(options) {
     );
   }
   if (signal.aborted) {
-    throw createDatasetReloadSupersededError(
+    throw cancelled('superseded',
       RELOAD_SUPERSEDED_MESSAGE
     );
   }
 
-  const abortStaging = () => {
-    dimensionManager.clearCache();
-  };
-  signal.addEventListener('abort', abortStaging, { once: true });
+  const stopStaging = onAbort(signal, () => dimensionManager.clearCache());
 
   try {
     const defaultLayoutKey = dimensionManager.getDefaultLayoutKey();
@@ -197,7 +184,7 @@ export async function stageDatasetPositionPayload(options) {
     const defaultDimension = dimensionManager.getLayout(defaultLayoutKey).dimension;
     const rawPositions = await dimensionManager.loadLayout(defaultLayoutKey);
     if (signal.aborted) {
-      throw createDatasetReloadSupersededError(
+      throw cancelled('superseded',
         RELOAD_SUPERSEDED_MESSAGE
       );
     }
@@ -209,7 +196,7 @@ export async function stageDatasetPositionPayload(options) {
 
     const positions = await dimensionManager.getPositions(defaultLayoutKey);
     if (signal.aborted) {
-      throw createDatasetReloadSupersededError(
+      throw cancelled('superseded',
         RELOAD_SUPERSEDED_MESSAGE
       );
     }
@@ -231,7 +218,7 @@ export async function stageDatasetPositionPayload(options) {
       positions
     });
   } finally {
-    signal.removeEventListener('abort', abortStaging);
+    stopStaging();
   }
 }
 
@@ -388,7 +375,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
 
   function begin() {
     if (retired) {
-      throw createDatasetReloadSupersededError(
+      throw cancelled('superseded',
         'The application was closed; no dataset change can begin.'
       );
     }
@@ -415,7 +402,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
     // A superseded transaction can no longer publish anything, so nothing
     // waits on it any more even while its own unwinding is still running.
     if (previous !== null) {
-      previous.controller.abort();
+      cancel(previous.controller, 'superseded', RELOAD_SUPERSEDED_MESSAGE);
       settle(previous);
     }
     let publicationIdentityAdopted = false;
@@ -427,7 +414,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
           controller.signal.aborted
           || generation !== latestGeneration
         ) {
-          throw createDatasetReloadSupersededError(
+          throw cancelled('superseded',
             RELOAD_SUPERSEDED_MESSAGE
           );
         }
@@ -462,7 +449,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
             captureReloadIdentity(captureIdentity)
           )
         ) {
-          throw createDatasetReloadSupersededError(
+          throw cancelled('superseded',
             RELOAD_SUPERSEDED_MESSAGE
           );
         }
@@ -475,7 +462,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
        * superseded one does, and the dataset on screen stays.
        */
       cancel() {
-        controller.abort();
+        cancel(controller, 'user', 'The dataset change was cancelled.');
       }
     });
   }
@@ -510,7 +497,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
     retire() {
       retired = true;
       if (latest === null) return;
-      latest.controller.abort();
+      cancel(latest.controller, 'closed', 'Dataset changes were retired.');
       settle(latest);
     },
     async whenSettled() {
@@ -526,6 +513,14 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
  * requests. Starting a newer request does not invalidate the live runtime;
  * only a later successful publication advances this epoch.
  *
+ * When the application is torn down, `retire()` ends the live publication as
+ * a newer one would: its signal aborts, so work waiting on it (a first
+ * frame to record, a read for its cells) stops instead of reaching a
+ * disposed viewer, and no publication follows. A first frame queued at the
+ * opening that the page closed before ran after dispose() and asked the
+ * disposed viewer for its statistics (Web contracts run 41269083996, Linux
+ * WebKit, `open-cells-in-place.spec.mjs`).
+ *
  * @returns {Readonly<{
  *   readonly generation: number,
  *   publish: (details?: object) => Readonly<object & {
@@ -533,12 +528,14 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
  *     signal: AbortSignal,
  *     isCurrent: () => boolean,
  *     assertCurrent: () => void
- *   }>
+ *   }>,
+ *   retire: () => void
  * }>}
  */
 export function createLatestDatasetPublicationContinuationOwner() {
   let activeSlot = null;
   let latestGeneration = 0;
+  let retired = false;
   const reservedKeys = new Set([
     'assertCurrent',
     'generation',
@@ -551,6 +548,9 @@ export function createLatestDatasetPublicationContinuationOwner() {
       return latestGeneration;
     },
     publish(details = {}) {
+      if (retired) {
+        throw cancelled('closed', 'Dataset publications were retired.');
+      }
       if (
         details === null ||
         typeof details !== 'object' ||
@@ -595,7 +595,7 @@ export function createLatestDatasetPublicationContinuationOwner() {
             activeSlot?.token !== token ||
             controller.signal.aborted
           ) {
-            throw createDatasetReloadSupersededError(
+            throw cancelled('superseded',
               'Dataset continuation was superseded by a newer runtime publication.'
             );
           }
@@ -605,8 +605,16 @@ export function createLatestDatasetPublicationContinuationOwner() {
       const previousSlot = activeSlot;
       latestGeneration = generation;
       activeSlot = { controller, token };
-      previousSlot?.controller.abort();
+      cancel(previousSlot?.controller, 'superseded', RELOAD_SUPERSEDED_MESSAGE);
       return token;
+    },
+    /**
+     * The application is closing: the live publication ends now, as one a
+     * newer publication replaced, and no other is made.
+     */
+    retire() {
+      retired = true;
+      cancel(activeSlot?.controller, 'closed', 'Dataset publications were retired.');
     }
   };
   return Object.freeze(owner);
@@ -666,9 +674,9 @@ export async function handleDatasetReloadFailure(options) {
       assertionError = error;
     }
     const supersessionError =
-      isDatasetReloadSupersededError(assertionError)
+      isCancellation(assertionError)
         ? assertionError
-        : createDatasetReloadSupersededError(
+        : cancelled('superseded',
             RELOAD_SUPERSEDED_MESSAGE
           );
     attachSecondaryFailure(supersessionError, cancellationError);
@@ -680,7 +688,7 @@ export async function handleDatasetReloadFailure(options) {
     }
     throw supersessionError;
   }
-  if (isDatasetReloadSupersededError(error)) {
+  if (isCancellation(error)) {
     try {
       cancel();
     } catch (cancellationError) {
@@ -747,7 +755,7 @@ export async function settlePublishedDatasetStateOutcome(options) {
     || !transaction.isCurrent()
   ) {
     return handleDatasetReloadFailure({
-      error: createDatasetReloadSupersededError(
+      error: cancelled('superseded',
         RELOAD_SUPERSEDED_MESSAGE
       ),
       transaction,
@@ -814,9 +822,7 @@ export async function settlePublishedDatasetUi(options) {
     errors.push(error);
   }
   if (errors.length === 0) return { status: 'ready' };
-  const supersessionError = errors.find(
-    isDatasetReloadSupersededError
-  );
+  const supersessionError = errors.find(isCancellation);
   if (supersessionError !== undefined) {
     const finalizationError = errors.find(
       error => error !== supersessionError

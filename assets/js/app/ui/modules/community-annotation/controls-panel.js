@@ -53,6 +53,7 @@ import {
 import { copyTextToClipboard } from './browser-integration.js';
 import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
 import { PLACES } from '../../place-names.js';
+import { onAbort } from '../../../../utils/abort.js';
 
 const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
 
@@ -190,7 +191,7 @@ export function createControlsPanel(controller) {
   // change, and its section is closed by default: while it cannot be seen a
   // render only marks the panel stale, and showing it renders once.
   const gatedRender = createVisibilityGatedRender(container, renderNow);
-  lifecycleSignal.addEventListener('abort', () => gatedRender.destroy(), { once: true });
+  onAbort(lifecycleSignal, () => gatedRender.destroy());
 
   function resolveIdentityModalFocus() {
     if (controller.isContextDestroyed()) return null;

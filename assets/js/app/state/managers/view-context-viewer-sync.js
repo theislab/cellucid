@@ -11,15 +11,17 @@ import { getFieldRegistry } from '../../utils/field-registry.js';
 import { getPageColor } from '../../utils/page-colors.js';
 import { adoptScientificFieldDescriptors } from './field/descriptor-ownership.js';
 import {
+  colorArrayWrites,
   createNeutralColors,
   createShownCellVisibilityMask,
   markSnapshotPublishedColors,
-  recordAlphaBytesMirror,
   transparencyArrayWrites,
   writableTransparency,
 } from './per-cell-array-ownership.js';
 import { recordUnfilteredVisibility } from './filter-manager.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { createCellIdentity } from '../../../data/cell-identity.js';
+import { DEFAULT_CELL_PRIORITY, requireCellPriority } from '../../../data/cell-priority.js';
 
 const SYNTHETIC_SCENE_KEYS = Object.freeze([
   'colors',
@@ -220,7 +222,6 @@ export const viewContextViewerSyncMethods = {
           );
         }
         writableTransparency(this).set(accepted);
-        this._syncColorsAlpha();
         this._updateActiveCategoryCounts();
       } catch (restorationError) {
         restorationFailures.push(restorationError);
@@ -259,6 +260,20 @@ export const viewContextViewerSyncMethods = {
     return field.centroidsByLayout.get(layoutKey) || [];
   },
 
+  /** Whether `viewId` shows centroid labels (they are elements only then). */
+  _centroidLabelsShown(viewId) {
+    return this.viewer?.getCentroidFlags?.(String(viewId))?.labels === true;
+  },
+
+  /**
+   * The active view's labels made when it starts showing them (`overlay`
+   * changes of the viewer): built only while shown (`buildCentroidsForField`).
+   */
+  _syncCentroidLabelsShown(viewId) {
+    if (String(viewId) !== String(this.activeViewId || 'live')) return;
+    if (this._centroidLabelsShown(viewId) && this.centroidLabels.length === 0) this._rebuildLabelLayerFromCentroids();
+  },
+
   _rebuildLabelLayerFromCentroids() {
     if (!this.labelLayer || !this.viewer) return;
     const viewKey = String(this.activeViewId || 'live');
@@ -266,7 +281,7 @@ export const viewContextViewerSyncMethods = {
     this.centroidLabels = [];
     const field = this.getActiveField ? this.getActiveField() : null;
     const centroids = this._getCentroidsForActiveLayout(field);
-    if (!field || field.kind !== 'category' || !this.centroidPositions || centroids.length === 0) {
+    if (!field || field.kind !== 'category' || !this.centroidPositions || centroids.length === 0 || !this._centroidLabelsShown(viewKey)) {
       this.viewer.setCentroidLabels([], viewKey);
       return;
     }
@@ -347,6 +362,8 @@ export const viewContextViewerSyncMethods = {
     this._renameRegistry.clear();
     this._deleteRegistry.clear();
     this._userDefinedFields.clear();
+    // Scores name cells of the reading they were computed on.
+    this._derivedResults?.clearScores();
     getFieldRegistry().invalidate();
 
     // An empty scene (no dataset) shows no layout; its stride is moot.
@@ -368,6 +385,10 @@ export const viewContextViewerSyncMethods = {
     this.positionsDimension = positionsDimension;
 
     this.pointCount = positions.length / positionsDimension;
+    // Every cell of the dataset is open; a subsample's identity replaces
+    // this one (`setCellIdentity`) before anything names a cell.
+    this.cellIdentity = createCellIdentity({ nObs: this.pointCount });
+    this.cellPriority = DEFAULT_CELL_PRIORITY;
 
     this.colorsArray = createNeutralColors(this.pointCount);
     this.categoryTransparency = new Uint8Array(this.pointCount).fill(1);
@@ -375,7 +396,6 @@ export const viewContextViewerSyncMethods = {
     // Every cell shown, with opaque alpha bytes: the first visibility pass
     // (no filter yet) adopts this generation instead of writing it again.
     recordUnfilteredVisibility(this.categoryTransparency, this.cellVisibilityMask);
-    recordAlphaBytesMirror(this.colorsArray, this.categoryTransparency);
     this.filteredCount = { shown: this.pointCount, total: this.pointCount };
 
     recordLiveViewerTransparency(this, null);
@@ -524,11 +544,14 @@ export const viewContextViewerSyncMethods = {
     this._renameRegistry.clear();
     this._deleteRegistry.clear();
     this._userDefinedFields.clear();
+    this._derivedResults.clear();
     getFieldRegistry().invalidate();
 
     this.positionsArray = exact.positions;
     this.positionsDimension = exact.dimensionLevel;
     this.pointCount = exact.pointCount;
+    this.cellIdentity = createCellIdentity({ nObs: this.pointCount });
+    this.cellPriority = DEFAULT_CELL_PRIORITY;
     this.colorsArray = exact.colors;
     this.categoryTransparency = transparency;
     this.cellVisibilityMask = cellVisibilityMask;
@@ -581,6 +604,40 @@ export const viewContextViewerSyncMethods = {
       dimensionLevel: exact.dimensionLevel,
       pointCount: exact.pointCount
     });
+  },
+
+  /**
+   * Publish which cells of the dataset are open (`data/cell-identity.js`):
+   * a subsample's identity, its `n` the cells this scene holds. Everything
+   * that names a cell outside the app (the viewer channel, exports) names it
+   * by original position through this identity.
+   *
+   * @param {import('../../../data/cell-identity.js').CellIdentity} identity
+   */
+  setCellIdentity(identity) {
+    if (
+      identity === null
+      || typeof identity !== 'object'
+      || typeof identity.toOriginal !== 'function'
+      || identity.n !== this.pointCount
+    ) {
+      throw new TypeError(`A cell identity must name the ${this.pointCount} open cells`);
+    }
+    this.cellIdentity = identity;
+  },
+
+  /**
+   * Publish the priority of the open cells (`data/cell-priority.js`): the
+   * order levels of detail draw them in and progressive analyses take their
+   * first pass from. A scene starts with every cell ranked under the default
+   * seed; its source says otherwise right after it is published.
+   *
+   * @param {Readonly<{seed: number|null, originals: Uint32Array|null}>} priority
+   */
+  setCellPriority(priority) {
+    const exact = requireCellPriority(priority, this.pointCount);
+    this.viewer.setCellPriority(exact);
+    this.cellPriority = exact;
   },
 
   _notifyVisibilityChange() {
@@ -667,6 +724,14 @@ export const viewContextViewerSyncMethods = {
       outlierQuantiles,
       outlierThreshold,
       positions,
+      // How many times the colours and the visibility were handed out for
+      // writing: with the arrays themselves, what a smoke volume read
+      // (`sameSmokeInputs`), so a rebuild for the same inputs is answered
+      // without copying or comparing them.
+      writes: Object.freeze({
+        colors: colorArrayWrites(colors),
+        alpha: transparencyArrayWrites(alpha),
+      }),
     });
   }
 };

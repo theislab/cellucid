@@ -533,6 +533,15 @@ export async function openZipArchive(reader, { name, verifyCrc = true, signal = 
       crc32: record.checksum,
       read,
       readRange,
+      /**
+       * The bytes a read of the entry would fetch now: its local header and
+       * data, less what the archive's byte reader holds without a request
+       * (kept in this browser, `io/kept-parts.js`, or cached).
+       */
+      bytesToFetch() {
+        const end = (record.dataOffset ?? record.offset + LOCAL_BYTES + record.nameBytes.length + record.extraLength) + record.compressedSize;
+        return typeof reader.bytesToFetch === 'function' ? reader.bytesToFetch(record.offset, Math.min(end, reader.size)) : end - record.offset;
+      },
     });
   }
 
@@ -545,6 +554,10 @@ export async function openZipArchive(reader, { name, verifyCrc = true, signal = 
     entries,
     entry: path => byPath.get(path) ?? null,
     stats: () => reader.stats(),
+    /** The link the archive is read over (its byte reader's), measured as it is read. */
+    link: reader.link ?? null,
+    /** Resolves once what this browser keeps of the archive is known (`ByteReader.keptReady`). */
+    keptReady: reader.keptReady ?? Promise.resolve(),
   });
 }
 

@@ -693,6 +693,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
       lodMembership: null,
       drawOrder: null,
       lodSizeMultiplier: 1,
+      pointLayers: { readScale: 1, readEveryLevel: true },
       normTransform: { center: [0, 0, 0], scale: 1 },
     },
   };

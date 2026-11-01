@@ -27,13 +27,17 @@ test('the gene index keeps the names in file order with their lower case', () =>
   assert.deepEqual(index.lowered, ['cd3e', 'cd3e', 'ms4a1']);
 });
 
-test('both gene search boxes rank their matches with it', () => {
+test('every gene search box ranks its matches through the gene lookup, which ranks with it', () => {
+  const lookup = readFileSync(new URL('../assets/js/app/utils/gene-lookup.js', import.meta.url), 'utf8');
+  assert.match(lookup, /rankedMatchIndices\(/);
   for (const file of [
     '../assets/js/app/ui/modules/field-selector-gene-expression.js',
     '../assets/js/app/analysis/ui/components/gene-set-editor.js',
+    '../assets/js/app/analysis/ui/components/selectors.js',
   ]) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-    assert.match(source, /rankedMatchIndices\(/, file);
-    assert.doesNotMatch(source, /\.includes\((normalizedQuery|query)\)/, file);
+    assert.match(source, /rankGeneMatches\(/, file);
+    assert.doesNotMatch(source, /rankedMatchIndices\(/, file);
+    assert.doesNotMatch(source, /\.includes\((normalizedQuery|query|lowerFilter|filter)\)/, file);
   }
 });

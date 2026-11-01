@@ -5,6 +5,7 @@ import { DataState } from '../assets/js/app/state/core/data-state.js';
 import {
   createInMemoryDimensionManager,
 } from '../assets/js/data/dimension-manager.js';
+import { visibleOf } from './helpers/category-state.mjs';
 
 function makeTwoViewState() {
   const published = [];
@@ -48,12 +49,12 @@ function makeTwoViewState() {
   state.varData = { fields: [] };
   state.activeFieldIndex = 0;
   state.activeFieldSource = 'obs';
-  state.obsData.fields[0]._categoryVisible = { 0: false, 1: true };
+  state.obsData.fields[0]._categoryVisible = visibleOf([false, true]);
   state._resetViewContexts();
   state.createViewFromSource('live', 'snap_1');
   state.dimensionManager.copyViewLayout('live', 'snap_1');
   // The live view clears its own filter; the kept view still hides 'a'.
-  state.obsData.fields[0]._categoryVisible = { 0: true, 1: true };
+  state.obsData.fields[0]._categoryVisible = visibleOf([true, true]);
   state._syncActiveContext();
   return { state, published };
 }

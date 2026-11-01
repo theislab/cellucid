@@ -1,5 +1,5 @@
 /* themes/_index.css - Aggregates all theme files. */
 
-@import '_base.css';
-@import '_light.css';
-@import '_dark.css';
+@import '_base.css?v=14df148c5e40';
+@import '_light.css?v=bc4280018373';
+@import '_dark.css?v=535975042aeb';

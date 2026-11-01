@@ -2,7 +2,12 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
-import { VECTOR_DATASET, listVectorDataset } from './helpers/vector-catalog.mjs';
+import {
+  VECTOR_DATASET,
+  expectVelocityBuilt,
+  listVectorDataset,
+  watchVelocityBuild,
+} from './helpers/vector-catalog.mjs';
 
 const PROCESS_INTENSIVE = Object.freeze({
   tag: '@browser-process-intensive',
@@ -213,10 +218,9 @@ test(
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await expect(page.locator('#velocity-density-display')).toHaveText('1K');
+    await watchVelocityBuild(page);
     await page.locator('#velocity-overlay-enabled').check();
-    await expect(
-      page.getByText('Velocity overlay ready', { exact: true }),
-    ).toBeVisible();
+    await expectVelocityBuilt(page);
 
     await resetAudit(page);
     // Two consecutive frames are the complete ping-pong ownership cycle.
@@ -405,24 +409,21 @@ test(
     await expect(page.locator('#dataset-name')).toHaveText(
       VECTOR_DATASET.name,
     );
-    // The injection below fails the next framebuffer *anyone* asks for, and the
-    // scene multisample target is the other thing in the frame that asks. It
-    // allocates lazily, on the first frame at a given drawing-buffer size, so
-    // whether it or the overlay consumes the one-shot failure depends on
-    // whether opening the overlay panel resized the canvas — which differs by
-    // engine, and is why this passed everywhere except one. Antialiasing off
-    // means `beginFrame` returns before allocating, so the failure can only
-    // reach the thing this test is named after.
-    await page.locator('#hp-antialias').uncheck();
-    await expect(page.locator('#hp-antialias')).not.toBeChecked();
-
+    // The overlay's own allocation fails, and only it: any other framebuffer
+    // asked for meanwhile is made. The frame's other owners allocate at times
+    // the engine and the GPU's speed decide: the scene multisample target on
+    // the first frame at a drawing-buffer size (opening the overlay panel
+    // resizes the canvas in one engine only), and the spatial tree's GPU
+    // gather (`high-perf/gpu-permute.js`) once level of detail or culling is
+    // on, which a frame of every cell measured slow turns on
+    // (`rendering/full-detail-frame-cost.js`: hosted runners' software GL).
+    // A failure of the next framebuffer anyone asked for reached the overlay
+    // or not by that race (Web contracts run 41213981681, Linux WebKit).
     await page.locator('#glcanvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2');
       const original = gl.createFramebuffer.bind(gl);
-      let failed = false;
       gl.createFramebuffer = () => {
-        if (!failed) {
-          failed = true;
+        if (/\/overlays\/velocity\/velocity-overlay\.js/.test(new Error().stack ?? '')) {
           gl.createFramebuffer = original;
           return null;
         }
@@ -430,7 +431,11 @@ test(
       };
     });
 
-    await page.locator('#velocity-overlay-enabled').check();
+    // A click, not `check()`: the failed allocation takes the box back
+    // off, in the frame the overlay first draws, which `check()` reads as a
+    // click that did nothing where that frame comes before its own look at
+    // the box (Web contracts run 41269083996, Windows Chromium and Firefox).
+    await page.locator('#velocity-overlay-enabled').click();
     await expect(page.locator('#velocity-overlay-enabled')).not.toBeChecked();
     await expect(page.locator('#velocity-overlay-info')).toHaveText(
       'Velocity rendering unavailable.',
@@ -494,12 +499,18 @@ test(
     await expect(page.locator('#dataset-name')).toHaveText(
       VECTOR_DATASET.name,
     );
+    // The overlay's own allocation fails, and only it: the spatial tree's
+    // GPU gather (`high-perf/gpu-permute.js`) makes transform feedback too,
+    // whenever a slow GPU has level of detail or culling turned on.
     await page.locator('#glcanvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2');
       const original = gl.createTransformFeedback.bind(gl);
       gl.createTransformFeedback = () => {
-        gl.createTransformFeedback = original;
-        return null;
+        if (/\/overlays\/velocity\/velocity-overlay\.js/.test(new Error().stack ?? '')) {
+          gl.createTransformFeedback = original;
+          return null;
+        }
+        return original();
       };
     });
 
@@ -513,11 +524,10 @@ test(
       'transform-feedback',
     );
 
+    await watchVelocityBuild(page);
     await checkbox.click();
     await expect(checkbox).toBeChecked();
-    await expect(
-      page.getByText('Velocity overlay ready', { exact: true }),
-    ).toBeVisible();
+    await expectVelocityBuilt(page);
     await advanceFrames(page, 2);
 
     const glError = await page.locator('#glcanvas').evaluate(canvas => (

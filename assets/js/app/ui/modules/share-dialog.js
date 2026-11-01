@@ -9,12 +9,15 @@
  *
  * Every snippet points at the public site, whatever origin this copy of the
  * app is served from, and carries only the data-source parameters
- * (`url-state.js` owns that list).
+ * (`url-state.js` owns that list), a data link in its public form: what the
+ * link carries to grant access (a share key, a signature, a token) stays in
+ * this page's address and is never shared; the dialog says so when it left
+ * something out.
  *
  * @module ui/modules/share-dialog
  */
 
-import { readDataSourceUrlParameters } from '../../url-state.js';
+import { dataLinkLeavesOutAccess, readDataSourceUrlParameters } from '../../url-state.js';
 import { copyWithFeedback, wireAppDialog } from '../components/app-dialog.js';
 
 export const PUBLIC_APP_URL = 'https://www.cellucid.com/';
@@ -92,6 +95,7 @@ export function initShareDialog({ ownerDocument = document, dataSourceManager })
   const link = byId('share-link');
   const badge = byId('share-badge');
   const embed = byId('share-embed');
+  const accessNote = byId('share-access-note');
   const owner = wireAppDialog(dialog);
   const controller = new AbortController();
   let shareUrl = null;
@@ -117,6 +121,7 @@ export function initShareDialog({ ownerDocument = document, dataSourceManager })
     if (shareUrl === null) return;
     const name = dataSourceManager.getCurrentMetadata?.()?.name ?? '';
     link.value = shareUrl;
+    accessNote.hidden = !dataLinkLeavesOutAccess(ownerDocument.defaultView.location.href);
     badge.value = badgeMarkdown(shareUrl);
     embed.value = embedHtml(shareUrl, name);
     owner.open(button);

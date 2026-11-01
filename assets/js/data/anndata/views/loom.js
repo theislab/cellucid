@@ -34,8 +34,10 @@
  */
 
 import { isArrayNode, isGroup, numericDtype, stringDtype } from '../../../formats/store.js';
-import { attributeValue } from '../elements.js';
+import { attributeValue, elementBytes } from '../elements.js';
+import { SLAB_BYTES, axisPositionWriter, readConvertedRange, readNumbers } from '../values.js';
 import { LayoutRefusal, noEmbeddingRefusal } from './refusal.js';
+import { isClusteringColumn } from '../transcode/tables.js';
 import {
   computedArray,
   encodingAttrs,
@@ -46,7 +48,8 @@ import {
   viewArray,
   viewGroup,
 } from './view-nodes.js';
-import { formatCountOf } from '../../../utils/format-units.js';
+import { sharedOnce } from '../../../utils/abort.js';
+import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
 
 /** How the AnnData reader names a Loom file in messages. */
 export const LOOM_FORMAT = Object.freeze({ storage: 'HDF5', file: 'Loom' });
@@ -82,9 +85,18 @@ function unescapeLoomText(value) {
     .replace(/&(lt|gt|quot|apos|amp);/g, (_match, name) => ({ lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' })[name]);
 }
 
-/** One array as an AnnData element, its text decoded where Loom 2 encoded it. */
+/**
+ * One array as an AnnData element, its text decoded where Loom 2 encoded it.
+ * An integer column named as a clustering (`ClusterID`, `Clusters`:
+ * `isClusteringColumn`, the rule a text table follows) holds labels: it is
+ * read as categories, Loom having no categorical type.
+ */
 function asElement(array, path = array.path) {
   const text = array.dtype.kind === 'string';
+  const integer = array.dtype.kind === 'int' || array.dtype.kind === 'uint';
+  if (integer && isClusteringColumn(path.slice(path.lastIndexOf('/') + 1))) {
+    return viewArray(array, { path, attrs: encodingAttrs('array'), labels: true });
+  }
   const attrs = encodingAttrs(text ? 'string-array' : 'array');
   if (text && array.dtype.variable === false) {
     return viewArray(array, {
@@ -156,7 +168,7 @@ function stackedArray(path, members) {
       const [first, last] = selection?.[1] ?? [0, width];
       const columns = await Promise.all(members.slice(first, last).map(member => member.read([[start, end]], options)));
       const count = last - first;
-      const out = new Output((end - start) * count);
+      const out = allocateTypedArray(Output, (end - start) * count, path);
       columns.forEach((values, column) => {
         for (let row = 0; row < end - start; row++) out[row * count + column] = Number(values[row]);
       });
@@ -238,7 +250,16 @@ function unsOf(root) {
   return mapping('/uns', children);
 }
 
-/** The coordinate list of one Loom graph as a CSR matrix, built on first read. */
+/**
+ * The coordinate list of one Loom graph (`a`, `b`, `w`: rows, columns,
+ * weights) as a CSR matrix, built on first read in two streamed passes, a
+ * slab of the list at a time: the rows counted, then each entry placed at
+ * its row; each row's entries are then put in column order. The list is
+ * never held whole (loompy writes `a` and `b` as int64 and `w` as float64:
+ * 24 bytes an entry); the matrix holds its indices as int32 and its weights
+ * in their stored precision. Row and column positions are converted through
+ * their 32-bit words (`values.js`), never a BigInt per entry.
+ */
 function graphMatrix(group, path, nCells) {
   const label = `Loom graph ${group.path}`;
   const a = group.get('a');
@@ -250,44 +271,48 @@ function graphMatrix(group, path, nCells) {
   }
   const nnz = a.shape[0];
   const wide = nnz > 2147483647;
-  let built = null;
-  const build = options => {
-    built ??= (async () => {
-      const [rows, columns, weights] = await Promise.all([a.read(undefined, options), b.read(undefined, options), w.read(undefined, options)]);
-      const counts = new Float64Array(nCells + 1);
-      const at = index => {
-        const value = Number(rows[index]);
-        if (!Number.isInteger(value) || value < 0 || value >= nCells) throw new RangeError(`${label} names cell ${value}, outside its ${formatCountOf(nCells, 'cell')}`);
-        return value;
-      };
-      for (let index = 0; index < nnz; index++) counts[at(index) + 1]++;
-      for (let row = 0; row < nCells; row++) counts[row + 1] += counts[row];
-      const indptr = wide ? new BigInt64Array(nCells + 1) : new Int32Array(nCells + 1);
-      for (let row = 0; row <= nCells; row++) indptr[row] = wide ? BigInt(counts[row]) : counts[row];
-      const next = counts.slice(0, nCells);
-      const order = new Float64Array(nnz);
-      for (let index = 0; index < nnz; index++) order[next[Number(rows[index])]++] = index;
-      const indices = new Int32Array(nnz);
-      const data = new Float64Array(nnz);
-      for (let row = 0; row < nCells; row++) {
-        const start = counts[row];
-        const end = counts[row + 1];
-        const entries = Array.from(order.subarray(start, end));
-        entries.sort((left, right) => Number(columns[left]) - Number(columns[right]));
-        entries.forEach((index, offset) => {
-          const column = Number(columns[index]);
-          if (!Number.isInteger(column) || column < 0 || column >= nCells) {
-            throw new RangeError(`${label} names cell ${column}, outside its ${formatCountOf(nCells, 'cell')}`);
-          }
-          indices[start + offset] = column;
-          data[start + offset] = Number(weights[index]);
-        });
+  const WeightArray = w.dtype.kind === 'float' && w.dtype.bytes <= 4 ? Float32Array : Float64Array;
+  const cell = axisPositionWriter(nCells);
+  const cellsOf = (array, start, end, options) => readConvertedRange(array, start, end, Int32Array, `${label} cell`, cell, options);
+  const step = Math.max(1, Math.floor(SLAB_BYTES / (elementBytes(a) + elementBytes(b) + elementBytes(w))));
+  /** The list's entries `[start, end)` a slab at a time, the next slab read before the current one is handed out. */
+  async function* slabs(read, options) {
+    let next = nnz > 0 ? read(0, Math.min(nnz, step), options) : null;
+    for (let start = 0; start < nnz; start += step) {
+      const end = Math.min(nnz, start + step);
+      const current = next;
+      next = end < nnz ? read(end, Math.min(nnz, end + step), options) : null;
+      next?.catch(() => {});
+      yield { start, values: await current };
+    }
+  }
+  // Built once, shared by every read asking meanwhile (`sharedOnce`).
+  const build = sharedOnce(async options => {
+    const starts = allocateTypedArray(Float64Array, nCells + 1, 'Loom graph row counts');
+    for await (const { values: rows } of slabs((start, end, readOptions) => cellsOf(a, start, end, readOptions), options)) {
+      for (let i = 0; i < rows.length; i++) starts[rows[i] + 1]++;
+    }
+    for (let row = 0; row < nCells; row++) starts[row + 1] += starts[row];
+    const next = copyTypedArray(Float64Array, starts.subarray(0, nCells), 'Loom graph row counts');
+    const indices = allocateTypedArray(Int32Array, nnz, 'Loom graph indices');
+    const data = allocateTypedArray(WeightArray, nnz, 'Loom graph values');
+    const entries = (start, end, readOptions) => Promise.all([
+      cellsOf(a, start, end, readOptions),
+      cellsOf(b, start, end, readOptions),
+      readNumbers(w, start, end, `${label} weight`, readOptions),
+    ]);
+    for await (const { values: [rows, columns, weights] } of slabs(entries, options)) {
+      for (let i = 0; i < rows.length; i++) {
+        const at = next[rows[i]]++;
+        indices[at] = columns[i];
+        data[at] = weights[i];
       }
-      return { indptr, indices, data };
-    })();
-    built.catch(() => { built = null; });
-    return built;
-  };
+    }
+    sortRowsByColumn(starts, indices, data);
+    const indptr = allocateTypedArray(wide ? BigInt64Array : Int32Array, nCells + 1, 'Loom graph indptr');
+    for (let row = 0; row <= nCells; row++) indptr[row] = wide ? BigInt(starts[row]) : starts[row];
+    return { indptr, indices, data };
+  });
   const part = (name, dtype, length) => () => computedArray({
     path: joinPath(path, name),
     dtype,
@@ -298,11 +323,32 @@ function graphMatrix(group, path, nCells) {
     path,
     attrs: { ...encodingAttrs('csr_matrix'), shape: [nCells, nCells] },
     children: new Map([
-      ['data', part('data', numericDtype('float', 8), nnz)],
+      ['data', part('data', numericDtype('float', WeightArray.BYTES_PER_ELEMENT), nnz)],
       ['indices', part('indices', numericDtype('int', 4), nnz)],
       ['indptr', part('indptr', numericDtype('int', wide ? 8 : 4), nCells + 1)],
     ]),
   });
+}
+
+/**
+ * Put each row's entries of a CSR matrix in ascending column order, in
+ * place (stable): a row already in order is left as it is; another is
+ * ordered through a typed permutation of its entries.
+ */
+function sortRowsByColumn(starts, indices, data) {
+  for (let row = 0; row + 1 < starts.length; row++) {
+    const start = starts[row];
+    const end = starts[row + 1];
+    let ordered = true;
+    for (let at = start + 1; at < end && ordered; at++) ordered = indices[at] >= indices[at - 1];
+    if (ordered) continue;
+    const order = Uint32Array.from({ length: end - start }, (_, i) => start + i)
+      .sort((left, right) => indices[left] - indices[right] || left - right);
+    const rowIndices = Int32Array.from(order, at => indices[at]);
+    const rowData = data.constructor.from(order, at => data[at]);
+    indices.set(rowIndices, start);
+    data.set(rowData, start);
+  }
 }
 
 /** The arrays of one attribute group, by key. */
@@ -461,13 +507,25 @@ export function loomView(root, { name }) {
       ['layers', () => mapping('/layers', layers)],
       ['uns', () => unsOf(root)],
     ]),
-    close: () => root.close?.(),
+    close: reason => root.close?.(reason),
   });
 }
 
+/**
+ * What the Loom view reads of a file before presenting it: all of it. Every
+ * attribute array names a column, a feature or a layer the view lists by
+ * shape and type, so a Loom file's tree is read whole (its objects are few
+ * and flat; only a graph's three arrays could wait).
+ */
+export const LOOM_OPENING_PATHS = Object.freeze(['']);
+
 /** The Loom entry of `LAYOUT_VIEWS`. */
 export const LOOM_VIEW = Object.freeze({
-  recognize: isLoomRoot,
-  view: loomView,
+  recognize: async root => isLoomRoot(root),
+  openingPaths: LOOM_OPENING_PATHS,
+  view: async (root, context) => {
+    await root.load(LOOM_OPENING_PATHS, { signal: context.signal ?? null, activity: context.activity ?? null });
+    return loomView(root, context);
+  },
   readerFormat: LOOM_FORMAT,
 });

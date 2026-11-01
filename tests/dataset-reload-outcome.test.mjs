@@ -15,6 +15,7 @@ import { DimensionManager } from '../assets/js/data/dimension-manager.js';
 import { debug } from '../assets/js/utils/debug.js';
 import { loadsAsReader } from './helpers/dimension-loads.mjs';
 import { settle } from './helpers/virtual-time.mjs';
+import { cancelled, cancellationKind, isCancellation } from '../assets/js/utils/abort.js';
 
 const outcomeModuleUrl = new URL(
   '../assets/js/app/dataset-reload-outcome.js',
@@ -679,7 +680,7 @@ test('a change that may not touch the dataset never overrides a later action', a
 });
 
 test('retiring the changes stops the one in flight and admits no other', async () => {
-  const { createLatestDatasetReloadCoordinator, isDatasetReloadSupersededError } =
+  const { createLatestDatasetReloadCoordinator } =
     await import(outcomeModuleUrl);
   const changes = createLatestDatasetReloadCoordinator(() => ({
     baseUrl: null,
@@ -699,13 +700,13 @@ test('retiring the changes stops the one in flight and admits no other', async (
   assert.equal(reading.signal.aborted, true);
   assert.equal(changes.settled, true);
   await changes.whenSettled();
-  assert.throws(() => reading.assertCurrent(), isDatasetReloadSupersededError);
+  assert.throws(() => reading.assertCurrent(), isCancellation);
   // Its owner unwinding afterwards changes nothing; no change begins again.
   reading.finish();
-  assert.throws(() => changes.begin(), isDatasetReloadSupersededError);
+  assert.throws(() => changes.begin(), isCancellation);
   assert.throws(
     () => changes.beginIfNoActionSince(changes.actionSequence),
-    isDatasetReloadSupersededError
+    isCancellation
   );
   // Retiring with nothing in flight, or twice, is harmless.
   changes.retire();
@@ -718,16 +719,12 @@ test('retiring the changes stops the one in flight and admits no other', async (
   }));
   idle.retire();
   assert.equal(idle.settled, true);
-  assert.throws(() => idle.begin(), isDatasetReloadSupersededError);
+  assert.throws(() => idle.begin(), isCancellation);
 });
 test(
   'publication continuation remains current until a newer runtime actually publishes',
   async () => {
-    const {
-      createLatestDatasetPublicationContinuationOwner,
-      createLatestDatasetReloadCoordinator,
-      isDatasetReloadSupersededError
-    } = await import(outcomeModuleUrl);
+    const { createLatestDatasetPublicationContinuationOwner, createLatestDatasetReloadCoordinator } = await import(outcomeModuleUrl);
     const source = {};
     let identity = {
       baseUrl: 'anndata://first/',
@@ -774,7 +771,7 @@ test(
     publicationC.assertCurrent();
     assert.throws(
       () => publicationA.assertCurrent(),
-      isDatasetReloadSupersededError
+      isCancellation
     );
     assert.equal(publicationC.generation, publicationA.generation + 1);
   }
@@ -911,32 +908,17 @@ test('dataset reload identity capture requires one exact explicit shape', async 
   empty.assertCurrent();
 });
 
-test('supersession classification uses only the exact current error code', async () => {
-  const {
-    DATASET_RELOAD_SUPERSEDED_CODE,
-    createDatasetReloadSupersededError,
-    isDatasetReloadSupersededError
-  } = await import(outcomeModuleUrl);
-  const exact = createDatasetReloadSupersededError(
-    'Dataset reload was superseded by a newer selection.'
-  );
-  assert.equal(exact.code, DATASET_RELOAD_SUPERSEDED_CODE);
-  assert.equal(isDatasetReloadSupersededError(exact), true);
-
-  const heuristicOnly = new Error(
-    'Dataset reload was superseded by a newer selection.'
-  );
-  heuristicOnly.name = 'AbortError';
-  assert.equal(
-    isDatasetReloadSupersededError(heuristicOnly),
-    false
-  );
-  assert.equal(
-    isDatasetReloadSupersededError({
-      code: 'CELLUCID_OLD_RELOAD_CANCELLED'
-    }),
-    false
-  );
+test('a dataset reload supersession is a superseded cancellation, classified by name alone', () => {
+  const exact = cancelled('superseded', 'Dataset reload was superseded by a newer selection.');
+  assert.equal(isCancellation(exact), true);
+  assert.equal(cancellationKind(exact), 'superseded');
+  // An AbortError made elsewhere (the platform's own, a reasonless abort) is
+  // a cancellation too: it is never shown as a failure.
+  const foreign = new DOMException('signal is aborted without reason', 'AbortError');
+  assert.equal(isCancellation(foreign), true);
+  assert.equal(cancellationKind(foreign), 'user');
+  // A code alone is not one: only the name says so.
+  assert.equal(isCancellation({ code: 'CELLUCID_OLD_RELOAD_CANCELLED' }), false);
 });
 
 test('reload owner suppresses stale failure reporting and cancels bookkeeping', async () => {
@@ -979,11 +961,7 @@ test('reload owner suppresses stale failure reporting and cancels bookkeeping', 
 test(
   'stale reload preserves exact supersession when bookkeeping cancellation fails',
   async () => {
-    const {
-      createLatestDatasetReloadCoordinator,
-      handleDatasetReloadFailure,
-      isDatasetReloadSupersededError
-    } = await import(outcomeModuleUrl);
+    const { createLatestDatasetReloadCoordinator, handleDatasetReloadFailure } = await import(outcomeModuleUrl);
     let identity = {
       source: {},
       baseUrl: 'anndata://first/',
@@ -1016,7 +994,7 @@ test(
       }),
       error => {
         supersessionError = error;
-        return isDatasetReloadSupersededError(error);
+        return isCancellation(error);
       }
     );
 
@@ -1026,11 +1004,7 @@ test(
 );
 
 test('published-state settlement gives superseded reloads one cancel and no success', async () => {
-  const {
-    createDatasetReloadSupersededError,
-    isDatasetReloadSupersededError,
-    settlePublishedDatasetStateOutcome
-  } = await import(outcomeModuleUrl);
+  const { settlePublishedDatasetStateOutcome } = await import(outcomeModuleUrl);
 
   for (const {
     current,
@@ -1051,7 +1025,7 @@ test('published-state settlement gives superseded reloads one cancel and no succ
       isCurrent: () => current,
       assertCurrent() {
         if (!current) {
-          throw createDatasetReloadSupersededError(
+          throw cancelled('superseded',
             'Dataset reload was superseded by a newer selection.'
           );
         }
@@ -1068,7 +1042,7 @@ test('published-state settlement gives superseded reloads one cancel and no succ
           completions += 1;
         }
       }),
-      error => isDatasetReloadSupersededError(error)
+      error => isCancellation(error)
     );
     assert.equal(cancellations, 1);
     assert.equal(completions, 0);
@@ -1107,11 +1081,7 @@ test('published-state settlement gives superseded reloads one cancel and no succ
 });
 
 test('reload owner adopts one committed identity before published-state success', async () => {
-  const {
-    createLatestDatasetReloadCoordinator,
-    isDatasetReloadSupersededError,
-    settlePublishedDatasetStateOutcome
-  } = await import(outcomeModuleUrl);
+  const { createLatestDatasetReloadCoordinator, settlePublishedDatasetStateOutcome } = await import(outcomeModuleUrl);
   const oldSource = {};
   const newSource = {};
   let identity = {
@@ -1159,7 +1129,7 @@ test('reload owner adopts one committed identity before published-state success'
   assert.equal(transaction.signal.aborted, true);
   assert.throws(
     () => transaction.adoptCurrentIdentity(),
-    error => isDatasetReloadSupersededError(error)
+    error => isCancellation(error)
   );
   superseded.assertCurrent();
 
@@ -1185,7 +1155,7 @@ test('reload owner adopts one committed identity before published-state success'
         completions += 1;
       }
     }),
-    error => isDatasetReloadSupersededError(error)
+    error => isCancellation(error)
   );
   assert.equal(cancellations, 1);
   assert.equal(completions, 0);
@@ -1365,14 +1335,11 @@ test('post-publication UI errors remain truthful ready outcomes', async () => {
 test(
   'superseded published UI synchronization finalizes silently without impaired-controls diagnostics',
   async () => {
-    const {
-      createDatasetReloadSupersededError,
-      settlePublishedDatasetUi
-    } = await import(outcomeModuleUrl);
+    const { settlePublishedDatasetUi } = await import(outcomeModuleUrl);
     const events = [];
     const outcome = await settlePublishedDatasetUi({
       synchronize() {
-        throw createDatasetReloadSupersededError(
+        throw cancelled('superseded',
           'Dataset reload was superseded by a newer selection.'
         );
       },
@@ -1392,17 +1359,14 @@ test(
 test(
   'superseded published UI synchronization preserves a finalization failure without reporting stale diagnostics',
   async () => {
-    const {
-      createDatasetReloadSupersededError,
-      settlePublishedDatasetUi
-    } = await import(outcomeModuleUrl);
+    const { settlePublishedDatasetUi } = await import(outcomeModuleUrl);
     const finalizationError = new Error(
       'exact stale publication finalization failure'
     );
     const reports = [];
     const outcome = await settlePublishedDatasetUi({
       synchronize() {
-        throw createDatasetReloadSupersededError(
+        throw cancelled('superseded',
           'Dataset reload was superseded by a newer selection.'
         );
       },
@@ -2490,7 +2454,9 @@ test('connectivity edge publication has one abortable generation owner', async (
     failedPublicationCleanupEnd
   );
   assert.match(failedPublicationCleanupSource, /viewer\.clearEdgesV2\(\)/);
-  assert.match(failedPublicationCleanupSource, /viewer\.clearKnnEdges\(\)/);
+  // The k-NN tool keeps its graph: it reads rows from the file, checked once
+  // for the graph in use; only replacing the graph (the reset) clears it.
+  assert.doesNotMatch(failedPublicationCleanupSource, /viewer\.clearKnnEdges\(\)/);
   assert.match(failedPublicationCleanupSource, /edgesLoaded = false/);
   assert.match(failedPublicationCleanupSource, /loadedEdgeData = null/);
   // The payload is the only owner of the endpoints (no second reference).
@@ -2510,7 +2476,7 @@ test('connectivity edge publication has one abortable generation owner', async (
   assert.doesNotMatch(ensureSource, /resetEdgeState\(\)/);
   assert.match(
     connectivitySource,
-    /isDatasetReloadSupersededError\(err\)/
+    /isCancellation\(err\)/
   );
   const publicationSynchronizationSource = connectivitySource.slice(
     synchronizationStart,
@@ -2568,11 +2534,9 @@ test('isolated local dataset candidates publish one truthful terminal outcome', 
   });
 
   await t.test('superseded reload dismisses without a failed terminal outcome', async t => {
-    const { createDatasetReloadSupersededError } =
-      await import(outcomeModuleUrl);
-    const result = await runLocalSelection(t, {
+        const result = await runLocalSelection(t, {
       activateDataset: async () => {
-        throw createDatasetReloadSupersededError(
+        throw cancelled('superseded',
           'Dataset reload was superseded by a newer selection.'
         );
       }
@@ -2773,6 +2737,9 @@ test('disconnect controls clear only their connection and never choose science',
                 connected,
                 inputPath: connected ? 'owner/repository' : null,
               };
+        },
+        getAddressLocator() {
+          return connected ? 'owner/repository' : null;
         },
         getType() {
           return connection.sourceType;

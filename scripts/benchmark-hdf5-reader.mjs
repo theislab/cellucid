@@ -145,7 +145,8 @@ async function runOurs({ file, url, size, latency, bandwidth, workloads }) {
     results[name] = { ms: performance.now() - started, requests: after.requests - before.requests, bytes: after.bytes - before.bytes };
   };
   await phase('open', async () => {
-    root = await openHdf5(reader);
+    // The whole tree, loaded with the root (`load`), as the walk visits all of it.
+    root = await openHdf5(reader, { load: [''] });
     const walk = group => {
       for (const key of group.keys()) {
         const child = group.get(key);

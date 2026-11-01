@@ -37,5 +37,6 @@ test('a settled noise generation asks the viewer for its frame', () => {
   // Both the published and the failed generation wake it.
   assert.equal((source.match(/this\._noiseSettled\(\);/g) ?? []).length, 2);
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  assert.match(viewer, /smokeRenderer\.setNoiseSettledHandler\(\(\) => \{\s*if \(!disposed && !webglContextLost\) invalidateFrame\(\);/);
+  // Made by `createSmokeOwner`, at construction and on a restored context.
+  assert.match(viewer, /renderer\.setNoiseSettledHandler\(\(\) => \{\s*if \(!disposed && !webglContextLost\) invalidateFrame\(\);/);
 });

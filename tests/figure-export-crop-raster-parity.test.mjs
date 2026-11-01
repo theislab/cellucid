@@ -31,6 +31,7 @@ function projectVector({ ndc, viewport, plotRect, crop }) {
     positions: new Float32Array([ndc[0], ndc[1], 0]),
     dimension: 3,
     colors: new Uint8Array([255, 0, 0, 255]),
+    colorAlpha: 'layer',
     renderState: {
       mvpMatrix: IDENTITY,
       viewportWidth: viewport.width,

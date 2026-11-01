@@ -2,8 +2,10 @@
  * Dropbox shared file links. A `www.dropbox.com` link answers with a redirect
  * that other sites may not follow, while the same file on
  * `dl.dropboxusercontent.com` allows cross-origin range reads, so the file
- * is read in place from that host. The share link names it (`?data=`,
- * sessions); the content-host address is only where its bytes come from. Folder links can only be read
+ * is read in place from that host. The share link with its `rlkey` is what
+ * it is read by (`?data=`); everywhere else it goes without the key
+ * (`publicValue`); the content-host address is only where its bytes come
+ * from. Folder links can only be read
  * with a Dropbox sign-in, which Cellucid does not ask for: share the file (an
  * `.h5ad`, a zipped Zarr store, or any other single-file input format)
  * instead.
@@ -14,6 +16,7 @@
 import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
 import { describeRemoteFile } from '../remote-file.js';
 import { fileNameOfUrl } from './http.js';
+import { publicLink } from '../link-credentials.js';
 import { openableNamesText } from '../../input-formats.js';
 
 const CONTENT_HOST = 'dl.dropboxusercontent.com';
@@ -63,11 +66,16 @@ export default Object.freeze({
   capabilities: Object.freeze({
     folders: false,
     private: 'none',
+    public: false,
     versions: false,
     write: false,
   }),
   match(input) {
     return parseDropbox(input);
+  },
+  /** A share link without its `rlkey`, the key that grants access to the file. */
+  publicValue(value) {
+    return value.startsWith('folder:') ? value : publicLink(value);
   },
   async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseDropbox(value);
@@ -95,7 +103,8 @@ export default Object.freeze({
       url: url.href,
       id: `dropbox:${encodeURIComponent(`${url.pathname}`)}`,
       name,
-      attribution: { title: name, url: parsed },
+      // Where it is said to come from: the share link without its key.
+      attribution: { title: name, url: publicLink(parsed) },
       signal,
       onStep,
     });

@@ -16,6 +16,7 @@ import {
   setAnnDataReaderWorkerFactory,
 } from '../assets/js/data/anndata-reader-client.js';
 import { createInProcessAnnDataReaderWorker } from './helpers/anndata-reader-in-process.mjs';
+import { until } from './helpers/until.mjs';
 
 function countingFactory(t) {
   const made = [];
@@ -60,7 +61,9 @@ test('the next client adopts the spare worker, wired as its own, and one spare e
   assert.equal(typeof made[0].onmessage, 'function');
   assert.equal(typeof made[0].onerror, 'function');
   client.close();
-  assert.equal(made[0].terminated, true, 'closing the client ends the adopted worker');
+  // It is asked to leave, keeps what it fetched, and ends itself.
+  assert.deepEqual(made[0].messages.at(-1), { leave: true });
+  await until(() => made[0].terminated, 'closing the client ends the adopted worker');
 });
 
 test('a spare nothing adopts ends when the page is left, or when the open it was for is abandoned', t => {

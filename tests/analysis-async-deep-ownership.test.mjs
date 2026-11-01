@@ -92,6 +92,8 @@ test('a cancelled signature job stops its gene reads and the run publishes nothi
       assert.equal(options.owner, job.id, 'the reads are owned by the job');
       return readUntilAborted(options.signal, reads);
     },
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
     },
@@ -184,6 +186,8 @@ test('signature snapshots genes and page IDs before its first await', async () =
       await gate.promise;
       return [Float32Array.of(1, 2, 3), Float32Array.of(3, 4, 5)];
     },
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     getPageCells(pageIds) {
       received.pageIds = pageIds;
       return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
@@ -227,6 +231,8 @@ function createDEMembershipProbe(indicesByPage) {
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     state: { pointCount: 6 },
     getAvailableVariables() {

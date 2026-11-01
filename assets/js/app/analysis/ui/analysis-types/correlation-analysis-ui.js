@@ -22,6 +22,7 @@ import {
   requireDatasetPages,
   requireDatasetVariable
 } from '../../shared/analysis-result-session.js';
+import { failureText } from '../../../../utils/errors.js';
 
 function requireCorrelationVariable(variable, label) {
   if (
@@ -88,6 +89,19 @@ function requireReadyPageData(pageData, pageIds, variableKey) {
 /**
  * @typedef {{ type: 'continuous_obs'|'gene_expression', key: string }} CorrelationVariable
  */
+
+/**
+ * Why a page's correlation is undefined: a variable constant in its cells
+ * (`computeCorrelation`'s `constant`), named.
+ *
+ * @param {{constant: 'x'|'y'|'both', xVariable?: string, yVariable?: string}} result
+ * @returns {string}
+ */
+function constantCorrelationReason(result) {
+  if (result.constant === 'both') return 'both variables are constant in these cells';
+  const name = result.constant === 'x' ? result.xVariable : result.yVariable;
+  return `${name ?? (result.constant === 'x' ? 'X' : 'Y')} is constant in these cells`;
+}
 
 export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   static getRequirements() {
@@ -199,10 +213,16 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // Run
   // ===========================================================================
 
-  async _runAnalysisImpl(options, requestId, job) {
+  /** @override */
+  _takesCellSample() {
+    return true;
+  }
+
+  async _runAnalysisImpl(options, requestId, job, sample = null) {
     requireCorrelationVariable(options.variableX, 'Correlation X variable');
     requireCorrelationVariable(options.variableY, 'Correlation Y variable');
-    const pageIds = [...this._selectedPages];
+    // A first pass correlates each page's cells in the sample.
+    const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
     const customColors = new Map(this._pageSelector?.getCustomColors?.() || []);
     const colorBy = options.colorBy === '' ? null : options.colorBy;
     const readinessRequests = [
@@ -233,6 +253,11 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       registerInvalidationCleanup: cleanup => this._registerAnalysisInvalidationCleanup(requestId, cleanup)
     });
     if (!this._isCurrentAnalysisRequest(requestId)) return null;
+    if (sample !== null) {
+      for (const result of correlationResults) {
+        if (result.pageId) result.pageId = sample.basePageId(result.pageId);
+      }
+    }
     if (customColors.size > 0) {
       for (const result of correlationResults) {
         if (result.pageId && customColors.has(result.pageId)) result.pageColor = customColors.get(result.pageId);
@@ -301,7 +326,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     const tbody = document.createElement('tbody');
     for (const r of results) {
       const hasError = !!r?.error;
-      const rVal = isFiniteNumber(r?.r) ? r.r.toFixed(4) : 'N/A';
+      const rVal = isFiniteNumber(r?.r) ? r.r.toFixed(4) : (r?.constant ? 'Undefined' : 'N/A');
       const r2Val = isFiniteNumber(r?.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
       const pVal = isFiniteNumber(r?.pValue) ? r.pValue.toExponential(3) : 'N/A';
       const nVal = typeof r?.n === 'number'
@@ -316,6 +341,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
       const tdR = document.createElement('td');
       tdR.textContent = hasError ? '—' : rVal;
+      if (!hasError && r?.constant) tdR.title = constantCorrelationReason(r);
       tr.appendChild(tdR);
 
       const tdR2 = document.createElement('td');
@@ -362,7 +388,19 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     const tbody = document.createElement('tbody');
 
     const valid = results.filter(r => !r?.error && isFiniteNumber(r?.r));
-    if (valid.length === 0) {
+    // A variable constant in a page: no correlation there to read.
+    for (const r of results) {
+      if (r?.error || !r?.constant) continue;
+      const tr = document.createElement('tr');
+      const tdPage = document.createElement('td');
+      tdPage.textContent = String(r.pageName || 'Page');
+      const tdReason = document.createElement('td');
+      tdReason.colSpan = 3;
+      tdReason.textContent = `Undefined: ${constantCorrelationReason(r)}`;
+      tr.append(tdPage, tdReason);
+      tbody.appendChild(tr);
+    }
+    if (valid.length === 0 && !results.some(r => !r?.error && r?.constant)) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
       td.colSpan = 4;
@@ -437,6 +475,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // ===========================================================================
 
   async _exportPlotPNG() {
+    if (this._refuseStaleExport('PNG')) return;
     const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
     if (!plotEl) return;
 
@@ -460,7 +499,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * points, variables by key.
    * @returns {null|{kind: 'correlation', version: number, payload: unknown}}
    */
-  exportResult() {
+  _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('correlation', this._lastResult);
   }
@@ -552,7 +591,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     try {
       this._pageSelector?.destroy();
     } catch (error) {
-      this._notifications.error(`Correlation cleanup failed: ${error.message}`, { category: 'analysis' });
+      this._notifications.error(`Correlation cleanup failed: ${failureText(error)}`, { category: 'analysis' });
     }
     this._pageSelector = null;
     this._pageSelectContainer = null;

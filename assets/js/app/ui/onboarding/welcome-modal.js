@@ -23,7 +23,6 @@ const FOCUSABLE_SELECTOR = [
 ].join(',');
 
 let welcomeModal = null;
-let welcomeCallbacks = { onExplore: null };
 let welcomeListenersAttached = false;
 /** Element that owned focus when the modal opened, restored when it closes. */
 let welcomeReturnFocus = null;
@@ -133,32 +132,17 @@ function restoreWelcomeReturnFocus() {
   target.focus();
 }
 
-export function initWelcomeModal(callbacks = {}) {
+export function initWelcomeModal() {
   welcomeModal = document.getElementById('welcome-modal');
   if (!welcomeModal) return;
-
-  welcomeCallbacks = { ...welcomeCallbacks, ...callbacks };
 
   if (!welcomeListenersAttached) {
     welcomeListenersAttached = true;
 
-    const exploreBtn = document.getElementById('welcome-demo-btn');
-    const backdrop = welcomeModal.querySelector('.welcome-backdrop');
-
-    if (exploreBtn) {
-      exploreBtn.addEventListener('click', (event) => {
-        hideWelcomeModal();
-        if (welcomeCallbacks.onExplore) {
-          // A click with no pointer behind it (detail 0) came from the
-          // keyboard: Enter or Space on the focused button.
-          welcomeCallbacks.onExplore({ fromKeyboard: event.detail === 0 });
-        }
-      });
-    }
-
-    if (backdrop) {
-      backdrop.addEventListener('click', () => hideWelcomeModal());
-    }
+    // Start exploring, the backdrop and Escape all close the dialog: the
+    // dataset behind it is the start, and focus returns where it was.
+    welcomeModal.querySelector('#welcome-start-btn')?.addEventListener('click', () => hideWelcomeModal());
+    welcomeModal.querySelector('.welcome-backdrop')?.addEventListener('click', () => hideWelcomeModal());
 
     document.addEventListener('keydown', containWelcomeFocus, true);
 

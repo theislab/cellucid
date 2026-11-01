@@ -16,6 +16,8 @@
  * @module ui/modules/open-data-menu
  */
 
+import { onAbort } from '../../../utils/abort.js';
+
 /**
  * @param {Object} options
  * @param {HTMLButtonElement} options.button
@@ -107,6 +109,6 @@ export function initOpenDataMenu({ button, menu, items, onChoose, signal }) {
     if (next !== null && !menu.contains(next) && next !== button) close();
   }, options);
 
-  signal.addEventListener('abort', () => close(), { once: true });
+  onAbort(signal, close);
   return Object.freeze({ close });
 }

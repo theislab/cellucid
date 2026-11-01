@@ -1,7 +1,13 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=outlier-filter-ci`;
@@ -66,9 +72,12 @@ test('latent-space outlier filtering uses the active field raw quantiles', async
   );
   expect(filteredState.visibility).toEqual(new Array(120).fill(1));
 
+  // Every filter applies until it is removed, whatever is coloured: the
+  // outlier filter keeps hiding its cells, and is listed, while the view is
+  // coloured by another field.
   await page.locator('#continuous-field').selectOption({ label: 'score' });
-  await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
-  await expect(page.locator('#active-filters')).toHaveText('No filters active.');
+  await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 cells');
+  await expect(page.locator('#active-filters')).toContainText('cell_type: outlier ≤ 50%');
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 cells');
   await expect(page.locator('#active-filters')).toContainText('cell_type: outlier ≤ 50%');

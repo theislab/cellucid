@@ -49,11 +49,23 @@ function createDataLayer({ genes = GENES, categories = CATEGORIES, pages = PAGES
     getCellCountForPageId(pageId) {
       return pages.get(pageId) ?? 0;
     },
+    // Each page's open cells, the pages one after another.
+    getPageCells(pageIds) {
+      const starts = new Map();
+      let at = 0;
+      for (const [id, count] of pages) {
+        starts.set(id, at);
+        at += count;
+      }
+      return pageIds.map(id => ({ pageId: id, pageName: id.toUpperCase(), cellIndices: Uint32Array.from({ length: pages.get(id) ?? 0 }, (_, k) => starts.get(id) + k) }));
+    },
     getPages() {
       return [...pages.keys()].map(id => ({ id, name: id.toUpperCase() }));
     },
     getExpressionMatrices: () => ({ choices: [{ value: 'mapped', label: 'Mapped (X)' }], reason: null }),
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables(type) {
       if (type === 'gene_expression') return genes.map(key => ({ key }));
@@ -251,6 +263,41 @@ test('differential expression results restore deep-equal through the session and
   );
 });
 
+test('a restored result is current at once; its drawing, which waits for its panel to be shown, is never waited for', async () => {
+  const source = createUI(DEAnalysisUI);
+  source._lastResult = source._buildResult(deFull(), source._requireOptions());
+  const exported = source.exportResult();
+
+  // A panel not shown (a closed row or window, a tab in the background):
+  // its plot draws only once it has a size, here never until `show()`.
+  const hidden = createUI(DEAnalysisUI);
+  let show;
+  hidden._showResult = result => new Promise(resolve => {
+    show = () => { hidden.shown.push(result); resolve(); };
+  });
+  await hidden.importResult(throughSession(exported));
+  assert.deepStrictEqual(hidden._lastResult.full, deFull(), 'restored before anything is drawn');
+  assert.equal(hidden.shown.length, 0);
+  assert.notEqual(hidden.exportResult(), null, 'saved again before it is drawn, the result is kept');
+  show();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(hidden.shown[0], hidden._lastResult, 'drawn once shown: the drawn and current result are one value');
+  assert.equal(hidden.isLoading(), false, 'the restore request ends with its drawing');
+
+  // A drawing that fails says so and withdraws the result.
+  const failing = createUI(DEAnalysisUI);
+  const said = [];
+  failing._notifications = { error: message => said.push(message) };
+  let fail;
+  failing._showResult = () => new Promise((_, reject) => { fail = reject; });
+  await failing.importResult(throughSession(exported));
+  assert.notEqual(failing._lastResult, null);
+  fail(new Error('no graphics'));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(failing._lastResult, null);
+  assert.deepEqual(said, ['The restored result could not be drawn: no graphics']);
+});
+
 test('gene signature results restore deep-equal through the session and the render path', async () => {
   const source = createUI(GeneSignatureUI);
   source._lastResult = await source._buildResult(signatureRaw(), source._requireOptions());
@@ -294,6 +341,29 @@ test('a signature result is refused when a group no longer has its scored cells'
     createUI(GeneSignatureUI, createDataLayer({ pages: new Map([['page-a', 4], ['page-b', 3]]) }))
       .importResult(throughSession(source.exportResult())),
     /5 scores for cell group "page-a", which now has 4 cells/,
+  );
+});
+
+test('a signature scored on the cells genes were read for restores with them, and says so', async () => {
+  // Genes read for the first 6 of 8 open cells: page-b (cells 5-7) was scored on cell 5 alone.
+  const raw = signatureRaw();
+  raw.geneSample = { cells: 6, of: 8, groups: [{ name: 'PAGE-A', used: 5, of: 5 }, { name: 'PAGE-B', used: 1, of: 3 }] };
+  raw.sets[0].pages[1] = { pageId: 'page-b', pageName: 'PAGE-B', scores: Float32Array.of(2), cellIndices: Uint32Array.of(5) };
+  const source = createUI(GeneSignatureUI);
+  source._lastResult = await source._buildResult(raw, source._requireOptions());
+  assert.deepEqual(source._lastResult.geneSample, raw.geneSample, 'the result names its gene sample');
+  const target = createUI(GeneSignatureUI);
+  await target.importResult(throughSession(source.exportResult()));
+  assert.deepStrictEqual(target._lastResult.raw, raw);
+  assert.deepEqual(target._lastResult.geneSample, raw.geneSample);
+  // Scores for more of a page's cells than genes were read for: refused, naming the sample.
+  const wrong = signatureRaw();
+  wrong.geneSample = raw.geneSample;
+  const refused = createUI(GeneSignatureUI);
+  refused._lastResult = await refused._buildResult(wrong, refused._requireOptions());
+  await assert.rejects(
+    createUI(GeneSignatureUI).importResult(throughSession(refused.exportResult())),
+    /3 scores for cell group "page-b", which now has 1 cell among the first 6 open cells, those genes were read for/,
   );
 });
 

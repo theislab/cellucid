@@ -11,6 +11,11 @@
  * byte reader's block cache; raw data (chunks, contiguous storage) is read
  * exactly and never cached there.
  *
+ * Every read runs within the file's lifetime (`lifetime`, aborted when the
+ * file is closed: `index.js`), as well as its caller's signal: closing the
+ * file stops every read still under way, whoever asked for it
+ * (`withinLifetime`).
+ *
  * @module formats/hdf5/context
  */
 
@@ -18,6 +23,7 @@ import { Cursor } from './binary.js';
 import { hasValidChecksum } from './checksum.js';
 import { formatError } from './errors.js';
 import { ByteBudget, ByteCache } from './lru.js';
+import { SharedWorks, withinLifetime } from '../../utils/abort.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 const MiB = 1024 * 1024;
@@ -40,7 +46,7 @@ function readOptions(cache, signal, activity) {
 export class FileContext {
   /**
    * @param {import('../io/byte-reader.js').ByteReader} reader
-   * @param {{decodedChunkCacheBytes?: number, verifyChecksums?: boolean}} [options]
+   * @param {{decodedChunkCacheBytes?: number|import('../io/decoded-budget.js').DecodedBudget, verifyChecksums?: boolean}} [options]
    */
   constructor(reader, { decodedChunkCacheBytes = 64 * MiB, verifyChecksums = true } = {}) {
     this.reader = reader;
@@ -54,8 +60,12 @@ export class FileContext {
     this.btreeK = { groupLeaf: 4, groupInternal: 16, chunk: 32 };
     /** Decoded chunks and parsed global heap collections, by key. */
     this.cache = new ByteCache(decodedChunkCacheBytes);
-    /** Parsed object headers and other shared metadata, by key. */
-    this.memo = new Map();
+    /**
+     * Loads of shared metadata in progress (global heap collections), by
+     * key: one load however many reads ask, stopped only once every one of
+     * them withdrew (`SharedWorks`).
+     */
+    this.loading = new SharedWorks();
     /** Chunk fetch-and-decodes in progress, shared by concurrent reads. */
     this.inflight = new Map();
     /**
@@ -84,11 +94,21 @@ export class FileContext {
     // Reads a view waits for take room before background work (a gene index
     // built ahead of need), which also leaves one decompression free for them.
     this.decodeBudget = new ByteBudget(decodeBudgetBytes);
+    /**
+     * How far a read through many parts reads ahead of what it has decoded
+     * (the same allowance: a string column's references a window at a time,
+     * `nodes.js` `rowsOf`).
+     */
+    this.readAheadBytes = decodeBudgetBytes;
     /** Chunks being decompressed at once (each decompressor holds native buffers). */
     this.decodeSlots = new ByteBudget(DECOMPRESSIONS_AT_ONCE, { waves: false, reserve: 1 });
     this.closed = false;
+    /** Aborted when the file is closed (`index.js`): every read made through it stops. */
+    this.lifetime = new AbortController();
     /** The file itself, under no read's activity (`withActivity`). */
     this.unscoped = this;
+    /** Reads made through the file itself are not background work. */
+    this.background = false;
   }
 
   /**
@@ -117,6 +137,8 @@ export class FileContext {
     scoped.metaUpTo = (address, length, what, signal = null) => file.metaUpTo(address, length, what, signal, activity);
     scoped.data = (address, length, what, signal = null) => file.data(address, length, what, signal, activity);
     scoped.dataUpTo = (address, length, what, signal = null) => file.dataUpTo(address, length, what, signal, activity);
+    /** Whether the reads made through this view are background work. */
+    scoped.background = activity.background === true;
     return scoped;
   }
 
@@ -156,22 +178,27 @@ export class FileContext {
     if (this.closed) throw new Error(`${this.name} has been closed.`);
   }
 
+  /** `length` bytes at absolute offset `start`, read within the file's lifetime. @private */
+  _read(start, length, cache, signal, activity) {
+    return withinLifetime(this.lifetime.signal, signal, joined => this.reader.read(start, length, readOptions(cache, joined, activity)));
+  }
+
   /** Read metadata (cached in blocks). */
   meta(address, length, what, signal = null, activity = null) {
     const start = this.requireRange(address, length, what);
-    return this.reader.read(start, length, readOptions(true, signal, activity));
+    return this._read(start, length, true, signal, activity);
   }
 
   /** Read up to `length` bytes of metadata, fewer when the file ends first. */
   metaUpTo(address, length, what, signal = null, activity = null) {
     const start = this.requireRange(address, 0, what);
-    return this.reader.read(start, Math.min(length, this.size - start), readOptions(true, signal, activity));
+    return this._read(start, Math.min(length, this.size - start), true, signal, activity);
   }
 
   /** Read raw data (exact, not cached). */
   data(address, length, what, signal = null, activity = null) {
     const start = this.requireRange(address, length, what);
-    return this.reader.read(start, length, readOptions(false, signal, activity));
+    return this._read(start, length, false, signal, activity);
   }
 
   /**
@@ -181,7 +208,7 @@ export class FileContext {
    */
   dataUpTo(address, length, what, signal = null, activity = null) {
     const start = this.requireRange(address, 0, what);
-    return this.reader.read(start, Math.min(length, this.size - start), readOptions(false, signal, activity));
+    return this._read(start, Math.min(length, this.size - start), false, signal, activity);
   }
 
   /** A cursor over `bytes` read from `address`, with this file's sizes. */
@@ -200,20 +227,6 @@ export class FileContext {
     if (this.verifyChecksums && !hasValidChecksum(bytes)) {
       throw formatError(what, this.base + address, 'its checksum does not match; the file is corrupt');
     }
-  }
-
-  /** Memoize an async load by key (one load per structure, however many ask). */
-  once(key, load) {
-    let promise = this.memo.get(key);
-    if (promise === undefined) {
-      promise = load();
-      this.memo.set(key, promise);
-      // A failed or aborted load may be asked for again.
-      promise.catch(() => {
-        if (this.memo.get(key) === promise) this.memo.delete(key);
-      });
-    }
-    return promise;
   }
 }
 

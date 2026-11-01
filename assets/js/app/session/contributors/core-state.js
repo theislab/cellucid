@@ -39,6 +39,7 @@ import {
 } from '../session-context.js';
 import { requireRepresentationRef } from '../../../data/dimension-manager.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 
 export const id = 'core-state';
 
@@ -60,12 +61,6 @@ const CORE_PAYLOAD_KEYS = [
   'activeFields',
   'multiview'
 ];
-
-function throwIfAborted(signal) {
-  if (signal !== null && signal.aborted) {
-    throw new DOMException('Aborted', 'AbortError');
-  }
-}
 
 function assertAbortSignal(signal) {
   if (

@@ -7,6 +7,7 @@
  * session, a link or a message records.
  */
 import assert from 'node:assert/strict';
+import { persistsAcrossVisits } from '../assets/js/data/sources/identity.js';
 import test from 'node:test';
 
 import { getProviderRegistry } from '../assets/js/data/sources/registry.js';
@@ -268,7 +269,7 @@ test('Drive, public: item and head go out together with the key, with no header 
   assert.equal(opened.file.resource.head.bytes.length, HEAD_BYTES);
   // The display link carries no key; the reads get it from the page.
   assert.ok(!opened.file.resource.url.includes('key='));
-  assert.deepEqual(Object.keys(opened.file.resource.access).sort(), ['provider', 'ref', 'stale', 'unreadable']);
+  assert.deepEqual(Object.keys(opened.file.resource.access).sort(), ['changed', 'limited', 'provider', 'ref', 'stale', 'unreadable', 'versioned']);
   // A read Google holds back from the key is said for what it is.
   assert.match(opened.file.resource.access.unreadable, /without a Google sign-in for now/);
   const target = await resolveSourceAccess(opened.file.resource.access.ref);
@@ -276,6 +277,20 @@ test('Drive, public: item and head go out together with the key, with no header 
   assert.deepEqual(target.headers, {});
   assert.equal(opened.file.resource.identity.key, `gdrive:${DRIVE_ID}`);
   assert.equal(opened.file.resource.identity.version, `md5:d41d:${SIZE}`);
+});
+
+test('Drive: a file is kept across visits only when Drive states a validator (a checksum or a revision)', async t => {
+  for (const [item, version] of [
+    [DRIVE_ITEM, `md5:d41d:${SIZE}`],
+    [{ ...DRIVE_ITEM, md5Checksum: undefined, headRevisionId: 'r7' }, `revision:r7:${SIZE}`],
+    [{ ...DRIVE_ITEM, md5Checksum: undefined }, `size:${SIZE}`],
+  ]) {
+    const calls = installFetch(t, async ({ url }) => (isMetadata(url) ? { status: 200, json: item } : isMedia(url) ? { status: 206 } : null));
+    const opened = await createDriveProvider({ google: fakeGoogle() }).open(DRIVE_ID);
+    assert.equal(opened.file.resource.identity.version, version);
+    assert.equal(persistsAcrossVisits(opened.file.resource.identity), !version.startsWith('size:'));
+    calls.length = 0;
+  }
 });
 
 test('Drive: a resource key goes in its header only on files whose link had one', async t => {
@@ -820,8 +835,43 @@ test('Figshare: a bot challenge from the file host is said for what it is', asyn
     ? { status: 200, json: ITEM }
     : { status: 202, headers: { 'x-amzn-waf-action': 'challenge' } }));
   await assert.rejects(figshare.open('16566057'), error => {
-    assert.equal(error.message, "Figshare's file host refused this browser with a bot check, so squidpy-visium.h5ad cannot be read here. Try again in a minute, open it in another browser, or download it from Figshare and open it from your computer.");
+    assert.equal(error.message, "Figshare's file host refused this browser with a bot check, so squidpy-visium.h5ad cannot be read here. Try again in a minute, or open it in another browser. Download it and open it from your computer (Open… › File…).");
     assert.ok(!error.message.includes('ndownloader'));
     return true;
   });
+});
+
+test('a file republished on Figshare, Drive or OneDrive opens as a new version; unchanged, as the same one', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+  let figshareItem = ITEM;
+  let driveItem = DRIVE_ITEM;
+  let graphItem = GRAPH_ITEM;
+  const calls = installFetch(t, ({ url }) => {
+    if (url === 'https://api.figshare.com/v2/articles/16566057') return { status: 200, json: figshareItem };
+    if (url.startsWith('https://ndownloader.figshare.com/files/')) return { status: 206, url: 'https://s3.example.org/f?X-Amz-Expires=10' };
+    if (isMetadata(url)) return { status: 200, json: driveItem };
+    if (isMedia(url)) return { status: 206 };
+    if (url.startsWith('https://graph.microsoft.com/')) return graphAnswer(url, graphItem);
+    if (url === DOWNLOAD) return { status: 206 };
+    return null;
+  });
+  const drive = createDriveProvider({ google: fakeGoogle() });
+  const onedrive = createOneDriveProvider({ microsoft: fakeMicrosoft() });
+  const versions = async () => [
+    (await figshare.open('16566057')).file.resource.identity.version,
+    (await drive.open(DRIVE_ID)).file.resource.identity.version,
+    (await onedrive.open(onedrive.match(SHARE, { explicit: false }))).file.resource.identity.version,
+  ];
+  const first = await versions();
+  assert.deepEqual(first, ['figshare:16566057v1:abc', `md5:d41d:${SIZE}`, `ctag:c1:${SIZE}`]);
+  assert.deepEqual(await versions(), first, 'unchanged: the same versions');
+  // Each republished: a new Figshare version with a new checksum, new bytes
+  // on Drive (its checksum), a new write on OneDrive (its cTag).
+  figshareItem = { ...ITEM, version: 2, files: [{ ...ITEM.files[0], computed_md5: 'def' }] };
+  driveItem = { ...DRIVE_ITEM, md5Checksum: 'e5f6' };
+  graphItem = { ...GRAPH_ITEM, cTag: 'c2' };
+  const next = await versions();
+  for (let i = 0; i < first.length; i++) assert.notEqual(next[i], first[i]);
+  // Figshare's item is asked of Figshare at each opening, never a cached answer.
+  assert.ok(calls.filter(call => call.url.startsWith('https://api.figshare.com/')).every(call => call.cache === 'no-cache'));
 });

@@ -4,8 +4,9 @@
  *
  * - `shape`, and `chunkShape`: the grid reads are made on (for a sharded
  *   array, the inner chunks; `sharding` then describes the shards);
- * - `type` (`dtypes.js`), `fill` (`{value, raw}`; `value` null for a Zarr v2
- *   array whose fill is undefined);
+ * - `type` (`dtypes.js`), `fill` (`{value, raw}`; a Zarr v2 array whose
+ *   `fill_value` is null has its type's default, `value` null only for a
+ *   type this reader does not read);
  * - `pipeline` (`codecs/pipeline.js`) decoding one read-grid chunk;
  * - `chunkKey(coords)`: the store key of a chunk (v2 `0.1` or `0/1`; v3
  *   `c/0/1`, or v2-style keys when `chunk_key_encoding` says so).

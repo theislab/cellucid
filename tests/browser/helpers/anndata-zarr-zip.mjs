@@ -196,7 +196,8 @@ function storedZip(files) {
  * @param {Object} dataset
  * @param {number} dataset.cells
  * @param {string[]} [dataset.genes] - Variable names; no genes writes no X
- * @param {Float32Array} [dataset.X] - Dense cells x genes, row-major (zeros when omitted)
+ * @param {Float32Array|{data: Float32Array, indices: Int32Array, indptr: Int32Array}} [dataset.X] - Dense
+ *   cells x genes, row-major (zeros when omitted), or a CSR matrix's arrays (written as `csr_matrix`)
  * @param {Object<string, Categorical|Float32Array|string[]>} [dataset.obs]
  * @param {Object<string, {data: Float32Array, columns: number}>} [dataset.obsm]
  * @param {Object} [dataset.uns] - Plain values: text, numbers, lists, mappings
@@ -209,7 +210,12 @@ export function anndataZarrZip({ cells, genes = [], X = null, obs = {}, obsm = {
   store.group('', { 'encoding-type': 'anndata', 'encoding-version': '0.1.0' });
   store.dataframe('obs', Array.from({ length: cells }, (_, index) => `cell-${index}`), obs);
   store.dataframe('var', genes, {});
-  if (genes.length > 0) {
+  if (genes.length > 0 && X !== null && !ArrayBuffer.isView(X)) {
+    store.group('X/', { 'encoding-type': 'csr_matrix', 'encoding-version': '0.1.0', shape: [cells, genes.length] });
+    store.typed('X/data', X.data, [X.data.length]);
+    store.typed('X/indices', X.indices, [X.indices.length]);
+    store.typed('X/indptr', X.indptr, [X.indptr.length]);
+  } else if (genes.length > 0) {
     store.typed('X', X ?? new Float32Array(cells * genes.length), [cells, genes.length]);
   }
   store.group('obsm/', DICT_ATTRS);

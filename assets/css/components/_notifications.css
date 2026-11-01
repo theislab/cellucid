@@ -145,7 +145,8 @@
 }
 
 /* A notification's one follow-up action, under its message. */
-.notification-action {
+.notification-action,
+.notification-cancel {
   align-self: flex-start;
 }
 

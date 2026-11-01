@@ -54,7 +54,11 @@ const FIXTURE = path.join(ROOT, 'tests/fixtures/input-formats.json');
  * (`tests/test_input_formats.py`) and cellucid-r
  * (`tests/testthat/test-input-formats.R`) pin the same one.
  */
-const INPUT_FORMATS_SHA256 = 'ed44816fc5299aea7b87a8f7e805a704779517e04a2dd5b9b6340ced511ba7e7';
+const INPUT_FORMATS_SHA256 = '7c1e079c33dcd7d1abb17e4996e6e6cf35f1968327a9097701dd9a1ca860c902';
+
+/** A dataset's structure for its default id (`defaultDatasetIdOf`), and its pinned digits. */
+const PBMC = Object.freeze({ nObs: 2700, nVars: 3, varNames: Object.freeze(['CD3E', 'MS4A1', 'LYZ']) });
+const PBMC_STRUCTURE = '1bd42f4e';
 
 test('input-formats.json is the registry document, byte for byte, at the pinned digest', async () => {
   const bytes = await readFile(FIXTURE, 'utf8');
@@ -119,23 +123,23 @@ test('a name says its format and layout; the longest ending wins', () => {
   assert.deepEqual(fileFormatOfName('GSE1_objects.RData.gz'), { format: 'rda', layout: 'file' });
   assert.deepEqual(fileFormatOfName('GSE1_objects.rda.gz'), { format: 'rda', layout: 'file' });
   assert.equal(titleOfName('GSM1_seurat.rds.gz'), 'GSM1_seurat');
-  assert.equal(defaultDatasetIdOf('rds', 'GSM1_seurat.rds.gz'), 'rds_GSM1_seurat');
+  assert.match(defaultDatasetIdOf('rds', 'GSM1_seurat.rds.gz', PBMC), /^rds_GSM1_seurat_[0-9a-f]{8}$/);
   assert.equal(fileFormatOfName('matrix.mtx.gz'), null);
   // A table of cells is read inside a MatrixMarket folder, never as a dataset of its own.
   assert.equal(fileFormatOfName('cells.csv.gz'), null);
   assert.equal(fileFormatOfName('pbmc.qs'), null);
   assert.equal(fileFormatOfName('notes.txt.gz'), null);
-  assert.equal(defaultDatasetIdOf('rds', 'pbmc.rds'), 'rds_pbmc');
+  assert.match(defaultDatasetIdOf('rds', 'pbmc.rds', PBMC), /^rds_pbmc_[0-9a-f]{8}$/);
   assert.deepEqual(fileFormatOfName('pbmc.loom'), { format: 'loom', layout: 'file' });
   assert.deepEqual(fileFormatOfName('filtered_feature_bc_matrix.h5'), { format: 'tenx-h5', layout: 'file' });
   assert.deepEqual(fileFormatOfName('citeseq.H5MU'), { format: 'h5mu', layout: 'file' });
-  assert.equal(defaultDatasetIdOf('loom', 'pbmc.loom'), 'loom_pbmc');
-  assert.equal(fileFormatOfName('a.h5ad.gz'), null);
+  assert.match(defaultDatasetIdOf('loom', 'pbmc.loom', PBMC), /^loom_pbmc_[0-9a-f]{8}$/);
+  assert.deepEqual(fileFormatOfName('a.h5ad.gz'), { format: 'h5ad', layout: 'file', compression: 'gzip' }, 'a compressed copy, read whole');
   assert.equal(fileFormatOfName('a.zarr'), null, 'a folder name is not a file name');
   assert.deepEqual(folderFormatOfName('atlas.zarr'), { format: 'zarr', layout: 'folder' });
   assert.deepEqual(folderFormatOfName('/a/b/atlas.ZARR/'), { format: 'zarr', layout: 'folder' });
   assert.equal(folderFormatOfName('atlas'), null);
-  assert.deepEqual(compressedFormatOfName('x.h5ad.gz'), { format: 'h5ad', layout: 'file' });
+  assert.deepEqual(compressedFormatOfName('x.h5ad.gz'), { format: 'h5ad', layout: 'file', compression: 'gzip' });
   assert.equal(compressedFormatOfName('x.h5ad'), null);
 
   assert.equal(titleOfName('atlas.h5ad'), 'atlas');
@@ -145,10 +149,25 @@ test('a name says its format and layout; the longest ending wins', () => {
   assert.equal(titleOfName('atlas.v2.h5ad'), 'atlas.v2');
   assert.equal(titleOfName('.zarr'), '.zarr', 'nothing would be left');
   assert.equal(titleOfName('notes.txt'), 'notes.txt');
-  // The ids every session saved on a dataset that states none records.
-  assert.equal(defaultDatasetIdOf('h5ad', 'pbmc.h5ad'), 'h5ad_pbmc');
-  assert.equal(defaultDatasetIdOf('zarr', 'pbmc.zarr.zip'), 'zarr_pbmc');
-  assert.equal(defaultDatasetIdOf('zarr', 'pbmc.zarr'), 'zarr_pbmc');
+  // The ids every session saved on a dataset that states none records:
+  // its format, its name and what it holds.
+  const structure = defaultDatasetIdOf('h5ad', 'pbmc.h5ad', PBMC).slice('h5ad_pbmc_'.length);
+  assert.match(structure, /^[0-9a-f]{8}$/);
+  assert.equal(defaultDatasetIdOf('h5ad', 'pbmc.h5ad', PBMC), `h5ad_pbmc_${structure}`);
+  assert.equal(defaultDatasetIdOf('zarr', 'pbmc.zarr.zip', PBMC), `zarr_pbmc_${structure}`);
+  assert.equal(defaultDatasetIdOf('zarr', 'pbmc.zarr', PBMC), `zarr_pbmc_${structure}`);
+  // Pinned: the same data named alike in every release.
+  assert.equal(structure, PBMC_STRUCTURE);
+  // Another cell count, gene count, gene name or gene order: another dataset.
+  for (const other of [
+    { ...PBMC, nObs: PBMC.nObs + 1 },
+    { nObs: PBMC.nObs, nVars: 2, varNames: ['CD3E', 'MS4A1'] },
+    { ...PBMC, varNames: ['CD3E', 'MS4A1', 'LYZx'] },
+    { ...PBMC, varNames: ['MS4A1', 'CD3E', 'LYZ'] },
+  ]) {
+    assert.notEqual(defaultDatasetIdOf('h5ad', 'pbmc.h5ad', other), `h5ad_pbmc_${structure}`, JSON.stringify(other));
+  }
+  assert.throws(() => defaultDatasetIdOf('h5ad', 'pbmc.h5ad', { nObs: 3, nVars: 2, varNames: ['a'] }), /one name per gene/);
   assert.equal(readsFromHead({ format: 'h5ad', layout: 'file' }), true);
   assert.equal(readsFromHead({ format: 'zarr', layout: 'zip' }), false);
   assert.equal(readsFromHead(null), false);
@@ -166,13 +185,23 @@ test('a folder is a store by its name or by a marker file anywhere below it', ()
     { format: 'tenx-outs', layout: 'folder' }
   );
   assert.deepEqual(folderFormatOfPaths(['filtered_gene_bc_matrices_h5.h5']), { format: 'tenx-outs', layout: 'folder' });
-  // A MatrixMarket folder whose files share a sample prefix (GEO's GSM…_).
+  // A MatrixMarket folder: a .mtx file, whatever its producer named it (its
+  // lists are the transcoder's to pair, a missing one refused by name).
   assert.deepEqual(folderFormatOfPaths(['GSE1/GSM1_matrix.mtx.gz', 'GSE1/GSM1_barcodes.tsv.gz']), { format: 'mtx', layout: 'folder' });
   assert.deepEqual(folderFormatOfPaths(['d/GSM1_RNA_3P-matrix.mtx.gz', 'd/GSM1_RNA_3P-features.tsv.gz']), { format: 'mtx', layout: 'folder' });
   assert.deepEqual(folderFormatOfPaths(['GSM1_count_matrix.mtx', 'GSM1_all_genes.csv']), { format: 'mtx', layout: 'folder' });
-  assert.equal(folderFormatOfPaths(['GSE1/GSM1_matrix.mtx.gz']), null, 'a prefix no other file shares');
-  assert.equal(folderFormatOfPaths(['d/xmatrix.mtx.gz', 'd/xa.tsv']), null, 'a name that merely ends alike');
-  assert.equal(folderFormatOfPaths(['a/GSM1_matrix.mtx.gz', 'b/GSM1_barcodes.tsv.gz']), null, 'the files share a folder');
+  assert.deepEqual(folderFormatOfPaths(['GSE158055/GSE158055_covid19_counts.mtx.gz', 'GSE158055/GSE158055_covid19_features.tsv.gz']), { format: 'mtx', layout: 'folder' });
+  assert.deepEqual(folderFormatOfPaths(['k/cells_x_genes.MTX']), { format: 'mtx', layout: 'folder' }, 'compared without case');
+  assert.deepEqual(folderFormatOfPaths(['GSE1/GSM1_matrix.mtx.gz']), { format: 'mtx', layout: 'folder' }, 'a matrix alone: refused naming its missing lists');
+  assert.equal(folderFormatOfPaths(['d/notes.mtx.txt', 'd/.mtx']), null, 'an ending, not a part of a name');
+  // A sci-RNA-seq3 matrix under a .txt name (GEO GSE119945) on this computer,
+  // as from a link; any other .txt is no matrix.
+  assert.deepEqual(
+    folderFormatOfPaths(['GSE119945/GSE119945_gene_count.txt.gz', 'GSE119945/GSE119945_cell_annotate.csv.gz', 'GSE119945/GSE119945_gene_annotate.csv.gz']),
+    { format: 'mtx', layout: 'folder' }
+  );
+  assert.deepEqual(folderFormatOfPaths(['m/GSE1_gene_count.run_13.TXT']), { format: 'mtx', layout: 'folder' }, 'a part, compared without case');
+  assert.equal(folderFormatOfPaths(['d/GSE131907_Lung_Cancer_raw_UMI_matrix.txt.gz', 'd/notes.txt']), null);
   assert.equal(folderFormatOfPaths(['cells/notes.txt', 'cells/a/b.csv']), null);
   assert.equal(folderFormatOfPaths([]), null);
 });
@@ -185,6 +214,16 @@ test('the first bytes decide the layout and container whatever the name says', (
   const userBlock = new Uint8Array(520);
   userBlock.set(hdf5.subarray(0, 8), 512);
   assert.deepEqual(layoutOfHead(userBlock), { layout: 'file', container: 'hdf5' }, 'after a 512-byte user block');
+  // Any user block HDF5 allows (a power of two from 512) within the head the
+  // HDF5 reader reads first: 4 KiB, 256 KiB; never between them.
+  for (const size of [4096, 65536, 262144]) {
+    const head = new Uint8Array(size + 8);
+    head.set(hdf5.subarray(0, 8), size);
+    assert.deepEqual(layoutOfHead(head), { layout: 'file', container: 'hdf5' }, `after a ${size}-byte user block`);
+  }
+  const between = new Uint8Array(3000 + 8);
+  between.set(hdf5.subarray(0, 8), 3000);
+  assert.equal(layoutOfHead(between), null, 'not at a power of two');
   assert.equal(layoutOfHead(Uint8Array.from([0x89, 0x48])), null, 'too short to carry a signature');
   assert.equal(layoutOfHead(new TextEncoder().encode('not-an-hdf5-file')), null);
   assert.equal(layoutOfHead(null), null);
@@ -201,9 +240,9 @@ test('a server may state every format in every layout it arrives in, and nothing
         layout,
         ...(INPUT_FORMATS.find(format => format.id === kind)?.container === 'zarr'
           ? {}
-          : { files: [{ path: 'matrix.mtx.gz', size: 10 }] }),
+          : { files: [{ path: 'matrix.mtx.gz', size: 10, etag: '"a-1"' }] }),
       }
-      : { url: '_cellucid/anndata/x', kind, layout, size: 10 },
+      : { url: '_cellucid/anndata/x', kind, layout, size: 10, etag: '"a-1"' },
     defaults: {},
   }, 'dataset');
   for (const format of INPUT_FORMATS) {
@@ -230,7 +269,7 @@ test('catalogs, drops, the picker and the address bar take exactly the names the
   // A two-part ending is offered by its last part only when that part is an
   // ending of its own (`.zip` covers `.zarr.zip`); otherwise whole
   // (`.rds.gz`), never as a bare `.gz` that would offer every gzip file.
-  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat');
+  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
   assert.ok(!filePickerAccept().split(',').includes('.gz'));
   assert.deepEqual(localFileLayout({ name: 'GSM1_seurat.rds.gz' }), 'file');
   assert.deepEqual(openableNamePhrases(), [
@@ -330,5 +369,25 @@ test('the Link or server tip names every link provider the registry holds', asyn
     // A plain web address is the bullets about addresses, not a name.
     if (provider.id === 'url') continue;
     assert.ok(text.includes(provider.label), `the data-address tip names ${provider.label}`);
+  }
+});
+
+test('a folder on this computer and a listing on a host tell a MatrixMarket matrix by the same names', async () => {
+  const { matrixMarketFileSets } = await import('../assets/js/data/matrix-market-files.js');
+  const { matrixMarketSets } = await import('../assets/js/data/anndata/transcode/matrix-market.js');
+  const names = [
+    'matrix.mtx.gz', 'GSM1_matrix.mtx.gz', 'GSE158055_covid19_counts.mtx.gz', 'GSM1_count_matrix.MTX', 'cells_x_genes.mtx',
+    'GSE119945_gene_count.txt.gz', 'GSE228590_gene_count.run_13.mtx.gz', 'GSE1_gene_count.run_2.txt',
+    'GSE131907_Lung_Cancer_raw_UMI_matrix.txt.gz', 'notes.mtx.txt', 'barcodes.tsv.gz', 'GSE1_cell_annotate.csv.gz',
+  ];
+  for (const name of names) {
+    const local = folderFormatOfPaths([`d/${name}`])?.format === 'mtx';
+    // The transcoder of a picked folder and a host's listing (GEO) each name
+    // the matrix, as a set or as a problem saying what it lacks.
+    const transcoder = matrixMarketSets(new Map([[`d/${name}`, {}]])).some(set => set.matrix === `d/${name}`);
+    const listing = matrixMarketFileSets([name]);
+    const listed = [...listing.sets, ...listing.problems].some(item => item.matrix === name) || /^(cells_x_genes|quants_mat)\./i.test(name);
+    assert.equal(transcoder, local, `${name}: the transcoder and the folder rule`);
+    assert.equal(listed, local, `${name}: a listing and the folder rule`);
   }
 });

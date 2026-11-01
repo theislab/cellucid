@@ -18,9 +18,33 @@
  * @module ui/modules/sidebar-controls
  */
 
+import { rememberPhoneSheet } from '../core/phone-sheet-memory.js';
 import { clampSidebarWidthPx } from '../../sidebar-metrics.js';
 import { StyleManager } from '../../../utils/style-manager.js';
 import { computeLeftOcclusionRatio } from '../../../rendering/viewport-center.js';
+
+/**
+ * Open the sidebar for a control outside it that leads to one inside it
+ * (Data mapping's way to its checklist, a gene sample's way to Genes read
+ * for). It works from the first frame: until the controls below take the
+ * phone's peek state over, that state is still the root's mark
+ * (`viewport-init.js`), which is dropped so the panel starts open; afterwards
+ * the toggle opens it, through the one path that keeps its state, ARIA and
+ * the presented area.
+ *
+ * @param {Document} ownerDocument
+ */
+export function revealSidebar(ownerDocument) {
+  const root = ownerDocument.documentElement;
+  if (root.dataset.phoneSheet === 'peek') {
+    delete root.dataset.phoneSheet;
+    rememberPhoneSheet(ownerDocument.defaultView, 'open');
+    return;
+  }
+  if (ownerDocument.getElementById('sidebar')?.classList.contains('hidden')) {
+    ownerDocument.getElementById('sidebar-toggle')?.click();
+  }
+}
 
 export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   if (dom === null || typeof dom !== 'object' || Array.isArray(dom)) {
@@ -142,6 +166,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     sidebarToggle.setAttribute('aria-expanded', isHidden ? 'false' : 'true');
     sidebarToggle.setAttribute('aria-label', isHidden ? 'Show sidebar' : 'Hide sidebar');
     sidebarToggle.title = isHidden ? 'Show sidebar' : 'Hide sidebar';
+    ownerDocument.getElementById('phone-sheet-bar')?.setAttribute('aria-expanded', isHidden ? 'false' : 'true');
   };
 
   sidebarToggle.type = 'button';
@@ -154,12 +179,29 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   if (!Number.isFinite(initialWidth) || initialWidth <= 0) {
     throw new RangeError('Sidebar width must be positive before initialization.');
   }
+  // The phone layout starts with the plot (`viewport-init.js` marked the root
+  // before the stylesheet applied): the panel waits as the peek bar, a state
+  // the sidebar's own `hidden` holds from here.
+  const root = ownerDocument.documentElement;
+  if (root.dataset.phoneSheet === 'peek') {
+    sidebar.classList.add('hidden');
+    delete root.dataset.phoneSheet;
+  }
   syncSidebarToggleState();
   publishViewportOcclusion();
+
+  // Whether this tab left the phone panel open or as the peek bar, kept for
+  // the next load of the tab (session storage: never in the address).
+  const phoneLayout = ownerWindow.matchMedia?.('(max-width: 720px)') ?? null;
+  const rememberSheet = () => {
+    if (phoneLayout?.matches !== true) return;
+    rememberPhoneSheet(ownerWindow, sidebar.classList.contains('hidden') ? 'peek' : 'open');
+  };
 
   const handleSidebarToggle = () => {
     if (destroyed) return;
     sidebar.classList.toggle('hidden');
+    rememberSheet();
     syncSidebarToggleState();
     publishViewportOcclusion();
     if (transitionFrame === 0) {
@@ -169,6 +211,34 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     }
   };
   sidebarToggle.addEventListener('click', handleSidebarToggle);
+
+  // The phone panel's peek bar: the dataset's name and a handle; a tap or an
+  // upward swipe opens the panel.
+  const phoneSheetBar = ownerDocument.getElementById('phone-sheet-bar');
+  const phoneSheetName = ownerDocument.getElementById('phone-sheet-name');
+  const datasetName = ownerDocument.getElementById('dataset-name');
+  const openFromBar = () => {
+    if (!destroyed && sidebar.classList.contains('hidden')) handleSidebarToggle();
+  };
+  let swipeFrom = null;
+  const onBarPointerDown = event => { swipeFrom = event.clientY; };
+  const onBarPointerUp = event => {
+    const from = swipeFrom;
+    swipeFrom = null;
+    if (from !== null && from - event.clientY > 24) openFromBar();
+  };
+  const nameObserver = datasetName === null || phoneSheetName === null
+    ? null
+    : new MutationObserver(() => { phoneSheetName.textContent = datasetName.textContent; });
+  if (phoneSheetBar !== null) {
+    phoneSheetBar.addEventListener('click', openFromBar);
+    phoneSheetBar.addEventListener('pointerdown', onBarPointerDown);
+    phoneSheetBar.addEventListener('pointerup', onBarPointerUp);
+  }
+  if (nameObserver !== null) {
+    phoneSheetName.textContent = datasetName.textContent;
+    nameObserver.observe(datasetName, { childList: true, characterData: true, subtree: true });
+  }
 
   let isResizing = false;
   let startX = 0;
@@ -261,6 +331,12 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
       }
       finishSidebarResize();
       sidebarToggle.removeEventListener('click', handleSidebarToggle);
+      if (phoneSheetBar !== null) {
+        phoneSheetBar.removeEventListener('click', openFromBar);
+        phoneSheetBar.removeEventListener('pointerdown', onBarPointerDown);
+        phoneSheetBar.removeEventListener('pointerup', onBarPointerUp);
+      }
+      nameObserver?.disconnect();
       sidebarResizeHandle.removeEventListener(
         'mousedown',
         handleSidebarResizeStart

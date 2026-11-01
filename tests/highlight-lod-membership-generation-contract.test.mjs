@@ -5,6 +5,7 @@ import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { SpatialIndex } from '../assets/js/rendering/high-perf/spatial-index.js';
+import { requireLodMembership } from '../assets/js/rendering/high-perf/renderer-contracts.js';
 import {
   HighlightRenderer,
   HighlightTools,
@@ -121,17 +122,11 @@ function assertExactMembershipDescriptor(
   },
 ) {
   assert.ok(Object.isFrozen(descriptor));
-  assert.deepEqual(
-    Object.keys(descriptor).sort(),
-    [
-      'admissionLevels',
-      'dimensionLevel',
-      'generationToken',
-      'indices',
-      'lodLevel',
-      'pointCount',
-    ],
+  assert.equal(
+    requireLodMembership(descriptor, { pointCount, dimensionLevel, owner: 'test' }),
+    descriptor,
   );
+  assert.equal(descriptor.count, indices.length);
   assert.ok(descriptor.admissionLevels instanceof Uint8Array);
   assert.equal(descriptor.admissionLevels, admissionLevels);
   assert.equal(descriptor.dimensionLevel, dimensionLevel);
@@ -221,6 +216,28 @@ test('LOD membership publishes one lazy compact admission owner shared by every 
     4;
   assert.equal(projectedSharedBytes, 30_000_000);
   assert.equal(retiredFourPaneDenseBytes, 480_000_000);
+});
+
+test('a ranked tree (cells in priority order) publishes its levels by count, with no admission bytes', () => {
+  const spatialIndex = makeNestedSpatialIndex({ order: [1, 0, 4, 2, 3, 7, 5, 6] });
+  spatialIndex.drawOrder = Object.freeze({ ...spatialIndex.drawOrder, ranked: true });
+  const pointCount = spatialIndex.pointCount;
+  const levelZero = spatialIndex.getLodMembership(0);
+  const levelOne = spatialIndex.getLodMembership(1);
+  for (const [membership, level] of [[levelZero, 0], [levelOne, 1]]) {
+    assert.equal(requireLodMembership(membership, { pointCount, dimensionLevel: 2, owner: 'test' }), membership);
+    assert.equal(membership.admissionLevels, null);
+    assert.equal(membership.indices, spatialIndex.lodLevels[level].indices);
+    assert.equal(membership.count, spatialIndex.lodLevels[level].pointCount);
+  }
+  assert.equal(levelOne.generationToken, levelZero.generationToken);
+  assert.equal(
+    collectReachableTypedViews(spatialIndex).some(
+      view => view instanceof Uint8Array && view.length === pointCount,
+    ),
+    false,
+    'nothing a cell is built',
+  );
 });
 
 test('hostile LOD membership construction is atomic and retryable', async t => {
@@ -604,6 +621,7 @@ function makeMembershipDescriptor({
   }
   return Object.freeze({
     admissionLevels,
+    count: admittedIds.length,
     dimensionLevel,
     generationToken: Object.freeze({ label }),
     indices: Uint32Array.from(admittedIds),
@@ -893,40 +911,43 @@ test('highlight publication keys exact geometry, dimension, and membership while
   assert.equal(fixture.uploads.length, 0);
 });
 
-test('transparency publication exactly retires same-reference KNN paths', () => {
-  // Edges 0-1 and 1-2, as the reader's edge payload.
-  const graph = extractConnectivityEdges({
-    format: 'csr',
-    shape: [3, 3],
-    indptr: Int32Array.of(0, 1, 3, 4),
-    indices: Int32Array.of(1, 0, 2, 1),
-    data: new Float32Array(4).fill(1),
-  }, 3);
+test('transparency publication exactly retires same-reference KNN paths', async () => {
+  // Edges 0-1 and 1-2, read by row as the reader worker reads them from the file.
+  const rows = [[1], [0, 2], [1]];
+  const graph = {
+    nCells: 3,
+    async readRows(cells) {
+      const offsets = Uint32Array.from([0, ...cells].map((_, i) => cells.slice(0, i).reduce((sum, cell) => sum + rows[cell].length, 0)));
+      return { offsets, neighbors: Uint32Array.from([...cells].flatMap(cell => rows[cell])) };
+    },
+  };
   const transparency = Uint8Array.from([1, 1, 1]);
   const tools = Object.assign(
     Object.create(HighlightTools.prototype),
     {
       _disposed: false,
       _transparencyGenerations: new Map(),
+      _knnExpansion: null,
       getViewTransparency: () => transparency,
       knnGraph: graph,
       knnSeedCell: { cellIndex: 0, viewId: 'live' },
     },
   );
-  const reach = degree => {
+  const reach = async degree => {
     const expansion = tools._knnQuery();
+    await expansion.completeTo(degree);
     assert.equal(expansion.expandTo(degree, Infinity), true);
     return [...expansion.cells()];
   };
-  assert.deepEqual(reach(2), [0, 1, 2]);
+  assert.deepEqual(await reach(2), [0, 1, 2]);
 
   // Filtering owns this array and mutates it in place. The explicit viewer
   // publication must invalidate the expansion even though the array identity
   // is unchanged.
   transparency[1] = 0;
-  assert.deepEqual(reach(2), [0, 1, 2], 'the expansion is reused until the publication');
+  assert.deepEqual(await reach(2), [0, 1, 2], 'the expansion is reused until the publication');
   assert.equal(tools.handleTransparencyChange('live'), 1);
-  assert.deepEqual(reach(2), [0]);
+  assert.deepEqual(await reach(2), [0]);
 });
 
 function makeHighlightUploadFailureFixture() {

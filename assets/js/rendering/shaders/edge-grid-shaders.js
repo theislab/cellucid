@@ -7,6 +7,7 @@
 
 import { FOG_GLSL } from './fog-shaders.js';
 import { LINEAR_TEXEL_GLSL } from '../linear-texture.js';
+import { UNPLACED_GLSL } from '../unplaced-positions.js';
 
 // ============================================================================
 // GPU-INSTANCED EDGE SHADER
@@ -49,10 +50,17 @@ uniform float u_lineWidth;
 // Line opacity, thinned by the shared fog model at each endpoint.
 uniform float u_lineAlpha;
 ${FOG_GLSL}
+${UNPLACED_GLSL}
 // The final opacity, linear along the line.
 out float v_alpha;
 
 void main() {
+  // An edge to or from a cell its embedding does not place is not drawn.
+  if (isUnplacedPosition(a_source) || isUnplacedPosition(a_destination)) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    v_alpha = 0.0;
+    return;
+  }
   // Determine which endpoint this vertex belongs to
   // a_quadPos.x: -1 = source, +1 = destination
   vec3 myPos = a_quadPos.x < 0.0 ? a_source : a_destination;

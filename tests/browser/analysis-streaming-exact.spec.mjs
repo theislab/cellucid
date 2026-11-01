@@ -13,6 +13,7 @@ import { expect, test } from './helpers/test.mjs';
 import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForDatasetReady } from './helpers/dataset-ready.mjs';
 
 const DATASET = 'streaming-exact';
 const ROOT = appUrl('/tests/browser/fixtures/generated-streaming-exact/');
@@ -62,9 +63,8 @@ test('streamed DE and marker statistics equal on-page references exactly', async
     { waitUntil: 'domcontentloaded' },
   );
   await dismissWelcome(page);
-  await page.waitForFunction(
-    () => window._comparisonModule?.state?.pointCount === 72,
-  );
+  // Its genes are named below through the data layer: once they are read.
+  await waitForDatasetReady(page, CELLS);
 
   const proof = await page.evaluate(async ({ genes: geneNames, expression }) => {
     const { computeDifferential } = await import(

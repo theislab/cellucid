@@ -252,6 +252,12 @@ function createHighlightFieldBinder(state) {
       categoryPositions.set(field, positions);
     }
     const categoryIndex = positions.get(group.categoryName);
+    // Refused for every field, a text or boolean column (whose categories
+    // are the labels its open cells hold) included: a category group holds
+    // cells of its category (one left empty goes), and a session is restored
+    // on the cells it was saved on, so those cells hold the category. A
+    // category filter or colour names categories with no cells too, and is
+    // held for them instead (`state-serializer/filters.js`).
     if (categoryIndex === undefined) {
       throw new RangeError(
         `${context} was saved on the category `

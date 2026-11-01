@@ -16,6 +16,7 @@ import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-ana
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
 import { requireTypedJsonValue } from '../assets/js/app/analysis/shared/analysis-result-codec.js';
+import { DerivedResultsRegistry } from '../assets/js/app/registries/derived-results.js';
 import { decodeTypedJson, encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
@@ -34,8 +35,14 @@ const CODES = Uint8Array.from({ length: 40 }, (_, cell) => cell % CATEGORIES.len
 const PAGES = new Map([['page-a', 5], ['page-b', 3], ['page-c', 7]]);
 
 function createDataLayer() {
+  const derivedResults = new DerivedResultsRegistry();
   return {
-    state: { pointCount: CODES.length, getDataMapping: () => ({ expression: 'X', geneNames: 'index' }) },
+    state: {
+      pointCount: CODES.length,
+      getDataMapping: () => ({ expression: 'X', geneNames: 'index' }),
+      // Where a shown result's gene sets and scores go, as in the app (`DataState`).
+      getDerivedResults: () => derivedResults,
+    },
     getPages: () => [...PAGES.keys()].map(id => ({ id, name: id.toUpperCase() })),
     getPageInfo: pageId => (PAGES.has(pageId) ? { id: pageId, name: pageId.toUpperCase() } : null),
     getCellCountForPageId: pageId => PAGES.get(pageId) ?? 0,
@@ -46,6 +53,8 @@ function createDataLayer() {
     })),
     getExpressionMatrices: () => ({ choices: [{ value: 'mapped', label: 'Mapped (X)' }], reason: null }),
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables(type) {
       if (type === 'gene_expression') return GENES.map(key => ({ key }));

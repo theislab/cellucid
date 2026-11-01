@@ -58,6 +58,7 @@ import {
   startUrl,
 } from './helpers/dataset-loading.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { TEST_COMMIT, answerLastCommit } from './helpers/github-api.mjs';
 
 /* ------------------------------------------------------------------ *
  * The startup dataset is still loading
@@ -206,7 +207,15 @@ test('a one-dataset GitHub repository connected while the startup dataset loads 
       default: TRAJECTORY.id,
       datasets: [{ id: TRAJECTORY.id, path: `${TRAJECTORY.id}.zarr.zip` }],
     }));
+  // Listed at the catalog's ref; opened at the commit that last wrote it, as
+  // GitHub's API names it.
   await serveDemoFile(page, `${rawPrefix}${TRAJECTORY.id}.zarr.zip`, TRAJECTORY);
+  await answerLastCommit(page, { owner: 'cellucid-tests', repo: 'one' });
+  await serveDemoFile(
+    page,
+    `https://raw.githubusercontent.com/cellucid-tests/one/${TEST_COMMIT}/catalog/${TRAJECTORY.id}.zarr.zip`,
+    TRAJECTORY,
+  );
   const { held, productErrors } = await openWithHeldStart(page);
   await page.locator('#data-address').fill('cellucid-tests/one/catalog');
   await page.locator('#data-address-open-btn').click();

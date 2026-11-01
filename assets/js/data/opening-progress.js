@@ -41,11 +41,13 @@
  */
 
 import { getReadActivityLog } from './read-activity-log.js';
+import { textWithPublicLinks } from './sources/link-credentials.js';
 import { getTransferLog } from './transfer-log.js';
 import { formatBytes, formatDuration, formatRemaining } from '../utils/format-units.js';
 import { createDeadline } from '../utils/deadline.js';
 import { onWaitingOnPerson, whileWaitingOnPerson } from '../utils/person-wait.js';
 import { STARTUP_STEP_DEADLINE_MS, onStartupStepDeadline } from '../app/startup-phase.js';
+import { isCancellation, cancelled, onAbort } from '../utils/abort.js';
 
 /**
  * Read kinds an opening reads before its first view: the file's structure,
@@ -64,8 +66,9 @@ export function describeOpeningRead(activity) {
     case 'open':
       return "Reading the file's structure";
     case 'transcode':
-      // A single-stream file read once from the start (`anndata/transcode/`).
-      return `Reading ${activity.label} once into this browser's storage`;
+      // A single-stream file read once from the start (`anndata/transcode/`);
+      // the opening's note says why and what becomes of it.
+      return `Reading ${activity.label} whole, once`;
     case 'embedding': {
       const key = /obsm\['([^']+)'\]/.exec(activity.label)?.[1] ?? null;
       return key === null ? 'Reading the embedding' : `Reading embedding ${key}`;
@@ -85,7 +88,7 @@ export function describeOpeningRead(activity) {
 
 /** Why an opening was cancelled, as the error each layer stops with. */
 export function openingCancelledError(title) {
-  return new DOMException(`Opening ${title} was cancelled.`, 'AbortError');
+  return cancelled('user', `Opening ${textWithPublicLinks(title)} was cancelled.`);
 }
 
 /**
@@ -96,7 +99,14 @@ export function openingCancelledError(title) {
  *   ended with nothing to say (superseded by a newer choice)
  * @property {string} step - What is happening now (`Reading embedding X_umap`)
  * @property {string|null} detail - How far: bytes, rate, time left; or why a request is made again
+ * @property {string|null} note - How the opening reads its data, when the
+ *   person should know it up front (a file that cannot be read in parts:
+ *   how much is read whole, that it is kept for next time, what is read in
+ *   parts instead), or null
  * @property {boolean} retrying - Whether a request is being made again
+ * @property {boolean} waiting - Whether a request waits for a wait its host named (its request
+ *   budget, a `Retry-After`: a server preparing what was asked for); `detail` says what, in the
+ *   host's own words when it sent some. Not a failure, and not a stall
  * @property {number|null} percent - 0–100 when known
  * @property {number} bytes - Bytes the opening's reads fetched
  * @property {number} elapsedMs
@@ -142,6 +152,14 @@ class Opening {
     this.firstByteAt = null;
     /** @type {string|null} Why a request is being made again */
     this.retrying = null;
+    /** @type {string|null} What a request waits for that its host named */
+    this.waiting = null;
+    /**
+     * @type {string|null} What the person should know of how this opening
+     * reads its data, said up front and kept while it runs (a file that
+     * cannot be read in parts: `whole-read-notice.js`)
+     */
+    this.note = null;
     /** @type {{bytes: number, total: number|null}|null} A whole-file read under way (a host that serves no ranges) */
     this.wholeFileRead = null;
     /** Transfers log keys that were active before the opening began. */
@@ -165,6 +183,12 @@ class Opening {
     this.transferMark = '';
     /** Layers that joined: a layer starting its part is progress; one letting go is not. */
     this.joins = 0;
+    /**
+     * The share of the opening last shown (0–100), or null: the bar is the
+     * opening's whole, never one read's, and never moves back
+     * (`OpeningProgress.snapshot`).
+     */
+    this.shownPercent = null;
   }
 
   /** What is opened: as the outermost layer still under way names it. */
@@ -197,6 +221,7 @@ function progressMark(opening) {
     opening.joins,
     opening.choice?.question ?? '',
     opening.retrying ?? '',
+    opening.waiting ?? '',
     opening.wholeFileRead?.bytes ?? '',
     opening.transferMark ?? '',
     reads.join(','),
@@ -285,6 +310,7 @@ export class OpeningProgress {
    *   joined: boolean,
    *   step: (text: string) => void,
    *   rename: (title: string) => void,
+   *   notice: (text: string|null) => void,
    *   onCancel: (cancel: () => void) => () => void,
    *   readonly cancelled: boolean,
    *   end: (message?: string) => void,
@@ -292,10 +318,11 @@ export class OpeningProgress {
    *   dismiss: () => void
    * }}
    */
-  begin({ title, step = 'Starting', onCancel = null, saysOutcome = true }) {
+  begin({ title, step: asked = 'Starting', onCancel = null, saysOutcome = true }) {
     if (typeof title !== 'string' || title.trim() === '') {
       throw new TypeError('An opening needs a title: what is opened.');
     }
+    const step = textWithPublicLinks(asked);
     let opening = this.active ? this._current : null;
     const joined = opening !== null;
     if (opening === null) {
@@ -309,7 +336,9 @@ export class OpeningProgress {
     } else if (step !== 'Starting') {
       opening.step = step;
     }
-    const holder = { title: title.trim(), saysOutcome: saysOutcome !== false };
+    // What is opened is shown, logged and said in failures: a link in it
+    // is named by its public form (`sources/link-credentials.js`).
+    const holder = { title: textWithPublicLinks(title.trim()), saysOutcome: saysOutcome !== false };
     opening.holders.push(holder);
     opening.joins += 1;
     const removeCancel = onCancel === null ? () => {} : this._addCancel(opening, onCancel);
@@ -327,14 +356,15 @@ export class OpeningProgress {
       joined,
       step: text => {
         if (opening.state !== 'running' || typeof text !== 'string' || text === '') return;
-        opening.step = text;
+        opening.step = textWithPublicLinks(text);
         this._publish();
       },
       rename: text => {
         if (opening.state !== 'running' || typeof text !== 'string' || text.trim() === '') return;
-        holder.title = text.trim();
+        holder.title = textWithPublicLinks(text.trim());
         this._publish();
       },
+      notice: text => this._notice(opening, text),
       onCancel: cancel => this._addCancel(opening, cancel),
       // The file holds several objects (an `.rda` of several Seurat
       // objects): the opening waits for the person to pick one, shown with
@@ -382,7 +412,7 @@ export class OpeningProgress {
         const outermost = (opening.holders.find(layer => layer.saysOutcome) ?? opening.holders[0]) === holder;
         if (!release()) return;
         // Stopped (Cancel, or a newer choice): it only lets go.
-        if (error?.name === 'AbortError') {
+        if (isCancellation(error)) {
           this._letGo(opening);
         } else if (outermost || opening.holders.length === 0) {
           if (outcome !== null) {
@@ -416,6 +446,40 @@ export class OpeningProgress {
     return this.active && activity?.background !== true && OPENING_READ_KINDS.has(activity?.kind);
   }
 
+  /**
+   * Say how the opening under way reads its data (`OpeningSnapshot.note`),
+   * from a layer that holds no handle of it (the reader, told by its
+   * worker); nothing without one. `null` clears it.
+   *
+   * @param {string|null} text
+   */
+  notice(text) {
+    if (this.active) this._notice(this._current, text);
+  }
+
+  /**
+   * Say the step of the opening under way, from a layer that holds no
+   * handle of it (a dataset catalog downloading a file whole); nothing
+   * without one.
+   *
+   * @param {string} text
+   */
+  step(text) {
+    const opening = this._current;
+    if (!this.active || typeof text !== 'string' || text === '') return;
+    const shown = textWithPublicLinks(text);
+    if (opening.step === shown) return;
+    opening.step = shown;
+    this._publish();
+  }
+
+  _notice(opening, text) {
+    if (opening.state !== 'running' || (text !== null && (typeof text !== 'string' || text === ''))) return;
+    if (opening.note === text) return;
+    opening.note = text;
+    this._publish();
+  }
+
   /** Cancel the opening under way: every layer's part stops. */
   cancel() {
     const opening = this._current;
@@ -447,35 +511,45 @@ export class OpeningProgress {
     const parts = [];
     let percent = null;
     let left = null;
+    const since = opening.firstByteAt === null ? 0 : now - opening.firstByteAt;
+    const rate = bytes > 0 && since >= 500 ? bytes / since : null;
+    // How far the opening is, over everything it has planned to read: one
+    // numerator and one denominator for all of its reads (each read's
+    // planned bytes, once it has said them). A read joining the opening adds
+    // its bytes to both, so the share shown never moves back: it holds until
+    // the reads catch up. While a running read has not said what it plans
+    // to read, how much is left is not known, and the bar says so
+    // (indeterminate) rather than show one read's share.
+    const planned = reads.filter(read => read.bytesTotal > 0);
+    const plannedTotal = planned.reduce((sum, read) => sum + Math.max(read.bytesTotal, read.bytesFetched), 0);
+    const plannedDone = planned.reduce((sum, read) => sum + Math.min(read.bytesFetched, read.bytesTotal), 0);
     if (wholeFile !== null && wholeFile.total > 0) {
       percent = Math.min(100, (100 * wholeFile.bytes) / wholeFile.total);
       parts.push(`${formatBytes(wholeFile.bytes)} of ${formatBytes(wholeFile.total)}`);
-    } else if (latest !== null && running.length === 1 && latest.bytesTotal > latest.bytesFetched) {
-      percent = Math.min(100, (100 * latest.bytesFetched) / latest.bytesTotal);
-      parts.push(`${formatBytes(latest.bytesFetched)} of ${formatBytes(latest.bytesTotal)}`);
+      if (wholeFile.total > wholeFile.bytes && rate !== null) left = (wholeFile.total - wholeFile.bytes) / rate;
+    } else if (plannedTotal > plannedDone && running.every(read => read.bytesTotal > 0)) {
+      const share = Math.min(99, (100 * plannedDone) / plannedTotal);
+      opening.shownPercent = Math.max(opening.shownPercent ?? 0, share);
+      percent = opening.shownPercent;
+      parts.push(`${formatBytes(plannedDone)} of ${formatBytes(plannedTotal)}`);
+      // At the opening's own rate once measured; before, the reads' own
+      // estimates (the longest of them).
+      left = rate !== null
+        ? (plannedTotal - plannedDone) / rate
+        : running.reduce((most, read) => (Number.isFinite(read.remainingMs) ? Math.max(most ?? 0, read.remainingMs) : most), null);
     } else if (bytes > 0) {
       // A read whose planned bytes have all arrived and that still runs is
       // waiting for what it asks for next: how much is left is not known.
       parts.push(`${formatBytes(bytes)} read`);
     }
-    const since = opening.firstByteAt === null ? 0 : now - opening.firstByteAt;
-    if (bytes > 0 && since >= 500) parts.push(`${formatBytes(Math.round((bytes * 1000) / since))}/s`);
-    if (wholeFile !== null && wholeFile.total > wholeFile.bytes && bytes > 0 && since >= 500) {
-      left = ((wholeFile.total - wholeFile.bytes) * since) / bytes;
-    }
-    left = running.reduce(
-      (most, read) => (
-        Number.isFinite(read.remainingMs) && read.bytesTotal > read.bytesFetched
-          ? Math.max(most ?? 0, read.remainingMs)
-          : most
-      ),
-      left
-    );
+    if (rate !== null) parts.push(`${formatBytes(Math.round(rate * 1000))}/s`);
     if (left !== null) parts.push(`${formatRemaining(left)} left`);
     if (parts.length === 0) parts.push(formatDuration(now - opening.startedAt));
     const retrying = opening.state === 'running' && opening.retrying !== null;
+    // A wait the host named is what the opening waits on: said, never taken for a stall.
+    const waiting = opening.state === 'running' && !retrying && opening.waiting !== null;
     // A stalled opening says how long nothing has moved and what it waits on.
-    const stalled = opening.state === 'running' && opening.stalled !== null
+    const stalled = opening.state === 'running' && !waiting && opening.stalled !== null
       ? `Nothing has changed for ${formatDuration(Math.max(this._stallMs, now - opening.progressAt))}` +
         (opening.stalled.reads === null
           ? ` while ${continuing(opening.stalled.step)}.`
@@ -485,10 +559,12 @@ export class OpeningProgress {
       id: opening.id,
       title: opening.title,
       state: opening.state,
-      step: retrying ? 'Retrying' : step,
-      detail: retrying ? opening.retrying : stalled ?? parts.join(' · '),
+      step: retrying ? 'Retrying' : waiting ? 'Waiting for the host' : step,
+      detail: retrying ? opening.retrying : waiting ? opening.waiting : stalled ?? parts.join(' · '),
+      note: opening.note,
       stalled,
       retrying,
+      waiting,
       percent,
       bytes,
       elapsedMs: now - opening.startedAt,
@@ -543,6 +619,7 @@ export class OpeningProgress {
       if (this._current !== opening || opening.state !== 'running') return;
       const ours = entries.filter(entry => entry.status === 'active' && !opening.knownTransfers.has(entry.key));
       const retrying = ours.find(entry => entry.retrying !== null)?.retrying ?? null;
+      const waiting = ours.find(entry => entry.waiting != null)?.waiting ?? null;
       if (ours.some(entry => entry.bytes > 0)) opening.firstByteAt ??= performance.now();
       const whole = ours.find(entry => entry.mode === 'download') ?? null;
       const wholeChanged = whole === null
@@ -553,8 +630,9 @@ export class OpeningProgress {
       const transferMark = ours.map(entry => `${entry.key}:${entry.bytes}:${entry.lastArrivalAt}`).join(',');
       const arrived = transferMark !== opening.transferMark;
       opening.transferMark = transferMark;
-      if (retrying !== opening.retrying || wholeChanged || arrived) {
+      if (retrying !== opening.retrying || waiting !== opening.waiting || wholeChanged || arrived) {
         opening.retrying = retrying;
+        opening.waiting = waiting;
         this._publish();
       }
     }));
@@ -595,7 +673,7 @@ export class OpeningProgress {
     opening.silence?.release();
     const silence = createDeadline(this._stallMs, { after: this._after });
     opening.silence = silence;
-    silence.signal.addEventListener('abort', () => this._stall(opening, silence), { once: true });
+    onAbort(silence.signal, () => this._stall(opening, silence));
     this._holdSilence(opening);
   }
 
@@ -722,6 +800,21 @@ export function getOpeningProgress() {
   return progress;
 }
 
+/** The handle of work not shown on the opening progress (`stoppableOpening`, `quiet`). */
+const QUIET_OPENING = Object.freeze({
+  id: null,
+  joined: false,
+  step() {},
+  rename() {},
+  notice() {},
+  onCancel: () => () => {},
+  choose: () => Promise.reject(new Error('Work not shown on the opening progress cannot ask the person.')),
+  cancelled: false,
+  end() {},
+  fail() {},
+  dismiss() {},
+});
+
 /**
  * Begin opening `title` on the page's opening progress, or join the one
  * under way (`OpeningProgress.begin`).
@@ -738,12 +831,15 @@ export function beginOpening(options) {
  * ends the layer's work at once (a file loader closes its reader, which ends
  * its worker and every request it had open); the layer then rejects with
  * `outcome(error)`: why it was stopped, not the error stopping it caused.
+ * `quiet`: work on an opening already shown (a progressive opening growing
+ * in place, `app/open-cells-resize.js`, which says its own progress), not
+ * shown on the opening progress; only `signal` stops it.
  *
- * @param {{title: string, step?: string, signal?: AbortSignal|null, stop: () => void}} options
+ * @param {{title: string, step?: string, signal?: AbortSignal|null, stop: () => void, quiet?: boolean}} options
  */
-export function stoppableOpening({ title, step, signal = null, stop }) {
+export function stoppableOpening({ title, step, signal = null, stop, quiet = false }) {
   if (typeof stop !== 'function') throw new TypeError('A stoppable opening needs stop().');
-  const handle = beginOpening({ title, ...(step === undefined ? {} : { step }) });
+  const handle = quiet ? QUIET_OPENING : beginOpening({ title, ...(step === undefined ? {} : { step }) });
   let reason = null;
   const halt = why => {
     if (reason !== null) return;
@@ -751,9 +847,7 @@ export function stoppableOpening({ title, step, signal = null, stop }) {
     stop();
   };
   const removeCancel = handle.onCancel(() => halt(openingCancelledError(title)));
-  const onAbort = () => halt(signal.reason ?? openingCancelledError(title));
-  if (signal?.aborted) onAbort();
-  else signal?.addEventListener('abort', onAbort, { once: true });
+  const removeAbort = onAbort(signal, () => halt(signal.reason ?? openingCancelledError(title)));
   return {
     handle,
     /** Whether it was stopped. */
@@ -771,7 +865,7 @@ export function stoppableOpening({ title, step, signal = null, stop }) {
     /** The layer is done: neither Cancel nor `signal` reach it any more. */
     release() {
       removeCancel();
-      signal?.removeEventListener('abort', onAbort);
+      removeAbort();
     },
   };
 }

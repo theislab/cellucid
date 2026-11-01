@@ -183,7 +183,9 @@ export const downloadTrackingMethods = {
     const finalMessage = message ??
       `${tracker.name} (${formatBytes(tracker.loadedBytes)} in ${formatDuration(duration)})`;
 
-    this.complete(`download-${id}`, finalMessage, { title: 'Loaded' });
+    // A file the person asked for (a session file): its outcome is news
+    // even when it came quicker than its card (NOTICE_AFTER_MS).
+    this.complete(`download-${id}`, finalMessage, { title: 'Loaded', announce: true });
     this.downloadTrackers.delete(id);
   },
 

@@ -13,6 +13,7 @@ import {
   drawnPointRadiusCss,
   findScreenSpacePick,
 } from '../assets/js/rendering/picking.js';
+import { admissionMembership, prefixMembership } from './helpers/lod-membership.mjs';
 
 const FOV = (45 * Math.PI) / 180;
 const PANE = Object.freeze({ cssWidth: 800, cssHeight: 600, framebufferHeight: 600 });
@@ -124,34 +125,62 @@ test('a filtered-out cell is never picked; the visible cell behind it is', () =>
 test('a cell the current level of detail does not draw is never picked', () => {
   const mvp = cameraMvp();
   const positions = Float32Array.from([0, 0, 0.5, 0, 0, -0.5, 5, 5, 0]);
-  const lodMembership = Object.freeze({
-    admissionLevels: Uint8Array.from([0xff, 0, 0]),
-    dimensionLevel: 3,
-    generationToken: Object.freeze({}),
-    indices: Uint32Array.of(1, 2),
-    lodLevel: 0,
-    pointCount: 3,
-  });
+  // A tree's level, admitting by byte: cell 0 only at full detail.
+  const lodMembership = admissionMembership(Uint8Array.from([0xff, 0, 0]), 0, { indices: Uint32Array.of(1, 2) });
   const cursor = project(mvp, [0, 0, 0]);
   assert.equal(pick({ positions, mvpMatrix: mvp, cursor }).cellIndex, 0);
   const coarse = pick({ positions, mvpMatrix: mvp, cursor, lodMembership });
   assert.equal(coarse.cellIndex, 1);
   assert.equal(coarse.examinedPointCount, 2);
+  const indexed = pick({ positions, mvpMatrix: mvp, cursor, lodMembership, spatialIndex: makeSpatialIndex(positions) });
+  assert.equal(indexed.cellIndex, 1);
 });
 
-test('a malformed level-of-detail certificate is refused', () => {
+test('a rank-order level picks among its first cells, with and without a tree (the level drawn while a tree is built or adopted)', () => {
+  const mvp = cameraMvp();
+  // Cells 0 and 1 overlap at the cursor; cell 1 is in front.
+  const positions = Float32Array.from([0, 0, -0.5, 0, 0, 0.5, 5, 5, 0]);
+  const cursor = project(mvp, [0, 0, 0]);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor }).cellIndex, 1);
+  // The level of the first cell (as `RankLevels` publishes it: by count).
+  const first = prefixMembership(3, 1);
+  const scan = pick({ positions, mvpMatrix: mvp, cursor, lodMembership: first });
+  assert.equal(scan.cellIndex, 0);
+  assert.equal(scan.examinedPointCount, 1, 'a scan visits the level only');
+  const spatialIndex = makeSpatialIndex(positions);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, lodMembership: first, spatialIndex }).cellIndex, 0);
+  // A ranked tree's record names the same cells in its draw order.
+  const ranked = prefixMembership(3, 2, { indices: Uint32Array.of(1, 0) });
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, lodMembership: ranked }).cellIndex, 1);
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, lodMembership: ranked, spatialIndex }).cellIndex, 1);
+});
+
+test('picking sizes a reduced level\'s dots as drawn: the level\'s size multiplier widens the hit', () => {
+  const mvp = cameraMvp();
+  const positions = Float32Array.from([0, 0, 0]);
+  const centre = project(mvp, [0, 0, 0]);
+  const cursor = { x: centre.x + 9, y: centre.y };
+  // 8 px dots: radius 4 plus 3 px of tolerance does not reach 9 px.
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, pointSize: 8 }).cellIndex, -1);
+  // The same dots at a level drawn 2x larger (16 px: radius 8) do.
+  assert.equal(pick({ positions, mvpMatrix: mvp, cursor, pointSize: 8 * 2 }).cellIndex, 0);
+});
+
+test('a malformed level-of-detail record is refused', () => {
   const positions = Float32Array.from([0, 0, 0.1, 0, 0, 0.2]);
   const base = { positions, cursor: { x: 400, y: 300 } };
-  const membership = ({ admissionLevels = Uint8Array.from([0, 0xff]), indices = Uint32Array.of(0), extra = false } = {}) => Object.freeze({
+  const membership = ({ admissionLevels = Uint8Array.from([0, 0xff]), indices = Uint32Array.of(0) } = {}) => Object.freeze({
     admissionLevels,
+    count: indices === null ? 1 : indices.length,
     dimensionLevel: 3,
     generationToken: Object.freeze({}),
     indices,
     lodLevel: 0,
     pointCount: 2,
-    ...(extra ? { unexpected: true } : {}),
   });
-  assert.throws(() => pick({ ...base, lodMembership: membership({ extra: true }) }), /frozen renderer certificate/);
+  assert.throws(() => pick({ ...base, lodMembership: { ...membership() } }), /frozen/);
+  assert.throws(() => pick({ ...base, lodMembership: prefixMembership(3, 1) }), /describes 3 cells/);
+  assert.throws(() => pick({ ...base, lodMembership: prefixMembership(2, 1, { dimensionLevel: 2 }) }), /in 2D/);
   assert.throws(() => pick({ ...base, lodMembership: membership({ indices: Uint32Array.of(2) }) }), /does not name an admitted source point/);
   assert.throws(() => pick({ ...base, lodMembership: membership({ admissionLevels: Uint8Array.from([0xff, 0]) }) }), /does not name an admitted source point/);
 });

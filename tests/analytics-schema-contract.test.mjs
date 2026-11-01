@@ -318,24 +318,14 @@ test('the schema covers every call site, and every declared event has one', asyn
 
 test('the code-load watch reports one schema-valid failure, only on production', async () => {
   const source = await read('assets/js/app/ui/core/code-load-watch.js');
-  // `failure` is how the graph fails: a module that did not download (an
-  // `error` on its script element), or one that did not run (an uncaught
-  // error on the window before main.js marked the root, settled once the
-  // document is parsed).
+  // `failure` is how the graph fails, as the boot script hands it over
+  // (`cellucid-code-load-failed`): a file that did not download (a fetch
+  // TypeError), or code that did not run (a link SyntaxError).
   const run = (enabled, search, failure) => {
     const calls = [];
     let listener = null;
-    let parsed = null;
-    class HTMLScriptElement {}
-    class ErrorEvent {}
-    const script = Object.assign(new HTMLScriptElement(), {
-      type: 'module',
-      src: 'https://www.cellucid.com/assets/js/app/main.js',
-    });
     const root = { dataset: {} };
     const context = vm.createContext({
-      HTMLScriptElement,
-      ErrorEvent,
       URL,
       URLSearchParams,
       // The build check after a failure finds no connection here.
@@ -347,28 +337,25 @@ test('the code-load watch reports one schema-valid failure, only on production',
         documentElement: root,
         getElementById: () => null,
         querySelector: () => null,
-        addEventListener: (type, handler) => { if (type === 'DOMContentLoaded') parsed = handler; },
+        addEventListener: () => {},
       },
       window: {
         cellucidAnalyticsEnabled: enabled,
         location: { search },
         gtag: (...args) => calls.push(args),
-        addEventListener: (_type, handler) => { listener = handler; },
+        addEventListener: (type, handler) => { if (type === 'cellucid-code-load-failed') listener = handler; },
       },
     });
     vm.runInContext(source, context);
-    if (failure === 'download') {
-      listener({ target: script });
-      listener({ target: script });
-    } else {
-      const error = vm.runInContext(
-        "new SyntaxError(\"The requested module './x.js' does not provide an export named 'y'\")",
-        context
-      );
-      listener(Object.assign(new ErrorEvent(), { target: context.window, error, filename: '' }));
-      listener(Object.assign(new ErrorEvent(), { target: context.window, error, filename: '' }));
-      parsed();
-    }
+    const error = vm.runInContext(
+      failure === 'download'
+        ? "new TypeError('Failed to fetch dynamically imported module: https://www.cellucid.com/assets/page/main.ABCDEFGH.js')"
+        : "new SyntaxError(\"The requested module './x.js' does not provide an export named 'y'\")",
+      context
+    );
+    const event = { detail: { entry: 'https://www.cellucid.com/assets/page/main.ABCDEFGH.js', error } };
+    listener(event);
+    listener(event);
     return calls;
   };
   for (const failure of ['download', 'run']) {

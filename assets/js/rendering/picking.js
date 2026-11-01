@@ -1,4 +1,5 @@
-import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
+import { BENEATH_ALPHA_BYTE, POINT_VISIBILITY_THRESHOLD, UNREAD_ALPHA_BYTE } from './alpha-visibility.js';
+import { requireLodMembership } from './high-perf/renderer-contracts.js';
 
 /**
  * Screen-space cell picking: the cell is the dot drawn under the pointer.
@@ -12,6 +13,14 @@ import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
  * dot still lands. Hidden cells and cells the current level of detail does not
  * draw are never picked.
  *
+ * A field's colours layer the cells (`alpha-visibility.js`, `pointLayers`):
+ * a cell drawn in an upper layer wins over one beneath it, as drawn -- in a
+ * flat layout by layer, in 3-D by depth among the cells read, every cell not
+ * read lying under them (drawn without depth writes). The cells read are
+ * found at the size they are drawn (`readPointSize`, larger while some cells
+ * are not read) and, when the renderer drew them at every level of detail,
+ * whatever the level.
+ *
  * This replaced a ray search with a fixed world-space radius, which ignored
  * drawn size and preferred the cell nearest the camera: zoomed in it picked a
  * neighbour of the dot under the pointer, zoomed out it missed dots entirely.
@@ -23,78 +32,6 @@ export const PICK_TOLERANCE_CSS_PX = 3;
 /** The vertex shader's clamp on gl_PointSize, in device pixels. */
 const MIN_DRAWN_POINT_SIZE_PX = 0.5;
 const MAX_DRAWN_POINT_SIZE_PX = 128;
-
-const LOD_MEMBERSHIP_KEYS = Object.freeze([
-  'admissionLevels',
-  'dimensionLevel',
-  'generationToken',
-  'indices',
-  'lodLevel',
-  'pointCount',
-]);
-
-function requireLodMembership(
-  lodMembership,
-  pointCount,
-  spatialIndex
-) {
-  if (lodMembership === null) return null;
-  if (
-    typeof lodMembership !== 'object' ||
-    Array.isArray(lodMembership) ||
-    Object.getPrototypeOf(lodMembership) !== Object.prototype ||
-    !Object.isFrozen(lodMembership) ||
-    Object.keys(lodMembership).length !== LOD_MEMBERSHIP_KEYS.length ||
-    !LOD_MEMBERSHIP_KEYS.every(key => (
-      Object.prototype.hasOwnProperty.call(lodMembership, key)
-    ))
-  ) {
-    throw new TypeError(
-      'Picking lodMembership must be null or one frozen renderer certificate.'
-    );
-  }
-  const {
-    admissionLevels,
-    dimensionLevel,
-    generationToken,
-    indices,
-    lodLevel,
-    pointCount: membershipPointCount,
-  } = lodMembership;
-  if (
-    !(admissionLevels instanceof Uint8Array) ||
-    admissionLevels.length !== pointCount ||
-    !(indices instanceof Uint32Array) ||
-    indices.length > pointCount ||
-    membershipPointCount !== pointCount ||
-    !Number.isInteger(dimensionLevel) ||
-    dimensionLevel < 1 ||
-    dimensionLevel > 3 ||
-    !Number.isInteger(lodLevel) ||
-    lodLevel < 0 ||
-    lodLevel >= 0xff ||
-    generationToken === null ||
-    typeof generationToken !== 'object' ||
-    !Object.isFrozen(generationToken)
-  ) {
-    throw new TypeError(
-      'Picking lodMembership must exactly match the point-count, dimension, and reduced-LOD certificate contract.'
-    );
-  }
-  if (
-    spatialIndex !== null &&
-    (
-      spatialIndex.dimensionLevel !== dimensionLevel ||
-      typeof spatialIndex.getLodMembership !== 'function' ||
-      spatialIndex.getLodMembership(lodLevel) !== lodMembership
-    )
-  ) {
-    throw new TypeError(
-      'Picking lodMembership must belong to the exact matching spatial owner.'
-    );
-  }
-  return lodMembership;
-}
 
 function requireFinite(value, label, { positive = false } = {}) {
   if (!Number.isFinite(value) || (positive && value <= 0)) {
@@ -124,6 +61,7 @@ function requireScreenPickInput(input) {
     pointSize,
     sizeAttenuation,
     fov,
+    pointLayers = null,
   } = input;
   if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
     throw new RangeError('Picking dimension must be exactly 1, 2, or 3.');
@@ -153,6 +91,17 @@ function requireScreenPickInput(input) {
   requireFinite(pointSize, 'Picking pointSize', { positive: true });
   requireFinite(sizeAttenuation, 'Picking sizeAttenuation');
   requireFinite(fov, 'Picking fov', { positive: true });
+  if (pointLayers !== null) {
+    if (
+      typeof pointLayers !== 'object'
+      || !(pointLayers.colors instanceof Uint8Array)
+      || pointLayers.colors.length !== pointCount * 4
+      || typeof pointLayers.readEveryLevel !== 'boolean'
+    ) {
+      throw new TypeError('Picking pointLayers must be null or {colors: RGBA8 of every point, readEveryLevel, readPointSize}.');
+    }
+    requireFinite(pointLayers.readPointSize, 'Picking pointLayers.readPointSize', { positive: true });
+  }
   if (spatialIndex !== null) {
     if (
       typeof spatialIndex !== 'object' ||
@@ -166,7 +115,13 @@ function requireScreenPickInput(input) {
   }
   return {
     dimension,
-    lodMembership: requireLodMembership(lodMembership, pointCount, spatialIndex),
+    // Admission is a test on the cell, so it holds whichever tree visits
+    // the candidates.
+    lodMembership: requireLodMembership(lodMembership, {
+      pointCount,
+      dimensionLevel: dimension,
+      owner: 'Picking lodMembership',
+    }),
     pointCount,
     positions,
     spatialIndex,
@@ -177,6 +132,7 @@ function requireScreenPickInput(input) {
     pointSize,
     sizeAttenuation,
     fov,
+    pointLayers,
   };
 }
 
@@ -209,8 +165,12 @@ export function drawnPointRadiusCss({ w, pointSize, sizeAttenuation, fov, frameb
  * @param {number} input.sizeAttenuation - u_sizeAttenuation.
  * @param {number} input.fov - u_fov, radians.
  * @param {import('./high-perf/spatial-index.js').SpatialIndex|null} [input.spatialIndex]
- * @param {Object|null} [input.lodMembership] - The renderer's frozen LOD
- *   certificate for the pane, or null at full detail.
+ * @param {import('./high-perf/renderer-contracts.js').LodMembership|null} [input.lodMembership] -
+ *   The cells the pane's level of detail draws, or null at full detail.
+ * @param {{colors: Uint8Array, readEveryLevel: boolean, readPointSize: number}|null} [input.pointLayers] -
+ *   The layers the pane was drawn with (`HighPerfRenderer#getCurrentPointLayers`):
+ *   the colours (alpha byte = layer), whether the cells read were drawn at
+ *   every level, and their u_pointSize; null: every cell on top at `pointSize`.
  * @returns {{ cellIndex: number, examinedPointCount: number, screenDistance: number, depth: number }}
  */
 export function findScreenSpacePick(input) {
@@ -227,14 +187,26 @@ export function findScreenSpacePick(input) {
     pointSize,
     sizeAttenuation,
     fov,
+    pointLayers,
   } = requireScreenPickInput(input);
+  // The level's cells (`LodMembership`): by admission level, or the first
+  // `count` cells (every cell at full detail).
   const lodAdmissionLevels = lodMembership === null ? null : lodMembership.admissionLevels;
   const lodLevel = lodMembership === null ? -1 : lodMembership.lodLevel;
+  const lodPrefix = lodMembership === null || lodAdmissionLevels !== null ? pointCount : lodMembership.count;
   const { cssWidth, cssHeight, framebufferHeight } = pane;
   const devicePixelRatio = framebufferHeight / cssHeight;
   const sizeInput = { w: 1, pointSize, sizeAttenuation, fov, framebufferHeight, devicePixelRatio };
+  const layerColors = pointLayers === null ? null : pointLayers.colors;
+  const readEveryLevel = pointLayers !== null && pointLayers.readEveryLevel;
+  const readPointSize = pointLayers === null ? pointSize : pointLayers.readPointSize;
+  // Without depth (1-D and 2-D, `NO_DEPTH_MAX_DIMENSION`) the layer drawn
+  // last is on top; with it, only the cells not read lie under every other.
+  const flat = dimension < 3;
 
   let bestCovering = -1;
+  let bestCoveringRank = Infinity;
+  let bestCoveringTieRank = Infinity;
   let bestCoveringDepth = Infinity;
   let bestCoveringDistance = Infinity;
   let bestNear = -1;
@@ -245,7 +217,12 @@ export function findScreenSpacePick(input) {
 
   const evaluatePoint = cellIndex => {
     examinedPointCount++;
-    if (lodAdmissionLevels !== null && lodAdmissionLevels[cellIndex] > lodLevel) return;
+    // The layer its colour names: 0 on top, 1 the grey beneath, 2 not read.
+    const layerByte = layerColors === null ? 255 : layerColors[cellIndex * 4 + 3];
+    const layer = layerByte === UNREAD_ALPHA_BYTE ? 2 : layerByte === BENEATH_ALPHA_BYTE ? 1 : 0;
+    const read = layer !== 2;
+    if (!(read && readEveryLevel)
+      && (lodAdmissionLevels !== null ? lodAdmissionLevels[cellIndex] > lodLevel : cellIndex >= lodPrefix)) return;
     if (!(transparency[cellIndex] >= POINT_VISIBILITY_THRESHOLD)) return;
     const offset = cellIndex * dimension;
     const x = positions[offset];
@@ -261,17 +238,27 @@ export function findScreenSpacePick(input) {
     const dy = (0.5 - ndcY * 0.5) * cssHeight - cursor.y;
     const distance = Math.hypot(dx, dy);
     sizeInput.w = w;
+    sizeInput.pointSize = read ? readPointSize : pointSize;
     const radius = drawnPointRadiusCss(sizeInput);
     if (distance <= radius) {
-      // Front-most first: what the depth test leaves on top. In a flat layout
-      // every dot has the same depth, so the nearer centre decides.
+      // The upper layer first, as drawn; then front-most: what the depth
+      // test leaves on top. In a flat layout every dot has the same depth,
+      // so the nearer centre decides.
+      const rank = flat ? layer : (read ? 0 : 1);
+      const tieRank = flat ? 0 : layer;
       if (
-        w < bestCoveringDepth - 1e-6 * bestCoveringDepth
-        || (Math.abs(w - bestCoveringDepth) <= 1e-6 * bestCoveringDepth
-          && (distance < bestCoveringDistance
-            || (distance === bestCoveringDistance && cellIndex < bestCovering)))
+        rank < bestCoveringRank
+        || (rank === bestCoveringRank && (
+          w < bestCoveringDepth - 1e-6 * bestCoveringDepth
+          || (Math.abs(w - bestCoveringDepth) <= 1e-6 * bestCoveringDepth
+            && (tieRank < bestCoveringTieRank
+              || (tieRank === bestCoveringTieRank && (distance < bestCoveringDistance
+                || (distance === bestCoveringDistance && cellIndex < bestCovering)))))
+        ))
       ) {
         bestCovering = cellIndex;
+        bestCoveringRank = rank;
+        bestCoveringTieRank = tieRank;
         bestCoveringDepth = w;
         bestCoveringDistance = distance;
       }
@@ -288,10 +275,14 @@ export function findScreenSpacePick(input) {
   };
 
   if (spatialIndex === null) {
-    if (lodMembership === null) {
-      for (let cellIndex = 0; cellIndex < pointCount; cellIndex++) evaluatePoint(cellIndex);
+    const lodIndices = lodMembership === null || lodAdmissionLevels === null ? null : lodMembership.indices;
+    if (lodIndices === null || readEveryLevel) {
+      // Every cell, or a level's first `count` cells; every cell when the
+      // cells read are drawn whatever the level (the level's test above
+      // still leaves out the others it does not draw).
+      const end = readEveryLevel ? pointCount : lodPrefix;
+      for (let cellIndex = 0; cellIndex < end; cellIndex++) evaluatePoint(cellIndex);
     } else {
-      const lodIndices = lodMembership.indices;
       for (let compactIndex = 0; compactIndex < lodIndices.length; compactIndex++) {
         const cellIndex = lodIndices[compactIndex];
         if (cellIndex >= pointCount || lodAdmissionLevels[cellIndex] > lodLevel) {

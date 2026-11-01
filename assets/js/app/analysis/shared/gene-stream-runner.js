@@ -16,34 +16,61 @@
  * - here (`DataLayer.readGeneColumn`), when the run has no route: a run
  *   computing on this thread, or a source whose reader is not a worker.
  *
+ * A run over some cells only (`cells`: differential expression of two
+ * groups) reads each task's genes in those cells, as a block
+ * (`DataLayer.deliverGeneCellSubset` over the route, `readGeneCellSubset`
+ * here; `data/gene-delivery.js` `block`). Such a read costs its cells
+ * whatever its genes (sent to the reader and checked; read by cell, a CSR
+ * matrix's rows, every row it touches decoded), so a read takes as many
+ * tasks as the memory gate has room for (`bufferedTasks`) and starts only
+ * once half the gate is free (`roomToRead`): the cells are read as few
+ * times as memory allows, never with more genes than it holds.
+ *
  * As many tasks' genes are read ahead as the tuner says (`prefetchDepth`)
  * and as many tasks are in flight as it says (`computeInFlight`); each read
- * and each task report to it. A task whose worker the pool replaced before
- * its genes arrived answers `{lost: true}`, and its genes are read again.
- * The loop stops at the first failure or abort, and settles every read and
- * task it started before it returns or throws.
+ * and each task report to it. What the genes read and not yet computed hold
+ * (in the reader, on their way, in the workers) is counted in the `analysis`
+ * share while the run goes (`GENES_IN_FLIGHT_LABEL`). A task whose worker
+ * the pool replaced before its genes arrived answers `{lost: true}`, and its
+ * genes are read again. The loop stops at the first failure or abort, and
+ * settles every read and task it started before it returns or throws.
  *
  * @module analysis/shared/gene-stream-runner
  */
 
 import { createRunTuner, genesPerTaskFor } from './run-tuner.js';
-import { getMemoryMonitor } from './memory-monitor.js';
-import { residencyBudgetBytes } from '../../../data/memory-budget.js';
+import { noteMemoryChanged, onMemoryChange, registerResidentHolder } from '../../../data/memory-budget.js';
+import { CELL_SUBSET_ENTRY_BYTES, subsetRun } from '../../../data/gene-delivery.js';
+import { analysisRunBudgetBytes } from '../compute/worker-pool.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { throwIfAborted, abortReason, cancelled, onAbort } from '../../../utils/abort.js';
+
+/** The ledger label of a run's genes read and not yet computed (`memory-budget.js`, `analysis` share). */
+export const GENES_IN_FLIGHT_LABEL = 'analysis genes in flight';
 
 /**
- * A run's tuner for a data layer, a worker pool size and the run's genes.
+ * A run's tuner for a data layer, a worker pool size and the run's genes:
+ * read whole (every open cell), or in `cells` only (a cell subset's blocks,
+ * `runGeneStream`'s `cells`).
  *
  * @param {Object} dataLayer
  * @param {number} poolSize
  * @param {number} geneCount
+ * @param {{cells?: ArrayLike<number>|null, budgetBytes?: () => number}} [options] -
+ *   `budgetBytes`: what the run's genes may take, read again when it shrinks
+ *   (default `analysisRunBudgetBytes`; a run that keeps per-cell state of
+ *   its own passes what that state leaves)
  */
-export function createRunTunerFor(dataLayer, poolSize, geneCount) {
-  const cellCount = dataLayer.state.pointCount;
+export function createRunTunerFor(dataLayer, poolSize, geneCount, { cells = null, budgetBytes = analysisRunBudgetBytes } = {}) {
+  const cellCount = cells === null ? dataLayer.state.pointCount : Math.max(1, cells.length);
+  const bytesPerCell = cells === null ? undefined : CELL_SUBSET_ENTRY_BYTES;
   return createRunTuner({
     poolSize,
     cellCount,
-    genesPerTask: genesPerTaskFor({ geneCount, poolSize, cellCount, budgetBytes: residencyBudgetBytes('analysis') }),
+    bytesPerCell,
+    genesPerTask: genesPerTaskFor({ geneCount, poolSize, cellCount, bytesPerCell, budgetBytes: budgetBytes() }),
+    geneCount,
+    budgetBytes,
     link: () => (typeof dataLayer.linkMeasurement === 'function' ? dataLayer.linkMeasurement() : null),
   });
 }
@@ -59,13 +86,15 @@ export function taskTiming(tuner) {
 }
 
 /**
- * What a task carries in its payload: its delivery, or its genes read here.
+ * What a task carries in its payload: its delivery, or its genes read here
+ * (whole columns, or a cell subset's block).
  *
  * @param {GeneTask} task
- * @returns {{delivery: Object}|{columns: Array}}
+ * @returns {{delivery: Object}|{columns: Array}|{block: Object}}
  */
 export function taskGenes(task) {
-  return task.delivery === null ? { columns: task.columns } : { delivery: task.delivery };
+  if (task.delivery !== null) return { delivery: task.delivery };
+  return task.block === null ? { columns: task.columns } : { block: task.block };
 }
 
 /**
@@ -77,8 +106,11 @@ export function taskGenes(task) {
  * @property {Object|null} delivery - What the task names its genes by
  *   (`{route, id, generation}`, or `{route, id, generations}` for a split
  *   delivery), null for genes read here
- * @property {Array|null} columns - The genes read here, each its own to
- *   transfer (a shared column is copied), null for delivered genes
+ * @property {Array|null} columns - The genes read here whole, each its own
+ *   to transfer (a shared column is copied), null otherwise
+ * @property {Object|null} block - The genes read here in the run's cells
+ *   (`{pointers, positions, values}`, `gene-delivery.js` `subsetRun`), its
+ *   own to transfer, null otherwise
  */
 
 /** Bytes one column read here holds. */
@@ -127,6 +159,11 @@ function requireGeneList(genes) {
  *   every worker of the route, each the range of cells `split[w]` to
  *   `split[w + 1]` (`data/gene-delivery.js` `ranges`); null: each task's
  *   genes go to one worker
+ * @param {Uint32Array|null} [options.cells] - Read each task's genes in
+ *   these cells only (distinct cell positions; the block's positions index
+ *   them), each read as many tasks as the memory gate has room for; null:
+ *   each gene's every cell. Every gene must then be read from the source
+ *   (`DataLayer.isGeneDeliverable`).
  * @param {string} [options.matrix='mapped'] - The expression matrix read
  * @param {string|null} [options.owner] - The job the reads are for
  * @param {'normal'|'bulk'} [options.priority='bulk'] - The reads' priority
@@ -149,6 +186,7 @@ export async function runGeneStream({
   tuner,
   route,
   split = null,
+  cells = null,
   matrix = 'mapped',
   owner = null,
   priority = 'bulk',
@@ -161,8 +199,14 @@ export async function runGeneStream({
   requireGeneList(genes);
   if (route === undefined) throw new TypeError('A gene stream names its route, or null to read its genes here');
   if (split !== null && route === null) throw new TypeError('A split gene stream delivers over a route');
+  if (cells !== null && (!(cells instanceof Uint32Array) || split !== null)) {
+    throw new TypeError('A gene stream over some cells names them as a Uint32Array, and is not split');
+  }
   const pointCount = dataLayer.state.pointCount;
-  const perTask = tuner.genesPerTask();
+  // Genes per task as the tuner sizes them now: from each gene's densest
+  // form until a read is measured, then from the genes' bytes as read; one
+  // read's tasks are split at the size it started with.
+  const perTask = () => tuner.genesPerTask();
 
   // Genes to read, in the run's order: those delivered over the route, then
   // those read here; genes of a lost task are read again first.
@@ -175,25 +219,6 @@ export async function runGeneStream({
   let deliveredHead = 0;
   let localHead = 0;
   const readAgain = [];
-  // One read of delivered genes serves a task on each worker (each task's
-  // genes go to its own worker); a split read, every worker's part of one.
-  const tasksPerRead = route === null || split !== null ? 1 : route.workerCount;
-  const nextReadGenes = () => {
-    if (readAgain.length > 0) return { indices: readAgain.splice(0, perTask * tasksPerRead), local: false };
-    if (deliveredHead < delivered.length) {
-      const indices = delivered.slice(deliveredHead, deliveredHead + perTask * tasksPerRead);
-      deliveredHead += indices.length;
-      return { indices, local: false };
-    }
-    if (localHead < local.length) {
-      const indices = local.slice(localHead, localHead + perTask);
-      localHead += indices.length;
-      return { indices, local: true };
-    }
-    return null;
-  };
-  const genesLeftToRead = () => readAgain.length > 0 || deliveredHead < delivered.length || localHead < local.length;
-
   const reads = new AbortController();
   const ready = [];
   const readsInFlight = new Set();
@@ -202,6 +227,60 @@ export async function runGeneStream({
   const tasksInFlight = new Set();
   let failure = null;
   let stopped = false;
+
+  // Tasks read ahead: as the tuner says; over some cells, as many as the
+  // memory gate holds (a read by cell decodes its rows whatever its genes).
+  const readAhead = () => (cells === null ? tuner.prefetchDepth() : tuner.bufferedTasks());
+  // One read of delivered genes serves a task on each worker (each task's
+  // genes go to its own worker); a split read, every worker's part of one; a
+  // read here, one task. A read over some cells takes every task the gate
+  // has room for (`roomToRead`: half the gate at least).
+  const tasksPerRead = here => {
+    if (cells !== null) return Math.max(1, readAhead() - tasksBeingRead - ready.length);
+    return here || route === null || split !== null ? 1 : route.workerCount;
+  };
+  const nextReadGenes = () => {
+    if (readAgain.length > 0) return { indices: readAgain.splice(0, perTask() * tasksPerRead(false)), local: false };
+    if (deliveredHead < delivered.length) {
+      const indices = delivered.slice(deliveredHead, deliveredHead + perTask() * tasksPerRead(false));
+      deliveredHead += indices.length;
+      return { indices, local: false };
+    }
+    if (localHead < local.length) {
+      const indices = local.slice(localHead, localHead + perTask() * tasksPerRead(true));
+      localHead += indices.length;
+      return { indices, local: true };
+    }
+    return null;
+  };
+  const genesLeftToRead = () => readAgain.length > 0 || deliveredHead < delivered.length || localHead < local.length;
+  // A read over some cells costs its cells whatever its genes (sent to the
+  // reader, checked, gathered): it starts once half the gate is free -- the
+  // other half's genes computed meanwhile -- or every task left fits. Started
+  // as each task left the gate, a 10M-cell differential expression of two
+  // groups (1.9M cells) made a read every task (15,000 reads; 54 s against
+  // the pushed tree's 4 s, which read a task a worker at a time).
+  const tasksLeftToRead = () => Math.ceil((readAgain.length + (delivered.length - deliveredHead) + (local.length - localHead)) / perTask());
+  const roomToRead = () => {
+    const room = readAhead() - tasksBeingRead - ready.length;
+    if (cells === null) return room > 0;
+    return room > 0 && room >= Math.min(Math.ceil(readAhead() / 2), tasksLeftToRead());
+  };
+  // A read over some cells tells the source the genes the run has still to
+  // read, its own included: the source prices its routes over the run (the
+  // gene index built once, or the cells' rows read once and kept), never
+  // decoding the cells' rows again a read (`AnnDataReader.getMatrixCellSubset`).
+  const runGenesFrom = indices => indices.length + readAgain.length + (delivered.length - deliveredHead) + (local.length - localHead);
+
+  // What the run's genes read and not yet computed hold, wherever they are
+  // (the reader, on their way, a worker's inbox, a task): counted in the
+  // `analysis` share while the run goes. In use, so never trimmed; the tuner
+  // holds them to the share.
+  const stopCounting = registerResidentHolder('analysis', {
+    label: GENES_IN_FLIGHT_LABEL,
+    bytes: () => (tasksBeingRead + ready.length + tasksInFlight.size) * tuner.taskBytes(),
+    trim: () => null,
+  });
 
   let wakeUp = null;
   const wake = () => {
@@ -214,23 +293,43 @@ export async function runGeneStream({
     wake();
   };
   const stopReads = () => {
-    reads.abort(signal?.reason ?? new DOMException('Gene streaming was aborted', 'AbortError'));
+    reads.abort(signal?.aborted ? abortReason(signal) : cancelled('superseded', 'Gene streaming was stopped.'));
     wake();
   };
-  signal?.addEventListener('abort', stopReads, { once: true });
-  stop?.addEventListener('abort', stopReads, { once: true });
-  const unsubscribe = getMemoryMonitor().onMemoryPressure(event => {
-    const level = event?.level;
-    if (level === 'critical' || level === 'cleanup' || level === 'warning') tuner.onPressure();
-    else if (level !== 'normal' && level !== 'unknown') fail(new TypeError(`Unknown memory pressure level: ${String(level)}`));
+  const stopListening = [onAbort(signal, stopReads), onAbort(stop, stopReads)];
+  // The run's budget shrank (`memory-budget.js`): the tuner reads it again
+  // and holds less in flight.
+  let runBudget = analysisRunBudgetBytes();
+  const unsubscribe = onMemoryChange(() => {
+    const now = analysisRunBudgetBytes();
+    if (now < runBudget) tuner.onPressure();
+    runBudget = now;
   });
-  if (typeof unsubscribe !== 'function') {
-    signal?.removeEventListener('abort', stopReads);
-    stop?.removeEventListener('abort', stopReads);
-    throw new TypeError('MemoryMonitor.onMemoryPressure must return an unsubscribe function');
-  }
 
-  const readHere = async indices => {
+  /** A cell subset's block of `indices`' genes, read here: a task of each `perTask` of them. */
+  const readSubsetHere = async (indices, perTask) => {
+    const keys = indices.map(index => genes[index]);
+    const block = await dataLayer.readGeneCellSubset(keys, cells, { signal: reads.signal, owner, matrix, runGenes: runGenesFrom(indices) });
+    if (block === null) {
+      throw new TypeError(`This dataset cannot read ${formatCountOf(keys.length, 'gene')} in some cells`);
+    }
+    const tasks = [];
+    for (let first = 0; first < indices.length; first += perTask) {
+      const last = Math.min(indices.length, first + perTask);
+      tasks.push({
+        indices: indices.slice(first, last),
+        genes: keys.slice(first, last),
+        worker: null,
+        delivery: null,
+        columns: null,
+        block: subsetRun(block, first, last),
+      });
+    }
+    return { tasks, bytes: block.cellIndex.byteLength + block.values.byteLength };
+  };
+
+  const readHere = async (indices, perTask) => {
+    if (cells !== null) return readSubsetHere(indices, perTask);
     const columns = await Promise.all(indices.map(async index => {
       const { values, owned } = await dataLayer.readGeneColumn(genes[index], {
         priority,
@@ -247,12 +346,12 @@ export async function runGeneStream({
       return { values: ownedColumn(values, owned === true), bytes: owned === true ? columnBytes(values) : 0 };
     }));
     return {
-      tasks: [{ indices, genes: indices.map(index => genes[index]), worker: null, delivery: null, columns: columns.map(column => column.values) }],
+      tasks: [{ indices, genes: indices.map(index => genes[index]), worker: null, delivery: null, columns: columns.map(column => column.values), block: null }],
       bytes: columns.reduce((sum, column) => sum + column.bytes, 0),
     };
   };
 
-  const deliver = async indices => {
+  const deliver = async (indices, perTask) => {
     const keys = indices.map(index => genes[index]);
     if (split !== null) {
       const id = route.nextDeliveryId();
@@ -261,7 +360,7 @@ export async function runGeneStream({
         route: route.id, id, split, generations,
       }, { priority, signal: reads.signal, owner, matrix });
       return {
-        tasks: [{ indices, genes: keys, worker: null, delivery: { route: route.id, id, generations }, columns: null }],
+        tasks: [{ indices, genes: keys, worker: null, delivery: { route: route.id, id, generations }, columns: null, block: null }],
         bytes: bytes.reduce((sum, value) => sum + value, 0),
       };
     }
@@ -274,8 +373,10 @@ export async function runGeneStream({
       runs.push({ id: route.nextDeliveryId(), worker, generation: route.generation(worker), first, last });
     }
     try {
-      const { bytes } = await dataLayer.deliverGeneColumns(keys, { route: route.id, runs },
-        { priority, signal: reads.signal, owner, matrix });
+      // Whole columns: each gene's bytes; a cell subset: the block's.
+      const { bytes } = cells === null
+        ? await dataLayer.deliverGeneColumns(keys, { route: route.id, runs }, { priority, signal: reads.signal, owner, matrix })
+        : await dataLayer.deliverGeneCellSubset(keys, cells, { route: route.id, runs }, { signal: reads.signal, owner, matrix, runGenes: runGenesFrom(indices) });
       return {
         tasks: runs.map(({ id, worker, generation, first, last }) => ({
           indices: indices.slice(first, last),
@@ -283,8 +384,9 @@ export async function runGeneStream({
           worker,
           delivery: { route: route.id, id, generation },
           columns: null,
+          block: null,
         })),
-        bytes: bytes.reduce((sum, value) => sum + value, 0),
+        bytes: Array.isArray(bytes) ? bytes.reduce((sum, value) => sum + value, 0) : bytes,
       };
     } catch (error) {
       for (const { worker, first, last } of runs) route.settle(worker, last - first);
@@ -294,10 +396,11 @@ export async function runGeneStream({
 
   const startRead = ({ indices, local: here }) => {
     const readStart = performance.now();
-    const taskCount = here ? 1 : Math.ceil(indices.length / perTask);
+    const perTask = tuner.genesPerTask();
+    const taskCount = here && cells === null ? 1 : Math.ceil(indices.length / perTask);
     tasksBeingRead += taskCount;
     let read;
-    read = (here ? readHere(indices) : deliver(indices)).then(
+    read = (here ? readHere(indices, perTask) : deliver(indices, perTask)).then(
       ({ tasks, bytes }) => {
         tuner.observeRead({ bytes, ms: performance.now() - readStart, genes: indices.length });
         if (reads.signal.aborted || failure !== null) {
@@ -312,9 +415,11 @@ export async function runGeneStream({
     ).finally(() => {
       tasksBeingRead -= taskCount;
       readsInFlight.delete(read);
+      noteMemoryChanged();
       wake();
     });
     readsInFlight.add(read);
+    noteMemoryChanged();
   };
 
   // A run stopped (or no longer current) dispatches nothing more, not even a
@@ -353,7 +458,7 @@ export async function runGeneStream({
         stopped = true;
         break;
       }
-      while (tasksBeingRead + ready.length < tuner.prefetchDepth() && genesLeftToRead()) {
+      while (genesLeftToRead() && roomToRead()) {
         startRead(nextReadGenes());
       }
       tuner.setReadsPending(readsInFlight.size);
@@ -366,9 +471,8 @@ export async function runGeneStream({
       });
     }
   } finally {
-    reads.abort(signal?.reason ?? new DOMException('Gene streaming run ended', 'AbortError'));
-    signal?.removeEventListener('abort', stopReads);
-    stop?.removeEventListener('abort', stopReads);
+    reads.abort(signal?.aborted ? abortReason(signal) : cancelled('superseded', 'The gene streaming run ended.'));
+    for (const stopListeningTo of stopListening) stopListeningTo();
     await Promise.all([...readsInFlight]);
     for (const task of ready) {
       if (task.worker !== null) route.settle(task.worker, task.indices.length);
@@ -376,8 +480,77 @@ export async function runGeneStream({
     ready.length = 0;
     await Promise.all([...tasksInFlight]);
     unsubscribe();
+    stopCounting();
+    noteMemoryChanged();
   }
-  if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+  throwIfAborted(signal);
   if (failure !== null) throw failure;
   return !stopped && !stop?.aborted && isCurrent();
+}
+
+/**
+ * Visit `genes` here, whole columns (`DataLayer.readGeneColumns`), in the
+ * run's order: the pass of an analysis that computes on this thread over
+ * many genes (signature scores). The genes are read a batch at a time, each
+ * as many as the run's buffered genes may hold (the tuner's memory gate,
+ * `bufferedTasks`, at the bytes a gene measured; until one is measured, its
+ * densest form over every open cell), and the batch is counted in the
+ * `analysis` share while it is held (`GENES_IN_FLIGHT_LABEL`). A gene's
+ * column is let go once visited.
+ *
+ * @param {object} options
+ * @param {Object} options.dataLayer
+ * @param {string[]} options.genes - Distinct gene keys (of `matrix`)
+ * @param {(gene: string, column: Float32Array|{length: number, indices: Uint32Array, values: Float32Array}, index: number) => (boolean|void|Promise<boolean|void>)} options.visit -
+ *   Takes each gene in turn (read only: a dense column may be a view's);
+ *   false stops the pass
+ * @param {string} [options.matrix='mapped']
+ * @param {string|null} [options.owner] - The job the reads are for
+ * @param {AbortSignal|null} [options.signal]
+ * @param {() => boolean} [options.isCurrent]
+ * @param {(cleanup: () => void) => void} [options.registerInvalidationCleanup]
+ * @returns {Promise<boolean>} False when the pass stopped (the request is no
+ *   longer current, or `visit` said so)
+ */
+export async function visitGeneColumnsHere({
+  dataLayer,
+  genes,
+  visit,
+  matrix = 'mapped',
+  owner = null,
+  signal = null,
+  isCurrent = () => true,
+  registerInvalidationCleanup,
+}) {
+  requireGeneList(genes);
+  if (typeof visit !== 'function') throw new TypeError('A gene pass visits each gene with a function');
+  if (genes.length === 0) return isCurrent();
+  const tuner = createRunTunerFor(dataLayer, 1, genes.length);
+  let held = 0;
+  const stopCounting = registerResidentHolder('analysis', {
+    label: GENES_IN_FLIGHT_LABEL,
+    bytes: () => held,
+    trim: () => null,
+  });
+  try {
+    for (let first = 0; first < genes.length;) {
+      if (!isCurrent()) return false;
+      const batch = genes.slice(first, first + Math.max(1, tuner.bufferedTasks() * tuner.genesPerTask()));
+      const readStart = performance.now();
+      const columns = await dataLayer.readGeneColumns(batch, { isCurrent, registerInvalidationCleanup, signal, owner, matrix });
+      held = columns.reduce((sum, column) => sum + columnBytes(column), 0);
+      noteMemoryChanged();
+      tuner.observeRead({ bytes: held, ms: performance.now() - readStart, genes: batch.length });
+      for (let k = 0; k < batch.length; k++) {
+        if ((await visit(batch[k], columns[k], first + k)) === false || !isCurrent()) return false;
+        held -= columnBytes(columns[k]);
+        columns[k] = null;
+      }
+      first += batch.length;
+    }
+    return isCurrent();
+  } finally {
+    stopCounting();
+    noteMemoryChanged();
+  }
 }

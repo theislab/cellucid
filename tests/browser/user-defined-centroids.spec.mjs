@@ -125,17 +125,30 @@ async function installFixture(page) {
   });
 }
 
+/**
+ * Every error the page reports, in order. `errors.next()` resolves when the
+ * next one is recorded (not enumerable: the list compares as a plain array).
+ */
 function observeErrors(page) {
   const errors = [];
+  const waiting = new Set();
+  const record = text => {
+    errors.push(text);
+    for (const resolve of waiting) resolve();
+    waiting.clear();
+  };
+  Object.defineProperty(errors, 'next', {
+    value: () => new Promise(resolve => waiting.add(resolve)),
+  });
   page.on('console', message => {
-    if (message.type() === 'error') errors.push(`console: ${message.text()}`);
+    if (message.type() === 'error') record(`console: ${message.text()}`);
   });
   page.on('pageerror', error => {
-    errors.push(`page: ${error.stack || error.message}`);
+    record(`page: ${error.stack || error.message}`);
   });
   page.on('response', response => {
     if (response.status() >= 400) {
-      errors.push(`http ${response.status()}: ${response.url()}`);
+      record(`http ${response.status()}: ${response.url()}`);
     }
   });
   return errors;
@@ -209,14 +222,10 @@ function readStoredCentroids(page) {
 async function saveSession(page, errors, sessionPath) {
   const errorCount = errors.length;
   const downloadPromise = page.waitForEvent('download');
+  // The first error the save raises ends the wait (the download's own
+  // timeout bounds it otherwise).
+  const failure = errors.next().then(() => null);
   await page.locator('#save-state-btn').click();
-  const failure = new Promise(resolve => {
-    const check = () => {
-      if (errors.length > errorCount) resolve(null);
-      else setTimeout(check, 50);
-    };
-    check();
-  });
   const download = await Promise.race([downloadPromise, failure]);
   expect(download, `saving the session failed: ${errors.slice(errorCount).join('\n')}`)
     .not.toBe(null);

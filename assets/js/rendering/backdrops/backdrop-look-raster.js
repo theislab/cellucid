@@ -16,6 +16,7 @@
 
 import { createBackdropLookRenderer } from './backdrop-look-renderer.js';
 import { isBackdropLook } from './backdrop-looks.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 let shared = null;
 
@@ -117,7 +118,7 @@ export async function renderBackdropLookRaster({
   const { canvas, gl, renderer } = getSharedContext();
   renderer.setLook(frozen.id);
   await renderer.whenReady();
-  if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+  throwIfAborted(signal);
 
   // The context draws at most its largest renderbuffer; a larger figure is
   // drawn at that size and scaled up (every look is smooth at that scale).

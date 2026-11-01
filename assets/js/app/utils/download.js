@@ -11,13 +11,14 @@
  * @module utils/download
  */
 
+import { abortReason } from '../../utils/abort.js';
+
 /** Delay before a clicked download's Object URL is released, in ms. */
 export const OBJECT_URL_RELEASE_DELAY_MS = 1500;
 
 function throwIfDownloadAborted(signal) {
   if (signal === null || !signal.aborted) return;
-  if (signal.reason !== undefined) throw signal.reason;
-  throw new DOMException('Download was aborted.', 'AbortError');
+  throw abortReason(signal);
 }
 
 /**

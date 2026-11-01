@@ -79,13 +79,14 @@ test('a data link that does not open leaves Cellucid running and offers the ways
   await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
   await expect(page.locator('#cellucid-startup-failure')).toHaveCount(0);
   await expect(failed.locator('.opening-title')).toHaveText('The data could not be opened');
-  // The reason itself, as its notification says it: not a generic "could
-  // not read" beside a specific notification.
-  const reason = /^missing-startup-link\.h5ad was not found at .*\. Check the link, or ask its owner whether it moved\.$/;
+  // The reason itself, not a generic "could not read", and said once: no
+  // card beside the dialog repeats it.
+  // The host's own answer, said as the host's (`formats/io/byte-source.js`).
+  const reason = /^missing-startup-link\.h5ad was not found at .* \(HTTP 404, not found\): the link or record does not exist, or it moved\. Check the link, or ask its owner\.$/;
   await expect(failed.locator('.opening-step')).toHaveText(reason);
   await expect(failed.locator('.welcome-details-text')).toBeHidden();
   await expect(failed.locator('.welcome-details-text')).toContainText('missing-startup-link.h5ad');
-  await expect(page.locator('.notification', { hasText: 'missing-startup-link.h5ad' })).toHaveCount(1);
+  await expect(page.locator('.notification', { hasText: 'missing-startup-link.h5ad' })).toHaveCount(0);
   // A missing file stays missing however often it is asked for: the way on
   // the failure leads with is opening Cellucid without the link.
   await expect(failed.locator('.opening-actions button')).toHaveText(['Open without this link', 'Try again']);
@@ -260,7 +261,7 @@ test('a successful startup publishes its phases and ends ready', async ({
   await expect(page.locator('#cellucid-startup-failure')).toHaveCount(0);
 });
 
-test('a failed opening stays in view above the sidebar, which on a phone fills the screen', async ({
+test('a failed opening stays in view above the sidebar, which open on a phone fills the screen', async ({
   page
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -270,7 +271,16 @@ test('a failed opening stays in view above the sidebar, which on a phone fills t
   await expect(failed).toBeVisible();
   const panel = failed.locator('.opening-panel');
   const sidebar = page.locator('#sidebar');
+  // The phone panel starts as its peek bar; opened full screen, it lies
+  // under the failed opening, which stays on top.
+  await page.locator('#phone-sheet-bar').dispatchEvent('click');
+  await expect(sidebar).not.toHaveClass(/\bhidden\b/);
   await expect(sidebar).toBeVisible();
+  // Measured once it has slid in: the sheet is the whole screen.
+  await expect.poll(async () => {
+    const box = await sidebar.boundingBox();
+    return box === null ? null : { x: Math.round(box.x), width: Math.round(box.width) };
+  }).toEqual({ x: 0, width: 390 });
   const [panelBox, sidebarBox] = [await panel.boundingBox(), await sidebar.boundingBox()];
   // The two overlap: the sidebar covers the middle of the screen.
   expect(sidebarBox.x < panelBox.x + panelBox.width && panelBox.x < sidebarBox.x + sidebarBox.width).toBe(true);

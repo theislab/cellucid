@@ -80,6 +80,16 @@ export function readExactTrueUrlFlag(searchParams, name) {
 
 function requireViewerHostConfigEvidence(value) {
   if (value === null) return false;
+  // A notebook widget's viewer (`EMBEDDED_VIEWER_HOST`): its credentials
+  // arrive from the widget, not in the address.
+  if (
+    typeof value === 'object' &&
+    Object.isFrozen(value) &&
+    Object.keys(value).length === 1 &&
+    value.embedded === true
+  ) {
+    return true;
+  }
   if (
     typeof value !== 'object' ||
     Array.isArray(value) ||

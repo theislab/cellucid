@@ -245,8 +245,9 @@ test('the volcano draws every gene where and in the colour Plotly would, before 
     const before = compare('render');
     // A threshold change recolours the genes (a style-only update).
     const changed = { ...options, pValueThreshold: 0.001, foldChangeThreshold: 2 };
+    // Resolves once the point image is redrawn: Plotly's style step waits
+    // for the layer's raster (`gd._promises`).
     await volcano.update(mine, { results }, changed);
-    await new Promise(resolve => setTimeout(resolve, 300));
     await Plotly.react(theirs, reference(), structuredClone(mine.layout), getPlotlyConfig());
     const after = compare('threshold change');
     if (after === before) failures.push('the point image was not redrawn after the colours changed');

@@ -59,7 +59,7 @@ export function testOptions(group) {
       default: 'exact',
       when: record => record.method === 'wilcox',
       choices: [
-        { value: 'exact', label: 'Exact or continuity-corrected (SciPy, R)' },
+        { value: 'exact', label: 'Exact or continuity-corrected (R)' },
         { value: 'normal', label: 'Normal approximation (scanpy)' },
         { value: 'normal_tie', label: 'Normal, tie-corrected' },
       ],

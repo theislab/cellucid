@@ -36,6 +36,7 @@
 
 import { CellSet } from '../app/utils/cell-set.js';
 import { POINT_VISIBILITY_THRESHOLD } from './alpha-visibility.js';
+import { cancel } from '../utils/abort.js';
 
 /**
  * The longest stretch, in milliseconds, one slice of a selection pass keeps
@@ -668,23 +669,36 @@ function growUint32(buffer, needed) {
 }
 
 /**
+ * Frontier cells whose rows one read asks for: a scheduling choice (one
+ * worker round trip and a few milliseconds of walking per batch), not a
+ * limit on how far an expansion reaches.
+ */
+const KNN_ROW_BATCH_CELLS = 1 << 16;
+
+/**
  * A breadth-first expansion from one seed cell over the neighbour graph,
  * through drawn cells only: degree d holds the cells at most d hops away.
  * The seed must be drawn, or the expansion is empty.
  *
- * The graph is the edge payload's adjacency (`ConnectivityEdges` of
- * `data/connectivity-edges.js`): a cell's neighbours are one range,
- * `neighbors[neighborOffsets[c] .. neighborOffsets[c + 1]]`.
+ * The graph is a row source (`KnnRowSource`): a cell's neighbours are read
+ * from the file by row (`getConnectivityRows`, the reader worker), a batch
+ * of frontier cells at a time, the next batch asked for while one is
+ * walked; while a view shows the graph, the source answers from the edges
+ * the page holds when that is measured faster (`knnRowReader`,
+ * `app/main.js`). No thread holds every cell's neighbour list for it.
  *
  * Reached cells are kept in discovery order with the count reached by each
  * degree, so the cells at exactly degree d are one range of that list (the
  * next degree's frontier), and going back to a smaller degree clears only
- * the cells beyond it.
+ * the cells beyond it. `expandTo` walks what has arrived until its deadline;
+ * while rows it needs are being read it returns false and `waiting` is the
+ * read, which settles when they have arrived (or rejects with the read's
+ * failure, which `expandTo` then throws).
  */
 export class KnnExpansion {
   /**
    * @param {object} options
-   * @param {import('../data/connectivity-edges.js').ConnectivityEdges} options.graph
+   * @param {KnnRowSource} options.graph
    * @param {number} options.seed
    * @param {Uint8Array} options.transparency
    */
@@ -713,9 +727,13 @@ export class KnnExpansion {
     // _reachedBy[d]: cells within d hops, for every completed degree d.
     this._reachedBy = [];
     // Position in the frontier (cells at exactly the last completed degree)
-    // of an expansion interrupted by its deadline.
+    // of an expansion interrupted by its deadline or by a read.
     this._cursor = 0;
     this._exhausted = false;
+    // Rows of frontier positions [start, end) that have arrived, and the
+    // reads in flight, oldest first: {start, end, rows, promise, controller}.
+    this._batches = [];
+    this._failure = null;
     if ((this._open[seed >>> 5] & (1 << (seed & 31))) !== 0) {
       this._open[seed >>> 5] ^= 1 << (seed & 31);
       this._visited.add(seed);
@@ -731,6 +749,50 @@ export class KnnExpansion {
   /** Degrees completed so far (0 is the seed alone). */
   get completedDegree() {
     return this._reachedBy.length - 1;
+  }
+
+  /** The read the expansion waits for, or null when it waits for none. */
+  get waiting() {
+    const batch = this._batches[0];
+    return batch !== undefined && batch.rows === null ? batch.promise : null;
+  }
+
+  /** Stop every read in flight (the expansion is no longer wanted). */
+  dispose() {
+    this._dropBatches();
+  }
+
+  _dropBatches() {
+    for (const batch of this._batches) {
+      if (batch.rows === null) cancel(batch.controller, 'superseded', 'The expansion no longer wants these rows.');
+    }
+    this._batches = [];
+  }
+
+  /** Ask for the rows of frontier positions [start, end). */
+  _request(start, end) {
+    const cells = this._order.slice(start, end);
+    const controller = new AbortController();
+    const batch = { start, end, rows: null, promise: null, controller };
+    batch.promise = Promise.resolve()
+      .then(() => this.graph.readRows(cells, { signal: controller.signal }))
+      .then(rows => {
+        if (
+          !(rows?.offsets instanceof Uint32Array) || rows.offsets.length !== cells.length + 1 ||
+          !(rows.neighbors instanceof Uint32Array) || rows.offsets[cells.length] !== rows.neighbors.length
+        ) {
+          throw new TypeError('KNN rows must be Uint32 offsets (one a cell, plus one) over Uint32 neighbours.');
+        }
+        batch.rows = rows;
+      }, error => {
+        if (this._batches.includes(batch)) this._failure ??= error;
+        throw error;
+      });
+    // The expansion reports a failure through `expandTo`; the promise is
+    // also the caller's to wait on.
+    batch.promise.catch(() => {});
+    this._batches.push(batch);
+    return batch;
   }
 
   /** Forget every cell beyond `degree` hops. */
@@ -750,11 +812,13 @@ export class KnnExpansion {
     this._reachedBy.length = degree + 1;
     this._cursor = 0;
     this._exhausted = this._reachedBy[degree] === 0;
+    this._dropBatches();
   }
 
   /**
-   * Hold exactly the cells within `degree` hops, expanding until done or
-   * until `deadline` passes; Infinity finishes.
+   * Hold exactly the cells within `degree` hops, expanding until done, until
+   * `deadline` passes, or until rows it needs are being read (`waiting`);
+   * Infinity runs until done or waiting.
    *
    * @param {number} degree
    * @param {number} deadline
@@ -765,12 +829,12 @@ export class KnnExpansion {
       throw new RangeError('KNN degree must be a non-negative integer.');
     }
     requireDeadline(deadline);
+    if (this._failure !== null) throw this._failure;
     // Back to a smaller degree, or the same one with a deeper expansion
     // interrupted part way.
     if (degree <= this.completedDegree && this._length !== this._reachedBy[degree]) {
       this._truncate(degree);
     }
-    const { neighborOffsets, neighbors } = this.graph;
     const open = this._open;
     while (this.completedDegree < degree && !this._exhausted) {
       const reachedBy = this._reachedBy;
@@ -780,28 +844,40 @@ export class KnnExpansion {
       let length = this._length;
       let index = frontierStart + this._cursor;
       let checked = 0;
-      for (; index < frontierEnd; index++) {
-        const cell = order[index];
-        const start = neighborOffsets[cell];
-        const end = neighborOffsets[cell + 1];
-        const reach = end - start;
-        if (length + reach > order.length) order = growUint32(order, length + reach);
-        for (let j = start; j < end; j++) {
-          const neighbor = neighbors[j];
-          const word = neighbor >>> 5;
-          const bit = 1 << (neighbor & 31);
-          if ((open[word] & bit) === 0) continue;
-          open[word] ^= bit;
-          order[length++] = neighbor;
-        }
-        checked += reach;
-        if (checked >= CELLS_PER_DEADLINE_CHECK) {
-          checked = 0;
-          if (index + 1 < frontierEnd && now() >= deadline) {
-            index++;
-            break;
+      let stopped = false;
+      while (index < frontierEnd && !stopped) {
+        if (this._batches.length === 0) this._request(index, Math.min(frontierEnd, index + KNN_ROW_BATCH_CELLS));
+        const batch = this._batches[0];
+        if (batch.rows === null) break;
+        // The next batch is read while this one is walked.
+        const last = this._batches[this._batches.length - 1];
+        if (last.end < frontierEnd) this._request(last.end, Math.min(frontierEnd, last.end + KNN_ROW_BATCH_CELLS));
+        const { offsets, neighbors } = batch.rows;
+        for (; index < batch.end; index++) {
+          const at = index - batch.start;
+          const start = offsets[at];
+          const end = offsets[at + 1];
+          const reach = end - start;
+          if (length + reach > order.length) order = growUint32(order, length + reach);
+          for (let j = start; j < end; j++) {
+            const neighbor = neighbors[j];
+            const word = neighbor >>> 5;
+            const bit = 1 << (neighbor & 31);
+            if ((open[word] & bit) === 0) continue;
+            open[word] ^= bit;
+            order[length++] = neighbor;
+          }
+          checked += reach;
+          if (checked >= CELLS_PER_DEADLINE_CHECK) {
+            checked = 0;
+            if (index + 1 < frontierEnd && now() >= deadline) {
+              index++;
+              stopped = true;
+              break;
+            }
           }
         }
+        if (index === batch.end) this._batches.shift();
       }
       // The reached cells' bits, once each.
       const words = this._visited.words;
@@ -829,6 +905,20 @@ export class KnnExpansion {
   }
 
   /**
+   * Hold exactly the cells within `degree` hops, waiting for every read it
+   * needs (the release of a k-NN drag).
+   *
+   * @param {number} degree
+   * @returns {Promise<void>}
+   */
+  async completeTo(degree) {
+    while (!this.expandTo(degree, Infinity)) {
+      const waiting = this.waiting;
+      if (waiting !== null) await waiting.catch(() => {});
+    }
+  }
+
+  /**
    * The cells reached, live (the caller copies what it keeps). Exactly the
    * cells within the degree of the last `expandTo` that returned true.
    *
@@ -840,25 +930,31 @@ export class KnnExpansion {
 }
 
 /**
- * Check the edge payload's adjacency arrays: their shapes, not their
- * contents (the reader worker built and checked them with the edges).
+ * What the k-NN tool expands through: the graph's cell count, and its rows
+ * read by cell (`readRows(cells, {signal})`: distinct cells' neighbours,
+ * cell `cells[i]`'s at `neighbors[offsets[i] .. offsets[i + 1]]`; the
+ * reader worker reads them from the file, `getConnectivityRows`).
+ *
+ * @typedef {{nCells: number, readRows: (cells: Uint32Array, options: {signal: AbortSignal}) =>
+ *   Promise<{offsets: Uint32Array, neighbors: Uint32Array}>}} KnnRowSource
+ */
+
+/**
+ * Check a k-NN row source (`KnnRowSource`).
  *
  * @param {unknown} graph
- * @returns {import('../data/connectivity-edges.js').ConnectivityEdges}
+ * @returns {KnnRowSource}
  */
 export function requireKnnGraph(graph) {
-  const { neighborOffsets, neighbors, nCells } = graph ?? {};
+  const nCells = graph?.nCells;
   if (
     !Number.isSafeInteger(nCells) ||
     nCells <= 0 ||
     nCells > 0xffff_ffff ||
-    !(neighborOffsets instanceof Uint32Array) ||
-    !(neighbors instanceof Uint32Array) ||
-    neighborOffsets.length !== nCells + 1 ||
-    neighborOffsets[nCells] !== neighbors.length
+    typeof graph.readRows !== 'function'
   ) {
     throw new TypeError(
-      'The KNN graph needs the edge payload\'s Uint32 neighbour offsets over its cells and its neighbours.'
+      'The KNN graph needs its cell count and a reader of its rows by cell.'
     );
   }
   return graph;

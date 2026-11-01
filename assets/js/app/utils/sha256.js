@@ -155,8 +155,9 @@ export async function sha256Hex(bytes) {
 }
 
 /**
- * The same digest without WebCrypto, for the contract test that has to compare
- * the two implementations against each other on the same inputs.
+ * The same digest without WebCrypto and without waiting: for a caller that
+ * needs it synchronously (a link's identity, `data/sources/link-credentials.js`)
+ * and for the contract test that compares the two implementations.
  *
  * @param {Uint8Array} bytes
  * @returns {string}

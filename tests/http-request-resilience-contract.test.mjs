@@ -19,13 +19,16 @@ import {
   BYTE_SOURCE_FAILURES,
   ByteSourceError,
   REMOTE_POLICY,
-  RETRY_DELAYS_MS,
+  RETRY_AT_LEAST,
+  RETRY_FOR_MS,
+  retryWaitMs,
   fetchOnce,
   httpByteSource,
   withRetries,
   worthAskingAgain,
 } from '../assets/js/formats/io/byte-source.js';
-import { LinkMeter, ResponseClock } from '../assets/js/formats/io/link.js';
+import { LinkMeter, MIN_STALL_TIMEOUT_MS, ResponseClock } from '../assets/js/formats/io/link.js';
+import { createHostBook } from '../assets/js/formats/io/hosts.js';
 import { ReadActivity } from '../assets/js/formats/io/activity.js';
 import { httpStore, openZarr } from '../assets/js/formats/zarr/index.js';
 import { fetchWhenNotBusy } from '../assets/js/data/data-source.js';
@@ -77,10 +80,15 @@ function never(signal) {
   });
 }
 
-/** A link measured on a virtual clock, its requests' timers on that clock. */
+/**
+ * A link measured on a virtual clock, its requests' timers on that clock,
+ * and a book of hosts (`hosts.js`: request budgets, a host's named waits) on
+ * the same clock.
+ */
 function virtualLink() {
   const time = virtualTime();
-  return { time, link: new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after }) };
+  const hosts = createHostBook({ now: time.now, after: time.after, epoch: () => 1_800_000_000_000 + time.now() });
+  return { time, hosts, link: new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after }) };
 }
 
 /**
@@ -143,9 +151,9 @@ test('a 503 without CORS headers, a 429 with Retry-After, a hung answer, a dropp
     '.zmetadata': ['cors-503', '429'],
     'a/0': ['hang', 'drop', 'stall-body'],
   });
-  const { time, link } = virtualLink();
+  const { time, link, hosts } = virtualLink();
   const started = time.now();
-  const root = await openZarr(httpStore(BASE, { fetch: host.fetch, concurrency: link }));
+  const root = await openZarr(httpStore(BASE, { fetch: host.fetch, concurrency: link, hosts }));
   const opened = time.now();
   assert.ok(opened - started >= 1000, 'the 429 is waited out as long as its Retry-After asks');
   assert.deepEqual([...await root.get('a').read()], [1, 2, 3, 4]);
@@ -183,7 +191,7 @@ test('a request is not stalled while the link delivers bytes to other requests',
 test('the stall timeout follows the measured answers (RFC 6298), doubles on a stall and is computed afresh after an answer', () => {
   let now = 0;
   const clock = new ResponseClock({ clock: () => now });
-  assert.equal(clock.timeoutMs, 1000, 'one second until the first answer');
+  assert.equal(clock.timeoutMs, 3000, 'three seconds until the first answer, which waits for the connection to be made (RFC 6298 5.7)');
   clock.answered(100);
   assert.equal(clock.timeoutMs, 1000, 'never under one second');
   clock.answered(4000);
@@ -199,14 +207,67 @@ test('the stall timeout follows the measured answers (RFC 6298), doubles on a st
   assert.equal(clock.lastActivityAt, 42);
 });
 
-test('a host that keeps failing is reported naming the URL and how many times it was asked', async () => {
-  const host = faultyHost(storeFiles(), { '.zmetadata': Array(10).fill('503') });
-  await assert.rejects(openZarr(httpStore(BASE, { fetch: host.fetch })), error => {
+test('a host that keeps failing a read it delivered to is reported naming the URL and how many times it was asked, once asked again for RFC 1122\'s 100 s', async () => {
+  // The store answered its opening; its chunk is then busy every time,
+  // saying "ask again now" (`Retry-After: 0`): asked again with waits that
+  // double from the link's retransmission timeout, at least three times and
+  // until they add up to 100 seconds.
+  const host = faultyHost(storeFiles(), { 'a/0': Array(20).fill('503') });
+  const { time, link, hosts } = virtualLink();
+  const root = await openZarr(httpStore(BASE, { fetch: host.fetch, concurrency: link, hosts }));
+  const started = time.now();
+  await assert.rejects(root.get('a').read(), error => {
     assert.equal(error.code, BYTE_SOURCE_FAILURES.UNAVAILABLE);
-    assert.match(error.message, /https:\/\/host\.test\/store\.zarr\/\.zmetadata: the host could not answer \(HTTP 503\)\. Asked 7 times\./);
+    // Said for the person (the host failing on its side, its status, not the
+    // link nor Cellucid); the requests under Details (its cause).
+    assert.equal(error.message, 'host.test is not answering (HTTP 503, service unavailable) for store.zarr/a/0: a ' +
+      'problem on host.test\'s side, not with the link or with Cellucid. It usually passes; try again later.');
+    assert.equal(error.details.explained, true);
+    assert.deepEqual(error.details.hostFault, { kind: 'failing', host: 'host.test', status: 503, what: 'store.zarr/a/0', service: null, retryAfterMs: 0 });
+    assert.match(error.cause.message, /https:\/\/host\.test\/store\.zarr\/a\/0: the host could not answer \(HTTP 503\)(: busy)?\. Asked 8 times\./);
     return true;
   });
-  assert.equal(host.log.length, 7);
+  // Waits of 1, 2, 4, …, 64 s (each stretched by up to a half): the seventh
+  // brings them past 100 s, and the eighth failure is reported.
+  assert.equal(host.log.filter(entry => entry.key === 'a/0').length, 8);
+  const waited = time.now() - started;
+  assert.ok(waited >= RETRY_FOR_MS && waited >= 127 * MIN_STALL_TIMEOUT_MS && waited < 1.5 * 127 * MIN_STALL_TIMEOUT_MS, `waited ${waited} ms`);
+  assert.equal(RETRY_AT_LEAST, 3);
+});
+
+test('a host answering errors before it delivered anything is reported after RFC 1122\'s R1 (three repeats, a few seconds), not waited on', async () => {
+  // An opening a person waits on with nothing on screen: the server's error
+  // is theirs to see (with "Try again") once asked again three times.
+  const host = faultyHost(storeFiles(), { '.zmetadata': Array(20).fill('503') });
+  const { time, link, hosts } = virtualLink();
+  const started = time.now();
+  await assert.rejects(openZarr(httpStore(BASE, { fetch: host.fetch, concurrency: link, hosts })), error => {
+    assert.equal(error.code, BYTE_SOURCE_FAILURES.UNAVAILABLE);
+    assert.match(error.message, /^host\.test is not answering \(HTTP 503, service unavailable\) for store\.zarr\/\.zmetadata: a problem on host\.test's side/);
+    assert.match(error.cause.message, /https:\/\/host\.test\/store\.zarr\/\.zmetadata: the host could not answer \(HTTP 503\)(: busy)?\. Asked 4 times\./);
+    return true;
+  });
+  assert.equal(host.log.length, RETRY_AT_LEAST + 1);
+  // Waits of 1, 2 and 4 s, each stretched by up to a half.
+  const waited = time.now() - started;
+  const least = (1 + 2 + 4) * MIN_STALL_TIMEOUT_MS;
+  assert.ok(waited >= least && waited < 1.5 * least, `waited ${waited} ms`);
+
+  // The same at the byte layer: a file's first range, and a request asked
+  // without a caller that knows of earlier deliveries.
+  let asked = 0;
+  const busy = async () => {
+    asked++;
+    return new Response('busy', { status: 503 });
+  };
+  const file = httpByteSource({ url: 'https://host.test/x.h5ad', size: 100 }, { fetch: busy });
+  const fresh = virtualLink();
+  await assert.rejects(file.read(0, 10, { link: fresh.link }), error => {
+    assert.match(error.message, /^host\.test is not answering \(HTTP 503, service unavailable\) for x\.h5ad: a problem on host\.test's side/);
+    assert.match(error.cause.message, /HTTP 503.*Asked 4 times\./);
+    return true;
+  });
+  assert.equal(asked, 4);
 });
 
 test('cancelling ends a hung request and a wait to ask again at once, and nothing is asked after', async () => {
@@ -228,7 +289,7 @@ test('cancelling ends a hung request and a wait to ask again at once, and nothin
   const retrying = withRetries(async attempt => {
     asked.push(attempt);
     throw new ByteSourceError(BYTE_SOURCE_FAILURES.RATE_LIMITED, 'busy', { retryAfter: '60' });
-  }, { signal: waiting.signal, after: timers.after });
+  }, { signal: waiting.signal, clock: timers.link.responses });
   await settle();
   assert.deepEqual(timers.set, [60_000], 'waiting as long as the Retry-After asks');
   waiting.abort(new DOMException('stop', 'AbortError'));
@@ -292,10 +353,10 @@ test('catalog and provider requests ride out a 503 without CORS headers', async 
 test('a range asked for is given the time its bytes take at the measured bandwidth before it is stalled', () => {
   let bandwidth = 0;
   const clock = new ResponseClock({ bandwidth: () => bandwidth });
-  assert.equal(clock.patienceMs(8_000_000), 1000, 'nothing added before the bandwidth is measured');
+  assert.equal(clock.patienceMs(8_000_000), 3000, 'nothing added before the bandwidth is measured');
   bandwidth = 5000;
-  assert.equal(clock.patienceMs(8_000_000), 1000 + 1600);
-  assert.equal(clock.patienceMs(0), 1000, 'a whole object of unknown size gets the timeout alone');
+  assert.equal(clock.patienceMs(8_000_000), 3000 + 1600);
+  assert.equal(clock.patienceMs(0), 3000, 'a whole object of unknown size gets the timeout alone');
 });
 
 test('a long request counts its bytes into the read\'s activity as they arrive, and a failed attempt takes them back', async () => {
@@ -346,11 +407,14 @@ test('a failure that repeats exactly, or a host that never answers this site, is
   const { time, link } = virtualLink();
   const started = time.now();
   await assert.rejects(openZarr(httpStore(BASE, { fetch: fetch500, concurrency: link })), error => {
-    assert.match(error.message, /HTTP 500\)\. Asked 2 times\./);
+    assert.match(error.message, /^host\.test is not answering \(HTTP 500, a server error\) for store\.zarr\/\.zmetadata: a problem on host\.test's side/);
+    assert.match(error.cause.message, /HTTP 500\)(: \{"status":500\})?\. Asked 2 times\./);
     return true;
   });
   assert.equal(failing.log.length, 2);
-  assert.equal(time.now() - started, RETRY_DELAYS_MS[0], 'reported after one short wait');
+  const waited = time.now() - started;
+  const first = link.responses.timeoutMs;
+  assert.ok(waited >= first && waited < 1.5 * first, `reported after one wait of the link's timeout (${waited} ms)`);
 
   // No answer at all (CORS refused): asked once more, then reported.
   let corsAsked = 0;
@@ -391,4 +455,39 @@ test('the signs of a host that will answer later are asked again for the whole s
   const other500 = failure(BYTE_SOURCE_FAILURES.UNAVAILABLE, { status: 500, retryAfter: null, signature: '500:90' });
   assert.equal(worthAskingAgain(other500, [first500]), true, 'a different answer may change again');
   assert.equal(worthAskingAgain(first500, [first500]), false, 'the same answer twice is reported');
+  // A host or gateway that says it is busy keeps the whole schedule, however
+  // alike its answers (S3's 503 SlowDown: the same body, no Retry-After).
+  for (const status of [429, 502, 503, 504]) {
+    const busy = failure(status === 429 ? BYTE_SOURCE_FAILURES.RATE_LIMITED : BYTE_SOURCE_FAILURES.UNAVAILABLE,
+      { status, retryAfter: null, signature: `${status}:120` });
+    assert.equal(worthAskingAgain(busy, [busy, busy, busy]), true, `HTTP ${status}`);
+  }
+});
+
+test('S3 answering 503 SlowDown is asked again with growing, spread waits and read once it answers; the link runs fewer requests at once meanwhile', async () => {
+  const body = '<?xml version="1.0" encoding="UTF-8"?><Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>';
+  const bytes = new Uint8Array(1000).map((_, i) => i & 255);
+  let asked = 0;
+  const fetch = async (url, init) => {
+    asked++;
+    if (asked >= 2 && asked <= 5) return new Response(body, { status: 503, headers: { 'Content-Length': String(body.length) } });
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
+    return new Response(bytes.slice(Number(start), Number(end) + 1), { status: 206 });
+  };
+  const { time, link } = virtualLink();
+  const source = httpByteSource({ url: 'https://bucket.s3.us-west-2.amazonaws.com/x.h5ad', size: 1000 }, { fetch });
+  // The file's first range arrived: S3 sheds load part way through a read.
+  assert.deepEqual(await source.read(0, 10, { link }), bytes.subarray(0, 10));
+  link.concurrency = 24;
+  const started = time.now();
+  assert.deepEqual(await source.read(10, 10, { link }), bytes.subarray(10, 20));
+  assert.equal(asked, 6, 'the first range, four busy answers, then the bytes');
+  const waited = time.now() - started;
+  // Waits doubling from the link's retransmission timeout (RFC 6298 5.5).
+  const least = (1 + 2 + 4 + 8) * MIN_STALL_TIMEOUT_MS;
+  assert.ok(waited >= least && waited < 1.5 * least, `waited ${waited} ms`);
+  // Each busy answer halved what runs at once; answers earn it back.
+  assert.ok(link.admitted < 24, `${link.admitted} requests at once after SlowDown`);
+  assert.equal(retryWaitMs(2, 1000, () => 0), 4000);
+  assert.equal(retryWaitMs(2, 1000, () => 0.999999), 4000 * 1.4999995);
 });

@@ -5,9 +5,10 @@
  * health endpoint, a dataset catalog, opening the startup dataset (its
  * metadata, field lists and the embedding its first view draws), and the
  * published default session a sample advertises.
- * The interface is built after the catalog is read and before the startup
- * dataset loads, so the data controls are live — and can replace that load —
- * for the whole of it.
+ * The interface is built before the sample catalog is awaited (its request
+ * goes out first; startup awaits its answer just before loading the default
+ * sample it names), so the data controls are live — and can replace that
+ * choice or that load — for the whole of it.
  * Each of them can stall without failing, and a stalled await leaves the page
  * waiting forever with nothing saying which request it is waiting on.
  *
@@ -46,6 +47,7 @@
  * @module app/startup-phase
  */
 
+import { onAbort } from '../utils/abort.js';
 import { createDeadline } from '../utils/deadline.js';
 import { onWaitingOnPerson } from '../utils/person-wait.js';
 
@@ -247,10 +249,9 @@ export function createStartupPhaseOwner(options) {
       // The person's time is not the network's: the deadline stands still.
       const stopPersonWaits = personWaits(waiting => (waiting ? deadline.pause() : deadline.resume()));
       const signal = AbortSignal.any([lifetime.signal, deadline.signal]);
-      let onDeadline = null;
+      let stopStalling = null;
       const stalled = new Promise((_resolve, reject) => {
-        onDeadline = () => reject(stallError());
-        deadline.signal.addEventListener('abort', onDeadline, { once: true });
+        stopStalling = onAbort(deadline.signal, () => reject(stallError()));
       });
       const work = Promise.resolve().then(() => operation(signal));
       // Whichever loses the race is still observed, never unhandled.
@@ -272,7 +273,7 @@ export function createStartupPhaseOwner(options) {
         stopProgress?.();
         stopPersonWaits();
         deadline.release();
-        deadline.signal.removeEventListener('abort', onDeadline);
+        stopStalling();
         measuringSteps -= 1;
         if (measuringSteps === 0) publishMeasuring(false);
       }

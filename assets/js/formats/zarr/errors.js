@@ -3,7 +3,7 @@
  *
  * - `ZarrFormatError`: the store is damaged or contradicts itself (metadata
  *   that is not valid JSON or misses a required field, a chunk that does not
- *   decode to its declared size, an absent chunk whose contents are undefined).
+ *   decode to its declared size).
  * - `ZarrUnsupportedError`: a valid store uses something this reader does not
  *   read (a codec, a data type, a chunk grid). `feature` names it, and the
  *   message says so in plain words.

@@ -184,8 +184,9 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
       [{ knn: 'missing' }, /defaults\.knn names obsp\['missing'\], which this file does not have\. obsp holds: \['connectivities', 'distances', 'scvi_connectivities'\]/],
       [{ expression: 'layers/none' }, /defaults\.expression names layers\['none'\], which this file does not have/],
       [{ latentKey: 'X_none' }, /defaults\.latentKey 'X_none' was not found in obsm/],
-      [{ geneIdColumn: 'symbol' }, /defaults\.geneIdColumn 'symbol' not found in var\. Available columns:/],
-      [{ geneIdColumn: 'dispersions' }, /defaults\.geneIdColumn 'dispersions': floating-point values cannot name genes/],
+      // The file opens on raw (more genes than X: `defaultExpression`): its genes' columns are raw.var's.
+      [{ geneIdColumn: 'symbol' }, /defaults\.geneIdColumn 'symbol' not found in raw\.var\. Available columns:/],
+      [{ expression: 'X', geneIdColumn: 'dispersions' }, /defaults\.geneIdColumn 'dispersions': floating-point values cannot name genes/],
       [{ obsKeys: ['cell_type', 'nope'] }, /defaults\.obsKeys contain columns not in obs: \['nope'\]\. Available columns: \['cell_type', 'batch'\]/],
       [{ embedding2d: 'X_none' }, /defaults\.embedding2d names obsm\['X_none'\], which this file does not have/],
       [{ embedding2d: 'X_broken' }, /X_broken/],

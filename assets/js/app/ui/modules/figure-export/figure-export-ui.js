@@ -8,10 +8,10 @@
  */
 
 import { createElement, clearElement } from '../../../utils/dom-utils.js';
-import { createDisclosure, createGroup, createInfoTip } from '../../components/controls.js';
+import { createDecimalInput, createDisclosure, createGroup, createInfoTip, readDecimalInput, writeDecimalInput } from '../../components/controls.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
-import { clamp, parseFiniteNumberInRange } from '../../../utils/number-utils.js';
+import { clamp } from '../../../utils/number-utils.js';
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { reportFigureExportFailure } from './figure-export-engine.js';
 import { computeSingleViewLayout } from './utils/layout.js';
@@ -58,6 +58,7 @@ import {
   assertCameraState,
   assertNavigationMode
 } from '../../../../rendering/camera-state-contract.js';
+import { cancel } from '../../../../utils/abort.js';
 
 const DEFAULT_SIZE = { width: 1600, height: 1200 };
 const PREVIEW_PRESENTATION_SETTLE_MS = 120;
@@ -237,6 +238,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   let previewDisposed = false;
   let exportInFlight = false;
   let activeExportAbortController = null;
+  /** Settles once the export under way (if any) has ended, stopped or not. */
+  let exportEnded = Promise.resolve();
   const domLifecycle = new AbortController();
   const previewEpochFence = createFigurePreviewEpochFence();
   function listen(target, eventName, handler) {
@@ -251,14 +254,16 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     );
   }
   cleanupFns.push(() => {
-    activeExportAbortController?.abort();
+    cancel(activeExportAbortController, 'closed', 'The figure export panel was closed.');
     activeExportAbortController = null;
     exportInFlight = false;
   });
+  // Returns a promise that settles once the export it stopped has ended
+  // (its late answers dropped, nothing downloaded or reported).
   const destroy = () => {
-    if (cleanupComplete) return;
+    if (cleanupComplete) return exportEnded;
     cleanupComplete = true;
-    container.__cellucidCleanup = () => {};
+    container.__cellucidCleanup = () => exportEnded;
     const failures = [];
     try {
       domLifecycle.abort();
@@ -278,6 +283,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         'Figure export cleanup did not release every owner.'
       );
     }
+    return exportEnded;
   };
   container.__cellucidCleanup = destroy;
 
@@ -639,15 +645,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // ─────────────────────────────────────────────────────────────────────────
   const selectionRow = createElement('div', { className: 'control-block figure-export-row' });
   const emphasizeSelectionCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-selection-emphasis' });
-  const selectionMutedOpacityInput = createElement('input', {
+  const selectionMutedOpacityInput = createDecimalInput({
     id: 'figure-export-muted-opacity',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '0.15',
-    min: '0',
-    max: '1',
-    step: '0.05',
-    inputMode: 'decimal',
+    value: 0.15,
     ariaLabel: 'Non-selected opacity (0..1)'
   });
   selectionRow.appendChild(createElement('label', { className: 'checkbox-inline', htmlFor: emphasizeSelectionCheckbox.id }, [
@@ -1150,11 +1151,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const legendModel = legendField && typeof state?.getLegendModel === 'function' ? state.getLegendModel(legendField) : null;
     let categorySummary = '';
     if (legendModel?.kind === 'category' && Array.isArray(legendModel.categories) && legendModel.categories.length) {
-      const visibleMap = legendModel.visible || {};
+      const visible = legendModel.visible ?? null;
       const visibleCounts = Array.isArray(legendModel?.counts?.visible) ? legendModel.counts.visible : null;
       const shown = legendModel.categories
         .map((name, i) => {
-          if (visibleMap[i] === false) return null;
+          if (visible !== null && visible[i] === 0) return null;
           if (visibleCounts && (Number(visibleCounts[i]) || 0) <= 0) return null;
           const s = String(name ?? '').trim();
           return s ? s : null;
@@ -1319,14 +1320,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   let cellsPresent = false;
 
   function syncExportAvailability() {
-    exportBtn.disabled = exportBusy || !cellsPresent;
+    // While an export runs the button stops it: there is always a way out.
+    exportBtn.disabled = !exportBusy && !cellsPresent;
     exportBtn.title = cellsPresent ? '' : 'Load a dataset to export a figure';
   }
 
   function setBusy(busy) {
     exportBusy = busy;
     syncExportAvailability();
-    exportBtn.textContent = busy ? 'Exporting…' : 'Export';
+    exportBtn.textContent = busy ? 'Cancel export' : 'Export';
   }
 
   /**
@@ -2371,12 +2373,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       ? state.getTotalHighlightedCellCount()
       : (typeof state?.getHighlightedCellCount === 'function' ? state.getHighlightedCellCount() : 0);
     const emphasizeSelection = emphasizeSelectionCheckbox.checked && totalHighlighted > 0;
-    const mutedAlpha = parseFiniteNumberInRange(
-      selectionMutedOpacityInput.value,
-      0,
-      1,
-      'Non-selected opacity',
-    );
+    // A decimal box: a point or a comma (`readDecimalInput`).
+    const mutedAlpha = readDecimalInput(selectionMutedOpacityInput);
+    if (!(mutedAlpha >= 0 && mutedAlpha <= 1)) {
+      throw new RangeError('Non-selected opacity must be a number from 0 to 1.');
+    }
     const sampledHighlights =
       emphasizeSelection &&
       reduced.highlighted instanceof Uint8Array &&
@@ -3023,13 +3024,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
 
   function readExactDecimalInput(input, label, minimum, maximum) {
-    const raw = input.value;
-    if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(raw)) {
+    // A decimal box: a point or a comma (`readDecimalInput`).
+    const value = readDecimalInput(input);
+    if (Number.isNaN(value)) {
       input.setCustomValidity(`${label} must be a decimal number.`);
       input.reportValidity();
       return null;
     }
-    const value = Number(raw);
     if (!Number.isFinite(value) || value < minimum || value > maximum) {
       input.setCustomValidity(
         `${label} must be between ${minimum} and ${maximum}.`
@@ -3046,10 +3047,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   });
 
   async function handleFigureExportClick() {
-    if (cleanupComplete || exportInFlight) return;
+    if (cleanupComplete) return;
+    if (exportInFlight) {
+      // The person stops the export where it is: its reads, its worker
+      // requests still queued and its passes end, and nothing is reported.
+      cancel(activeExportAbortController, 'user', 'Figure export was cancelled.');
+      return;
+    }
     exportInFlight = true;
     const abortController = new AbortController();
     activeExportAbortController = abortController;
+    let ended;
+    exportEnded = new Promise(resolve => {
+      ended = resolve;
+    });
     setBusy(true);
     try {
       await exportFigureFromUi(abortController.signal);
@@ -3060,12 +3071,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         reportFigureExportFailure(error);
       }
     } finally {
-      abortController.abort();
+      cancel(abortController, 'closed', 'The figure export ended.');
       if (activeExportAbortController === abortController) {
         activeExportAbortController = null;
       }
       exportInFlight = false;
       if (!cleanupComplete) setBusy(false);
+      ended();
     }
   }
 
@@ -3428,7 +3440,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     depthSortCheckbox.checked = exact.depthSort;
     legendPosSelect.value = exact.legendPosition;
     emphasizeSelectionCheckbox.checked = exact.emphasizeSelection;
-    selectionMutedOpacityInput.value = String(exact.selectionMutedOpacity);
+    writeDecimalInput(selectionMutedOpacityInput, exact.selectionMutedOpacity);
 
     downloadSelect.value = exact.download;
     dpiSelect.value = String(exact.dpi);

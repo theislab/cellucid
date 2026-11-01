@@ -23,8 +23,8 @@ const FIXTURE_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
   '&dataset=current-ui&acceptance=highlight-store-draw-parity-ci';
 const POINT_COUNT = 40_000;
-// A reduced level (rendering/high-perf/draw-order.js LOD_REDUCTION_FACTORS:
-// 4.8x fewer points), below the highlights of either test.
+// A reduced level (rendering/high-perf/draw-order.js `lodLadder`: 9,306 of
+// the 40,000 cells), below the highlights of either test.
 const LEVEL = 10;
 
 async function loadAtlas(page) {
@@ -99,7 +99,14 @@ for (const [label, every] of [['every cell', 1], ['every other cell', 2]]) {
       .toBe(LEVEL);
     // Nothing but the pulse still changes the frame (fades, bakes, levels).
     await expect
-      .poll(() => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().lastCause), { timeout: 60_000 })
+      .poll(() => page.evaluate(() => {
+      // A pulse frame drawn, only the pulse left, and no change still owed a
+      // frame (the cause of the last frame drawn alone says nothing of that).
+      const schedule = window._cellucidViewer.getFrameScheduleState();
+      return schedule.lastCause === 'highlight' && schedule.animationCause === 'highlight' && !schedule.invalidated
+        ? 'highlight'
+        : `${schedule.lastCause}/${schedule.animationCause}${schedule.invalidated ? '/invalidated' : ''}`;
+    }), { timeout: 60_000 })
       .toBe('highlight');
     const result = await compareDraws(page);
     expect(result.recordViews).toBe(0);

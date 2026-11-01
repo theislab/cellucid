@@ -228,7 +228,8 @@ test('the iOS viewport bootstrap runs in the head, before the stylesheet', () =>
   // Its URL names its bytes (index.html, CELLUCID_MODULE_VERSIONS).
   const script = head.search(/<script src="assets\/js\/app\/ui\/core\/viewport-init\.js\?v=[0-9a-f]{12}"><\/script>/);
   const theme = head.indexOf('assets/js/app/ui/core/theme-init.js');
-  const stylesheet = head.indexOf('<link rel="stylesheet" href="assets/css/main.css"');
+  // The first stylesheet request: a preload of one main.css imports, or main.css.
+  const stylesheet = head.search(/<link rel="(?:preload" as="style"|stylesheet)" href="assets\/css\//);
   assert.ok(script > -1, 'viewport-init.js is loaded from the head');
   assert.ok(theme > -1 && theme < script, 'after the theme bootstrap');
   assert.ok(stylesheet > script, 'before the stylesheet');

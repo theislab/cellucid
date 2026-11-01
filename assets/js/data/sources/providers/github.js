@@ -16,17 +16,28 @@
  * - Shorthand without `@ref` reads `HEAD`, which both hosts resolve to the
  *   repository's default branch (`main`, `master` or any other): no request
  *   finds the branch, and none is ever probed.
- * - A catalog or a Zarr folder costs no request here: the reader's first
- *   request is the catalog or the store's metadata.
- * - One file costs one round trip: a `HEAD` (its size) and, beside it, a
+ * - A catalog costs no request here: the reader's first request is the
+ *   catalog. A Zarr folder costs one, GitHub's API naming the commit that
+ *   last wrote anything below it (`lastCommitOf`): the folder is read at
+ *   that commit, which names its content, so what is kept of its objects
+ *   serves a later visit (without it, read at its ref and kept for the tab).
+ * - One file costs two round trips. First GitHub's API names the commit that
+ *   last wrote the file on its ref (`lastCommitOf`): the file is read at that
+ *   commit, whose bytes never change, so its version names its content and
+ *   stays the same until the file itself changes. A link naming a commit
+ *   asks nothing. Then a `HEAD` (its size) and, beside it, a
  *   range read of its head -- an `.h5ad`'s first read (`HEAD_BYTES`), which
  *   opening then starts from, or the first kilobyte of any other file. A file
  *   that small may be a Git LFS pointer, and the head holds it whole: the
- *   pointer states the object's size and hash, so the media host is never
- *   probed. The `HEAD` carries `Range: bytes=0-`, for which a browser asks
+ *   pointer states the object's size and hash (its version), so the media
+ *   host is never probed, and is read at the same commit. The `HEAD` carries
+ *   `Range: bytes=0-`, for which a browser asks
  *   for the bytes unencoded: its length is the file's, never a compressed
  *   transfer's (GitHub Pages compresses binary files, and a page cannot see
- *   that it did).
+ *   that it did). Neither raw host shows its `ETag` to other sites, so
+ *   without the commit (GitHub's API refused this browser: 60 requests an
+ *   hour without a sign-in, revalidations not counted) the file is read at
+ *   its ref with no version (`size:<n>`): nothing kept of it is used.
  * - Every request is CORS-safelisted (a `HEAD`, a `GET`, one plain range),
  *   so none needs a preflight. A request the host answers as busy or
  *   failing, whose connection fails or that stalls is made again
@@ -35,10 +46,11 @@
  * @module data/sources/providers/github
  */
 
-import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
-import { describeRemoteFile } from '../remote-file.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultFailure } from '../../data-source.js';
+import { describeRemoteFile, headBytesFor } from '../remote-file.js';
 import { fileFormatOfName, folderFormatOfName, readsFromHead, titleOfName } from '../../input-formats.js';
-import { HEAD_BYTES, headOfFile, readFileHead } from '../../../formats/io/byte-source.js';
+import { HEAD_BYTES, fetchOnce, headOfFile, hostFaultOfStatus, readFileHead } from '../../../formats/io/byte-source.js';
+import { isCancellation } from '../../../utils/abort.js';
 
 /**
  * The ref a link without `@ref` reads: the repository's default branch, as
@@ -273,6 +285,7 @@ function lfsObject(bytes) {
 
 function hostFailure(name, url, status) {
   const host = new URL(url).host;
+  if (hostFaultOfStatus(status) !== null) return hostFaultFailure({ host, status, what: name }, { url });
   return new DataSourceError(
     status === 404 || status === 403
       ? `${name} was not found at ${host} (HTTP ${status}). Check the owner, repository, ` +
@@ -291,7 +304,7 @@ async function gitHubRequest(url, name, init) {
   try {
     response = await fetchWhenNotBusy(url, init);
   } catch (error) {
-    if (error?.name === 'AbortError' || init.signal?.aborted) throw error;
+    if (isCancellation(error) || init.signal?.aborted) throw error;
     throw new DataSourceError(
       `${name} could not be read from ${new URL(url).host}: ${error?.message ?? error}.`,
       DataSourceErrorCode.NETWORK_ERROR,
@@ -307,8 +320,8 @@ async function gitHubRequest(url, name, init) {
 }
 
 /**
- * The exact size of one file on raw.githubusercontent.com, and its `ETag`
- * when the host lets this page see it: one `HEAD`. Its `Range: bytes=0-`
+ * The exact size of one file on raw.githubusercontent.com: one `HEAD`
+ * (its `ETag` the host does not show other sites). Its `Range: bytes=0-`
  * makes the browser ask for the bytes unencoded, so the length is the file's
  * own (a host that compresses the transfer would otherwise state the
  * compressed length, and hide that it did).
@@ -317,6 +330,8 @@ async function headOf(url, name, signal) {
   const response = await gitHubRequest(url, name, {
     method: 'HEAD',
     headers: { Range: 'bytes=0-' },
+    // Past the HTTP cache (GitHub lets a browser keep it five minutes).
+    cache: 'no-store',
     signal,
   });
   const size = Number(response.headers.get('Content-Length'));
@@ -328,13 +343,59 @@ async function headOf(url, name, signal) {
       { url }
     );
   }
-  return { size, etag: response.headers.get('ETag') };
+  return size;
 }
 
-async function describeGitHubFile(parsed, { signal }) {
+const COMMIT = /^[0-9a-f]{40}$/;
+
+/**
+ * The commit that last wrote one file on its ref, asked of GitHub's API now
+ * (one request, never a cached answer): reading the file at it reads the
+ * bytes its ref holds, and they never change. A ref that is a commit is
+ * its own. Null when the API does not say (its hourly limit for a browser
+ * without a sign-in, a path the ref does not hold, no connection): asked
+ * once, never waited on: not even for the API's request budget, which this
+ * realm tracks from its answers (`formats/io/hosts.js`; 60 an hour without a
+ * sign-in).
+ */
+async function lastCommitOf(parsed, signal) {
+  if (COMMIT.test(parsed.branch)) return parsed.branch;
+  const url = `https://api.github.com/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}` +
+    `/commits?sha=${encodeURIComponent(parsed.branch)}&path=${encodeURIComponent(parsed.path)}&per_page=1`;
+  try {
+    const { response, bytes } = await fetchOnce(url, { cache: 'no-cache' }, {
+      fetchImpl: globalThis.fetch,
+      signal,
+      wantsBody: answer => answer.ok,
+      // Optional: with its hourly budget spent, the file is read at its ref now.
+      waits: false,
+    });
+    if (!response.ok || bytes === null) return null;
+    const sha = JSON.parse(new TextDecoder().decode(bytes))?.[0]?.sha;
+    return typeof sha === 'string' && COMMIT.test(sha) ? sha : null;
+  } catch (error) {
+    if (isCancellation(error) || signal?.aborted) throw error;
+    return null;
+  }
+}
+
+/**
+ * The dataset id of a file or store on GitHub: its repository, the ref the
+ * link names (a branch, a tag or a commit, as given: two refs are two
+ * datasets, and what is kept of one never stands for, or replaces, the
+ * other's) and its path. Without "/", as it becomes `anndata://<id>/`.
+ */
+function datasetIdOf(link) {
+  return `gh:${encodeURIComponent(`${link.owner}/${link.repo}@${link.branch}/${link.path}`)}`;
+}
+
+async function describeGitHubFile(link, { signal }) {
+  const commit = await lastCommitOf(link, signal);
+  // Read at the commit, whose bytes never change; without it, at the ref.
+  const parsed = commit === null ? link : { ...link, branch: commit };
   const name = parsed.path.split('/').at(-1);
   const common = {
-    id: `gh:${encodeURIComponent(`${parsed.owner}/${parsed.repo}/${parsed.path}`)}`,
+    id: datasetIdOf(link),
     name,
     attribution: {
       title: `${parsed.owner}/${parsed.repo}`,
@@ -344,31 +405,36 @@ async function describeGitHubFile(parsed, { signal }) {
     signal,
   };
   const url = rawFileUrl(parsed);
-  // The head goes out beside the HEAD: an .h5ad's first read, else enough to
-  // hold an LFS pointer whole.
-  const headBytes = readsFromHead(fileFormatOfName(name)) ? HEAD_BYTES : LFS_POINTER_MAX_BYTES;
+  // The head goes out beside the HEAD: an .h5ad's first read, unless this
+  // browser keeps the file's parts (`headBytesFor`: a later visit reads its
+  // head from there), else enough to hold an LFS pointer whole.
+  const headBytes = readsFromHead(fileFormatOfName(name)) && (await headBytesFor(common.id)) === HEAD_BYTES ? HEAD_BYTES : LFS_POINTER_MAX_BYTES;
   const headRead = readFileHead(url, headBytes, { signal });
   headRead.catch(() => {});
-  const { size, etag } = await headOf(url, name, signal);
+  const size = await headOf(url, name, signal);
   let head = null;
   try {
     head = headOfFile(await headRead, size, headBytes);
   } catch (error) {
     // The size stands without the head: opening reads it again.
-    if (error?.name === 'AbortError' || signal?.aborted) throw error;
+    if (isCancellation(error) || signal?.aborted) throw error;
   }
+  // The commit and path name the file's bytes; no commit, no version.
+  const version = commit === null ? `size:${size}` : `commit:${commit}`;
   if (size > LFS_POINTER_MAX_BYTES) {
-    return describeRemoteFile({ url, size, version: etag, head: headBytes === HEAD_BYTES ? head : null, ...common });
+    return describeRemoteFile({ url, size, version, head: headBytes === HEAD_BYTES ? head : null, ...common });
   }
   // Small enough to be a Git LFS pointer: the head holds it, a few lines.
-  const pointer = head?.bytes ?? new Uint8Array(await (await gitHubRequest(url, name, { signal })).arrayBuffer());
+  const pointer = head?.bytes ?? new Uint8Array(await (await gitHubRequest(url, name, { cache: 'no-store', signal })).arrayBuffer());
   const lfs = lfsObject(pointer);
-  if (lfs === null) return describeRemoteFile({ url, size, version: etag, head: headBytes === HEAD_BYTES ? head : null, ...common });
+  if (lfs === null) return describeRemoteFile({ url, size, version, head: headBytes === HEAD_BYTES ? head : null, ...common });
   return describeRemoteFile({
     url: rawFileUrl(parsed, 'https://media.githubusercontent.com/media/'),
     size: lfs.size,
-    // The object's hash names exactly these bytes.
-    version: lfs.oid,
+    // The object's hash names exactly these bytes, read at the commit whose
+    // pointer named it; at a ref, the pointer and the object are read apart
+    // and may be of two versions, so neither names them.
+    version: commit === null || lfs.oid === null ? `size:${lfs.size}` : lfs.oid,
     ...common,
   });
 }
@@ -384,12 +450,17 @@ export default Object.freeze({
   capabilities: Object.freeze({
     folders: true,
     private: 'none',
+    public: false,
     versions: false,
     write: false,
   }),
   match(input) {
     const parsed = parseGitHubPath(input);
     return parsed === null ? null : canonicalValue(parsed);
+  },
+  /** A value carries nothing that grants access: it is shown as it is. */
+  publicValue(value) {
+    return value;
   },
   async open(value, { signal = null } = {}) {
     const parsed = parseGitHubPath(value);
@@ -409,18 +480,26 @@ export default Object.freeze({
       title: `${parsed.owner}/${parsed.repo}`,
       url: `https://github.com/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}`,
     };
-    // A Zarr store folder, read through its consolidated metadata.
+    // A Zarr store folder, read through its consolidated metadata, at the
+    // commit that last wrote anything below it (`lastCommitOf`, one request,
+    // as a file's): its objects never change there, so that commit names its
+    // content, and what is kept of them serves a later visit until the
+    // folder itself changes. Without it, read at its ref, kept for this tab.
     if (folderFormatOfName(parsed.path) !== null) {
       const name = parsed.path.split('/').at(-1);
+      const commit = await lastCommitOf(parsed, signal);
       return {
         title: `${parsed.owner}/${parsed.repo}/${parsed.path}`,
         store: {
-          url: buildRawUrl(parsed),
+          url: buildRawUrl(commit === null ? parsed : { ...parsed, branch: commit }),
           name,
           title: titleOfName(name),
           // The dataset id of a store that states none: without "/", as it
           // becomes `anndata://<id>/`.
-          id: `gh:${encodeURIComponent(`${parsed.owner}/${parsed.repo}/${parsed.path}`)}`,
+          id: datasetIdOf(parsed),
+          // Where it is whatever its version (the ref the link names, not
+          // the commit read): another commit's kept objects are stale.
+          ...(commit === null ? {} : { version: `commit:${commit}`, key: datasetIdOf(parsed) }),
           attribution: repository,
         },
         attribution: repository,

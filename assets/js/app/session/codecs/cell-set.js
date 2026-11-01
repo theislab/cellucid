@@ -30,6 +30,7 @@
 import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
 import { decodeUvarint, uvarintLength, writeUvarint } from './varint.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 
 export const CELL_SET_SORTED_DELTA = 0;
 export const CELL_SET_BITSET = 1;
@@ -39,12 +40,6 @@ export const CELL_SET_REFERENCE_ALL = 4;
 
 /** Cells decoded between yields to the interface. */
 const COOPERATIVE_DECODE_BUDGET = 64 * 1024;
-
-function throwIfAborted(signal) {
-  if (signal !== null && signal.aborted) {
-    throw signal.reason ?? new DOMException('Aborted', 'AbortError');
-  }
-}
 
 /**
  * Order-independent 32-bit digest of a set of cell indices: the sum, modulo

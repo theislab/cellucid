@@ -35,6 +35,8 @@ import { PlotlyRenderSlot } from '../../shared/plotly-render-slot.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 import { excludeMissingCategoricalValues } from '../../data/data-layer.js';
 import { PLACES } from '../../../ui/place-names.js';
+import { analysisCostKind, runProgressively } from '../../shared/progressive-cells.js';
+import { failureText } from '../../../../utils/errors.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -130,6 +132,20 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._destroyPromise = null;
     this._modalRenderGeneration = 0;
 
+    // Genes read for more of the open cells (Genes read for): a gene's plot
+    // is drawn again on the cells now read, once the growth ends (the
+    // detailed view follows its inputs; it has no Run to go stale).
+    const geneSampleState = this.dataLayer?.state ?? null;
+    let geneCells = geneSampleState?.getGeneSample?.()?.cells ?? null;
+    const onGeneSample = ({ sample = null, growth = null } = {}) => {
+      const cells = sample?.cells ?? null;
+      if (this._isDestroyed || growth != null || cells === geneCells) return;
+      geneCells = cells;
+      if (this._currentConfig?.dataSource?.type === 'gene_expression' && this._committedView !== null) this._scheduleUpdate();
+    };
+    geneSampleState?.on?.('gene-sample:changed', onGeneSample);
+    this._stopGeneSampleWatch = () => geneSampleState?.off?.('gene-sample:changed', onGeneSample);
+
     // Bind methods
     this._handleVariableChange = this._handleVariableChange.bind(this);
     this._handlePlotTypeChange = this._handlePlotTypeChange.bind(this);
@@ -153,6 +169,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
 
     // The running, cancelled or failed state of the plot's job.
     this._container.appendChild(this._getJobStatusView().root);
+
+    // The cells the shown plot used (a first pass's sample, or all), and
+    // how the open cells were chosen.
+    this._container.appendChild(this._getCellsUsedLine().root);
+    this._container.appendChild(this._getCellChoiceChip());
 
     // Preview container
     this._previewContainer = document.createElement('div');
@@ -465,7 +486,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       error = new TypeError(`${context} failed with a non-Error value`);
     }
     this._notifications.error(
-      `${context} failed: ${error.message}`,
+      `${context} failed: ${failureText(error)}`,
       { category: 'analysis', title: 'Analysis error' }
     );
   }
@@ -545,16 +566,55 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   // Analysis Execution
   // ===========================================================================
 
+  /** A gene's values are read when the variable is a gene's. @override */
+  _runReadsGenes() {
+    return this._currentConfig?.dataSource?.type === 'gene_expression';
+  }
+
   /**
    * Run the analysis (implements abstract method from BaseAnalysisUI)
    * @override
    */
   async _runAnalysis(requestId, job) {
     if (!this._isCurrentAnalysisRequest(requestId)) return;
-    await this._whileBusy(
-      this._previewContainer,
-      () => this._runPreviewAnalysis(requestId, job)
-    );
+    const openCells = this.dataLayer.state?.pointCount ?? 0;
+    const isCurrent = () => this._isCurrentAnalysisRequest(requestId);
+    const progress = { shown: null };
+    try {
+      // A first pass on a uniform sample of the open cells, when it answers
+      // sooner by enough to be worth its cost (measured on this device);
+      // each pass draws its plot.
+      const done = await this._whileBusy(
+        this._previewContainer,
+        () => runProgressively({
+          kind: analysisCostKind(this._getJobTitle()),
+          dataLayer: this.dataLayer,
+          job,
+          isCurrent,
+          progress,
+          pass: async sample => {
+            await this._runPreviewAnalysis(requestId, job, sample);
+            return isCurrent() ? true : null;
+          },
+          onFirstPass: async (_drawn, sample) => {
+            this._showCellsUsed(sample, openCells, 'refining');
+            // Cancelled or superseded while refining: the first pass stays
+            // on screen, saying it is one.
+            this._registerAnalysisInvalidationCleanup(requestId, () => {
+              if (progress.shown === sample) this._showCellsUsed(sample, openCells, 'stopped');
+            });
+          }
+        })
+      );
+      if (done !== null && isCurrent()) {
+        progress.shown = null;
+        this._showCellsUsed(null, openCells, null, true);
+      }
+      else if (progress.shown !== null && isCurrent()) this._showCellsUsed(progress.shown, openCells, 'stopped');
+    } catch (error) {
+      if (progress.shown !== null && isCurrent()) this._showCellsUsed(progress.shown, openCells, 'stopped');
+      throw error;
+    }
   }
 
   /** @override */
@@ -563,9 +623,10 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   /** @private */
-  async _runPreviewAnalysis(requestId, job) {
+  async _runPreviewAnalysis(requestId, job, sample = null) {
     const config = structuredClone(this._currentConfig);
-    const pageIds = [...this._selectedPages];
+    // A first pass reads each page's cells in the sample (`progressive-cells.js`).
+    const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
     const customColors = new Map(
       this._pageSelector?.getCustomColors?.() || []
     );
@@ -591,9 +652,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       job.step('Drawing the plot');
       // Missing categories are excluded per variable, before any plot,
       // summary table or categorical test sees the page.
-      const pageData = config.dataSource.type === 'categorical_obs'
+      const pageDataOfCells = config.dataSource.type === 'categorical_obs'
         ? excludeMissingCategoricalValues(fetchedPageData)
         : fetchedPageData;
+      // A sample's pages are named and coloured as their pages.
+      const pageData = sample === null
+        ? pageDataOfCells
+        : pageDataOfCells.map(page => ({ ...page, pageId: sample.basePageId(page.pageId) }));
 
       if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (pageData.length === 0) {
@@ -645,6 +710,10 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._previewContainer.classList.remove('empty');
       this._currentPageData = pageData;
       this._committedView = Object.freeze({ config, pageData, layoutEngine });
+      // A gene read for a sample of the open cells is summarised on its
+      // cells with a value (NaN elsewhere): the chip says which.
+      const geneSample = config.dataSource.type === 'gene_expression' ? (this.dataLayer.state?.getGeneSample?.() ?? null) : null;
+      this._showCellChoice(this.dataLayer.state?.cellIdentity ?? null, geneSample === null ? null : { cells: geneSample.cells, of: geneSample.of, groups: [] });
 
       // Show actions
       this._renderActions();
@@ -762,6 +831,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     if (this._actionsContainer) {
       this._actionsContainer.hidden = true;
     }
+    this._showCellsUsed(null);
+    this._showCellChoice(null);
     return true;
   }
 
@@ -1071,6 +1142,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const errors = [];
     const selectorTasks = [];
     this._isDestroyed = true;
+    this._stopGeneSampleWatch?.();
     this._modalRenderGeneration += 1;
     try {
       this._invalidateAnalysisRequest();

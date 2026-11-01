@@ -11,14 +11,24 @@
  * (`this._options`); sessions save `{options, selectedPages, view}`. Typing
  * never runs anything. An option change re-applies a display option to the
  * shown result, or marks the result stale (dimmed, with a "Stale · Run"
- * chip) until the next run.
+ * chip) until the next run. So do another set of open cells (Apply in place,
+ * a progressive opening's step: `state.cellIdentity` is replaced), a
+ * highlight change and, for an analysis of the visible cells, a filter. A
+ * stale result is never passed on as current: it is not saved in a session
+ * (`exportResult` gives null), not exported (CSV, PNG, SVG, GMT refuse and
+ * say why) and not published to the derived results a notebook reads (its
+ * scores and gene sets are withdrawn while it is stale).
  *
  * Subclasses implement:
  * - static getRequirements() - { minPages, maxPages, description }
  * - _getTitle()
  * - _getOptionsSchema() - the analysis's schema
- * - _runAnalysisImpl(options, requestId, job) - the result `{ data, ... }`,
- *   or null when superseded
+ * - _runAnalysisImpl(options, requestId, job, sample) - the result
+ *   `{ data, ... }`, or null when superseded. `sample` is null (every open
+ *   cell) unless the analysis takes a first pass (`_takesCellSample`): then
+ *   it is the first pass's cells (`shared/progressive-cells.js`), and the
+ *   analysis runs exactly as it would on every cell, on each group's cells
+ *   among them
  * - _showResult(result, requestId) - render the completed result
  *
  * Subclasses may implement:
@@ -32,6 +42,9 @@
  *   session's `view` record beside the open disclosures
  * - _getExtraSettingKeys() / _exportExtraSettings() / _importExtraSettings()
  * - _getSuccessMessage(), _getClassName(), and the _renderModal* methods
+ * - _takesCellSample() - true when `_runAnalysisImpl` narrows its cells to a
+ *   `sample`: a run then answers first on a uniform sample of the open cells
+ *   when that pays (measured), and refines in place to every open cell
  *
  * @module analysis-types/base/form-based-analysis
  */
@@ -55,6 +68,10 @@ import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { PlotlyRenderSlot } from '../../../shared/plotly-render-slot.js';
 import { isPlainRecord, requireExactKeys } from '../../../../../utils/exact-record.js';
+import { analysisCostKind, runProgressively } from '../../../shared/progressive-cells.js';
+import { formatCountOf } from '../../../../../utils/format-units.js';
+import { cellsSteady } from '../../../../../data/open-cells-work.js';
+import { failureText } from '../../../../../utils/errors.js';
 
 function requirePageIds(pageIds) {
   if (!Array.isArray(pageIds)) {
@@ -189,8 +206,12 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._disclosures = { more: false, groups: [] };
     /** @type {ReturnType<typeof renderOptionsForm>|null} */
     this._optionsForm = null;
-    /** The options and pages the shown result was computed with. */
+    /** The options, pages and open cells the shown result was computed with. */
     this._resultInputs = null;
+    /** Whether the shown result's derived results were withdrawn as stale. */
+    this._publishedStale = false;
+    /** The open cells what the analysis keeps of the data describes (`_onOpenCellsChanged`). */
+    this._cellsSeen = this._openCells();
     /** Highlight changes since the shown result was computed. */
     this._highlightRevision = 0;
     /**
@@ -210,6 +231,16 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
     /** The gene loader last asked for highly variable genes, and its answer. */
     this._highlyVariable = { loader: null, marked: false };
+    // Genes read for more of the open cells (Genes read for): a result
+    // that read genes for fewer is stale (`_isResultStale`).
+    const geneSampleState = this.dataLayer?.state ?? null;
+    const onGeneSample = () => {
+      if (!this._isDestroyed) this._updateStale();
+    };
+    const unsubscribe = typeof geneSampleState?.on === 'function' ? geneSampleState.on('gene-sample:changed', onGeneSample) : null;
+    this._stopGeneSampleWatch = typeof unsubscribe === 'function'
+      ? unsubscribe
+      : () => geneSampleState?.off?.('gene-sample:changed', onGeneSample);
     // Note: _selectedPages, _lastResult, and _isLoading are inherited from BaseAnalysisUI
   }
 
@@ -302,7 +333,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
           if (this._highlyVariable.marked) this._refreshOptionsContext();
         }, error => {
           if (this._isDestroyed || this._highlyVariable.loader !== loader) return;
-          this._notifications.error(`Highly variable genes could not be read: ${error.message}`, { category: 'analysis' });
+          this._notifications.error(`Highly variable genes could not be read: ${failureText(error)}`, { category: 'analysis' });
         });
       }
     }
@@ -422,10 +453,82 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._updateStale();
   }
 
+  /** The cells open now: replaced whenever they change (`state.cellIdentity`). @protected */
+  _openCells() {
+    return this.dataLayer?.state?.cellIdentity ?? null;
+  }
+
+  /**
+   * The gene sample a result read its genes for (`shared/gene-sample-cells.js`
+   * `geneSampleUse`), as the run recorded it: a differential expression's
+   * summary, a signature's, a marker run's metadata; else, for an analysis
+   * that reads genes (`_readsGenes`), the open cells' gene sample now. Null
+   * when genes were read for every open cell, or none were read.
+   *
+   * @param {Object|null} result
+   * @returns {{cells: number, of: number, groups?: Array}|null}
+   * @protected
+   */
+  _resultGeneSample(result) {
+    const recorded = result?.geneSample ?? result?.summary?.geneSample ?? result?.metadata?.geneSample
+      ?? result?.data?.geneSample ?? result?.data?.summary?.geneSample ?? undefined;
+    if (recorded !== undefined) return recorded;
+    if (!this._readsGenes(result?.options ?? null)) return null;
+    const sample = this.dataLayer?.state?.getGeneSample?.() ?? null;
+    return sample === null ? null : { cells: sample.cells, of: sample.of, groups: [] };
+  }
+
+  /**
+   * Whether a run with these options reads genes: any variable it names is a
+   * gene's (`type: 'gene_expression'`), or it names genes or gene sets.
+   * Overridden by an analysis that always does.
+   *
+   * @param {Object|null} options
+   * @returns {boolean}
+   * @protected
+   */
+  _readsGenes(options) {
+    if (options === null || typeof options !== 'object') return false;
+    const seen = new Set();
+    const visit = value => {
+      if (value === null || typeof value !== 'object' || seen.has(value)) return false;
+      seen.add(value);
+      if (value.type === 'gene_expression') return true;
+      return Object.entries(value).some(([key, entry]) => ((key === 'genes' || key === 'geneSets' || key === 'geneList') && entry != null && (!Array.isArray(entry) || entry.length > 0)) || visit(entry));
+    };
+    return visit(options);
+  }
+
+  /**
+   * The open cells changed (Apply in place, a progressive opening's step):
+   * what the analysis keeps of the data (a field's codes, its groups and
+   * their counts) describes the cells open before, and is read again. A
+   * description still being read for those cells is dropped when it
+   * arrives. @protected
+   */
+  _onOpenCellsChanged() {}
+
+  /** Call `_onOpenCellsChanged` once for each new set of open cells. @private */
+  _syncOpenCells() {
+    const cells = this._openCells();
+    if (cells === this._cellsSeen) return;
+    this._cellsSeen = cells;
+    this._onOpenCellsChanged();
+    // A blocker may depend on how the open cells were chosen.
+    this._updateRunRow();
+  }
+
+  /** Whether the shown result was computed on other open cells than the ones open now. */
+  _resultCellsChanged() {
+    return this._lastResult !== null && this._resultInputs !== null && this._resultInputs.cells !== this._openCells();
+  }
+
   /** Whether the shown result was computed from other inputs than the form's. */
   _isResultStale() {
     if (this._lastResult === null || this._resultInputs === null) return false;
-    const { options, pages, highlightRevision, visibleDigest } = this._resultInputs;
+    const { options, pages, highlightRevision, visibleDigest, cells } = this._resultInputs;
+    if (cells !== this._openCells()) return true;
+    if (this._resultGeneCellsChanged()) return true;
     if (highlightRevision !== this._highlightRevision) return true;
     if (this._scopesByVisibleCells(options) && visibleDigest !== this._visibleCellsDigest()) return true;
     if (!sameOptionValue(pages, [...this._selectedPages])) return true;
@@ -433,11 +536,59 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     return schema.keys.some(key => !this._isDisplayOption(key) && !sameOptionValue(options[key], this._options[key]));
   }
 
+  /**
+   * Whether the shown result read genes for a sample of the open cells and
+   * genes are read for more of them now (`gene-sample.js`). @private
+   */
+  _resultGeneCellsChanged() {
+    const then = this._resultInputs?.geneCells ?? null;
+    return then !== null && (this.dataLayer?.state?.getGeneSample?.()?.cells ?? null) !== then;
+  }
+
+  /** Why the shown result is stale, in one sentence. @private */
+  _staleReason() {
+    if (this._resultGeneCellsChanged()) {
+      const now = this.dataLayer?.state?.getGeneSample?.() ?? null;
+      return `Genes are read for more cells since this result (${formatCountOf(this._resultInputs.geneCells, 'cell')} then, ${now === null ? 'every open cell' : formatCountOf(now.cells, 'cell')} now).`;
+    }
+    if (this._resultCellsChanged()) {
+      const then = this._resultInputs.cells;
+      const now = this._openCells();
+      return then !== null && now !== null && then.n !== now.n
+        ? `The open cells changed since this result (${formatCountOf(then.n, 'cell')} then, ${formatCountOf(now.n, 'cell')} now).`
+        : 'The open cells changed since this result.';
+    }
+    return 'The settings, pages or cells changed since this result.';
+  }
+
+  /**
+   * Refuse to export a stale result, saying why: an export is read as the
+   * result of the settings and cells shown now. True when refused.
+   * @protected
+   */
+  _refuseStaleExport(format) {
+    if (!this._isResultStale()) return false;
+    this._notifications.warning(`${format} not exported. ${this._staleReason()} Run it again to export it.`, { category: 'download' });
+    return true;
+  }
+
+  /**
+   * A stale result's scores and gene sets leave the derived results (a
+   * notebook would read them as current); they come back when it is current
+   * again (a setting changed back). @private
+   */
+  _syncStalePublication(stale) {
+    if (this._lastResult === null || stale === this._publishedStale) return;
+    this._publishedStale = stale;
+    this._publishDerivedResultsSafely(stale ? null : this._lastResult);
+  }
+
   /** Dim the shown result and offer a run when it no longer matches the form. @private */
   _updateStale() {
+    const stale = this._isResultStale();
+    this._syncStalePublication(stale);
     const container = this._resultContainer;
     if (!(container instanceof HTMLElement)) return;
-    const stale = this._isResultStale();
     container.classList.toggle('analysis-result-stale', stale);
     let chip = container.querySelector(':scope > .analysis-stale-chip');
     if (!stale) {
@@ -449,10 +600,26 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       chip.type = 'button';
       chip.className = 'analysis-chip analysis-chip-warning analysis-stale-chip';
       chip.textContent = 'Stale · Run';
-      chip.title = 'The settings or pages changed since this result: run again';
       chip.addEventListener('click', () => this._runAgain());
       container.prepend(chip);
     }
+    chip.title = `${this._staleReason()} Run again.`;
+  }
+
+  /**
+   * The shown result for a session, or null when there is none or it is
+   * stale: a session restores it as the result of the settings and cells it
+   * saves, which a stale result is not. Subclasses encode it
+   * (`_exportResult`).
+   * @returns {null|{kind: string, version: number, payload: unknown}}
+   */
+  exportResult() {
+    return this._isResultStale() ? null : this._exportResult();
+  }
+
+  /** The shown, current result as a session envelope, or null. @protected */
+  _exportResult() {
+    return null;
   }
 
   /** Disable Run with its reason when the options cannot run. @private */
@@ -460,11 +627,26 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (this._runRow === null || this._options === null) return;
     const { button, reason } = this._runRow;
     const blocker = this._isLoading ? null : this._getRunBlocker(this._options);
+    // What a run would cost, said before it starts when it is large; it
+    // never disables Run.
+    const said = blocker ?? (this._isLoading ? null : this._getRunNotice(this._options));
     if (button.dataset.running !== 'true') button.disabled = blocker !== null;
-    reason.hidden = blocker === null;
-    reason.textContent = blocker ?? '';
+    reason.hidden = said === null;
+    reason.textContent = said ?? '';
     if (blocker === null) button.removeAttribute('title');
     else button.title = blocker;
+  }
+
+  /**
+   * A cost of running these options worth saying before Run (memory a
+   * result would hold beyond this device's share for analyses), or null.
+   * Never a refusal: `_getRunBlocker` refuses.
+   * @param {Object} _options
+   * @returns {string|null}
+   * @protected
+   */
+  _getRunNotice(_options) {
+    return null;
   }
 
   /**
@@ -698,7 +880,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       error = new TypeError('Analysis plot resize failed with a non-Error value');
     }
     this._notifications.error(
-      `Plot resize failed: ${error.message}`,
+      `Plot resize failed: ${failureText(error)}`,
       { category: 'analysis', title: 'Analysis error' }
     );
   }
@@ -955,7 +1137,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         );
       }
       this._notifications.error(
-        `Expanded view cleanup failed: ${error.message}`,
+        `Expanded view cleanup failed: ${failureText(error)}`,
         { category: 'analysis', title: 'Analysis cleanup error' }
       );
     };
@@ -997,7 +1179,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         'SVG export'
       ),
       onExportCSV: () => this._trackInteractiveTask(
-        Promise.resolve().then(() => this._exportModalCSV()),
+        Promise.resolve().then(() => (this._refuseStaleExport('CSV') ? undefined : this._exportModalCSV())),
         'CSV export'
       )
     });
@@ -1099,18 +1281,22 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * Show a result restored from a session through the same render and
-   * publication path a fresh run takes, so the two draw identically.
+   * Show a result restored from a session through the same render path a
+   * fresh run takes, so the two draw identically.
+   *
+   * The result is this UI's current one once this resolves; its plot is
+   * drawn as soon as its panel can draw. A plot waits for its host to have a
+   * size (`PlotRenderSlot`), and a host in a closed analysis row, a closed
+   * window or a tab in the background has none until the person shows it,
+   * so a restore that waited for the drawing would wait on a click. A
+   * drawing that fails says so and withdraws the result.
    *
    * @param {Object} result - The decoded result, shaped as `_runAnalysisImpl`
    *   returns it.
-   * @param {Object} [options]
-   * @param {() => void} [options.beforePublish] - Restores the state a run
-   *   sets beside its result, after the render and before publication.
    * @returns {Promise<void>}
    * @protected
    */
-  async _restoreAnalysisResult(result, { beforePublish = null } = {}) {
+  async _restoreAnalysisResult(result) {
     if (this._isDestroyed) {
       throw new Error(`${this.constructor.name} was destroyed before its result was restored`);
     }
@@ -1123,28 +1309,45 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       throw new Error(`${this.constructor.name} could not start restoring its result`);
     }
     const releaseBusy = this._claimBusy();
+    let drawing = null;
     try {
-      await this._showResult(result, requestId);
-      if (!this._isCurrentAnalysisRequest(requestId)) {
-        throw new Error(`Restoring the ${this.constructor.name} result was superseded`);
-      }
-      if (beforePublish !== null) beforePublish();
+      drawing = this._showResult(result, requestId);
       await this._publishAnalysisResult(result, requestId);
-      // A restored result was computed from the options restored with it.
+      // A restored result was computed from the options restored with it,
+      // on the cells the session opened.
       this._resultInputs = {
         options: structuredClone(this._requireOptions()),
         pages: [...this._selectedPages],
         highlightRevision: this._highlightRevision,
-        visibleDigest: this._visibleCellsDigest()
+        visibleDigest: this._visibleCellsDigest(),
+        cells: this._openCells(),
+        geneCells: this._resultGeneSample(result)?.cells ?? null
       };
       this._updateStale();
       if (this.onResultChange !== null && this.onResultChange !== undefined) {
         this.onResultChange(result);
       }
-    } finally {
+    } catch (error) {
       releaseBusy();
       this._finishAnalysisRequest(requestId);
+      drawing?.catch(() => {});
+      throw error;
     }
+    void drawing.then(
+      () => {},
+      async error => {
+        if (!this._isCurrentAnalysisRequest(requestId)) return;
+        this._notifications.error(
+          `The restored result could not be drawn: ${failureText(error)}`,
+          { category: 'analysis', title: 'Analysis error' }
+        );
+        this._invalidateAnalysisRequest();
+        await this._discardFormResult();
+      }
+    ).finally(() => {
+      releaseBusy();
+      this._finishAnalysisRequest(requestId);
+    });
   }
 
   /**
@@ -1166,6 +1369,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   async _publishAnalysisResult(result, requestId = null) {
     this._lastResult = result;
+    this._publishedStale = false;
+    // Every result is of the open cells: say how they were chosen, and on
+    // which of them genes were read (`_resultGeneSample`).
+    this._showCellChoice(this._openCells(), this._resultGeneSample(result));
+    this._publishDerivedResultsSafely(result);
     this._currentPageData = result.data || result;
     this._requestedPlotOptions = structuredClone(result.options || {});
 
@@ -1540,6 +1748,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Export modal plot as PNG
    */
   async _exportModalPNG() {
+    if (this._refuseStaleExport('PNG')) return;
     const modal = this._modal;
     const slot = modal?._analysisPlotSlot ?? null;
     if (!(modal?._plotContainer instanceof HTMLElement) || slot === null) {
@@ -1565,6 +1774,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Export modal plot as SVG
    */
   async _exportModalSVG() {
+    if (this._refuseStaleExport('SVG')) return;
     const modal = this._modal;
     const slot = modal?._analysisPlotSlot ?? null;
     if (!(modal?._plotContainer instanceof HTMLElement) || slot === null) {
@@ -1638,6 +1848,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     // The running, cancelled or failed state of the analysis's job.
     this._container.appendChild(this._getJobStatusView().root);
 
+    // The cells the shown result used (a first pass's sample, or all), and
+    // how the open cells were chosen.
+    this._container.appendChild(this._getCellsUsedLine().root);
+    this._container.appendChild(this._getCellChoiceChip());
+
     // Result container (hidden initially)
     this._resultContainer = document.createElement('div');
     this._resultContainer.className = `${this._getClassName()}-result-container`;
@@ -1663,7 +1878,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     const validation = this.validateRequirements(this._selectedPages);
     if (!validation.valid) {
       this._formContainer.appendChild(createStatusLine({
-        tone: 'warning',
+        // Genes still being read is no problem: the form opens once they are.
+        tone: validation.pending === true ? 'muted' : 'warning',
         text: validation.error || this.getRequirementText()
       }).root);
       return;
@@ -1774,38 +1990,88 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       this._updateRunRow();
       return;
     }
+    // The open cells being changed in place: the run starts on the cells
+    // after it, and its result is theirs (`data/open-cells-work.js`).
+    const steady = cellsSteady();
+    if (steady !== null) {
+      await steady;
+      if (this._isDestroyed) return;
+    }
+    // Genes read for more cells in the background (the first gene's
+    // top-up): stopped and settled, so the run reads on the sample that stays.
+    const holding = this.dataLayer?.holdGeneSample?.() ?? null;
+    if (holding !== null) {
+      await holding;
+      if (this._isDestroyed) return;
+    }
     const pages = [...this._selectedPages];
     const highlightRevision = this._highlightRevision;
     const visibleDigest = this._visibleCellsDigest();
+    const cells = this._openCells();
 
     const requestId = this._startAnalysisRequest();
     if (requestId === null) return;
     const releaseBusy = this._claimBusy();
     const job = this._startAnalysisJob(requestId, { title: this._getJobTitle() });
     this._holdRunButton(requestId, job);
+    const openCells = this._takesCellSample() ? (this.dataLayer.state?.pointCount ?? 0) : 0;
+    // The first pass on screen, if any (`runProgressively`).
+    const progress = { shown: null };
 
     try {
-      const result = this._isCurrentAnalysisRequest(requestId)
-        ? await this._runAnalysisImpl(options, requestId, job)
-        : null;
+      const isCurrent = () => this._isCurrentAnalysisRequest(requestId);
+      const pass = sample => this._runAnalysisImpl(options, requestId, job, sample);
+      // A first pass on a uniform sample of the open cells, when it answers
+      // sooner by enough to be worth its cost (measured on this device).
+      const result = !isCurrent()
+        ? null
+        : this._takesCellSample()
+          ? await runProgressively({
+              kind: analysisCostKind(this._getTitle()),
+              units: this._getRunUnits(options),
+              dataLayer: this.dataLayer,
+              job,
+              isCurrent,
+              pass,
+              progress,
+              onFirstPass: async (first, sample) => {
+                this._requireFormResult(first);
+                job.step('Drawing the first pass');
+                await this._showResult(first, requestId);
+                if (!isCurrent()) return false;
+                // The gene sample first: the line says it with the cells used.
+                this._showCellChoice(cells, this._resultGeneSample(first));
+                this._showCellsUsed(sample, openCells, 'refining');
+                // Cancelled or superseded while refining: the first pass
+                // stays on screen, saying it is one.
+                this._registerAnalysisInvalidationCleanup(requestId, () => {
+                  if (progress.shown === sample) this._showCellsUsed(sample, openCells, 'stopped');
+                });
+                return true;
+              }
+            })
+          : await pass(null);
 
-      if (result === null || !this._isCurrentAnalysisRequest(requestId)) {
+      if (result === null || !isCurrent()) {
         job.cancel();
+        if (progress.shown !== null && isCurrent()) this._showCellsUsed(progress.shown, openCells, 'stopped');
         return;
       }
-      if (!isPlainRecord(result)) {
-        throw new TypeError('Form-based analysis must return an exact result object');
-      }
-      if (!Object.hasOwn(result, 'data')) {
-        throw new TypeError('Form-based analysis result must contain data');
-      }
+      this._requireFormResult(result);
       job.step('Drawing the result');
       await this._showResult(result, requestId);
       if (!this._isCurrentAnalysisRequest(requestId)) return;
+      progress.shown = null;
+      if (this._takesCellSample()) {
+        // The gene sample the result read genes for first: the line says it
+        // (never "every cell" for a moment); publishing says it again.
+        this._showCellChoice(cells, this._resultGeneSample(result));
+        this._showCellsUsed(null, openCells, null, true);
+      }
 
       // Publish result/data only after the owned render transaction commits.
       await this._publishAnalysisResult(result, requestId);
-      this._resultInputs = { options, pages, highlightRevision, visibleDigest };
+      this._resultInputs = { options, pages, highlightRevision, visibleDigest, cells, geneCells: this._resultGeneSample(result)?.cells ?? null };
       // Display options changed while the run went: drawn now, once.
       const schema = this._getOptionsSchema();
       const displayChanged = schema.keys.filter(name =>
@@ -1832,6 +2098,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         job.cancel();
         return;
       }
+      // A first pass stays on screen, saying it is one.
+      if (progress.shown !== null) this._showCellsUsed(progress.shown, openCells, 'stopped');
       // The job's status view and notification say why; a cancel is calm.
       this._failAnalysisJob(job, error);
     } finally {
@@ -1839,6 +2107,40 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       this._finishAnalysisRequest(requestId);
     }
   }
+
+  /** @private */
+  _requireFormResult(result) {
+    if (!isPlainRecord(result)) {
+      throw new TypeError('Form-based analysis must return an exact result object');
+    }
+    if (!Object.hasOwn(result, 'data')) {
+      throw new TypeError('Form-based analysis result must contain data');
+    }
+  }
+
+  /**
+   * Whether `_runAnalysisImpl` narrows its cells to a first pass's `sample`
+   * (see the module comment). An analysis that cannot answer on a sample
+   * keeps the default and always runs once on every open cell.
+   * @returns {boolean}
+   * @protected
+   */
+  _takesCellSample() {
+    return false;
+  }
+
+  /**
+   * The units of work a run of `options` scales with, for the cost model a
+   * first pass is judged by (`shared/progressive-cells.js`): the genes it
+   * reads, for an analysis that reads genes; 1 otherwise.
+   * @param {Object} _options
+   * @returns {number}
+   * @protected
+   */
+  _getRunUnits(_options) {
+    return 1;
+  }
+
 
   // ===========================================================================
   // Page Selection
@@ -1851,6 +2153,8 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   _discardFormResult() {
     this._optionRenderRevision += 1;
     this._clearJobStatus();
+    this._showCellsUsed(null);
+    this._showCellChoice(null);
     const cleanupTasks = [];
     if (this._previewPlotSlot != null) {
       cleanupTasks.push(this._previewPlotSlot.invalidate());
@@ -1876,6 +2180,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       }
     }
     this._lastResult = null;
+    this._publishDerivedResultsSafely(null);
     this._currentPageData = null;
     this._requestedPlotOptions = null;
     if (cleanupTasks.length === 0) return;
@@ -1913,6 +2218,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @override
    */
   onHighlightChanged() {
+    this._syncOpenCells();
     this._updatePageSelectorCounts();
     this._highlightRevision += 1;
     this._refreshOptionsContext();
@@ -1989,10 +2295,24 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     if (kind === 'highlight') this._highlightRevision += 1;
     else if (kind !== 'cell-visibility') throw new RangeError(`Unknown analysis input change: ${String(kind)}`);
     this._missedInputChange = true;
+    // Hidden, a result made stale is withdrawn at once all the same.
+    if (kind === 'highlight') this._syncStalePublication(this._isResultStale());
+  }
+
+  /**
+   * The gene list was read after the first view (or could not be): the form
+   * is built again -- every choice kept -- so a form that waited for the
+   * genes opens, and every gene choice lists them.
+   * @override
+   */
+  onGenesListed() {
+    if (this._isDestroyed || this._formContainer === null) return;
+    this._renderControls();
   }
 
   /** Shown again: catch up with the changes recorded while hidden. */
   onShown() {
+    this._syncOpenCells();
     if (!this._missedInputChange) return;
     this._missedInputChange = false;
     if (this._scopesByVisibleCells(this._options)) this._syncVisibleCells();
@@ -2016,6 +2336,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   destroy() {
     if (this._destroyPromise != null) return this._destroyPromise;
     this._isDestroyed = true;
+    this._stopGeneSampleWatch?.();
     this._invalidateAnalysisRequest();
     this._optionRenderRevision += 1;
     this._cancelChunkedTableRender();

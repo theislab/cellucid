@@ -11,6 +11,9 @@
  * - no category large enough: one line saying the fewest cells a category
  *   needs;
  * - quantiles stored in the file, or already got: the slider alone, instant;
+ *   when they were computed on the open cells of a subsample, one line saying
+ *   they are an estimate ("Estimated from the open 1,000 cells."): stored
+ *   quantiles describe the whole dataset, computed ones only the open cells;
  * - quantiles to compute: the slider and one line naming what the first use
  *   reads and how large it is;
  * - while they are got: a progress bar, one line, and Cancel (which puts the
@@ -72,18 +75,28 @@ export function describeOutlierStatus(status) {
         action: null,
         slider: false,
       };
+    case 'ready':
+      if (status.estimate == null) return null;
+      return {
+        text: `Estimated from the open ${formatCountOf(status.estimate.open, 'cell')}.`,
+        detail: estimateDetail(status.estimate),
+        tone: 'info',
+        action: null,
+        slider: true,
+      };
     case 'available': {
       const plan = status.plan;
       if (plan?.source !== 'read') return null;
       const bytes = describePlanBytes(plan);
       const size = bytes === null ? '' : ` (${bytes})`;
+      const detail = plan.kept
+        ? 'The outlier distances are computed once from the latent space; every other field then filters at once.'
+        : 'The latent space is larger than the memory Cellucid keeps for it, so each field reads it again.';
       return {
         text: plan.kept
           ? `First use reads ${plan.latentKey}${size}.`
           : `Each field’s first use reads ${plan.latentKey}${size}.`,
-        detail: plan.kept
-          ? 'The outlier distances are computed once from the latent space; every other field then filters at once.'
-          : 'The latent space is larger than the memory Cellucid keeps for it, so each field reads it again.',
+        detail: status.estimate == null ? detail : `${detail} ${estimateDetail(status.estimate)}`,
         tone: 'info',
         action: null,
         slider: true,
@@ -118,6 +131,12 @@ export function describeOutlierStatus(status) {
     default:
       return null;
   }
+}
+
+/** Why quantiles computed on a subsample's open cells are an estimate. */
+function estimateDetail({ open, of }) {
+  return `Computed on the ${formatCountOf(open, 'open cell')} of ${formatCountOf(of, 'cell')}, so they estimate the whole ` +
+    'dataset’s: opening other cells can move a cell’s quantile. Quantiles stored by prepare() describe every cell.';
 }
 
 /** How far a running status has come, 0–100, or null when not known. */

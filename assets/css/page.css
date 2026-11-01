@@ -11,10 +11,10 @@
 
 @layer tokens, themes, base, utilities, components, layouts, overrides;
 
-@import 'tokens/_index.css' layer(tokens);
-@import 'themes/_index.css' layer(themes);
-@import 'base/_index.css' layer(base);
+@import 'tokens/_index.css?v=fbf7d190a123' layer(tokens);
+@import 'themes/_index.css?v=4f6132404d9d' layer(themes);
+@import 'base/_index.css?v=698a201a13bc' layer(base);
 
-@import 'components/_welcome.css' layer(components);
-@import 'layouts/_page.css' layer(layouts);
-@import 'layouts/_responsive.css' layer(layouts);
+@import 'components/_welcome.css?v=ff5fab99eaab' layer(components);
+@import 'layouts/_page.css?v=467569f78436' layer(layouts);
+@import 'layouts/_responsive.css?v=f62b5136c24c' layer(layouts);

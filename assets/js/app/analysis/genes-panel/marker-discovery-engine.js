@@ -33,6 +33,7 @@ import { createRunTunerFor, runGeneStream, taskGenes } from '../shared/gene-stre
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
 import { P_CONVENTIONS, TEST_METHODS } from '../compute/gene-statistics.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { abortReason, onAbort, throwIfAborted } from '../../../utils/abort.js';
 
 // =============================================================================
 // INTERNAL HELPERS
@@ -46,17 +47,6 @@ import { formatCount, formatCountOf } from '../../../utils/format-units.js';
  */
 let markerContextLeaseActive = false;
 const markerContextLeaseWaiters = [];
-
-function getAbortReason(signal) {
-  return signal?.reason ??
-    new DOMException('Marker discovery was aborted', 'AbortError');
-}
-
-function throwIfAborted(signal) {
-  if (signal?.aborted) {
-    throw getAbortReason(signal);
-  }
-}
 
 /**
  * @param {AbortSignal|undefined} signal
@@ -77,7 +67,7 @@ async function acquireMarkerContextLease(signal) {
         const waiter = markerContextLeaseWaiters.shift();
         waiter.removeAbortListener();
         if (waiter.signal?.aborted) {
-          waiter.reject(getAbortReason(waiter.signal));
+          waiter.reject(abortReason(waiter.signal));
           continue;
         }
         waiter.resolve(createRelease());
@@ -99,32 +89,41 @@ async function acquireMarkerContextLease(signal) {
         reject,
         removeAbortListener: () => {}
       };
-      if (signal) {
-        const handleAbort = () => {
-          const index = markerContextLeaseWaiters.indexOf(waiter);
-          if (index >= 0) {
-            markerContextLeaseWaiters.splice(index, 1);
-          }
-          waiter.removeAbortListener();
-          reject(getAbortReason(signal));
-        };
-        waiter.removeAbortListener = () => {
-          signal.removeEventListener('abort', handleAbort);
-        };
-        signal.addEventListener('abort', handleAbort, { once: true });
-      }
+      // Queued first: a signal stopped already takes it out again at once.
       markerContextLeaseWaiters.push(waiter);
+      waiter.removeAbortListener = onAbort(signal, () => {
+        const index = markerContextLeaseWaiters.indexOf(waiter);
+        if (index >= 0) {
+          markerContextLeaseWaiters.splice(index, 1);
+        }
+        reject(abortReason(signal));
+      });
     });
   }
 
   if (signal?.aborted) {
     release();
-    throw getAbortReason(signal);
+    throw abortReason(signal);
   }
   return release;
 }
 
 const CORRECTIONS = Object.freeze(['bh', 'bonferroni']);
+
+/**
+ * What one analysis worker holds for a marker run's groups: the codes sent
+ * (while the group index is built from them), each cell's group index, and
+ * the kernel's per-group tables (`createGroupingContext`: sizes, flags, and
+ * 64 rows of per-group counts to start).
+ *
+ * @param {Uint8Array|Uint16Array|Uint32Array} codes
+ * @param {number} groupCount
+ * @returns {number}
+ */
+function markerContextBytes(codes, groupCount) {
+  const indexBytes = groupCount <= 0x7fff ? 2 : 4;
+  return codes.length * (codes.BYTES_PER_ELEMENT + indexBytes) + groupCount * (4 + 1 + 64 * 4);
+}
 
 // =============================================================================
 // MARKER DISCOVERY ENGINE
@@ -172,7 +171,7 @@ export class MarkerDiscoveryEngine {
    * @param {string|null} [options.readOwner]
    * @param {string} [options.matrix='mapped'] - The expression matrix the
    *   genes are read from (`DataLayer.readGeneColumn`)
-   * @param {(gene: string, moments: {sum: number, sumSq: number, nonZero: number, n: number}) => void} [options.onGeneMoments] -
+   * @param {(gene: string, moments: {mean: number, m2: number, nonZero: number, n: number}) => void} [options.onGeneMoments] -
    *   Each gene's moments over every cell, which the same pass computes
    *   (`shared/gene-moments-cache.js`)
    * @returns {Promise<Object>} The full statistics (`MarkerStatistics` without groups)
@@ -262,11 +261,22 @@ export class MarkerDiscoveryEngine {
           reference
         }),
         // A worker replaced after a cancelled task gets the context again.
-        { timeout: 30000, signal: signal ?? null, retainAs: 'markers' }
+        // Each worker holds the codes while it builds each cell's group
+        // index from them (two bytes a cell, four past 32,767 groups) and its
+        // tables (`data-worker.js` `setMarkerContext`, `createGroupingContext`):
+        // counted as held, not the codes alone.
+        { signal: signal ?? null, retainAs: 'markers', heldBytes: markerContextBytes(workerCodes, groupCount) }
       );
       throwIfAborted(signal);
 
-      const lane = (ArrayType, fill) => Array.from({ length: groupCount }, () => new ArrayType(geneCount).fill(fill));
+      // A lane per tested group; the groups not tested (the reference, small
+      // groups skipped) share one lane of NaN per statistic, never written:
+      // a field of a thousand groups mostly skipped holds only what it tests
+      // (`MARKER_RESULT_BYTES_PER_GROUP_GENE` a group and gene).
+      const lane = (ArrayType, fill) => {
+        const untested = new ArrayType(geneCount).fill(fill);
+        return Array.from({ length: groupCount }, (_, g) => (tested[g] === 1 ? new ArrayType(geneCount).fill(fill) : untested));
+      };
       const pValuesByGroup = lane(Float64Array, NaN);
       const scoresByGroup = lane(Float32Array, NaN);
       const log2FoldChangeByGroup = lane(Float32Array, NaN);
@@ -297,13 +307,13 @@ export class MarkerDiscoveryEngine {
           signal: signal ?? null,
           dispatch: (task, onTiming) => {
             const payload = { ...payloadBase, ...taskGenes(task) };
-            const execution = { timeout: 120000, transfer: true, signal: signal ?? null, onTiming };
+            const execution = { transfer: true, signal: signal ?? null, onTiming };
             return task.worker === null
               ? pool.execute('MARKERS_COMPUTE_GENES', payload, execution)
               : pool.executeOnWorker(task.worker, 'MARKERS_COMPUTE_GENES', payload, execution);
           },
           onResult: (task, packed) => {
-            ingestMarkerBatch(task, groupCount, packed, lanes, onGeneMoments !== null && scope === null ? onGeneMoments : null);
+            ingestMarkerBatch(task, groupCount, tested, packed, lanes, onGeneMoments !== null && scope === null ? onGeneMoments : null);
             completed += task.indices.length;
             job?.items(completed, geneCount, 'genes');
           }
@@ -324,7 +334,13 @@ export class MarkerDiscoveryEngine {
       const genesTestedByGroup = [];
       const adjust = correction === 'bh' ? benjaminiHochbergAdjusted : bonferroniAdjusted;
       const yieldIfSliceSpent = createSlicedYield();
+      const untestedAdjusted = new Float64Array(geneCount).fill(NaN);
       for (let g = 0; g < groupCount; g++) {
+        if (tested[g] !== 1) {
+          adjustedPValuesByGroup.push(untestedAdjusted);
+          genesTestedByGroup.push(0);
+          continue;
+        }
         const { adjustedPValues, testedCount } = adjust(pValuesByGroup[g]);
         adjustedPValuesByGroup.push(adjustedPValues);
         genesTestedByGroup.push(testedCount);
@@ -384,7 +400,7 @@ const MARKER_BATCH_LANES = Object.freeze([
  * cell to `onGeneMoments`, when given.
  * @private
  */
-function ingestMarkerBatch(task, groupCount, packed, lanes, onGeneMoments) {
+function ingestMarkerBatch(task, groupCount, tested, packed, lanes, onGeneMoments) {
   const genes = task.indices.length;
   if (packed === null || typeof packed !== 'object' || Array.isArray(packed) ||
       packed.genes !== genes || packed.groupCount !== groupCount) {
@@ -411,6 +427,11 @@ function ingestMarkerBatch(task, groupCount, packed, lanes, onGeneMoments) {
       if (!Number.isNaN(p) && !(p >= 0 && p <= 1)) {
         throw new RangeError(`Marker worker p-value for "${task.genes[k]}" group ${g} must be between 0 and 1`);
       }
+      // A group not tested keeps its shared lanes of NaN.
+      if (tested[g] !== 1) {
+        if (!Number.isNaN(p)) throw new RangeError(`Marker worker tested group ${g}, which is not to be tested`);
+        continue;
+      }
       lanes.pValuesByGroup[g][geneIndex] = p;
       lanes.scoresByGroup[g][geneIndex] = scores[base + g];
       lanes.aurocByGroup[g][geneIndex] = auroc[base + g];
@@ -421,14 +442,21 @@ function ingestMarkerBatch(task, groupCount, packed, lanes, onGeneMoments) {
     }
     if (onGeneMoments !== null) {
       onGeneMoments(task.genes[k], {
-        sum: moments[k * 4],
-        sumSq: moments[k * 4 + 1],
+        mean: moments[k * 4],
+        m2: moments[k * 4 + 1],
         nonZero: moments[k * 4 + 2],
         n: moments[k * 4 + 3]
       });
     }
   }
 }
+
+/**
+ * Bytes a marker run's result holds per tested group and gene: a Float64
+ * p-value and adjusted p-value, and Float32 score, log fold change, mean,
+ * two fractions and AUROC.
+ */
+export const MARKER_RESULT_BYTES_PER_GROUP_GENE = 2 * 8 + 6 * 4;
 
 /** The run's plan, as its job states it. */
 export function describeMarkerRun({ geneCount, testedCount, groupCount }) {

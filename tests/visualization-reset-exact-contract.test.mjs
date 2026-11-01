@@ -151,6 +151,7 @@ function createHarness() {
   const renderControls = {};
   for (const method of [
     'applyRenderMode',
+    'markSmokeDirty',
     'applyPointSizeFromSlider',
     'updateSmokeStepSlider',
     'updateSmokeDensitySlider',
@@ -328,6 +329,8 @@ test('visualization reset restores every captured value without defaults or coer
     assert.deepEqual(harness.calls, [
       ['viewer', 'resetCamera'],
       ['viewer', 'setBackground', 'grid-dark'],
+      // Smoke's lower-layer colours follow the background.
+      ['render', 'markSmokeDirty'],
       ['viewer', 'getFocusedViewId'],
       ['viewer', 'getViewDimension', 'live'],
       ['viewer', 'setNavigationMode', 'orbit'],

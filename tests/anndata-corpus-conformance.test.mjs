@@ -11,8 +11,9 @@
  * requests, where a cell-major matrix is indexed by its structure first);
  * each Zarr store as a `.zarr.zip` archive and as a picked folder.
  *
- * Values the app holds as float32 (obs columns, genes) are compared with the
- * nearest float32 of the stored value; embeddings and graphs exactly. A file
+ * Values the app holds as float32 (genes, obs columns of floats and narrow
+ * integers) are compared with the nearest float32 of the stored value;
+ * obs integers wider than 16 bits, embeddings and graphs exactly. A file
  * the reader may refuse (a codec or filter the browser does not have) must
  * either read exactly or refuse naming what it cannot read.
  */
@@ -65,6 +66,9 @@ function numberOf(value) {
 }
 
 const f32 = value => Math.fround(numberOf(value));
+
+/** Integer dtypes float32 cannot hold exactly: read as float64 (`values.js` `readContinuous`). */
+const WIDE_INTEGERS = /^(Int|UInt|int|uint)(32|64)$/;
 
 /** Equal as stored numbers: NaN equals NaN, and -0 equals 0 (a sparse sum loses the sign). */
 function sameNumber(actual, expected) {
@@ -222,16 +226,21 @@ async function checkObsColumn(reader, column, where, readsMore) {
     return;
   }
   switch (column.kind) {
-    case 'numeric':
+    case 'numeric': {
       assert.ok(['float', 'int', 'uint'].includes(field.dtype), `${where}: dtype ${field.dtype}`);
-      assertNumbers(field.values, column.values, f32, where);
+      // An integer wider than 16 bits stays exact (float64: every integer up
+      // to 2^53, the nearest double beyond); every other number is float32.
+      const exact = WIDE_INTEGERS.test(column.dtype ?? '');
+      assert.equal(field.values instanceof Float64Array, exact, `${where}: ${exact ? 'float64' : 'float32'} values`);
+      assertNumbers(field.values, column.values, exact ? numberOf : f32, where);
       return;
+    }
     case 'bool':
-      assert.equal(field.dtype, 'bool', `${where}: dtype`);
-      assert.deepEqual(Array.from(field.values), column.values, where);
-      return;
     case 'string':
-      assert.equal(field.dtype, 'string', `${where}: dtype`);
+      // A text or boolean column is coded as it is read, its categories its
+      // labels in code-point order (`codeDiscoveredColumn`).
+      assert.equal(field.dtype, 'categorical', `${where}: dtype`);
+      assert.equal(field.discovered, true, `${where}: categories found by reading it`);
       assert.deepEqual(Array.from(field.values), column.values, where);
       return;
     case 'categorical': {
@@ -368,7 +377,7 @@ async function checkFixture(reader, expected, where, readsMore = null) {
   } else {
     assert.deepEqual(reader.obsKeys, columns, `${where}: obs columns`);
   }
-  assert.deepEqual(reader.varNames, expected.var.index, `${where}: var names`);
+  assert.deepEqual((await reader.readVarNames('X', null)).index, expected.var.index, `${where}: var names`);
   for (const column of expected.obs.columns) {
     await checkObsColumn(reader, column, `${where} obs['${column.name}']`, readsMore);
   }

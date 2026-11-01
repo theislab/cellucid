@@ -212,10 +212,15 @@ signs in in a hidden window and closes it before the callback is reached
    organisation's file.
 8. Microsoft: a personal "anyone" link opened by a work account, and the
    reverse.
-9. Microsoft: the sign-in renews without a click within 24 hours (the access
-   token expires after about an hour), and asks for **Sign in again** after.
-10. Both: reload the tab (still signed in), close it and open a new one
-    (signed out); a session saved with a Drive or OneDrive file reopens after
+9. Microsoft: within the page, the sign-in renews without a click for 24
+   hours (the access token expires after about an hour), and asks for
+   **Sign in again** after; after a reload (the refresh token is held in
+   memory only, never in `sessionStorage`), it asks once the access token
+   expires.
+10. Both: reload the tab (still signed in while the access token lasts),
+    close it and open a new one (signed out); **Sign out** revokes Google's
+    token (`POST https://oauth2.googleapis.com/revoke` answered `200`) and
+    says that Microsoft's cannot be revoked; a session saved with a Drive or OneDrive file reopens after
     signing in; `?data=gdrive:<id>` and `?data=onedrive:<drive>/<item>` links
     open for a collaborator the file is shared with, and are refused, with the
     reason, for an account it is not shared with.

@@ -20,7 +20,7 @@ test('a free spot is kept as asked', () => {
   assert.deepEqual(
     clearOfOpenHeaders({
       left: 400, top: 100, width: 300, height: 400, minHeight: 100, ...VIEWPORT,
-      headers: [header(800, 100)], step: 28
+      headers: [header(800, 100)], step: 28, reach: 0
     }),
     { x: 400, y: 100, height: 400 }
   );
@@ -29,7 +29,7 @@ test('a free spot is kept as asked', () => {
 test('a window opened on another one steps down until that header shows', () => {
   const placed = clearOfOpenHeaders({
     left: 400, top: 100, width: 300, height: 400, minHeight: 100, ...VIEWPORT,
-    headers: [header(400, 100)], step: 28
+    headers: [header(400, 100)], step: 28, reach: 0
   });
   assert.deepEqual(placed, { x: 428, y: 128, height: 400 });
   const covered = header(400, 100);
@@ -39,7 +39,7 @@ test('a window opened on another one steps down until that header shows', () => 
 test('stacked windows cascade past every header in turn', () => {
   const placed = clearOfOpenHeaders({
     left: 400, top: 100, width: 300, height: 400, minHeight: 100, ...VIEWPORT,
-    headers: [header(400, 100), header(428, 128)], step: 28
+    headers: [header(400, 100), header(428, 128)], step: 28, reach: 0
   });
   assert.deepEqual(placed, { x: 456, y: 156, height: 400 });
 });
@@ -50,7 +50,7 @@ test('on a short screen the window starts under the header and gets shorter', ()
   const short = { viewportWidth: 844, viewportHeight: 390 };
   const placed = clearOfOpenHeaders({
     left: 8, top: 8, width: 600, height: 374, minHeight: 100, ...short,
-    headers: [header(8, 8, 600, 36)], step: 36
+    headers: [header(8, 8, 600, 36)], step: 36, reach: 0
   });
   assert.deepEqual(placed, { x: 236, y: 52, height: 330 });
 });
@@ -61,27 +61,49 @@ test('a window that cannot fit under the header keeps its place and size', () =>
   const corner = clampFloatingPosition({ left: 0, top: 0, ...box });
   const placed = clearOfOpenHeaders({
     left: 0, top: 0, ...box,
-    headers: [header(8, 8, 374, 36)], step: 36
+    headers: [header(8, 8, 374, 36)], step: 36, reach: 0
   });
   assert.deepEqual(placed, { ...corner, height: 134 });
 });
 
 test('placement requires its inputs', () => {
   assert.throws(
-    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: 1, ...VIEWPORT, headers: null, step: 28 }),
+    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: 1, ...VIEWPORT, headers: null, step: 28, reach: 0 }),
     TypeError
   );
   assert.throws(
-    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: 1, ...VIEWPORT, headers: [], step: 0 }),
+    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: 1, ...VIEWPORT, headers: [], step: 0, reach: 0 }),
     TypeError
   );
   assert.throws(
-    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: -1, ...VIEWPORT, headers: [], step: 28 }),
+    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: -1, ...VIEWPORT, headers: [], step: 28, reach: 0 }),
     TypeError
   );
   // A window with no minimum of its own still keeps one header of height.
   assert.deepEqual(
-    clearOfOpenHeaders({ left: 8, top: 8, width: 300, height: 200, minHeight: 0, viewportWidth: 316, viewportHeight: 216, headers: [header(8, 8, 300, 28)], step: 28 }),
+    clearOfOpenHeaders({ left: 8, top: 8, width: 300, height: 200, minHeight: 0, viewportWidth: 316, viewportHeight: 216, headers: [header(8, 8, 300, 28)], step: 28, reach: 0 }),
     { x: 8, y: 44, height: 164 }
+  );
+});
+
+test('a window keeps a header clear of the touches it takes past its frame', () => {
+  // On a touch screen a window's resize handles reach 12 px past its frame,
+  // more than the 8 px gap: placed by its frame alone, its top handle took
+  // the taps meant for the copy and close buttons of the header above it.
+  const phone = { viewportWidth: 390, viewportHeight: 800 };
+  const placed = clearOfOpenHeaders({
+    left: 8, top: 100, width: 374, height: 600, minHeight: 100, ...phone,
+    headers: [header(0, 100, 390, 40)], step: 40, reach: 12
+  });
+  assert.equal(placed.y - 12 >= 140, true, 'the top handle stays under the header');
+  // Stepping too: a window whose handle would still reach a header steps on.
+  const stepped = clearOfOpenHeaders({
+    left: 400, top: 100, width: 300, height: 400, minHeight: 100, ...VIEWPORT,
+    headers: [header(400, 100)], step: 28, reach: 4
+  });
+  assert.deepEqual(stepped, { x: 456, y: 156, height: 400 });
+  assert.throws(
+    () => clearOfOpenHeaders({ left: 0, top: 0, width: 1, height: 1, minHeight: 1, ...VIEWPORT, headers: [], step: 28, reach: -1 }),
+    TypeError
   );
 });

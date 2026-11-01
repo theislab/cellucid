@@ -286,6 +286,21 @@ test('the snapshot records what the run measured and decided', () => {
   assert.equal(snapshot.memoryBudgetMB, 1024);
 });
 
+test('a gene of a cell subset holds a position and a value a cell until measured; the gate and a task\'s bytes are the run\'s to read', () => {
+  // Dense columns: 4 bytes a cell; a cell subset's block: 8.
+  assert.equal(genesPerTaskFor({ geneCount: 30_000, poolSize: 8, cellCount: 1_000_000, budgetBytes: GB, bytesPerCell: 8 }), 4);
+  const unmeasured = createRunTuner({ poolSize: 4, cellCount: 25_000, bytesPerCell: 8, genesPerTask: 2, budgetBytes: () => 1_000_000 });
+  assert.equal(unmeasured.taskBytes(), 25_000 * 8 * 2);
+  // 30 % of 1 MB over 400 kB a task: the gate holds no more than one task.
+  assert.equal(unmeasured.bufferedTasks(), 1);
+  unmeasured.observeRead({ bytes: 20_000, ms: 1, genes: 2 });
+  assert.equal(unmeasured.taskBytes(), 20_000);
+  assert.equal(unmeasured.bufferedTasks(), 15);
+  // The read-ahead never passes the gate.
+  assert.ok(unmeasured.prefetchDepth() <= unmeasured.bufferedTasks());
+  assert.throws(() => createRunTuner({ poolSize: 2, cellCount: 10, bytesPerCell: 0 }), RangeError);
+});
+
 test('the tuner refuses inputs it cannot size a run from', () => {
   assert.throws(() => createRunTuner({ poolSize: 0, cellCount: 10 }), RangeError);
   assert.throws(() => createRunTuner({ poolSize: 2, cellCount: 1.5 }), RangeError);

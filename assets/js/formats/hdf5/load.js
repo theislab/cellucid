@@ -1,19 +1,41 @@
 /**
- * Loading a file's whole object tree at open.
+ * Loading a file's objects as they are navigated into (`formats/store.js`,
+ * `Group.load`): nothing is read before something asks for it.
  *
- * Every object (group, dataset, committed datatype) is loaded as soon as the
- * link that names it is known, and all loads run at once: one object's
- * header, its group's B-tree or fractal heap, its attributes and its
- * children's headers are each asked for the moment their address is known.
- * The byte reader gathers everything asked for in the same task into one
- * plan, so the number of sequential round trips grows with the depth of the
- * tree (times a small constant per level), not with the number of objects.
+ * An object (group, dataset, committed datatype) is loaded by its header
+ * address: its header, its messages (shared ones resolved) and its
+ * attributes. A group's links are loaded on their own. Each is read once,
+ * however many hard links lead to it and however many loads ask at once
+ * (`SharedWorks`: a read stops only once every load waiting on it has
+ * withdrawn, and one stopped or failed is read again by the next that
+ * asks), and kept while the file is open.
  *
- * Each object is loaded once by its header address, however many hard links
- * lead to it, so a hard link cycle cannot loop. Soft links, external links
- * and virtual datasets are recorded, not followed: soft links resolve on
- * navigation; the other two fail only when accessed, so a file that has one
- * still opens.
+ * Loads that are background work (an activity marked `background`, as a
+ * reader completes the tree after its first view) share their reads only
+ * among themselves: a load someone waits for starts its own, which the byte
+ * reader joins to any background request of the same bytes and lets go
+ * first (`io/byte-reader.js`, priority), so it never waits behind background
+ * work.
+ *
+ * A group is loaded (`loadGroup`) with its links and every child's object,
+ * and below that to a depth: each child is asked for the moment the links
+ * naming it are known, and a child group's own links the moment their
+ * address is (an older-format group's symbol table entry caches a child
+ * group's B-tree and heap: its links are asked for in the round its header
+ * is). Paths below a group (`loadPaths`) are followed the same way: the
+ * next group on a path is asked for as soon as its parent's links name it,
+ * while the parent's other children still load. The byte reader gathers
+ * everything asked for in one task into one plan, so what is asked for
+ * loads in as many sequential round trips as it is deep (times a small
+ * constant per level), whatever its number of objects, and what is not
+ * asked for is not read.
+ *
+ * One load visits an object once, so a hard link cycle cannot loop. A soft
+ * link is loaded through: the groups on the way to its target and the
+ * target itself load with the group holding it, so it resolves on
+ * navigation. External links and virtual datasets are recorded, not
+ * followed: they fail only when accessed, so a file that has one still
+ * opens.
  *
  * @module formats/hdf5/load
  */
@@ -32,6 +54,8 @@ import { localHeapString, readLocalHeap, withCollections } from './heaps.js';
 import { attributeValue, heapAddresses } from './decode.js';
 import { decodeText } from './binary.js';
 import { Hdf5UnsupportedError, formatError } from './errors.js';
+import { SharedWorks } from '../../utils/abort.js';
+import { pathParts } from '../store.js';
 
 /**
  * @typedef {Object} AttributeInfo
@@ -47,7 +71,6 @@ import { Hdf5UnsupportedError, formatError } from './errors.js';
  * @property {number} address
  * @property {'group'|'dataset'|'datatype'|'unknown'} kind
  * @property {AttributeInfo[]} attributes
- * @property {import('./messages.js').Link[]} [links]
  * @property {import('./messages.js').Dataspace} [space]
  * @property {Object} [type]
  * @property {import('./messages.js').Layout} [layout]
@@ -55,6 +78,12 @@ import { Hdf5UnsupportedError, formatError } from './errors.js';
  * @property {import('./messages.js').FillValue} [fill]
  * @property {boolean} [externalStorage]
  * @property {Error|null} [unsupported]
+ */
+
+/**
+ * @typedef {Object} LoadOptions
+ * @property {AbortSignal|null} [signal]
+ * @property {import('../io/activity.js').ReadActivity|null} [activity] - Counts what the load reads
  */
 
 /** Bit of the shared message table's type flags for each shareable message. */
@@ -67,81 +96,119 @@ const SHARED_INDEX_BITS = new Map([
 ]);
 
 /**
- * State of one open: object headers, group link lists and heaps asked for so
- * far (each once, by address), and the shared message table.
+ * Every object of one open file loaded so far, and the loads of the rest:
+ * object headers, objects, group links and heaps, each read once, by
+ * address.
  */
-class OpenSession {
-  constructor(file, signal) {
+export class ObjectLoader {
+  /**
+   * @param {import('./context.js').FileContext} file
+   * @param {number} rootAddress
+   */
+  constructor(file, rootAddress) {
     this.file = file;
-    this.signal = signal;
-    this.headers = new Map();
-    this.heaps = new Map();
-    this.groupLinks = new Map();
+    this.rootAddress = rootAddress;
+    this.headers = new SharedWorks({ keep: true });
+    this.heaps = new SharedWorks({ keep: true });
+    this.linkWorks = new SharedWorks({ keep: true });
+    this.objectWorks = new SharedWorks({ keep: true });
+    /** @type {Map<number, ObjectInfo>} Loaded objects by address. */
+    this.objects = new Map();
+    /** @type {Map<number, import('./messages.js').Link[]>} Loaded groups' links by address. */
+    this.links = new Map();
+    /** A child group's B-tree and heap, as its parent's symbol table entry caches them, by address. */
+    this.cachedTables = new Map();
+    /** Groups whose links and every child are loaded (navigable), by address. */
+    this.open = new Set();
+    /** Groups loaded with every object below them, by address. */
+    this.whole = new Set();
+    /** @type {Promise<Array<{types: number, heapAddress: number|null}>>|null} */
     this.sharedTable = null;
-    /** Called with every group's links as soon as they are known. */
-    this.onLinks = null;
+  }
+
+  /** The file, reading under `activity`. */
+  fileOf(options) {
+    this.file.requireOpen();
+    return this.file.withActivity(options?.activity ?? null);
+  }
+
+  /** An object header. */
+  header(address, options) {
+    return this.headers.run(workKey(address, options), own => readObjectHeader(this.fileOf(own), address, own.signal), options);
+  }
+
+  /** A fractal heap (dense links or attributes, the shared message heap). */
+  heap(address, options) {
+    return this.heaps.run(workKey(address, options), own => openFractalHeap(this.fileOf(own), address, own.signal), options);
   }
 
   /**
-   * An object header. As soon as its first block is parsed, a group's links
-   * are asked for too: they need not wait for continuation blocks, shared
-   * messages or attributes.
+   * Read the superblock extension: non-default B-tree 'K' values and the
+   * shared message table.
    */
-  header(address) {
-    let promise = this.headers.get(address);
-    if (promise === undefined) {
-      promise = readObjectHeader(this.file, address, this.signal, header => this.startLinks(header));
-      promise.catch(() => {});
-      this.headers.set(address, promise);
-    }
-    return promise;
-  }
-
-  /** Ask for a group's links from the messages of its header's first block. */
-  startLinks(header) {
+  async readExtension(address, options) {
+    const header = await this.header(address, options);
+    const file = this.file;
     for (const message of header.messages) {
-      if (message.flags & 2) continue;
-      let links = null;
-      if (message.type === MESSAGE.SYMBOL_TABLE) {
-        links = this.symbolTableLinks(parse(this.file, message, parseSymbolTable, 'Symbol table message'));
-      } else if (message.type === MESSAGE.LINK_INFO) {
-        const linkInfo = parse(this.file, message, parseLinkInfo, 'Link info message');
-        if (linkInfo.heapAddress !== null) links = this.denseLinks(linkInfo, header.address);
+      const cursor = file.cursor(message.data, message.address, 'Superblock extension message');
+      if (message.type === MESSAGE.BTREE_K) {
+        const k = parseBtreeK(cursor);
+        Object.assign(file.btreeK, { chunk: k.chunk, groupInternal: k.groupInternal, groupLeaf: k.groupLeaf });
+      } else if (message.type === MESSAGE.SHARED_MESSAGE_TABLE) {
+        // Read when a shared message first needs it, by whichever load that is.
+        const table = parseSharedMessageTable(cursor);
+        const tables = new SharedWorks({ keep: true });
+        this.sharedTable = own => tables.run(workKey('table', own), start => readSharedTable(this.fileOf(start), table, start.signal), own);
       }
-      // Children are visited as soon as the links are known, without waiting
-      // for the rest of this header (continuation blocks, attributes).
-      links?.then(found => this.onLinks?.(found), () => {});
     }
   }
 
-  heap(address) {
-    let promise = this.heaps.get(address);
-    if (promise === undefined) {
-      promise = openFractalHeap(this.file, address, this.signal);
-      this.heaps.set(address, promise);
-    }
-    return promise;
+  /** An object: its header, kind, dataspace, datatype, layout and attributes. @returns {Promise<ObjectInfo>} */
+  object(address, options) {
+    const loaded = this.objects.get(address);
+    if (loaded !== undefined) return Promise.resolve(loaded);
+    return this.objectWorks.run(workKey(address, options), async own => {
+      const info = await loadObject(this, address, own);
+      this.objects.set(address, info);
+      return info;
+    }, options);
+  }
+
+  /** A group's links (`object`'s header names where they are). */
+  linksOf(address, options) {
+    const loaded = this.links.get(address);
+    if (loaded !== undefined) return Promise.resolve(loaded);
+    return this.linkWorks.run(workKey(`group:${address}`, options), async own => {
+      const header = await this.header(address, own);
+      let symbolTable = null;
+      let linkInfo = null;
+      const compact = [];
+      for (const message of header.messages) {
+        if (message.type === MESSAGE.SYMBOL_TABLE) symbolTable = parse(this.file, message, parseSymbolTable, 'Symbol table message');
+        else if (message.type === MESSAGE.LINK_INFO) linkInfo = parse(this.file, message, parseLinkInfo, 'Link info message');
+        else if (message.type === MESSAGE.LINK) compact.push(parse(this.file, message, parseLink, 'Link message'));
+      }
+      let found = compact;
+      if (symbolTable !== null) found = await this.tableLinks(symbolTable, own);
+      else if (linkInfo !== null && linkInfo.heapAddress !== null) found = await this.denseLinks(linkInfo, address, own);
+      this.links.set(address, found);
+      return found;
+    }, options);
   }
 
   /**
    * The links of an older-format group: its B-tree and local heap read at
-   * once, then its symbol table nodes. A child group's entry usually caches
-   * that child's own B-tree and heap addresses (cache type 1): its header and
-   * its links are asked for right away, in the same round.
+   * once, then its symbol table nodes. Each entry's cached B-tree and heap
+   * (cache type 1, a child group) are kept: a load of that child asks for its
+   * links with its header.
    */
-  symbolTableLinks({ btreeAddress, heapAddress }) {
-    const key = `symbols:${btreeAddress}:${heapAddress}`;
-    let promise = this.groupLinks.get(key);
-    if (promise === undefined) {
-      promise = this.readSymbolTable(btreeAddress, heapAddress);
-      this.groupLinks.set(key, promise);
-    }
-    return promise;
+  tableLinks({ btreeAddress, heapAddress }, options) {
+    return this.linkWorks.run(workKey(`symbols:${btreeAddress}:${heapAddress}`, options), own => this.readSymbolTable(btreeAddress, heapAddress, own), options);
   }
 
-  async readSymbolTable(btreeAddress, heapAddress) {
-    const file = this.file;
-    const signal = this.signal;
+  async readSymbolTable(btreeAddress, heapAddress, options) {
+    const file = this.fileOf(options);
+    const signal = options.signal;
     // The heap holds only names: nothing below waits for it but naming.
     const heapRead = readLocalHeap(file, heapAddress, signal);
     heapRead.catch(() => {});
@@ -155,14 +222,10 @@ class OpenSession {
         return;
       }
       entries.push({ nameOffset, address: objectAddress });
-      if (objectAddress === null) return;
-      // The child's header, and a child group's own B-tree and heap (cached in
-      // the entry, cache type 1), are asked for now: same round as the names.
-      this.header(objectAddress);
-      if (cacheType === 1) {
+      if (objectAddress !== null && cacheType === 1) {
         const cursor = file.cursor(scratch, NaN, 'Symbol table entry');
         const cached = { btreeAddress: cursor.address(), heapAddress: cursor.address() };
-        if (cached.btreeAddress !== null && cached.heapAddress !== null) this.symbolTableLinks(cached).catch(() => {});
+        if (cached.btreeAddress !== null && cached.heapAddress !== null) this.cachedTables.set(objectAddress, cached);
       }
     }, signal);
     const heap = await heapRead;
@@ -175,55 +238,206 @@ class OpenSession {
   }
 
   /** The links of a newer-format group stored densely (fractal heap + name index). */
-  denseLinks(linkInfo, address) {
-    const key = `dense:${linkInfo.heapAddress}`;
-    let promise = this.groupLinks.get(key);
-    if (promise === undefined) {
-      promise = this.readDenseLinks(linkInfo, address);
-      this.groupLinks.set(key, promise);
-    }
-    return promise;
+  denseLinks(linkInfo, address, options) {
+    return this.linkWorks.run(workKey(`dense:${linkInfo.heapAddress}`, options), async own => {
+      const file = this.fileOf(own);
+      const ids = [];
+      const [heap] = await Promise.all([
+        this.heap(linkInfo.heapAddress, own),
+        walkBtreeV2(file, linkInfo.nameIndexAddress, (bytes, offset) => {
+          ids.push(bytes.slice(offset + 4, offset + 11));
+        }, { signal: own.signal, expectType: 5 }),
+      ]);
+      const records = await readHeapObjects(file, heap, ids, own.signal);
+      return records.map(bytes => parseLink(file.cursor(bytes, address, 'Link message in a fractal heap')));
+    }, options);
   }
 
-  async readDenseLinks(linkInfo, address) {
-    const file = this.file;
-    const ids = [];
-    const [heap] = await Promise.all([
-      this.heap(linkInfo.heapAddress),
-      walkBtreeV2(file, linkInfo.nameIndexAddress, (bytes, offset) => {
-        ids.push(bytes.slice(offset + 4, offset + 11));
-      }, { signal: this.signal, expectType: 5 }),
+  /** Ask for a child group's links now when its parent's entry says where they are. */
+  warmLinks(address, options) {
+    const cached = this.cachedTables.get(address);
+    if (cached !== undefined && !this.links.has(address)) this.tableLinks(cached, options).catch(() => {});
+  }
+
+  /**
+   * Load the group at `address` to `depth` levels: its links and every
+   * child's object (1), and every child group the same way to the depth
+   * left. `visited` (address → depth loaded by this load) keeps one load
+   * from visiting an object twice.
+   *
+   * @param {number} address
+   * @param {number} depth - At least 1
+   * @param {LoadOptions} options
+   * @param {Map<number, number>} [visited]
+   * @returns {Promise<void>}
+   */
+  async loadGroup(address, depth, options, visited = new Map()) {
+    if (this.whole.has(address) || (visited.get(address) ?? 0) >= depth) return;
+    visited.set(address, depth);
+    const own = settledLater(this.object(address, options));
+    this.warmLinks(address, options);
+    const links = await this.linksOf(address, options);
+    const children = [own];
+    const loads = [];
+    for (const link of links) {
+      if (link.type === 'hard' && link.address !== null) {
+        const child = link.address;
+        if (depth > 1) this.warmLinks(child, options);
+        const object = this.object(child, options);
+        children.push(object);
+        if (depth > 1) loads.push(settledLater(object.then(info => (info.kind === 'group' ? this.loadGroup(child, depth - 1, options, visited) : null))));
+      } else if (link.type === 'soft') {
+        // Its target and the way to it, so it resolves on navigation.
+        loads.push(settledLater(this.loadSoft(address, link.target, depth - 1, options, visited)));
+      }
+    }
+    await Promise.all(children);
+    this.open.add(address);
+    await Promise.all(loads);
+  }
+
+  /**
+   * Load what a soft link of the group at `from` leads to (absolute, or
+   * relative to that group): every group on the way opened, and the target
+   * to `depth`. A link that leads nowhere loads only the way.
+   *
+   * @returns {Promise<void>}
+   */
+  async loadSoft(from, target, depth, options, visited) {
+    const address = await this.resolveTo(from, target, options);
+    if (address === null) return;
+    const info = await this.object(address, options);
+    if (info.kind === 'group' && depth > 0) await this.loadGroup(address, depth, options, visited);
+  }
+
+  /**
+   * Open the group at `address`: its links and every child's object (what
+   * navigating it needs), following nothing further.
+   */
+  async openGroup(address, options) {
+    if (this.open.has(address)) return;
+    const links = await this.linksOf(address, options);
+    await Promise.all([
+      this.object(address, options),
+      ...links.filter(link => link.type === 'hard' && link.address !== null).map(link => this.object(link.address, options)),
     ]);
-    const records = await readHeapObjects(file, heap, ids, this.signal);
-    return records.map(bytes => parseLink(file.cursor(bytes, address, 'Link message in a fractal heap')));
+    this.open.add(address);
+  }
+
+  /**
+   * The address a path from the group at `from` leads to (absolute, or
+   * relative to it), every group on the way opened; null when it leads
+   * nowhere, out of the file, or round soft links in a circle (`visiting`:
+   * the soft links being followed, by group and target).
+   */
+  async resolveTo(from, path, options, visiting = new Set()) {
+    let parts;
+    try {
+      parts = pathParts(path);
+    } catch {
+      return null;
+    }
+    let address = path.startsWith('/') ? this.rootAddress : from;
+    for (const part of parts) {
+      const info = await this.object(address, options);
+      if (info.kind !== 'group') return null;
+      await this.openGroup(address, options);
+      const link = this.links.get(address).find(candidate => candidate.name === part);
+      if (link === undefined) return null;
+      if (link.type === 'soft') {
+        const hop = `${address}:${link.target}`;
+        if (visiting.has(hop)) return null;
+        visiting.add(hop);
+        const through = await this.resolveTo(address, link.target, options, visiting);
+        if (through === null) return null;
+        address = through;
+      } else if (link.type === 'hard' && link.address !== null) {
+        address = link.address;
+      } else {
+        return null;
+      }
+    }
+    return address;
+  }
+
+  /**
+   * Load paths below the group at `address` (`formats/store.js`,
+   * `Group.load`): the group itself to the deepest depth asked of it (and to
+   * 1 when a path goes below it), and each path's next group the moment the
+   * group's links name it.
+   *
+   * @param {number} address
+   * @param {import('../store.js').LoadSpec[]} specs
+   * @param {LoadOptions} options
+   * @returns {Promise<void>}
+   */
+  async loadPaths(address, specs, options) {
+    let own = 0;
+    const deeper = [];
+    for (const spec of specs) {
+      if (spec.parts.length === 0) own = Math.max(own, spec.depth);
+      else deeper.push(spec);
+    }
+    if (deeper.length > 0) own = Math.max(own, 1);
+    if (own === 0) return;
+    // The way on is asked for with the group's own links, before its children load.
+    if (deeper.length > 0) this.warmLinks(address, options);
+    const loading = settledLater(own === Infinity ? this.loadWhole(address, options) : this.loadGroup(address, own, options));
+    if (deeper.length === 0) return loading;
+    const links = await this.linksOf(address, options);
+    const byChild = new Map();
+    for (const { parts: [first, ...rest], depth } of deeper) {
+      for (const link of links) {
+        if (first !== '*' && link.name !== first) continue;
+        if (!byChild.has(link)) byChild.set(link, []);
+        byChild.get(link).push({ parts: rest, depth });
+      }
+    }
+    const below = [...byChild].map(async ([link, paths]) => {
+      let child = null;
+      if (link.type === 'hard') child = link.address;
+      else if (link.type === 'soft') child = await this.resolveTo(address, link.target, options);
+      if (child === null) return;
+      if (paths.some(path => path.parts.length > 0 || path.depth > 0)) this.warmLinks(child, options);
+      const info = await this.object(child, options);
+      if (info.kind === 'group') await this.loadPaths(child, paths, options);
+    });
+    await Promise.all([loading, ...below]);
+  }
+
+  /** Load the whole subtree of the group at `address`. */
+  async loadWhole(address, options) {
+    if (this.whole.has(address)) return;
+    await this.loadGroup(address, Infinity, options);
+    this.whole.add(address);
   }
 }
 
 /**
- * Read the superblock extension: non-default B-tree 'K' values and the
- * shared message table.
+ * `promise`, marked as handled: it is awaited later, after other awaits that
+ * may throw first, and its failure must not be reported unhandled then.
  */
-async function readExtension(session, address) {
-  const header = await session.header(address);
-  const file = session.file;
-  for (const message of header.messages) {
-    const cursor = file.cursor(message.data, message.address, 'Superblock extension message');
-    if (message.type === MESSAGE.BTREE_K) {
-      const k = parseBtreeK(cursor);
-      // Changed in place: `file` may be a per-read view of the file context.
-      Object.assign(file.btreeK, { chunk: k.chunk, groupInternal: k.groupInternal, groupLeaf: k.groupLeaf });
-    } else if (message.type === MESSAGE.SHARED_MESSAGE_TABLE) {
-      session.sharedTable = readSharedTable(session, parseSharedMessageTable(cursor));
-      session.sharedTable.catch(() => {});
-    }
-  }
+function settledLater(promise) {
+  promise.catch(() => {});
+  return promise;
 }
 
-async function readSharedTable(session, { address, indexCount }) {
-  const file = session.file;
+/**
+ * The key one piece of loading work is shared under: background loads share
+ * theirs apart from the others' (module doc).
+ */
+function workKey(key, options) {
+  return options?.activity?.background === true ? `background:${key}` : key;
+}
+
+/**
+ * The shared message table: one entry per index, the message types it
+ * holds and the heap they are stored in.
+ */
+async function readSharedTable(file, { address, indexCount }, signal) {
   const what = 'Shared message table';
   const entrySize = 1 + 1 + 2 + 4 + 2 + 2 + 2 + 2 * file.offsetSize;
-  const bytes = await file.meta(address, 4 + indexCount * entrySize + 4, what, session.signal);
+  const bytes = await file.meta(address, 4 + indexCount * entrySize + 4, what, signal);
   const cursor = file.cursor(bytes, address, what);
   cursor.signature('SMTB');
   const indexes = [];
@@ -244,90 +458,37 @@ async function readSharedTable(session, { address, indexCount }) {
  * The data of a shared message: the message it points to in another object
  * header (a committed message) or in the shared message heap.
  */
-async function sharedMessageData(session, type, data, address) {
-  const file = session.file;
+async function sharedMessageData(loader, type, data, address, options) {
+  const file = loader.file;
   const pointer = parseSharedMessage(file.cursor(data, address, 'Shared message'));
   if (pointer.kind === 'header') {
     if (pointer.address === null) throw formatError('Shared message', file.absolute(address), 'it points to an undefined address');
-    const target = await session.header(pointer.address);
+    const target = await loader.header(pointer.address, options);
     const message = target.messages.find(candidate => candidate.type === type);
     if (message === undefined) {
       throw formatError('Shared message', file.absolute(address), `the object header at ${pointer.address} holds no message of type ${type}`);
     }
-    if (message.flags & 2) return sharedMessageData(session, type, message.data, message.address);
+    if (message.flags & 2) return sharedMessageData(loader, type, message.data, message.address, options);
     return { data: message.data, address: message.address };
   }
-  const indexes = session.sharedTable === null ? null : await session.sharedTable;
+  const indexes = loader.sharedTable === null ? null : await loader.sharedTable(options);
   const bit = SHARED_INDEX_BITS.get(type);
   const index = indexes?.find(candidate => (candidate.types & bit) !== 0);
   if (index === undefined || index.heapAddress === null) {
     throw formatError('Shared message', file.absolute(address), `no shared message index holds messages of type ${type}`);
   }
-  const heap = await session.heap(index.heapAddress);
-  const [bytes] = await readHeapObjects(file, heap, [pointer.heapId], session.signal);
+  const heap = await loader.heap(index.heapAddress, options);
+  const [bytes] = await readHeapObjects(loader.fileOf(options), heap, [pointer.heapId], options.signal);
   return { data: bytes, address: null };
 }
 
 /** Replace shared messages by the data they point to. */
-async function resolveMessages(session, messages) {
+async function resolveMessages(loader, messages, options) {
   return Promise.all(messages.map(async message => {
     if ((message.flags & 2) === 0 || !SHAREABLE.has(message.type)) return message;
-    const shared = await sharedMessageData(session, message.type, message.data, message.address);
+    const shared = await sharedMessageData(loader, message.type, message.data, message.address, options);
     return { ...message, data: shared.data, address: shared.address ?? message.address, flags: message.flags & ~2 };
   }));
-}
-
-/**
- * Load the whole object tree below `rootAddress`.
- *
- * @param {import('./context.js').FileContext} file
- * @param {{rootAddress: number, extensionAddress: number|null}} superblock
- * @param {AbortSignal|null} signal
- * @returns {Promise<Map<number, ObjectInfo>>}
- */
-export async function loadTree(file, { rootAddress, rootSymbolTable = null, extensionAddress }, signal = null) {
-  const session = new OpenSession(file, signal);
-  // The root header (and, from the superblock's cache, its links) is asked
-  // for now, alongside the extension.
-  session.header(rootAddress);
-  if (rootSymbolTable !== null && rootSymbolTable.btreeAddress !== null && rootSymbolTable.heapAddress !== null) {
-    session.symbolTableLinks(rootSymbolTable).catch(() => {});
-  }
-  if (extensionAddress !== null) await readExtension(session, extensionAddress);
-
-  const objects = new Map();
-  const started = new Set();
-  const pending = new Set();
-  let failure = null;
-  const track = promise => {
-    pending.add(promise);
-    promise.then(
-      () => pending.delete(promise),
-      error => {
-        pending.delete(promise);
-        failure ??= error;
-      }
-    );
-  };
-  // Children are visited as soon as their group's links are known, while
-  // the group's own attributes are still loading.
-  const visitLinks = links => {
-    for (const link of links) {
-      if (link.type === 'hard' && link.address !== null) visit(link.address);
-    }
-  };
-  const visit = address => {
-    if (started.has(address)) return;
-    started.add(address);
-    track(loadObject(session, address, visitLinks).then(info => {
-      objects.set(address, info);
-    }));
-  };
-  session.onLinks = visitLinks;
-  visit(rootAddress);
-  while (pending.size > 0 && failure === null) await Promise.allSettled([...pending]);
-  if (failure !== null) throw failure;
-  return objects;
 }
 
 /** Parse a message with its parser, naming the object on failure. */
@@ -336,25 +497,22 @@ function parse(file, message, parser, what) {
 }
 
 /**
- * Load one object: its header, what it is, its links (groups) and its
- * attributes, with links and attributes loaded at the same time.
+ * Load one object: its header, what it is and its attributes (a group's
+ * links are loaded on their own, `ObjectLoader.linksOf`).
  *
  * @returns {Promise<ObjectInfo>}
  */
-async function loadObject(session, address, onLinks) {
-  const file = session.file;
-  const header = await session.header(address);
-  const messages = await resolveMessages(session, header.messages);
+async function loadObject(loader, address, options) {
+  const file = loader.file;
+  const header = await loader.header(address, options);
+  const messages = await resolveMessages(loader, header.messages, options);
   const info = { address, kind: 'unknown', attributes: [], unsupported: null };
   if (header.unknownRequired !== null) {
     info.unsupported = new Hdf5UnsupportedError('object-header-message',
       `The object at address ${address} needs header message type ${header.unknownRequired}, which this reader does not know.`);
   }
-  let symbolTable = null;
-  let linkInfo = null;
   let attributeInfo = null;
   let isGroup = false;
-  const links = [];
   const attributeMessages = [];
   let fillOld = null;
   for (const message of messages) {
@@ -366,10 +524,10 @@ async function loadObject(session, address, onLinks) {
       case MESSAGE.LAYOUT: info.layout = parse(file, message, parseLayout, 'Data layout message'); break;
       case MESSAGE.FILTER_PIPELINE: info.filters = parse(file, message, parseFilterPipeline, 'Filter pipeline message'); break;
       case MESSAGE.EXTERNAL_FILES: info.externalStorage = true; break;
-      case MESSAGE.LINK: isGroup = true; links.push(parse(file, message, parseLink, 'Link message')); break;
-      case MESSAGE.LINK_INFO: isGroup = true; linkInfo = parse(file, message, parseLinkInfo, 'Link info message'); break;
-      case MESSAGE.GROUP_INFO: isGroup = true; break;
-      case MESSAGE.SYMBOL_TABLE: isGroup = true; symbolTable = parse(file, message, parseSymbolTable, 'Symbol table message'); break;
+      case MESSAGE.LINK:
+      case MESSAGE.LINK_INFO:
+      case MESSAGE.GROUP_INFO:
+      case MESSAGE.SYMBOL_TABLE: isGroup = true; break;
       case MESSAGE.ATTRIBUTE: attributeMessages.push(message); break;
       case MESSAGE.ATTRIBUTE_INFO: attributeInfo = parse(file, message, parseAttributeInfo, 'Attribute info message'); break;
       default: break;
@@ -388,46 +546,27 @@ async function loadObject(session, address, onLinks) {
   } else if (info.type !== undefined) {
     info.kind = 'datatype';
   }
-
-  const [groupLinks, attributes] = await Promise.all([
-    info.kind === 'group'
-      ? loadLinks(session, address, symbolTable, linkInfo, links).then(found => {
-        onLinks(found);
-        return found;
-      })
-      : Promise.resolve(null),
-    loadAttributes(session, address, attributeMessages, attributeInfo),
-  ]);
-  if (groupLinks !== null) info.links = groupLinks;
-  info.attributes = attributes;
+  info.attributes = await loadAttributes(loader, address, attributeMessages, attributeInfo, options);
   return info;
-}
-
-/* ---------- links ---------- */
-
-function loadLinks(session, address, symbolTable, linkInfo, compactLinks) {
-  if (symbolTable !== null) return session.symbolTableLinks(symbolTable);
-  if (linkInfo !== null && linkInfo.heapAddress !== null) return session.denseLinks(linkInfo, address);
-  return Promise.resolve(compactLinks);
 }
 
 /* ---------- attributes ---------- */
 
-async function loadAttributes(session, address, compactMessages, attributeInfo) {
-  const file = session.file;
-  const signal = session.signal;
+async function loadAttributes(loader, address, compactMessages, attributeInfo, options) {
+  const file = loader.fileOf(options);
+  const signal = options.signal;
   const messages = compactMessages.map(message => ({ data: message.data, address: message.address }));
   if (attributeInfo !== null && attributeInfo.heapAddress !== null) {
     const records = [];
     const [heap] = await Promise.all([
-      session.heap(attributeInfo.heapAddress),
+      loader.heap(attributeInfo.heapAddress, options),
       walkBtreeV2(file, attributeInfo.nameIndexAddress, (bytes, offset) => {
         records.push({ id: bytes.slice(offset, offset + 8), flags: bytes[offset + 8] });
       }, { signal, expectType: 8 }),
     ]);
     const objects = await readHeapObjects(file, heap, records.map(record => record.id), signal);
     const dense = await Promise.all(objects.map((bytes, index) => (records[index].flags & 2
-      ? sharedMessageData(session, MESSAGE.ATTRIBUTE, bytes, address)
+      ? sharedMessageData(loader, MESSAGE.ATTRIBUTE, bytes, address, options)
       : { data: bytes, address })));
     messages.push(...dense.map(entry => ({ data: entry.data, address: entry.address ?? address })));
   }
@@ -437,8 +576,8 @@ async function loadAttributes(session, address, compactMessages, attributeInfo) 
   const parsed = await Promise.all(messages.map(async message => {
     const parts = parse(file, message, parseAttribute, 'Attribute message');
     const [typeField, spaceField] = await Promise.all([
-      parts.typeShared ? sharedMessageData(session, MESSAGE.DATATYPE, parts.typeBytes, message.address) : { data: parts.typeBytes, address: message.address },
-      parts.spaceShared ? sharedMessageData(session, MESSAGE.DATASPACE, parts.spaceBytes, message.address) : { data: parts.spaceBytes, address: message.address },
+      parts.typeShared ? sharedMessageData(loader, MESSAGE.DATATYPE, parts.typeBytes, message.address, options) : { data: parts.typeBytes, address: message.address },
+      parts.spaceShared ? sharedMessageData(loader, MESSAGE.DATASPACE, parts.spaceBytes, message.address, options) : { data: parts.spaceBytes, address: message.address },
     ]);
     const type = parseDatatype(file.cursor(typeField.data, typeField.address ?? address, `Datatype of attribute '${parts.name}'`));
     const space = parseDataspace(file.cursor(spaceField.data, spaceField.address ?? address, `Dataspace of attribute '${parts.name}'`));

@@ -236,10 +236,21 @@ test('a recolour of an ordered live store holds the new colours in draw order', 
     const count = renderer.pointCount;
     // The adopted store holds the positions, bit for bit, in the draw order.
     const dimension = renderer.currentDimensionLevel;
-    const storedPositions = new Uint32Array(count * dimension);
-    gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.positions);
-    gl.getBufferSubData(gl.ARRAY_BUFFER, 0, storedPositions);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    // Every segment of a segmented store (point-store-segments.js), read
+    // with the GL calls themselves: the renderer facade hands out its stores
+    // read-only, so none of their methods is called through it.
+    const readStore = (store, out) => {
+      const segments = store.segments;
+      const elements = store.bytesPerPoint / out.BYTES_PER_ELEMENT;
+      for (let index = 0; index < segments.length; index++) {
+        const segment = segments[index];
+        gl.bindBuffer(gl.ARRAY_BUFFER, segment.buffer);
+        gl.getBufferSubData(gl.ARRAY_BUFFER, 0, out, segment.first * elements, segment.count * elements);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      return out;
+    };
+    const storedPositions = readStore(renderer.buffers.positions, new Uint32Array(count * dimension));
     const sourcePositions = new Uint32Array(renderer._positions.buffer, renderer._positions.byteOffset, count * dimension);
     let positionMismatches = 0;
     for (let slot = 0; slot < count; slot++) {
@@ -251,10 +262,7 @@ test('a recolour of an ordered live store holds the new colours in draw order', 
     for (let i = 0; i < colors.length; i++) colors[i] = (i * 2654435761) >>> 24;
     renderer.updateColors(colors);
     renderer.flushBufferUpdates(renderer.currentDimensionLevel);
-    const stored = new Uint8Array(count * 4);
-    gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.colors);
-    gl.getBufferSubData(gl.ARRAY_BUFFER, 0, stored);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    const stored = readStore(renderer.buffers.colors, new Uint8Array(count * 4));
     const indices = record.drawOrder.indices;
     let mismatches = 0;
     for (let slot = 0; slot < count; slot++) {
@@ -270,5 +278,135 @@ test('a recolour of an ordered live store holds the new colours in draw order', 
   expect(proof.positionMismatches).toBe(0);
   expect(proof.error).toBe(0);
   expect(proof.count).toBeGreaterThan(0);
+  expect(pageErrors).toEqual([]);
+});
+
+test('a gather above one chunk is byte-exact, from page memory a chunk at a time, into one buffer or segments', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+
+  const proof = await page.evaluate(async () => {
+    const { GpuPermuter } = await import('/assets/js/rendering/high-perf/gpu-permute.js');
+    const { planStoreSegments } = await import('/assets/js/rendering/high-perf/point-store-segments.js');
+    const linear = await import('/assets/js/rendering/linear-texture.js');
+    const gl = document.createElement('canvas').getContext('webgl2');
+    let seed = 777;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) >>> 0;
+      return seed;
+    };
+    const results = [];
+    // Chunks of 1000 points: 70,001 points take 71 source chunks x 71 target
+    // ranges; segments of 4096 slots split those ranges again.
+    const chunkPoints = 1000;
+    const permuter = new GpuPermuter(gl, null, { chunkPoints });
+    for (const count of [999, 1000, 1001, 70_001]) {
+      const indices = new Uint32Array(count);
+      for (let i = 0; i < count; i++) indices[i] = i;
+      for (let i = count - 1; i > 0; i--) {
+        const j = random() % (i + 1);
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+      }
+      const plan = linear.planLinearTextureFor(gl, count);
+      const orderTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, orderTexture);
+      linear.allocateLinearTexture(gl, gl.R32UI, plan);
+      linear.writeLinearTextureRows(gl, plan, gl.RED_INTEGER, gl.UNSIGNED_INT, indices, 1);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+      const record = { texture: orderTexture, plan };
+      const buffer = (bytes, data = null) => {
+        const handle = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, handle);
+        gl.bufferData(gl.ARRAY_BUFFER, data ?? bytes, gl.DYNAMIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        return handle;
+      };
+      const read = (handle, words) => {
+        const out = new Uint32Array(words);
+        gl.bindBuffer(gl.ARRAY_BUFFER, handle);
+        gl.getBufferSubData(gl.ARRAY_BUFFER, 0, out);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        return out;
+      };
+      let mismatches = 0;
+      let refusedWithoutPage = count <= chunkPoints;
+      for (const wordsPerPoint of [1, 2, 3]) {
+        const array = new Uint32Array(count * wordsPerPoint);
+        for (let i = 0; i < array.length; i++) array[i] = random();
+        const expected = new Uint32Array(array.length);
+        for (let slot = 0; slot < count; slot++) {
+          for (let word = 0; word < wordsPerPoint; word++) {
+            expected[slot * wordsPerPoint + word] = array[indices[slot] * wordsPerPoint + word];
+          }
+        }
+        // One buffer: from page memory, and in place over its source order.
+        const fresh = buffer(count * wordsPerPoint * 4);
+        permuter.writeWords(fresh, array, record, wordsPerPoint);
+        const inPlace = buffer(0, array);
+        permuter.writeWords(inPlace, { buffer: inPlace, words: array.length, page: array }, record, wordsPerPoint);
+        // Segments of 4096 slots, from page memory and in place.
+        const segments = planStoreSegments(count, 4096).map(segment => ({
+          ...segment,
+          buffer: buffer(0, array.subarray(segment.first * wordsPerPoint, (segment.first + segment.count) * wordsPerPoint)),
+        }));
+        permuter.writeWords(segments, { buffer: segments, words: array.length, page: array }, record, wordsPerPoint);
+        const segmentWords = new Uint32Array(array.length);
+        for (const segment of segments) {
+          segmentWords.set(read(segment.buffer, segment.count * wordsPerPoint), segment.first * wordsPerPoint);
+        }
+        for (const got of [read(fresh, array.length), read(inPlace, array.length), segmentWords]) {
+          for (let i = 0; i < got.length; i++) if (got[i] !== expected[i]) mismatches++;
+        }
+        if (count > chunkPoints) {
+          try {
+            permuter.writeWords(fresh, { buffer: fresh, words: array.length }, record, wordsPerPoint);
+          } catch (error) {
+            refusedWithoutPage = /page memory/.test(error.message);
+          }
+        }
+        for (const handle of [fresh, inPlace, ...segments.map(segment => segment.buffer)]) gl.deleteBuffer(handle);
+      }
+      // Highlight words into segments: slot s holds point order[s].
+      const byteTexture = bytes => {
+        const texture = gl.createTexture();
+        const bytePlan = linear.planLinearTextureFor(gl, count);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+        linear.allocateLinearTexture(gl, gl.R8UI, bytePlan);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        linear.writeLinearTextureRows(gl, bytePlan, gl.RED_INTEGER, gl.UNSIGNED_BYTE, bytes, 1);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+        return { texture, plan: bytePlan };
+      };
+      const intensity = new Uint8Array(count).map(() => [0, 3, 200][random() % 3]);
+      const shown = new Uint8Array(count).map(() => random() % 2);
+      const highlight = byteTexture(intensity);
+      const visible = byteTexture(shown);
+      const wordSegments = planStoreSegments(count, 4096).map(segment => ({ ...segment, buffer: buffer(segment.count * 4) }));
+      permuter.writeHighlightWords(wordSegments, count, record, highlight, visible, 3);
+      let highlightMismatches = 0;
+      for (const segment of wordSegments) {
+        const got = read(segment.buffer, segment.count);
+        for (let local = 0; local < segment.count; local++) {
+          const point = indices[segment.first + local];
+          const want = intensity[point] >= 3 && shown[point] === 1 ? (0x00ffffff | (intensity[point] << 24)) >>> 0 : 0;
+          if (got[local] !== want) highlightMismatches++;
+        }
+        gl.deleteBuffer(segment.buffer);
+      }
+      for (const texture of [orderTexture, highlight.texture, visible.texture]) gl.deleteTexture(texture);
+      results.push({ count, mismatches, highlightMismatches, refusedWithoutPage, error: gl.getError() });
+    }
+    permuter.dispose();
+    return results;
+  });
+
+  for (const row of proof) {
+    expect(row, `count ${row.count}`).toEqual({
+      count: row.count, mismatches: 0, highlightMismatches: 0, refusedWithoutPage: true, error: 0,
+    });
+  }
   expect(pageErrors).toEqual([]);
 });

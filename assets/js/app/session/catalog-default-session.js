@@ -14,16 +14,13 @@ import {
   assertNonEmptyString,
   requireMethod,
 } from './schema-contract.js';
-import {
-  isSessionRestoreCanceledError,
-  isSessionRestoreSupersededError,
-} from './session-serializer.js';
 // `crypto.subtle` is secure-context only and has no non-secure counterpart, so
 // verifying a published state's advertised digest through it fails on exactly
 // the plain-HTTP LAN address the Python package is built to serve from.
 import { sha256Hex } from '../utils/sha256.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { throwIfAborted, cancellationKind } from '../../utils/abort.js';
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const DESCRIPTOR_KEYS = Object.freeze([
@@ -53,10 +50,10 @@ export function classifyAdvertisedDatasetStateRestoreError(
   if (options.ownerAborted) {
     return Object.freeze({ status: 'superseded' });
   }
-  if (isSessionRestoreSupersededError(error)) {
+  if (cancellationKind(error) === 'superseded') {
     return Object.freeze({ status: 'ready-state-replaced' });
   }
-  if (isSessionRestoreCanceledError(error)) {
+  if (cancellationKind(error) === 'user') {
     return Object.freeze({ status: 'ready-state-canceled' });
   }
   return null;
@@ -80,12 +77,6 @@ function assertOwner(value, label) {
     throw new TypeError(`${label} must be an object.`);
   }
   return value;
-}
-
-function throwIfAborted(signal) {
-  if (signal.aborted) {
-    throw new DOMException('Aborted', 'AbortError');
-  }
 }
 
 function assertHttpUrl(value, label) {

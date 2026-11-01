@@ -110,7 +110,7 @@ function geneFilteredContext() {
 
 test('a view lists the same restrictions whether or not it is focused', () => {
   const context = geneFilteredContext();
-  const expected = ['CD3E: 1.00 – 2.00'];
+  const expected = ['CD3E: 1 – 2'];
 
   const unfocused = {
     activeViewId: 'live',

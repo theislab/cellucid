@@ -1,6 +1,6 @@
 import { readdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,7 +24,13 @@ if (testFiles.length === 0) {
 // timeout and the run goes on, instead of blocking the suite for hours.
 const TEST_TIMEOUT_MS = 120_000;
 
-const result = spawnSync(process.execPath, ['--test', `--test-timeout=${TEST_TIMEOUT_MS}`, ...testFiles], {
+// No contract test reaches the network: every request to a host other than
+// this machine is refused, and the test file that made it fails, naming it
+// (`network-guard-preload.mjs`). Preloaded before `--test`, it runs in every
+// test file's process.
+const NETWORK_GUARD = pathToFileURL(path.join(repositoryRoot, 'scripts', 'network-guard-preload.mjs')).href;
+
+const result = spawnSync(process.execPath, ['--import', NETWORK_GUARD, '--test', `--test-timeout=${TEST_TIMEOUT_MS}`, ...testFiles], {
   cwd: repositoryRoot,
   stdio: 'inherit',
 });

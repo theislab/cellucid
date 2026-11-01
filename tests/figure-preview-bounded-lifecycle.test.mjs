@@ -519,7 +519,7 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
   );
   assert.match(
     source,
-    /if \(cleanupComplete \|\| exportInFlight\) return;[\s\S]*setBusy\(true\);[\s\S]*await exportFigureFromUi\(abortController\.signal\)/
+    /if \(cleanupComplete\) return;\s*if \(exportInFlight\) \{[\s\S]*?cancel\(activeExportAbortController, 'user'[\s\S]*setBusy\(true\);[\s\S]*await exportFigureFromUi\(abortController\.signal\)/
   );
   assert.match(
     source,
@@ -548,11 +548,12 @@ test('figure-export UI exposes its stable idempotent cleanup owner', async () =>
     'utf8'
   );
 
+  // Idempotent, and each call answers when the export it stopped has ended.
   assert.match(
     source,
-    /const destroy = \(\) => \{\s*if \(cleanupComplete\) return;/
+    /const destroy = \(\) => \{\s*if \(cleanupComplete\) return exportEnded;\s*cleanupComplete = true;\s*container\.__cellucidCleanup = \(\) => exportEnded;/
   );
-  assert.match(source, /container\.__cellucidCleanup = destroy;/);
+  assert.match(source, /\s{4}return exportEnded;\n  \};\n  container\.__cellucidCleanup = destroy;/);
   assert.match(source, /return \{ setCellsPresent, destroy, exportSessionSettings, importSessionSettings \};\s*\n\}/);
 });
 
@@ -566,7 +567,7 @@ test('figure-export Export is offered only while the runtime has cells', async (
   );
 
   assert.match(source, /let cellsPresent = false;/);
-  assert.match(source, /exportBtn\.disabled = exportBusy \|\| !cellsPresent;/);
+  assert.match(source, /exportBtn\.disabled = !exportBusy && !cellsPresent;/);
   assert.match(
     source,
     /exportBtn\.title = cellsPresent \? '' : 'Load a dataset to export a figure';/

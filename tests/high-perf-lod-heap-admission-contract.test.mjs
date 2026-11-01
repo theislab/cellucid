@@ -16,6 +16,7 @@
  * the boundary bytes of its own arithmetic, without ever running the size that
  * hangs.
  */
+import { DEFAULT_CELL_PRIORITY } from '../assets/js/data/cell-priority.js';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -181,6 +182,7 @@ function makeRenderer({
       _perViewState: new Map(),
       _positions: makePositions(geometryPoints),
       _snapshotGeometryPools: new Map(),
+      _cellPriority: DEFAULT_CELL_PRIORITY,
       currentDimensionLevel: 3,
       forceLODLevel: -1,
       options: { LOD_MAX_DEPTH: 8, LOD_MAX_POINTS_PER_NODE: 1000 },
@@ -434,3 +436,38 @@ test('every LOD tree construction is admitted first', async () => {
     '`requireLodBuildHeapHeadroom(` admission check',
   );
 });
+
+test(
+  'a build in the tree worker is admitted against what this thread receives, not the worker\'s scratch',
+  (t) => {
+    // Measured on Chromium (ANGLE Metal, Apple M1 Pro): 100M synthetic 3D
+    // points loaded, 2,121 MiB of heap in use against a 4,192 MiB cap. The
+    // whole-build projection refused it; the build runs in the worker, and
+    // this thread receives typed arrays and about one tree node per thousand
+    // points.
+    const pointCount = 100_000_000;
+    const used = 2_121 * MIB;
+    const limit = 4_192 * MIB;
+    simulateHeap(t, { limitBytes: limit, usedBytes: used });
+    const errors = recordErrorNotifications(t);
+    recordCalculationNotifications(t);
+    const previousWorker = globalThis.Worker;
+    globalThis.Worker = class Worker {};
+    t.after(() => { globalThis.Worker = previousWorker; });
+    const { renderer } = makeRenderer({ pointCount });
+    const builds = [];
+    renderer._buildSpatialTreeJob = (...args) => builds.push(args);
+    renderer.setAdaptiveLOD(true);
+    renderer._requestSpatialIndex({ kind: 'live' }, true);
+    assert.deepEqual(errors, []);
+    assert.equal(builds.length, 1, 'the worker build is started');
+    // Where there is no worker the build runs on this thread, and the whole
+    // build is still what is admitted.
+    delete globalThis.Worker;
+    const inline = makeRenderer({ pointCount });
+    inline.renderer.setAdaptiveLOD(true);
+    inline.renderer._requestSpatialIndex({ kind: 'live' }, true);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /cannot build a level-of-detail index for 100,000,000 points/);
+  },
+);

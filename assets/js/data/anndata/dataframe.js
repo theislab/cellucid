@@ -4,15 +4,18 @@
  *
  * Validation (`*Contract`, `validate*`) reads no values; reading (`read*`)
  * reads exactly the arrays a column needs, in parallel where it needs more
- * than one.
+ * than one. Both work on loaded groups (`formats/store.js`, `Group.load`):
+ * a frame is loaded with its columns known (`loadFrameStructure` adds what
+ * its index and nested column names need), a column's parts when it is
+ * read.
  *
  * @module data/anndata/dataframe
  */
 
 import { requireCategoricalCategoryCount } from '../categorical-storage-contract.js';
-import { decodeAnnDataBoolean } from '../anndata-value-kinds.js';
+import { decodeAnnDataBoolean, decodeAnnDataBooleanFlags } from '../anndata-value-kinds.js';
 import { geneNameText } from '../gene-names.js';
-import { isGroup } from '../../formats/store.js';
+import { StoreNotLoadedError, isGroup } from '../../formats/store.js';
 import {
   NULLABLE_ENCODINGS,
   child,
@@ -26,7 +29,7 @@ import {
   validateOneDimensional,
   valueKind,
 } from './elements.js';
-import { readInt32, readStored } from './values.js';
+import { readContinuous, readInt32, readStored } from './values.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
 
 /**
@@ -114,11 +117,12 @@ export function nullableContract(item, key, declared, format, expectedLength = n
 }
 
 /** A boolean mask as 0/1 bytes; any other stored value is refused. */
-export async function readBooleanMask(maskArray, length, label, options) {
-  const raw = await readStored(maskArray, 0, length, label, options);
+export async function readBooleanMask(maskArray, length, label, options, range = null) {
+  const { start, end } = range ?? { start: 0, end: length };
+  const raw = await readStored(maskArray, start, end, label, options);
   const message = `${label} must contain only boolean values`;
-  const mask = raw instanceof Uint8Array ? raw : allocateTypedArray(Uint8Array, length, label);
-  for (let i = 0; i < length; i++) {
+  const mask = raw instanceof Uint8Array ? raw : allocateTypedArray(Uint8Array, end - start, label);
+  for (let i = 0; i < end - start; i++) {
     const value = raw[i];
     if (value === 0 || value === 1) mask[i] = value;
     else mask[i] = decodeAnnDataBoolean(value, message) ? 1 : 0;
@@ -127,32 +131,38 @@ export async function readBooleanMask(maskArray, length, label, options) {
 }
 
 /**
- * A nullable column's values: integers as float32 with NaN where missing,
- * booleans and strings as values with null where missing.
+ * A nullable column's values: integers as numbers with NaN where missing
+ * (float32, or float64 where float32 cannot hold them exactly:
+ * `exactIntegersNeedFloat64`), booleans and strings as values with null
+ * where missing. `range` (`{start, end}`) reads only those rows; every row
+ * by default.
  */
-export async function readNullableValues(item, key, declared, format, expectedLength = null, contract = null, options = {}) {
-  const { maskArray, valuesArray, valuesKind, valuesLength } =
+export async function readNullableValues(item, key, declared, format, expectedLength = null, contract = null, options = {}, range = null) {
+  const { maskArray, valuesArray, valuesKind, valuesLength: storedLength } =
     contract ?? nullableContract(item, key, declared, format, expectedLength);
-  const [mask, rawValues] = await Promise.all([
-    readBooleanMask(maskArray, valuesLength, `Nullable mask for '${key}'`, options),
-    readStored(valuesArray, 0, valuesLength, `Nullable values for '${key}'`, options),
-  ]);
+  const { start, end } = range ?? { start: 0, end: storedLength };
+  const valuesLength = end - start;
   if (declared === 'nullable-integer') {
     // Only present values are checked: what a writer leaves under the mask
-    // is not data.
-    // Stored as float32, as every continuous field (64-bit integers too).
-    const values = allocateTypedArray(Float32Array, valuesLength, `Nullable values for '${key}'`);
-    for (let i = 0; i < valuesLength; i++) values[i] = mask[i] ? Number.NaN : Number(rawValues[i]);
+    // is not data. Integers stay exact: float64 where float32 cannot hold
+    // them (`readContinuous`, 64-bit ones through their words).
+    const [mask, values] = await Promise.all([
+      readBooleanMask(maskArray, storedLength, `Nullable mask for '${key}'`, options, { start, end }),
+      readContinuous(valuesArray, start, end, `Nullable values for '${key}'`, options),
+    ]);
+    for (let i = 0; i < valuesLength; i++) if (mask[i]) values[i] = Number.NaN;
     return { dtype: valuesKind === 'uint' ? 'uint' : 'int', values };
   }
-  const values = new Array(valuesLength);
+  const [mask, rawValues] = await Promise.all([
+    readBooleanMask(maskArray, storedLength, `Nullable mask for '${key}'`, options, { start, end }),
+    readStored(valuesArray, start, end, `Nullable values for '${key}'`, options),
+  ]);
   if (declared === 'nullable-boolean') {
+    // One byte a cell (0, 1, or missing), coded by its caller (`codeBooleanColumn`).
     const message = `Nullable boolean values for '${key}' must contain only boolean values`;
-    for (let i = 0; i < valuesLength; i++) {
-      values[i] = mask[i] ? null : decodeAnnDataBoolean(rawValues[i], message);
-    }
-    return { dtype: 'bool', values };
+    return { dtype: 'bool', flags: decodeAnnDataBooleanFlags(rawValues, mask, message) };
   }
+  const values = new Array(valuesLength);
   for (let i = 0; i < valuesLength; i++) values[i] = mask[i] ? null : String(rawValues[i]);
   return { dtype: 'string', values };
 }
@@ -176,6 +186,7 @@ async function readNames(array, length, label, options) {
  */
 export async function readDataFrameIndex(indexNode, format, label, expectedLength = null, materialize = false, options = {}) {
   if (isGroup(indexNode)) {
+    await indexNode.load([''], options);
     const declared = encodingType(indexNode);
     if (declared !== 'nullable-string-array') {
       throw new Error(`${label} group uses unsupported encoding '${declared || 'unknown'}'`);
@@ -246,41 +257,84 @@ export async function readCategories(categories, key, format, options = {}) {
     return freezeUniqueCategories(result.values, key);
   }
   const length = categoryCount(categories, key, format);
-  const kind = valueKind(categories);
   const raw = await readStored(categories, 0, length, `Categorical categories for '${key}'`, options);
-  if (kind === 'string') return freezeUniqueCategories(Array.from(raw, value => String(value)), key);
+  return freezeUniqueCategories(categoryLabels(raw, valueKind(categories), key), key);
+}
+
+/**
+ * Some of a categorical column's labels: those at the stored positions
+ * `positions` (ascending), in that order, each exactly what
+ * `readCategories` gives at its position. `gather(array, positions)` is the
+ * array's rows at those positions (`views/cell-subset.js` `gatheredArray`):
+ * only what they need of its storage is read (a dictionary of one category
+ * per cell is tens of megabytes; a share of the cells names a share of
+ * them). Labels must be unique among those read; the others are not read,
+ * so not checked. A nullable dictionary (a group of values and mask,
+ * which anndata does not write for categories) is read whole and picked.
+ *
+ * @param {Object} categories
+ * @param {Uint32Array} positions
+ * @param {string} key
+ * @param {import('./elements.js').AnnDataFormat} format
+ * @param {Object} options - Read options
+ * @param {(array: Object, positions: Uint32Array) => Object} gather
+ * @returns {Promise<ReadonlyArray<string|number|boolean>>}
+ */
+export async function readCategoriesAt(categories, positions, key, format, options, gather) {
+  if (isGroup(categories)) {
+    const all = await readCategories(categories, key, format, options);
+    return Object.freeze(Array.from(positions, position => all[position]));
+  }
+  categoryCount(categories, key, format);
+  if (positions.length === 0) return Object.freeze([]);
+  const raw = await readStored(gather(categories, positions), 0, positions.length, `Categorical categories for '${key}'`, options);
+  return freezeUniqueCategories(categoryLabels(raw, valueKind(categories), key), key);
+}
+
+/** Stored category values as labels (`readCategories`): text, booleans or finite numbers. */
+function categoryLabels(raw, kind, key) {
+  if (kind === 'string') return Array.from(raw, value => String(value));
   if (kind === 'bool') {
-    return freezeUniqueCategories(Array.from(raw, value => decodeAnnDataBoolean(
+    return Array.from(raw, value => decodeAnnDataBoolean(
       value,
       `Categorical categories for '${key}' contain a non-boolean value`
-    )), key);
+    ));
   }
   // Labels are names: a 64-bit integer label beyond 2^53 has no exact
   // number, so such labels are all given as their exact decimal text.
   if (Array.prototype.some.call(raw, value => typeof value === 'bigint' && (value > 9007199254740991n || value < -9007199254740991n))) {
-    return freezeUniqueCategories(Array.from(raw, value => String(value)), key);
+    return Array.from(raw, value => String(value));
   }
-  return freezeUniqueCategories(Array.from(raw, value => {
+  return Array.from(raw, value => {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) {
       throw new Error(`Categorical categories for '${key}' cannot contain non-finite numeric labels`);
     }
     return numeric;
-  }), key);
+  });
 }
 
-/** Validate a categorical column's codes array (one signed integer per row). */
+/**
+ * Validate a categorical column's codes array: one integer per row, signed
+ * (anndata's, -1 for a missing value) or unsigned (other writers'; every
+ * code then names a category, checked as the codes are read).
+ */
 export function validateCodes(codes, key, format, nRows) {
   validateArrayEncoding(codes, format, `Categorical codes for '${key}'`, 'array');
   const length = validateOneDimensional(codes, format, `Categorical codes for '${key}'`, nRows);
-  if (valueKind(codes) !== 'int') throw new Error(`Categorical codes for '${key}' must use a signed integer dtype`);
+  const kind = valueKind(codes);
+  if (kind !== 'int' && kind !== 'uint') throw new Error(`Categorical codes for '${key}' must use an integer dtype`);
   return length;
 }
 
-/** A categorical column's codes as int32, each a category or -1 (missing). */
-export async function readCodes(codes, nCategories, key, format, nRows, options = {}) {
+/**
+ * A categorical column's codes as int32, each a category or -1 (missing);
+ * `range` (`{start, end}`) reads only those rows, every row by default.
+ */
+export async function readCodes(codes, nCategories, key, format, nRows, options = {}, range = null) {
   const length = validateCodes(codes, key, format, nRows);
-  const values = await readInt32(codes, 0, length, `Categorical code for '${key}'`, options);
+  const { start, end } = range ?? { start: 0, end: length };
+  const values = await readInt32(codes, start, end, `Categorical code for '${key}'`, options);
   for (let i = 0; i < values.length; i++) {
     const code = values[i];
     if (code < -1 || code >= nCategories) {
@@ -291,34 +345,78 @@ export async function readCodes(codes, nCategories, key, format, nRows, options 
 }
 
 /**
- * Check one dataframe column against the current specs and the frame's row
- * count, reading no values.
+ * Check one dataframe column as opening sees it, reading no values: its own
+ * encoding, and an array's shape and element type against the frame's row
+ * count. A categorical or nullable column is a group whose parts (codes and
+ * categories, values and mask) are not loaded at open
+ * (`ANNDATA_OPENING_PATHS`): they are loaded and checked when the column is
+ * read (`resolveCategoricalColumn`, `validateCodes`, `nullableContract`),
+ * which refuses a column whose parts are wrong with the same words.
  */
 export function validateColumnAxis(frame, key, format, frameLabel, expectedLength) {
+  if (!frame.has(key)) throw new Error(`${frameLabel} declared column '${key}' was not found`);
   const item = frame.get(key);
   const label = `${frameLabel} column '${key}'`;
-  const declared = validateColumnEncoding(item, format, label);
-  const categorical = resolveCategoricalColumn(frame, key, format);
-  if (categorical) {
-    validateCodes(categorical.codes, key, format, expectedLength);
-    categoryCount(categorical.categories, key, format);
-    return;
-  }
-  if (isGroup(item)) {
-    if (NULLABLE_ENCODINGS.has(declared)) {
-      nullableContract(item, key, declared, format, expectedLength);
-      return;
-    }
-    throw new Error(`${label} uses unsupported encoding '${declared || 'unknown'}'`);
-  }
+  validateColumnEncoding(item, format, label);
+  if (isGroup(item)) return;
   validateOneDimensional(item, format, label, expectedLength);
   requirePrimitiveKind(item, label);
 }
 
-/** The columns of a dataframe and the dtype each holds, for the data-mapping catalog. */
-export function probeColumns(frame, format, label) {
+/**
+ * Why one dataframe column cannot be read (`validateColumnAxis`'s refusal,
+ * as a sentence), or null when it can. One column a reader does not
+ * understand (an unknown encoding, a compound or opaque dtype, the wrong
+ * length) is left out of the dataset with this reason, never the dataset
+ * refused for it: the frame's index and shape are what the file needs. A
+ * column whose parts are wrong is refused when it is read.
+ *
+ * @param {Object} frame
+ * @param {string} key
+ * @param {import('./elements.js').AnnDataFormat} format
+ * @param {string} frameLabel - `obs`, `var`, `raw.var`, `<modality> var`
+ * @param {number|null} expectedLength
+ * @returns {string|null}
+ */
+export function columnDefect(frame, key, format, frameLabel, expectedLength) {
+  try {
+    validateColumnAxis(frame, key, format, frameLabel, expectedLength);
+    return null;
+  } catch (error) {
+    // Not loading what is checked is the reader's mistake, never the file's.
+    if (error instanceof StoreNotLoadedError) throw error;
+    return `${String(error?.message ?? error).replace(/\.$/, '')}; the column was not read.`;
+  }
+}
+
+/**
+ * Load what checking a loaded dataframe's columns and reading its index
+ * navigate besides its own children (`formats/store.js`, `Group.load`): its
+ * index whole (a nullable index is a group of values and mask), and the way
+ * to each column whose name is a path (`a/b`, a column in a nested group).
+ * Columns' own parts are not loaded: they are when the column is read.
+ *
+ * @param {Object|null} frame - A loaded dataframe group (or anything else: nothing is loaded)
+ * @param {{signal?: AbortSignal|null, activity?: Object|null}} [options]
+ * @returns {Promise<void>}
+ */
+export async function loadFrameStructure(frame, options = {}) {
+  if (!isGroup(frame)) return;
+  const indexKey = frame.attrs?._index;
+  const order = frame.attrs?.['column-order'];
+  const columns = Array.isArray(order) ? order.map(String) : (typeof order === 'string' ? [order] : []);
+  const paths = columns.filter(key => key.includes('/')).map(path => ({ path, depth: 0 }));
+  if (typeof indexKey === 'string' && indexKey !== '') paths.push(indexKey);
+  await frame.load(paths, options);
+}
+
+/**
+ * The columns of a dataframe that can be read and the dtype each holds,
+ * for the data-mapping catalog: a column `columnDefect` refuses is left out.
+ */
+export function probeColumns(frame, format, label, expectedLength = null) {
   const { columnOrder } = validateDataFrame(frame, format, label);
-  return columnOrder.map(key => {
+  return columnOrder.filter(key => columnDefect(frame, key, format, label, expectedLength) === null).map(key => {
     const node = frame.get(key);
     if (!isGroup(node)) return { key, dtype: numpyDtypeName(node) };
     const declared = encodingType(node);
@@ -346,7 +444,7 @@ export async function readBooleanColumn(frame, key, format, label, nRows, option
       readBooleanMask(contract.maskArray, contract.valuesLength, `Nullable mask for '${key}'`, options),
       readBooleanMask(contract.valuesArray, contract.valuesLength, label, options),
     ]);
-    const flags = new Uint8Array(contract.valuesLength);
+    const flags = allocateTypedArray(Uint8Array, contract.valuesLength, label);
     for (let row = 0; row < flags.length; row++) flags[row] = values[row] === 1 && mask[row] === 0 ? 1 : 0;
     return flags;
   }

@@ -11,6 +11,7 @@ function makeMembership(indices, dimensionLevel, pointCount) {
   for (const index of indices) admissionLevels[index] = 0;
   return Object.freeze({
     admissionLevels,
+    count: indices.length,
     dimensionLevel,
     generationToken: Object.freeze({}),
     indices,
@@ -101,23 +102,23 @@ function makeRenderer() {
   };
 }
 
-test('LOD indices use the main spatial owner for live and shared-position views', () => {
+test('LOD membership uses the main spatial owner for live and shared-position views', () => {
   const fixture = makeRenderer();
 
   assert.equal(
-    fixture.renderer.getCurrentLodIndices('live', 2),
+    fixture.renderer.getCurrentLodMembership('live', 2).indices,
     fixture.mainIndices
   );
   assert.equal(
-    fixture.renderer.getCurrentLodIndices('snap_shared', 2),
+    fixture.renderer.getCurrentLodMembership('snap_shared', 2).indices,
     fixture.mainIndices
   );
 });
 
-test('LOD indices use the exact custom snapshot spatial owner', () => {
+test('LOD membership uses the exact custom snapshot spatial owner', () => {
   const fixture = makeRenderer();
 
-  const indices = fixture.renderer.getCurrentLodIndices('snap_custom', 2);
+  const indices = fixture.renderer.getCurrentLodMembership('snap_custom', 2).indices;
 
   assert.equal(indices, fixture.customIndices);
   assert.notEqual(indices, fixture.mainIndices);
@@ -129,25 +130,26 @@ test('custom snapshot LOD lookup never falls back to a stale or mismatched owner
 
   snapshot.dimensionLevel = 3;
   assert.throws(
-    () => fixture.renderer.getCurrentLodIndices('snap_custom', 2),
+    () => fixture.renderer.getCurrentLodMembership('snap_custom', 2),
     /snapshot "snap_custom".*owns 3D.*2D spatial-owner request/i
   );
 
   snapshot.dimensionLevel = 2;
   snapshot.spatialIndex = {
     dimensionLevel: 2,
-    lodLevels: [{ indices: fixture.customIndices }],
+    lodLevels: [{ indices: fixture.customIndices, isFullDetail: false, pointCount: 2 }],
+    getLodMembership() { return fixture.customMembership; },
     positions: fixture.customPositions.slice(),
   };
   assert.throws(
-    () => fixture.renderer.getCurrentLodIndices('snap_custom', 2),
-    /snapshot "snap_custom".*no current 2D spatial index/i
+    () => fixture.renderer.getCurrentLodMembership('snap_custom', 2),
+    /snapshot "snap_custom".*no current 2D spatial index or rank levels/i
   );
 
   snapshot.spatialIndex = null;
   assert.throws(
-    () => fixture.renderer.getCurrentLodIndices('snap_custom', 2),
-    /snapshot "snap_custom".*no current 2D spatial index/i
+    () => fixture.renderer.getCurrentLodMembership('snap_custom', 2),
+    /snapshot "snap_custom".*no current 2D spatial index or rank levels/i
   );
 });
 
@@ -163,18 +165,20 @@ test('a new live generation detaches snapshots even when live array identity is 
   assert.notEqual(snapshot.positions, liveIdentity);
   assert.equal(snapshot.positions, immutableSnapshotPositions);
   assert.throws(
-    () => fixture.renderer.getCurrentLodIndices('snap_shared', 2),
-    /snapshot "snap_shared".*no current 2D spatial index/i
+    () => fixture.renderer.getCurrentLodMembership('snap_shared', 2),
+    /snapshot "snap_shared".*no current 2D spatial index or rank levels/i
   );
 
   const snapshotIndices = Uint32Array.from([1, 2]);
+  const snapshotMembership = makeMembership(snapshotIndices, 2, 4);
   snapshot.spatialIndex = {
     dimensionLevel: 2,
-    lodLevels: [{ indices: snapshotIndices }],
+    lodLevels: [{ indices: snapshotIndices, isFullDetail: false, pointCount: 2 }],
+    getLodMembership() { return snapshotMembership; },
     positions: snapshot.positions,
   };
   assert.equal(
-    fixture.renderer.getCurrentLodIndices('snap_shared', 2),
+    fixture.renderer.getCurrentLodMembership('snap_shared', 2).indices,
     snapshotIndices
   );
   assert.notEqual(snapshotIndices, fixture.mainIndices);

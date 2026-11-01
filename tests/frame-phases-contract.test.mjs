@@ -107,7 +107,10 @@ test('the viewer drains the phases around every frame, drawn or not', () => {
   const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  function renderSceneFrame() {'));
   assert.match(render, /if \(isWebGLContextLostForAsyncCommit\(\)\) return;\n(\s*\/\/.*\n)*\s*drainBeforeFramePhase\(\);[\s\S]*nextFrameCause\(frameSize\)/);
   assert.match(render, /settleWindowElapsed\(\)\) \{[\s\S]*?drainAfterFramePhase\(\);\n\s*return;/);
-  assert.match(render, /sceneMsaaTarget\.endFrameUnchanged\(\);\n\s*\}\n\s*\}\n(\s*\/\/.*\n)*\s*drainAfterFramePhase\(\);/);
+  // Between them only the full-detail frame measurement (full-detail-frame-cost.js).
+  assert.match(render, /sceneMsaaTarget\.endFrameUnchanged\(\);\n\s*\}\n(\s*\/\/.*\n)*\s*if \(!sceneDrawn\) fullDetailFrameCost\.frameEnded\(false\);\n\s*\}\n\s*if \(sceneDrawn && fullDetailFrameCost\.isArmed\(\)\) \{\n[^}]*\}\n(\s*\/\/.*\n)*\s*drainAfterFramePhase\(\);/);
+  // The measured frame opens before its first command (the GPU timer's query).
+  assert.match(render, /if \(fullDetailFrameCost\.isArmed\(\)\) fullDetailFrameCost\.frameStarted\(frameStartedAt\);\n\s*let sceneDrawn = false;\n\s*try \{\n\s*renderSceneFrame\(\);/);
   for (const site of ['start()', 'pause()', 'resume()']) {
     const body = viewer.slice(viewer.indexOf(`    ${site} {`), viewer.indexOf('\n    },', viewer.indexOf(`    ${site} {`)));
     assert.match(body, /reconcileFramePhases\(\);/, site);
@@ -173,7 +176,7 @@ test('a frame the highlight pulse alone asks for waits for the ambient pacer', (
   // Not yet due: no draw and no animation frame; the pacer's timer re-arms.
   assert.match(render, /if \(frameCause === AMBIENT_FRAME_CAUSE && !ambientFramePacer\.isDue\(now\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.wakeWhenDue\(ensureFrameScheduled\);\n\s*drainAfterFramePhase\(\);\n\s*return;/);
   // Every drawn frame is measured.
-  assert.match(render, /ambientFramePacer\.frameDrawn\(frameStartedAt\);\n\s*try \{\n\s*renderSceneFrame\(\);/);
+  assert.match(render, /ambientFramePacer\.frameDrawn\(frameStartedAt\);\n(\s*\/\/.*\n)*\s*if \(fullDetailFrameCost\.isArmed\(\)\) fullDetailFrameCost\.frameStarted\(frameStartedAt\);\n\s*let sceneDrawn = false;\n\s*try \{\n\s*renderSceneFrame\(\);/);
   // The pulse is the last cause named, so 'highlight' means nothing else asks.
   const causes = viewer.slice(viewer.indexOf('  function sceneAnimationCause() {'), viewer.indexOf('  function nextFrameCause('));
   assert.match(causes, /return AMBIENT_FRAME_CAUSE;\n\s*return null;\n\s*\}/);

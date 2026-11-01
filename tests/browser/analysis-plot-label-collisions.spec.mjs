@@ -480,6 +480,8 @@ function dotplotData() {
     cellCounts: groups.map(() => 400),
     color,
     fraction: Array.from({ length: n }, (_, index) => ((index * 53) % 100) / 100),
+    // Every cell of a group holds a value of every gene.
+    measured: Array.from({ length: n }, () => 400),
     mean: color,
     colorLabel: 'Mean expression',
     colorMap: 'Reds',

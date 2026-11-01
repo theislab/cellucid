@@ -13,9 +13,12 @@ import {
   createConnectivityEdgeIndex,
   createConnectivityEdgeOrder,
   createConnectivitySelectionScratch,
+  requireConnectivityVisibility,
   selectConnectivityEdges,
 } from '../assets/js/rendering/connectivity-edge-selection.js';
+import { lodMembershipAdmits } from '../assets/js/rendering/high-perf/renderer-contracts.js';
 import { connectivityEdgesFromPairs, edgeListOf } from './helpers/connectivity-edges.mjs';
+import { admissionMembership, prefixMembership } from './helpers/lod-membership.mjs';
 
 /**
  * The order's definition, computed round by round with no tables: a
@@ -146,13 +149,19 @@ test('selection writes exactly the first K visible records of the order, by eith
   // the visible-cell walk (which also returns the count).
   for (const fraction of [1, 0.97, 0.6, 0.25, 0.08, 0.02, 0]) {
     const transparency = visibilityOf(cellCount, fraction, 99);
-    for (const [admission, lodLevel] of [[null, -1], [admissionLevels, 2]]) {
-      const visibility = { transparency, admissionLevels: admission, lodLevel };
+    // Full detail, a level admitting by byte, and a level of the first
+    // cells (rank order).
+    for (const [lodMembership, lodLevel] of [
+      [null, -1],
+      [admissionMembership(admissionLevels, 2), 2],
+      [prefixMembership(cellCount, 1700, { lodLevel: 3 }), 3],
+    ]) {
+      const visibility = { transparency, lodMembership };
       const visible = edge => {
         const s = edgeListOf(graph).sources[edge];
         const d = edgeListOf(graph).destinations[edge];
         return transparency[s] === 1 && transparency[d] === 1 &&
-          (admission === null || (admission[s] <= lodLevel && admission[d] <= lodLevel));
+          lodMembershipAdmits(lodMembership, s) && lodMembershipAdmits(lodMembership, d);
       };
       const reference = [];
       for (let rank = 0; rank < edgeCount; rank++) {
@@ -191,15 +200,25 @@ test('selection writes exactly the first K visible records of the order, by eith
 test('the visible-cell mask is the transparency itself, LOD-filtered, or null when every cell is visible', () => {
   const transparency = Uint8Array.from([1, 0, 1, 1]);
   assert.equal(connectivityVisibleCells(null, null).mask, null);
-  assert.equal(connectivityVisibleCells({ transparency, admissionLevels: null, lodLevel: -1 }, null).mask, transparency);
+  assert.equal(connectivityVisibleCells({ transparency, lodMembership: null }, null).mask, transparency);
   const all = new Uint8Array(4).fill(1);
-  assert.equal(connectivityVisibleCells({ transparency: all, admissionLevels: null, lodLevel: -1 }, null).mask, null);
+  assert.equal(connectivityVisibleCells({ transparency: all, lodMembership: null }, null).mask, null);
   const lod = connectivityVisibleCells(
-    { transparency, admissionLevels: Uint8Array.from([0, 0, 3, 1]), lodLevel: 1 }, null,
+    { transparency, lodMembership: admissionMembership(Uint8Array.from([0, 0, 3, 1]), 1) }, null,
   );
   assert.deepEqual(Array.from(lod.mask), [1, 0, 0, 1]);
   assert.equal(
-    connectivityVisibleCells({ transparency: all, admissionLevels: new Uint8Array(4), lodLevel: 0 }, lod.scratch).mask,
+    connectivityVisibleCells({ transparency: all, lodMembership: admissionMembership(new Uint8Array(4), 0) }, lod.scratch).mask,
     null,
+  );
+  // A level of the first cells shows only those, in the same scratch.
+  const prefix = connectivityVisibleCells(
+    { transparency, lodMembership: prefixMembership(4, 3) }, lod.scratch,
+  );
+  assert.equal(prefix.scratch, lod.scratch);
+  assert.deepEqual(Array.from(prefix.mask), [1, 0, 1, 0]);
+  assert.throws(
+    () => requireConnectivityVisibility({ transparency, lodMembership: prefixMembership(5, 3) }, 4),
+    /describes 5 cells/,
   );
 });

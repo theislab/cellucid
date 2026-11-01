@@ -29,7 +29,7 @@ import {
 } from '../assets/js/data/sources/auth/token-store.js';
 import { codeChallengeOf, createPkce } from '../assets/js/data/sources/auth/pkce.js';
 import { SignInSteps } from '../assets/js/data/sources/auth/sign-in.js';
-import { DRIVE_FILE_SCOPE, GOOGLE_ADMIN_HELP, createGoogleAuth } from '../assets/js/data/sources/auth/google.js';
+import { DRIVE_FILE_SCOPE, GOOGLE_ADMIN_HELP, REVOKE_URL, createGoogleAuth } from '../assets/js/data/sources/auth/google.js';
 import {
   CALLBACK_PATH,
   FILES_READ_ALL,
@@ -40,6 +40,8 @@ import {
 } from '../assets/js/data/sources/auth/microsoft.js';
 import { callbackMessage } from '../assets/js/data/sources/auth/callback-page.js';
 import { embeddedInOtherSite, embeddingOrigin } from '../assets/js/data/sources/auth/page-context.js';
+
+import { until } from './helpers/until.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TOKEN = 'TOKEN-MARKER-91c2';
@@ -259,7 +261,7 @@ function placePage(win, { origin, top = null, named = 'ancestors' }) {
 }
 
 function fakeGoogleWindow({ origin = 'https://www.cellucid.com', top = null, response = null, error = null } = {}) {
-  const log = { requested: 0, revoked: [], fileIds: null, visible: false, built: null };
+  const log = { requested: 0, fileIds: null, visible: false, built: null };
   const picker = {
     Response: { ACTION: 'action', DOCUMENTS: 'docs' },
     Action: { PICKED: 'picked', CANCEL: 'cancel' },
@@ -324,10 +326,6 @@ function fakeGoogleWindow({ origin = 'https://www.cellucid.com', top = null, res
               },
             };
           },
-          revoke: (token, done) => {
-            log.revoked.push(token);
-            done();
-          },
         },
       },
     },
@@ -357,7 +355,8 @@ test('Google: not configured, or on an origin Google does not know, says so befo
   assert.equal(empty.whyNoSignIn(), 'Signing in to Google is not configured on this site yet.');
   const at = (origin, top = null) => createGoogleAuth({ config: GOOGLE_CONFIG, steps, win: fakeGoogleWindow({ origin, top }).win });
   // The registered origins: a public file and a sign-in both work, in a tab
-  // or in a notebook on port 8765.
+  // or framed in a notebook widget (the app from www.cellucid.com, or a copy
+  // on port 8765).
   for (const google of [at('https://www.cellucid.com'), at('http://localhost:8765'), at('http://127.0.0.1:8765', 'http://localhost:8888')]) {
     assert.equal(google.whyNoPublicAccess(), null);
     assert.equal(google.whyNoSignIn(), null);
@@ -369,8 +368,8 @@ test('Google: not configured, or on an origin Google does not know, says so befo
       'Google Drive works on a local cellucid serve only on its default port, 8765 (this page is http://127.0.0.1:9000). ' +
       'Start it without --port, or open www.cellucid.com.'],
     [at('http://127.0.0.1:53124', 'http://localhost:8888'),
-      'Google Drive works in a notebook viewer only on port 8765 (this one is http://127.0.0.1:53124). ' +
-      'Another server held 8765 when it started: stop that one and show the data again, or open www.cellucid.com.'],
+      'Google Drive works in a notebook viewer that loads the app from www.cellucid.com (the default web_source_url), ' +
+      'or from a copy served at port 8765; this one loads it from http://127.0.0.1:53124.'],
     [at('http://192.168.1.20:8765'), 'Google Drive works on www.cellucid.com, not on http://192.168.1.20:8765.'],
     [at('https://hub.example.org', 'https://hub.example.org'), 'Google Drive works on www.cellucid.com, not on https://hub.example.org.'],
   ]);
@@ -406,7 +405,12 @@ test('Google: the click asks GIS for drive.file only; the token is kept for the 
   const steps = new SignInSteps();
   const { win, log } = fakeGoogleWindow({ response: { access_token: TOKEN, expires_in: 3599, scope: DRIVE_FILE_SCOPE } });
   let now = 1_000_000;
-  const google = createGoogleAuth({ config: GOOGLE_CONFIG, steps, win, now: () => now });
+  const revocations = [];
+  const fetchImpl = async (url, init) => {
+    revocations.push({ url, init });
+    return new Response(null, { status: 200 });
+  };
+  const google = createGoogleAuth({ config: GOOGLE_CONFIG, steps, win, fetchImpl, now: () => now });
   const authorized = google.authorize({ kind: 'sign-in', text: 'Private file on Google Drive.' });
   await new Promise(resolve => setTimeout(resolve, 0));
   const [step] = steps.list();
@@ -419,7 +423,7 @@ test('Google: the click asks GIS for drive.file only; the token is kept for the 
   const stored = JSON.parse(values.get('cellucid:google-auth:session'));
   assert.deepEqual(stored, { accessToken: TOKEN, expiresAt: 1_000_000 + 3_599_000, scope: DRIVE_FILE_SCOPE });
   // A reload of the tab finds it; an expired one is not used.
-  const reloaded = createGoogleAuth({ config: GOOGLE_CONFIG, steps, win, now: () => now });
+  const reloaded = createGoogleAuth({ config: GOOGLE_CONFIG, steps, win, fetchImpl, now: () => now });
   assert.equal(reloaded.validToken(), TOKEN);
   now += 3_599_000;
   assert.equal(reloaded.validToken(), null);
@@ -428,9 +432,16 @@ test('Google: the click asks GIS for drive.file only; the token is kept for the 
   assert.equal(await reloaded.pick('FILE-ID-1234'), 'FILE-ID-1234');
   assert.equal(log.fileIds, 'FILE-ID-1234');
   assert.deepEqual(log.built, { token: TOKEN, key: GOOGLE_CONFIG.apiKey, appId: GOOGLE_CONFIG.projectNumber });
-  reloaded.signOut();
-  assert.deepEqual(log.revoked, [TOKEN]);
+  assert.equal(await reloaded.signOut(), true, 'revoked at Google');
   assert.equal(values.has('cellucid:google-auth:session'), false);
+  // Revoked at Google's endpoint (RFC 7009), whether or not Google's scripts
+  // were loaded in this page, and sent even when the page closes.
+  assert.equal(revocations.length, 1);
+  assert.equal(revocations[0].url, REVOKE_URL);
+  assert.equal(revocations[0].init.method, 'POST');
+  assert.equal(revocations[0].init.body, `token=${TOKEN}`);
+  assert.equal(revocations[0].init.keepalive, true);
+  assert.equal(revocations[0].init.headers['Content-Type'], 'application/x-www-form-urlencoded');
 });
 
 test('Google: a blocked popup and a refused scope are said, and the step stays to try again', async t => {
@@ -532,9 +543,7 @@ const readyStep = list => list.length > 0 && list[0].ready;
  * PKCE challenge is made (`crypto.subtle`, which answers when it answers).
  */
 async function microsoftAddress(fake, count) {
-  for (let round = 0; round < 1000 && fake.log.opened.length < count; round += 1) {
-    await new Promise(resolve => setImmediate(resolve));
-  }
+  await until(() => fake.log.opened.length >= count, 'the sign-in window sent to Microsoft');
   assert.equal(fake.log.opened.length, count, 'the sign-in window went to Microsoft');
   return Object.fromEntries(fake.log.opened[count - 1].searchParams);
 }
@@ -609,9 +618,8 @@ function fakeMicrosoftWindow(t, { tokenAnswers = [], origin = 'https://www.cellu
 test('Microsoft: PKCE in a popup, the code redeemed in the page with the verifier, no secret', async t => {
   const values = installSessionStorage(t);
   const steps = new SignInSteps();
-  const fake = fakeMicrosoftWindow(t, {
-    tokenAnswers: [{ status: 200, json: { access_token: TOKEN, refresh_token: `R-${TOKEN}`, expires_in: 3600, scope: 'Files.Read openid' } }],
-  });
+  const tokenAnswers = [{ status: 200, json: { access_token: TOKEN, refresh_token: `R-${TOKEN}`, expires_in: 3600, scope: 'Files.Read openid' } }];
+  const fake = fakeMicrosoftWindow(t, { tokenAnswers });
   let now = 5_000_000;
   const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl, now: () => now });
   const authorized = microsoft.authorize({ kind: 'sign-in' });
@@ -646,29 +654,33 @@ test('Microsoft: PKCE in a popup, the code redeemed in the page with the verifie
   assert.equal(await codeChallengeOf(post.body.code_verifier), query.code_challenge);
   assert.equal('client_secret' in post.body, false);
   assert.equal(post.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  // The tab keeps the short-lived access token only; the refresh token is
+  // held in this page's memory, never stored.
   const stored = JSON.parse(values.get('cellucid:microsoft-auth:session'));
-  assert.equal(stored.refreshExpiresAt, 5_000_000 + 24 * 3600 * 1000);
-  // An hour on, the token renews without a click, once for every caller.
+  assert.deepEqual(stored, { accessToken: TOKEN, expiresAt: 5_000_000 + 3_600_000, scope: 'Files.Read openid' });
+  assert.ok(!values.get('cellucid:microsoft-auth:session').includes(`R-${TOKEN}`), 'no refresh token is stored');
+  // A reload of the tab finds the access token while it lasts, and cannot
+  // renew it: after its hour, a click is needed.
+  const reloaded = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl, now: () => now });
+  assert.equal(await reloaded.silentToken(), TOKEN);
+  // An hour on, within the page, the token renews without a click, once for every caller.
   now += 3_600_000;
-  const renewals = [{ status: 200, json: { access_token: `${TOKEN}-2`, refresh_token: 'R2', expires_in: 3600, scope: 'Files.Read' } }];
-  fake.fetchImpl = undefined;
-  const again = createMicrosoftAuth({
-    config: { clientId: 'app-id', authority: 'common' },
-    steps,
-    win: fake.win,
-    now: () => now,
-    fetchImpl: async (url, init) => {
-      fake.log.posts.push({ url, body: Object.fromEntries(new URLSearchParams(init.body)) });
-      const answer = renewals.shift();
-      return new Response(JSON.stringify(answer.json), { status: answer.status });
-    },
-  });
-  assert.deepEqual(await Promise.all([again.silentToken(), again.silentToken()]), [`${TOKEN}-2`, `${TOKEN}-2`]);
+  const posted = fake.log.posts.length;
+  assert.equal(await reloaded.silentToken(), null);
+  assert.equal(fake.log.posts.length, posted, 'nothing to renew it with after a reload');
+  tokenAnswers.push({ status: 200, json: { access_token: `${TOKEN}-2`, refresh_token: 'R2', expires_in: 3600, scope: 'Files.Read' } });
+  assert.deepEqual(await Promise.all([microsoft.silentToken(), microsoft.silentToken()]), [`${TOKEN}-2`, `${TOKEN}-2`]);
   assert.equal(fake.log.posts.at(-1).body.grant_type, 'refresh_token');
-  assert.equal(fake.log.posts.length, 2);
+  assert.equal(fake.log.posts.length, posted + 1);
+  assert.ok(!values.get('cellucid:microsoft-auth:session').includes('R2'), 'nor a renewed one');
   // Past the 24 hours of the first sign-in, a click is needed.
   now = 5_000_000 + 24 * 3600 * 1000 + 3_600_001;
-  assert.equal(await again.silentToken(), null);
+  assert.equal(await microsoft.silentToken(), null);
+  // Sign out forgets the access token and the refresh token; Microsoft offers
+  // no revocation, which the sign-out answers (the caller says so).
+  assert.equal(await microsoft.signOut(), false);
+  assert.equal(values.has('cellucid:microsoft-auth:session'), false);
+  assert.equal(await microsoft.signOut(), true, 'nothing left to revoke');
 });
 
 test('Microsoft: an organisation that requires an administrator: the step says so, links the steps, and offers another account', async t => {
@@ -881,11 +893,19 @@ test('the provider config holds public identifiers only', async () => {
   assert.doesNotMatch(source.replace(/\/\*[\s\S]*?\*\//g, ''), /secret/i, 'no secret is configured');
 });
 
-test('the privacy page says where sign-ins live and that no Cellucid server sees the data', async () => {
+test('the privacy page says where sign-ins live, for how long, what is kept of the data, and that no Cellucid server sees it', async () => {
   const page = await readFile(path.join(ROOT, 'privacy.html'), 'utf8');
   assert.match(page, /<link rel="canonical" href="https:\/\/www\.cellucid\.com\/privacy\.html" \/>/);
-  assert.match(page, /session storage/);
-  assert.match(page, /deleted when the tab closes/);
+  assert.match(page, /session storage, which your browser may also write to its profile on disk/);
+  assert.match(page, /lasts about an hour/);
+  assert.match(page, /Microsoft's renewal token[^.]*is kept only in the page's memory/);
+  assert.match(page, /Your GitHub token expires after 8 hours/);
+  assert.match(page, /signing out also revokes it at GitHub/);
+  assert.match(page, /Signing out revokes the Google token at Google/);
+  // What is kept of the data, in the policy Google and Microsoft link to.
+  assert.match(page, /the parts of a remote file it downloaded/);
+  assert.match(page, /Session › Open data › Stored › Manage…/);
+  assert.match(page, /The parts of the file Cellucid downloaded are kept/);
   assert.match(page, /Neither the file nor your sign-in passes through a Cellucid server/);
   assert.match(page, /Limited Use requirements/);
   const policy = /<meta http-equiv="Content-Security-Policy" content="([^"]+)" \/>/.exec(page)[1];

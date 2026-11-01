@@ -169,6 +169,8 @@ test('differential expression stops before testing when its owner is stale', asy
   const analysis = new MultiVariableAnalysis({
     state: { pointCount: 10 },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables: () => [{ key: 'G' }],
   });

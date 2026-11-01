@@ -31,20 +31,24 @@
  * @module ui/modules/cell-info
  */
 
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatSignificant } from '../../../utils/format-units.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../../rendering/alpha-visibility.js';
+import { drawnCellRgb } from '../../../rendering/read-cell-layer.js';
+import { GENES_READ_PLACE, geneSampleText } from '../../../data/gene-read-plan.js';
+import { categoryCssAt } from '../../utils/category-state.js';
 
 const PICK_MOVE_THRESHOLD_PX = 2;
 // A lookup runs only once the pointer has rested this long, like a tooltip:
 // sweeping across the plot does no work at all, so frame time while moving is
 // exactly what it is with the card off.
-const REST_MS = 60;
+export const REST_MS = 60;
 // One column of the card. More loaded fields than fit the window's height
 // flow into further columns of this width.
 const CARD_COLUMN_PX = 240;
 const CARD_OFFSET_PX = 16;
 const EDGE_MARGIN_PX = 8;
-const TOUCH_HOLD_MS = 450;
+// A finger held still this long shows the card; a shorter tap shows none.
+export const TOUCH_HOLD_MS = 450;
 const TOUCH_HOLD_SLOP_PX = 8;
 const MOTION_RECHECK_MS = 120;
 
@@ -67,15 +71,12 @@ function requireMethods(owner, label, names) {
   return owner;
 }
 
-/** Four significant figures, scientific notation outside 0.001 to 100,000. */
+/**
+ * A cell's value, in the one number format (`formatSignificant`) to six
+ * significant figures: a count up to 999,999 is written whole.
+ */
 export function formatCellValue(value) {
-  if (!Number.isFinite(value)) return 'NaN';
-  if (value === 0) return '0';
-  const abs = Math.abs(value);
-  if (abs >= 100000 || abs < 0.001) {
-    return value.toExponential(2).replace(/\.?0+e/, 'e').replace('e+', 'e');
-  }
-  return String(Number(value.toPrecision(4)));
+  return Number.isFinite(value) ? formatSignificant(value, 6) : 'NaN';
 }
 
 function categoryLabel(field, cellIndex) {
@@ -86,19 +87,17 @@ function categoryLabel(field, cellIndex) {
   return typeof label === 'string' ? label : String(label);
 }
 
-function cssColor(colors, cellIndex) {
+/**
+ * The colour cell `cellIndex` is drawn in: its own, or, for a cell beneath
+ * (no value) or not read, its layer's colour over the view's background
+ * (`layerColors`, `rendering/read-cell-layer.js`).
+ */
+function cssColor(colors, cellIndex, layerColors) {
   if (!(colors instanceof Uint8Array) || colors.length < (cellIndex + 1) * 4) {
     return null;
   }
-  const j = cellIndex * 4;
-  return `rgb(${colors[j]}, ${colors[j + 1]}, ${colors[j + 2]})`;
-}
-
-function categoryColor(field, code) {
-  const rgb = Array.isArray(field._categoryColors) ? field._categoryColors[code] : null;
-  if (!Array.isArray(rgb) || rgb.length < 3) return null;
-  const channel = (value) => Math.round(Math.min(1, Math.max(0, value)) * 255);
-  return `rgb(${channel(rgb[0])}, ${channel(rgb[1])}, ${channel(rgb[2])})`;
+  const [r, g, b] = drawnCellRgb(colors, cellIndex, layerColors);
+  return `rgb(${r}, ${g}, ${b})`;
 }
 
 function createCard(ownerDocument) {
@@ -148,7 +147,7 @@ function createCard(ownerDocument) {
 /**
  * @param {object} options
  * @param {object} options.viewer - Needs pickReadyCellRecordAtScreen,
- *   isCameraInMotion and prepareCellPicking.
+ *   isCameraInMotion, prepareCellPicking, isContextLost and onGraphicsReset.
  * @param {object} options.state - The data state.
  * @param {HTMLInputElement} options.toggle - The Show cell info checkbox.
  * @param {HTMLInputElement} options.categoriesToggle - Also list the cell's
@@ -160,7 +159,10 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     'pickReadyCellRecordAtScreen',
     'isCameraInMotion',
     'onPresentedViewStateChanged',
-    'prepareCellPicking'
+    'prepareCellPicking',
+    'getCellLayerColors',
+    'isContextLost',
+    'onGraphicsReset'
   ]);
   if (state === null || typeof state !== 'object') {
     throw new TypeError('Cell info requires the data state.');
@@ -239,7 +241,9 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     if (idleHandle !== 0) return;
     const run = () => {
       idleHandle = 0;
-      if (!enabled || destroyed) return;
+      // While the graphics context is lost the viewer refuses every change
+      // (a stale idle request threw there); it is asked again once restored.
+      if (!enabled || destroyed || viewer.isContextLost()) return;
       viewer.prepareCellPicking();
     };
     idleHandle = typeof view.requestIdleCallback === 'function'
@@ -284,8 +288,9 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     }
     parts.scaleBar.style.setProperty('--cell-info-stops', colormap.cssStops.join(', '));
     parts.scaleMarker.style.setProperty('--cell-info-t', String(t));
-    parts.scaleMin.textContent = formatCellValue(domain.min);
-    parts.scaleMax.textContent = formatCellValue(domain.max);
+    // The scale's ends as the legend's colour bar writes them.
+    parts.scaleMin.textContent = formatSignificant(domain.min);
+    parts.scaleMax.textContent = formatSignificant(domain.max);
     parts.scale.hidden = false;
   }
 
@@ -365,7 +370,11 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
         continue;
       }
       const label = categoryLabel(field, cellIndex);
-      rows.push({ key: field.key, label, color: label === null ? null : categoryColor(field, field.codes[cellIndex]) });
+      // A field no view has coloured holds no colours yet: its row has no dot.
+      const color = label === null || field._categoryColors === undefined
+        ? null
+        : categoryCssAt(field._categoryColors, field.codes[cellIndex]);
+      rows.push({ key: field.key, label, color });
     }
     const fragment = ownerDocument.createDocumentFragment();
     for (const row of rows) {
@@ -395,7 +404,7 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     const field = typeof state.getFieldForView === 'function'
       ? state.getFieldForView(viewId)
       : null;
-    const color = cssColor(viewColors(viewId), cellIndex);
+    const color = cssColor(viewColors(viewId), cellIndex, viewer.getCellLayerColors());
     parts.swatch.style.background = color ?? '';
     parts.swatch.hidden = color === null;
 
@@ -410,8 +419,15 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
       parts.count.textContent = counts ? `${formatCountOf(counts[code], 'cell')}` : '';
     } else if (field && field.kind === 'continuous' && field.values && field.values.length > cellIndex) {
       const value = field.values[cellIndex];
-      parts.value.textContent = formatCellValue(value);
-      parts.value.classList.toggle('is-missing', !Number.isFinite(value));
+      // A gene read for a sample of the open cells (`gene-sample.js`) has no
+      // value on the others: not read, which is neither 0 nor missing.
+      const key = String(viewId || 'live');
+      const source = key === String(state.activeViewId) ? state.activeFieldSource : state.viewContexts?.get(key)?.activeFieldSource;
+      const sample = source === 'var' ? (state.getGeneSample?.() ?? null) : null;
+      const unread = sample !== null && cellIndex >= sample.cells;
+      parts.value.textContent = unread ? 'not read' : formatCellValue(value);
+      parts.value.title = unread ? `${geneSampleText(sample)}; this cell is not among them (read genes for more cells in ${GENES_READ_PLACE}).` : '';
+      parts.value.classList.toggle('is-missing', unread || !Number.isFinite(value));
       parts.field.textContent = field.key;
       fillScale(field, cellIndex);
       parts.count.textContent = '';
@@ -469,6 +485,39 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     parts.card.style.transform = `translate3d(${Math.round(left)}px, ${Math.round(top)}px, 0)`;
   }
 
+  function preparingKey(record) {
+    return `${record.viewId}:preparing`;
+  }
+
+  /** The card while a large pane's cell lookup is being prepared. */
+  function showPreparing(record, x, y) {
+    const key = preparingKey(record);
+    if (key !== shownKey) {
+      parts.swatch.hidden = true;
+      parts.value.textContent = 'Preparing cell lookup…';
+      parts.value.classList.remove('is-missing');
+      parts.field.textContent = 'A large dataset needs a moment before hovering names a cell.';
+      parts.scale.hidden = true;
+      parts.rows.hidden = true;
+      parts.more.hidden = true;
+      parts.count.textContent = '';
+      parts.count.hidden = true;
+      const wasHidden = parts.card.hidden;
+      parts.card.hidden = false;
+      cardSize = fitCard();
+      shownKey = key;
+      lastPick = null;
+      if (wasHidden) {
+        place(x, y);
+        view.requestAnimationFrame(() => {
+          if (shownKey === key) parts.card.classList.add('is-visible');
+        });
+        return;
+      }
+    }
+    place(x, y);
+  }
+
   function show(record, x, y) {
     const key = `${record.viewId}:${record.cellIndex}`;
     if (key !== shownKey) {
@@ -495,7 +544,7 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
   function onFrame() {
     frameHandle = 0;
     if (!enabled || destroyed) return;
-    if (pointer === null || suppressedByPress) {
+    if (pointer === null || suppressedByPress || viewer.isContextLost()) {
       hide();
       return;
     }
@@ -526,12 +575,23 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
       }
       return;
     }
-    // Never builds a large pane's index on the hover path: without one the
-    // lookup answers null and the card waits.
+    // Never scans a large pane on the hover path: until its tree lands
+    // (the lookup asked for it) the card says so, and looks again then.
     const record = viewer.pickReadyCellRecordAtScreen(x, y);
     if (record === null) {
       lastMiss = { x, y, sceneGeneration };
       hide();
+      return;
+    }
+    if (record.preparing !== undefined) {
+      lastMiss = null;
+      showPreparing(record, x, y);
+      record.preparing.then(
+        () => {
+          if (!destroyed && shownKey === preparingKey(record)) scheduleFrame();
+        },
+        error => console.warn('[CellInfo] The cell lookup could not be prepared:', error)
+      );
       return;
     }
     lastMiss = null;
@@ -689,6 +749,17 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
   }
   listeners.push(viewer.onPresentedViewStateChanged(() => {
     sceneGeneration += 1;
+  }));
+  // Nothing is looked up while the graphics context is lost; restored, the
+  // panes' indexes are asked for again, as when the card is turned on.
+  listeners.push(viewer.onGraphicsReset(phase => {
+    if (phase === 'lost') {
+      cancelIdle();
+      cancelFrame();
+      hide();
+    } else if (phase === 'restored') {
+      prepareAgain();
+    }
   }));
   const stateEvents = [
     ['view:representation-changed', prepareAgain],

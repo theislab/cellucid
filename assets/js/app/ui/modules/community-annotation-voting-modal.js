@@ -26,6 +26,7 @@ import {
 import { el, toCleanString } from './community-annotation/dom.js';
 import { createDomId } from '../components/dom-id.js';
 import { createInfoTip } from '../components/controls.js';
+import { cancel, cancelled, onAbort } from '../../../utils/abort.js';
 
 function requireVotingContext(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1578,23 +1579,13 @@ function showOwnedConfirmDialog(lifecycle, options) {
       returnFocusTo.focus();
     }
   };
+  let stopWaiting = () => {};
   const release = () => {
     if (settled) return false;
     settled = true;
-    signal?.removeEventListener('abort', cancelForRetiredOwner);
+    stopWaiting();
     return true;
   };
-  const cancelForRetiredOwner = () => {
-    if (settled) return;
-    if (cancelHandle !== null) {
-      cancelHandle();
-      return;
-    }
-    release();
-  };
-  if (signal !== null) {
-    signal.addEventListener('abort', cancelForRetiredOwner, { once: true });
-  }
   try {
     cancelHandle = showConfirmDialog({
       ...dialogOptions,
@@ -1620,7 +1611,16 @@ function showOwnedConfirmDialog(lifecycle, options) {
     release();
     throw error;
   }
-  if (signal?.aborted) cancelForRetiredOwner();
+  // Registered once the dialog exists: an owner retired while it opened
+  // closes it at once.
+  stopWaiting = onAbort(signal, () => {
+    if (settled) return;
+    if (cancelHandle !== null) {
+      cancelHandle();
+      return;
+    }
+    release();
+  });
   return cancelHandle;
 }
 
@@ -1974,21 +1974,12 @@ function showSecondaryModal({
     const generation = renderGeneration;
     renderController = new AbortController();
     const ownedController = renderController;
-    const abortRender = () => {
+    // The modal's lifecycle ends this render; a render that ends first
+    // stops listening to it.
+    const stopRelay = onAbort(lifecycleController.signal, () => {
       if (!ownedController.signal.aborted) ownedController.abort();
-    };
-    if (lifecycleController.signal.aborted) abortRender();
-    else {
-      lifecycleController.signal.addEventListener('abort', abortRender, {
-        once: true
-      });
-      ownedController.signal.addEventListener('abort', () => {
-        lifecycleController.signal.removeEventListener(
-          'abort',
-          abortRender
-        );
-      }, { once: true });
-    }
+    });
+    onAbort(ownedController.signal, stopRelay);
     const lifecycle = {
       signal: ownedController.signal,
       isCurrent: () => (
@@ -3680,27 +3671,16 @@ function buildVotingDetail({
   };
   const invalidateCapSearch = () => {
     searchGeneration += 1;
-    if (
-      activeSearchController !== null &&
-      !activeSearchController.signal.aborted
-    ) {
-      const reason = new Error('CAP form search was superseded');
-      reason.name = 'AbortError';
-      activeSearchController.abort(reason);
-    }
+    cancel(activeSearchController, 'superseded', 'CAP form search was superseded.');
     activeSearchController = null;
     removeSearchPanel();
     setSearchBusy(false);
   };
-  lifecycle.signal.addEventListener('abort', invalidateCapSearch, {
-    once: true
-  });
+  onAbort(lifecycle.signal, invalidateCapSearch);
 
   const applyCapResult = (result) => {
     if (!isCurrent()) {
-      const error = new Error('CAP result belongs to a retired form');
-      error.name = 'AbortError';
-      throw error;
+      throw cancelled('closed', 'CAP result belongs to a retired form.');
     }
     const labelCandidates = [
       ['full CAP name', toCleanString(result?.fullName)],
@@ -3770,17 +3750,11 @@ function buildVotingDetail({
     const generation = ++searchGeneration;
     const controller = new AbortController();
     activeSearchController = controller;
-    const relayLifecycleAbort = () => {
+    const stopRelay = onAbort(lifecycle.signal, () => {
       if (!controller.signal.aborted) {
         controller.abort(lifecycle.signal.reason);
       }
-    };
-    if (lifecycle.signal.aborted) relayLifecycleAbort();
-    else {
-      lifecycle.signal.addEventListener('abort', relayLifecycleAbort, {
-        once: true
-      });
-    }
+    });
     setSearchBusy(true, button);
     try {
       const envelope = await request(controller.signal);
@@ -3825,10 +3799,7 @@ function buildVotingDetail({
         { category: 'annotation' }
       );
     } finally {
-      lifecycle.signal.removeEventListener(
-        'abort',
-        relayLifecycleAbort
-      );
+      stopRelay();
       if (
         generation === searchGeneration &&
         activeSearchController === controller
@@ -4214,21 +4185,14 @@ export function openCommunityAnnotationVotingModal({
 
         // Build new content then swap atomically to avoid flashing
         const detailController = new AbortController();
+        let stopRetiring = () => {};
         const retireDetail = () => {
-          contextLease.signal.removeEventListener(
-            'abort',
-            retireDetail
-          );
+          stopRetiring();
           if (!detailController.signal.aborted) {
             detailController.abort(contextLease.signal.reason);
           }
         };
-        if (contextLease.signal.aborted) retireDetail();
-        else {
-          contextLease.signal.addEventListener('abort', retireDetail, {
-            once: true
-          });
-        }
+        stopRetiring = onAbort(contextLease.signal, retireDetail);
         const detailLifecycle = {
           signal: detailController.signal,
           isCurrent: () => (

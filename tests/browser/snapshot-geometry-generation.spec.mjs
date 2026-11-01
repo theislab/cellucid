@@ -106,7 +106,8 @@ test('same-reference live publication preserves immutable kept-view geometry', a
     const inspectSnapshotVao = snapshot => {
       const previousVao =
         gl.getParameter(gl.VERTEX_ARRAY_BINDING);
-      gl.bindVertexArray(snapshot.vao);
+      // Segmented vertex arrays (point-store-segments.js): one segment here.
+      gl.bindVertexArray(snapshot.vao.vaos[0]);
       const attributes = [0, 1].map(index => ({
         buffer: gl.getVertexAttrib(
           index,
@@ -131,12 +132,12 @@ test('same-reference live publication preserves immutable kept-view geometry', a
       internalCopiesShared,
       gpuPositionsShared:
         geometry.positionBuffer !== null &&
-        firstAttributes[0].buffer === geometry.positionBuffer &&
-        secondAttributes[0].buffer === geometry.positionBuffer,
+        firstAttributes[0].buffer === geometry.positionBuffer.segments[0].buffer &&
+        secondAttributes[0].buffer === geometry.positionBuffer.segments[0].buffer,
       colorsIndependent:
         firstSnapshot.buffer !== secondSnapshot.buffer &&
-        firstAttributes[1].buffer === firstSnapshot.buffer &&
-        secondAttributes[1].buffer === secondSnapshot.buffer,
+        firstAttributes[1].buffer === firstSnapshot.buffer.segments[0].buffer &&
+        secondAttributes[1].buffer === secondSnapshot.buffer.segments[0].buffer,
       splitAttributeLayout: {
         firstPosition: {
           offset: firstAttributes[0].offset,
@@ -183,16 +184,8 @@ test('same-reference live publication preserves immutable kept-view geometry', a
       secondHasStats: viewer.hasRendererStats(second.id),
       firstLodLevel: viewer.getCurrentLODLevel(first.id),
       secondLodLevel: viewer.getCurrentLODLevel(second.id),
-      firstLodIndicesAvailable:
-        firstLodMembership?.admissionLevels instanceof Uint8Array &&
-        firstLodMembership.admissionLevels.some(
-          level => level <= firstLodMembership.lodLevel,
-        ),
-      secondLodIndicesAvailable:
-        secondLodMembership?.admissionLevels instanceof Uint8Array &&
-        secondLodMembership.admissionLevels.some(
-          level => level <= secondLodMembership.lodLevel,
-        ),
+      firstLodEveryCell: firstLodMembership === null,
+      secondLodEveryCell: secondLodMembership === null,
       lodMembershipShared:
         firstLodMembership === secondLodMembership,
       glError: gl.getError(),
@@ -241,10 +234,13 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   );
   expect(publication.firstHasStats).toBe(true);
   expect(publication.secondHasStats).toBe(true);
+  // The fixture's 120 cells are below the ladder's first count
+  // (rendering/high-perf/draw-order.js `lodLadder`): one level, every cell.
+  // Level 0 is drawn, and the membership of both views is null (all cells).
   expect(publication.firstLodLevel).toBe(0);
   expect(publication.secondLodLevel).toBe(0);
-  expect(publication.firstLodIndicesAvailable).toBe(true);
-  expect(publication.secondLodIndicesAvailable).toBe(true);
+  expect(publication.firstLodEveryCell).toBe(true);
+  expect(publication.secondLodEveryCell).toBe(true);
   expect(publication.lodMembershipShared).toBe(true);
   expect(publication.glError).toBe(0);
   expect(browserErrors).toEqual([]);

@@ -8,6 +8,7 @@ import {
 } from './ui/onboarding/welcome-modal.js';
 import { DataSourceError, isExplainedFailure } from '../data/data-source.js';
 import { STARTUP_STALL_CODE } from './startup-phase.js';
+import { failureText } from '../utils/errors.js';
 
 /**
  * Convert JavaScript's unrestricted thrown-value channel into the sole
@@ -39,7 +40,7 @@ const DOCS = 'https://docs.cellucid.com/en/latest/user_guide/web_app/';
 export const STARTUP_TROUBLESHOOTING_URL =
   `${DOCS}b_data_loading/08_troubleshooting_data_loading.html`;
 
-/** What a browser needs to run Cellucid (WebGL2). */
+/** What a browser needs to run Cellucid (WebGL2, `BROWSER_FLOOR`). */
 export const STARTUP_REQUIREMENTS_URL =
   `${DOCS}a_orientation/02_system_requirements.html`;
 
@@ -49,6 +50,49 @@ export const STARTUP_TROUBLESHOOTING_INDEX_URL =
 
 /** Where a failure nobody explained can be reported. */
 export const STARTUP_ISSUES_URL = 'https://github.com/theislab/cellucid/issues';
+
+/**
+ * What a browser must have besides WebGL2: the newest platform features
+ * Cellucid calls, which set its floor (Chrome 116, Firefox 124, Safari 17.4).
+ * They are checked before anything starts (`requireBrowserFeatures`), so an
+ * older browser is told so at once instead of failing in the middle of an
+ * opening. No stand-in is supplied for a missing one.
+ */
+export const BROWSER_FEATURES = Object.freeze([
+  // Every reader `open`, growth step and provider request joins signals with it.
+  Object.freeze({ name: 'AbortSignal.any', present: scope => typeof scope.AbortSignal?.any === 'function' }),
+]);
+
+/** The browser versions `BROWSER_FEATURES` asks for, as people name them. */
+const BROWSER_FLOOR = 'Chrome or Edge 116, Firefox 124, Safari 17.4';
+
+/** Code of the failure `requireBrowserFeatures` throws. */
+export const BROWSER_TOO_OLD_CODE = 'CELLUCID_BROWSER_TOO_OLD';
+
+/**
+ * The features of `BROWSER_FEATURES` `scope` lacks, by name.
+ *
+ * @param {typeof globalThis} [scope]
+ * @returns {string[]}
+ */
+export function missingBrowserFeatures(scope = globalThis) {
+  return BROWSER_FEATURES.filter(feature => !feature.present(scope)).map(feature => feature.name);
+}
+
+/**
+ * Throw when `scope` lacks a feature of `BROWSER_FEATURES` (the failure the
+ * startup screen shows as this browser being too old).
+ *
+ * @param {typeof globalThis} [scope]
+ */
+export function requireBrowserFeatures(scope = globalThis) {
+  const missing = missingBrowserFeatures(scope);
+  if (missing.length === 0) return;
+  const error = new Error(`This browser lacks ${missing.join(', ')}; Cellucid needs ${BROWSER_FLOOR} or later.`);
+  error.code = BROWSER_TOO_OLD_CODE;
+  error.missing = missing;
+  throw error;
+}
 
 /** The message of an explained failure (the first of an AggregateError). */
 function explainedReason(error) {
@@ -67,7 +111,8 @@ function explainedReason(error) {
  * without it and its failed opening says why (main.js, failStartupData).
  * What remains:
  *
- * - `browser`: no WebGL2, so Cellucid cannot run in this browser at all;
+ * - `browser`: no WebGL2, or a browser older than `BROWSER_FLOOR`, so
+ *   Cellucid cannot run in this browser at all;
  * - `data`: the server the page itself is served from could not be read;
  * - `stall`: a server startup waited on never answered (the page's own
  *   server, the sample catalog, a published default view);
@@ -84,6 +129,17 @@ function explainedReason(error) {
  * }}
  */
 export function describeStartupFailure(error, { webgl2Available, hasLaunchSettings }) {
+  if (error.code === BROWSER_TOO_OLD_CODE) {
+    return {
+      kind: 'browser',
+      title: 'This browser cannot run Cellucid',
+      sentence:
+        `This browser is older than Cellucid needs (${BROWSER_FLOOR} or later). ` +
+        'Update the browser, then try again.',
+      offerWithoutSettings: false,
+      links: [[STARTUP_REQUIREMENTS_URL, 'System requirements']]
+    };
+  }
   if (!webgl2Available) {
     return {
       kind: 'browser',
@@ -335,7 +391,7 @@ export function publishStartupFailure(options) {
   }
   surface.focus();
   if (statsElement !== null) {
-    statsElement.textContent = `Startup failed: ${error.message}`;
+    statsElement.textContent = `Startup failed: ${failureText(error)}`;
   }
   return surface;
 }

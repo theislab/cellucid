@@ -16,7 +16,8 @@ import {
   requirePointTransparency,
 } from '../../../rendering/alpha-visibility.js';
 import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
-import { formatCountOf } from '../../../utils/format-units.js';
+import { formatBound, formatCountOf } from '../../../utils/format-units.js';
+import { lodMembershipAdmits } from '../../../rendering/high-perf/renderer-contracts.js';
 
 function requireFieldSource(source) {
   if (source !== 'obs' && source !== 'var') {
@@ -623,6 +624,42 @@ export const highlightStateMethods = {
     return true;
   },
 
+  /**
+   * What deleting a page takes away, for Undo (`restoreHighlightPage`): the
+   * page itself (its groups and their cell lists), its place among the
+   * pages, whether it was the active one, and the open cells its lists name.
+   *
+   * @param {string} pageId
+   * @returns {{page: Object, index: number, active: boolean, cells: Object|null}|null}
+   */
+  highlightPageRecord(pageId) {
+    const index = this.highlightPages.findIndex((p) => p.id === pageId);
+    if (index === -1) return null;
+    return { page: this.highlightPages[index], index, active: this.activePageId === pageId, cells: this.cellIdentity ?? null };
+  },
+
+  /**
+   * Put a deleted page back where it was (Undo). Refused when the open cells
+   * changed since (its cell lists name other cells) or a page of its id
+   * exists again.
+   *
+   * @param {{page: Object, index: number, active: boolean, cells: Object|null}} record
+   * @returns {boolean}
+   */
+  restoreHighlightPage(record) {
+    const { page, index, active, cells } = record;
+    if ((this.cellIdentity ?? null) !== cells) return false;
+    if (this.highlightPages.some((p) => p.id === page.id)) return false;
+    this.highlightPages.splice(Math.min(index, this.highlightPages.length), 0, page);
+    if (active) {
+      this.activePageId = page.id;
+      this._recomputeHighlightArray();
+      this._notifyHighlightChange();
+    }
+    this._notifyHighlightPageChange();
+    return true;
+  },
+
   renameHighlightPage(pageId, newName) {
     const page = this.highlightPages.find((p) => p.id === pageId);
     if (!page) return false;
@@ -1067,16 +1104,12 @@ export const highlightStateMethods = {
     if (cellIndices.length === 0) return null;
 
     const id = `highlight_${++this._highlightIdCounter}`;
-    const formatVal = (v) => {
-      if (Math.abs(v) >= 1000 || (Math.abs(v) > 0 && Math.abs(v) < 0.01)) {
-        return v.toExponential(2);
-      }
-      return v.toFixed(2);
-    };
     const group = {
       id,
       type: 'range',
-      label: `${field.key}: ${formatVal(minVal)} – ${formatVal(maxVal)}`,
+      // The bounds as every range bound is written (and the label a session
+      // restores: `field/overlay-internals.js`).
+      label: `${field.key}: ${formatBound(minVal)} – ${formatBound(maxVal)}`,
       enabled: true,
       fieldKey: field.key,
       fieldIndex,
@@ -1158,6 +1191,47 @@ export const highlightStateMethods = {
     this.highlightedGroups.splice(idx, 1);
     this._recomputeHighlightArray();
     this._notifyHighlightChange();
+    return true;
+  },
+
+  /**
+   * What removing a group of the active page takes away, for Undo
+   * (`restoreHighlightGroup`): the group, its page and place there, and the
+   * open cells its list names.
+   *
+   * @param {string} groupId
+   * @returns {{group: Object, pageId: string, index: number, cells: Object|null}|null}
+   */
+  highlightGroupRecord(groupId) {
+    const page = this._getActivePage();
+    const index = page === null ? -1 : page.highlightedGroups.findIndex((g) => g.id === groupId);
+    if (index === -1) return null;
+    return { group: page.highlightedGroups[index], pageId: page.id, index, cells: this.cellIdentity ?? null };
+  },
+
+  /**
+   * Put a removed group back on its page, where it was (Undo). Refused when
+   * the open cells changed since, its page is gone, or a group of its id is
+   * there again.
+   *
+   * @param {{group: Object, pageId: string, index: number, cells: Object|null}} record
+   * @returns {boolean}
+   */
+  restoreHighlightGroup(record) {
+    const { group, pageId, index, cells } = record;
+    if ((this.cellIdentity ?? null) !== cells) return false;
+    const page = this.highlightPages.find((p) => p.id === pageId);
+    if (!page || page.highlightedGroups.some((g) => g.id === group.id)) return false;
+    // A new list: the analyses' page memberships see the change.
+    const groups = [...page.highlightedGroups];
+    groups.splice(Math.min(index, groups.length), 0, group);
+    page.highlightedGroups = groups;
+    if (pageId === this.activePageId) {
+      this._recomputeHighlightArray();
+      this._notifyHighlightChange();
+    } else {
+      this._notifyHighlightPageChange();
+    }
     return true;
   },
 
@@ -1277,9 +1351,6 @@ export const highlightStateMethods = {
       return this._cachedHighlightCount;
     }
 
-    const admissionLevels =
-      lodMembership?.admissionLevels ?? null;
-    const lodLevel = lodMembership?.lodLevel ?? -1;
     let count = 0;
     for (let cursor = 0; cursor < highlightedIndices.length; cursor++) {
       const index = highlightedIndices[cursor];
@@ -1287,10 +1358,7 @@ export const highlightStateMethods = {
         !this.categoryTransparency ||
         this.categoryTransparency[index] >=
           POINT_VISIBILITY_THRESHOLD;
-      const visibleByLod =
-        admissionLevels === null ||
-        admissionLevels[index] <= lodLevel;
-      if (visibleByAlpha && visibleByLod) count++;
+      if (visibleByAlpha && lodMembershipAdmits(lodMembership, index)) count++;
     }
     this._cachedHighlightCount = count;
     this._cachedHighlightLodMembership = lodMembership;

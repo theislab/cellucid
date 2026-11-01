@@ -8,6 +8,13 @@
  * longest observed interaction (event entries of at least 40 ms). FID is not
  * reported: browsers retired it in favour of INP.
  *
+ * An observer's entries reach its callback in a later task, at the browser's
+ * leisure (Chromium runs it at low priority): on the first hide each
+ * observer's queued entries are taken (`takeRecords`) before it is
+ * disconnected, which would drop them. A busy page hidden right after its
+ * largest paint otherwise reported no LCP (Web contracts run 41269083996,
+ * macOS Chromium).
+ *
  * @module analytics/performance
  */
 
@@ -39,7 +46,13 @@ function observe(type, onEntries, options = {}) {
   if (!PerformanceObserver.supportedEntryTypes?.includes(type)) return null;
   const observer = new PerformanceObserver(list => onEntries(list.getEntries()));
   observer.observe({ type, buffered: true, ...options });
-  return observer;
+  return {
+    /** Take the entries not yet delivered, then stop observing. */
+    finish() {
+      onEntries(observer.takeRecords());
+      observer.disconnect();
+    },
+  };
 }
 
 /**
@@ -101,7 +114,7 @@ export function initPerformanceAnalytics({ dataSourceManager }) {
   ].filter(Boolean);
 
   onFirstHidden(() => {
-    for (const observer of observers) observer.disconnect();
+    for (const observer of observers) observer.finish();
     if (lcp) report('LCP', lcp.renderTime || lcp.loadTime || lcp.startTime);
     if (PerformanceObserver.supportedEntryTypes?.includes('layout-shift')) {
       report('CLS', cls);

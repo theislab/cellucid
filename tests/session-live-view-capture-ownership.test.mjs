@@ -9,6 +9,7 @@ import {
 import {
   capture as captureCoreState
 } from '../assets/js/app/session/contributors/core-state.js';
+import { visibleOf } from './helpers/category-state.mjs';
 
 function cameraState() {
   return {
@@ -53,7 +54,7 @@ function twoViewState() {
   // Live view: coloured by leiden with category "a" hidden.
   state.activeFieldIndex = 0;
   state.activeFieldSource = 'obs';
-  state.obsData.fields[0]._categoryVisible = { 0: false, 1: true };
+  state.obsData.fields[0]._categoryVisible = visibleOf([false, true]);
   state._resetViewContexts();
   // Kept view: coloured by sample, no filters.
   state.createViewFromSource('live', 'snap_1');
@@ -134,7 +135,7 @@ test('the selected kept view is captured from the state it is being edited in', 
   const state = twoViewState();
   state.setActiveView('snap_1');
   // An edit on the selected kept view lives in DataState until focus moves.
-  state.obsData.fields[1]._categoryVisible = { 0: true, 1: false };
+  state.obsData.fields[1]._categoryVisible = visibleOf([true, false]);
   const payload = captureWith(state, 'snap_1');
   assert.deepEqual(payload.multiview.snapshots[0].filters, {
     'obs:sample': {

@@ -16,6 +16,7 @@
  */
 
 import { formatCountOf } from '../utils/format-units.js';
+import { markProvenCellRows } from './unplaced-positions.js';
 
 const POSITION_BYTES_PER_COMPONENT = Float32Array.BYTES_PER_ELEMENT;
 
@@ -97,8 +98,10 @@ export function readPositionXYZ(positions, dimension, index, out) {
 const POSITION_BOUNDS = new WeakMap();
 
 /**
- * Float32 arrays already proven finite (`assertFiniteFloat32Array` of the
- * viewer contracts): scanned once, or proven where they were made.
+ * Float32 arrays already proven finite in every value (`assertFiniteFloat32Array`
+ * of the viewer contracts: centroids): scanned once. Cell positions and
+ * vectors may hold an unplaced cell's NaN row and carry their own proof
+ * (`isProvenCellRows`, `unplaced-positions.js`).
  */
 const PROVEN_FINITE_FLOAT32_ARRAYS = new WeakSet();
 
@@ -139,12 +142,14 @@ export function publishPositionBounds(positions, dimension, bounds) {
     dimension,
     bounds: Object.freeze({ min: Object.freeze(min), max: Object.freeze(max) }),
   });
-  PROVEN_FINITE_FLOAT32_ARRAYS.add(positions);
+  // Checked where it was made: every cell finite, or NaN in every axis (a
+  // cell the embedding does not place) — not "finite".
+  markProvenCellRows(positions);
 }
 
 /**
  * Exact per-axis minimum and maximum of a positions array, with zero for the
- * axes the embedding does not have. The first point seeds every axis.
+ * axes the embedding does not have, over the cells the embedding places.
  *
  * @param {Float32Array} positions - Non-empty, `dimension` components a point.
  * @param {number} dimension
@@ -160,14 +165,18 @@ export function readPositionBounds(positions, dimension) {
   const min = [0, 0, 0];
   const max = [0, 0, 0];
   for (let axis = 0; axis < dimension; axis++) {
-    let lo = positions[axis];
-    let hi = lo;
-    for (let i = axis + dimension; i < positions.length; i += dimension) {
+    // Seeded by +/-Infinity, so an unplaced cell's NaN (which fails every
+    // comparison, `unplaced-positions.js`) is left out wherever it is.
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = axis; i < positions.length; i += dimension) {
       const v = positions[i];
-      if (v < lo) lo = v; else if (v > hi) hi = v;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
     }
-    min[axis] = lo;
-    max[axis] = hi;
+    // No placed cell: a point at the origin.
+    min[axis] = lo <= hi ? lo : 0;
+    max[axis] = lo <= hi ? hi : 0;
   }
   const bounds = Object.freeze({
     min: Object.freeze(min),
@@ -186,29 +195,4 @@ export function readPositionBounds(positions, dimension) {
  */
 export function positionByteLength(pointCount, dimension) {
   return pointCount * dimension * POSITION_BYTES_PER_COMPONENT;
-}
-
-/**
- * Point the bound vertex array's `location` attribute at a tightly packed
- * position stream of `dimension` Float32 components per point. Declared in the
- * shader as a `vec3`, the attribute receives 0 for the components the stream
- * does not supply.
- *
- * @param {WebGL2RenderingContext} gl
- * @param {WebGLBuffer} buffer
- * @param {number} dimension
- * @param {number} [location=0]
- */
-export function bindPositionAttribute(gl, buffer, dimension, location = 0) {
-  requirePositionDimension(dimension, 'Position attribute dimension');
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.enableVertexAttribArray(location);
-  gl.vertexAttribPointer(
-    location,
-    dimension,
-    gl.FLOAT,
-    false,
-    dimension * POSITION_BYTES_PER_COMPONENT,
-    0
-  );
 }

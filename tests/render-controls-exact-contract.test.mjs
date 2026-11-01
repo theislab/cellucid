@@ -61,16 +61,17 @@ class FakeElement {
     );
   }
 
-  dispatch(type) {
+  // A person's event is trusted (`isTrusted`); one a module dispatches is not.
+  dispatch(type, { isTrusted = true } = {}) {
     for (const listener of [...(this.listeners.get(type) ?? [])]) {
-      listener({ target: this });
+      listener({ target: this, isTrusted });
     }
   }
 
   // Publishing a control value by dispatching the control's own event is the
   // ownership rule the session serializer follows, so the fake has to model it.
   dispatchEvent(event) {
-    this.dispatch(event.type);
+    this.dispatch(event.type, { isTrusted: false });
     return true;
   }
 }
@@ -113,6 +114,11 @@ const DISPLAY_KEYS = Object.freeze([
   'noiseResolutionDisplay',
 ]);
 
+/** A measured frame time as the viewer reports it: bounds, exact for a number. */
+function boundsOf(milliseconds) {
+  return typeof milliseconds === 'number' ? { lo: milliseconds, hi: milliseconds } : milliseconds;
+}
+
 function makeDom() {
   const dom = {
     backgroundSelect: new FakeElement({ value: 'grid' }),
@@ -139,6 +145,7 @@ function makeDom() {
     // is held by `antialias-setting-contract.test.mjs`.
     hpAntialiasCheckbox: new FakeElement({ checked: true }),
     hpAntialiasStatus: new FakeElement(),
+    hpPerformanceStatus: new FakeElement(),
   };
   for (const [key, [value, step, min = '0']] of Object.entries(INPUT_DEFAULTS)) {
     dom[key] = new FakeElement({
@@ -199,12 +206,81 @@ function makeViewer({
     },
     setAdaptiveLOD(value) {
       calls.push(['setAdaptiveLOD', value]);
+      viewer.emitPerformanceSettings();
+    },
+    lodLevelCount: 18,
+    getLODLevelCount() {
+      return viewer.lodLevelCount;
     },
     setForceLOD(value) {
       calls.push(['setForceLOD', value]);
     },
     setFrustumCulling(value) {
       calls.push(['setFrustumCulling', value]);
+      viewer.emitPerformanceSettings();
+    },
+    /** The opening measured now, as the viewer numbers each one it arms. */
+    opening: 1,
+    settingsListeners: new Set(),
+    onPerformanceSettingsChanged(listener) {
+      viewer.settingsListeners.add(listener);
+      return () => viewer.settingsListeners.delete(listener);
+    },
+    emitPerformanceSettings() {
+      for (const listener of [...viewer.settingsListeners]) listener({ opening: viewer.opening });
+    },
+    frameCostListeners: new Set(),
+    onFullDetailFrameCost(listener) {
+      viewer.frameCostListeners.add(listener);
+      return () => viewer.frameCostListeners.delete(listener);
+    },
+    measureFullDetailFrameCost() {
+      calls.push(['measureFullDetailFrameCost']);
+      viewer.reportMeasuring();
+    },
+    verifyFullDetailFrameCost() {
+      calls.push(['verifyFullDetailFrameCost']);
+    },
+    /**
+     * As the viewer does when it starts a measurement (a dataset published,
+     * cells grown, another representation, a restored context, a framing):
+     * a new opening, said before it is measured.
+     */
+    reportMeasuring() {
+      viewer.opening += 1;
+      for (const listener of [...viewer.frameCostListeners]) {
+        listener({ kind: 'measuring', opening: viewer.opening });
+      }
+    },
+    /**
+     * As the viewer does once a full-detail frame is measured too slow
+     * (`cullable`: a cell of the frames measured may lie outside its view).
+     */
+    reportFullDetailFrameCost(milliseconds, { cullable = true } = {}) {
+      const frame = boundsOf(milliseconds);
+      for (const listener of [...viewer.frameCostListeners]) {
+        listener({ kind: 'too-slow', opening: viewer.opening, frame, gpu: frame, budgetMilliseconds: 1000 / 30, cullable });
+      }
+    },
+    /** As the viewer does when nothing the page could turn on draws fewer cells. */
+    reportNothingFewer() {
+      for (const listener of [...viewer.frameCostListeners]) {
+        listener({ kind: 'nothing-fewer', opening: viewer.opening });
+      }
+    },
+    /** As the viewer does once the frames drawn with the choice are measured. */
+    reportVerified(verdict, milliseconds, fullMilliseconds) {
+      for (const listener of [...viewer.frameCostListeners]) {
+        listener({ kind: 'verified', opening: viewer.opening, verdict, frame: boundsOf(milliseconds), fullFrame: boundsOf(fullMilliseconds) });
+      }
+    },
+    presentedListeners: new Set(),
+    onPresentedViewStateChanged(listener) {
+      viewer.presentedListeners.add(listener);
+      return () => viewer.presentedListeners.delete(listener);
+    },
+    emitPresented(reason) {
+      for (const listener of [...viewer.presentedListeners]) listener({ generation: 1, reason, viewId: 'live' });
     },
     hasSnapshots() {
       calls.push(['hasSnapshots']);
@@ -458,6 +534,188 @@ test('a dataset opens at the point size its cell count wants', t => {
     [['setPointSize', published]],
   );
   assert.equal(dom.pointSizeDisplay.textContent, formatPointSize(published));
+});
+
+test('level of detail and culling turn on when a full-detail frame is measured too slow; a person\'s choice stands; the next dataset is measured afresh', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
+
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(120);
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', true], ['setFrustumCulling', true]]);
+  assert.equal(dom.hpLodEnabledCheckbox.checked, true);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, true);
+  // Kept only once its frames are measured faster.
+  assert.deepEqual(viewer.calls.at(-1), ['verifyFullDetailFrameCost']);
+  assert.match(dom.hpPerformanceStatus.textContent, /120 ms here; measuring level of detail and frustum culling/);
+  viewer.reportVerified('faster', 40, 120);
+  assert.equal(dom.hpLodEnabledCheckbox.checked, true);
+  assert.match(dom.hpPerformanceStatus.textContent, /120 ms.*33 ms.*40 ms with level of detail and frustum culling/);
+
+  // The next dataset: back off before it is measured, and fast enough stays off.
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', false], ['setFrustumCulling', false]]);
+  assert.equal(dom.hpPerformanceStatus.textContent, '');
+
+  // A person turns level of detail on, then off: their choice stands.
+  dom.hpLodEnabledCheckbox.checked = true;
+  dom.hpLodEnabledCheckbox.dispatch('change');
+  dom.hpLodEnabledCheckbox.checked = false;
+  dom.hpLodEnabledCheckbox.dispatch('change');
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(400);
+  assert.deepEqual(toggles(), []);
+  assert.equal(dom.hpLodEnabledCheckbox.checked, false);
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), []);
+  controls.destroy();
+  assert.equal(viewer.frameCostListeners.size, 0);
+});
+
+test('an automatic choice measured no faster is turned off again, and the next framing is measured afresh', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
+  // A 2D view at full framing: level of detail stays at every cell and
+  // culling only costs (721 ms against 438 ms measured on software GL).
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(438);
+  viewer.reportVerified('not-faster', 721, 438);
+  assert.deepEqual(toggles(), [
+    ['setAdaptiveLOD', true], ['setFrustumCulling', true],
+    ['setAdaptiveLOD', false], ['setFrustumCulling', false],
+  ]);
+  assert.equal(dom.hpLodEnabledCheckbox.checked, false);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, false);
+  assert.equal(dom.hpPerformanceStatus.textContent, 'Every cell drawn: level of detail and frustum culling measured 721 ms a frame against 438 ms without, no faster here. Measured again when the view moves.');
+  // Nothing more to undo at the next opening.
+  viewer.calls.length = 0;
+  // A style change is no new framing; a camera that moved and settled is.
+  viewer.emitPresented('style');
+  assert.deepEqual(viewer.calls, []);
+  viewer.emitPresented('camera-settled');
+  assert.deepEqual(viewer.calls, [['measureFullDetailFrameCost']]);
+  assert.equal(viewer.presentedListeners.size, 0, 'one re-measurement a framing');
+  // Zoomed in, culling gains: kept.
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(300);
+  viewer.reportVerified('faster', 90, 300);
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', true], ['setFrustumCulling', true]]);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, true);
+  controls.destroy();
+  assert.equal(viewer.presentedListeners.size, 0);
+});
+
+test('a caller that sets level of detail or culling itself makes its opening\'s choice; the next opening is measured as any', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
+  // Turned on by this page, then a caller (a benchmark configuration, a
+  // test) sets culling while the choice is being verified: the verdict of
+  // that opening changes nothing the caller set.
+  viewer.reportFullDetailFrameCost(400);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, true);
+  viewer.setFrustumCulling(true);
+  viewer.calls.length = 0;
+  viewer.reportVerified('not-faster', 500, 400);
+  assert.deepEqual(toggles(), []);
+  assert.equal(dom.hpPerformanceStatus.textContent, '');
+  // A caller's setting that equals the boxes' is a choice too: a report
+  // later in the same opening turns nothing on.
+  viewer.setAdaptiveLOD(false);
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(400);
+  assert.deepEqual(toggles(), []);
+  // The framing this page waited for is not measured.
+  viewer.emitPresented('camera-settled');
+  assert.deepEqual(viewer.calls.filter(([method]) => method === 'measureFullDetailFrameCost'), []);
+  // The next opening: what this page turned on is turned off, and its
+  // measurement decides again.
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', false], ['setFrustumCulling', false]]);
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(400);
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', true], ['setFrustumCulling', true]]);
+  controls.destroy();
+  assert.equal(viewer.settingsListeners.size, 0);
+});
+
+test('every new measurement re-verifies this page\'s own choice as at an opening (a restored context, another representation); a person\'s choice is left alone', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
+  viewer.reportFullDetailFrameCost(120);
+  viewer.reportVerified('faster', 40, 120);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, true);
+  // A restored context (or a representation) is measured afresh: the choice
+  // goes off for the frames of every cell...
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', false], ['setFrustumCulling', false]]);
+  assert.equal(dom.hpPerformanceStatus.textContent, '');
+  // ...then on again and verified, not kept unverified.
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(130);
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', true], ['setFrustumCulling', true]]);
+  assert.deepEqual(viewer.calls.at(-1), ['verifyFullDetailFrameCost']);
+  // No faster on the new basis: off.
+  viewer.reportVerified('not-faster', 128, 130);
+  assert.equal(dom.hpLodEnabledCheckbox.checked, false);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, false);
+  // Nothing of this page's left on: the next measurement turns nothing off.
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), []);
+  // A person's choice is never undone by a measurement.
+  dom.hpFrustumCullingCheckbox.checked = true;
+  dom.hpFrustumCullingCheckbox.dispatch('change');
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  viewer.reportFullDetailFrameCost(400);
+  assert.deepEqual(toggles(), []);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, true);
+  controls.destroy();
+});
+
+test('below the ladder\'s first count a slow frame turns culling on, not level of detail (every level is every cell)', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
+  viewer.lodLevelCount = 1;
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(120);
+  assert.deepEqual(toggles(), [['setFrustumCulling', true]]);
+  assert.equal(dom.hpLodEnabledCheckbox.checked, false);
+  viewer.reportVerified('faster', 60, 120);
+  assert.match(dom.hpPerformanceStatus.textContent, /^Turned on for this dataset: a frame of every cell took 120 ms/);
+  // The cells grow past the ladder's first count and are measured again,
+  // as at an opening: culling off for the frames of every cell, then both on
+  // and verified; the next opening turns both back off.
+  viewer.lodLevelCount = 9;
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), [['setFrustumCulling', false]]);
+  viewer.reportFullDetailFrameCost(90);
+  assert.deepEqual(toggles(), [['setFrustumCulling', false], ['setAdaptiveLOD', true], ['setFrustumCulling', true]]);
+  assert.deepEqual(viewer.calls.at(-1), ['verifyFullDetailFrameCost']);
+  viewer.reportVerified('faster', 30, 90);
+  viewer.calls.length = 0;
+  viewer.reportMeasuring();
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', false], ['setFrustumCulling', false]]);
+  controls.destroy();
 });
 
 test('smoke conflicts notify and roll back the selector while the public owner rejects', t => {
@@ -1085,4 +1343,52 @@ test('the maturity tag names the selected mode, not the control', t => {
   assert.equal(dom.renderModeMaturityTag.hidden, false);
   controls.settleSmokeRenderFailure(new Error('synthetic smoke failure'));
   assert.equal(dom.renderModeMaturityTag.hidden, true);
+});
+
+test('culling is tried only where a cell may lie outside the view, and a framing where nothing could be drawn fewer is not measured', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  const toggles = () => viewer.calls.filter(([method]) => method === 'setAdaptiveLOD' || method === 'setFrustumCulling');
+  const measured = () => viewer.calls.filter(([method]) => method === 'measureFullDetailFrameCost');
+
+  // Too slow with every cell in view: level of detail alone is tried.
+  viewer.calls.length = 0;
+  viewer.reportFullDetailFrameCost(120, { cullable: false });
+  assert.deepEqual(toggles(), [['setAdaptiveLOD', true]]);
+  assert.match(dom.hpPerformanceStatus.textContent, /120 ms here; measuring level of detail\.$/);
+  viewer.reportVerified('not-faster', 118, 120);
+
+  // Nothing could be drawn fewer: nothing is turned on, and the next
+  // framing (a zoom that leaves cells out) is measured afresh.
+  viewer.reportMeasuring();
+  viewer.calls.length = 0;
+  viewer.reportNothingFewer();
+  assert.deepEqual(toggles(), []);
+  assert.deepEqual(measured(), []);
+  viewer.emitPresented('camera-settled');
+  assert.deepEqual(measured(), [['measureFullDetailFrameCost']]);
+  controls.destroy();
+});
+
+test('frames the browser cannot time apart are not kept, and the tip says so, with the bounds measured', t => {
+  const restore = installDocument();
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const controls = initRenderControls({ viewer, dom, smoke });
+  // A fence polled late on a busy page: the frame of every cell lies
+  // between 174 and 324 ms, and the frame with the choice on between 150
+  // and 174 ms (Web contracts run 41307458156, Linux Chromium).
+  viewer.reportFullDetailFrameCost({ lo: 174.4, hi: 323.6 });
+  assert.equal(dom.hpPerformanceStatus.textContent, 'A frame of every cell took 174–324 ms here; measuring level of detail and frustum culling.');
+  viewer.reportVerified('unresolved', { lo: 150, hi: 174.2 }, { lo: 174.4, hi: 323.6 });
+  assert.equal(dom.hpLodEnabledCheckbox.checked, false);
+  assert.equal(dom.hpFrustumCullingCheckbox.checked, false);
+  assert.equal(dom.hpPerformanceStatus.textContent, 'Every cell drawn: level of detail and frustum culling measured 150–174 ms a frame against 174–324 ms without, closer than this browser can time. Measured again when the view moves.');
+  // Measured again at the next framing, as after a verdict of no faster.
+  viewer.calls.length = 0;
+  viewer.emitPresented('camera-settled');
+  assert.deepEqual(viewer.calls, [['measureFullDetailFrameCost']]);
+  controls.destroy();
 });

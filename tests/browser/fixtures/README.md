@@ -46,7 +46,7 @@ a *different* number, so the fixture cannot quietly stop discriminating.
 `data-mapping-guess.h5ad`, `data-mapping-guess.zarr.zip`,
 `data-mapping-wide.h5ad` and `data-mapping-multi.h5ad` are the 300-cell
 data-mapping fixtures used by `tests/browser/data-mapping.spec.mjs`: a file
-with no UMAP whose best-ranked candidate holds a NaN (so the best guess skips
+with no UMAP whose best-ranked candidate holds a value past float32 (so the best guess skips
 it for `X_tsne`), one with only a wide `X_pca` (guessed at columns 0 and 1),
 and one with `X_umap`, `X_tsne`, `X_pca` and a vector field bound to `X_umap`.
 `data-mapping-crowded.h5ad` (`tests/browser/data-mapping-layout.spec.mjs`)

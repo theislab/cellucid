@@ -8,10 +8,12 @@
  * Inputs:
  * - the worker pool's size (one worker per core, less two:
  *   `performance-config.js` `analysisWorkerCount`);
- * - the analysis memory budget (`data/memory-budget.js`
- *   `residencyBudgetBytes('analysis')`), read at the start and again on
- *   every memory-pressure event, so a refused allocation (which halves the
- *   allowance) or pressure shrinks the run at once;
+ * - the analysis memory budget: the `analysis` share (`data/memory-budget.js`)
+ *   less the per-cell state the run keeps in every worker
+ *   (`compute/worker-pool.js` `analysisRunBudgetBytes`), read at the start
+ *   and again whenever the share shrinks (`onPressure`: a refused
+ *   allocation halves the allowance; a larger working set or another page
+ *   leaves less), so the run shrinks at once;
  * - each read of a task's genes: their bytes as read (sparse entries, not
  *   cells × 4) and how long it took;
  * - each worker task: how long it ran;
@@ -22,9 +24,17 @@
  * Rules:
  * - **Genes per task** (`genesPerTask`): sixteen tasks per worker over the
  *   run's genes, as many as even out uneven genes and the last tasks, and no
- *   more than lets the compute in flight hold dense columns within half the
- *   budget. A task's genes are read together and computed in one message, so
- *   the page's work per gene shrinks with them.
+ *   more than lets the compute in flight hold the genes within half the
+ *   budget: until a read is measured a gene holds its densest form,
+ *   `bytesPerCell` bytes a cell read (a dense float32 column, 4; a cell
+ *   subset's block, a position and a value a cell, 8), then its bytes as
+ *   read (a sparse gene's entries: tens of times fewer). Sized again as each
+ *   read is measured and when the budget shrinks (a run that names its
+ *   `geneCount`). A task's genes are read together and computed in one
+ *   message, so the page's work per gene shrinks with them: held at the
+ *   densest form, a 10M-cell differential expression of two groups (1.9M
+ *   cells) went one gene a task, 30,000 tasks and page messages where the
+ *   pushed tree sent 128.
  * - **Compute in flight** = two tasks per worker (one running, one queued,
  *   so no worker waits for a message round trip), capped by half the budget
  *   over the measured bytes a task carries.
@@ -33,7 +43,7 @@
  *   plus the tasks in flight in the workers; consumeRate = workers / task
  *   time. Until the first measurements arrive it is twice the compute in
  *   flight. It is held to what 30 % of the budget buffers at the measured
- *   bytes per task.
+ *   bytes per task (`bufferedTasks`, the memory gate).
  * - **Adaptation**, once per window of max(250 ms, 32 tasks): 250 ms is the
  *   rate floor the reader's activity reporting uses, 32 tasks one full round
  *   of two tasks on each of sixteen workers. When workers sat idle more than
@@ -54,7 +64,8 @@
  * @module analysis/shared/run-tuner
  */
 
-import { residencyBudgetBytes } from '../../../data/memory-budget.js';
+import { analysisRunBudgetBytes } from '../compute/worker-pool.js';
+import { loadedRoundTripMs } from '../../../formats/io/link.js';
 
 /** The reader's activity reporting rate floor (ms): one window at least. */
 export const TUNER_WINDOW_MS = 250;
@@ -80,34 +91,50 @@ function positiveInteger(value, label) {
   return value;
 }
 
+/** Bytes a gene read as a dense float32 column holds a cell. */
+const DENSE_COLUMN_BYTES_PER_CELL = 4;
+
 /**
  * The genes each task of a run takes: the run's genes over sixteen tasks per
- * worker, held so that the compute in flight (two tasks per worker) of dense
- * columns fits half the budget.
+ * worker, held so that the compute in flight (two tasks per worker) fits
+ * half the budget, at `bytesPerGene` a gene (as read), else the genes'
+ * densest form.
  *
  * @param {object} options
  * @param {number} options.geneCount - The run's genes
  * @param {number} options.poolSize - Analysis workers
- * @param {number} options.cellCount - Cells per gene column
+ * @param {number} options.cellCount - Cells each gene is read in
  * @param {number} options.budgetBytes - The analysis memory budget
+ * @param {number} [options.bytesPerCell] - What a gene holds a cell read, at
+ *   most (a dense column's 4; a cell subset's block, 8)
+ * @param {number|null} [options.bytesPerGene] - What a gene holds as read
+ *   (measured), or null: its densest form, `cellCount × bytesPerCell`
  * @returns {number}
  */
-export function genesPerTaskFor({ geneCount, poolSize, cellCount, budgetBytes }) {
+export function genesPerTaskFor({ geneCount, poolSize, cellCount, budgetBytes, bytesPerCell = DENSE_COLUMN_BYTES_PER_CELL, bytesPerGene = null }) {
   positiveInteger(geneCount, 'A run\'s geneCount');
   positiveInteger(poolSize, 'A run\'s poolSize');
   positiveInteger(cellCount, 'A run\'s cellCount');
+  positiveInteger(bytesPerCell, 'A run\'s bytesPerCell');
   const even = Math.ceil(geneCount / (poolSize * TASKS_PER_WORKER_OVER_A_RUN));
-  const byMemory = Math.floor((budgetBytes * COMPUTE_SHARE) / (poolSize * TASKS_PER_WORKER * cellCount * 4));
+  const perGene = bytesPerGene !== null && bytesPerGene > 0 ? bytesPerGene : cellCount * bytesPerCell;
+  const byMemory = Math.floor((budgetBytes * COMPUTE_SHARE) / (poolSize * TASKS_PER_WORKER * perGene));
   return Math.max(1, Math.min(even, byMemory));
 }
 
 /**
  * @param {object} options
  * @param {number} options.poolSize - Analysis workers
- * @param {number} options.cellCount - Cells per gene column
+ * @param {number} options.cellCount - Cells each gene is read in
+ * @param {number} [options.bytesPerCell] - What a gene holds a cell read
+ *   until a read is measured (as `genesPerTaskFor`)
  * @param {number} [options.genesPerTask=1] - Genes each task takes (`genesPerTaskFor`)
+ *   until a read is measured; fixed when the run names no `geneCount`
+ * @param {number|null} [options.geneCount] - The run's genes: genes per task
+ *   are sized again (`genesPerTaskFor`) at each measured read and each
+ *   shrink of the budget
  * @param {() => number} [options.budgetBytes] - The analysis memory budget,
- *   read again on pressure (default: `residencyBudgetBytes('analysis')`)
+ *   read again when it shrinks (default: `analysisRunBudgetBytes`)
  * @param {() => ({latencyMs: number, bytesPerMs: number}|null)} [options.link] -
  *   The reader's latest link measurement, or null before one
  * @param {() => number} [options.now] - Clock (ms)
@@ -115,20 +142,30 @@ export function genesPerTaskFor({ geneCount, poolSize, cellCount, budgetBytes })
 export function createRunTuner({
   poolSize,
   cellCount,
-  genesPerTask = 1,
-  budgetBytes = () => residencyBudgetBytes('analysis'),
+  bytesPerCell = DENSE_COLUMN_BYTES_PER_CELL,
+  genesPerTask: firstGenesPerTask = 1,
+  geneCount = null,
+  budgetBytes = analysisRunBudgetBytes,
   link = () => null,
   now = () => performance.now(),
 }) {
   positiveInteger(poolSize, 'Tuner poolSize');
   positiveInteger(cellCount, 'Tuner cellCount');
-  positiveInteger(genesPerTask, 'Tuner genesPerTask');
+  positiveInteger(bytesPerCell, 'Tuner bytesPerCell');
+  positiveInteger(firstGenesPerTask, 'Tuner genesPerTask');
+  if (geneCount !== null) positiveInteger(geneCount, 'Tuner geneCount');
   if (typeof budgetBytes !== 'function' || typeof link !== 'function' || typeof now !== 'function') {
     throw new TypeError('Tuner budgetBytes, link and now must be functions');
   }
 
   let budget = budgetBytes();
   let bytesPerGene = null;
+  let genesPerTask = firstGenesPerTask;
+  /** Genes per task at the budget and the genes' bytes as read (a run that names its `geneCount`). */
+  const resize = () => {
+    if (geneCount === null || bytesPerGene === null) return;
+    genesPerTask = genesPerTaskFor({ geneCount, poolSize, cellCount, budgetBytes: budget, bytesPerCell, bytesPerGene });
+  };
   let readMs = null;
   let taskMs = null;
   let readAhead = null;
@@ -154,8 +191,8 @@ export function createRunTuner({
     return measurement;
   };
 
-  /** Bytes one task in flight costs: its genes as measured, else dense columns. */
-  const taskBytes = () => (bytesPerGene ?? cellCount * 4) * genesPerTask;
+  /** Bytes one task in flight costs: its genes as measured, else their densest form. */
+  const taskBytes = () => (bytesPerGene ?? cellCount * bytesPerCell) * genesPerTask;
 
   const computeInFlight = () => {
     const byMemory = Math.floor((budget * COMPUTE_SHARE) / taskBytes());
@@ -171,7 +208,8 @@ export function createRunTuner({
     const consumePerMs = poolSize / taskMs;
     const measured = measuredLink();
     let fetchMs;
-    if (measured !== null) fetchMs = measured.latencyMs + taskBytes() / measured.bytesPerMs;
+    // A request under load takes longer than the shortest seen (`loadedRoundTripMs`).
+    if (measured !== null) fetchMs = loadedRoundTripMs(measured) + taskBytes() / measured.bytesPerMs;
     else fetchMs = readMs ?? 0;
     return Math.ceil(consumePerMs * fetchMs) + inFlight;
   };
@@ -239,7 +277,7 @@ export function createRunTuner({
   };
 
   return {
-    /** The genes each task takes. */
+    /** The genes each task takes now (sized again as reads are measured: `geneCount`). */
     genesPerTask: () => genesPerTask,
     /** Tasks' genes to read ahead of the consumer. */
     prefetchDepth() {
@@ -248,12 +286,22 @@ export function createRunTuner({
     },
     /** Worker tasks to keep in flight. */
     computeInFlight,
+    /**
+     * Tasks whose genes may be read and not yet computed (being read, or
+     * waiting for a worker) within the buffered genes' share of the budget:
+     * the memory gate the read-ahead is held to. A read whose cost does not
+     * shrink with its genes (a cell subset read by cell) fills it.
+     */
+    bufferedTasks: () => memoryGate(),
+    /** Bytes one task's genes hold: as measured, else their densest form. */
+    taskBytes,
     /** The analysis memory budget as last read. */
     memoryBudgetBytes: () => budget,
     /** A task's genes were read (`genes` of them): their bytes as read and how long the read took. */
     observeRead({ bytes, ms, genes = 1 }) {
       if (Number.isFinite(bytes) && bytes > 0 && Number.isSafeInteger(genes) && genes > 0) {
         bytesPerGene = ema(bytesPerGene, bytes / genes);
+        resize();
       }
       if (Number.isFinite(ms) && ms >= 0) readMs = ema(readMs, ms);
     },
@@ -274,9 +322,10 @@ export function createRunTuner({
       windowTasks++;
       closeWindow();
     },
-    /** Memory pressure, or a refused allocation: the budget is read again and the read-ahead halves. */
+    /** The budget shrank (a refused allocation, a larger working set, another page): it is read again and the read-ahead halves. */
     onPressure() {
       budget = budgetBytes();
+      resize();
       pressureHalvings++;
       const from = readAhead ?? clampReadAhead(modelledReadAhead());
       readAhead = clampReadAhead(from / 2);

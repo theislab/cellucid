@@ -155,9 +155,9 @@ test('genes in sets, brackets, a not-found chip, display without reading, dendro
   expect(file.suggestedFilename()).toBe('dot_plot.csv');
   const text = await (await file.createReadStream()).toArray().then(chunks => Buffer.concat(chunks).toString('utf8'));
   const lines = text.trim().split('\n');
-  expect(lines[0]).toBe('group,gene,gene_group,mean,fraction_expressing,n_cells');
+  expect(lines[0]).toBe('group,gene,gene_group,mean,fraction_expressing,n_cells,n_measured');
   expect(lines).toHaveLength(1 + 3 * 5);
-  expect(lines[1]).toMatch(/^T,CD3E,T cells,[0-9.]+,0\.75,100$/);
+  expect(lines[1]).toMatch(/^T,CD3E,T cells,[0-9.]+,0\.75,100,100$/);
   await page.keyboard.press('Escape');
 
   // Score as signature opens Gene signature with one set per gene set.

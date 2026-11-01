@@ -7,10 +7,10 @@
  *   (a run of zeros) never expands past a bounded amount before its output
  *   is read;
  * - bzip2 (`BZh`) and xz (`fd 37 7a 58 5a 00`): this package's own decoders
- *   (`bzip2.js`, `xz.js`; no WebAssembly, so no change to the page's script
- *   policy);
- * - zstd (`28 b5 2f fd`, R >= 4.5 `compress = "zstd"`): refused with what to
- *   do;
+ *   (`bzip2.js`, `xz.js`);
+ * - zstd (`28 b5 2f fd`, R >= 4.5 `compress = "zstd"`): zstd itself, in
+ *   WebAssembly (`io/wasm-codecs.js` `zstdStream`), piece by piece, every
+ *   frame's checksum verified when written;
  * - none (`X\n`, `RDX2\n`, `RDX3\n`): the bytes as they are; such a file
  *   also allows random access (`isUncompressed`).
  *
@@ -23,8 +23,11 @@
 import { RdsFormatError, RdsUnsupportedError } from './errors.js';
 import { bunzip2 } from './bzip2.js';
 import { unxz } from './xz.js';
+import { WasmCodecError, zstdStream } from '../io/wasm-codecs.js';
 import { gunzipWorkerScript } from '../../../workers/scripts.js';
 import { startWorker } from '../../workers/worker-script.js';
+import { allocateTypedArray } from '../../data/sparse-column-index.js';
+import { abortReason, cancel, onAbort, throwIfAborted } from '../../utils/abort.js';
 
 /** Input bytes handed to the native decompressor per write (see `formats/io/inflate.js`). */
 const INFLATE_SLICE_BYTES = 64 * 1024;
@@ -32,6 +35,17 @@ const INFLATE_SLICE_BYTES = 64 * 1024;
 /** Bytes of a file read per request while it streams, and how many requests run ahead. */
 export const STREAM_PIECE_BYTES = 4 * 1024 * 1024;
 const STREAM_AHEAD = 3;
+
+/**
+ * The first request's bytes (a scheduling choice): each later one twice the
+ * one before, up to `STREAM_PIECE_BYTES`, with as many requests run ahead
+ * as pieces have arrived, up to `STREAM_AHEAD`. A reader that needs only a file's
+ * start (a MatrixMarket size line, an R object's class, a table's header)
+ * stops after one small request (the next, asked as it arrived, cancelled),
+ * not after `STREAM_AHEAD` large ones; one that reads on reaches full-size
+ * pieces within six requests.
+ */
+export const STREAM_FIRST_PIECE_BYTES = 64 * 1024;
 
 /**
  * The compression one file's first bytes name.
@@ -75,36 +89,53 @@ export function isUncompressed(head) {
 }
 
 /**
- * Read a file in order, a few pieces ahead.
+ * Read a file in order, a few pieces ahead, the first ones small
+ * (`STREAM_FIRST_PIECE_BYTES`, doubling up to `pieceBytes`). A reader that
+ * stops early (returns, or fails) cancels the requests still on their way.
  *
  * @param {{size: number, read: (offset: number, length: number, options?: Object) => Promise<Uint8Array>}} file
- * @param {{signal?: AbortSignal|null, activity?: Object|null, onBytes?: ((read: number) => void)|null, pieceBytes?: number}} [options]
+ * @param {{signal?: AbortSignal|null, activity?: Object|null, onBytes?: ((read: number) => void)|null,
+ *   pieceBytes?: number, firstPieceBytes?: number}} [options]
  * @returns {AsyncGenerator<Uint8Array>}
  */
-export async function* readInOrder(file, { signal = null, activity = null, onBytes = null, pieceBytes = STREAM_PIECE_BYTES } = {}) {
+export async function* readInOrder(file, {
+  signal = null, activity = null, onBytes = null, pieceBytes = STREAM_PIECE_BYTES, firstPieceBytes = STREAM_FIRST_PIECE_BYTES,
+} = {}) {
+  // Stopped before it began: nothing is asked of the file.
+  throwIfAborted(signal);
   const pending = [];
   let next = 0;
   let delivered = 0;
+  let size = Math.min(firstPieceBytes, pieceBytes);
+  // The requests' own signal: the caller's, and this stream's end.
+  const own = new AbortController();
+  const stopRelay = onAbort(signal, () => own.abort(signal.reason));
   const request = () => {
     const offset = next;
-    const length = Math.min(pieceBytes, file.size - offset);
+    const length = Math.min(size, file.size - offset);
+    size = Math.min(size * 2, pieceBytes);
     next += length;
-    const promise = file.read(offset, length, { signal, activity });
+    const promise = file.read(offset, length, { signal: own.signal, activity });
     // A request's failure is seen when it is awaited, in order.
     promise.catch(() => {});
     pending.push(promise);
   };
+  // Requests run ahead: one per piece delivered so far, up to `STREAM_AHEAD`.
+  let pieces = 0;
   try {
-    while (next < file.size && pending.length < STREAM_AHEAD) request();
+    if (file.size > 0) request();
     while (pending.length > 0) {
       const bytes = await pending.shift();
-      if (next < file.size) request();
+      pieces++;
+      while (next < file.size && pending.length < Math.min(STREAM_AHEAD, pieces)) request();
       delivered += bytes.length;
       onBytes?.(delivered);
       // A read is a view into a buffer the reader may reuse: copied once here.
       yield bytes.slice();
     }
   } finally {
+    stopRelay();
+    if (pending.length > 0) cancel(own, 'superseded', 'The stream was left before its end.');
     pending.length = 0;
   }
 }
@@ -152,10 +183,6 @@ async function startGunzipWorker() {
   return null;
 }
 
-function abortReason(signal) {
-  return signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
-}
-
 /**
  * The output of a gzip stream decompressed on `worker` (`gunzip-worker.js`):
  * the compressed pieces are given to it as they are read, a few ahead, and
@@ -189,8 +216,7 @@ async function* gunzipOnWorker(worker, pieces, signal) {
     failure ??= event.message || 'its worker stopped';
     notify();
   };
-  const onAbort = () => notify();
-  signal?.addEventListener('abort', onAbort);
+  const stopWaking = onAbort(signal, notify);
   worker.postMessage({ credit: GUNZIP_OUTPUT_AHEAD });
   const feeding = (async () => {
     try {
@@ -229,7 +255,7 @@ async function* gunzipOnWorker(worker, pieces, signal) {
     // A reader that stops early: the feeding stops reading the file too.
     stopped = true;
     notify();
-    signal?.removeEventListener('abort', onAbort);
+    stopWaking();
     worker.terminate();
   }
 }
@@ -316,7 +342,7 @@ async function peek(pieces, count) {
     held.push(value);
     have += value.length;
   }
-  const head = new Uint8Array(Math.min(have, count));
+  const head = allocateTypedArray(Uint8Array, Math.min(have, count), 'The start of an R file');
   let offset = 0;
   for (const piece of held) {
     if (offset >= head.length) break;
@@ -325,14 +351,52 @@ async function peek(pieces, count) {
     offset += take;
   }
   async function* rest() {
-    for (const piece of held) yield piece;
-    for (;;) {
-      const { value, done } = await iterator.next();
-      if (done) return;
-      yield value;
+    let ended = false;
+    try {
+      for (const piece of held) yield piece;
+      for (;;) {
+        const { value, done } = await iterator.next();
+        if (done) {
+          ended = true;
+          return;
+        }
+        yield value;
+      }
+    } finally {
+      // Left before its end: what feeds it stops too (a decompressor, its reads).
+      if (!ended) await close();
     }
   }
-  return { head, pieces: rest() };
+  async function close() {
+    try {
+      await iterator.return?.();
+    } catch {
+      // A failure of the stream itself is reported where it is read.
+    }
+  }
+  return { head, pieces: rest(), close };
+}
+
+/**
+ * A zstd stream's decompressed bytes, piece by piece (R's `zstdfile`
+ * connection writes frames one after another, as any zstd writer may).
+ *
+ * @param {AsyncIterable<Uint8Array>} pieces
+ * @param {AbortSignal|null} signal
+ * @returns {AsyncGenerator<Uint8Array>}
+ */
+async function* unzstd(pieces, signal) {
+  const stream = await zstdStream();
+  try {
+    for await (const piece of pieces) {
+      if (signal?.aborted) throw abortReason(signal);
+      yield* stream.push(piece);
+    }
+    stream.end();
+  } catch (error) {
+    if (error instanceof WasmCodecError) throw new RdsFormatError(`This R file's zstd stream is damaged: ${error.message}`, { cause: error });
+    throw error;
+  }
 }
 
 /**
@@ -350,16 +414,10 @@ export async function decompressed(pieces, { signal = null, bytes = null } = {})
     const peeked = await peek(current, 8);
     const compression = compressionOf(peeked.head);
     if (compression === 'none') return { pieces: peeked.pieces, compressions, head: peeked.head };
-    if (compression === 'zstd') {
-      throw new RdsUnsupportedError(
-        'zstd compression',
-        'This R file is compressed with zstd (saveRDS(compress = "zstd"), R 4.5 and later), which browsers do not decompress. ' +
-        'Save it again with saveRDS(object, file) (gzip), or compress = "xz" or "bzip2".'
-      );
-    }
     compressions.push(compression);
     if (compression === 'gzip') current = gunzip(peeked.pieces, signal, bytes);
     else if (compression === 'bzip2') current = bunzip2(peeked.pieces, { signal });
+    else if (compression === 'zstd') current = unzstd(peeked.pieces, signal);
     else current = unxz(peeked.pieces, { signal });
   }
 }

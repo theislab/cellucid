@@ -11,6 +11,7 @@ import {
   categoricalStorageForCodes
 } from '../../../data/categorical-storage-contract.js';
 import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
+import { abortReason } from '../../../utils/abort.js';
 
 function requireCategoryInventory(categories) {
   if (!Array.isArray(categories) || categories.length === 0) {
@@ -113,9 +114,11 @@ export function computeAllLayoutCentroids(codes, categories, state) {
 /**
  * Per-category sums of one layout's positions over cells `[from, to)`, one
  * loop per dimension, each adding its axes in cell order, so a pass split
- * into ranges makes exactly the Float64 additions of one whole pass. `v - v`
- * is 0 exactly for a finite `v` and NaN otherwise, which tests finiteness
- * without a call.
+ * into ranges makes exactly the Float64 additions of one whole pass. A cell
+ * the layout does not place (NaN in every axis, `rendering/unplaced-positions.js`)
+ * is in no centroid, as a cell with a missing category is. `v - v` is 0
+ * exactly for a finite `v` and NaN otherwise, which tests finiteness without
+ * a call.
  */
 function accumulateCentroids1(codes, positions, missingCode, numCategories, sums, counts, from, to) {
   for (let i = from; i < to; i++) {
@@ -123,6 +126,7 @@ function accumulateCentroids1(codes, positions, missingCode, numCategories, sums
     if (cat === missingCode) continue;
     if (cat >= numCategories) return -(i + 1);
     const x = positions[i];
+    if (x !== x) continue;
     if (x - x !== 0) return i + 1;
     sums[cat * 3] += x;
     counts[cat]++;
@@ -136,6 +140,7 @@ function accumulateCentroids2(codes, positions, missingCode, numCategories, sums
     if (cat === missingCode) continue;
     if (cat >= numCategories) return -(i + 1);
     const x = positions[base];
+    if (x !== x) continue;
     const y = positions[base + 1];
     if (x - x !== 0 || y - y !== 0) return i + 1;
     const slot = cat * 3;
@@ -152,6 +157,7 @@ function accumulateCentroids3(codes, positions, missingCode, numCategories, sums
     if (cat === missingCode) continue;
     if (cat >= numCategories) return -(i + 1);
     const x = positions[base];
+    if (x !== x) continue;
     const y = positions[base + 1];
     const z = positions[base + 2];
     if (x - x !== 0 || y - y !== 0 || z - z !== 0) return i + 1;
@@ -284,7 +290,7 @@ export async function computeCentroidsForDimensionInSlices(
     if (from < total) {
       await yieldToMacrotask();
       if (signal?.aborted) {
-        throw signal.reason ?? new DOMException('The centroid pass was aborted.', 'AbortError');
+        throw abortReason(signal);
       }
     }
   }

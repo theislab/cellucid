@@ -557,7 +557,7 @@ test('highlight tools disposal fences callbacks and attempts every DOM/GPU owner
     knnGraph: { nCells: 2 },
     _lassoHitTest: { query: {} },
     _proximityHitTest: { query: {} },
-    _knnExpansion: { query: {} },
+    _knnExpansion: { query: { dispose() {} } },
     mat4: {},
     vec3: {},
     gl: {},

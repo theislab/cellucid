@@ -145,7 +145,7 @@ test('GPU-gathered edges draw exactly the pixels of CPU-gathered records', async
     layer.setGraph(edgePayloadOf(sources, destinations, strength, cellCount));
     layer.addView('live');
     layer.setVisibleTarget(target);
-    layer.publishVisibility('live', { transparency, admissionLevels: null, lodLevel: -1 });
+    layer.publishVisibility('live', { transparency, lodMembership: null });
     const shown = layer.refresh('live').shownCount;
     const layerPixels = capture(() => layer.draw('live', frame));
 

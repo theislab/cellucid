@@ -13,8 +13,14 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const FULL_H5AD = path.join(FIXTURES, 'data-mapping-full.h5ad');
@@ -220,9 +226,18 @@ for (const [format, input, file] of [
       await openFullFixture(page, input, file);
       const expression = page.locator('#data-mapping-expression');
       const names = page.locator('#data-mapping-gene-names');
+      const hint = page.locator('[data-mapping-section="genes"] .data-mapping-hint');
+      // raw.X holds more genes than X: the file opens on raw, as Scanpy reads
+      // genes, and the genes line says why.
+      await expect(expression).toHaveValue('raw');
+      await expect(hint).toHaveText('Expression: raw, as Scanpy reads genes: it holds more genes than X.');
+      // X is one choice away.
+      await expression.selectOption('X');
+      await apply(page);
+      await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       await expect(expression).toHaveValue('X');
       await expect(expression.locator('option')).toHaveText([
-        'None', 'X', "layers['counts']", "layers['log1p']", 'raw.X · 8 genes',
+        'None', 'X', "layers['counts'] · counts", "layers['log1p']", 'raw.X · 8 genes · counts',
       ]);
       await expect(names).toHaveValue('index');
       await expect(names.locator('option')).toHaveText([
@@ -232,9 +247,9 @@ for (const [format, input, file] of [
         'highly_variable · true/false values cannot name genes',
         'dispersions · floating-point values cannot name genes',
       ]);
-      // One short line: what was guessed from the file, then the names note.
-      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint'))
-        .toHaveText("Guessed: highly variable genes. Gene names are Ensembl ids; 'gene_symbols' holds symbols.");
+      // Nothing is guessed about X's names: no column is named but the one in use.
+      await expect(hint).not.toContainText('Guessed');
+      await expect(hint).not.toContainText('gene_symbols');
 
       // A highlight and a filtered gene colouring are in place.
       await page.evaluate(() => {
@@ -259,9 +274,8 @@ for (const [format, input, file] of [
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       expect(await activeGene(page)).toEqual({ key: 'LYZ', index: 2, filter: range });
       expect(await page.evaluate(() => window._cellucidState.getDataMapping().geneNames)).toBe('column:gene_symbols');
-      await expect(page.locator('[data-mapping-section="genes"] .data-mapping-hint')).toHaveText(
-        "Guessed: highly variable genes. "
-        + "1 gene has no 'gene_symbols' value and uses its var index name. "
+      await expect(hint).toHaveText(
+        "1 gene has no 'gene_symbols' value and uses its var index name. "
           + "1 duplicate name was made unique, e.g. 'LYZ' → 'LYZ-1'."
       );
       expect(await page.evaluate(() => window._cellucidState.getHighlightedCellCount())).toBe(3);
@@ -374,14 +388,16 @@ for (const [format, input, file] of [
         sha256: EXPECTED.latent.X_pca.cell_type,
       });
 
-      // A space with a NaN is refused when it is read: the control says why,
-      // the threshold is back at 100%, and the space is offered no more.
+      // A space holding a value past float32 is refused when it is read: the
+      // control says why, the threshold is back at 100%, and the space is
+      // offered no more. (A NaN row is a cell the space does not place: it
+      // gets no quantile, and the space is used.)
       await latent.selectOption('X_broken');
       await apply(page);
       await expect(note).toHaveText('This latent space cannot be used.');
-      await expect(note).toHaveAttribute('title', /NaN at cell 5/);
+      await expect(note).toHaveAttribute('title', /not representable as float32 at cell 5/);
       await expect(page.locator('#outlier-filter-action')).toHaveText('Choose latent space');
-      await expect(latent.locator('option[value="X_broken"]')).toContainText('NaN at cell 5');
+      await expect(latent.locator('option[value="X_broken"]')).toContainText('not representable as float32 at cell 5');
       expect(await activeOutliers(page)).toBeNull();
       await expect(page.locator('#outlier-filter')).toHaveValue('100');
 

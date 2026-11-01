@@ -8,6 +8,8 @@ import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { requireObjectRecord } from '../../../../utils/exact-record.js';
+import { formatBound } from '../../../../utils/format-units.js';
+import { hiddenCategoryCount } from '../../../utils/category-state.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -126,13 +128,7 @@ function formatRangeValue(value) {
   if (!Number.isFinite(value)) {
     throw new TypeError('Highlight range bounds must be finite numbers');
   }
-  if (
-    Math.abs(value) >= 1000
-    || (Math.abs(value) > 0 && Math.abs(value) < 0.01)
-  ) {
-    return value.toExponential(2);
-  }
-  return value.toFixed(2);
+  return formatBound(value);
 }
 
 /**
@@ -460,9 +456,10 @@ export class FieldOverlayInternalMethods {
    * }} definition
    * @param {(state: {
    *   categories: Array<string|number|boolean>,
-   *   colors: number[][],
-   *   visible: Object<number, boolean>
-   * }) => {colors: number[][], visible: Object<number, boolean>}} carryCategoryState
+   *   colors: Uint8Array,
+   *   visible: Uint8Array
+   * }) => {colors: Uint8Array, visible: Uint8Array}} carryCategoryState - colours and
+   *   visibility as `utils/category-state.js` holds them
    */
   _publishUserDefinedCategorical(fieldId, definition, carryCategoryState) {
     if (typeof carryCategoryState !== 'function') {
@@ -545,7 +542,7 @@ export class FieldOverlayInternalMethods {
       const shows = view.activeFieldSource === FieldSource.OBS && view.activeFieldIndex === index;
       const filters = field._categoryFilterEnabled !== false
         && field._categoryVisible !== undefined
-        && field.categories.some((_, code) => field._categoryVisible[code] === false);
+        && hiddenCategoryCount(field._categoryVisible) > 0;
       return shows || filters ? { index, shows } : null;
     };
     const redraw = use => {

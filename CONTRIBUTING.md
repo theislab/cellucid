@@ -144,10 +144,12 @@ High-level map:
 - `cellucid/assets/js/data/`: data sources + loaders (AnnData `.h5ad`/Zarr/`.zarr.zip` files, links and catalogs, `cellucid serve`, Jupyter)
   - `data/anndata/`: the one AnnData reader (elements, data frames, dense and sparse matrices) over any store
   - `data/sources/`: dataset catalogs (`datasets.json`, `anndata-catalog.js`) and link providers
-- `cellucid/assets/js/formats/`: file-format readers with no Cellucid knowledge — `hdf5/`, `zarr/` (v2 and v3, folder/ZIP/HTTP stores), `zip/`, and `io/` (byte sources, range reads, the decode worker pool)
+- `cellucid/assets/js/formats/`: file-format readers with no Cellucid knowledge — `hdf5/`, `zarr/` (v2 and v3, folder/ZIP/HTTP stores), `zip/`, `rds/` (R serialization), `text/` (MatrixMarket), and `io/` (byte sources, range reads, the link model, kept parts, the decode worker pool); see `assets/js/ARCHITECTURE.md` and the folder READMEs
 - `cellucid/assets/js/rendering/`: WebGL2 viewer + shaders + overlays
 - `cellucid/assets/js/workers/`: `worker-script.js`, where every worker starts from (`startWorker`)
 - `cellucid/assets/workers/`: generated worker bundles and `scripts.js` (never edited; see Testing & validation)
+- `cellucid/assets/page/`: the generated page bundle a deployed site loads (`scripts/build-page-bundle.mjs`; never edited)
+- `cellucid/assets/wasm/`: `codecs.wasm`, the zstd, lz4 and c-blosc decoders built from pinned sources by `scripts/build-wasm-codecs.mjs` (never edited), with their licences
 - `cellucid/assets/css/`: design system (tokens/themes/components)
 
 ---
@@ -197,6 +199,7 @@ the suites:
 npm ci
 npm test                    # every web contract in tests/*.test.mjs
 npm run test:browser        # Playwright suites in tests/browser/
+npm run test:browser:repeat # the browser specs a change touches, 5 times in every engine
 npm run test:worker-bundle  # dry-run build of the community-annotation Cloudflare Worker
 ```
 
@@ -256,7 +259,9 @@ same check CI applies:
 
 - `npm test` runs on Ubuntu, macOS, and Windows across Node 22/24/26, with
   `cellucid-datasets` (its catalog and session presets) checked out beside the
-  repository so the cross-repository session-preset contracts run.
+  repository so the cross-repository session-preset contracts run, and
+  `cellucid-python` and `cellucid-r` (the notebook widget's front end each
+  ships) so the widget contract runs against both copies.
 - On every push and pull request the browser suite runs chromium, firefox, and
   webkit on Ubuntu, plus webkit on macOS. Every engine on every operating
   system runs nightly and on manual dispatch (**Actions → Web contracts → Run
@@ -285,6 +290,15 @@ so concurrent runs do not overwrite each other's evidence.
 A new browser spec must take its origins from `tests/browser/helpers/origins.mjs`
 rather than writing an address down; `tests/browser-test-port-contract.test.mjs`
 fails on a reintroduced literal.
+
+A browser spec waits for the product's state, never a fixed time:
+`tests/browser-spec-fixed-waits-contract.test.mjs` fails on a new
+`page.waitForTimeout(…)` or timer-resolved promise unless time itself is what
+the spec checks. Before pushing a spec change, run
+`npm run test:browser:repeat` (or name the specs: `-- <spec> --repeat=10`),
+which runs the specs the change touches several times in each engine with no
+retries and fails on any single failed run; see the developer docs' "Browser
+specs that wait for state, not time".
 
 Automated coverage does not replace manual smoke testing of the interactive
 surface. Run through this checklist for any change a user can see:

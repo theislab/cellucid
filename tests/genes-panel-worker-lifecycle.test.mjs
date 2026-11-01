@@ -7,6 +7,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { memoryReport, releaseResidentMemory } from '../assets/js/data/memory-budget.js';
 
 import { getWorkerPool } from '../assets/js/app/analysis/compute/worker-pool.js';
 import { computeCategoryGroupingDigest } from '../assets/js/app/analysis/data/data-layer.js';
@@ -256,8 +257,15 @@ test('the marker cache holds a share of the analysis budget, dropping the oldest
   budget = 8 * 4; // a refused allocation halved the allowance, twice
   cache.set({ i: 6 }, { lane: new Float64Array(1) });
   assert.equal(cache.getStats().entries, 1, 'the next store reads the budget again');
-  cache.trim();
-  assert.equal(cache.getStats().entries, 1);
+  // The memory model trims it to what the share leaves (oldest first), and
+  // stops counting it once it is closed.
+  assert.equal(memoryReport().shares.analysis.heldBytes, 8);
+  releaseResidentMemory('caches', 'hidden');
+  assert.equal(cache.getStats().entries, 0);
+  cache.close();
+  const holders = memoryReport().holders;
+  assert.equal(new MarkerCache({ identity: { key: 'next' } }).close(), undefined);
+  assert.equal(memoryReport().holders, holders, 'a closed cache is not counted');
 });
 
 test('over a gene route a marker task names its delivery and runs on the worker it went to', async () => {

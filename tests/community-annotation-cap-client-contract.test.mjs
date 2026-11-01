@@ -32,7 +32,7 @@ function capResult(overrides = {}) {
 function capResponse(results, omittedInvalidCount = 0, init = {}) {
   return new Response(
     JSON.stringify({
-      contractVersion: 1,
+      contractVersion: 2,
       results,
       omittedInvalidCount,
     }),
@@ -348,7 +348,7 @@ test('CAP distinguishes an independent fetch abort', async () => {
     () => assert.rejects(
       () => searchCellTypes('T cell'),
       error => {
-        assert.equal(error?.code, 'CAP_FETCH_ABORTED');
+        assert.equal(error?.code, 'CAP_FETCH_INTERRUPTED');
         assert.match(error?.message ?? '', /independently aborted/);
         return true;
       }
@@ -483,7 +483,7 @@ test('CAP invalid UTF-8 cancels its response reader', async () => {
 
 test('CAP rejects a UTF-8 BOM instead of accepting an alternate JSON wire form', async () => {
   const json = new TextEncoder().encode(JSON.stringify({
-    contractVersion: 1,
+    contractVersion: 2,
     results: [],
     omittedInvalidCount: 0,
   }));

@@ -8,9 +8,20 @@
 
 import { formatCountOf } from '../../utils/format-units.js';
 
-function createIndexArray(count) {
-  const indices = new Uint32Array(count);
-  for (let i = 0; i < count; i++) indices[i] = i;
+/**
+ * The ids of the points a tree holds: the points the embedding places. A
+ * cell it does not place has NaN positions (the readers' contract: the one
+ * mark of an unplaced cell) and is in no leaf.
+ */
+function placedIds(positions, count, stride) {
+  let placed = 0;
+  for (let i = 0; i < count; i++) if (positions[i * stride] === positions[i * stride]) placed++;
+  const indices = new Uint32Array(placed);
+  if (placed === count) {
+    for (let i = 0; i < count; i++) indices[i] = i;
+    return indices;
+  }
+  for (let i = 0, at = 0; i < count; i++) if (positions[i * stride] === positions[i * stride]) indices[at++] = i;
   return indices;
 }
 
@@ -19,6 +30,8 @@ function calculateBounds(tree) {
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
   const positions = tree.positions;
+  // An unplaced cell's NaN fails every comparison: the bounds are the
+  // placed cells'.
   const count = tree.pointCount;
   const stride = tree.dimensionLevel;
 
@@ -47,6 +60,10 @@ function calculateBounds(tree) {
   } else {
     minZ = 0;
     maxZ = 0;
+  }
+  if (!(minX <= maxX)) {
+    // No placed point: an empty tree in a box at the origin.
+    minX = maxX = minY = maxY = minZ = maxZ = 0;
   }
 
   // Calculate extents
@@ -198,6 +215,20 @@ function buildNode(tree, indices, bounds, depth) {
 }
 
 /**
+ * How many points of `positions` the embedding places: those whose
+ * positions are not NaN (an unplaced cell's are NaN in every axis).
+ *
+ * @param {Float32Array} positions
+ * @param {1|2|3} dimensionLevel
+ * @returns {number}
+ */
+export function countPlacedPoints(positions, dimensionLevel) {
+  let placed = 0;
+  for (let i = 0; i < positions.length; i += dimensionLevel) if (positions[i] === positions[i]) placed++;
+  return placed;
+}
+
+/**
  * The padded bounds the tree is built in.
  *
  * @param {Float32Array} positions
@@ -209,7 +240,9 @@ export function calculateSpatialBounds(positions, dimensionLevel) {
 }
 
 /**
- * Build the tree over `positions` (`dimensionLevel` components per point).
+ * Build the tree over the points of `positions` (`dimensionLevel`
+ * components per point) the embedding places: a cell it does not place has
+ * NaN positions and is in no leaf; the bounds are the placed cells'.
  *
  * @param {Float32Array} positions
  * @param {1|2|3} dimensionLevel
@@ -227,16 +260,16 @@ export function buildSpatialTree(positions, dimensionLevel, maxPointsPerNode, ma
     maxDepth,
   };
   const bounds = calculateBounds(tree);
-  const root = buildNode(tree, createIndexArray(tree.pointCount), bounds, 0);
+  const root = buildNode(tree, placedIds(positions, tree.pointCount, dimensionLevel), bounds, 0);
   return { bounds, root };
 }
 
 /**
  * A tree handed back from the worker must cover exactly the point set it is
- * installed over.
+ * installed over: the points its embedding places.
  *
  * @param {unknown} tree
- * @param {number} pointCount
+ * @param {number} pointCount - The placed points.
  */
 export function requirePrebuiltSpatialTree(tree, pointCount) {
   const bounds = tree?.bounds;

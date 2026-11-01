@@ -8,7 +8,9 @@
  * The list's two interactions are delegated to the list element, so a render
  * only builds rows. Counting a filter's cells is a pass over the dataset per
  * filter, so the list is drawn only while its panel is shown and catches up
- * when the panel opens; the one-line total above it is always current.
+ * when the panel opens; the one-line total above it is always current, and
+ * on a subsample says the open cells of every cell ("Showing all 300 of
+ * 1,200 cells", `formatOpenCells`).
  *
  * @module ui/modules/filter-controls
  */
@@ -19,7 +21,7 @@ import {
   createListItem,
   restoreListItemFocus
 } from '../components/controls.js';
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatOpenCells } from '../../../utils/format-units.js';
 import { createVisibilityGatedRender } from '../core/visibility-gate.js';
 
 /**
@@ -122,9 +124,11 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
     const counts = state.getFilteredCount ? state.getFilteredCount() : { shown: 0, total: 0 };
     const shown = counts?.shown ?? 0;
     const total = counts?.total ?? 0;
+    // A subsample's open cells are said against every cell of the dataset.
+    const open = formatOpenCells(total, state.cellIdentity?.nOriginal);
     filterCountEl.textContent = shown === total
-      ? `Showing all ${formatCountOf(total, 'cell')}`
-      : `Showing ${formatCount(shown)} of ${formatCountOf(total, 'cell')}`;
+      ? `Showing all ${open}`
+      : `Showing ${formatCount(shown)} of ${open}`;
 
     if (viewer?.hasSnapshots && viewer.hasSnapshots()) {
       callbacks.onViewBadgesMaybeChanged?.();

@@ -15,7 +15,7 @@
  * Fixtures are the layout-view corpus (`tests/fixtures/{loom,tenx,mudata}/`,
  * `scripts/formats-corpus/`), unpacked for the page.
  */
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,11 +24,17 @@ import { inflateRawSync } from 'node:zlib';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { createDrag, dragAndDrop, folderPayload } from './helpers/dataset-drop.mjs';
 import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures');
 const START_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=layout-view-formats`;
@@ -56,9 +62,14 @@ function unzip(file) {
   return entries;
 }
 
+// Every temporary directory unpacked here, removed once the file's tests are done.
+const madeDirectories = [];
+test.afterAll(() => Promise.all(madeDirectories.map(directory => rm(directory, { recursive: true, force: true }))));
+
 /** One corpus file or folder written to a temporary directory: its path there. */
 async function unpacked(folder, writer, inside) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'cellucid-formats-'));
+  madeDirectories.push(directory);
   for (const [name, data] of unzip(path.join(FIXTURES, folder, `${writer}.zip`))) {
     if (name !== inside && !name.startsWith(`${inside}/`)) continue;
     const target = path.join(directory, name);
@@ -183,8 +194,7 @@ test('a 10x .h5 linked at startup fails over the empty viewer, saying what to do
   const failed = page.locator('.opening-overlay[data-state="failed"]');
   await expect(failed).toBeVisible();
   await expect(failed.locator('.opening-title')).toHaveText('The data could not be opened');
-  // The dialog says the reason itself, as the notification does, not a
-  // generic "could not read"; trying again cannot change a refusal, so the
+  // The dialog says the reason itself, not a generic "could not read"; trying again cannot change a refusal, so the
   // way on it leads with is opening Cellucid without the link.
   // From a link, which opens one file and no folder: the outs/ folder is
   // downloaded and opened from this computer.
@@ -192,7 +202,8 @@ test('a 10x .h5 linked at startup fails over the empty viewer, saying what to do
     /has no cell embedding.*a link to one file cannot bring along: download the whole outs\/ folder and open it from this computer/
   );
   await expect(failed.locator('.opening-step')).not.toContainText('could not read the data this link points to');
-  await expect(page.locator('.notification[data-type="error"]').filter({ hasText: /has no cell embedding/ })).toHaveCount(1);
+  // Said once, over the empty viewer: no card repeats it beside the dialog.
+  await expect(page.locator('.notification[data-type="error"]').filter({ hasText: /has no cell embedding/ })).toHaveCount(0);
   await expect(failed.locator('.welcome-details-text')).toContainText(/has no cell embedding.*download the whole outs\/ folder/);
   const actions = failed.locator('.opening-actions button');
   await expect(actions).toHaveText(['Open without this link', 'Try again']);

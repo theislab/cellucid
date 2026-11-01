@@ -13,8 +13,14 @@ import {
   expectSettledOn,
   openStarted,
 } from './helpers/dataset-loading.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 test('a file opened after a sample leaves nothing of the sample in the Session panel', async ({ page }) => {
   const productErrors = await openStarted(page);

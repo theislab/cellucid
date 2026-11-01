@@ -41,6 +41,7 @@ import {
   defaultEnabledEmbeddings,
   defaultEmbeddingSlots,
   defaultExpression,
+  defaultGraph,
   defaultHighlyVariable,
   defaultLog1p,
   defaultVectorBindings,
@@ -50,12 +51,6 @@ import {
   vectorFieldKeys,
 } from './data-mapping.js';
 import { formatCountOf } from '../utils/format-units.js';
-
-/**
- * The neighbour graph a file read in the browser opens with, when `obsp`
- * holds it: what `sc.pp.neighbors()` writes.
- */
-export const DEFAULT_KNN_KEY = 'connectivities';
 
 /**
  * Require one `obsp` key: a non-empty string naming a single HDF5/Zarr member.
@@ -151,12 +146,16 @@ function requireElementProbe(probe, label) {
   if (typeof probe.numeric !== 'boolean') {
     throw new TypeError(`${label} numeric must be a boolean.`);
   }
+  if (probe.problem !== undefined && (typeof probe.problem !== 'string' || probe.problem.length === 0)) {
+    throw new TypeError(`${label} problem must be a non-empty string when given.`);
+  }
   return {
     key: probe.key,
     storage: requireStorage(probe.storage, label),
     shape: requireShape(probe.shape, label),
     dtype: probe.dtype,
     numeric: probe.numeric,
+    problem: probe.problem ?? null,
   };
 }
 
@@ -174,7 +173,9 @@ export function describeObsmProbes(probes, nObs) {
     const probe = requireElementProbe(raw, `obsm probe ${index}`);
     const { storage, shape } = probe;
     let reason = null;
-    if (storage === 'dataframe') {
+    if (probe.problem !== null) {
+      reason = `cannot be read: ${probe.problem.replace(/\.\s*$/, '')}`;
+    } else if (storage === 'dataframe') {
       reason = 'obsm table, not an array';
     } else if (storage === 'csr' || storage === 'csc') {
       reason = 'sparse obsm arrays cannot be plotted';
@@ -234,7 +235,9 @@ function describeObsp(probes, nObs) {
     const probe = requireElementProbe(raw, `obsp probe ${index}`);
     const { storage, shape } = probe;
     let reason = null;
-    if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
+    if (probe.problem !== null) {
+      reason = `cannot be read: ${probe.problem.replace(/\.\s*$/, '')}`;
+    } else if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
       reason = 'not a matrix';
     } else if (shape === null || shape.length !== 2 || shape[0] !== shape[1]) {
       reason = 'not square';
@@ -281,12 +284,43 @@ function describeVarColumns(columns) {
   });
 }
 
+/** A probe's `counts`: true, false, or null (not probed). */
+function countsOf(probe, label) {
+  const counts = probe.counts ?? null;
+  if (counts !== null && typeof counts !== 'boolean') throw new TypeError(`${label} counts must be a boolean or null.`);
+  return counts;
+}
+
+/**
+ * A probe's `notLog1p`: null (the values do not refute `uns['log1p']`, or
+ * were not probed), or what refutes it (`AnnDataReader` `storedValueFacts`):
+ * the largest value read, the matrix's dtype, and the cell total its log1p
+ * undone implies (null past float64).
+ */
+function notLog1pOf(probe, label) {
+  const notLog1p = probe.notLog1p ?? null;
+  if (notLog1p === null) return null;
+  if (
+    typeof notLog1p !== 'object' || !Number.isFinite(notLog1p.value) || typeof notLog1p.dtype !== 'string' ||
+    !(notLog1p.total === null || (typeof notLog1p.total === 'number' && Number.isFinite(notLog1p.total)))
+  ) {
+    throw new TypeError(`${label} notLog1p must be null or {value, dtype, total}.`);
+  }
+  return { value: notLog1p.value, dtype: notLog1p.dtype, total: notLog1p.total };
+}
+
 function describeMatrix(matrix, label) {
   if (matrix === null) return null;
   if (typeof matrix?.dtype !== 'string') {
     throw new TypeError(`${label} must name its dtype.`);
   }
-  return { storage: requireStorage(matrix.storage, label), dtype: matrix.dtype };
+  const scaled = matrix.scaled ?? null;
+  if (scaled !== null && typeof scaled !== 'boolean') throw new TypeError(`${label} scaled must be a boolean or null.`);
+  // `scaled`: whether a dense float matrix holds negative values in its
+  // first chunk (`sc.pp.scale`), null when it was not probed; `counts`:
+  // whether it holds counts (an integer dtype, or whole non-negative first
+  // values), null when it was not probed.
+  return { storage: requireStorage(matrix.storage, label), dtype: matrix.dtype, scaled, counts: countsOf(matrix, label), notLog1p: notLog1pOf(matrix, label) };
 }
 
 function describeLayers(probes, nObs, nVars) {
@@ -294,14 +328,16 @@ function describeLayers(probes, nObs, nVars) {
     const probe = requireElementProbe(raw, `layer probe ${index}`);
     const { storage, shape } = probe;
     let reason = null;
-    if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
+    if (probe.problem !== null) {
+      reason = `cannot be read: ${probe.problem.replace(/\.\s*$/, '')}`;
+    } else if (storage !== 'dense' && storage !== 'csr' && storage !== 'csc') {
       reason = 'not a matrix';
     } else if (shape === null || shape.length !== 2 || shape[0] !== nObs || shape[1] !== nVars) {
       reason = `has shape ${(shape ?? []).join(' x ')}, expected ${nObs} x ${nVars}`;
     } else if (!probe.numeric) {
       reason = 'not a numeric matrix';
     }
-    return { key: probe.key, storage, dtype: probe.dtype, usable: reason === null, reason };
+    return { key: probe.key, storage, dtype: probe.dtype, counts: countsOf(raw, `layer probe ${index}`), notLog1p: notLog1pOf(raw, `layer probe ${index}`), usable: reason === null, reason };
   });
 }
 
@@ -417,9 +453,10 @@ export function modalityNames(candidates) {
  * rule, or the best guess after its load checks); they become the defaults,
  * and every narrow array is enabled beside them (`defaultEnabledEmbeddings`).
  * `guessed` names the groups that were guessed. The other defaults are the ones this viewer reads
- * from such a file: `obsp['connectivities']` when it is listed, the var index,
- * `X` (else `raw` or a layer, guessed; or no expression matrix), each
- * matrix's `log1p` by Scanpy's `uns['log1p']` (`defaultLog1p`, guessed), the
+ * from such a file: the default graph (`defaultGraph`: `connectivities`, else
+ * Seurat's `<modality>_snn`), the var index, `raw` (else `X`, else a layer,
+ * guessed; or no expression matrix: `defaultExpression`), each matrix's
+ * `log1p` by Scanpy's `uns['log1p']` (`defaultLog1p`, guessed), the
  * `highly_variable` column of the expression matrix's genes when it is boolean
  * there (`defaultHighlyVariable`, guessed), no latent space, and the vector
  * fields the default rule binds.
@@ -452,23 +489,27 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     const ref = slots[slot] ?? null;
     defaults[slot] = ref === null ? null : { key: ref.key, columns: [...ref.columns] };
   }
-  const connectivities = described.obsp.find(item => item.key === DEFAULT_KNN_KEY);
+  // The graph the dataset opens with (`defaultGraph`): connectivities, else
+  // Seurat's shared-nearest-neighbour graph of the modality it opens with.
+  const graph = defaultGraph(described.obsp.map(item => item.key), { modality });
   const loadFailures = new Map(rejected);
-  // X when the file has it; otherwise raw, the only layer, or the best-named
-  // layer (`defaultExpression`), recorded as guessed.
+  // raw when the file has it (Scanpy's convention), else X; otherwise the
+  // only layer, or the best-named layer (`defaultExpression`), guessed.
   const expression = Object.hasOwn(chosen, 'expression')
-    ? { expression: chosen.expression, guessed: false }
+    ? { expression: chosen.expression, guessed: false, reason: null }
     : defaultExpression({
       hasX: scope.X !== null,
       hasRaw: scope.raw !== null && scope.raw.X !== null,
       layers: scope.layers.filter(layer => layer.usable).map(layer => layer.key),
+      rawHasMoreGenes: scope.raw !== null && scope.raw.X !== null && scope.raw.n_vars > scope.var.n_vars,
+      xScaled: scope.X?.scaled === true,
     });
   const latent = Object.hasOwn(chosen, 'latent') ? chosen.latent : null;
   const log1p = defaultLog1p({
     log1p: scope.log1p,
-    hasX: scope.X !== null,
-    raw: scope.raw === null || scope.raw.X === null ? null : { dtype: scope.raw.X.dtype },
-    layers: scope.layers.filter(layer => layer.usable).map(layer => layer.key),
+    X: scope.X,
+    raw: scope.raw === null || scope.raw.X === null ? null : scope.raw.X,
+    layers: scope.layers.filter(layer => layer.usable),
   });
   const highlyVariable = expression.expression === null
     ? { highlyVariable: null, guessed: false }
@@ -501,9 +542,7 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
         enabled,
         defaults,
       },
-      knn: Object.hasOwn(chosen, 'knn')
-        ? chosen.knn
-        : (connectivities === undefined ? null : DEFAULT_KNN_KEY),
+      knn: Object.hasOwn(chosen, 'knn') ? chosen.knn : graph,
       ...(modalities === null ? {} : { modality }),
       geneNames: Object.hasOwn(chosen, 'geneNames') ? chosen.geneNames : 'index',
       expression: expression.expression,
@@ -512,6 +551,11 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
       latent,
       vectorFields: defaultVectorBindings(entries, enabled),
     },
+    // Why the default expression is raw, not X (`defaultExpression`), or null.
+    expressionReason: expression.reason,
+    // The matrices `uns['log1p']` would name whose stored values refute it,
+    // read as stored (`defaultLog1p`), with what refutes each.
+    log1pRefuted: log1p.refuted,
     guessed: [
       ...guessed,
       ...(expression.guessed ? ['expression'] : []),
@@ -631,6 +675,19 @@ export function expressionAxisRoute(candidates, expression, modality = null) {
     return index < 0 ? null : `${prefix}layer-${index}`;
   }
   return null;
+}
+
+/**
+ * How many genes one axis route lists: its var axis's length (`raw.var`'s
+ * for `raw`), known from metadata, before any gene name is read.
+ *
+ * @param {Object} candidates
+ * @param {string} axisRoute
+ * @returns {number}
+ */
+export function axisGeneCount(candidates, axisRoute) {
+  const { scope, matrix } = axisScope(candidates, axisRoute);
+  return matrix === 'raw' ? scope.raw.n_vars : scope.var.n_vars;
 }
 
 /**
@@ -975,9 +1032,11 @@ export class EmbeddingLoadError extends MappingLoadError {
 /**
  * Return why the selected columns of one embedding cannot be plotted, or null.
  *
- * The rule is `prepare()`'s: every value is finite and representable as
- * float32 (a non-zero value that narrows to zero is not), and the columns span
- * a non-zero range. The first offending cell is named.
+ * The rule is `prepare()`'s: a cell whose row holds NaN or an infinity has
+ * no position (it is not drawn in the embedding, `embedding-payload.js`);
+ * every value of the other cells is representable as float32 (a non-zero
+ * value that narrows to zero is not), at least one cell is placed, and the
+ * placed cells span a non-zero range. The first offending cell is named.
  *
  * @param {ArrayLike<number|bigint>} values - Row-major, `width` values a cell.
  * @param {number} width
@@ -988,13 +1047,18 @@ export function embeddingLoadDefect(values, width) {
   if (defect !== null || values.length === 0) return defect;
   const minima = new Array(width).fill(Infinity);
   const maxima = new Array(width).fill(-Infinity);
-  for (let index = 0; index < values.length; index++) {
-    const raw = values[index];
-    const value = typeof raw === 'bigint' ? Number(raw) : raw;
-    const column = index % width;
-    if (value < minima[column]) minima[column] = value;
-    if (value > maxima[column]) maxima[column] = value;
+  let placed = 0;
+  for (let start = 0; start < values.length; start += width) {
+    if (!placedValues(values, start, width)) continue;
+    placed++;
+    for (let column = 0; column < width; column++) {
+      const raw = values[start + column];
+      const value = typeof raw === 'bigint' ? Number(raw) : raw;
+      if (value < minima[column]) minima[column] = value;
+      if (value > maxima[column]) maxima[column] = value;
+    }
   }
+  if (placed === 0) return everyRowMissing('coordinates are');
   let span = 0;
   for (let column = 0; column < width; column++) {
     span = Math.max(span, maxima[column] - minima[column]);
@@ -1003,10 +1067,35 @@ export function embeddingLoadDefect(values, width) {
 }
 
 /**
+ * Why a whole per-cell array none of whose rows is finite is refused (an
+ * embedding placing no cell, a vector field with no vector, a latent space
+ * with no value); `what` names a row's content, with its verb.
+ *
+ * @param {string} what - `coordinates are`, `vector is`, `latent values are`
+ * @returns {string}
+ */
+export function everyRowMissing(what) {
+  return `every cell's ${what} missing (NaN or infinite)`;
+}
+
+/** Whether the row of `width` values at `start` is finite in every column (a placed cell). */
+function placedValues(values, start, width) {
+  for (let index = start; index < start + width; index++) {
+    const raw = values[index];
+    const value = typeof raw === 'bigint' ? Number(raw) : raw;
+    if (!(value > -Infinity && value < Infinity)) return false;
+  }
+  return true;
+}
+
+/**
  * The first value of a row-major numeric array Cellucid cannot read, as the
- * clause a refusal names (`NaN at cell 17`, `not representable as float32 at
- * cell 4`), or null when every value is finite and representable as float32.
- * The words `prepare()` uses for the same array.
+ * clause a refusal names (`not representable as float32 at cell 4`), or null
+ * when every value of every placed cell is representable as float32. A cell
+ * whose row holds NaN or an infinity is not placed: it is a cell the array
+ * has no value for (an embedding computed on some of the cells, a modality
+ * that did not measure it), never a refusal. The words `prepare()` uses for
+ * the same array.
  *
  * @param {ArrayLike<number|bigint>} values - Row-major, `width` values a cell.
  * @param {number} width
@@ -1022,16 +1111,15 @@ export function valueLoadDefect(values, width, firstCell = 0) {
   if (length % width !== 0) {
     throw new RangeError('Array values do not fill whole cells.');
   }
-  for (let index = 0; index < length; index++) {
-    const raw = values[index];
-    const value = typeof raw === 'bigint' ? Number(raw) : raw;
-    const cell = firstCell + Math.floor(index / width);
-    if (Number.isNaN(value)) return `NaN at cell ${cell}`;
-    if (value === Infinity) return `Infinity at cell ${cell}`;
-    if (value === -Infinity) return `-Infinity at cell ${cell}`;
-    const narrowed = Math.fround(value);
-    if (!Number.isFinite(narrowed) || (value !== 0 && narrowed === 0)) {
-      return `not representable as float32 at cell ${cell}`;
+  for (let start = 0; start < length; start += width) {
+    if (!placedValues(values, start, width)) continue;
+    for (let index = start; index < start + width; index++) {
+      const raw = values[index];
+      const value = typeof raw === 'bigint' ? Number(raw) : raw;
+      const narrowed = Math.fround(value);
+      if (!Number.isFinite(narrowed) || (value !== 0 && narrowed === 0)) {
+        return `not representable as float32 at cell ${firstCell + start / width}`;
+      }
     }
   }
   return null;
@@ -1054,10 +1142,11 @@ export function valueLoadDefect(values, width, firstCell = 0) {
  * @param {Array<{key: string, width: number|null, usable: boolean, reason: string|null}>} entries
  * @param {(key: string, columns: number[]) => Promise<string|null>} loadCheck
  *   Resolves to null when the columns load, else to the reason they do not.
+ * @param {{modality?: string|null}} [options] - The modality a dataset of several opens with
  * @returns {Promise<{slots: Object, guessed: string[], rejected: Array<[string, string]>}>}
  */
-export async function resolveEmbeddingSlotsAsync(entries, loadCheck) {
-  const slots = defaultEmbeddingSlots(entries);
+export async function resolveEmbeddingSlotsAsync(entries, loadCheck, { modality = null } = {}) {
+  const slots = defaultEmbeddingSlots(entries, { modality });
   if (DIMENSION_SLOTS.some(slot => slots[slot] !== null)) {
     for (const slot of DIMENSION_SLOTS) {
       const ref = slots[slot];
@@ -1080,6 +1169,7 @@ export async function resolveEmbeddingSlotsAsync(entries, loadCheck) {
   // key, so the loop ends within one round per candidate.
   for (;;) {
     const guess = bestGuessEmbeddingSlots(entries, {
+      modality,
       loadCheck: key => (failures.has(key) ? failures.get(key) : null),
     });
     let failed = false;

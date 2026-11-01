@@ -21,7 +21,12 @@ function lcg(seed) {
 
 /** Distance of two items computed directly from the definition. */
 function directDistance(a, b, metric) {
-  if (metric === 'correlation') return 1 - pearsonCorrelation(a, b);
+  if (metric === 'correlation') {
+    // A constant item has no correlation (NaN); its correlation distance is
+    // 1, as the kernel defines it.
+    const r = pearsonCorrelation(a, b);
+    return 1 - (Number.isNaN(r) ? 0 : r);
+  }
   if (metric === 'euclidean') {
     let sum = 0;
     for (let k = 0; k < a.length; k++) sum += (a[k] - b[k]) ** 2;

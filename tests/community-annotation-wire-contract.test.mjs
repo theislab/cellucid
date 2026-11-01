@@ -135,6 +135,17 @@ function remoteFiles(session, docs) {
   return files;
 }
 
+
+/**
+ * A stored GitHub session without its expiry, which is checked first: the
+ * token's own lifetime from now (an expiring user token; never indefinite).
+ */
+function storedIdentity(text) {
+  const { expiresAt, ...identity } = parseExactJson(text);
+  assert.ok(Number.isSafeInteger(expiresAt) && expiresAt > Date.now(), 'a stored token names when it expires');
+  return identity;
+}
+
 test('community annotation state preserves every legal prototype-named field and dataset identity', () => {
   const objectPrototypeBefore =
     Object.getOwnPropertyDescriptors(Object.prototype);
@@ -1340,7 +1351,7 @@ test('GitHub annotation requests compose and physically honor an owner abort sig
       pending,
       error => {
         assert.equal(error?.name, 'AbortError');
-        assert.equal(error?.code, 'GITHUB_REQUEST_ABORTED');
+        assert.equal(error?.name, 'AbortError');
         assert.deepEqual(error?.github, {
           path: '/repos/owner/repo',
           method: 'GET',
@@ -1572,7 +1583,7 @@ test('GitHub identities reject strings, fractions, and malformed persisted state
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token","user":{"id":42,"\\u0069d":43,"login":"researcher"}}',
+      '{"expiresAt":4102444800000,"token":"token","user":{"id":42,"\\u0069d":43,"login":"researcher"}}',
     ],
   ]);
   const storage = {
@@ -1599,14 +1610,14 @@ test('GitHub identities reject strings, fractions, and malformed persisted state
 test('unreadable persisted auth state degrades to signed out instead of failing construction', () => {
   const previousSessionStorage = globalThis.sessionStorage;
   const poisoned = [
-    ['truncated JSON', '{"token":"t","user":{"id":42,"log'],
+    ['truncated JSON', '{"expiresAt":4102444800000,"token":"t","user":{"id":42,"log'],
     ['empty document', ''],
     ['JSON null', 'null'],
     ['JSON array', '[]'],
-    ['unknown session key', '{"token":"t","user":{"id":42,"login":"r"},"extra":1}'],
-    ['non-positive user id', '{"token":"t","user":{"id":0,"login":"r"}}'],
-    ['blank token', '{"token":"","user":{"id":42,"login":"r"}}'],
-    ['unknown user key', '{"token":"t","user":{"id":42,"login":"r","legacy":true}}'],
+    ['unknown session key', '{"expiresAt":4102444800000,"token":"t","user":{"id":42,"login":"r"},"extra":1}'],
+    ['non-positive user id', '{"expiresAt":4102444800000,"token":"t","user":{"id":0,"login":"r"}}'],
+    ['blank token', '{"expiresAt":4102444800000,"token":"","user":{"id":42,"login":"r"}}'],
+    ['unknown user key', '{"expiresAt":4102444800000,"token":"t","user":{"id":42,"login":"r","legacy":true}}'],
   ];
   try {
     for (const [label, raw] of poisoned) {
@@ -1662,8 +1673,8 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
     };
     globalThis.window = {
       location: {
-        href: `https://example.test/#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}`,
-        hash: `#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}`,
+        href: `https://example.test/#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}&cellucid_github_token_expires_in=28800`,
+        hash: `#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}&cellucid_github_token_expires_in=28800`,
         origin: 'https://example.test',
         pathname: '/',
         search: '',
@@ -1678,10 +1689,11 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
         : {
           status: 'ok',
           service: 'Cellucid GitHub Auth',
-          contractVersion: 1,
+          contractVersion: 2,
           endpoints: [
             '/auth/login',
             '/auth/callback',
+            '/auth/revoke',
             '/auth/user',
             '/auth/installations',
             '/auth/installation-repos',
@@ -1697,7 +1709,7 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
     const session = new GitHubAuthSession();
     await assert.rejects(
       () => session.completeSignInFromRedirect(),
-      /GITHUB_AUTH_STORAGE_FAILED|sessionStorage write failed/
+      { code: 'GITHUB_AUTH_STORAGE_FAILED' }
     );
     // The unpersistable candidate is never published as an authenticated identity.
     assert.equal(session.isAuthenticated(), false);
@@ -1748,13 +1760,13 @@ test('GitHub auth callbacks scrub every owned fragment before validation', async
       fragment:
         'cellucid_github_auth=1&cellucid_github_token=secret-one' +
         '&cellucid_github_token=secret-two',
-      error: /exactly one token or one error/,
+      error: /exactly one token with its lifetime, or one error/,
     },
     {
       fragment:
         'cellucid_github_auth=1&cellucid_github_token=secret' +
         '&cellucid_github_error=denied',
-      error: /exactly one token or one error/,
+      error: /exactly one token with its lifetime, or one error/,
     },
     {
       fragment:
@@ -1768,8 +1780,17 @@ test('GitHub auth callbacks scrub every owned fragment before validation', async
       error: /flag must occur once/,
     },
     {
-      fragment: 'cellucid_github_auth=1&cellucid_github_token=',
+      fragment: 'cellucid_github_auth=1&cellucid_github_token=&cellucid_github_token_expires_in=28800',
       error: /token must be an exact nonblank string/,
+    },
+    {
+      // A token without its lifetime (a GitHub App without token expiration).
+      fragment: 'cellucid_github_auth=1&cellucid_github_token=secret',
+      error: /exactly one token with its lifetime, or one error/,
+    },
+    {
+      fragment: 'cellucid_github_auth=1&cellucid_github_token=secret&cellucid_github_token_expires_in=0',
+      error: /lifetime must be a positive whole number/,
     },
     {
       fragment: 'cellucid_github_auth=1&cellucid_github_error=%20denied',
@@ -1785,13 +1806,13 @@ test('GitHub auth callbacks scrub every owned fragment before validation', async
     },
     {
       fragment: 'cellucid_github_auth=1',
-      error: /exactly one token or one error/,
+      error: /exactly one token with its lifetime, or one error/,
     },
     {
       fragment:
         'cellucid_github_auth=1&%63ellucid_github_token=encoded-secret' +
         '&cellucid_github_token=plain-secret',
-      error: /exactly one token or one error/,
+      error: /exactly one token with its lifetime, or one error/,
     },
     {
       fragment: 'cellucid_github_auth=1&cellucid_github_error=access_denied',
@@ -1904,10 +1925,11 @@ test('GitHub sign-in verifies the exact current Worker before navigation and pre
     return new Response(JSON.stringify({
       status: 'ok',
       service: 'Cellucid GitHub Auth',
-      contractVersion: 1,
+      contractVersion: 2,
       endpoints: [
         '/auth/login',
         '/auth/callback',
+        '/auth/revoke',
         '/auth/user',
         '/auth/installations',
         '/auth/installation-repos',
@@ -1976,6 +1998,7 @@ test('stale Worker capabilities fail before OAuth navigation or token exposure',
       endpoints: [
         '/auth/login',
         '/auth/callback',
+        '/auth/revoke',
         '/auth/user',
         '/auth/installations',
         '/auth/installation-repos',
@@ -2204,7 +2227,7 @@ test('Worker health trust failures cancel known oversize and invalid UTF-8 bodie
         caller.abort(reason);
         await assert.rejects(
           () => pending,
-          error => error?.code === 'GITHUB_REQUEST_ABORTED'
+          error => error?.name === 'AbortError'
         );
       }
     );
@@ -2336,10 +2359,11 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
       return new Response(JSON.stringify({
         status: 'ok',
         service: 'Cellucid GitHub Auth',
-        contractVersion: 1,
+        contractVersion: 2,
         endpoints: [
           '/auth/login',
           '/auth/callback',
+          '/auth/revoke',
           '/auth/user',
           '/auth/installations',
           '/auth/installation-repos',
@@ -2358,7 +2382,7 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
     await auth.completeSignInFromRedirect({
       url:
         'https://app.example/' +
-        '#cellucid_github_auth=1&cellucid_github_token=candidate-token',
+        '#cellucid_github_auth=1&cellucid_github_token=candidate-token&cellucid_github_token_expires_in=28800',
     });
     assert.deepEqual(requests, [
       { path: '/', authorization: null },
@@ -2377,7 +2401,7 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
 test('restored GitHub sessions prove Worker capabilities before token-bearing refresh', async () => {
   const values = new Map([[
     'cellucid:github-app-auth:session',
-    '{"token":"restored-token","user":{"id":42,"login":"researcher"}}',
+    '{"expiresAt":4102444800000,"token":"restored-token","user":{"id":42,"login":"researcher"}}',
   ]]);
   const storage = {
     getItem: key => values.get(String(key)) ?? null,
@@ -2398,10 +2422,11 @@ test('restored GitHub sessions prove Worker capabilities before token-bearing re
       return new Response(JSON.stringify({
         status: 'ok',
         service: 'Cellucid GitHub Auth',
-        contractVersion: 1,
+        contractVersion: 2,
         endpoints: [
           '/auth/login',
           '/auth/callback',
+          '/auth/revoke',
           '/auth/user',
           '/auth/installations',
           '/auth/installation-repos',
@@ -2470,10 +2495,11 @@ test('overlapping GitHub sign-in preflights are generation-owned and caller-abor
   const liveResponse = () => new Response(JSON.stringify({
     status: 'ok',
     service: 'Cellucid GitHub Auth',
-    contractVersion: 1,
+    contractVersion: 2,
     endpoints: [
       '/auth/login',
       '/auth/callback',
+      '/auth/revoke',
       '/auth/user',
       '/auth/installations',
       '/auth/installation-repos',
@@ -2499,9 +2525,7 @@ test('overlapping GitHub sign-in preflights are generation-owned and caller-abor
       signal: controller.signal,
     });
     controller.abort('user cancelled');
-    await assert.rejects(cancelled, {
-      code: 'GITHUB_REQUEST_ABORTED',
-    });
+    await assert.rejects(cancelled, { name: 'AbortError' });
     assert.equal(assignments.length, 1);
   } finally {
     globalThis.fetch = previousFetch;
@@ -2549,10 +2573,10 @@ test('GitHub auth stores only the exact current identity projection', async () =
   try {
     const auth = new GitHubAuthSession();
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
-    await auth._acceptToken('test-token');
+    await auth._acceptToken('test-token', 28_800);
     assert.deepEqual(auth.getUser(), { id: 42, login: 'researcher' });
     assert.deepEqual(
-      parseExactJson(
+      storedIdentity(
         sessionStore.values.get('cellucid:github-app-auth:session')
       ),
       {
@@ -2605,8 +2629,8 @@ test('GitHub auth generations fence overlapping token adoption and sign-out', as
   try {
     const auth = new GitHubAuthSession();
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
-    const first = auth._acceptToken('token-a');
-    const second = auth._acceptToken('token-b');
+    const first = auth._acceptToken('token-a', 28_800);
+    const second = auth._acceptToken('token-b', 28_800);
     assert.equal(
       requests.get('token-a').signal.aborted,
       true,
@@ -2632,7 +2656,7 @@ test('GitHub auth generations fence overlapping token adoption and sign-out', as
     assert.equal(auth.getToken(), 'token-b');
     assert.deepEqual(auth.getUser(), { id: 202, login: 'user-b' });
     assert.deepEqual(
-      parseExactJson(
+      storedIdentity(
         sessionStore.values.get('cellucid:github-app-auth:session')
       ),
       {
@@ -2651,8 +2675,8 @@ test('GitHub auth generations fence overlapping token adoption and sign-out', as
     auth.on('changed', (event) => {
       if (event.user !== null) secondListenerLogin = event.user.login;
     });
-    const staleFailure = auth._acceptToken('token-c');
-    const current = auth._acceptToken('token-d');
+    const staleFailure = auth._acceptToken('token-c', 28_800);
+    const current = auth._acceptToken('token-d', 28_800);
     requests.get('token-d').resolve(
       new Response('{"id":404,"login":"user-d"}', { status: 200 })
     );
@@ -2690,9 +2714,7 @@ test('GitHub auth generations fence overlapping token adoption and sign-out', as
     discoveryRequest.resolve(
       new Response('{"installations":[]}', { status: 200 })
     );
-    await assert.rejects(discovery, {
-      code: 'GITHUB_REQUEST_ABORTED',
-    });
+    await assert.rejects(discovery, { name: 'AbortError' });
     assert.equal(auth.isAuthenticated(), true);
     assert.deepEqual(auth.getUser(), { id: 404, login: 'user-d' });
 
@@ -2733,7 +2755,7 @@ test('candidate authentication exclusively owns its transition generation', asyn
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token-a","user":{"id":101,"login":"user-a"}}',
+      '{"expiresAt":4102444800000,"token":"token-a","user":{"id":101,"login":"user-a"}}',
     ],
   ]);
   const storage = {
@@ -2765,7 +2787,7 @@ test('candidate authentication exclusively owns its transition generation', asyn
   try {
     const auth = new GitHubAuthSession();
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
-    const adoption = auth._acceptToken('token-b');
+    const adoption = auth._acceptToken('token-b', 28_800);
     const refresh = auth.fetchUser();
     const discovery = auth.listInstallations();
     const candidateRequest = requests.find(
@@ -2810,7 +2832,7 @@ test('candidate authentication exclusively owns its transition generation', asyn
     assert.equal(auth.getToken(), 'token-b');
     assert.deepEqual(auth.getUser(), { id: 202, login: 'user-b' });
     assert.deepEqual(
-      parseExactJson(values.get('cellucid:github-app-auth:session')),
+      storedIdentity(values.get('cellucid:github-app-auth:session')),
       {
         token: 'token-b',
         user: { id: 202, login: 'user-b' },
@@ -2827,7 +2849,7 @@ test('reentrant abort listeners cannot publish a retired auth candidate', async 
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token-a","user":{"id":101,"login":"user-a"}}',
+      '{"expiresAt":4102444800000,"token":"token-a","user":{"id":101,"login":"user-a"}}',
     ],
   ]);
   const storage = {
@@ -2874,7 +2896,7 @@ test('reentrant abort listeners cannot publish a retired auth candidate', async 
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
     const changed = [];
     auth.on('changed', (event) => changed.push(event));
-    const adoption = auth._acceptToken('token-b');
+    const adoption = auth._acceptToken('token-b', 28_800);
     const discovery = auth.listInstallations();
     const candidateRequest = requests.find(
       (request) => request.path === '/auth/user' && request.token === 'token-b'
@@ -2923,7 +2945,7 @@ test('reentrant changed-listener sign-out supersedes login without recursion', a
     });
 
     await assert.rejects(
-      () => auth._acceptToken('token-b'),
+      () => auth._acceptToken('token-b', 28_800),
       { code: 'GITHUB_AUTH_SUPERSEDED' }
     );
     assert.deepEqual(events, ['user-b', null]);
@@ -2965,7 +2987,7 @@ test('changed-listener failures are reported without rewriting auth outcome', as
       laterListenerLogin = event.user?.login ?? null;
     });
 
-    const result = await auth._acceptToken('token-b');
+    const result = await auth._acceptToken('token-b', 28_800);
     assert.deepEqual(result, {
       token: 'token-b',
       user: { id: 202, login: 'user-b' },
@@ -2975,7 +2997,7 @@ test('changed-listener failures are reported without rewriting auth outcome', as
     assert.equal(auth.getToken(), 'token-b');
     assert.deepEqual(auth.getUser(), { id: 202, login: 'user-b' });
     assert.deepEqual(
-      parseExactJson(values.get('cellucid:github-app-auth:session')),
+      storedIdentity(values.get('cellucid:github-app-auth:session')),
       {
         token: 'token-b',
         user: { id: 202, login: 'user-b' },
@@ -2994,7 +3016,7 @@ test('GitHub auth observes caller cancellation at the final publication boundary
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token-a","user":{"id":101,"login":"user-a"}}',
+      '{"expiresAt":4102444800000,"token":"token-a","user":{"id":101,"login":"user-a"}}',
     ],
   ]);
   const storage = {
@@ -3035,12 +3057,12 @@ test('GitHub auth observes caller cancellation at the final publication boundary
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
     await assert.rejects(
       () => auth.fetchUser({ signal: controller.signal }),
-      { code: 'GITHUB_REQUEST_ABORTED' }
+      { name: 'AbortError' }
     );
     assert.equal(auth.getToken(), 'token-a');
     assert.deepEqual(auth.getUser(), { id: 101, login: 'user-a' });
     assert.deepEqual(
-      parseExactJson(values.get('cellucid:github-app-auth:session')),
+      storedIdentity(values.get('cellucid:github-app-auth:session')),
       {
         token: 'token-a',
         user: { id: 101, login: 'user-a' },
@@ -3057,7 +3079,7 @@ test('GitHub auth request cancellation preserves the first abort cause', async (
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token-a","user":{"id":101,"login":"user-a"}}',
+      '{"expiresAt":4102444800000,"token":"token-a","user":{"id":101,"login":"user-a"}}',
     ],
   ]);
   const storage = {
@@ -3089,6 +3111,8 @@ test('GitHub auth request cancellation preserves the first abort cause', async (
   try {
     const auth = new GitHubAuthSession();
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
+    // The restored sign-in's own end is a timer too; only request timers count here.
+    timers.length = 0;
 
     const timeoutThenCaller = new AbortController();
     const timeoutFirst = auth.listInstallations({
@@ -3106,9 +3130,7 @@ test('GitHub auth request cancellation preserves the first abort cause', async (
     });
     callerThenTimeout.abort();
     timers[1]();
-    await assert.rejects(callerFirst, {
-      code: 'GITHUB_REQUEST_ABORTED',
-    });
+    await assert.rejects(callerFirst, { name: 'AbortError' });
     assert.equal(auth.isAuthenticated(), true);
     assert.deepEqual(auth.getUser(), { id: 101, login: 'user-a' });
   } finally {
@@ -3124,7 +3146,7 @@ test('GitHub auth publishes only storage-durable generations', async () => {
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token-a","user":{"id":101,"login":"user-a"}}',
+      '{"expiresAt":4102444800000,"token":"token-a","user":{"id":101,"login":"user-a"}}',
     ],
   ]);
   let failSet = false;
@@ -3165,14 +3187,14 @@ test('GitHub auth publishes only storage-durable generations', async () => {
 
     failSet = true;
     await assert.rejects(
-      () => auth._acceptToken('token-b'),
+      () => auth._acceptToken('token-b', 28_800),
       { code: 'GITHUB_AUTH_STORAGE_FAILED' }
     );
     assert.equal(auth.getToken(), 'token-a');
     assert.deepEqual(auth.getUser(), { id: 101, login: 'user-a' });
     assert.equal(auth.isAuthenticated(), true);
     assert.deepEqual(
-      parseExactJson(values.get('cellucid:github-app-auth:session')),
+      storedIdentity(values.get('cellucid:github-app-auth:session')),
       {
         token: 'token-a',
         user: { id: 101, login: 'user-a' },
@@ -3181,7 +3203,7 @@ test('GitHub auth publishes only storage-durable generations', async () => {
     assert.deepEqual(changed, []);
 
     failSet = false;
-    await auth._acceptToken('token-b');
+    await auth._acceptToken('token-b', 28_800);
     assert.equal(auth.getToken(), 'token-b');
     assert.deepEqual(auth.getUser(), { id: 202, login: 'user-b' });
     assert.equal(changed.length, 1);
@@ -3195,7 +3217,7 @@ test('GitHub auth publishes only storage-durable generations', async () => {
     assert.deepEqual(auth.getUser(), { id: 202, login: 'user-b' });
     assert.equal(auth.isAuthenticated(), true);
     assert.deepEqual(
-      parseExactJson(values.get('cellucid:github-app-auth:session')),
+      storedIdentity(values.get('cellucid:github-app-auth:session')),
       {
         token: 'token-b',
         user: { id: 202, login: 'user-b' },
@@ -3287,7 +3309,7 @@ test('GitHub installation discovery rejects response fields outside its contract
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token","user":{"id":42,"login":"researcher"}}',
+      '{"expiresAt":4102444800000,"token":"token","user":{"id":42,"login":"researcher"}}',
     ],
   ]);
   const storage = {
@@ -3321,7 +3343,7 @@ test('GitHub installation discovery bounds every client-side collection', async 
   const values = new Map([
     [
       'cellucid:github-app-auth:session',
-      '{"token":"token","user":{"id":42,"login":"researcher"}}',
+      '{"expiresAt":4102444800000,"token":"token","user":{"id":42,"login":"researcher"}}',
     ],
   ]);
   const storage = {
@@ -4309,7 +4331,7 @@ test('CAP exact ontology lookup never substitutes the first approximate result',
   });
   const responseFor = results =>
     new Response(JSON.stringify({
-      contractVersion: 1,
+      contractVersion: 2,
       results,
       omittedInvalidCount: 0,
     }), {
@@ -4341,7 +4363,7 @@ test('CAP HTTP success rejects duplicate JSON keys', async () => {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response(
-      '{"contractVersion":1,"results":[],"\\u0072esults":[],"omittedInvalidCount":0}',
+      '{"contractVersion":2,"results":[],"\\u0072esults":[],"omittedInvalidCount":0}',
       { status: 200 }
     );
   try {
@@ -4617,4 +4639,66 @@ test('counts and exported keys have no fixed limit; the 1 MB file bounds them', 
   const merges = validMerges();
   merges.merges[0].bucket = longBucket;
   assert.doesNotThrow(() => assertMergesDocument(merges));
+});
+
+test('GitHub sign-in lasts as long as its token: an expired one is forgotten, and Sign out revokes it at GitHub', async () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.has(key) ? values.get(key) : null,
+    setItem: (key, value) => values.set(String(key), String(value)),
+    removeItem: (key) => values.delete(String(key)),
+  };
+  const key = 'cellucid:github-app-auth:session';
+  const previousSessionStorage = globalThis.sessionStorage;
+  const previousFetch = globalThis.fetch;
+  const asked = [];
+  globalThis.sessionStorage = storage;
+  globalThis.fetch = async (url, options = {}) => {
+    asked.push({ url: String(url), options });
+    return new Response(null, { status: 204 });
+  };
+  try {
+    // A stored token past its end is not restored, and is removed.
+    values.set(key, `{"expiresAt":${Date.now() - 1},"token":"old","user":{"id":7,"login":"r"}}`);
+    assert.equal(new GitHubAuthSession().isAuthenticated(), false);
+    assert.equal(values.has(key), false);
+
+    // A token that reaches its end while the page is open is forgotten then.
+    values.set(key, `{"expiresAt":${Date.now() + 40},"token":"short","user":{"id":7,"login":"r"}}`);
+    const expiring = new GitHubAuthSession();
+    assert.equal(expiring.getToken(), 'short');
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(expiring.getToken(), null);
+    assert.equal(values.has(key), false);
+    assert.equal(asked.length, 0, 'an expired token needs no revocation');
+
+    // Sign out forgets at once and revokes through the worker.
+    values.set(key, `{"expiresAt":${Date.now() + 3_600_000},"token":"live","user":{"id":7,"login":"r"}}`);
+    const auth = new GitHubAuthSession();
+    const revoked = auth.signOut();
+    assert.equal(auth.getToken(), null, 'forgotten at once');
+    assert.equal(await revoked, true);
+    assert.equal(values.has(key), false);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].url, `${auth.getWorkerOrigin()}/auth/revoke`);
+    assert.equal(asked[0].options.method, 'POST');
+    assert.equal(asked[0].options.headers.Authorization, 'Bearer live');
+    assert.equal(asked[0].options.keepalive, true, 'sent even when the page closes right after');
+    assert.equal(asked[0].options.credentials, 'omit');
+
+    // A worker deployed before /auth/revoke (404), or one that cannot be
+    // reached: the sign-out says the token was not revoked.
+    globalThis.fetch = async () => new Response('{"error":"Route not found"}', { status: 404 });
+    values.set(key, `{"expiresAt":${Date.now() + 3_600_000},"token":"live","user":{"id":7,"login":"r"}}`);
+    assert.equal(await new GitHubAuthSession().signOut(), false);
+    globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+    values.set(key, `{"expiresAt":${Date.now() + 3_600_000},"token":"live","user":{"id":7,"login":"r"}}`);
+    assert.equal(await new GitHubAuthSession().signOut(), false);
+    assert.equal(values.has(key), false, 'forgotten whatever GitHub answered');
+    assert.equal(await new GitHubAuthSession().signOut(), true, 'nothing to revoke');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
+    else globalThis.sessionStorage = previousSessionStorage;
+  }
 });

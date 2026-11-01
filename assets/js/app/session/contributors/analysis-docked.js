@@ -43,6 +43,10 @@ function assertDockedState(value) {
 }
 
 export function capture(ctx) {
+  // The analysis module never started (its code could not load): no analysis
+  // was ever run, so there is nothing to keep (session-serializer
+  // `setAnalysisRefs`).
+  if (ctx?.comparisonModule === null) return [];
   const module = requireModule(ctx, ['exportSessionState']);
   const state = assertDockedState(module.exportSessionState());
   return [{

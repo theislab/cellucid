@@ -14,6 +14,7 @@ import test from 'node:test';
 import {
   BUNDLE_FILE,
   WORKERS_DIR,
+  WORKER_ASSETS,
   WORKER_ENTRIES,
   WORKER_SCRIPTS_PATH,
   buildWorkerBundles,
@@ -90,7 +91,7 @@ test('a bundle source map maps back to the shipped sources', async () => {
 
 test('every worker is started, and every worker module named, through the generated scripts.js', async () => {
   const names = new Set(WORKER_ENTRIES.map(({ name }) => `${name}Script`));
-  assert.deepEqual(Object.keys(scripts).sort(), [...names].sort());
+  assert.deepEqual(Object.keys(scripts).sort(), [...names, ...WORKER_ASSETS.map(({ name }) => name)].sort());
   const used = new Set();
   for (const path of await shippedScripts()) {
     // The one place a worker is constructed.
@@ -130,11 +131,25 @@ test('workers start from their bundles on a deployed site, from their sources on
   assert.equal(startsFromBundles({}), false);
   for (const [name, script] of Object.entries(scripts)) {
     const entry = WORKER_ENTRIES.find(candidate => `${candidate.name}Script` === name);
+    if (entry === undefined) continue;
     assert.equal(fileURLToPath(script()), join(ROOT, ...entry.source.split('/')));
   }
   const text = built.files.get(WORKER_SCRIPTS_PATH).toString('utf8');
   for (const { name, path } of built.bundles) {
     assert.match(text, new RegExp(`${name}Script = .*'\\./${posix.basename(path).replace(/\./g, '\\.')}'\\);`));
+  }
+});
+
+test('a file a worker loads by URL is named at the version of its bytes, the same anywhere', async () => {
+  const { createHash } = await import('node:crypto');
+  for (const { name, path } of WORKER_ASSETS) {
+    const version = createHash('sha256').update(await readFile(join(ROOT, ...path.split('/')))).digest('hex').slice(0, 12);
+    const url = scripts[name]();
+    assert.equal(fileURLToPath(url), join(ROOT, ...path.split('/')), name);
+    assert.equal(url.search, `?v=${version}`, name);
+    // Every worker bundle names it at that version too, so a deploy never pairs one build's code with another's file.
+    const text = built.files.get(WORKER_SCRIPTS_PATH).toString('utf8');
+    assert.match(text, new RegExp(`export const ${name} = \\(\\) => new URL\\('\\.\\./${path.slice('assets/'.length).replace(/\./g, '\\.')}\\?v=${version}', import\\.meta\\.url\\);`));
   }
 });
 

@@ -37,10 +37,15 @@
  * a colleague shared needs `Files.Read.All`, asked for only then; in most
  * organisations an administrator approves that once for everyone.
  *
- * The access token (about an hour) and the refresh token (24 hours for a
- * single-page application, Microsoft's rule) are kept for the tab in the
- * shared sign-in store; a token is renewed without a click until the refresh
- * token ends, then the calm "Sign in again" step asks for one.
+ * The access token (about an hour) is kept for the tab in the shared sign-in
+ * store (`sessionStorage`: it survives a reload of the tab). The refresh token
+ * (24 hours for a single-page application, Microsoft's rule) is held in this
+ * page's memory only, never stored: within the page a token is renewed
+ * without a click until the refresh token ends; after a reload the stored
+ * access token serves until it expires, and then the calm "Sign in again"
+ * step asks for one. Microsoft offers no way for a single-page application to
+ * revoke its own token: Sign out forgets both here, and the access token
+ * lapses within its hour.
  *
  * @module data/sources/auth/microsoft
  */
@@ -50,6 +55,7 @@ import { embeddedInOtherSite, embeddingOrigin, pageOrigin } from './page-context
 import { createPkce } from './pkce.js';
 import { finalSignInFailure, getSignInSteps } from './sign-in.js';
 import { readSignInRecord, removeSignIn, setSignInExpiry, writeSignInRecord } from './token-store.js';
+import { onAbort } from '../../../utils/abort.js';
 
 export const GRAPH = 'https://graph.microsoft.com';
 export const FILES_READ = `${GRAPH}/Files.Read`;
@@ -65,11 +71,23 @@ const POPUP_WATCH_MS = 500;
 const SPA_REFRESH_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const STORE_NAME = 'microsoft';
 
+/** What is stored for the tab: the short-lived access token only, never the refresh token. */
+const STORED_KEYS = Object.freeze(['accessToken', 'expiresAt', 'scope']);
+
 function validRecord(record) {
-  return typeof record.accessToken === 'string' && record.accessToken !== '' &&
-    Number.isFinite(record.expiresAt) && typeof record.scope === 'string' &&
-    (record.refreshToken === null || typeof record.refreshToken === 'string') &&
-    Number.isFinite(record.refreshExpiresAt);
+  return Object.keys(record).sort().join(',') === STORED_KEYS.join(',') &&
+    typeof record.accessToken === 'string' && record.accessToken !== '' &&
+    Number.isFinite(record.expiresAt) && typeof record.scope === 'string';
+}
+
+/** The stored part of a sign-in. */
+function storedRecord(session) {
+  return { accessToken: session.accessToken, expiresAt: session.expiresAt, scope: session.scope };
+}
+
+/** A sign-in read back from the tab's store: no refresh token, which was never stored. */
+function restoredSession(record) {
+  return record === null ? null : { ...record, refreshToken: null, refreshExpiresAt: record.expiresAt };
 }
 
 /**
@@ -212,7 +230,7 @@ export function createMicrosoftAuth({
   fetchImpl = (...args) => globalThis.fetch(...args),
   now = () => Date.now(),
 } = {}) {
-  let session = readSignInRecord(STORE_NAME, validRecord);
+  let session = restoredSession(readSignInRecord(STORE_NAME, validRecord));
   setSignInExpiry(STORE_NAME, signedInUntil(session), now);
   let renewing = null;
   /** How the next sign-in asks Microsoft: to choose an account, after one that cannot sign in. */
@@ -255,7 +273,7 @@ export function createMicrosoftAuth({
       // A renewal keeps the first sign-in's end: the 24 hours are not extended.
       refreshExpiresAt: previous?.refreshExpiresAt ?? askedAt + SPA_REFRESH_LIFETIME_MS,
     };
-    writeSignInRecord(STORE_NAME, session);
+    writeSignInRecord(STORE_NAME, storedRecord(session));
     setSignInExpiry(STORE_NAME, signedInUntil(session), now);
     return session.accessToken;
   }
@@ -366,10 +384,11 @@ export function createMicrosoftAuth({
       const { state } = pkce;
       const channel = new win.BroadcastChannel(SIGN_IN_CHANNEL);
       let watch = null;
+      let stopWaiting = () => {};
       const stop = () => {
         clearInterval(watch);
         channel.close();
-        signal.removeEventListener('abort', ended);
+        stopWaiting();
       };
       const ended = () => {
         stop();
@@ -391,7 +410,7 @@ export function createMicrosoftAuth({
         ended();
         return;
       }
-      signal.addEventListener('abort', ended, { once: true });
+      stopWaiting = onAbort(signal, ended);
       channel.onmessage = event => {
         const message = event.data;
         if (message?.state !== state || message.received === true) return;
@@ -447,19 +466,29 @@ export function createMicrosoftAuth({
   function refused(token) {
     if (session?.accessToken === token) {
       session = { ...session, expiresAt: 0 };
-      writeSignInRecord(STORE_NAME, session);
+      writeSignInRecord(STORE_NAME, storedRecord(session));
       setSignInExpiry(STORE_NAME, signedInUntil(session), now);
     }
   }
 
-  /** Forget the sign-in in this tab. Cellucid does not sign the person out of Microsoft. */
+  /**
+   * Forget the sign-in in this tab: the access token and the refresh token
+   * held in memory. Microsoft offers a single-page application no revocation
+   * of its own token; the access token lapses within its hour. Cellucid does
+   * not sign the person out of Microsoft.
+   *
+   * @returns {Promise<boolean>} Whether the token was revoked: false whenever
+   *   there was one (Microsoft cannot revoke it), which the caller says.
+   */
   function signOut() {
+    const hadToken = session !== null;
     session = null;
     try {
       removeSignIn(STORE_NAME);
     } catch {
       // Nothing stored that could be read back either.
     }
+    return Promise.resolve(!hadToken);
   }
 
   return Object.freeze({

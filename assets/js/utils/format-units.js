@@ -86,6 +86,31 @@ export function formatCells(value) {
   return formatCountOf(value, 'cell');
 }
 
+/**
+ * A count of the open cells, said against every cell of the dataset when
+ * only some are open (a subsample): `"1,200 cells"`, or `"300 of 1,200
+ * cells"`. The one way a shown count of the open cells is written, so a
+ * subsample's counts are never read as the whole dataset's: the filter
+ * line, the legend, the status line, the category builder, the dataset
+ * picker. The noun agrees with the count it follows last.
+ *
+ * @param {number} open - The open cells
+ * @param {number|null|undefined} total - Every cell of the dataset (`cellIdentity.nOriginal`); none, or
+ *   `open`, when every cell is open
+ * @param {(value: number) => string} [format] - How each number is written (`formatCount`, or a
+ *   compact form)
+ * @returns {string}
+ */
+export function formatOpenCells(open, total, format = formatCount) {
+  requireCount(open);
+  if (total === null || total === undefined || Number(total) === Number(open)) {
+    return `${format(open)} ${countNoun(open, 'cell')}`;
+  }
+  requireCount(total);
+  if (Number(total) < Number(open)) throw new RangeError('The open cells are some of the dataset\'s cells, never more');
+  return `${format(open)} of ${format(total)} ${countNoun(total, 'cell')}`;
+}
+
 /** A value below 10 of its unit keeps one decimal; larger ones none. */
 function roundForUnit(value, unit) {
   if (unit > 0 && value < 9.95) return Math.round(value * 10) / 10;
@@ -158,6 +183,73 @@ export function formatRemaining(ms) {
 }
 
 /**
+ * A measured value as every place that shows one writes it — the legends'
+ * colour bars, the filter list, figure provenance, exported figures' axes
+ * and legends, cell info, analysis summaries: `figures` significant figures
+ * (three by default), in fixed notation from 0.01 up to 10,000 (or up to the
+ * power of ten the figures reach, when there are more than four), in
+ * scientific notation outside (`0.00123` → `"1.23e-3"`, `1234567.891` →
+ * `"1.23e6"`, `12.345` → `"12.3"`, `0.0149` → `"0.0149"`); trailing zeros
+ * dropped; `"—"` for no value.
+ *
+ * The value is rounded first and the notation chosen for the rounded value,
+ * so a value that rounds into the next decade is written in that decade's
+ * form (`9999.6` → `"1e4"`, `0.009996` → `"0.01"`, `99960` → `"1e5"`), never
+ * as `"10.0e3"`.
+ *
+ * @param {number|null|undefined} value
+ * @param {number} [figures=3] - Significant figures, 1 to 17
+ * @returns {string}
+ */
+export function formatSignificant(value, figures = 3) {
+  if (!Number.isSafeInteger(figures) || figures < 1 || figures > 17) {
+    throw new RangeError('Significant figures must be a whole number from 1 to 17');
+  }
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value === 0) return '0';
+  const sign = value < 0 ? '-' : '';
+  const abs = Math.abs(value);
+  // Correctly rounded and renormalised: 9999.6 is "1.00e+4".
+  const [digits, exponent] = abs.toExponential(figures - 1).split('e');
+  const power = Number(exponent);
+  if (power >= -2 && power < Math.max(4, figures)) return sign + String(Number(abs.toPrecision(figures)));
+  const mantissa = digits.includes('.') ? digits.replace(/0+$/, '').replace(/\.$/, '') : digits;
+  return `${sign}${mantissa}e${power}`;
+}
+
+/**
+ * Significant figures of a range bound where it names cells — the filter
+ * list, figure provenance, a range highlight's label: enough that a bound
+ * typed or set by a slider (`legend-renderer.js`) is written exactly.
+ */
+export const BOUND_FIGURES = 6;
+
+/**
+ * A range bound as the filter list, provenance and range labels write it
+ * (`formatSignificant` to `BOUND_FIGURES`).
+ *
+ * @param {number|null|undefined} value
+ * @returns {string}
+ */
+export function formatBound(value) {
+  return formatSignificant(value, BOUND_FIGURES);
+}
+
+/**
+ * Significant figures that tell evenly spaced ticks apart: at least three,
+ * and enough that ticks `step` apart up to `largest` differ in writing.
+ *
+ * @param {number} largest - The largest tick's magnitude
+ * @param {number} step - The spacing of the ticks
+ * @returns {number}
+ */
+export function tickFigures(largest, step) {
+  if (!(Math.abs(step) > 0) || !Number.isFinite(step) || !Number.isFinite(largest) || largest === 0) return 3;
+  const needed = Math.floor(Math.log10(Math.abs(largest))) - Math.floor(Math.log10(Math.abs(step))) + 1;
+  return Math.min(17, Math.max(3, needed));
+}
+
+/**
  * A large count in compact form: "950", "12.3K", "4.0M", "1.2B".
  *
  * @param {number} n
@@ -171,4 +263,21 @@ export function formatCompactNumber(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(n);
+}
+
+/**
+ * A decimal number as a person types it, in any locale: a decimal point or a
+ * decimal comma ("12.5", "12,5", "12," while typing), an optional sign and an
+ * optional exponent and trailing `%` (the box itself may show a tiny share
+ * as `2e-7`). No thousands separators: a number with both a point
+ * and a comma, or more than one of either, is not read (NaN), so "9,969" is
+ * 9.969 and never nine thousand. NaN for anything else (empty included).
+ *
+ * @param {string} text
+ * @returns {number}
+ */
+export function parseDecimalText(text) {
+  const value = String(text).trim().replace(/\s*%$/, '');
+  if (!/^[+-]?(\d+([.,]\d*)?|[.,]\d+)([eE][+-]?\d+)?$/.test(value)) return NaN;
+  return Number(value.replace(',', '.'));
 }

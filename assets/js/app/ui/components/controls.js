@@ -18,6 +18,7 @@
 import { runBeforeNextFrame } from '../../../rendering/frame-phases.js';
 import { createDomId } from './dom-id.js';
 import { renderInfoTip } from './info-tips.js';
+import { parseDecimalText } from '../../../utils/format-units.js';
 
 function requireText(value, label) {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
@@ -244,6 +245,58 @@ export function createSliderField({
       paint();
     }
   };
+}
+
+/**
+ * A box a person types a decimal number into, read the same in every locale:
+ * a text field with the decimal keypad (`inputmode="decimal"`), never
+ * `<input type="number">`. A number box of a page marked English refuses a
+ * typed decimal comma in Firefox ("12,5" reads as empty), and Chromium shows
+ * it in the system's locale, so a value the page wrote can read back wrong.
+ * The text is read by `parseDecimalText` (a point or a comma,
+ * `readDecimalInput`) and always written with a point (`writeDecimalInput`).
+ * Static markup uses the same attributes (`index.html`: `type="text"
+ * inputmode="decimal" autocomplete="off" spellcheck="false"`). A whole
+ * number box stays `type="number"` with an integer `step`.
+ *
+ * @param {{id?: string, className?: string, value?: number|null, placeholder?: string, title?: string, ariaLabel?: string}} [options]
+ * @returns {HTMLInputElement}
+ */
+export function createDecimalInput({ id, className = 'obs-select', value = null, placeholder, title, ariaLabel } = {}) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.inputMode = 'decimal';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.className = className;
+  if (id !== undefined) input.id = requireText(id, 'Decimal box id');
+  if (placeholder !== undefined) input.placeholder = placeholder;
+  if (title !== undefined) input.title = title;
+  if (ariaLabel !== undefined) input.setAttribute('aria-label', requireText(ariaLabel, 'Decimal box label'));
+  writeDecimalInput(input, value);
+  return input;
+}
+
+/**
+ * The number a decimal box holds (`createDecimalInput`), typed with a point
+ * or a comma; NaN when it holds none (empty included).
+ *
+ * @param {HTMLInputElement} input
+ * @returns {number}
+ */
+export function readDecimalInput(input) {
+  return parseDecimalText(input.value);
+}
+
+/**
+ * Show `value` in a decimal box, with a point (empty for null).
+ *
+ * @param {HTMLInputElement} input
+ * @param {number|null} value
+ */
+export function writeDecimalInput(input, value) {
+  if (value !== null && !Number.isFinite(value)) throw new TypeError('A decimal box shows a finite number or nothing.');
+  input.value = value === null ? '' : String(value);
 }
 
 /**
@@ -572,6 +625,110 @@ export function createEmptyState(text) {
   root.className = 'empty-state';
   root.textContent = requireText(text, 'Empty state text');
   return root;
+}
+
+/**
+ * @typedef {Object} FactRow - One row of a Details table: a short label and
+ *   its short value
+ * @property {string} label - A word or two ("Seed", "Chosen by")
+ * @property {string} value - The fact itself, short
+ * @property {string|null} [title] - The longer text behind the value (its
+ *   tooltip): why, and what follows
+ * @property {string} [href] - The value is a link there
+ * @property {string[]} [lines] - Several facts: the row takes the table's
+ *   whole width, each fact on its own line
+ * @property {string} [id] - The value's element id (a value a test or a
+ *   later update finds)
+ */
+
+/**
+ * Fill a Details table (`dl.fact-list`, under a `.details-disclosure`): a
+ * label and its value per row, side by side; a value with `href` is a link
+ * opening in a new tab, one with `lines` takes the whole width under its
+ * label, and `title` is the tooltip of the value. Every row is rewritten.
+ *
+ * @param {HTMLDListElement} list
+ * @param {ReadonlyArray<FactRow>} rows
+ */
+export function renderFactList(list, rows) {
+  if (!list || typeof list.replaceChildren !== 'function') throw new TypeError('A fact list needs its <dl>');
+  if (!Array.isArray(rows)) throw new TypeError('Fact rows must be an array');
+  const doc = list.ownerDocument;
+  const nodes = [];
+  for (const row of rows) {
+    const term = doc.createElement('dt');
+    term.textContent = requireText(row.label, 'Fact label');
+    const value = doc.createElement('dd');
+    if (row.id !== undefined) value.id = row.id;
+    if (row.lines !== undefined) {
+      term.className = 'fact-list-wide';
+      value.className = 'fact-list-wide';
+      for (const line of row.lines) {
+        const fact = doc.createElement('div');
+        fact.textContent = line;
+        value.appendChild(fact);
+      }
+    } else if (row.href !== undefined) {
+      const link = doc.createElement('a');
+      link.href = row.href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = row.value;
+      value.appendChild(link);
+    } else {
+      value.textContent = row.value;
+    }
+    if (typeof row.title === 'string' && row.title !== '') value.title = row.title;
+    nodes.push(term, value);
+  }
+  list.replaceChildren(...nodes);
+}
+
+/**
+ * A row of a `.list-box` that the person chooses for an action (Remove
+ * selected): a checkbox named by the row's name, the name (one line, cut
+ * with its whole text as the tooltip), a size or count at the right, and one
+ * line of facts under the name. A row that cannot be chosen has its
+ * checkbox disabled and says why in its facts. Rows carry no listeners; the
+ * list delegates `change`.
+ *
+ * @param {object} options
+ * @param {string} options.name
+ * @param {string} [options.size] - A short figure at the right ("388 MB")
+ * @param {string} options.meta - The facts under the name
+ * @param {boolean} [options.disabled=false]
+ * @returns {{ root: HTMLLabelElement, checkbox: HTMLInputElement }}
+ */
+export function createSelectItem({ name, size, meta, disabled = false }) {
+  requireText(name, 'Selectable row name');
+  requireText(meta, 'Selectable row facts');
+  if (typeof disabled !== 'boolean') throw new TypeError('Selectable row state must be boolean');
+  const root = document.createElement('label');
+  root.className = 'select-item';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.disabled = disabled;
+  const body = document.createElement('span');
+  body.className = 'select-item-body';
+  const head = document.createElement('span');
+  head.className = 'select-item-head';
+  const nameEl = document.createElement('span');
+  nameEl.className = 'select-item-name';
+  nameEl.textContent = name;
+  nameEl.title = name;
+  head.appendChild(nameEl);
+  if (size !== undefined) {
+    const sizeEl = document.createElement('span');
+    sizeEl.className = 'select-item-size';
+    sizeEl.textContent = requireText(size, 'Selectable row size');
+    head.appendChild(sizeEl);
+  }
+  const metaEl = document.createElement('span');
+  metaEl.className = 'select-item-meta';
+  metaEl.textContent = meta;
+  body.append(head, metaEl);
+  root.append(checkbox, body);
+  return { root, checkbox };
 }
 
 /**

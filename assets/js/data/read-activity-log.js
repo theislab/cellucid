@@ -7,8 +7,11 @@ import { formatBytes, formatDuration, formatRemaining, formatCountOf } from '../
  * one has come, and how it ended. Local files and remote ones alike.
  *
  * The AnnData reader worker reports each operation while it runs and when it
- * ends (`anndata-reader-worker.js`); this log keeps them for the open dataset
- * (cleared when another opens), tells subscribers, and writes to the console
+ * ends (`anndata-reader-worker.js`); this log keeps the operations under way
+ * and, for the open dataset (cleared when another opens), the totals of
+ * every one that ended (`totals`): an analysis over every gene ends
+ * thousands, and none is kept once it is counted. It tells subscribers
+ * every report, and writes to the console
  * as `[cellucid:read]`: a long operation every few seconds while it runs
  * (how much of how much, how fast, how long is left), and every operation
  * when it ends — at info level when it took a while or built an index, at
@@ -19,11 +22,21 @@ import { formatBytes, formatDuration, formatRemaining, formatCountOf } from '../
  * announcing each as it arrived cost the page 83–129 ms per run. A flush
  * keeps each operation's latest report, tells subscribers about it once, and
  * writes the operations that ended quietly as one debug entry. Reading the
- * log (`entries`, `totals`) flushes first, so it is always current.
+ * log (`entries`, `totals`) flushes first, so it is always current; what an
+ * operation was is told to subscribers (`subscribe`), the log's only memory
+ * of it once it ended.
  *
  * @module data/read-activity-log
  */
 
+
+/**
+ * The purpose a read of the cells added to a growing opening names at the end
+ * of its label (`<what> (embedding, cells added)`, `embedding-payload.js`):
+ * the Dataset box says how such a growth goes, so no read notification does
+ * (`app/read-progress-notifications.js`).
+ */
+export const GROWTH_READ_REASON = 'cells added';
 
 /** Operations at least this long are written at info level. */
 const NOTABLE_MS = 1000;
@@ -52,6 +65,8 @@ export function describeReadProgress(activity) {
   if (activity.remainingMs !== null && activity.remainingMs !== undefined) {
     parts.push(`${formatRemaining(activity.remainingMs)} left`);
   }
+  // A wait its host named (`formats/io/activity.js` `waiting`): what it waits for.
+  if (activity.waiting) parts.push(`waiting: ${activity.waiting.text}`);
   return parts.length === 0 ? null : parts.join(', ');
 }
 
@@ -80,8 +95,10 @@ const FLUSH_DELAY_MS = 16;
 
 class ReadActivityLog {
   constructor() {
-    /** @type {Map<number, Object>} By activity id, in the order they started */
+    /** @type {Map<number, Object>} The operations under way, by activity id, in the order they started */
     this._activities = new Map();
+    /** Totals of the operations that ended, for the open dataset. */
+    this._ended = { operations: 0, requests: 0, bytesFetched: 0, decodedBytes: 0 };
     this._listeners = new Set();
     /** @type {Map<number, number>} When a running operation was last written */
     this._written = new Map();
@@ -144,7 +161,16 @@ class ReadActivityLog {
     const quiet = [];
     for (const report of reports) {
       const activity = Object.freeze({ ...report, adoptedBy: this._adoptersOf(report) });
-      this._activities.set(activity.id, activity);
+      if (activity.status === 'running') {
+        this._activities.set(activity.id, activity);
+      } else {
+        // Ended: counted, and kept no longer.
+        this._activities.delete(activity.id);
+        this._ended.operations += 1;
+        this._ended.requests += activity.requests;
+        this._ended.bytesFetched += activity.bytesFetched;
+        this._ended.decodedBytes += activity.decodedBytes;
+      }
       if (activity.status === 'running') {
         const last = this._written.get(activity.id) ?? null;
         if (activity.elapsedMs >= RUNNING_LINE_AFTER_MS && (last === null || now - last >= RUNNING_LINE_EVERY_MS)) {
@@ -169,24 +195,23 @@ class ReadActivityLog {
     if (quiet.length > 0) console.debug(quiet.join('\n'));
   }
 
-  /** Every operation of the open dataset, oldest first. */
+  /** The operations under way, oldest first. */
   entries() {
     this.flush();
     return [...this._activities.values()];
   }
 
-  /** Totals over the open dataset: requests, bytes fetched, bytes decoded. */
+  /** Totals over the open dataset, every operation that ended and those under way: requests, bytes fetched, bytes decoded. */
   totals() {
     this.flush();
-    let requests = 0;
-    let bytesFetched = 0;
-    let decodedBytes = 0;
+    const totals = { ...this._ended };
     for (const activity of this._activities.values()) {
-      requests += activity.requests;
-      bytesFetched += activity.bytesFetched;
-      decodedBytes += activity.decodedBytes;
+      totals.operations += 1;
+      totals.requests += activity.requests;
+      totals.bytesFetched += activity.bytesFetched;
+      totals.decodedBytes += activity.decodedBytes;
     }
-    return { operations: this._activities.size, requests, bytesFetched, decodedBytes };
+    return totals;
   }
 
   /** Forget everything: another dataset opened. */
@@ -195,6 +220,7 @@ class ReadActivityLog {
     this._flushTimer = null;
     this._pending.clear();
     this._activities.clear();
+    this._ended = { operations: 0, requests: 0, bytesFetched: 0, decodedBytes: 0 };
     this._written.clear();
     this._adopted.clear();
   }

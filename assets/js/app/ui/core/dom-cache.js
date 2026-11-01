@@ -80,6 +80,55 @@ export function collectDOMReferences(root) {
       dataLinkConnectionTarget: byId('data-link-connection-target'),
     },
 
+    subsample: {
+      root: byId('subsample-block'),
+      slider: byId('subsample-slider'),
+      percent: byId('subsample-percent'),
+      count: byId('subsample-count'),
+      settings: byId('subsample-settings'),
+      method: byId('subsample-method'),
+      seed: byId('subsample-seed'),
+      fieldRow: byId('subsample-field-row'),
+      field: byId('subsample-field'),
+      balanced: byId('subsample-balanced'),
+      embeddingRow: byId('subsample-embedding-row'),
+      embedding: byId('subsample-embedding'),
+      actions: byId('subsample-actions'),
+      apply: byId('subsample-apply'),
+      notice: byId('subsample-notice'),
+      details: byId('subsample-details'),
+      detailsList: byId('subsample-details-list'),
+      openAll: byId('subsample-open-all'),
+      copyLink: byId('subsample-copy-link'),
+      useBlocks: byId('subsample-use-blocks'),
+    },
+
+    geneRead: {
+      root: byId('gene-read-block'),
+      slider: byId('gene-read-slider'),
+      percent: byId('gene-read-percent'),
+      status: byId('gene-read-status'),
+      actions: byId('gene-read-actions'),
+      action: byId('gene-read-action'),
+    },
+
+    keptStores: {
+      root: byId('kept-stores-line'),
+      text: byId('kept-stores-text'),
+      manage: byId('kept-stores-manage-btn'),
+    },
+
+    keptStoresDialog: {
+      dialog: byId('kept-stores-dialog'),
+      list: byId('kept-stores-list'),
+      empty: byId('kept-stores-empty'),
+      status: byId('kept-stores-status'),
+      removeSelected: byId('kept-stores-remove-selected'),
+      removeAll: byId('kept-stores-remove-all'),
+      where: byId('kept-stores-where'),
+      persist: byId('kept-stores-persist'),
+    },
+
     session: {
       saveBtn: byId('save-state-btn'),
       loadBtn: byId('load-state-btn'),
@@ -130,6 +179,17 @@ export function collectDOMReferences(root) {
     filter: {
       countEl: byId('filter-count'),
       activeFiltersEl: byId('active-filters'),
+    },
+
+    // The exports of the highlighted cells and of the selected fields
+    // (ui/modules/cell-exports-ui.js).
+    cellExports: {
+      highlightsCsvButton: byId('export-highlights-csv'),
+      highlightsH5adButton: byId('export-highlights-h5ad'),
+      categoricalExportButton: byId('export-categorical-field'),
+      continuousExportButton: byId('export-continuous-field'),
+      categoricalSelect: byId('categorical-field'),
+      continuousSelect: byId('continuous-field'),
     },
 
     // The Highlighting panel and the selection bar over the plot (#select-bar)
@@ -183,6 +243,7 @@ export function collectDOMReferences(root) {
       hpFrustumCullingCheckbox: byId('hp-frustum-culling'),
       hpAntialiasCheckbox: byId('hp-antialias'),
       hpAntialiasStatus: byId('hp-antialias-status'),
+      hpPerformanceStatus: byId('hp-performance-status'),
 
       smokeGridInput: byId('smoke-grid'),
       smokeGridDisplay: byId('smoke-grid-display'),

@@ -239,3 +239,33 @@ test('an empty gene list needs no loader', async () => {
     /field loader/
   );
 });
+
+test('a gene field of a replaced list is located on the list in use: by position on the same axis, by name on another, -1 when gone', async () => {
+  const { state } = await makeState();
+  const [a, b, c] = state.varData.fields;
+  assert.equal(state.locateVarField(b), 1);
+
+  // The same axis under other names (or the same matrix read another way):
+  // the same column, whatever it is called now.
+  const renamed = await state.stageVarAxisReplacement({
+    geneList: geneList(['a1', 'b1', 'c1']),
+    varFieldLoader: loaderFor({ a1: [1, 1, 1, 1], b1: [2, 2, 2, 2], c1: [3, 3, 3, 3] }, []),
+    sameAxis: true,
+    sameMatrix: false,
+  });
+  renamed.commit();
+  assert.deepEqual([a, b, c].map(field => state.locateVarField(field)), [0, 1, 2]);
+  assert.equal(state.varData.fields[state.locateVarField(c)].key, 'c1');
+
+  // Another axis: by name, through every replacement since.
+  const other = await state.stageVarAxisReplacement({
+    geneList: geneList(['c1', 'x', 'a1']),
+    varFieldLoader: loaderFor({ c1: [3, 3, 3, 3], x: [0, 0, 0, 0], a1: [1, 1, 1, 1] }, []),
+    sameAxis: false,
+    sameMatrix: false,
+  });
+  other.commit();
+  assert.deepEqual([a, b, c].map(field => state.locateVarField(field)), [2, -1, 0]);
+  // A field of the list in use is where it is.
+  assert.equal(state.locateVarField(state.varData.fields[1]), 1);
+});

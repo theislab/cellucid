@@ -12,6 +12,8 @@
  * @module shared/plot-render-slot
  */
 
+import { abortReason, cancel, onAbort } from '../../../utils/abort.js';
+
 const ALWAYS_CURRENT = () => true;
 
 function combineErrors(errors, message) {
@@ -94,32 +96,22 @@ function defaultCreateResizeObserver(callback) {
   return new globalThis.ResizeObserver(callback);
 }
 
-function staleRequestError(signal) {
-  if (signal?.reason instanceof Error) return signal.reason;
-  const error = new Error('PlotRenderSlot request is stale');
-  error.name = 'AbortError';
-  return error;
-}
-
 async function defaultMeasure({ host, signal, createResizeObserver }) {
   const initial = readHostLayoutBox(host);
   if (initial.width > 0 && initial.height > 0) return initial;
-  if (signal?.aborted) throw staleRequestError(signal);
+  if (signal?.aborted) throw abortReason(signal);
 
   return new Promise((resolve, reject) => {
     let observer = null;
     let settled = false;
+    let stopListening = () => {};
 
     const settle = (measurement, error = null) => {
       if (settled) return;
       settled = true;
 
       const cleanupErrors = [];
-      try {
-        signal?.removeEventListener('abort', handleAbort);
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
+      stopListening();
       try {
         observer?.disconnect();
       } catch (cleanupError) {
@@ -147,7 +139,6 @@ async function defaultMeasure({ host, signal, createResizeObserver }) {
         settle(null, error);
       }
     };
-    const handleAbort = () => settle(null, staleRequestError(signal));
 
     try {
       observer = createResizeObserver(readPositiveMeasurement);
@@ -155,11 +146,8 @@ async function defaultMeasure({ host, signal, createResizeObserver }) {
           typeof observer.disconnect !== 'function') {
         throw new Error('PlotRenderSlot resize observer must implement observe and disconnect');
       }
-      signal?.addEventListener('abort', handleAbort, { once: true });
-      if (signal?.aborted) {
-        handleAbort();
-        return;
-      }
+      stopListening = onAbort(signal, () => settle(null, abortReason(signal)));
+      if (settled) return;
 
       observer.observe(host);
       // Close the gap between the first measurement and observer registration.
@@ -674,10 +662,8 @@ export class PlotRenderSlot {
   }
 
   _abortRequest(request, message) {
-    if (!request || request.abortController.signal.aborted) return;
-    const error = new Error(message);
-    error.name = 'AbortError';
-    request.abortController.abort(error);
+    if (!request) return;
+    cancel(request.abortController, 'superseded', message);
   }
 
   _runExclusive(operation) {

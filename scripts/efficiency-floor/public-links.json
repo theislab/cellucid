@@ -1,0 +1,68 @@
+{
+  "about": "Real public links a new user tries first, one or more per source and per format the app reads (scripts/efficiency-floor/public-links.mjs probes them; scripts/benchmark-real-links.mjs --corpus measures them in the app). Sizes, layouts and host behaviour are filled in by the probe, never assumed. 'heavy' marks a file of gigabytes: its browser run goes through the shared heavy-job lock. 'shares' are the Cells-to-open settings measured besides the default (auto).",
+  "version": 1,
+  "links": [
+    { "id": "cxg-liver-2k", "link": "cellxgene:a49d9109-1d0c-4b36-8139-19aa9a83428c", "source": "CELLxGENE", "note": "Healthy human liver lymphocytes; documented example" },
+    { "id": "cxg-pancreas-2.5k", "link": "cellxgene:66d15835-5dc8-4e96-b0eb-f48971cb65e8", "source": "CELLxGENE" },
+    { "id": "cxg-retina-34k", "link": "cellxgene:f5be9ed2-5d41-4a52-91e4-4ff24ff84900", "source": "CELLxGENE", "note": "documented example" },
+    { "id": "cxg-endothelial-60k", "link": "cellxgene:278eac3f-a5a4-4d0a-9d83-0ca7efc67e16", "source": "CELLxGENE" },
+    { "id": "cxg-pancreas-122k", "link": "cellxgene:31f657dc-1875-4c4b-a5ca-ce63b3ef3a82", "source": "CELLxGENE", "note": "documented example" },
+    { "id": "cxg-bcells-250k", "link": "cellxgene:1d54fb17-90d5-47ca-ad8d-22ab63cb5c1f", "source": "CELLxGENE", "shares": ["1%", "100%"] },
+    { "id": "cxg-soundlife-1.2M", "link": "cellxgene:5fde5c9c-5b1e-4df5-982a-3f8e7635161f", "source": "CELLxGENE", "heavy": true, "shares": ["1%", "10%"] },
+    { "id": "cxg-hlca-2.3M", "link": "cellxgene:9f222629-9e39-47d0-b83f-e08d610c7479", "source": "CELLxGENE", "heavy": true, "shares": ["1%", "10%"], "note": "Human Lung Cell Atlas core; documented example" },
+    { "id": "cxg-ts-1.1M", "link": "cellxgene:53d208b0-2cfd-4366-9866-c3c6114081bc", "source": "CELLxGENE", "heavy": true, "note": "Tabula Sapiens, all cells (1.14M, 45 GB)" },
+    { "id": "cxg-brain-2.5M", "link": "cellxgene:8e10f1c4-8e98-41e5-b65f-8cd89a887122", "source": "CELLxGENE", "heavy": true, "note": "Siletti et al. human brain, all neurons (2.48M, 33 GB)" },
+    { "id": "cxg-merfish-4.2M", "link": "cellxgene:73c39ba5-17dc-4630-b99a-0d43164a3945", "source": "CELLxGENE", "heavy": true, "note": "MERFISH whole mouse brain (4.17M cells, few genes, 2.7 GB)" },
+    { "id": "cxg-embryo-11.4M", "link": "cellxgene:dcfd4feb-18a3-4b30-81d7-1b0c544a8ab3", "source": "CELLxGENE", "heavy": true, "note": "mouse embryo raw counts (11.44M cells, 46 GB): the one real 10M-scale file found" },
+    { "id": "cxg-explore-link", "link": "https://cellxgene.cziscience.com/e/a49d9109-1d0c-4b36-8139-19aa9a83428c.cxg/", "source": "CELLxGENE", "note": "an Explorer link, opened as the Census copy" },
+    { "id": "census-bucket-url", "link": "s3://cellxgene-census-public-us-west-2/cell-census/2025-11-10/h5ads/a49d9109-1d0c-4b36-8139-19aa9a83428c.h5ad", "source": "public S3", "note": "the same file by its bucket address (one identity with cxg-liver-2k)" },
+
+    { "id": "zenodo-scanpy-624", "link": "zenodo:13255338/processedScanpyAnndata.h5ad", "source": "Zenodo", "note": "documented example" },
+    { "id": "zenodo-bradyzoite-3d", "link": "zenodo:23288289", "source": "Zenodo", "note": "a record with one openable file; 3-D embedding" },
+    { "id": "zenodo-liao-66k", "link": "zenodo:10850398/liao20_sub.h5ad", "source": "Zenodo", "shares": ["1%", "100%"], "note": "documented example" },
+    { "id": "zenodo-tica-317k", "link": "zenodo:5205544/TICAtlas.h5ad", "source": "Zenodo", "heavy": true, "shares": ["1%", "10%"] },
+    { "id": "zenodo-hlca-2.3M", "link": "zenodo:7599104/HLCA_full_v1.1_emb.h5ad", "source": "Zenodo", "heavy": true, "note": "Human Lung Cell Atlas full, embeddings and obs (2.28M cells, 2.4 GB)" },
+    { "id": "zenodo-loom-stetson", "link": "zenodo:6587903/Stetson.loom", "source": "Zenodo" },
+    { "id": "zenodo-h5mu-eatris", "link": "zenodo:19136013/EATRIS_PLUS_mudata.h5mu", "source": "Zenodo" },
+    { "id": "zenodo-seurat-mast", "link": "zenodo:8071138/Mice_Mast_cells.Rds", "source": "Zenodo", "note": "a Seurat object read once; documented example" },
+    { "id": "zenodo-seurat-tica-ds", "link": "zenodo:5205544/TICAtlas_downsampled.rds", "source": "Zenodo", "note": "a 187 MB Seurat object" },
+    { "id": "zenodo-10x-h5", "link": "zenodo:14050429/arb_raw_feature_bc_matrix.h5", "source": "Zenodo", "note": "a Cell Ranger matrix alone: refused (no embedding), at what cost" },
+
+    { "id": "geo-h5ad-flex", "link": "geo:GSE350831/GSE350831_Flex_pilot_paper_annotated_bbknn.h5ad", "source": "GEO", "note": "documented example" },
+    { "id": "geo-h5ad-saber", "link": "geo:GSE327505", "source": "GEO", "heavy": true, "note": "a series with one openable file; documented example" },
+    { "id": "geo-mtx-zebrafish", "link": "geo:GSE336826/GSM9843410_12hpf_scRNA_matrix.mtx.gz", "source": "GEO", "note": "a MatrixMarket sample with UMAP and cluster tables; documented example" },
+    { "id": "geo-h5ad-gz-cite", "link": "geo:GSE194122/GSE194122_openproblems_neurips2021_cite_BMMC_processed.h5ad.gz", "source": "GEO", "note": "a gzip-compressed .h5ad, as GEO often ships them" },
+    { "id": "geo-10x-h5-sample", "link": "geo:GSM4339769", "source": "GEO", "note": "a Cell Ranger .h5 kept in a sample folder (the series' _RAW.tar member)" },
+    { "id": "geo-rds-gz-lung", "link": "geo:GSE131907/GSE131907_Lung_Cancer_raw_UMI_matrix.rds.gz", "source": "GEO", "heavy": true, "note": "a gzipped R matrix" },
+    { "id": "geo-mtx-cortex", "link": "geo:GSE132044/GSE132044_cortex_mm10_count_matrix.mtx.gz", "source": "GEO", "note": "a matrix with _cell/_gene lists" },
+    { "id": "geo-mtx-1.46M", "link": "geo:GSE158055/GSE158055_covid19_counts.mtx.gz", "source": "GEO", "heavy": true, "note": "1.46M COVID-19 cells: an 8.2 GB gzip stream, read whole once into this browser's storage" },
+    { "id": "geo-txt-gz-matrix", "link": "geo:GSE131907/GSE131907_Lung_Cancer_raw_UMI_matrix.txt.gz", "source": "GEO", "note": "a dense text matrix" },
+
+    { "id": "ebi-scea-911k", "link": "https://ftp.ebi.ac.uk/pub/databases/microarray/data/atlas/sc_experiments/E-ANND-5/E-ANND-5.project.h5ad", "source": "EBI SCEA", "heavy": true, "note": "the Atlas's largest experiment (911,873 cells, Suo et al. developing immune system, 17.4 GB)" },
+    { "id": "ebi-scea-project", "link": "https://ftp.ebi.ac.uk/pub/databases/microarray/data/atlas/sc_experiments/E-MTAB-5061/E-MTAB-5061.project.h5ad", "source": "EBI SCEA", "note": "Single Cell Expression Atlas project .h5ad, a plain web address" },
+
+    { "id": "figshare-pbmc3k-processed", "link": "figshare:22577536", "source": "Figshare", "note": "documented example" },
+    { "id": "figshare-pbmc3k", "link": "figshare:16447278", "source": "Figshare", "note": "documented example" },
+
+    { "id": "hf-kang-8k", "link": "hf:Nikita1113/tb-science-scrna-kang-ifnb", "source": "Hugging Face", "note": "documented example" },
+    { "id": "hf-pbmc-17k", "link": "hf:datavil/pbmc3k", "source": "Hugging Face", "note": "uncompressed CSR; documented example" },
+
+    { "id": "hf-wholebrain-9.6G", "link": "hf:perturbai/wholebrain_crispr_atlas/h5ads/WB8588_2_1.h5ad", "source": "Hugging Face", "heavy": true, "shares": ["1%"], "note": "the largest .h5ad found on the Hub (9.6 GB, a whole-brain CRISPR screen sample)" },
+    { "id": "gh-h5ad", "link": "gh:theislab/cellucid-demo-custom-datasets/files/synthetic-cell-types-2d.h5ad", "source": "GitHub" },
+    { "id": "gh-zarr-folder", "link": "gh:theislab/cellucid-demo-custom-datasets/catalog/synthetic-cell-types-2d.zarr", "source": "GitHub" },
+    { "id": "gh-seurat", "link": "gh:theislab/cellucid-demo-custom-datasets/catalog/synthetic-citeseq-seurat.rds", "source": "GitHub" },
+
+    { "id": "dropbox-pancreas", "link": "https://www.dropbox.com/s/qj1jlm9w10wmt0u/pancreas.h5ad?dl=1", "source": "Dropbox", "note": "written by anndata 0.6; documented example" },
+    { "id": "dropbox-seqfish", "link": "https://www.dropbox.com/s/cm3uw8czhz5hu30/seqFISH.h5ad?dl=1", "source": "Dropbox", "note": "documented example" },
+
+    { "id": "gdrive-liver", "link": "gdrive:1lylTBkM-sOjKMsA2gve3gKzcrI3XIyVQ", "source": "Google Drive", "note": "documented example" },
+    { "id": "gdrive-thymus", "link": "gdrive:1tWxN8Ls8Ars8yQ7YYlQ1t-C6FmHXCivF", "source": "Google Drive", "note": "1.7 GB; documented example" },
+    { "id": "gdrive-loom", "link": "gdrive:1yVD9HcN6dFIlhWhMmDiv2U8P_e1PF4El", "source": "Google Drive", "note": "documented example" },
+
+    { "id": "tenx-1.3M-h5", "link": "https://cf.10xgenomics.com/samples/cell-exp/1.3.0/1M_neurons/1M_neurons_filtered_gene_bc_matrices_h5.h5", "source": "10x Genomics", "heavy": true, "note": "1.3M mouse brain cells; 10x's CDN sends no CORS headers, so no web page can read it" },
+    { "id": "gcs-tahoe-plate3", "link": "gs://arc-institute-virtual-cell-atlas/tahoe100M/2025-02-25/h5ad/plate3_filt_Vevo_Tahoe100M_WServicesFrom_ParseGigalab.h5ad", "source": "public GCS", "heavy": true, "note": "Tahoe-100M plate 3 (13 GB) in Arc Institute's public bucket: Google Cloud Storage answers without CORS headers, so no web page can read it" },
+    { "id": "s3-allen-th", "link": "https://allen-brain-cell-atlas.s3.us-west-2.amazonaws.com/expression_matrices/WMB-10Xv2/20230630/WMB-10Xv2-TH-log2.h5ad", "source": "public S3", "heavy": true, "note": "Allen Brain Cell Atlas: expression only, its embedding is in a separate table" },
+
+    { "id": "sample-catalog", "link": "https://theislab.github.io/cellucid-datasets/anndata/", "source": "sample catalog", "note": "the built-in sample catalog from its GitHub Pages folder (opens Suo et al.)" }
+  ]
+}

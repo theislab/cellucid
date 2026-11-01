@@ -117,7 +117,12 @@ test('an opening whose reader never answers says what it waits on, and the page 
         asked: [],
         terminated: false,
         postMessage(message) {
-          this.asked.push(message?.method ?? Object.keys(message ?? {}).join(','));
+          // Only a request (`{id, method, args}`) asks a reader anything:
+          // what it is handed as it starts (the page's range cache, a
+          // widget's host, the page's memory state) and the notices it is
+          // sent (a memory release, leave) are not requests.
+          if (typeof message?.method !== 'string') return;
+          this.asked.push(message.method);
         },
         terminate() {
           this.terminated = true;

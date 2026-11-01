@@ -14,6 +14,8 @@
  */
 import { createViewer } from '../rendering/viewer.js';
 import { CONNECTIVITY_DEFAULT_VISIBLE_TARGET } from '../rendering/connectivity-edge-layer.js';
+import { requireLodMembership } from '../rendering/high-perf/renderer-contracts.js';
+import { keepSessionThroughGraphicsReset } from './graphics-reset-session.js';
 import { initSidebarLayout } from './ui/core/sidebar-layout.js';
 import {
   MAX_SMOKE_GRID_SIZE
@@ -42,17 +44,26 @@ import {
 import { initDockableAccordions } from './dockable-accordions.js';
 import { setDockableAccordions } from './dockable-accordions-registry.js';
 import { getNotificationCenter } from './notification-center.js';
+import { installMatrixShareNotices } from './matrix-share-notices.js';
 import { showReadProgress } from './read-progress-notifications.js';
 import { showOpeningProgress } from './opening-progress-view.js';
 import { showSourceSignIn } from './source-sign-in-view.js';
+import { initPageMemory } from './page-memory.js';
+import { setWorkingSet, typedArrayBytes } from '../data/memory-budget.js';
+import { forwardEdgeRows } from '../data/connectivity-edges.js';
 import { beginOpening } from '../data/opening-progress.js';
+import { retireAnnDataReaderWorkers } from '../data/anndata-reader-client.js';
 import {
   createObsFieldLoader,
   createVarFieldLoader,
   varLoaderMappingOf,
   loadEdges,
+  loadConnectivityRows,
+  loadCoordinateRows,
   loadDatasetGeneration,
+  loadConnectivitySummary,
   loadMappingCandidates,
+  loadCompleteMappingCandidates,
   getEmbeddingsMetadata
 } from '../data/data-loaders.js';
 import {
@@ -67,11 +78,9 @@ import { syntheticRepresentations } from './ui/modules/benchmark/representations
 import { describeOpeningFailure } from './ui/modules/dataset-connections.js';
 import { createMappingLayoutProvider } from './state/managers/mapping-manager.js';
 import { createVectorFieldManager, resolveVectorFields } from '../data/vector-field-manager.js';
-import { createCandidateAnnDataBinding } from '../data/anndata-provider.js';
-import {
-  createDatasetReloadSupersededError,
-  isDatasetReloadSupersededError
-} from '../data/dataset-lifecycle-errors.js';
+import { anndataCellIdentity, anndataCellPriority, createCandidateAnnDataBinding } from '../data/anndata-provider.js';
+import { parseSubsampleUrlParameters } from './subsample-url.js';
+import { setNextCellSubsetRequest, setTabCellSubsetRequest } from '../data/cell-subset-policy.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { getTransferLog } from '../data/transfer-log.js';
 import { getReadActivityLog } from '../data/read-activity-log.js';
@@ -86,6 +95,11 @@ import {
 import {
   createViewerHostCommandHandlers
 } from './viewer-host-command-handler.js';
+import { createViewerHostResults } from './viewer-host-results.js';
+import { createHighlightDraft } from './highlight-draft.js';
+import { createOpenCellsResize } from './open-cells-resize.js';
+import { recordFirstFrame } from '../data/opening-cost.js';
+import { runAfterNextFrame } from '../rendering/frame-phases.js';
 import {
   createViewerHostPointerDelivery
 } from './viewer-host-pointer-delivery.js';
@@ -97,7 +111,6 @@ import {
   isExplainedFailure
 } from '../data/data-source.js';
 import { formatCompactCount as formatNumber } from './ui/components/display-format.js';
-import { createComparisonModule } from './analysis/comparison-module.js';
 import { ThemeManager } from '../utils/theme-manager.js';
 import { debug } from '../utils/debug.js';
 import { clamp } from './utils/number-utils.js';
@@ -121,7 +134,8 @@ import {
 } from './startup-url-intent.js';
 import {
   normalizeStartupError,
-  publishStartupFailure
+  publishStartupFailure,
+  requireBrowserFeatures
 } from './startup-failure.js';
 import {
   STARTUP_STALL_CODE,
@@ -135,16 +149,25 @@ import { yieldToMacrotask } from '../utils/yield-macrotask.js';
 import { PLACES } from './ui/place-names.js';
 import { loadAppCode } from './app-code.js';
 import { formatCountOf, countNoun } from '../utils/format-units.js';
+import { isCancellation, cancelled, cancel, abortReason, onAbort } from '../utils/abort.js';
+import { failureText } from '../utils/errors.js';
 
-// The whole static graph has loaded, linked and run: the code-load watch
-// (ui/core/code-load-watch.js) reads an uncaught error before this mark as
-// the graph failing to run.
+// The whole static graph has loaded, linked and run (a graph that fails to
+// is reported by ui/core/code-load-watch.js, from index.html's boot script).
 document.documentElement.dataset.codeStarted = 'true';
 
 debug.log('Starting…');
 
 const BENCHMARK_GPU_ESTIMATE_BYTES_PER_POINT = 28;
 const MEBIBYTE = 1024 * 1024;
+
+/**
+ * Edges a millisecond one pass of `forwardEdgeRows` walks, before this page
+ * has timed one (`knnRowReader`): about 100,000, measured in Node on an
+ * Apple M-series laptop (20M edges: 183 ms for a 65,536-cell frontier). A
+ * prior replaced by the first pass's own rate, never a limit.
+ */
+const KNN_SCAN_EDGES_PER_MS = 100_000;
 
 function estimateBenchmarkGpuMemoryMB(pointCount) {
   return Number.isSafeInteger(pointCount) && pointCount >= 0
@@ -202,6 +225,9 @@ void sweepAbandonedTranscodes();
   });
 
   try {
+    // A browser older than the platform features Cellucid calls is told so
+    // now, not in the middle of its first opening.
+    requireBrowserFeatures();
     ThemeManager.init();
     publishWebBuildVersion();
 
@@ -228,10 +254,26 @@ void sweepAbandonedTranscodes();
     setDockableAccordions(initDockableAccordions({ sidebar }));
 
     // The notification center is created before the first yield below, so
-    // it is on the page by DOMContentLoaded and whatever fails or reports
-    // from here on has somewhere to be announced.
+    // whatever fails or reports from here on has somewhere to be announced.
+    // (This code starts at DOMContentLoaded: the page boot imports it then.)
     const notifications = getNotificationCenter();
     notifications.init();
+
+    // A subsample the link names (`subsample-url.js`): the linked dataset
+    // opens with exactly it, overriding fitting to the device; a share also
+    // applies to datasets opened next in this tab. A malformed one is said
+    // by name, and the dataset opens as if it named none.
+    try {
+      const linked = parseSubsampleUrlParameters(urlParams);
+      if (linked !== null) {
+        setNextCellSubsetRequest(linked);
+        if (linked.mode === 'all' || linked.percent !== undefined) {
+          setTabCellSubsetRequest(linked.mode === 'all' ? linked : { ...linked, strict: false });
+        }
+      }
+    } catch (error) {
+      notifications.error(failureText(error), { category: 'data' });
+    }
 
     // The renderer and benchmark controls are wired at the far end of this
     // bootstrap, past every await below. They are painted and offered long
@@ -246,28 +288,16 @@ void sweepAbandonedTranscodes();
       });
     }
 
-    const sessionSection = document.getElementById('session-section');
-    const sessionSummary = sessionSection?.querySelector(':scope > summary');
-    if (
-      !(sessionSection instanceof HTMLDetailsElement) ||
-      !(sessionSummary instanceof HTMLElement)
-    ) {
-      throw new Error('Onboarding requires the Session panel and its heading.');
-    }
-    initWelcomeModal({
-      // "Choose a dataset" leads to the data controls without choosing for
-      // the user: the Session panel opens. The Sample dataset dropdown is
-      // never focused or opened for them. A keyboard user's focus lands on the
-      // panel heading, one Tab before its controls; a pointer user's stays
-      // where the dialog leaves it, so nothing on the page is ringed.
-      onExplore({ fromKeyboard }) {
-        sessionSection.open = true;
-        if (fromKeyboard) sessionSummary.focus();
-      }
-    });
+    initWelcomeModal();
     if (shouldShowWelcome) {
       showWelcomeModal();
     }
+    // The analysis panel and windows are imported on demand: requested now,
+    // they load while the dataset opens, and the first view never waits for
+    // their code (the page bundle keeps them in chunks of their own).
+    const analysisCode = loadAppCode(() => import('./analysis/comparison-module.js'));
+    // Its failure is handled where the panel starts, further down.
+    analysisCode.catch(() => {});
     // The startup work before the first network wait ran as one task of
     // ~90 ms (module evaluation, the WebGL programs, the interface). It
     // yields to the event loop between its stages, so the page paints and
@@ -289,9 +319,14 @@ void sweepAbandonedTranscodes();
     let ui = null;
     let sidebarLayout = null;
     let comparisonModule = null;
+    /** Unwires the page from the memory model (`app/page-memory.js`), once wired. */
+    let stopPageMemory = null;
     // The owner of every dataset change (`createLatestDatasetReloadCoordinator`),
     // once it exists.
     let datasetReloadCoordinator = null;
+    // The owner of the live dataset publication's continuations
+    // (`createLatestDatasetPublicationContinuationOwner`), once it exists.
+    let datasetPublicationOwner = null;
     let applicationRetired = false;
     let stopPerfMonitoring = () => {};
 
@@ -316,6 +351,8 @@ void sweepAbandonedTranscodes();
     // valid while the later UI and analysis owners are adopted, and always
     // fences the render loop and releases WebGL synchronously before its
     // returned task waits for asynchronous child teardown.
+    /** Whether the application is torn down because the page is left. */
+    let pageLeaving = false;
     destroyApplication = createStableTerminalDestroy({
       closeAdmission: () => {
         applicationRetired = true;
@@ -331,18 +368,30 @@ void sweepAbandonedTranscodes();
         ...(datasetReloadCoordinator === null
           ? []
           : [() => datasetReloadCoordinator.retire()]),
+        // So does the work of the dataset on screen (its first frame to
+        // record, its reads): its publication ends with the page's.
+        ...(datasetPublicationOwner === null
+          ? []
+          : [() => datasetPublicationOwner.retire()]),
+        // Nor can a reader worker that never leaves: every one still leaving,
+        // or ended from now on, is ended from outside. A page being left
+        // ends its workers itself, so a leaving one keeps what it fetched
+        // until then.
+        ...(pageLeaving ? [] : [() => retireAnnDataReaderWorkers()]),
         () => stopPerfMonitoring(),
         ...(comparisonModule === null
           ? []
           : [() => comparisonModule.destroy()]),
         ...(ui === null ? [] : [() => ui.destroy()]),
         ...(sidebarLayout === null ? [] : [() => sidebarLayout.destroy()]),
+        ...(stopPageMemory === null ? [] : [() => stopPageMemory()]),
         () => viewer.dispose()
       ],
       failureMessage: 'Application teardown was incomplete.'
     });
     function retireApplicationOnPageHide(event) {
       if (event.persisted === true) return;
+      pageLeaving = true;
       void destroyApplication().catch(error => {
         console.error('[Main] Application teardown failed:', error);
       });
@@ -356,20 +405,18 @@ void sweepAbandonedTranscodes();
     sidebarLayout = initSidebarLayout({ documentOwner: document, viewer });
 
     const state = createDataState({ viewer, labelLayer });
+    // A matrix read after its map: its pass said, its genes read on arrival.
+    installMatrixShareNotices(state);
 
-    // A page left hidden for ten minutes gives back the positions and GPU
-    // geometry of every representation no view shows; they load again when
-    // shown.
-    const HIDDEN_RELEASE_MS = 10 * 60 * 1000;
-    let hiddenReleaseTimer = null;
+    // The page's side of the memory model (`app/page-memory.js`): other
+    // Cellucid pages of this origin, what a hidden or frozen page gives back,
+    // and the notice when memory runs short.
+    stopPageMemory = initPageMemory({ notifications });
+    // How many times the page was hidden: an opening measured across one is
+    // not measured (`data/opening-cost.js`).
+    let pageHiddenCount = 0;
     document.addEventListener('visibilitychange', () => {
-      clearTimeout(hiddenReleaseTimer);
-      hiddenReleaseTimer = null;
-      if (document.visibilityState === 'hidden') {
-        hiddenReleaseTimer = setTimeout(() => {
-          state.dimensionManager?.releaseUnderPressure?.();
-        }, HIDDEN_RELEASE_MS);
-      }
+      if (document.visibilityState === 'hidden') pageHiddenCount += 1;
     });
     debug.log('[Main] State created successfully');
 
@@ -463,7 +510,7 @@ void sweepAbandonedTranscodes();
         );
       }
       console.error('[GitHubAuth] Redirect completion failed:', error);
-      notifications.error(error.message, {
+      notifications.error(failureText(error), {
         category: 'annotation',
         duration: 8000
       });
@@ -471,6 +518,15 @@ void sweepAbandonedTranscodes();
 
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
+    // Unsaved highlights survive a reload: a draft per dataset in this
+    // browser, offered when the dataset opens again (`highlight-draft.js`).
+    const highlightDraft = createHighlightDraft({
+      state,
+      notifications,
+      datasetKey: () => dataSourceManager.getCurrentDatasetId?.() ?? null,
+      datasetName: () => dataSourceManager.getCurrentMetadata?.()?.name ?? null
+    });
+    window.addEventListener('pagehide', () => { void highlightDraft.flush(); });
     datasetReloadCoordinator = createLatestDatasetReloadCoordinator(
       () => {
         const source = dataSourceManager.activeSource;
@@ -500,7 +556,15 @@ void sweepAbandonedTranscodes();
     // discarded behind it. When two startup intents resolve, the later one is
     // the selection, exactly as successive switches would have left it.
     let startupSelection = null;
-    function selectStartupDataset(sourceType, datasetId, loadMethod) {
+    /**
+     * @param {string} sourceType
+     * @param {string} datasetId
+     * @param {string} loadMethod
+     * @param {ReadonlyArray<{id: string, name: string}>|null} [listed] - The
+     *   source's listing it was chosen from: the opening is labelled with the
+     *   name the dataset is listed under (the Dataset box's), not its id.
+     */
+    function selectStartupDataset(sourceType, datasetId, loadMethod, listed = null) {
       for (const [label, value] of [
         ['source type', sourceType],
         ['id', datasetId],
@@ -512,7 +576,12 @@ void sweepAbandonedTranscodes();
           );
         }
       }
-      startupSelection = Object.freeze({ datasetId, loadMethod, sourceType });
+      const name = listed?.find(dataset => dataset.id === datasetId)?.name ?? null;
+      startupSelection = Object.freeze(
+        typeof name === 'string' && name.length > 0
+          ? { datasetId, loadMethod, name, sourceType }
+          : { datasetId, loadMethod, sourceType }
+      );
       debug.log(
         `[Main] Startup dataset selection: ${sourceType}/${datasetId}`
       );
@@ -566,15 +635,44 @@ void sweepAbandonedTranscodes();
 
     // Check if a viewer host (Python, Jupyter or R) opened this page
     let viewerHostSource = null;
+    // What the person makes, published to the host (app/viewer-host-results.js).
+    let viewerHostResults = null;
+    /** The open cells grown or cut in place (`open-cells-resize.js`), once the UI is up. */
+    let openCellsResize = null;
+    /**
+     * The progressive opening growing now: its source and its publication's
+     * signal. A page put in the back/forward cache ends its reader (the
+     * growth step under way ends as a cancellation); back, growth resumes
+     * from the cells open (`grow` skips the steps reached).
+     */
+    let resumableGrowth = null;
+    window.addEventListener('pageshow', event => {
+      if (event.persisted !== true || resumableGrowth === null || openCellsResize === null) return;
+      const { shown, signal } = resumableGrowth;
+      if (signal.aborted || shown !== shownAnnDataSource() || openCellsResize.growing) return;
+      const target = shown.getCellSubset?.()?.growth?.target ?? null;
+      if (target !== null && state.pointCount < target) void openCellsResize.grow(shown, signal);
+    });
+    /** The AnnData source of the dataset shown, or null. */
+    const shownAnnDataSource = () => {
+      const sourceType = dataSourceManager.getCurrentSourceType?.() ?? null;
+      const datasetId = dataSourceManager.getCurrentDatasetId?.() ?? null;
+      if (sourceType === null || datasetId === null) return null;
+      return dataSourceManager.getSource(sourceType)?.getAnnDataSource?.(datasetId) ?? null;
+    };
     if (inViewerHost) {
       debug.log('[Main] Detected a viewer host, initializing the viewer channel...');
       viewerHostSource = createViewerHostBridgeDataSource(viewerHostConfig);
       dataSourceManager.registerSource('jupyter', viewerHostSource);
 
+      // A notebook widget's viewer waits for the widget to connect it: the
+      // kernel answers between cells, so this wait has no deadline.
+      startup.enter('health');
+      await viewerHostSource.connectHost();
       const viewerHostInitialized = await startup.step(
         'health',
         "the viewer's host",
-        () => viewerHostSource.initialize()
+        signal => viewerHostSource.initialize({ signal })
       );
       if (viewerHostInitialized !== true) {
         throw new Error(
@@ -633,6 +731,24 @@ void sweepAbandonedTranscodes();
             document.body.appendChild(overlay);
           }
           overlay.style.display = 'block';
+          // The last frame stays as an image; everything that drew it goes
+          // (the renderer and its WebGL context, the dataset's reader and
+          // caches, every worker): a stopped viewer holds one picture.
+          const still = document.createElement('img');
+          const bounds = canvas.getBoundingClientRect();
+          still.alt = 'The last view of the stopped viewer';
+          still.src = canvas.toDataURL('image/png');
+          still.style.position = 'fixed';
+          still.style.left = `${bounds.left}px`;
+          still.style.top = `${bounds.top}px`;
+          still.style.width = `${bounds.width}px`;
+          still.style.height = `${bounds.height}px`;
+          overlay.appendChild(still);
+        });
+        attempt(() => {
+          void destroyApplication()
+            .then(() => viewerHostSource.destroy())
+            .catch(error => reportViewerHostConsoleError('[Main] A stopped viewer could not let go of its memory:', error));
         });
         for (const failure of failures) {
           reportViewerHostConsoleError(
@@ -844,7 +960,8 @@ void sweepAbandonedTranscodes();
       selectStartupDataset(
         'jupyter',
         viewerHostDatasetId,
-        DATA_LOAD_METHODS.VIEWER_HOST_AUTO
+        DATA_LOAD_METHODS.VIEWER_HOST_AUTO,
+        viewerHostDatasets
       );
     }
 
@@ -876,7 +993,8 @@ void sweepAbandonedTranscodes();
         selectStartupDataset(
           'remote',
           remoteDatasetId,
-          DATA_LOAD_METHODS.REMOTE_URL_PARAM
+          DATA_LOAD_METHODS.REMOTE_URL_PARAM,
+          remoteDatasets
         );
       } catch (error) {
         failStartupData(
@@ -985,7 +1103,8 @@ void sweepAbandonedTranscodes();
               selectStartupDataset(
                 'remote',
                 remoteDatasetId,
-                DATA_LOAD_METHODS.SERVER_AUTO
+                DATA_LOAD_METHODS.SERVER_AUTO,
+                datasets
               );
             }
           }
@@ -1011,6 +1130,12 @@ void sweepAbandonedTranscodes();
       && requestedDataset === null
       && (sourceParam === null || sourceParam === 'local-demo')
       && startupSelection === null;
+    // The default sample is asked of its catalog now and awaited only once
+    // the interface is live, just before startup loads it: the data controls
+    // never wait for a list of samples the person may not want (a file of
+    // their own, a link or a dropped folder open from the first moment), and
+    // a choice they make while the catalog answers is the one that opens.
+    let defaultSample = null;
     if (useDefaultDemo) {
       const localDemoSource = dataSourceManager.getSource('local-demo');
       if (
@@ -1022,40 +1147,14 @@ void sweepAbandonedTranscodes();
           'Default sample startup requires the registered catalog default owner.'
         );
       }
-      const sampleCatalog =
-        localDemoSource.catalogUrl ?? 'the sample catalog';
-      let demoCatalogAvailable = false;
-      try {
-        demoCatalogAvailable = await startup.step(
-          'catalog',
-          sampleCatalog,
-          () => localDemoSource.isAvailable()
-        );
-      } catch (error) {
-        if (!(error instanceof Error)) {
-          throw new TypeError(
-            'Default sample catalog availability rejected with a non-Error value.'
-          );
-        }
-        // An unreachable catalog only leaves startup without a default; a
-        // stalled one is a startup failure that names where it stopped.
-        if (error.code === STARTUP_STALL_CODE) throw error;
-        debug.log(
-          `[Main] Default sample catalog is unavailable: ${error.message}`
-        );
-      }
-      if (demoCatalogAvailable) {
-        const defaultDatasetId = await startup.step(
-          'catalog',
-          sampleCatalog,
-          () => localDemoSource.getDefaultDatasetId()
-        );
-        selectStartupDataset(
-          'local-demo',
-          defaultDatasetId,
-          DATA_LOAD_METHODS.DEFAULT_DEMO
-        );
-      }
+      const answer = Promise.resolve().then(() => localDemoSource.isAvailable());
+      // Awaited below; a failure is handled there.
+      answer.catch(() => {});
+      defaultSample = {
+        catalog: localDemoSource.catalogUrl ?? 'the sample catalog',
+        answer,
+        defaultDatasetId: () => localDemoSource.getDefaultDatasetId()
+      };
     }
 
     // A data link in the query (?data=): GitHub, CELLxGENE, GEO, any web
@@ -1117,7 +1216,8 @@ void sweepAbandonedTranscodes();
         selectStartupDataset(
           'link',
           linkDatasetId,
-          DATA_LOAD_METHODS.DATA_URL_PARAM
+          DATA_LOAD_METHODS.DATA_URL_PARAM,
+          linkConnection.datasets
         );
       } catch (error) {
         failStartupData(
@@ -1133,7 +1233,9 @@ void sweepAbandonedTranscodes();
           'Data link startup requires the address bar.'
         );
       }
-      dataLinkInput.value = linkConnection.locator;
+      // The link as it is read, access key included: the address bar and
+      // this field are the two places it is kept.
+      dataLinkInput.value = dataSourceManager.getSource('link').getAddressLocator();
     }
 
     // Check URL parameters for dataset selection
@@ -1190,7 +1292,7 @@ void sweepAbandonedTranscodes();
     let activeRuntimeStage = null;
     const runtimeRetirementOwner =
       createDatasetRuntimeRetirementOwner();
-    const datasetPublicationOwner =
+    datasetPublicationOwner =
       createLatestDatasetPublicationContinuationOwner();
     let datasetPublicationGeneration = 0;
     let activeDatasetPublication = null;
@@ -1328,6 +1430,7 @@ void sweepAbandonedTranscodes();
       state.setFieldLoader(null);
       state.setVarFieldLoader(null);
       state.initVarData({ fields: [] });
+      state.beginGeneListing(false);
       state.setVectorFieldManager(null);
       state.publishDatasetMapping({ mapping: null, candidates: null, origin: null });
       state.initScene(new Float32Array(), { fields: [], count: 0 });
@@ -1416,18 +1519,17 @@ void sweepAbandonedTranscodes();
         return Promise.reject(signal.reason);
       }
       return new Promise((resolve, reject) => {
-        const onSuperseded = () => {
+        const stopWaiting = onAbort(signal, () => {
           discardLate();
           reject(signal.reason);
-        };
-        signal.addEventListener('abort', onSuperseded, { once: true });
+        });
         work.then(
           value => {
-            signal.removeEventListener('abort', onSuperseded);
+            stopWaiting();
             resolve(value);
           },
           error => {
-            signal.removeEventListener('abort', onSuperseded);
+            stopWaiting();
             reject(error);
           }
         );
@@ -1568,11 +1670,13 @@ void sweepAbandonedTranscodes();
             storedOutlierLatentKey: generation.obsFields.stored_outlier_latent_key,
           }
         );
-        const varFieldLoader = generation.geneList
+        // The genes' loader needs no gene name: the list itself is read
+        // after the first view (`DataState.listPublishedGenes`).
+        const varFieldLoader = generation.identity.stats.n_genes > 0
           ? createVarFieldLoader(
               getGeneListUrl(baseUrl),
               {
-                pointCount: generation.geneList.n_points,
+                pointCount: generation.identity.stats.n_cells,
                 // How its genes' values are transformed and which are highly
                 // variable, as the mapping it opens with says.
                 mapping: varLoaderMappingOf(mapping.mapping),
@@ -1598,6 +1702,11 @@ void sweepAbandonedTranscodes();
           fieldLoader,
           generation,
           positions: positionStage.positions,
+          // Which of the dataset's cells were opened (a subsample's, or
+          // every cell): published with the scene.
+          cellIdentity: anndataCellIdentity(baseUrl, candidateAnnDataBinding),
+          // The order levels of detail and progressive analyses take them in.
+          cellPriority: anndataCellPriority(baseUrl, candidateAnnDataBinding),
           runtimeKind: 'dataset',
           defaultDimension: positionStage.defaultDimension,
           varFieldLoader,
@@ -1710,20 +1819,65 @@ void sweepAbandonedTranscodes();
       state.setDimensionManager(dimensionManager);
       state.setFieldLoader(stage.fieldLoader);
       state.setVarFieldLoader(stage.varFieldLoader);
-      // A dataset without genes publishes no gene list; it still has a var
-      // inventory, an empty one, so everything that reads it (session
-      // capture, filters, user-defined fields) treats it like any dataset.
-      state.initVarData(stage.generation.geneList ?? { fields: [] });
+      // The var inventory is published empty: the first view never waits
+      // for gene names. A dataset with genes lists them as soon as it is
+      // published (`listPublishedGenes` below); until then its gene list is
+      // pending, and everything that reads it (session capture, filters,
+      // user-defined fields) treats it as a dataset whose genes are being
+      // read.
+      state.initVarData({ fields: [] });
+      state.beginGeneListing(stage.varFieldLoader !== null);
       state.initScene(positions, obs);
+      if (stage.cellIdentity !== null) state.setCellIdentity(stage.cellIdentity);
+      if (stage.cellPriority !== null) state.setCellPriority(stage.cellPriority);
       state.clearActiveField();
       state.clearActivePageHighlights();
       state.setVectorFieldManager(stage.vectorFieldManager);
       state.publishDatasetMapping(stage.mapping);
       activeRuntimeStage = stage;
+      listPublishedGenes(stage);
+      completePublishedMapping(stage);
 
       return restorationPublication !== null
         ? requireRestorablePublication(restorationPublication)
         : publishDatasetReplacement(stage, previousDimensionManager);
+    }
+
+    /**
+     * Read the gene list of a dataset just published (a new one, or one
+     * restored after a failed change; `DataState.listPublishedGenes`).
+     * Everything the first view draws is in place already: nothing it needs
+     * waits for this read. Everything that names genes shows them loading
+     * until `genes:listed`.
+     */
+    function listPublishedGenes(stage) {
+      if (!state.areGenesPending()) return;
+      void state.listPublishedGenes().catch(error => {
+        if (activeRuntimeStage !== stage) return;
+        console.error('[Main] The gene list could not be read:', error);
+        notifications.error(
+          `The dataset is open, but its gene names could not be read: ${error instanceof Error ? error.message : String(error)}`,
+          { category: 'data' }
+        );
+      });
+    }
+
+    /**
+     * Complete the data mapping's catalog of a dataset just published (or
+     * grown or reordered in place): whether each expression matrix holds
+     * counts is read from its values, so never on the first view's path
+     * (`BaseAnnDataAdapter.completeMappingCandidates`). Adopted while the
+     * stage is still the one shown; the mapping's choices never change.
+     */
+    function completePublishedMapping(stage) {
+      if (stage.mapping?.candidates?.kind !== 'anndata') return;
+      void loadCompleteMappingCandidates(`${stage.baseUrl}${MAPPING_CANDIDATES_ROUTE}`).then(candidates => {
+        if (activeRuntimeStage !== stage) return;
+        state.adoptMappingCandidates(candidates);
+      }).catch(error => {
+        if (activeRuntimeStage !== stage) return;
+        console.warn('[Main] Whether the expression matrices hold counts could not be read:', error);
+      });
     }
 
     function commitSyntheticRuntimeStage(
@@ -1754,6 +1908,7 @@ void sweepAbandonedTranscodes();
       }
       const previousDimensionManager = dimensionManager;
       retireDatasetInteractions();
+      state.beginGeneListing(false);
       state.initSyntheticScene({
         positions: stage.positions,
         colors: stage.colors,
@@ -1815,7 +1970,7 @@ void sweepAbandonedTranscodes();
       }
       publication.assertCurrent();
       if (publication.generation !== datasetPublicationGeneration) {
-        throw createDatasetReloadSupersededError(
+        throw cancelled('superseded',
           'Dataset continuation was superseded by a newer runtime publication.'
         );
       }
@@ -1912,12 +2067,6 @@ void sweepAbandonedTranscodes();
           debug.log(
             `[Main] Published dataset "${publication.stage.generation.identity.id}"`
           );
-          if (publication.stage.generation.geneList) {
-            debug.log(
-              `Loaded a gene list of ` +
-              `${formatCountOf(publication.stage.generation.geneList.fields.length, 'gene')}.`
-            );
-          }
           const publishedGraph = publication.stage.generation.connectivitySummary;
           if (publishedGraph) {
             debug.log(publishedGraph.n_edges === null
@@ -1925,6 +2074,11 @@ void sweepAbandonedTranscodes();
               : `Loaded a neighbour graph of ${formatCountOf(publishedGraph.n_edges, 'edge')}.`);
           }
           ui.refreshDatasetUI(activeMetadata);
+          // Highlights of this dataset not saved in a session, kept from
+          // an earlier visit: offered back.
+          void highlightDraft.datasetOpened().catch(error => {
+            console.warn('[Main] Reading the highlight draft failed:', error);
+          });
           // The notebook learns the mapping each dataset opens with.
           if (viewerHostSource !== null && state.getDataMapping() !== null) {
             void viewerHostSource.notifyDataMapping({
@@ -1935,12 +2089,21 @@ void sweepAbandonedTranscodes();
               console.error('[Main] Viewer host data-mapping report failed:', error);
             });
           }
+          // Each dataset opened starts a new epoch of results for the host:
+          // its own dataset's, or none while another one is open.
+          if (viewerHostResults !== null) {
+            void viewerHostResults.datasetOpened().catch(error => {
+              console.error('[Main] Sending the results of the opened dataset to the host failed:', error);
+            });
+          }
           // The cell count is the one thing a sensible opening point size
           // depends on, and it is known here for the first time. Applied before
           // `restoreAdvertisedDatasetState`, so a saved session or a published
-          // preset still overrides it.
+          // preset still overrides it. A progressive opening's first view is
+          // drawn as the cells it grows to will be (`open-cells-resize.js`).
           ui.applyDatasetRenderDefaults(
-            publication.stage.generation.identity.stats.n_cells,
+            shownAnnDataSource()?.getCellSubset?.()?.growth?.target
+              ?? publication.stage.generation.identity.stats.n_cells,
             publication.stage.generation.identity.embeddings.default_dimension
           );
         },
@@ -1996,6 +2159,7 @@ void sweepAbandonedTranscodes();
       const activationKeys = [
         'datasetId',
         'loadMethod',
+        'name',
         'source',
         'sourceType',
         'startup',
@@ -2003,7 +2167,7 @@ void sweepAbandonedTranscodes();
       ];
       const activationShapeMessage =
         'Dataset activation must contain exactly datasetId, loadMethod, ' +
-        'source, sourceType, startup, and transaction.';
+        'name, source, sourceType, startup, and transaction.';
       if (
         selection === null ||
         typeof selection !== 'object' ||
@@ -2039,11 +2203,15 @@ void sweepAbandonedTranscodes();
       const {
         datasetId,
         loadMethod,
+        name: datasetName,
         source,
         sourceType,
         startup: isStartupLoad,
         transaction: reloadTransaction
       } = selection;
+      if (datasetName !== null && (typeof datasetName !== 'string' || datasetName.length === 0)) {
+        throw new TypeError('Dataset activation name must be a non-empty string or null.');
+      }
       if (typeof isStartupLoad !== 'boolean') {
         throw new TypeError('Dataset activation startup must be a boolean.');
       }
@@ -2060,6 +2228,11 @@ void sweepAbandonedTranscodes();
       let selectionStage = null;
       let runtimeStage = null;
       let urlPublication = null;
+      // When the page starts showing the cells read (their GPU stores made
+      // next): what showing a cell costs is measured from here to their
+      // first frame (`data/opening-cost.js`), while the page stays shown.
+      let showingStartedAt = null;
+      let hiddenBeforeShowing = 0;
 
       try {
         // A newer dataset change ends this step at once: a catalog dataset
@@ -2073,7 +2246,7 @@ void sweepAbandonedTranscodes();
         // and then names the reads still open.
         selectionStage = await stagePhases.step(
           'dataset',
-          `the host of dataset "${datasetId}"`,
+          datasetName === null ? 'the host of the dataset' : `the host of "${datasetName}"`,
           () => untilSuperseded(
             dataSourceManager.stageDatasetSelection(
               sourceType,
@@ -2136,6 +2309,8 @@ void sweepAbandonedTranscodes();
         // itself, with its own message.
         if (Number.isSafeInteger(stagedPointCount) && stagedPointCount > 0) {
           step('Allocating the GPU memory for the cells');
+          showingStartedAt = performance.now();
+          hiddenBeforeShowing = document.visibilityState === 'hidden' ? -1 : pageHiddenCount;
           viewer.prepareDataStores(stagedPointCount, stagedDimension);
           // The publication runs in a task of its own.
           await yieldToMacrotask();
@@ -2306,6 +2481,22 @@ void sweepAbandonedTranscodes();
           }
         });
       }
+      // What showing a cell costs this page, for the next opening's first
+      // view: these cells, from their GPU stores to their first frame.
+      if (showingStartedAt !== null) {
+        const shownCells = state.pointCount;
+        void recordFirstFrame({
+          cells: shownCells,
+          startedAt: showingStartedAt,
+          afterNextFrame: runAfterNextFrame,
+          // A page hidden meanwhile drew no frame: its wait is not theirs.
+          drawn: () => pageHiddenCount === hiddenBeforeShowing &&
+            viewer.hasRendererStats('live') && viewer.getRendererStats('live').visiblePoints > 0,
+          signal: publication.signal
+        }).then(ms => {
+          if (ms !== null) debug.log(`[Main] ${formatCountOf(shownCells, 'cell')} shown: first frame ${ms.toFixed(0)} ms after their GPU stores`);
+        });
+      }
       let managerListenerError = null;
       try {
         dataSourceManager.publishDatasetSelection(managerPublication);
@@ -2328,7 +2519,7 @@ void sweepAbandonedTranscodes();
         publication.isCurrent() !== true
       ) {
         return handleDatasetReloadFailure({
-          error: createDatasetReloadSupersededError(
+          error: cancelled('superseded',
             'Dataset reload was superseded during UI synchronization.'
           ),
           transaction: publication,
@@ -2406,8 +2597,16 @@ void sweepAbandonedTranscodes();
         `[Main] Published dataset state outcome: ` +
         `${settledStateOutcome.status}`
       );
-      return synchronizationOutcome.status === 'ready' ||
+      const ready = synchronizationOutcome.status === 'ready' ||
         synchronizationOutcome.status === 'ready-ui-error';
+      // A progressive opening grows in place, in the background, to the
+      // cells it was asked for; a newer dataset change ends it.
+      const shown = shownAnnDataSource();
+      if (ready && shown?.getCellSubset?.()?.growth != null && openCellsResize !== null) {
+        resumableGrowth = { shown, signal: publication.signal };
+        void openCellsResize.grow(shown, publication.signal);
+      }
+      return ready;
     }
 
     /**
@@ -2418,31 +2617,33 @@ void sweepAbandonedTranscodes();
      * startup), so the opening only lets go of it.
      */
     async function reloadActiveDatasetShown(selection) {
+      // Named as the Dataset box names it (never by its id: a link's is its
+      // encoded address); a dataset no listing named yet is named once its
+      // source lists it.
       const opening = beginOpening({
-        title: selection.datasetId,
+        title: selection.name ?? 'Dataset',
         step: 'Opening the dataset',
         onCancel: () => selection.transaction.cancel()
       });
-      // Named as the dataset list names it, once that is read.
-      const source = selection.source ?? dataSourceManager.getSource(selection.sourceType);
-      Promise.resolve(source?.listDatasets?.())
-        .then(datasets => {
-          const name = datasets?.find?.(dataset => dataset.id === selection.datasetId)?.name;
-          if (typeof name === 'string') opening.rename(name);
-        })
-        .catch(() => {});
+      if (selection.name === null) {
+        const source = selection.source ?? dataSourceManager.getSource(selection.sourceType);
+        Promise.resolve(source?.listDatasets?.())
+          .then(datasets => {
+            const name = datasets?.find?.(dataset => dataset.id === selection.datasetId)?.name;
+            if (typeof name === 'string') opening.rename(name);
+          })
+          .catch(() => {});
+      }
       // A newer choice replaces this change at once: the opening is left to
       // it (and so is the startup opening, when this change was startup's)
       // even while this change's own reads are still unwinding, which a
       // read that never answers would otherwise hold on screen.
       // (A malformed selection is refused by the reload itself.)
       const signal = selection?.transaction?.signal ?? null;
-      const letGo = () => {
+      const stopLettingGo = onAbort(signal, () => {
         opening.dismiss();
         if (selection.startup === true) startupOpening?.dismiss();
-      };
-      if (signal?.aborted) letGo();
-      else signal?.addEventListener('abort', letGo, { once: true });
+      });
       try {
         const ready = await reloadActiveDatasetInPlace(selection, {
           step: text => opening.step(text)
@@ -2454,7 +2655,7 @@ void sweepAbandonedTranscodes();
         opening.dismiss();
         throw error;
       } finally {
-        signal?.removeEventListener('abort', letGo);
+        stopLettingGo();
       }
     }
 
@@ -2584,7 +2785,7 @@ void sweepAbandonedTranscodes();
         emptyPublication.isCurrent() !== true
       ) {
         return handleDatasetReloadFailure({
-          error: createDatasetReloadSupersededError(
+          error: cancelled('superseded',
             'Dataset clear was superseded during UI synchronization.'
           ),
           transaction: emptyPublication,
@@ -2656,7 +2857,7 @@ void sweepAbandonedTranscodes();
         || Array.isArray(source)
         || Object.getPrototypeOf(source) !== Object.prototype
         || Object.keys(source).sort().join(',') !==
-          'alpha,colors,dimension,outlierQuantiles,outlierThreshold,positions'
+          'alpha,colors,dimension,outlierQuantiles,outlierThreshold,positions,writes'
         || !(source.positions instanceof Float32Array)
         || ![1, 2, 3].includes(source.dimension)
         || source.positions.length % source.dimension !== 0
@@ -2686,6 +2887,7 @@ void sweepAbandonedTranscodes();
           outlierQuantiles: source.outlierQuantiles,
           outlierThreshold: source.outlierThreshold,
         },
+        writes: source.writes,
       });
     }
 
@@ -2698,12 +2900,21 @@ void sweepAbandonedTranscodes();
       sidebar,
       dataSourceManager
     });
+    // Highlights a session file holds (saved or restored) are no unsaved
+    // draft: the draft of them goes.
+    sessionSerializer.setSessionFileObserver({
+      saving: () => highlightDraft.sessionSaving(),
+      restored: () => highlightDraft.sessionRestored()
+    });
+    // A graphics reset keeps everything in the page; the session is
+    // captured at the loss in case the context does not come back.
+    keepSessionThroughGraphicsReset({ viewer, sessionSerializer, notifications });
     let activePublishedStateController = null;
     let activePublishedStateTask = null;
 
     async function cancelPublishedDatasetStateAndWait() {
       const task = activePublishedStateTask;
-      activePublishedStateController?.abort();
+      cancel(activePublishedStateController, 'superseded', 'The published dataset state was superseded.');
       await sessionSerializer.cancelRestoreAndWait();
       if (task !== null) {
         await task;
@@ -2728,12 +2939,7 @@ void sweepAbandonedTranscodes();
       }
 
       const controller = new AbortController();
-      const relayAbort = () => controller.abort();
-      if (signal.aborted) {
-        controller.abort();
-      } else {
-        signal.addEventListener('abort', relayAbort, { once: true });
-      }
+      const stopRelay = onAbort(signal, () => controller.abort(abortReason(signal)));
       activePublishedStateController = controller;
 
       const task = (async () => {
@@ -2780,7 +2986,7 @@ void sweepAbandonedTranscodes();
             status: 'ready-state-error'
           };
         } finally {
-          signal.removeEventListener('abort', relayAbort);
+          stopRelay();
         }
       })();
       activePublishedStateTask = task;
@@ -2801,8 +3007,10 @@ void sweepAbandonedTranscodes();
     if (viewerHostSource) {
       viewerHostSource.onMessage(async message => {
         if (message.type !== 'requestSessionBundle') return;
+        const saved = highlightDraft.sessionSaving();
         const bundle = await sessionSerializer.createSessionBundle();
         viewerHostSource.sendSessionBundle(message.requestId, bundle);
+        await saved();
       });
     }
 
@@ -2815,21 +3023,90 @@ void sweepAbandonedTranscodes();
       },
       clearActiveDataset: clearActiveDatasetInPlace,
       reloadActiveDataset: reloadActiveDatasetShown,
+      resizeOpenCells: options => {
+        if (openCellsResize === null) throw new Error('The open cells cannot be resized before the app has started.');
+        return openCellsResize.resize(options);
+      },
       datasetChanges: datasetReloadCoordinator,
       sessionSerializer,
       dataSourceManager,
       viewerHostSource
     });
     window._cellucidUi = ui;
+    // The data controls are live from here: a dataset the person chooses
+    // from now on decides what startup opens (`defaultSample`).
+    const controlsLiveAt = datasetReloadCoordinator.actionSequence;
+    // The open cells grown or cut in place: Apply of a larger or smaller
+    // share of the same method and seed, and a progressive opening's steps
+    // (`open-cells-resize.js`).
+    openCellsResize = createOpenCellsResize({
+      state,
+      viewer,
+      notify: (text, { level = 'info', action = null } = {}) => notifications[level](text, {
+        category: 'data',
+        ...(action === null ? {} : { action }),
+      }),
+      onProgress: progress => ui.showOpenCellsGrowth?.(progress),
+      runtime: {
+        // The cells added: rows of an embedding's positions, in the frame
+        // shown (`loadCoordinateRows`), and the dataset's generation again.
+        readPositionRows: ({ path, dimension, rows, signal }) => loadCoordinateRows('embedding', `${DATASET_BASE_URL}${path}`, { dimension, rows, signal }),
+        loadGeneration: ({ expectedIdentityId, signal }) => loadDatasetGeneration(DATASET_BASE_URL, { expectedIdentityId, signal }),
+        stage: () => activeRuntimeStage,
+        adoptStage: stage => {
+          activeRuntimeStage = stage;
+          positions = stage.positions;
+          obs = stage.generation.obsFields;
+        },
+        retireKeptViews,
+        retireSelections: retireInProgressHighlightSelection,
+        keptViews: sessionSerializer === null
+          ? null
+          : { capture: () => sessionSerializer.captureViewCarry(), restore: record => sessionSerializer.restoreViewCarry(record) },
+        connectivity: {
+          getConnectivityGraph: connectivityRuntimeOwner.getConnectivityGraph,
+          replaceConnectivityGraph: connectivityRuntimeOwner.replaceConnectivityGraph,
+          loadSummary: (url, signal) => loadConnectivitySummary(url, { signal })
+        },
+        // Analyses' cached cell lists and gene columns are of the earlier
+        // cells; their windows stay, their results marked stale.
+        invalidateAnalysisData: () => window._comparisonModule?.dataLayer?.resetForDatasetReload?.(),
+        loadMappingCandidates: signal => loadMappingCandidates(`${DATASET_BASE_URL}${MAPPING_CANDIDATES_ROUTE}`, { signal }),
+        completeMappingCandidates: () => completePublishedMapping(activeRuntimeStage),
+        adoptMetadata: metadata => dataSourceManager.adoptResizedMetadata(metadata),
+        afterResize: async () => {
+          ui.refreshOpenCells(dataSourceManager.getCurrentMetadata());
+          if (viewerHostResults !== null) await viewerHostResults.resync();
+        }
+      }
+    });
     // Every runtime publication so far reached no UI.
     ui.publishCellPresence(publicationHasCells(activeDatasetPublication));
 
     if (viewerHostSource !== null) {
+      const getCellIdentity = () => state.cellIdentity;
+      viewerHostSource.setCellIdentityProvider(getCellIdentity);
+      // The host's dataset, while the viewer shows it: a dataset the person
+      // opened instead is not the one the host's cell positions describe.
+      viewerHostSource.setShownDatasetProvider(() => (
+        dataSourceManager.getCurrentSourceType() === viewerHostSource.type
+          ? dataSourceManager.getCurrentDatasetId()
+          : null
+      ));
+      viewerHostResults = createViewerHostResults({
+        state,
+        viewerHostSource,
+        getCellIdentity
+      });
       const viewerHostCommandHandlers = createViewerHostCommandHandlers({
         state,
         viewer,
         refreshUi: ui.refreshUiAfterStateLoad,
-        reportDataMapping: report => viewerHostSource.notifyDataMapping(report)
+        reportDataMapping: report => viewerHostSource.notifyDataMapping(report),
+        getCellIdentity,
+        getShownHostDataset: () => viewerHostSource.getShownHostDataset(),
+        results: viewerHostResults,
+        getHostLabel: () => viewerHostSource.getHostLabel()
       });
       // Every mapping change reaches the notebook, except an answer to its
       // own setDataMapping, which the command handler sends with the request
@@ -2860,9 +3137,13 @@ void sweepAbandonedTranscodes();
     sessionSerializer.setCinematicCameraRef(ui.cinematicCamera);
     sessionSerializer.setFigureExportRef(ui.figureExport);
 
-    // Initialize Page Analysis / Comparison Module
+    // The analysis panel and windows start once their code has arrived
+    // (`analysisCode`), without holding the rest of startup. Sessions wait for
+    // them, so a session's analysis parts are taken and given only once they
+    // exist (`setAnalysisRefs`).
     const pageAnalysisSection = document.getElementById('page-analysis-section');
-    if (pageAnalysisSection) {
+    sessionSerializer.setAnalysisRefs(analysisCode.then(({ createComparisonModule }) => {
+      if (applicationRetired || pageAnalysisSection === null) return null;
       comparisonModule = createComparisonModule({
         state,
         container: pageAnalysisSection,
@@ -2870,13 +3151,16 @@ void sweepAbandonedTranscodes();
       });
       // Store reference for potential external access
       window._comparisonModule = comparisonModule;
-      // Allow session restore to reopen analysis windows once the module exists.
       const analysisWindowManager = comparisonModule.getAnalysisWindowManager();
-      sessionSerializer.setAnalysisRefs({
-        comparisonModule,
-        analysisWindowManager
-      });
-    }
+      return { comparisonModule, analysisWindowManager };
+    }).catch(error => {
+      console.error('[Main] The analysis tools could not load:', error);
+      notifications.error(
+        `The analysis tools could not load, so the ${PLACES.analysis.name} panel is empty. Reload the page to try again.`,
+        { category: 'analysis', title: 'Analysis unavailable' }
+      );
+      return null;
+    }));
 
     // Setup connectivity controls
     // NOTE: Handlers are ALWAYS set up so they work for datasets loaded dynamically (h5ad/zarr)
@@ -2902,49 +3186,10 @@ void sweepAbandonedTranscodes();
       let actualVisibleEdges = getTotalEdges();
 
       /**
-       * Validate one immutable SpatialIndex-owned LOD admission descriptor.
-       * Null is the exact full-detail contract.
-       *
-       * @param {object|null} membership
-       * @param {number} pointCount
-       * @param {number} dimensionLevel
-       * @returns {object|null}
-       */
-      function requireConnectivityLodMembership(
-        membership,
-        pointCount,
-        dimensionLevel
-      ) {
-        if (membership === null) return null;
-        if (
-          typeof membership !== 'object' ||
-          Array.isArray(membership) ||
-          Object.keys(membership).sort().join(',') !==
-            'admissionLevels,dimensionLevel,generationToken,indices,lodLevel,pointCount' ||
-          !Object.isFrozen(membership) ||
-          !(membership.admissionLevels instanceof Uint8Array) ||
-          membership.admissionLevels.length !== pointCount ||
-          !(membership.indices instanceof Uint32Array) ||
-          membership.indices.length > pointCount ||
-          membership.pointCount !== pointCount ||
-          membership.dimensionLevel !== dimensionLevel ||
-          !Number.isInteger(membership.lodLevel) ||
-          membership.lodLevel < 0 ||
-          membership.lodLevel >= 0xff ||
-          membership.generationToken === null ||
-          typeof membership.generationToken !== 'object'
-        ) {
-          throw new TypeError(
-            'Connectivity LOD requires one exact immutable admission owner.'
-          );
-        }
-        return membership;
-      }
-
-      /**
        * Resolve one exact compositional visibility owner.
        * An endpoint is visible only when its per-view transparency passes the
-       * scatter threshold and its current LOD admits the source ID.
+       * scatter threshold and its current level of detail draws it
+       * (`LodMembership`).
        *
        * @param {string} viewId - Exact live or snapshot view ID.
        * @param {number} dimensionLevel - Exact view dimension.
@@ -2981,10 +3226,9 @@ void sweepAbandonedTranscodes();
         }
 
         const pointCount = transparency.length;
-        const lodMembership = requireConnectivityLodMembership(
+        const lodMembership = requireLodMembership(
           viewer.getCurrentLodMembership(viewId, dimensionLevel),
-          pointCount,
-          dimensionLevel
+          { pointCount, dimensionLevel, owner: 'Connectivity level of detail' }
         );
 
         return Object.freeze({
@@ -3017,6 +3261,19 @@ void sweepAbandonedTranscodes();
         userEdgeLimit ?? CONNECTIVITY_DEFAULT_VISIBLE_TARGET,
         getTotalEdges()
       );
+      /**
+       * Set the person's edge preference (null: the default), and what a
+       * session records of the slider (`data-session-preference`,
+       * `state-serializer/ui-controls.js`): the preference, not the value the
+       * slider shows, whose range follows the visible edges of a graph that
+       * may not be read yet.
+       */
+      function setUserEdgeLimit(limit) {
+        userEdgeLimit = limit;
+        if (connectivityLimitInput) {
+          connectivityLimitInput.dataset.sessionPreference = String(limit ?? CONNECTIVITY_DEFAULT_VISIBLE_TARGET);
+        }
+      }
 
       /**
        * Update slider range based on visible edges.
@@ -3069,11 +3326,27 @@ void sweepAbandonedTranscodes();
        * Edge visibility is based on BOTH filter state AND point LOD.
        * Only edges where both endpoints pass filters AND are visible at current LOD are shown.
        */
+      /**
+       * What the shown graph holds on the page: its forward adjacency, and
+       * what showing K of its edges keeps (the shown-order prefix, the
+       * selection's buffers, each pane's records), all of it the working set
+       * while edges are shown or the k-NN tool uses the graph.
+       */
+      function connectivityWorkingBytes(edgeData) {
+        const memory = viewer.getConnectivityMemoryStats();
+        let bytes = memory.graphBytes + memory.selectionBytes;
+        for (const pane of memory.panes) bytes += pane.cpuBytes;
+        return Math.max(bytes, typedArrayBytes(edgeData));
+      }
+
       function applyEdgeLodLimit() {
         const activeViewId = state.getActiveViewId();
         // One stable user target: every pane shows the first
         // `currentEdgeLimit()` of its own visible edges.
         viewer.setEdgeVisibleTarget(currentEdgeLimit());
+        if (loadedEdgeData !== null) {
+          setWorkingSet('graph', connectivityWorkingBytes(loadedEdgeData), loadedEdgeData);
+        }
         const acceptedStats =
           viewer.getEdgeSelectionStatsForView(activeViewId);
         if (acceptedStats === null || acceptedStats.current !== true) {
@@ -3117,9 +3390,14 @@ void sweepAbandonedTranscodes();
       let edgeLoadOwner = null;
       let connectivityToggleGeneration = 0;
       let knnLoadPromise = null;
+      // The graph in use was read and checked once (its edges built: bounds,
+      // order, exact symmetry): `{generation, nCells, nEdges}`, kept after
+      // its edges are let go, so the k-NN tool, which reads rows from the
+      // file, never holds them (null until then, and for a replaced graph).
+      let checkedConnectivity = null;
 
       function createConnectivitySupersededError() {
-        return createDatasetReloadSupersededError(
+        return cancelled('superseded',
           'Connectivity edge loading was superseded by a newer dataset generation.'
         );
       }
@@ -3205,12 +3483,14 @@ void sweepAbandonedTranscodes();
         }
         connectivityToggleGeneration++;
         knnLoadPromise = null;
+        checkedConnectivity = null;
         edgesLoaded = false;
         loadedEdgeData = null;
+        setWorkingSet('graph', 0);
         publishedEdgeCount = null;
         activeConnectivityStatsViewId = null;
         actualVisibleEdges = 0;
-        userEdgeLimit = null;
+        setUserEdgeLimit(null);
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -3229,7 +3509,7 @@ void sweepAbandonedTranscodes();
 
       function synchronizeDatasetPublication() {
         actualVisibleEdges = getTotalEdges();
-        userEdgeLimit = null;
+        setUserEdgeLimit(null);
         if (connectivityCheckbox) {
           connectivityCheckbox.checked = false;
           connectivityCheckbox.disabled = false;
@@ -3328,9 +3608,13 @@ void sweepAbandonedTranscodes();
         updateSliderRange(actualVisibleEdges);
         applyEdgeLodLimit();
 
-        // The lifecycle and k-NN owner is the payload itself (no copy).
+        // The lifecycle and k-NN owner is the payload itself (no copy). While
+        // edges are shown or the k-NN tool uses it, it is drawn: counted in
+        // the working set, never as a cached copy (`memory-budget.js`).
         const publishedEdgeData = edgeData;
         loadedEdgeData = publishedEdgeData;
+        recordConnectivityCheck(edgeData);
+        setWorkingSet('graph', connectivityWorkingBytes(edgeData), edgeData);
         edgesLoaded = true;
         ui.showLoadedConnectivityEdges(edgeData.nEdges);
         debug.log(
@@ -3341,16 +3625,69 @@ void sweepAbandonedTranscodes();
         return publishedEdgeData;
       }
 
+      /** The graph in use was read and checked: what the k-NN tool needs of it. */
+      function recordConnectivityCheck(edgeData) {
+        checkedConnectivity = Object.freeze({
+          generation: `${datasetPublicationGeneration}:${connectivityGraphGeneration}`,
+          nCells: edgeData.nCells,
+          nEdges: edgeData.nEdges,
+        });
+      }
+
+      /**
+       * The k-NN tool's rows of a checked graph (`KnnRowSource.readRows`):
+       * from the file by row (`loadConnectivityRows`, the reader worker), or,
+       * while the page holds the graph's edges (shown in a view), from them
+       * (`forwardEdgeRows`: two passes over every edge) when that is
+       * cheaper. Each way is priced by its rate measured here (milliseconds
+       * a row from the file, edges a millisecond of a pass), the passes
+       * before their first by `KNN_SCAN_EDGES_PER_MS`; the file's first
+       * rows (the seed's) are always read, so a pass is never chosen
+       * against an unmeasured file.
+       */
+      function knnRowReader(rowsUrl, check) {
+        let fileMsPerRow = null;
+        let scanEdgesPerMs = KNN_SCAN_EDGES_PER_MS;
+        return async (cells, { signal }) => {
+          const held = loadedEdgeData;
+          const current = currentConnectivityCheck();
+          const usable = held !== null && current !== null && current.generation === check.generation &&
+            held.nCells === check.nCells && held.nEdges === check.nEdges;
+          if (usable && fileMsPerRow !== null && held.nEdges / scanEdgesPerMs < cells.length * fileMsPerRow) {
+            const started = performance.now();
+            const rows = await forwardEdgeRows(held, cells, { signal });
+            scanEdgesPerMs = held.nEdges / Math.max(1, performance.now() - started);
+            return rows;
+          }
+          const started = performance.now();
+          const rows = await loadConnectivityRows(rowsUrl, cells, { signal });
+          if (cells.length > 0) fileMsPerRow = (performance.now() - started) / cells.length;
+          return rows;
+        };
+      }
+
+      function currentConnectivityCheck() {
+        return checkedConnectivity !== null &&
+          checkedConnectivity.generation === `${datasetPublicationGeneration}:${connectivityGraphGeneration}`
+          ? checkedConnectivity
+          : null;
+      }
+
+      /**
+       * Let the shown edges go. The k-NN tool keeps its graph: it reads rows
+       * from the file, and the graph stays checked until it is replaced
+       * (`prepareDatasetReplacement`).
+       */
       function clearPublishedConnectivityEdges() {
         viewer.setShowConnectivity(false);
         viewer.clearEdgesV2();
-        viewer.clearKnnEdges();
         edgesLoaded = false;
         loadedEdgeData = null;
-        publishedEdgeCount = null;
+        setWorkingSet('graph', 0);
+        publishedEdgeCount = currentConnectivityCheck()?.nEdges ?? null;
         activeConnectivityStatsViewId = null;
         actualVisibleEdges = getTotalEdges();
-        userEdgeLimit = null;
+        setUserEdgeLimit(null);
         stopLodTracking();
         if (edgeVisibilityThrottleTimer !== null) {
           clearTimeout(edgeVisibilityThrottleTimer);
@@ -3444,7 +3781,7 @@ void sweepAbandonedTranscodes();
 
             } catch (err) {
               if (
-                isDatasetReloadSupersededError(err) ||
+                isCancellation(err) ||
                 toggleGeneration !== connectivityToggleGeneration
               ) {
                 notifications.dismiss(connNotifId);
@@ -3495,9 +3832,30 @@ void sweepAbandonedTranscodes();
             startLodTracking();
           } else {
             stopLodTracking();
+            // Edges off: their arrays go (the k-NN tool reads the file).
+            releaseUnusedConnectivityEdges();
           }
         });
       }
+
+      /**
+       * Let the neighbour graph's edges go once no view shows them: what the
+       * viewer built from them, and this page's hold. The k-NN tool never
+       * needs them (it reads rows from the file). The reader's adapter may
+       * keep a copy within its cache budget; showing the edges again reads
+       * it from there, or from the file.
+       */
+      function releaseUnusedConnectivityEdges() {
+        if (!edgesLoaded || connectivityCheckbox?.checked === true) return;
+        clearPublishedConnectivityEdges();
+      }
+      viewer.setKnnEdgeReleaseCallback(() => releaseUnusedConnectivityEdges());
+      viewer.setKnnFailureCallback(() => {
+        notifications.warning(
+          'KNN selection stopped: the neighbor graph could not be read',
+          { category: 'connectivity' }
+        );
+      });
 
       function updateEdgeVisibilityForView(
         viewId,
@@ -3762,6 +4120,24 @@ void sweepAbandonedTranscodes();
         });
       }
 
+      // A session's preference (`session-preference`, `ui-controls.js`): kept
+      // whatever the graph shows now; the slider shows what it can of it
+      // once the graph's edges are read.
+      if (connectivityLimitInput && connectivityLimitDisplay) {
+        connectivityLimitInput.addEventListener('session-preference', () => {
+          const limit = Number(connectivityLimitInput.dataset.sessionPreference);
+          if (!Number.isSafeInteger(limit) || limit < 1) {
+            throw new TypeError('A restored edge preference is a positive whole number of edges.');
+          }
+          setUserEdgeLimit(limit);
+          connectivityLimitDisplay.textContent = formatEdgeCount(currentEdgeLimit());
+          if (loadedEdgeData !== null) {
+            updateSliderRange(actualVisibleEdges);
+            applyEdgeLodLimit();
+          }
+        });
+      }
+
       // Wire up limit slider (LOD control)
       if (connectivityLimitInput && connectivityLimitDisplay) {
         connectivityLimitInput.addEventListener('input', () => {
@@ -3781,7 +4157,7 @@ void sweepAbandonedTranscodes();
               'Connectivity edge limit controls require exact integer bounds.'
             );
           }
-          userEdgeLimit = clamp(requested, min, max);
+          setUserEdgeLimit(clamp(requested, min, max));
           connectivityLimitInput.value = userEdgeLimit;
           connectivityLimitDisplay.textContent = formatEdgeCount(userEdgeLimit);
 
@@ -3818,7 +4194,7 @@ void sweepAbandonedTranscodes();
           }
           return;
         }
-        if (edgesLoaded && viewer.isKnnEdgesLoaded()) {
+        if (viewer.isKnnEdgesLoaded()) {
           return;
         }
         if (knnLoadPromise !== null) {
@@ -3827,45 +4203,60 @@ void sweepAbandonedTranscodes();
 
         const requestGeneration = datasetPublicationGeneration;
         const requestGraphGeneration = connectivityGraphGeneration;
+        const rowsUrl = connectivityUrl;
         const knnNotifId = notifications.loading(
           'Loading neighbor graph for KNN mode',
           { category: 'connectivity' }
         );
         const operation = (async () => {
           try {
-            debug.log('[Main] Loading edges for KNN mode...');
-            const edgeData = await ensureConnectivityEdgesLoaded();
-            if (
-              requestGeneration !== datasetPublicationGeneration ||
-              requestGraphGeneration !== connectivityGraphGeneration ||
-              edgesLoaded !== true ||
-              loadedEdgeData !== edgeData
-            ) {
-              notifications.dismiss(knnNotifId);
-              return;
+            debug.log('[Main] Checking the neighbor graph for KNN mode...');
+            // The graph is read and checked once (its edges: bounds, order,
+            // exact symmetry; `publishConnectivityEdges` records the check);
+            // the tool then reads the rows it expands through from the file,
+            // by cell, and holds no edge: the edges go again unless a view
+            // shows them.
+            let check = currentConnectivityCheck();
+            if (check === null) {
+              await ensureConnectivityEdgesLoaded();
+              releaseUnusedConnectivityEdges();
+              check = currentConnectivityCheck();
             }
             if (
-              viewer.loadKnnEdges(edgeData) !== true
-            ) {
-              throw new Error(
-                'The viewer rejected an exact KNN connectivity payload.'
-              );
-            }
-            notifications.complete(
-              knnNotifId,
-              `Neighbor graph ready ` +
-              `(${formatCountOf(edgeData.nEdges, 'edge')})`
-            );
-          } catch (err) {
-            if (
-              isDatasetReloadSupersededError(err) ||
+              check === null ||
               requestGeneration !== datasetPublicationGeneration ||
               requestGraphGeneration !== connectivityGraphGeneration
             ) {
               notifications.dismiss(knnNotifId);
               return;
             }
-            console.error('[Main] Failed to load edges for KNN:', err);
+            const rowSource = Object.freeze({
+              nCells: check.nCells,
+              readRows: knnRowReader(rowsUrl, check),
+            });
+            if (
+              viewer.loadKnnEdges(rowSource) !== true
+            ) {
+              throw new Error(
+                'The viewer rejected the KNN graph\'s row source.'
+              );
+            }
+            notifications.complete(
+              knnNotifId,
+              `Neighbor graph ready ` +
+              `(${formatCountOf(check.nEdges, 'edge')})`
+            );
+          } catch (err) {
+            if (
+              isCancellation(err) ||
+              isCancellation(err) ||
+              requestGeneration !== datasetPublicationGeneration ||
+              requestGraphGeneration !== connectivityGraphGeneration
+            ) {
+              notifications.dismiss(knnNotifId);
+              return;
+            }
+            console.error('[Main] Failed to check the neighbor graph for KNN:', err);
             notifications.fail(
               knnNotifId,
               'Failed to load neighbor graph'
@@ -4560,7 +4951,7 @@ void sweepAbandonedTranscodes();
         console.error('Failed to stage benchmark data:', error);
         notifications.fail(
           benchNotifId,
-          `Benchmark failed: ${error.message}`
+          `Benchmark failed: ${failureText(error)}`
         );
         return false;
       }
@@ -5185,6 +5576,40 @@ void sweepAbandonedTranscodes();
     // opening says why); any other failure no newer choice superseded ends
     // startup.
     let startupOutcome = 'none';
+    // The default sample, once its catalog has answered, unless the person
+    // chose a dataset meanwhile. An unreachable catalog only leaves startup
+    // without a default (the sample picker says why); a stalled one is a
+    // startup failure that names where it stopped.
+    if (defaultSample !== null && !startupOpening.cancelled) {
+      let available = false;
+      try {
+        available = await startup.step('catalog', defaultSample.catalog, () => defaultSample.answer);
+      } catch (error) {
+        if (!(error instanceof Error)) {
+          throw new TypeError(
+            'Default sample catalog availability rejected with a non-Error value.'
+          );
+        }
+        if (error.code === STARTUP_STALL_CODE) throw error;
+        debug.log(
+          `[Main] Default sample catalog is unavailable: ${error.message}`
+        );
+      }
+      if (available && datasetReloadCoordinator.actionSequence === controlsLiveAt) {
+        const defaultDatasetId = await startup.step(
+          'catalog',
+          defaultSample.catalog,
+          () => defaultSample.defaultDatasetId()
+        );
+        if (datasetReloadCoordinator.actionSequence === controlsLiveAt) {
+          selectStartupDataset(
+            'local-demo',
+            defaultDatasetId,
+            DATA_LOAD_METHODS.DEFAULT_DEMO
+          );
+        }
+      }
+    }
     // Cancelled while startup resolved it: Cellucid starts without it.
     if (startupSelection !== null && !startupOpening.cancelled) {
       try {
@@ -5210,16 +5635,27 @@ void sweepAbandonedTranscodes();
       }
       // A viewer host: it is told the viewer is ready only once its own
       // dataset is on screen. A dataset the user chose instead in this
-      // viewer is not the one Python's indices describe.
+      // viewer is not the one the host's cell positions describe: its
+      // results name no host dataset (app/viewer-host-results.js), and the
+      // commands that name cells are refused while it is open.
       if (viewerHostSource !== null && startupOutcome === 'ready') {
         await startup.step(
           'ui',
           "the viewer's host",
           () => viewerHostSource.notifyReady({
-            nCells: state.pointCount,
             dimensions: state.getDimensionLevel()
           })
         );
+        // Everything the person had made (a restored session's highlights
+        // and fields) reaches the host, replacing what it kept before; and
+        // again whenever the channel opens again after a drop.
+        if (viewerHostResults !== null) {
+          const resync = () => viewerHostResults.resync().catch(error => {
+            console.error('[Main] Sending the results snapshot to the host failed:', error);
+          });
+          viewerHostSource.onChannelReopen(() => { void resync(); });
+          void resync();
+        }
       }
     }
     startup.enter('ready');

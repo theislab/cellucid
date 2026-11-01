@@ -25,6 +25,11 @@ globalThis.addEventListener = (type, listener) => {
   for (const data of waiting.splice(0)) listener({ data });
 };
 parentPort.on('message', data => {
+  // Ended by the pool: the thread exits once what it is decoding is done.
+  if (data !== null && typeof data === 'object' && data.__endDecodeWorker === true) {
+    parentPort.close();
+    return;
+  }
   if (listeners.length === 0) waiting.push(data);
   else for (const listener of listeners) listener({ data });
 });
@@ -45,6 +50,12 @@ export function createNodeDecodeWorker({ url = DECODE_WORKER, failToLoad = false
   const listeners = { message: [], error: [], messageerror: [] };
   const code = BOOTSTRAP.replace('workerData.url', JSON.stringify(failToLoad ? `${url}.missing.js` : url));
   const worker = new Worker(code, { eval: true });
+  // Node aborts the process ("close before init", node_zlib.cc) when a
+  // worker thread is terminated while a DecompressionStream in it is still
+  // starting; the pool may end a worker mid-decode (a measuring phase under
+  // way as a test reconfigures it). Ended here, the thread finishes what it
+  // decodes and exits on its own, as a browser's terminated worker simply stops.
+  worker.unref();
   worker.on('message', data => {
     if (data?.bootstrapError !== undefined) {
       for (const listener of listeners.error) listener({ message: data.bootstrapError, preventDefault() {} });
@@ -59,7 +70,7 @@ export function createNodeDecodeWorker({ url = DECODE_WORKER, failToLoad = false
     postMessage: (message, transfer) => worker.postMessage(message, transfer),
     addEventListener: (type, listener) => listeners[type]?.push(listener),
     terminate: () => {
-      worker.terminate();
+      worker.postMessage({ __endDecodeWorker: true });
     },
   };
 }

@@ -17,6 +17,88 @@ import { formatCountOf } from '../utils/format-units.js';
 
 export const MIN_VISIBLE_ALPHA_BYTE = 3;
 
+/**
+ * A cell's colour (RGBA8) never carries its visibility: the transparency
+ * does. Its alpha byte says how it is layered instead, three layers drawn
+ * bottom to top:
+ *
+ * - `UNREAD_ALPHA_BYTE`: a cell a gene sample did not read (a gene read for
+ *   a sample of the open cells, `data/anndata/subsample-plan.js`), which has
+ *   no value yet. It is drawn first, flat, in a colour derived from the
+ *   view's background (`rendering/read-cell-layer.js`, `unreadCellColor`),
+ *   so the map keeps its shape but recedes; its RGB bytes are not drawn.
+ * - `BENEATH_ALPHA_BYTE`: a cell drawn beneath the coloured ones -- a
+ *   continuous field's no-value grey (a gene's cells read that do not express
+ *   it, a missing value) -- so a sparse gene's expressing cells are never
+ *   covered by the grey around them.
+ * - 255: a cell drawn as usual, on top.
+ *
+ * The renderer draws a field with lower layers in one pass a layer over the
+ * same points (`HighPerfRenderer`, `colorLayersOf`); while some cells are not
+ * read, the cells read are drawn larger (their density on screen,
+ * `readCellSizeMultiplier`) and, whenever there are no more of them than a
+ * level of detail draws, every one at that level. A figure draws the
+ * layers in the same order (`drawnSequence`).
+ */
+export const BENEATH_ALPHA_BYTE = 254;
+export const UNREAD_ALPHA_BYTE = 253;
+
+/**
+ * What the alpha byte of an RGBA8 colour array says, named by every consumer
+ * that reads one: `'layer'` for a field's colours of the cells (255,
+ * `BENEATH_ALPHA_BYTE` or `UNREAD_ALPHA_BYTE`; their visibility is the
+ * transparency), `'opacity'` for the colours of markers of their own
+ * (centroids), whose alpha byte is the marker's opacity, 0 hiding it.
+ *
+ * @param {unknown} meaning
+ * @param {string} label - What to name in the failure.
+ * @returns {'layer'|'opacity'}
+ */
+export function requireColorAlphaMeaning(meaning, label) {
+  if (meaning !== 'layer' && meaning !== 'opacity') {
+    throw new TypeError(`${label} must say what its colours' alpha byte is: 'layer' or 'opacity', not ${String(meaning)}.`);
+  }
+  return meaning;
+}
+
+/** Platform byte order of the RGBA8 words read below. */
+const LITTLE_ENDIAN = new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
+
+/** The answer for colours with every cell on top. */
+const SINGLE_LAYER = Object.freeze({ layered: false, unread: 0 });
+
+/**
+ * The layers of `colors` (RGBA8): whether any cell lies below the top layer
+ * (its alpha byte below 255), and how many cells are not read
+ * (`UNREAD_ALPHA_BYTE`). One pass of word reads.
+ *
+ * @param {Uint8Array} colors
+ * @returns {Readonly<{layered: boolean, unread: number}>}
+ */
+export function colorLayersOf(colors) {
+  let layered = false;
+  let unread = 0;
+  if (colors.byteOffset % 4 === 0) {
+    const words = new Uint32Array(colors.buffer, colors.byteOffset, colors.length >>> 2);
+    const shift = LITTLE_ENDIAN ? 24 : 0;
+    for (let i = 0; i < words.length; i++) {
+      const alpha = (words[i] >>> shift) & 0xff;
+      if (alpha !== 255) {
+        layered = true;
+        if (alpha === UNREAD_ALPHA_BYTE) unread++;
+      }
+    }
+  } else {
+    for (let i = 3; i < colors.length; i += 4) {
+      if (colors[i] !== 255) {
+        layered = true;
+        if (colors[i] === UNREAD_ALPHA_BYTE) unread++;
+      }
+    }
+  }
+  return layered ? Object.freeze({ layered, unread }) : SINGLE_LAYER;
+}
+
 export const POINT_VISIBILITY_THRESHOLD = Math.fround(
   (MIN_VISIBLE_ALPHA_BYTE - 0.5) / 255
 );
@@ -48,10 +130,9 @@ export function requirePointTransparency(values, pointCount, label) {
 /*
  * Per-cell 0/1 byte arrays are read four cells to a 32-bit word where the
  * bytes start on a word boundary: a byte is 0 or 1 iff its upper seven bits
- * are clear (`word & 0xfefefefe` is 0 for four such bytes), and `word * 255`
- * turns four 0/1 bytes into four 0/255 bytes with no carry between them
- * (each product is at most 255). Both hold in either byte order. The word
- * loops are functions of their own so each is compiled for its loop alone.
+ * are clear (`word & 0xfefefefe` is 0 for four such bytes), in either byte
+ * order. The word loop is a function of its own so it is compiled for its
+ * loop alone.
  */
 
 /** Index of the first word of `words[from, to)` holding a byte above 1, or -1. */
@@ -88,88 +169,4 @@ export function firstNonBinaryByte(bytes) {
     if (bytes[i] > 1) return i;
   }
   return -1;
-}
-
-/**
- * Four 0/1 transparency bytes a word as their R8 bytes (0 or 255) into
- * `target[from, to)`, compared with `reference` (read before `target` is
- * written, so the two may be one array). Returns 1 when any byte
- * differs from `reference`, 0 when none does, and -1 when a source byte is
- * above 1 (the caller names it).
- */
-function encodeAlphaWords(source, target, reference, from, to) {
-  let seen = 0;
-  let moved = 0;
-  for (let i = from; i < to; i++) {
-    const value = source[i];
-    seen |= value;
-    const encoded = Math.imul(value, 255);
-    moved |= encoded ^ reference[i];
-    target[i] = encoded;
-  }
-  if ((seen & 0xfefefefe) !== 0) return -1;
-  return moved !== 0 ? 1 : 0;
-}
-
-/**
- * Word views over the byte arrays an R8 alpha encoding reads and writes, or
- * null when one of them does not start on a word boundary.
- *
- * @param {Uint8Array} alphas - Transparency, exactly 0 or 1 a cell.
- * @param {Uint8Array} target - R8 bytes written.
- * @param {Uint8Array} reference - R8 bytes compared with.
- * @returns {{source: Uint32Array, target: Uint32Array, reference: Uint32Array}|null}
- */
-export function alphaEncodingWords(alphas, target, reference) {
-  if (
-    (alphas.byteOffset & 3) !== 0 ||
-    (target.byteOffset & 3) !== 0 ||
-    (reference.byteOffset & 3) !== 0
-  ) {
-    return null;
-  }
-  const words = array => new Uint32Array(array.buffer, array.byteOffset, array.length >>> 2);
-  return { source: words(alphas), target: words(target), reference: words(reference) };
-}
-
-/**
- * Encode the transparency of cells `[from, to)` as R8 bytes, `alpha * 255`
- * (exactly `Math.round(value * 255)` for 0 and 1), into `target`, and
- * compare them with `reference`.
- *
- * @param {Uint8Array} alphas - Transparency, exactly 0 or 1 a cell.
- * @param {Uint8Array} target
- * @param {Uint8Array} reference
- * @param {{source: Uint32Array, target: Uint32Array, reference: Uint32Array}|null} words
- *   `alphaEncodingWords` of the three arrays; null encodes byte by byte.
- * @param {number} from - First cell; a multiple of 4 when `words` is given.
- * @param {number} to - End cell (exclusive), at most `alphas.length`.
- * @returns {number} 1 when a byte moved, 0 when none did, or `-(index + 1)`
- *   naming the first cell whose value is above 1.
- */
-export function encodeAlphaSpan(alphas, target, reference, words, from, to) {
-  let wordEnd = from;
-  let result = 0;
-  if (words !== null) {
-    const wordFrom = from >>> 2;
-    const wordTo = to >>> 2;
-    if (wordTo > wordFrom) {
-      result = encodeAlphaWords(words.source, words.target, words.reference, wordFrom, wordTo);
-      if (result < 0) {
-        let index = from;
-        while (alphas[index] <= 1) index++;
-        return -(index + 1);
-      }
-      wordEnd = wordTo * 4;
-    }
-  }
-  let moved = 0;
-  for (let i = wordEnd; i < to; i++) {
-    const value = alphas[i];
-    if (value > 1) return -(i + 1);
-    const encoded = -value & 255;
-    moved |= encoded ^ reference[i];
-    target[i] = encoded;
-  }
-  return result !== 0 || moved !== 0 ? 1 : 0;
 }

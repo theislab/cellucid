@@ -1,0 +1,1 @@
+{"zarr_format": 2, "shape": [12, 5], "chunks": [4, 5], "dtype": "<f4", "compressor": {"id": "blosc", "cname": "zlib", "clevel": 5, "shuffle": 0, "blocksize": 0}, "fill_value": 0.0, "order": "C", "filters": null}

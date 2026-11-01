@@ -1,7 +1,9 @@
 /**
- * The back-reference copy every LZ77 decoder here shares (Zstandard, LZ4,
- * blosclz, LZF): `length` bytes from `offset` bytes back, where the source
- * may overlap what is being written (a short offset repeats a pattern).
+ * The back-reference copy of the LZ77 decoder written here (LZF,
+ * `hdf5/lzf.js`; Zstandard, LZ4 and Blosc are decoded by their own libraries
+ * in WebAssembly, `wasm-codecs.js`): `length` bytes from `offset` bytes
+ * back, where the source may overlap what is being written (a short offset
+ * repeats a pattern).
  *
  * The copy writes exactly `[at, at + length)`. Callers check both bounds
  * first; this does not.

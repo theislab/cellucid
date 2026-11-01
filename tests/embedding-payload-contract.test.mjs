@@ -2,13 +2,17 @@
  * Embedding and vector payloads made in the reader worker
  * (`data/embedding-payload.js`): one pass of checks and bounds, one pass of
  * float32 output, the same refusals as the load-time checks, the same
- * coordinates the app has always shown, and the vectors scaled once.
+ * coordinates the app has always shown, and the vectors scaled once. A row
+ * holding NaN or an infinity is a cell the array does not place: NaN on
+ * every axis, left out of the bounds and the transform, counted and the
+ * first named; only an array placing no cell is refused for it.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
   EmbeddingPayloads,
+  UNPLACED_CELLS_NAMED,
   embeddingPayloadOf,
   vectorPayloadOf,
 } from '../assets/js/data/embedding-payload.js';
@@ -40,10 +44,12 @@ function formatRule(values, width) {
 
 test('refusals name the first offending cell exactly as the load-time checks do', () => {
   const cases = [
-    [[0, 0, Number.NaN, 1], 2],
-    [[Number.POSITIVE_INFINITY, 0, 0, 1], 2],
-    [[0, 0, 0, Number.NEGATIVE_INFINITY], 2],
+    [[0, 0, Number.NaN, 1, 2, 3], 2],
+    [[Number.POSITIVE_INFINITY, 0, 0, 1, 2, 2], 2],
+    [[0, 0, 0, Number.NEGATIVE_INFINITY, 1, 1], 2],
+    [[Number.NaN, 0, Number.NaN, Number.NaN], 2],
     [[1e308, 0, 0, 1], 2],
+    [[Number.NaN, 0, 1e308, 0, 1, 1], 2],
     [[0, 0, 1e-60, 1], 2],
     [[2, 3, 2, 3], 2],
     [[1, 2, 3], 1],
@@ -53,7 +59,10 @@ test('refusals name the first offending cell exactly as the load-time checks do'
       const array = Type.from(values);
       if (Type === Float32Array && !values.every(value => Object.is(Math.fround(value), value) || Number.isNaN(value))) continue;
       assert.equal(embeddingPayloadOf(array, width, true).defect, embeddingLoadDefect(array, width), `${values} normalized`);
-      assert.equal(embeddingPayloadOf(array, width, false).defect, valueLoadDefect(array, width), `${values} as stored`);
+      // Kept as stored, a constant layout is shown (at unit range); every
+      // other refusal is the load-time check's.
+      const loadTime = embeddingLoadDefect(array, width);
+      assert.equal(embeddingPayloadOf(array, width, false).defect, loadTime === 'no coordinate variation' ? valueLoadDefect(array, width) : loadTime, `${values} as stored`);
     }
   }
 });
@@ -94,31 +103,60 @@ test('vectors are scaled once, as the coordinates they move were', () => {
   assert.deepEqual(bits(stored.vectors), bits(Float32Array.from(raw, value => Math.fround(value) * own.transform.scale)));
 });
 
-test('a vector a value cannot be drawn is named before any overflow', () => {
+test('a vector a value cannot be drawn is named before any overflow; a NaN row is a cell without a vector', () => {
   const transform = { vectorScale: 1e300, roundFirst: false };
   const overflow = vectorPayloadOf(Float64Array.from([1, 2, 0, 0]), 2, transform);
   assert.equal(overflow.overflow, 0);
-  const named = vectorPayloadOf(Float64Array.from([1, 2, Number.NaN, 0]), 2, transform);
-  assert.equal(named.defect, 'NaN at cell 1');
+  const named = vectorPayloadOf(Float64Array.from([1, 2, 1e300, 0]), 2, transform);
+  assert.equal(named.defect, 'not representable as float32 at cell 1');
   assert.equal(named.overflow, null);
+  const gaps = vectorPayloadOf(Float64Array.from([3, 4, Number.NaN, 0, 0, Infinity, 1, 0]), 2, { vectorScale: 2, roundFirst: false });
+  assert.deepEqual(Array.from(gaps.vectors), [6, 8, NaN, NaN, NaN, NaN, 2, 0]);
+  assert.equal(gaps.unplacedCount, 2);
+  assert.deepEqual(gaps.firstUnplaced, [1, 2]);
+  assert.equal(gaps.maxMagnitude, 10);
+});
+
+test('cells an embedding does not place are NaN on every axis, outside the bounds and the transform', () => {
+  // Rows 1 and 3 unplaced (NaN in one axis, an infinity in the other).
+  const raw = Float64Array.from([0, 0, Number.NaN, 5, 4, 2, 1e9, Infinity, 2, 1]);
+  const placed = Float64Array.from([0, 0, 4, 2, 2, 1]);
+  for (const normalize of [true, false]) {
+    const payload = embeddingPayloadOf(raw, 2, normalize);
+    const reference = embeddingPayloadOf(placed, 2, normalize);
+    assert.equal(payload.defect, null);
+    assert.deepEqual(payload.transform, reference.transform, 'the placed cells alone set the transform');
+    assert.deepEqual(payload.bounds, reference.bounds);
+    const shown = Array.from(payload.positions);
+    assert.deepEqual([shown.slice(0, 2), shown.slice(4, 6), shown.slice(8, 10)], [0, 1, 2].map(i => Array.from(reference.positions.slice(i * 2, i * 2 + 2))));
+    assert.ok([2, 3, 6, 7].every(i => Number.isNaN(shown[i])), 'every axis of an unplaced cell is NaN');
+    assert.equal(payload.unplacedCount, 2);
+    assert.deepEqual(payload.firstUnplaced, [1, 3]);
+  }
+  // At most UNPLACED_CELLS_NAMED are named; all are counted.
+  const many = embeddingPayloadOf(Float64Array.from([0, 0, NaN, NaN, NaN, 1, NaN, NaN, 1, 1, NaN, NaN, 2, 2]), 2, true);
+  assert.equal(many.unplacedCount, 4);
+  assert.deepEqual(many.firstUnplaced, [1, 2, 3].slice(0, UNPLACED_CELLS_NAMED));
+  assert.equal(embeddingPayloadOf(Float64Array.from([NaN, NaN]), 2, true).defect, "every cell's coordinates are missing (NaN or infinite)");
 });
 
 function payloadsOver(arrays) {
   const reads = [];
   let generation = 0;
-  const payloads = new EmbeddingPayloads(async (key, columns) => {
+  const payloads = new EmbeddingPayloads(async (key, columns, { rows } = {}) => {
     reads.push(key);
     const { values, width } = arrays[key];
-    return Float64Array.from({ length: (values.length / width) * columns.length }, (_, index) =>
-      values[Math.floor(index / columns.length) * width + columns[index % columns.length]]);
-  }, () => generation);
+    const [start, end] = rows ?? [0, values.length / width];
+    return Float64Array.from({ length: (end - start) * columns.length }, (_, index) =>
+      values[(start + Math.floor(index / columns.length)) * width + columns[index % columns.length]]);
+  }, { cellNames: async cells => cells.map(cell => `cell${cell}`), cellCount: () => 3, generation: () => generation });
   return { payloads, reads, advance: () => { generation++; } };
 }
 
 const ARRAYS = {
   X_umap: { values: [0, 0, 4, 2, 2, 1], width: 2 },
   velocity_umap: { values: [1, 1, 2, 2, 3, 3], width: 2 },
-  X_bad: { values: [0, 0, Number.NaN, 1, 1, 1], width: 2 },
+  X_bad: { values: [0, 0, 1e300, 1, 1, 1], width: 2 },
 };
 const UMAP = { key: 'X_umap', columns: [0, 1] };
 
@@ -142,10 +180,48 @@ test('a vector field reuses its embedding\'s transform, and an embedding read fo
 });
 
 test('refusals arrive as the errors the adapter passes on', async () => {
-  const { payloads } = payloadsOver({ ...ARRAYS, velocity_bad: { values: [1, 1, Number.NaN, 2, 3, 3], width: 2 } });
+  const { payloads } = payloadsOver({
+    ...ARRAYS,
+    velocity_bad: { values: [1, 1, 1e300, 2, 3, 3], width: 2 },
+    velocity_none: { values: [NaN, 1, NaN, NaN, Infinity, 0], width: 2 },
+    velocity_gaps: { values: [1, 1, NaN, 2, 3, 3], width: 2 },
+  });
   await assert.rejects(payloads.embedding('X_bad', [0, 1], true), error =>
-    error instanceof EmbeddingLoadError && error.reason === 'NaN at cell 1' && error.key === 'X_bad');
+    error instanceof EmbeddingLoadError && error.reason === 'not representable as float32 at cell 1' && error.key === 'X_bad');
   await assert.rejects(payloads.vectors('velocity_bad', [0, 1], UMAP, true), error =>
-    error instanceof MappingLoadError && error.message === "Vector field 'velocity_bad' cannot be drawn: NaN at cell 1.");
+    error instanceof MappingLoadError && error.message === "Vector field 'velocity_bad' cannot be drawn: not representable as float32 at cell 1.");
+  await assert.rejects(payloads.vectors('velocity_none', [0, 1], UMAP, true), error =>
+    error instanceof MappingLoadError && error.message === "Vector field 'velocity_none' cannot be drawn: every cell's vector is missing (NaN or infinite).");
   await assert.rejects(payloads.vectors('velocity_umap', [0, 1], { key: 'X_bad', columns: [0, 1] }, true), EmbeddingLoadError);
+  const gaps = await payloads.vectors('velocity_gaps', [0, 1], UMAP, true);
+  assert.equal(gaps.unplacedCount, 1);
+  assert.deepEqual(gaps.unplacedNames, ['cell1'], 'the first cells without a vector, by obs name');
+  // Rows of an opening grown in place that are all unplaced are not refused.
+  const rows = await payloads.vectors('velocity_none', [0, 1], UMAP, true, { rows: [0, 2] });
+  assert.equal(rows.unplacedCount, 2);
+});
+
+test('every payload the page reads names its unplaced cells by obs name, and never hands on open-cell positions', async () => {
+  const arrays = { ...ARRAYS, X_gaps: { values: [0, 0, NaN, NaN, 2, 1], width: 2 } };
+  // A whole read: counted, named by obs name (`unplacedNames`), and the
+  // open-cell positions it found them by (`firstUnplaced`) stay in the reader.
+  const whole = await payloadsOver(arrays).payloads.embedding('X_gaps', [0, 1], true);
+  assert.equal(whole.unplacedCount, 1);
+  assert.deepEqual(whole.unplacedNames, ['cell1']);
+  assert.equal(Object.hasOwn(whole, 'firstUnplaced'), false);
+  // Rows of an opening grown in place, in the frame of the cells before:
+  // cell 1 of the store is named, not row 0 of the rows read.
+  const grown = payloadsOver(arrays);
+  await grown.payloads.embedding('X_gaps', [0, 1], true);
+  const rows = await grown.payloads.embedding('X_gaps', [0, 1], true, { rows: [1, 3] });
+  assert.equal(rows.unplacedCount, 1);
+  assert.deepEqual(rows.unplacedNames, ['cell1']);
+  assert.equal(Object.hasOwn(rows, 'firstUnplaced'), false);
+  // An embedding read for a vector field and handed on is named the same.
+  const handed = payloadsOver({ ...arrays, velocity_gaps: { values: [1, 1, 2, 2, 3, 3], width: 2 } });
+  await handed.payloads.vectors('velocity_gaps', [0, 1], { key: 'X_gaps', columns: [0, 1] }, true);
+  const after = await handed.payloads.embedding('X_gaps', [0, 1], true);
+  assert.deepEqual(handed.reads.filter(key => key === 'X_gaps').length, 1, 'read once, handed on');
+  assert.deepEqual(after.unplacedNames, ['cell1']);
+  assert.equal(Object.hasOwn(after, 'firstUnplaced'), false);
 });

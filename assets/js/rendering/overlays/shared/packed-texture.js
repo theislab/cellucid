@@ -1,9 +1,15 @@
 /**
  * @fileoverview Packed per-item texture helpers.
  *
- * These helpers upload 1D per-cell arrays into 2D textures, avoiding GPU buffer
- * readbacks and avoiding padded CPU copies for large datasets by streaming
- * row-by-row with `texSubImage2D`.
+ * These helpers upload 1D per-cell arrays into linear textures
+ * (`../../linear-texture.js`): a `TEXTURE_2D_ARRAY` of power-of-two rows in as
+ * many layers as the count needs, one texel an item, written row by row
+ * straight from the source array (no padded CPU copy). A shader finds item
+ * `i` with `linearTexel(i, layout)`, the layout uniform set by
+ * `setLinearLayoutUniform`. A single 2D texture used to cap them at
+ * `MAX_TEXTURE_SIZE^2` items: 67,108,864 cells where the engine reports 8192
+ * (Firefox on macOS), so the velocity overlay refused larger datasets there;
+ * a linear texture holds every item a shader index can address (2^31 - 1).
  *
  * A texture whose storage already has the packed shape is rewritten in place:
  * rows written into storage WebGL has accepted allocate nothing, so only a lost
@@ -16,36 +22,30 @@
  * caller before it publishes (`'caller'`), which lets it read once for several
  * textures, a task later, when the GPU process has caught up.
  *
+ * A record is `{texture, plan, components}`: `plan` is the linear layout
+ * (`planLinearTexture`), whose `texels` count the texture's storage.
+ *
  * @module rendering/overlays/shared/packed-texture
  */
 
 import { requireCleanWebGLState, requireLiveContext } from '../../gl-errors.js';
 import { deleteTextureTracked, restorableTexture } from '../../gl-utils.js';
+import { allocateLinearTexture, planLinearTextureFor, writeLinearTextureRows } from '../../linear-texture.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
 /**
- * Compute width/height for a packed 2D texture.
+ * The linear layout of `itemCount` items (one texel for none).
  *
  * @param {WebGL2RenderingContext} gl
  * @param {number} itemCount
  */
-function computePackedDims(gl, itemCount) {
+function computePackedPlan(gl, itemCount) {
   if (!Number.isSafeInteger(itemCount) || itemCount < 0) {
     throw new RangeError(
       'Packed texture itemCount must be a non-negative safe integer.'
     );
   }
-  const maxTexSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-  if (!Number.isSafeInteger(maxTexSize) || maxTexSize <= 0) {
-    throw new Error('WebGL MAX_TEXTURE_SIZE must be a positive safe integer.');
-  }
-  const packedCount = itemCount === 0 ? 1 : itemCount;
-  const width = Math.min(packedCount, maxTexSize);
-  const height = Math.ceil(packedCount / width);
-  if (height > maxTexSize) {
-    throw new Error(`Packed texture dims ${width}x${height} exceed MAX_TEXTURE_SIZE=${maxTexSize}`);
-  }
-  return { width, height, maxTexSize };
+  return planLinearTextureFor(gl, itemCount);
 }
 
 /**
@@ -54,14 +54,13 @@ function computePackedDims(gl, itemCount) {
  * items then goes in place.
  *
  * @param {WebGL2RenderingContext} gl
- * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} existing
+ * @param {{texture: WebGLTexture, plan: object, components: number}|null} existing
  * @param {number} itemCount
  * @param {number} components
  * @returns {boolean}
  */
 export function packedTextureFits(gl, existing, itemCount, components) {
-  const { width, height } = computePackedDims(gl, itemCount);
-  return fitsExisting(existing, width, height, components, 'Packed texture');
+  return fitsExisting(existing, computePackedPlan(gl, itemCount), components, 'Packed texture');
 }
 
 /**
@@ -71,7 +70,7 @@ export function packedTextureFits(gl, existing, itemCount, components) {
  *
  * @returns {boolean}
  */
-function fitsExisting(existing, width, height, components, label) {
+function fitsExisting(existing, plan, components, label) {
   if (existing === null) return false;
   if (
     typeof existing !== 'object' ||
@@ -80,35 +79,10 @@ function fitsExisting(existing, width, height, components, label) {
   ) {
     throw new TypeError(`${label} existing texture must be a packed texture record or null.`);
   }
-  return existing.width === width &&
-    existing.height === height &&
+  return existing.plan?.width === plan.width &&
+    existing.plan?.rowsPerLayer === plan.rowsPerLayer &&
+    existing.plan?.layers === plan.layers &&
     existing.components === components;
-}
-
-/**
- * Write `itemCount` items, `components` values each, row by row from the top
- * of the bound texture.
- */
-function writeRows(gl, width, itemCount, components, format, type, data) {
-  let remaining = itemCount;
-  let srcOffset = 0;
-  for (let y = 0; remaining > 0; y++) {
-    const rowItems = Math.min(width, remaining);
-    const rowLen = rowItems * components;
-    gl.texSubImage2D(
-      gl.TEXTURE_2D,
-      0,
-      0,
-      y,
-      rowItems,
-      1,
-      format,
-      type,
-      data.subarray(srcOffset, srcOffset + rowLen)
-    );
-    remaining -= rowItems;
-    srcOffset += rowLen;
-  }
 }
 
 /**
@@ -116,13 +90,12 @@ function writeRows(gl, width, itemCount, components, format, type, data) {
  * texture. The caller owns both: a new texture is returned for it to publish
  * and `existing` is left for it to retire.
  *
- * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ * @returns {{ texture: WebGLTexture, plan: object, components: number }}
  */
 function uploadPacked(gl, existing, spec) {
   const {
     label,
-    width,
-    height,
+    plan,
     components,
     internalFormat,
     format,
@@ -134,9 +107,9 @@ function uploadPacked(gl, existing, spec) {
   if (allocationCheck !== 'now' && allocationCheck !== 'caller') {
     throw new TypeError(`${label} allocationCheck must be exactly 'now' or 'caller'.`);
   }
-  const inPlace = fitsExisting(existing, width, height, components, label);
+  const inPlace = fitsExisting(existing, plan, components, label);
   if (!inPlace) requireLiveContext(gl, `${label} preflight`);
-  const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D);
+  const previousBinding = gl.getParameter(gl.TEXTURE_BINDING_2D_ARRAY);
   const previousAlignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
   const previousPixelUnpackBuffer =
     gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING);
@@ -145,28 +118,15 @@ function uploadPacked(gl, existing, spec) {
     throw new Error(`WebGL failed to allocate ${label}.`);
   }
   try {
-    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, target);
     gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    if (!inPlace) {
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      // Allocate storage, then stream rows to avoid padded CPU copies.
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        internalFormat,
-        width,
-        height,
-        0,
-        format,
-        type,
-        null
-      );
+    // Immutable storage, then the rows straight from the source (no padded
+    // CPU copy); a table refilled with fewer items writes only those.
+    if (!inPlace) allocateLinearTexture(gl, internalFormat, plan);
+    if (itemCount > 0) {
+      writeLinearTextureRows(gl, { ...plan, itemCount }, format, type, data, components);
     }
-    writeRows(gl, width, itemCount, components, format, type, data);
     if (inPlace || allocationCheck === 'caller') {
       requireLiveContext(gl, `${label} upload`);
     } else {
@@ -175,13 +135,13 @@ function uploadPacked(gl, existing, spec) {
     }
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment);
     gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, previousPixelUnpackBuffer);
-    gl.bindTexture(gl.TEXTURE_2D, restorableTexture(previousBinding));
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(previousBinding));
   } catch (error) {
     const cleanupErrors = [];
     const cleanups = [
       () => gl.pixelStorei(gl.UNPACK_ALIGNMENT, previousAlignment),
       () => gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, previousPixelUnpackBuffer),
-      () => gl.bindTexture(gl.TEXTURE_2D, restorableTexture(previousBinding)),
+      () => gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(previousBinding)),
     ];
     if (!inPlace) cleanups.push(() => deleteTextureTracked(gl, target));
     for (const cleanup of cleanups) {
@@ -199,7 +159,7 @@ function uploadPacked(gl, existing, spec) {
     }
     throw error;
   }
-  return inPlace ? existing : { texture: target, width, height, components };
+  return inPlace ? existing : { texture: target, plan, components };
 }
 
 function requireExactOptions(options, keys, label) {
@@ -230,14 +190,14 @@ function requireItemCount(count, label) {
  *
  * @param {WebGL2RenderingContext} gl
  * @param {object} options
- * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} options.texture
+ * @param {{texture: WebGLTexture, plan: object, components: number}|null} options.texture
  *   The texture this one replaces, or null.
  * @param {Float32Array} options.data
  * @param {number} options.itemCount
  * @param {1|2|3|4} options.components
  * @param {'now'|'caller'} options.allocationCheck - Who reads the error queue
  *   after a new allocation (an in-place write reads none).
- * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ * @returns {{ texture: WebGLTexture, plan: object, components: number }}
  */
 export function createOrUpdatePackedFloatTexture(gl, options) {
   requireExactOptions(
@@ -265,11 +225,9 @@ export function createOrUpdatePackedFloatTexture(gl, options) {
     );
   }
 
-  const { width, height } = computePackedDims(gl, count);
   return uploadPacked(gl, existing, {
     label: 'packed float texture',
-    width,
-    height,
+    plan: computePackedPlan(gl, count),
     components: comps,
     internalFormat:
       comps === 1 ? gl.R32F :
@@ -291,16 +249,16 @@ export function createOrUpdatePackedFloatTexture(gl, options) {
 /**
  * Write the packed per-cell visibility texture (R8UI) from point transparency:
  * one byte a cell, exactly 0 or 1 (rendering/alpha-visibility.js), uploaded as
- * it is held; the shader reads it through a `usampler2D`. Into `texture` when
+ * it is held; the shader reads it through a `usampler2DArray`. Into `texture` when
  * it has the shape, else into a new one (the caller retires `texture`).
  *
  * @param {WebGL2RenderingContext} gl
  * @param {object} options
- * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} options.texture
+ * @param {{texture: WebGLTexture, plan: object, components: number}|null} options.texture
  * @param {Uint8Array} options.data
  * @param {number} options.itemCount
  * @param {'now'|'caller'} options.allocationCheck
- * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ * @returns {{ texture: WebGLTexture, plan: object, components: number }}
  */
 export function createOrUpdatePackedVisibilityTexture(gl, options) {
   requireExactOptions(
@@ -319,13 +277,11 @@ export function createOrUpdatePackedVisibilityTexture(gl, options) {
     );
   }
 
-  const { width, height } = computePackedDims(gl, count);
   // One unsigned byte a cell, as the visibility is held (0 or 1): no float
   // conversion, a quarter of a float texture's bytes.
   return uploadPacked(gl, existing, {
     label: 'packed visibility texture',
-    width,
-    height,
+    plan: computePackedPlan(gl, count),
     components: 1,
     internalFormat: gl.R8UI,
     format: gl.RED_INTEGER,
@@ -344,12 +300,12 @@ export function createOrUpdatePackedVisibilityTexture(gl, options) {
  *
  * @param {WebGL2RenderingContext} gl
  * @param {object} options
- * @param {{texture: WebGLTexture, width: number, height: number, components: number}|null} options.texture
+ * @param {{texture: WebGLTexture, plan: object, components: number}|null} options.texture
  * @param {Uint32Array} options.data
  * @param {number} options.itemCount
  * @param {number} options.capacity - Items the shape holds; at least `itemCount`.
  * @param {'now'|'caller'} options.allocationCheck
- * @returns {{ texture: WebGLTexture, width: number, height: number, components: number }}
+ * @returns {{ texture: WebGLTexture, plan: object, components: number }}
  */
 export function createOrUpdatePackedUintTexture(gl, options) {
   requireExactOptions(
@@ -379,11 +335,9 @@ export function createOrUpdatePackedUintTexture(gl, options) {
     );
   }
 
-  const { width, height } = computePackedDims(gl, capacity);
   return uploadPacked(gl, existing, {
     label: 'packed uint texture',
-    width,
-    height,
+    plan: computePackedPlan(gl, capacity),
     components: 1,
     internalFormat: gl.R32UI,
     format: gl.RED_INTEGER,

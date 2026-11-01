@@ -124,7 +124,11 @@ export function obsmColumnReader(arrays) {
  * @returns {T}
  */
 export function withObsmPayloads(loader) {
-  const payloads = new EmbeddingPayloads((key, columns, options) => loader.readObsmColumns(key, columns, options));
+  const payloads = new EmbeddingPayloads(
+    (key, columns, options) => loader.readObsmColumns(key, columns, options),
+    // A test file's cells are named by their open position.
+    { cellCount: () => loader.nObs, cellNames: async cells => cells.map(cell => `cell${cell}`) }
+  );
   loader.readEmbedding = (key, columns, normalize, options = {}) =>
     payloads.embedding(key, [...columns], normalize, options);
   loader.readVectorField = (key, columns, embedding, normalize, options = {}) =>

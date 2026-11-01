@@ -4,7 +4,9 @@
  * readers and (with `--baseline`) with an earlier revision's.
  *
  *   node scripts/benchmark-real-links.mjs [--baseline REF] [--links data1,data2]
- *     [--timeout-s 600] [--browser-args --use-angle=metal] [--out results.json]
+ *     [--corpus scripts/efficiency-floor/public-links.json [--ids a,b] [--with-heavy]]
+ *     [--query "&cells=1%"] [--open-only] [--linger-s 0] [--genes 2]
+ *     [--timeout-s 600] [--browser-args A,B] [--software-gl] [--out results.json]
  *
  * Each implementation is the whole app, served from its own checkout (the
  * earlier one from a temporary worktree, removed afterwards) on its own port.
@@ -12,11 +14,17 @@
  * time, in Chromium. Steps, each timed and with the bytes and requests the
  * Transfers log counted for it:
  *
- * 1. open: from navigation to a ready view of the dataset;
+ * 1. open: from navigation to a ready view of the dataset (and, within it,
+ *    `firstPictureSeconds`: until the first cells are drawn);
  * 2. colour by a categorical field (the second one the field menu lists);
  * 3. show a gene (the first of the gene list).
  *
- * 4. show another gene.
+ * 4. show another gene, and with `--genes N` the next ones, up to N genes.
+ *
+ * A progressive opening (a first view of fewer cells, grown in place to the
+ * cells asked for: `app/open-cells-resize.js`) adds a step after 1, "grown
+ * to every cell asked for", and records the first view's cells
+ * (`firstViewCells`).
  *
  * A step that does not finish within `--timeout-s` is recorded as timed out,
  * and the link's later steps are skipped.
@@ -37,8 +45,26 @@
  * Folder… button, after the app has started on its test catalog.
  *
  * Each step also reports the peak memory of the browser's processes
- * (resident set, sampled every 100 ms) and the page's main-thread long
- * tasks (count, longest, total).
+ * (resident set, sampled every 100 ms), the page's main-thread long
+ * tasks (count, longest, total), and the bytes it fetched that the page had
+ * fetched already (`refetchedBytes`, "MB again": a range read twice, by any
+ * worker or mirror).
+ *
+ * `--corpus`: the links of a corpus of real public links
+ * (`efficiency-floor/public-links.json`: every source and format, with the
+ * Cells-to-open shares each is measured at besides the default), `--ids`
+ * some of them; a link marked `heavy` (a file of gigabytes) only with
+ * `--with-heavy`. Each result carries the corpus entry's id and share.
+ *
+ * `--again`: each link is opened a second time in a new page of the same
+ * browser profile, after the first page is closed: a later visit, with what
+ * the first kept in this browser's storage (a file read whole: an R object,
+ * a MatrixMarket folder, a file its host serves only whole), reported as
+ * `<implementation> again`. The profile is a fresh one on disk per link (a
+ * persistent context): an incognito context's storage quota is a share of
+ * memory, too small for a large file read whole. The later visit also lists
+ * every request it sent (`sent`: method, host, range, status, bytes; never
+ * a query string): what should be the version check alone.
  */
 
 import { execFileSync, spawn } from 'node:child_process';
@@ -50,6 +76,8 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { browserLaunchOptions, requireHardwareRenderer } from './lib/browser-launch.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY = path.resolve(HERE, '..');
@@ -81,14 +109,39 @@ const linkLatencyMs = Number(argument('--link-latency', '0'));
 const linkBytesPerMs = Number(argument('--link-bandwidth', '0')) * 1e6 / 1000;
 const linkProtocol = argument('--link-protocol', 'http/1.1');
 if (linkProtocol !== 'http/1.1' && linkProtocol !== 'h2') throw new Error('--link-protocol is http/1.1 or h2');
-const links = (argument('--links') ?? DEFAULT_LINKS.join(','))
-  .split(',')
-  .map(link => link.replaceAll('{serve}', `${linkProtocol === 'h2' ? 'https' : 'http'}://127.0.0.1:${SERVE_PORT}`));
+/** The corpus entries asked for, each at the default share and at each share it names. */
+function corpusLinks(file) {
+  const corpus = JSON.parse(readFileSync(file, 'utf8'));
+  const ids = argument('--ids')?.split(',') ?? null;
+  return corpus.links
+    .filter(entry => (ids === null || ids.includes(entry.id)) && (entry.heavy !== true || process.argv.includes('--with-heavy') || ids !== null))
+    .flatMap(entry => [null, ...(entry.shares ?? [])].map(share => ({ id: entry.id, share, data: entry.link })));
+}
+const links = argument('--corpus') !== null
+  ? corpusLinks(argument('--corpus'))
+  : (argument('--links') ?? DEFAULT_LINKS.join(','))
+    .split(',')
+    .map(link => ({ id: null, share: null, data: link.replaceAll('{serve}', `${linkProtocol === 'h2' ? 'https' : 'http'}://127.0.0.1:${SERVE_PORT}`) }));
 const timeoutMs = Number(argument('--timeout-s', '600')) * 1000;
 const baseline = argument('--baseline');
 const out = argument('--out');
-// Extra Chromium switches, comma-separated: `--browser-args --use-angle=metal`
-// renders on the Mac's GPU through Metal.
+// What the link asks for besides the dataset (`--query "&cells=1%"`: a
+// subsample, `app/subsample-url.js`), and whether to stop once it is open
+// (`--open-only`: the opening and its growth, no field or gene steps).
+const query = argument('--query') ?? '';
+const openOnly = process.argv.includes('--open-only');
+// How long a page stays open after its last step before it is closed
+// (`--linger-s`): a person reads the view before leaving. What the page
+// read is kept for a later visit as it arrives, so 0 (closed at once) is a
+// visit cut short, which keeps it too.
+const lingerMs = Number(argument('--linger-s', '0')) * 1000;
+// How many genes each visit shows, one after another (`--genes N`, the
+// first N of the gene list): the first gene, then later ones.
+const geneCount = Math.max(1, Number(argument('--genes', '2')));
+// Extra Chromium switches, comma-separated (`--browser-args A,B`). The
+// browser draws on the machine's GPU (`lib/browser-launch.mjs`); each result
+// names its renderer, and a software one refuses the run unless
+// `--software-gl` is passed (its times are then not the app's).
 const browserArgs = (argument('--browser-args') ?? '').split(',').filter(Boolean);
 
 function serve(root, port) {
@@ -125,9 +178,12 @@ function serveFiles(root) {
       response.writeHead(404).end();
       return;
     }
-    const range = /bytes=(\d+)-(\d*)/.exec(request.headers.range ?? '');
-    const start = range ? Number(range[1]) : 0;
-    const end = range ? Math.min(stat.size, range[2] === '' ? stat.size : Number(range[2]) + 1) : stat.size;
+    // A range `bytes=a-b` or `bytes=a-`, or a suffix `bytes=-n`, as every web host answers them.
+    const plain = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? '');
+    const suffix = /^bytes=-(\d+)$/.exec(request.headers.range ?? '');
+    const range = plain ?? suffix;
+    const start = plain ? Number(plain[1]) : suffix ? Math.max(0, stat.size - Number(suffix[1])) : 0;
+    const end = plain ? Math.min(stat.size, plain[2] === '' ? stat.size : Number(plain[2]) + 1) : stat.size;
     const headers = {
       'Accept-Ranges': 'bytes',
       'Content-Length': String(end - start),
@@ -226,8 +282,33 @@ const transferTotals = page => page.evaluate(async () => {
 
 const longTasksSoFar = page => page.evaluate(() => window.__benchLongTasks?.length ?? 0).catch(() => 0);
 
+/**
+ * The byte ranges a page's requests fetched, by file (its address, whichever
+ * mirror answered: the path names the file), to count bytes fetched more
+ * than once: a range read again is a defect wherever it is read (each step
+ * reports `refetchedBytes`).
+ */
+function rangeLog(context) {
+  const files = new Map();
+  let refetched = 0;
+  context.on('requestfinished', async request => {
+    const range = /bytes=(\d+)-(\d+)/.exec((await request.allHeaders().catch(() => ({}))).range ?? '');
+    const response = await request.response().catch(() => null);
+    if (range === null || response?.status() !== 206) return;
+    const file = new URL(request.url()).pathname;
+    const start = Number(range[1]);
+    const end = Number(range[2]) + 1;
+    const ranges = files.get(file) ?? [];
+    for (const [from, to] of ranges) refetched += Math.max(0, Math.min(end, to) - Math.max(start, from));
+    ranges.push([start, end]);
+    files.set(file, ranges);
+  });
+  return { refetched: () => refetched };
+}
+
 async function measure(page, label, action, steps) {
   const before = await transferTotals(page).catch(() => ({ bytes: 0, requests: 0 }));
+  const refetchedBefore = page.__ranges?.refetched() ?? 0;
   const tasksBefore = await longTasksSoFar(page);
   let peakBytes = browserResidentBytes();
   const sampler = setInterval(() => {
@@ -252,6 +333,8 @@ async function measure(page, label, action, steps) {
     requests: after.requests - before.requests,
     peakMB: Math.round(Math.max(peakBytes, browserResidentBytes()) / 1e6),
     longTasks: { count: tasks.length, maxMs: Math.round(Math.max(0, ...tasks)), totalMs: Math.round(tasks.reduce((sum, ms) => sum + ms, 0)) },
+    // Bytes this step fetched that an earlier request of the page fetched already.
+    refetchedBytes: (page.__ranges?.refetched() ?? 0) - refetchedBefore,
     outcome,
   });
   return outcome === 'ok';
@@ -284,12 +367,57 @@ async function openLocal(page, input, target) {
   }, before, { timeout: timeoutMs, polling: 100 });
 }
 
-async function runLink(browser, port, data) {
-  const context = await browser.newContext({ viewport: { width: 1400, height: 900 }, ignoreHTTPSErrors: linkProtocol === 'h2' });
+const again = process.argv.includes('--again');
+
+async function runLink(browser, port, link) {
+  const options = { viewport: { width: 1400, height: 900 }, ignoreHTTPSErrors: linkProtocol === 'h2' };
+  const profile = again ? mkdtempSync(path.join(tmpdir(), 'cellucid-profile-')) : null;
+  const context = profile === null
+    ? await browser.newContext(options)
+    : await chromium.launchPersistentContext(profile, { ...options, ...browserLaunchOptions('chromium', { args: browserArgs }) });
   await context.addInitScript(LONG_TASKS);
+  try {
+    const first = await runLinkIn(context, port, link);
+    if (!again) return [first];
+    return [first, { ...(await runLinkIn(context, port, link, { listSent: true })), again: true }];
+  } finally {
+    await context.close();
+    if (profile !== null) rmSync(profile, { recursive: true, force: true });
+  }
+}
+
+/** The address a request may be written down by: no query (signed links, keys), no fragment. */
+const publicAddress = url => {
+  const parsed = new URL(url);
+  return `${parsed.host}${parsed.pathname}`;
+};
+
+/** The page's gene sample (`DataState.getGeneSample`): `{cells, of, limit, kept, fitBytes}`, or null for every open cell. */
+function geneSampleOf(page) {
+  return page.evaluate(() => {
+    const sample = window._cellucidState?.getGeneSample?.() ?? null;
+    if (sample === null) return null;
+    const fit = sample.fit ?? null;
+    return { cells: sample.cells, of: sample.of, limit: fit?.limit ?? null, kept: fit?.kept ?? null, fitBytes: fit?.bytes ?? null, fitRequests: fit?.requests ?? null };
+  });
+}
+
+async function runLinkIn(context, port, { id, share, data }, { listSent = false } = {}) {
   const page = await context.newPage();
+  page.__ranges = rangeLog(context);
   const steps = [];
-  const result = { data, steps, name: null, cells: null };
+  const result = { id, share, data, steps, name: null, cells: null, renderer: await requireHardwareRenderer(page) };
+  // Every request this visit sends beyond the app's own pages and scripts.
+  const sent = [];
+  const onSent = async request => {
+    if (new URL(request.url()).host === `127.0.0.1:${port}`) return;
+    const response = await request.response().catch(() => null);
+    const sizes = await request.sizes().catch(() => null);
+    sent.push({ method: request.method(), url: publicAddress(request.url()), range: (await request.allHeaders().catch(() => ({}))).range ?? null,
+      status: response?.status() ?? null, bytes: sizes?.responseBodySize ?? null });
+  };
+  if (listSent) context.on('requestfinished', onSent);
+  const linkQuery = share === null ? query : `&cells=${encodeURIComponent(share)}`;
   try {
     const local = data.startsWith('{local}') ? data.slice('{local}'.length) : null;
     const input = local === null ? null : await startForLocal(page, port, local);
@@ -298,16 +426,37 @@ async function runLink(browser, port, data) {
         await openLocal(page, input, local);
         return;
       }
-      await page.goto(`http://127.0.0.1:${port}/?data=${encodeURIComponent(data)}`);
+      const navigated = performance.now();
+      await page.goto(`http://127.0.0.1:${port}/?data=${encodeURIComponent(data)}${linkQuery}`);
+      // The first cells drawn, within the opening.
+      page.waitForFunction(() => (window._cellucidState?.pointCount ?? 0) > 0, null, { timeout: timeoutMs, polling: 100 })
+        .then(() => { result.firstPictureSeconds = Math.round((performance.now() - navigated) / 100) / 10; }, () => {});
       await page.waitForFunction(() => {
         if (document.getElementById('cellucid-startup-failure')) throw new Error('refused');
+        const failed = document.querySelector('.opening-overlay[data-state="failed"]:not([hidden])');
+        if (failed !== null) throw new Error(`refused: ${failed.textContent.trim().slice(0, 300)}`);
         const name = document.getElementById('dataset-name')?.textContent.trim() ?? '';
-        return document.documentElement.dataset.startupPhase === 'ready' && name !== '' && name !== '–' && name !== '—';
+        return document.documentElement.dataset.startupPhase === 'ready' && name !== '' && name !== '–' && name !== '—' &&
+          document.getElementById('dataset-info')?.dataset.state === 'ready';
       }, null, { timeout: timeoutMs, polling: 250 });
     }, steps);
     if (!opened) return result;
+    // A progressive opening (`app/open-cells-resize.js`) showed a first view
+    // of fewer cells: the time until every cell asked for is open, read as
+    // it grows in place.
+    result.firstViewCells = await page.evaluate(() => window._cellucidState?.pointCount ?? null);
+    if (await page.evaluate(() => document.getElementById('subsample-notice')?.dataset.state === 'growing')) {
+      await measure(page, 'grown to every cell asked for', async () => {
+        await page.waitForFunction(
+          () => document.getElementById('subsample-notice')?.dataset.state !== 'growing',
+          null,
+          { timeout: timeoutMs, polling: 250 }
+        );
+      }, steps);
+    }
     result.name = (await page.textContent('#dataset-name')).trim();
     result.cells = (await page.textContent('#dataset-cells')).trim();
+    if (openOnly) return result;
     const field = await page.evaluate(() => {
       const options = [...document.querySelectorAll('#categorical-field option')].map(option => option.value).filter(Boolean);
       return options[1] ?? options[0] ?? null;
@@ -323,9 +472,11 @@ async function runLink(browser, port, data) {
         }, field, { timeout: timeoutMs, polling: 250 });
       }, steps);
     }
-    const genes = await page.evaluate(() => (window._cellucidState?.varData?.fields ?? []).slice(0, 2).map(field => field.key));
+    // The gene list is read after the first view: the genes are picked once it is in.
+    await page.waitForFunction(() => window._cellucidState?.areGenesPending?.() === false, null, { timeout: timeoutMs, polling: 250 }).catch(() => {});
+    const genes = await page.evaluate(count => (window._cellucidState?.varData?.fields ?? []).slice(0, count).map(field => field.key), geneCount);
     for (const [index, gene] of genes.entries()) {
-      await measure(page, index === 0 ? 'show a gene' : 'show another gene', async () => {
+      await measure(page, index === 0 ? 'show a gene' : index === 1 ? 'show another gene' : `show gene ${index + 1}`, async () => {
         const search = page.locator('#gene-expression-search');
         // The panel holding the search may start collapsed.
         await search.evaluate(element => {
@@ -341,9 +492,19 @@ async function runLink(browser, port, data) {
             state.varData.fields[state.activeVarFieldIndex].values != null;
         }, gene, { timeout: timeoutMs, polling: 250 });
       }, steps);
+      // The open cells the gene was read for (`geneSample`: null when every
+      // open cell's; `fit`: what sized it), as the gene was drawn.
+      steps.at(-1).geneSample = await geneSampleOf(page);
     }
   } finally {
-    await context.close();
+    if (lingerMs > 0) await page.waitForTimeout(lingerMs).catch(() => {});
+    // The gene sample as the page leaves it (grown by the top-up meanwhile).
+    if (!page.isClosed()) result.geneSampleAtLeave = await geneSampleOf(page).catch(() => null);
+    await page.close();
+    if (listSent) {
+      context.off('requestfinished', onSent);
+      result.sent = sent;
+    }
   }
   return result;
 }
@@ -359,20 +520,25 @@ if (baseline !== null) {
 }
 const results = [];
 const fileServer = serveRoot === null ? null : serveFiles(path.resolve(serveRoot));
-const browser = await chromium.launch({ args: browserArgs });
+const browser = await chromium.launch(browserLaunchOptions('chromium', { args: browserArgs }));
 try {
   for (const [, root, port] of implementations) {
     servers.push(serve(root, port));
     await waitForServer(port);
   }
-  for (const data of links) {
+  for (const link of links) {
     for (const [implementation, , port] of implementations) {
-      const result = { implementation, ...(await runLink(browser, port, data)) };
-      results.push(result);
-      const summary = result.steps.map(step =>
-        `${step.step} ${step.seconds} s, ${(step.bytes / 1e6).toFixed(1)} MB, ${step.requests} req, peak ${step.peakMB} MB, ` +
-        `long tasks ${step.longTasks.count} (max ${step.longTasks.maxMs} ms)${step.outcome === 'ok' ? '' : ` (${step.outcome})`}`).join(' | ');
-      console.log(`${implementation.padEnd(8)} ${data}\n         ${result.name ?? ''} ${result.cells ?? ''} cells | ${summary}`);
+      for (const run of await runLink(browser, port, link)) {
+        const label = run.again ? `${implementation} again` : implementation;
+        const result = { implementation: label, ...run };
+        results.push(result);
+        const summary = result.steps.map(step =>
+          `${step.step} ${step.seconds} s, ${(step.bytes / 1e6).toFixed(1)} MB (${(step.refetchedBytes / 1e6).toFixed(1)} MB again), ${step.requests} req, peak ${step.peakMB} MB, ` +
+          `long tasks ${step.longTasks.count} (max ${step.longTasks.maxMs} ms)${step.outcome === 'ok' ? '' : ` (${step.outcome})`}`).join(' | ');
+        console.log(`${label.padEnd(8)} ${link.id ?? link.data}${link.share === null ? '' : ` (${link.share})`}\n         ${result.name ?? ''} ${result.cells ?? ''} cells` +
+          `${result.firstPictureSeconds === undefined ? '' : `, first picture ${result.firstPictureSeconds} s`} | ${summary}` +
+          `${result.sent === undefined ? '' : `\n         sent ${result.sent.length}: ${result.sent.slice(0, 6).map(item => `${item.method} ${item.url.split('/')[0]}${item.range ? ` ${item.range}` : ''}`).join('; ')}${result.sent.length > 6 ? '; …' : ''}`}`);
+      }
     }
   }
 } finally {

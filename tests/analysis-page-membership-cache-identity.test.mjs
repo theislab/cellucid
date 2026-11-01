@@ -197,7 +197,7 @@ test('disabling one group and enabling a disjoint group of equal size changes th
   layer.refreshPageVersions(['page_1']);
   const after = keysFor(layer);
 
-  assert.deepEqual(layer.getCellIndicesForPage('page_1'), [7, 8, 9]);
+  assert.deepEqual(Array.from(layer.getCellIndicesForPage('page_1')), [7, 8, 9]);
   assert.notEqual(before.hash, after.hash);
   assert.notEqual(before.dataKey, after.dataKey);
 });
@@ -374,7 +374,9 @@ test('page membership equals the set-union definition for every group shape', t 
 
   const check = label => {
     const expected = referenceMembership(pages[0]);
-    assert.deepEqual(layer.getCellIndicesForPage('page_1'), expected, label);
+    const cells = layer.getCellIndicesForPage('page_1');
+    assert.ok(cells instanceof Uint32Array, `${label}: a cell list`);
+    assert.deepEqual(Array.from(cells), expected, label);
     assert.equal(layer.getCellCountForPageId('page_1'), expected.length, label);
   };
   check('mixed ascending, unordered, typed and disabled groups');
@@ -408,7 +410,7 @@ test('a reused page membership never outlives the structure it describes', t => 
   layer.refreshPageVersions(['page_1']);
   const pushed = layer._getPageVersion('page_1');
   assert.notEqual(pushed, first);
-  assert.deepEqual(layer.getCellIndicesForPage('page_1'), [5, 6, 7, 9]);
+  assert.deepEqual(Array.from(layer.getCellIndicesForPage('page_1')), [5, 6, 7, 9]);
 
   pages[0].name = 'Renamed';
   layer.refreshPageVersions(['page_1']);
@@ -421,14 +423,15 @@ test('indices outside the dataset are still reported, as before', t => {
   const pages = singleGroupPages([2, POINT_COUNT + 3, 1]);
   const layer = makeLayer(pages);
   t.after(() => layer.destroy());
-  assert.deepEqual(layer.getCellIndicesForPage('page_1'), [1, 2, POINT_COUNT + 3]);
+  assert.deepEqual(Array.from(layer.getCellIndicesForPage('page_1')), [1, 2, POINT_COUNT + 3]);
   assert.equal(layer.getCellCountForPageId('page_1'), 3);
 });
 
-test('a page\'s count never copies its cells; its indices are built once, when read', t => {
-  // The page selectors count every page on every highlight change; copying a
-  // 5,000,000-cell selection into an array for that count cost 85 ms of the
-  // change at 10 million cells.
+test('a page\'s count and cells never copy a group\'s cells', t => {
+  // The page selectors count every page on every highlight change, and every
+  // analysis reads its pages' cells: copying a 5,000,000-cell selection into
+  // an array cost 85 ms of a change at 10 million cells, and 0.3 s and
+  // 40-80 MB a read. A page of one group is that group's own cell list.
   const cells = new Uint32Array(200_000);
   for (let i = 0; i < cells.length; i++) cells[i] = i * 3;
   const pages = [{
@@ -437,6 +440,7 @@ test('a page\'s count never copies its cells; its indices are built once, when r
     highlightedGroups: [{ id: 'g', type: 'annotation', label: 'G', enabled: true, cellIndices: cells, cellCount: cells.length }],
   }];
   const layer = makeLayer(pages, 1_000_000);
+  t.after(() => layer.destroy());
   const from = Array.from;
   let copies = 0;
   t.mock.method(Array, 'from', function counted(...args) {
@@ -445,10 +449,32 @@ test('a page\'s count never copies its cells; its indices are built once, when r
   });
   assert.equal(layer.getCellCountForPageId('page_1'), cells.length);
   assert.equal(layer.getCellCountForPageId('page_1'), cells.length);
-  assert.equal(copies, 0, 'counting copies nothing');
-  const indices = layer.getCellIndicesForPage('page_1');
-  assert.equal(copies, 1, 'the first read builds the indices once');
-  assert.deepEqual(indices.slice(0, 3), [0, 3, 6]);
+  assert.equal(layer.getCellIndicesForPage('page_1'), cells, 'the group\'s own list');
+  assert.equal(layer.getCellIndicesForPage('page_1'), cells, 'every read');
+  assert.equal(copies, 0, 'nothing copied');
+  assert.equal(layer._heldPageCellBytes(), 0, 'a group\'s list is not the data layer\'s to count');
+});
+
+test('every page cell list is a Uint32Array, and the lists the data layer makes count against its cache budget', t => {
+  const a = Uint32Array.of(1, 4, 9);
+  const b = Uint32Array.of(2, 4, 10);
+  const pages = [{
+    id: 'page_1',
+    name: 'Page 1',
+    highlightedGroups: [
+      { id: 'a', enabled: true, cellIndices: a, cellCount: 3 },
+      { id: 'b', enabled: true, cellIndices: b, cellCount: 3 },
+    ],
+  }];
+  const layer = makeLayer(pages, 12);
+  t.after(() => layer.destroy());
+  const union = layer.getCellIndicesForPage('page_1');
+  assert.ok(union instanceof Uint32Array);
+  assert.deepEqual(Array.from(union), [1, 2, 4, 9, 10]);
+  const rest = layer.getCellIndicesForPage('restof__page_1');
+  assert.ok(rest instanceof Uint32Array);
+  assert.deepEqual(Array.from(rest), [0, 3, 5, 6, 7, 8, 11]);
+  // The union is the data layer's: counted once, however many reads share it.
   layer.getCellIndicesForPage('page_1');
-  assert.equal(copies, 1, 'and keeps them');
+  assert.equal(layer._heldPageCellBytes(), union.byteLength);
 });

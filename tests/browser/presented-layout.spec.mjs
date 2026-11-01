@@ -232,7 +232,7 @@ async function toggleSidebar(page, hidden) {
  * to its end and sampled settled.
  *
  * Sampling the frames the browser happened to draw saw nothing of the slide
- * wherever a frame outlasted it: the slide is 300 ms, and on a Windows WebKit
+ * wherever a frame outlasted it: the slide is 300 ms, and on a slow hosted
  * runner it had already ended by the first frame after the click, so the only
  * samples were that frame and the settled one. A
  * paused slide keeps the sidebar's transition running, which is all the
@@ -791,25 +791,24 @@ test('proximity and KNN drags in the left cell grow from the cell under the poin
   await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
 
   // A chain graph (each cell's neighbours are the previous and next index),
-  // handed over as the reader's edge payload.
-  await page.evaluate(async () => {
-    const { extractConnectivityEdges } = await import('/assets/js/data/connectivity-edges.js');
+  // handed over as the k-NN tool's row source (rows read by cell, as the
+  // reader worker reads them from the file).
+  await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const count = viewer.getPointCount();
-    const indptr = new Int32Array(count + 1);
-    const indices = [];
-    for (let index = 0; index < count; index++) {
-      if (index > 0) indices.push(index - 1);
-      if (index + 1 < count) indices.push(index + 1);
-      indptr[index + 1] = indices.length;
-    }
-    viewer.loadKnnEdges(extractConnectivityEdges({
-      format: 'csr',
-      shape: [count, count],
-      indptr,
-      indices: Int32Array.from(indices),
-      data: new Float32Array(indices.length).fill(1),
-    }, count));
+    viewer.loadKnnEdges({
+      nCells: count,
+      async readRows(cells) {
+        const offsets = new Uint32Array(cells.length + 1);
+        const neighbors = [];
+        cells.forEach((cell, i) => {
+          if (cell > 0) neighbors.push(cell - 1);
+          if (cell + 1 < count) neighbors.push(cell + 1);
+          offsets[i + 1] = neighbors.length;
+        });
+        return { offsets, neighbors: Uint32Array.from(neighbors) };
+      },
+    });
   });
   await page.locator('.highlight-mode-btn[data-mode="knn"]').click();
   await armSelection(page, 'knn', () => altPath(page, [

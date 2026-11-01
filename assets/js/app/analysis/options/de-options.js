@@ -106,6 +106,13 @@ export const DE_OPTIONS = defineOptions({
         ...(context?.categoricalFields ?? []).map(field => ({ value: field.key, label: field.key })),
       ],
     },
+    {
+      // A sample with fewer of a group's cells is left out of that side: its
+      // mean is mostly noise, and every sample weighs the same.
+      key: 'minCellsPerSample', kind: 'number', label: 'Min cells per sample', tip: 'analysis-replicates', group: 'test',
+      default: 10, min: 1, integer: true,
+      when: record => record.replicates !== '',
+    },
     // Pseudobulk is one test (Welch's t across samples): the cell-level
     // method and p-value convention apply only without replicates.
     ...testOptions('test').map(entry => (

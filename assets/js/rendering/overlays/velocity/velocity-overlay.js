@@ -51,10 +51,32 @@ import {
   createOrUpdatePackedVisibilityTexture,
   packedTextureFits,
 } from '../shared/packed-texture.js';
+import { setLinearLayoutUniform } from '../../linear-texture.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../alpha-visibility.js';
 import { requireCleanWebGLState, requireLiveContext } from '../../gl-errors.js';
-import { isProvenFiniteFloat32Array, markProvenFiniteFloat32Array } from '../../position-layout.js';
+import { isProvenCellRows, isUnplacedCell, positionsForGpu, requirePlacedOrUnplacedRows, unplacedCountOf, vectorsForGpu } from '../../unplaced-positions.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { requireLodMembership } from '../../high-perf/renderer-contracts.js';
+import { failureText } from '../../../utils/errors.js';
+
+/**
+ * The cells particles may spawn from at a view's level of detail
+ * (`LodMembership`): every cell at full detail, else the level's cells, in
+ * the order the level draws them (`indices`) or as its first `count` cells.
+ * Candidate `k` is cell `lodIndices[k]`, or cell `k` when `lodIndices` is null.
+ *
+ * @param {import('../../high-perf/renderer-contracts.js').LodMembership|null} lodMembership
+ * @param {number} cellCount
+ * @returns {{lodIndices: Uint32Array|null, candidateCount: number}}
+ */
+function spawnCandidatesOf(lodMembership, cellCount) {
+  const membership = requireLodMembership(lodMembership, {
+    pointCount: cellCount,
+    owner: 'VelocityOverlay LOD spawn candidates',
+  });
+  if (membership === null) return { lodIndices: null, candidateCount: cellCount };
+  return { lodIndices: membership.indices, candidateCount: membership.count };
+}
 
 // =============================================================================
 // CONFIGURATION
@@ -551,12 +573,12 @@ function validateVelocityFieldData(
     fieldData === null ||
     typeof fieldData !== 'object' ||
     Array.isArray(fieldData) ||
-    Object.getPrototypeOf(fieldData) !== Object.prototype ||
-    Object.keys(fieldData).sort().join(',') !==
-      'cellCount,components,maxMagnitude,vectors'
+    Object.getPrototypeOf(fieldData) !== Object.prototype
   ) {
+    // The fields read below are checked, not the set of keys: a producer
+    // may carry more than the overlay reads.
     throw new TypeError(
-      'VelocityOverlay fieldData must contain exactly cellCount, components, maxMagnitude, and vectors.'
+      'VelocityOverlay fieldData must be an object of cellCount, components, maxMagnitude, and vectors.'
     );
   }
   const {
@@ -580,16 +602,10 @@ function validateVelocityFieldData(
     );
   }
   // Vectors the reader worker checked arrive proven finite; any other is
-  // scanned once.
-  if (!isProvenFiniteFloat32Array(vectors)) {
-    for (let index = 0; index < vectors.length; index += 1) {
-      if (!Number.isFinite(vectors[index])) {
-        throw new RangeError(
-          `VelocityOverlay vector value ${index} must be finite.`
-        );
-      }
-    }
-    markProvenFiniteFloat32Array(vectors);
+  // scanned once. A cell with no vector (or no position) in this embedding
+  // has NaN in every component (`unplaced-positions.js`): no arrow.
+  if (!isProvenCellRows(vectors)) {
+    requirePlacedOrUnplacedRows(vectors, components, 'VelocityOverlay vectors');
   }
   requireNumber(maxMagnitude, 'maxMagnitude', 0, Number.MAX_VALUE);
   return {
@@ -633,23 +649,23 @@ function requireViewId(value) {
   return value;
 }
 
-function createRNG(seed) {
-  let state = seed >>> 0;
-  if (state === 0) state = 0x6d2b79f5;
-  return {
-    next() {
-      state ^= (state << 13) >>> 0;
-      state ^= (state >>> 17) >>> 0;
-      state ^= (state << 5) >>> 0;
-      return state >>> 0;
-    },
-    nextInt(max) {
-      if (!Number.isSafeInteger(max) || max <= 0 || max > 0x1_0000_0000) {
-        throw new RangeError('VelocityOverlay random sample bound must be an integer from 1 through 2^32.');
-      }
-      return Math.floor((this.next() / 0x1_0000_0000) * max);
-    }
-  };
+/**
+ * The step of the order spawn candidates are visited in: candidate
+ * `(start + j * step) mod count` for j = 0, 1, ... (the spawn-table build's
+ * `build.position += build.stride`).
+ * Coprime with the count, so the order visits every candidate once a cycle;
+ * near the golden ratio of the count, so consecutive candidates lie far
+ * apart and any run of them spreads evenly over the cells.
+ *
+ * @param {number} count
+ * @returns {number}
+ */
+function spawnStrideOf(count) {
+  if (count <= 2) return 1;
+  let step = Math.max(1, Math.round(count * 0.6180339887498949));
+  const gcd = (a, b) => { while (b !== 0) [a, b] = [b, a % b]; return a; };
+  while (gcd(step, count) !== 1) step++;
+  return step % count;
 }
 
 // =============================================================================
@@ -950,10 +966,10 @@ export class VelocityOverlay extends OverlayBase {
     const existing = perField.get(validated.layoutKey);
     const replacedBinding =
       existing !== undefined &&
-      this.gl.getParameter(this.gl.TEXTURE_BINDING_2D) === existing.texture;
+      this.gl.getParameter(this.gl.TEXTURE_BINDING_2D_ARRAY) === existing.texture;
     const textureInfo = createOrUpdatePackedFloatTexture(this.gl, {
       texture: null,
-      data: validated.vectors,
+      data: vectorsForGpu(validated.vectors, validated.components),
       itemCount: validated.cellCount,
       components: validated.components,
       allocationCheck: 'now'
@@ -1008,7 +1024,7 @@ export class VelocityOverlay extends OverlayBase {
       if (replacedBinding) {
         try {
           this.gl.bindTexture(
-            this.gl.TEXTURE_2D,
+            this.gl.TEXTURE_2D_ARRAY,
             textureInfo.texture
           );
         } catch (error) {
@@ -1248,7 +1264,6 @@ export class VelocityOverlay extends OverlayBase {
       state.building = false;
       state.buildToken = null;
       state.tableSize = 0;
-      state.tableWidth = 1;
       state.textureInfo = null;
       state.visibilityTextureInfo = null;
       if (state.notificationId !== null) {
@@ -1602,7 +1617,7 @@ export class VelocityOverlay extends OverlayBase {
     }
 
     const posTexture = this._ensurePositionTexture(viewId, positions, dim);
-    const spawnState = this._ensureSpawnTable(viewId, ctx, field.cellCount);
+    const spawnState = this._ensureSpawnTable(viewId, ctx, field.cellCount, positions, dim);
     // The particle count this view's table serves, read by
     // needsContinuousFrames.
     if (spawnState) spawnState.targetCount = targetCount;
@@ -2231,11 +2246,11 @@ export class VelocityOverlay extends OverlayBase {
 
     // Bind textures
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, field.texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, field.texture);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, posTexture.texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, posTexture.texture);
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, spawnState.textureInfo.texture);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, spawnState.textureInfo.texture);
 
     // Set uniforms
     const u = this._uniformsUpdate;
@@ -2265,9 +2280,9 @@ export class VelocityOverlay extends OverlayBase {
       u.u_velocityBlend,
       1 - Math.pow(0.75, frameScale)
     );
-    gl.uniform1i(u.u_velocityTexWidth, field.width);
-    gl.uniform1i(u.u_positionTexWidth, posTexture.width);
-    gl.uniform1i(u.u_spawnTableWidth, spawnState.tableWidth);
+    setLinearLayoutUniform(gl, u.u_velocityLayout, field.plan);
+    setLinearLayoutUniform(gl, u.u_positionLayout, posTexture.plan);
+    setLinearLayoutUniform(gl, u.u_spawnTableLayout, spawnState.textureInfo.plan);
     gl.uniform1i(u.u_spawnTableSize, spawnState.tableSize);
 
     let transformFeedbackActive = false;
@@ -2636,9 +2651,10 @@ export class VelocityOverlay extends OverlayBase {
 
     // Visibility
     gl.uniform1i(u.u_useAlphaTex, 1);
-    gl.uniform1i(
-      u.u_alphaTexWidth,
-      spawnState.visibilityTextureInfo.width
+    setLinearLayoutUniform(
+      gl,
+      u.u_alphaLayout,
+      spawnState.visibilityTextureInfo.plan
     );
 
     // Fog
@@ -2654,7 +2670,7 @@ export class VelocityOverlay extends OverlayBase {
     // Bind textures
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(
-      gl.TEXTURE_2D,
+      gl.TEXTURE_2D_ARRAY,
       spawnState.visibilityTextureInfo.texture
     );
     gl.activeTexture(gl.TEXTURE3);
@@ -3523,10 +3539,8 @@ export class VelocityOverlay extends OverlayBase {
       !textureInfo ||
       typeof textureInfo !== 'object' ||
       !textureInfo.texture ||
-      !Number.isSafeInteger(textureInfo.width) ||
-      textureInfo.width <= 0 ||
-      !Number.isSafeInteger(textureInfo.height) ||
-      textureInfo.height <= 0 ||
+      !Number.isSafeInteger(textureInfo.plan?.texels) ||
+      textureInfo.plan.texels <= 0 ||
       !Number.isSafeInteger(bytesPerPixel) ||
       bytesPerPixel <= 0
     ) {
@@ -3534,11 +3548,7 @@ export class VelocityOverlay extends OverlayBase {
         'VelocityOverlay derived texture byte ownership is invalid.'
       );
     }
-    return (
-      BigInt(textureInfo.width) *
-      BigInt(textureInfo.height) *
-      BigInt(bytesPerPixel)
-    );
+    return BigInt(textureInfo.plan.texels) * BigInt(bytesPerPixel);
   }
 
   _queueDerivedTextureDelete(textureInfo, bytesPerPixel) {
@@ -3615,7 +3625,6 @@ export class VelocityOverlay extends OverlayBase {
       state.ready = false;
       state.generation = -1;
       state.tableSize = 0;
-      state.tableWidth = 1;
 
       if (state.notificationId !== null) {
         const notificationId = state.notificationId;
@@ -3870,11 +3879,11 @@ export class VelocityOverlay extends OverlayBase {
         'u_velocityBlend'
       ),
       u_velocityTex: gl.getUniformLocation(this._programUpdate, 'u_velocityTex'),
-      u_velocityTexWidth: gl.getUniformLocation(this._programUpdate, 'u_velocityTexWidth'),
+      u_velocityLayout: gl.getUniformLocation(this._programUpdate, 'u_velocityLayout'),
       u_positionTex: gl.getUniformLocation(this._programUpdate, 'u_positionTex'),
-      u_positionTexWidth: gl.getUniformLocation(this._programUpdate, 'u_positionTexWidth'),
+      u_positionLayout: gl.getUniformLocation(this._programUpdate, 'u_positionLayout'),
       u_spawnTableTex: gl.getUniformLocation(this._programUpdate, 'u_spawnTableTex'),
-      u_spawnTableWidth: gl.getUniformLocation(this._programUpdate, 'u_spawnTableWidth'),
+      u_spawnTableLayout: gl.getUniformLocation(this._programUpdate, 'u_spawnTableLayout'),
       u_spawnTableSize: gl.getUniformLocation(this._programUpdate, 'u_spawnTableSize')
     };
 
@@ -3896,7 +3905,7 @@ export class VelocityOverlay extends OverlayBase {
       u_cometStretch: gl.getUniformLocation(this._programRender, 'u_cometStretch'),
       u_invMaxMagnitude: gl.getUniformLocation(this._programRender, 'u_invMaxMagnitude'),
       u_alphaTex: gl.getUniformLocation(this._programRender, 'u_alphaTex'),
-      u_alphaTexWidth: gl.getUniformLocation(this._programRender, 'u_alphaTexWidth'),
+      u_alphaLayout: gl.getUniformLocation(this._programRender, 'u_alphaLayout'),
       u_useAlphaTex: gl.getUniformLocation(this._programRender, 'u_useAlphaTex'),
       u_colormapTex: gl.getUniformLocation(this._programRender, 'u_colormapTex'),
       u_fogNear: gl.getUniformLocation(this._programRender, 'u_fogNear'),
@@ -4201,7 +4210,7 @@ export class VelocityOverlay extends OverlayBase {
     if (!entry) {
       const textureInfo = createOrUpdatePackedFloatTexture(this.gl, {
         texture: null,
-        data: positions,
+        data: positionsForGpu(positions, dimension),
         itemCount: positions.length / dimension,
         components: dimension,
         allocationCheck: 'now'
@@ -4281,7 +4290,26 @@ export class VelocityOverlay extends OverlayBase {
   }
 
 
-  _createSpawnTableBuild(transparency, cellCount, lodIndices) {
+  /**
+   * A spawn-table build: the next `spawnTableSize` visible, placed candidates
+   * (the level's cells, or every cell) in the visiting order
+   * (`spawnStrideOf`) from position `start`. A view's table is refilled each
+   * respawn epoch from where the last one stopped (`reseed`: the same
+   * inputs, already validated), so over successive epochs every visible
+   * cell is a spawn source, each once a cycle; when one build visits every
+   * candidate it holds every visible cell and is not refilled. A build that
+   * is not a refill first checks every transparency value.
+   *
+   * @param {Uint8Array} transparency
+   * @param {number} cellCount
+   * @param {object|null} lodMembership
+   * @param {{positions: Float32Array, dimension: number}|null} placement -
+   *   The view's positions when some cells are unplaced (they never spawn).
+   * @param {number} [start] - The first position visited
+   * @param {boolean} [reseed] - A refill of the same inputs
+   * @private
+   */
+  _createSpawnTableBuild(transparency, cellCount, lodMembership, placement, start = 0, reseed = false) {
     if (
       !(transparency instanceof Uint8Array) ||
       !Number.isSafeInteger(cellCount) ||
@@ -4292,43 +4320,34 @@ export class VelocityOverlay extends OverlayBase {
         'VelocityOverlay spawn sampling requires exactly one Uint8 transparency value per cell.'
       );
     }
-    if (lodIndices !== null && !(lodIndices instanceof Uint32Array)) {
-      throw new TypeError(
-        'VelocityOverlay LOD spawn candidates must be a Uint32Array or null.'
-      );
-    }
-
-    const candidateCount = lodIndices ? lodIndices.length : cellCount;
+    const { lodIndices, candidateCount } = spawnCandidatesOf(lodMembership, cellCount);
     const maxSize = Math.min(this.config.spawnTableSize, candidateCount);
-    const seed = (
-      0x9e3779b9
-      ^ Math.imul(cellCount, 0x85ebca6b)
-      ^ Math.imul(candidateCount, 0xc2b2ae35)
-    ) >>> 0;
     return {
       candidateCount,
-      candidateIndex: 0,
       cellCount,
       filled: 0,
       lodIndices,
-      // Without an indexed LOD candidate set, validation and sampling visit
-      // the same cells in the same order and can share one exact pass.
-      phase: lodIndices === null ? 'sample-unindexed' : 'validate',
-      rng: createRNG(seed),
+      // The visiting order: position `position`, then `+ stride` mod count.
+      position: candidateCount === 0 ? 0 : start % candidateCount,
+      stride: spawnStrideOf(candidateCount),
+      visited: 0,
+      // Whether the build visited every candidate (its table is every visible cell).
+      coversAll: false,
+      phase: reseed ? 'sample' : 'validate',
+      reseed,
       // Textures allocated for this build's tables, awaiting the error read
       // that publishes them (`runBuildSlice`).
       staged: null,
       table: new Uint32Array(maxSize),
       transparency,
+      placement,
       validationIndex: 0,
-      visibleCount: 0,
     };
   }
 
   /**
-   * Advance one bounded portion of an asynchronous spawn-table build.
-   * Indexed LOD validation remains a separate first pass so error ordering and
-   * the final reservoir sample are identical to _buildSpawnTable().
+   * Advance one bounded portion of an asynchronous spawn-table build
+   * (`_createSpawnTableBuild`): the transparency check, then the visits.
    *
    * @param {object} build
    * @param {IdleDeadline|null|undefined} idleDeadline
@@ -4390,48 +4409,28 @@ export class VelocityOverlay extends OverlayBase {
           build.phase = 'sample';
         }
       } else {
-        const end = Math.min(
-          build.candidateCount,
-          build.candidateIndex + batchSize
-        );
-        const start = build.candidateIndex;
-        for (; build.candidateIndex < end; build.candidateIndex++) {
-          const idx = build.lodIndices
-            ? build.lodIndices[build.candidateIndex]
-            : build.candidateIndex;
+        const start = build.visited;
+        const end = Math.min(build.candidateCount, build.visited + batchSize);
+        for (; build.visited < end && build.filled < build.table.length; build.visited++) {
+          const position = build.position;
+          build.position += build.stride;
+          if (build.position >= build.candidateCount) build.position -= build.candidateCount;
+          const idx = build.lodIndices ? build.lodIndices[position] : position;
           if (idx >= build.cellCount) {
             throw new RangeError(
               `VelocityOverlay LOD spawn index ${idx} exceeds the ${build.cellCount}-cell field.`
             );
           }
-          const alpha = build.transparency[idx];
-          if (
-            build.phase === 'sample-unindexed' &&
-            (!Number.isFinite(alpha) || alpha < 0 || alpha > 1)
-          ) {
-            throw new RangeError(
-              `VelocityOverlay transparency value ${idx} must be finite and between 0 and 1.`
-            );
-          }
-          if (
-            alpha < POINT_VISIBILITY_THRESHOLD
-          ) {
+          if (build.transparency[idx] < POINT_VISIBILITY_THRESHOLD) continue;
+          // A cell its embedding does not place: no particle starts there.
+          if (build.placement !== null && isUnplacedCell(build.placement.positions, build.placement.dimension, idx)) {
             continue;
           }
-
-          build.visibleCount++;
-          if (build.filled < build.table.length) {
-            build.table[build.filled++] = idx;
-            continue;
-          }
-
-          const replacementIndex = build.rng.nextInt(build.visibleCount);
-          if (replacementIndex < build.table.length) {
-            build.table[replacementIndex] = idx;
-          }
+          build.table[build.filled++] = idx;
         }
-        processed += end - start;
-        if (build.candidateIndex === build.candidateCount) {
+        processed += build.visited - start;
+        if (build.visited === build.candidateCount || build.filled === build.table.length) {
+          build.coversAll = build.visited === build.candidateCount;
           build.phase = 'complete';
         }
       }
@@ -4495,14 +4494,25 @@ export class VelocityOverlay extends OverlayBase {
         'VelocityOverlay cannot publish an incomplete spawn-table build.'
       );
     }
-    // A view of the filled entries: the build is dropped once its table is
-    // uploaded, so nothing else reads the rest.
-    return build.filled === build.table.length
+    // A view of the filled entries (the build is dropped once its table is
+    // uploaded, so nothing else reads the rest), in cell order: the visiting
+    // order says which cells, not where in the table.
+    const table = build.filled === build.table.length
       ? build.table
       : build.table.subarray(0, build.filled);
+    return table.sort();
   }
 
-  _ensureSpawnTable(viewId, ctx, cellCount) {
+  /**
+   * @param {string} viewId
+   * @param {object} ctx
+   * @param {number} cellCount
+   * @param {Float32Array} positions - The view's positions: a cell its
+   *   embedding does not place (NaN, `unplaced-positions.js`) never spawns.
+   * @param {number} dimension
+   * @private
+   */
+  _ensureSpawnTable(viewId, ctx, cellCount, positions, dimension) {
     const key = requireViewId(viewId);
     let state = this._spawnByView.get(key);
 
@@ -4516,14 +4526,31 @@ export class VelocityOverlay extends OverlayBase {
         textureInfo: null,
         visibilityTextureInfo: null,
         tableSize: 0,
-        tableWidth: 1,
         lastLod: null,
         ready: false,
         generation: -1,
         cellCount: null,
         layoutKey: null,
+        placement: null,
+        // The respawn epoch (`_createSpawnTableBuild`): where the next refill
+        // starts, whether the table holds every visible cell, and when the
+        // table was published (overlay time, s).
+        spawnNext: 0,
+        coversAll: true,
+        epochStartedAt: -Infinity,
       };
       this._spawnByView.set(key, state);
+    }
+    // Positions with unplaced cells are a table of their own; between
+    // positions that place every cell the table is kept.
+    const placement = unplacedCountOf(positions, dimension) > 0 ? { positions, dimension } : null;
+    const previousPlacement = state.placement ?? null;
+    if (previousPlacement === null ? placement !== null : previousPlacement.positions !== placement?.positions) {
+      state.placement = placement;
+      state.dirty = true;
+      state.version++;
+      state.ready = false;
+      this._invalidateViewGeneration(key);
     }
     if (typeof ctx.layoutKey === 'string' && ctx.layoutKey.length > 0) {
       state.layoutKey = ctx.layoutKey;
@@ -4541,6 +4568,17 @@ export class VelocityOverlay extends OverlayBase {
       this._invalidateViewGeneration(key);
     }
     state.lastLod = lod;
+
+    // A respawn epoch over (one particle lifetime): the table is refilled
+    // from where the last one stopped, so every visible cell becomes a spawn
+    // source in turn, unless it already holds every one. The table drawn
+    // stays until the refill lands.
+    if (
+      !state.dirty && !state.building && state.ready && state.coversAll === false
+      && Number.isFinite(ctx.time) && ctx.time - state.epochStartedAt >= this.config.lifetime
+    ) {
+      state.dirty = true;
+    }
 
     if (!state.dirty || state.building) return state;
 
@@ -4587,11 +4625,15 @@ export class VelocityOverlay extends OverlayBase {
           notifications.hasNotification(notifId)
         ) {
           if (success) {
+            // The particles appearing say a quick build ended; with no
+            // visible cell nothing appears, so that outcome is said even
+            // when the build was too quick for its card to show.
             notifications.complete(
               notifId,
               state.tableSize > 0
                 ? 'Velocity overlay ready'
-                : 'Velocity overlay ready (no visible cells)'
+                : 'Velocity overlay ready (no visible cells)',
+              { announce: state.tableSize === 0 }
             );
           } else {
             notifications.fail(notifId, 'Velocity overlay unavailable');
@@ -4689,7 +4731,7 @@ export class VelocityOverlay extends OverlayBase {
           }
         } else {
           notifications.error(
-            `Velocity overlay preparation failed: ${err.message}`,
+            `Velocity overlay preparation failed: ${failureText(err)}`,
             { category: 'render' }
           );
         }
@@ -4727,17 +4769,22 @@ export class VelocityOverlay extends OverlayBase {
             );
           }
 
-          if (typeof ctx.getLodIndices !== 'function') {
+          if (typeof ctx.getLodMembership !== 'function') {
             throw new TypeError(
-              'VelocityOverlay context getLodIndices() is required.'
+              'VelocityOverlay context getLodMembership() is required.'
             );
           }
-          const lodIndices =
-            this.config.syncWithLOD ? ctx.getLodIndices() : null;
+          const lodMembership =
+            this.config.syncWithLOD ? ctx.getLodMembership() : null;
+          // A refill of the table published for these inputs (an epoch's).
+          const reseed = state.ready && state.generation === scheduledVersion;
           build = this._createSpawnTableBuild(
             transparency,
             cellCount,
-            lodIndices
+            lodMembership,
+            state.placement ?? null,
+            reseed ? state.spawnNext : 0,
+            reseed
           );
         }
 
@@ -4752,12 +4799,12 @@ export class VelocityOverlay extends OverlayBase {
           const previousVisibilityTextureInfo =
             state.visibilityTextureInfo;
           state.tableSize = 0;
-          state.tableWidth = 1;
           state.textureInfo = null;
           state.visibilityTextureInfo = null;
           state.generation = scheduledVersion;
           state.cellCount = cellCount;
           state.ready = true;
+          state.coversAll = true;
 
           let retirementFailures = null;
           if (previousTextureInfo?.texture) {
@@ -4814,7 +4861,8 @@ export class VelocityOverlay extends OverlayBase {
           const previousVisibilityTextureInfo =
             state.visibilityTextureInfo;
           if (build.staged === null) {
-            const visibilityFits = packedTextureFits(
+            // A refill keeps the visibility texture: its inputs are the same.
+            const visibilityFits = build.reseed || packedTextureFits(
               this.gl, previousVisibilityTextureInfo, cellCount, 1
             );
             const tableFits = packedTextureFits(
@@ -4864,7 +4912,9 @@ export class VelocityOverlay extends OverlayBase {
           // Storage that already had the shape takes its rows now, as the
           // generation is published.
           const visibilityTextureInfo =
-            build.staged.visibilityTextureInfo === previousVisibilityTextureInfo
+            build.reseed
+              ? previousVisibilityTextureInfo
+              : build.staged.visibilityTextureInfo === previousVisibilityTextureInfo
               ? createOrUpdatePackedVisibilityTexture(this.gl, {
                 texture: previousVisibilityTextureInfo,
                 data: build.transparency,
@@ -4887,10 +4937,12 @@ export class VelocityOverlay extends OverlayBase {
           state.textureInfo = textureInfo;
           state.visibilityTextureInfo = visibilityTextureInfo;
           state.tableSize = table.length;
-          state.tableWidth = textureInfo.width;
           state.generation = scheduledVersion;
           state.cellCount = cellCount;
           state.ready = true;
+          state.spawnNext = build.position;
+          state.coversAll = build.coversAll;
+          state.epochStartedAt = ctx.time;
 
           let retirementFailures = null;
           if (
@@ -4956,64 +5008,22 @@ export class VelocityOverlay extends OverlayBase {
     return state;
   }
 
-  _buildSpawnTable(transparency, cellCount, lodIndices) {
-    if (
-      !(transparency instanceof Uint8Array) ||
-      !Number.isSafeInteger(cellCount) ||
-      cellCount < 0 ||
-      transparency.length !== cellCount
-    ) {
-      throw new TypeError(
-        'VelocityOverlay spawn sampling requires exactly one Uint8 transparency value per cell.'
-      );
-    }
-    if (lodIndices !== null && !(lodIndices instanceof Uint32Array)) {
-      throw new TypeError(
-        'VelocityOverlay LOD spawn candidates must be a Uint32Array or null.'
-      );
-    }
-    for (let index = 0; index < transparency.length; index++) {
-      const alpha = transparency[index];
-      if (!Number.isFinite(alpha) || alpha < 0 || alpha > 1) {
-        throw new RangeError(
-          `VelocityOverlay transparency value ${index} must be finite and between 0 and 1.`
-        );
-      }
-    }
-    const candidates = lodIndices;
-    const candidateCount = candidates ? candidates.length : cellCount;
-    const maxSize = Math.min(this.config.spawnTableSize, candidateCount);
-    const table = new Uint32Array(maxSize);
-    const seed = (
-      0x9e3779b9
-      ^ Math.imul(cellCount, 0x85ebca6b)
-      ^ Math.imul(candidateCount, 0xc2b2ae35)
-    ) >>> 0;
-    const rng = createRNG(seed);
-    let filled = 0;
-    let visibleCount = 0;
-
-    for (let candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
-      const idx = candidates ? candidates[candidateIndex] : candidateIndex;
-      if (idx >= cellCount) {
-        throw new RangeError(
-          `VelocityOverlay LOD spawn index ${idx} exceeds the ${cellCount}-cell field.`
-        );
-      }
-      if (transparency[idx] < POINT_VISIBILITY_THRESHOLD) continue;
-
-      visibleCount++;
-      if (filled < maxSize) {
-        table[filled++] = idx;
-        continue;
-      }
-
-      const replacementIndex = rng.nextInt(visibleCount);
-      if (replacementIndex < maxSize) {
-        table[replacementIndex] = idx;
-      }
-    }
-
-    return filled === table.length ? table : table.slice(0, filled);
+  /**
+   * A view's spawn table at once (`_createSpawnTableBuild` run to its end):
+   * the cells a build from `start` takes.
+   *
+   * @param {Uint8Array} transparency
+   * @param {number} cellCount
+   * @param {object|null} lodMembership
+   * @param {{positions: Float32Array, dimension: number}|null} [placement]
+   * @param {number} [start]
+   * @returns {Uint32Array}
+   * @private
+   */
+  _buildSpawnTable(transparency, cellCount, lodMembership, placement = null, start = 0) {
+    const build = this._createSpawnTableBuild(transparency, cellCount, lodMembership, placement, start);
+    while (!this._advanceSpawnTableBuild(build, null));
+    return this._finishSpawnTableBuild(build).slice();
   }
+
 }

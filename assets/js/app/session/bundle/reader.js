@@ -16,6 +16,7 @@ import {
   MAX_FRAME_BYTES,
   NOT_A_SESSION_FILE_MESSAGE,
   SESSION_BUNDLE_MAGIC_BYTES,
+  sessionSignatureRefusal,
   U32_BYTES,
   bytesToU32LE
 } from './format.js';
@@ -25,6 +26,7 @@ import {
 } from '../schema-contract.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { throwIfAborted, cancelled } from '../../../utils/abort.js';
 
 /**
  * The byte stream ended before a read it was asked for. Kept distinct so the
@@ -34,15 +36,6 @@ class UnexpectedEndOfFileError extends Error {
   constructor(message) {
     super(message);
     this.name = 'UnexpectedEndOfFileError';
-  }
-}
-
-/**
- * @param {AbortSignal | null | undefined} signal
- */
-function throwIfAborted(signal) {
-  if (signal !== null && signal.aborted) {
-    throw new DOMException('Aborted', 'AbortError');
   }
 }
 
@@ -266,7 +259,8 @@ export async function readBundle(source, options) {
       throw error;
     }
     if (!SESSION_BUNDLE_MAGIC_BYTES.every((byte, i) => magic[i] === byte)) {
-      throw new Error(NOT_A_SESSION_FILE_MESSAGE);
+      // Another format version's signature says which; anything else is not a session.
+      throw new Error(sessionSignatureRefusal(magic));
     }
 
     // 2) Manifest length
@@ -355,7 +349,7 @@ export async function readBundle(source, options) {
     } finally {
       // A consumer that stopped iterating early still owns an unsettled
       // reader here; after the exact end or a failure this is a no-op.
-      await cancel(new DOMException('Session bundle reading stopped.', 'AbortError'));
+      await cancel(cancelled('closed', 'Session bundle reading stopped.'));
     }
   }
 

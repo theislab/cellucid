@@ -36,17 +36,7 @@ async function installPixelDecoder(page) {
       const image = new Image();
       image.src = `data:image/png;base64,${base64}`;
       await image.decode();
-      let canvas;
-      if (typeof OffscreenCanvas === 'function') {
-        canvas = new OffscreenCanvas(image.width, image.height);
-      } else {
-        // Windows WebKit does not expose OffscreenCanvas. Pixel decoding is a
-        // test-side operation, and a detached real canvas has the same 2D
-        // pixel contract without requiring that unrelated optional API.
-        canvas = document.createElement('canvas');
-        canvas.width = image.width;
-        canvas.height = image.height;
-      }
+      const canvas = new OffscreenCanvas(image.width, image.height);
       const context = canvas.getContext('2d', { willReadFrequently: true });
       if (context === null) {
         throw new Error('Screenshot pixel decoder could not create a 2D context.');

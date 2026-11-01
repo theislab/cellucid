@@ -306,7 +306,7 @@ test('lookup route maps every search kind to the exact official APQ fields', asy
       );
       assert.equal(response.status, 200);
       assert.deepEqual(await responseDocument(response), {
-        contractVersion: 1,
+        contractVersion: 2,
         results: [projectedLookupItem(upstreamItem)],
         omittedInvalidCount: 0,
       });
@@ -623,7 +623,7 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
       );
       assert.equal(response.status, 200);
       const document = await responseDocument(response);
-      assert.equal(document.contractVersion, 1);
+      assert.equal(document.contractVersion, 2);
       assert.equal(document.omittedInvalidCount, invalid.length);
       assert.equal(document.results.length, 2);
       assert.deepEqual(document.results[0], projectedLookupItem(valid));

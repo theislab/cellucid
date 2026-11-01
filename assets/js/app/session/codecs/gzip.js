@@ -17,16 +17,7 @@ import {
 import { createSlicedInputStream } from '../../../formats/io/inflate.js';
 import { requireExactKeys } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-
-/**
- * @param {AbortSignal | null | undefined} signal
- */
-function throwIfAborted(signal) {
-  if (signal !== null && signal.aborted) {
-    // DOMException is the browser-standard for abort flows.
-    throw new DOMException('Aborted', 'AbortError');
-  }
-}
+import { throwIfAborted } from '../../../utils/abort.js';
 
 function assertSignal(signal, context) {
   if (
@@ -94,23 +85,6 @@ function requireSingleMemberEnvelope(compressed, exactOutputBytes) {
       + `the exact ${exactOutputBytes}-byte contract modulo 2^32.`,
     );
   }
-}
-
-/**
- * Convert a Uint8Array into a ReadableStream<Uint8Array>.
- * @param {Uint8Array} bytes
- * @returns {ReadableStream<Uint8Array>}
- */
-function bytesToStream(bytes) {
-  if (!(bytes instanceof Uint8Array)) {
-    throw new TypeError('Gzip input must be a Uint8Array.');
-  }
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes);
-      controller.close();
-    }
-  });
 }
 
 /**
@@ -306,7 +280,10 @@ export async function gzipCompress(uncompressed, options) {
     throw new Error('Gzip compression requires CompressionStream.');
   }
 
-  const cs = new CompressionStream('gzip');
-  const compressedStream = bytesToStream(uncompressed).pipeThrough(cs);
+  // In slices that hand the thread back (`createSlicedInputStream`): a
+  // chunk of hundreds of megabytes (an analysis's marker statistics) is
+  // compressed over many tasks, not one that holds the page for seconds.
+  const compressedStream = createSlicedInputStream([uncompressed])
+    .pipeThrough(new CompressionStream('gzip'));
   return streamToUint8Array(compressedStream, { maxBytes: null, signal });
 }

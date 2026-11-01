@@ -32,6 +32,8 @@
   --sidebar-width: var(--sidebar-user-width, 280px);
   --sidebar-toggle-width: 38px;
   --sidebar-toggle-height: 34px;
+  /* The phone panel's peek bar (layouts/_responsive.css): a fingertip's height. */
+  --phone-sheet-bar-height: 44px;
   --header-height: 36px;
   --accordion-default-width: 320px;
   --accordion-default-height: 400px;

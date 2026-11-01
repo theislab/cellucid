@@ -7,6 +7,7 @@ import { isFiniteNumber } from './utils/number-utils.js';
 import { createAccordionInteractions } from './dockable-accordions/interactions.js';
 import { createSheetLayout } from './dockable-accordions/sheets.js';
 import { announceKeyboardMove } from './ui/keyboard-move.js';
+import { cancel } from '../utils/abort.js';
 
 const DRAG_THRESHOLD_PX = 6;
 const DETACH_DISTANCE_PX = 30;     // Distance from sidebar right edge to detach
@@ -167,6 +168,21 @@ function ensurePanelFrame(details) {
   return frame;
 }
 
+/**
+ * How far a floating window takes touches past its frame: the outer part of
+ * its resize handles (`--handle-outside`, _accordion.css; larger on a touch
+ * screen). 0 for a frame without handles.
+ *
+ * @param {HTMLElement} frame
+ * @returns {number}
+ */
+function handleReach(frame) {
+  const handle = frame.querySelector(':scope > .accordion-resize-handle');
+  if (handle === null) return 0;
+  const reach = Number.parseFloat(getComputedStyle(handle).getPropertyValue('--handle-outside'));
+  return Number.isFinite(reach) ? reach : 0;
+}
+
 function ensureFloatingRoot() {
   let root = document.getElementById('floating-panels-root');
   if (root) return root;
@@ -185,6 +201,26 @@ export function initDockableAccordions({ sidebar } = {}) {
 
   const floatingRoot = ensureFloatingRoot();
   const stateByDetails = new Map();
+  // The bar a phone's closed panel waits as at the foot of the screen
+  // (index.html, layouts/_responsive.css): the one way back to the panel.
+  const phoneBar = document.getElementById('phone-sheet-bar');
+
+  /**
+   * The area a floating window is placed, dragged, resized and kept in: the
+   * window, less the panel's bar while it shows (a phone with its panel
+   * closed). No window is put over the bar, so it is never covered; a
+   * phone's window sheets stand on it (`--phone-bar-space`).
+   *
+   * @returns {{viewportWidth: number, viewportHeight: number}}
+   */
+  function floatingArea() {
+    const viewportWidth = window.innerWidth;
+    let viewportHeight = window.innerHeight;
+    if (phoneBar !== null && phoneBar.getClientRects().length > 0) {
+      viewportHeight = Math.min(viewportHeight, phoneBar.getBoundingClientRect().top);
+    }
+    return { viewportWidth, viewportHeight };
+  }
   // The phone layout of the panels registered as sheets; built with the
   // first of them, so a page without any never watches the viewport for it.
   let sheets = null;
@@ -396,8 +432,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     const content = details.querySelector('.accordion-content');
 
     // Viewport constraints
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
+    const { viewportWidth, viewportHeight } = floatingArea();
     // The limits are the content's and the viewport's: no panel is held
     // narrower or shorter than it has to be. The least height is the header
     // and the content's first row.
@@ -454,7 +489,8 @@ export function initDockableAccordions({ sidebar } = {}) {
         headers: [...floatingRoot.querySelectorAll(
           ':scope > .accordion-floating > .accordion-section > summary'
         )].map(header => header.getBoundingClientRect()),
-        step: Math.max(headerHeight, 24)
+        step: Math.max(headerHeight, 24),
+        reach: handleReach(frame)
       });
       clampedLeft = placed.x;
       clampedTop = placed.y;
@@ -582,6 +618,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     raiseToTop,
     undock,
     dock,
+    floatingArea,
     constants: {
       DRAG_THRESHOLD_PX,
       DETACH_DISTANCE_PX,
@@ -692,7 +729,7 @@ export function initDockableAccordions({ sidebar } = {}) {
   function unregister(details) {
     const state = stateByDetails.get(details);
     if (!state) return;
-    state.controller?.abort();
+    cancel(state.controller, 'closed', 'The accordion was unregistered.');
     try { state.dockPlaceholder?.remove(); } catch {}
     // The handle and the two window buttons are this module's own elements and
     // carry its listeners; leaving them behind would leave a re-registered
@@ -728,13 +765,14 @@ export function initDockableAccordions({ sidebar } = {}) {
   // A window resize fires many times per frame; the panels are re-clamped
   // once per frame. Every panel is measured before any is moved, so one
   // panel's write never forces the next panel's read to lay out again.
+  // The area shrinks too when a phone's panel closes and its bar shows at the
+  // foot of the screen: a window there is moved clear of the bar.
   let resizeFrame = null;
-  window.addEventListener('resize', () => {
+  const reclampFloating = () => {
     if (resizeFrame !== null) return;
     resizeFrame = requestAnimationFrame(() => {
       resizeFrame = null;
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
+      const { viewportWidth, viewportHeight } = floatingArea();
       const measured = [];
       for (const frame of [...floatingRoot.children]) {
         const details = frame.querySelector(':scope > details.accordion-section');
@@ -757,7 +795,9 @@ export function initDockableAccordions({ sidebar } = {}) {
         StyleManager.setPosition(frame, { x: clamped.x, y: clamped.y });
       }
     });
-  });
+  };
+  window.addEventListener('resize', reclampFloating);
+  if (phoneBar !== null) new ResizeObserver(reclampFloating).observe(phoneBar);
 
   return {
     dock,

@@ -15,7 +15,9 @@ import {
   createConnectivitySelectionScratch,
   selectConnectivityEdges,
 } from '../assets/js/rendering/connectivity-edge-selection.js';
+import { requireLodMembership } from '../assets/js/rendering/high-perf/renderer-contracts.js';
 import { connectivityEdgesFromPairs } from './helpers/connectivity-edges.mjs';
+import { admissionMembership, prefixMembership } from './helpers/lod-membership.mjs';
 
 const mainSource = await readFile(
   new URL('../assets/js/app/main.js', import.meta.url),
@@ -42,10 +44,10 @@ function nextFloat32(value, direction) {
   return view.getFloat32(0, true);
 }
 
-const membershipValidatorSource = extractSource(
+const visibilityOwnerSource = extractSource(
   mainSource,
-  'function requireConnectivityLodMembership(',
-  '/**\n       * Resolve one exact compositional visibility owner.'
+  'function getConnectivityVisibilityOwner(viewId, dimensionLevel)',
+  '// Format edge count for display (compact)'
 );
 const targetedVisibilitySource = extractSource(
   mainSource,
@@ -93,61 +95,36 @@ const edgePublicationSource = extractSource(
   'function clearPublishedConnectivityEdges()'
 );
 
-test('connectivity validates the exact immutable compact LOD owner', () => {
-  const requireMembership = new Function(
-    `${membershipValidatorSource}
-     return requireConnectivityLodMembership;`
-  )();
-  const generationToken = Object.freeze({});
-  const valid = Object.freeze({
-    admissionLevels: Uint8Array.from([0, 2, 1]),
-    dimensionLevel: 2,
-    generationToken,
-    indices: Uint32Array.from([0, 2]),
-    lodLevel: 1,
-    pointCount: 3
-  });
-
-  assert.equal(requireMembership(null, 3, 2), null);
-  assert.equal(requireMembership(valid, 3, 2), valid);
-  assert.throws(
-    () => requireMembership({ ...valid }, 3, 2),
-    /exact immutable admission owner/
+test('connectivity takes the level of detail through the one shared LodMembership validator', () => {
+  // main.js keeps no validator of its own (a hand copy pinned the key set
+  // and threw on every rank-order level).
+  assert.match(
+    visibilityOwnerSource,
+    /requireLodMembership\(\s*viewer\.getCurrentLodMembership\(viewId, dimensionLevel\),\s*\{ pointCount, dimensionLevel, owner: 'Connectivity level of detail' \}/
   );
+  assert.doesNotMatch(mainSource, /requireConnectivityLodMembership|admissionLevels,dimensionLevel/);
+  const owner = { pointCount: 3, dimensionLevel: 2, owner: 'Connectivity level of detail' };
+  const tree = admissionMembership(Uint8Array.from([0, 2, 1]), 1, { dimensionLevel: 2 });
+  const rank = prefixMembership(3, 2, { dimensionLevel: 2 });
+  assert.equal(requireLodMembership(null, owner), null);
+  assert.equal(requireLodMembership(tree, owner), tree);
+  assert.equal(requireLodMembership(rank, owner), rank);
+  // A record carrying more fields than the contract names still passes.
+  const extra = Object.freeze({ ...rank, ownerNote: 'kept' });
+  assert.equal(requireLodMembership(extra, owner), extra);
+  assert.throws(() => requireLodMembership({ ...tree }, owner), /frozen/);
   assert.throws(
-    () => requireMembership(Object.freeze({
-      ...valid,
-      admissionLevels: Uint8Array.from([0, 1])
-    }), 3, 2),
-    /exact immutable admission owner/
+    () => requireLodMembership(Object.freeze({ ...tree, admissionLevels: Uint8Array.from([0, 1]) }), owner),
+    /one byte a cell/
   );
+  assert.throws(() => requireLodMembership(Object.freeze({ ...tree, dimensionLevel: 3 }), owner), /in 3D/);
+  assert.throws(() => requireLodMembership(Object.freeze({ ...tree, generationToken: null }), owner), /generationToken/);
+  assert.throws(() => requireLodMembership(Object.freeze({ ...tree, generationToken: 1 }), owner), /generationToken/);
+  assert.throws(() => requireLodMembership(Object.freeze({ ...tree, lodLevel: 0xff }), owner), /reduced level/);
+  assert.throws(() => requireLodMembership(Object.freeze({ ...rank, count: 4 }), owner), /reduced level/);
   assert.throws(
-    () => requireMembership(Object.freeze({
-      ...valid,
-      dimensionLevel: 3
-    }), 3, 2),
-    /exact immutable admission owner/
-  );
-  assert.throws(
-    () => requireMembership(Object.freeze({
-      ...valid,
-      generationToken: null
-    }), 3, 2),
-    /exact immutable admission owner/
-  );
-  assert.throws(
-    () => requireMembership(Object.freeze({
-      ...valid,
-      generationToken: 1
-    }), 3, 2),
-    /exact immutable admission owner/
-  );
-  assert.throws(
-    () => requireMembership(Object.freeze({
-      ...valid,
-      lodLevel: 0xff
-    }), 3, 2),
-    /exact immutable admission owner/
+    () => requireLodMembership(Object.freeze({ ...rank, indices: Uint32Array.of(0) }), owner),
+    /indices/
   );
 });
 
@@ -172,8 +149,8 @@ test('an edge is visible exactly when both endpoints pass the point threshold an
   const transparency = Uint8Array.from([1, 1, 1, 0]);
   const admissionLevels = Uint8Array.from([0, 1, 2, 0]);
   const index = createConnectivityEdgeIndex(connectivityEdgesFromPairs(sources, destinations, 4));
-  const visibleAt = (lodMembership, lodLevel) => {
-    const visibility = { transparency, admissionLevels: lodMembership, lodLevel };
+  const visibleAt = (lodMembership) => {
+    const visibility = { transparency, lodMembership };
     const { mask } = connectivityVisibleCells(visibility, null);
     const output = new Uint32Array(4 * 3);
     const { shown } = selectConnectivityEdges(index, mask, 4, output, createConnectivitySelectionScratch());
@@ -188,10 +165,13 @@ test('an edge is visible exactly when both endpoints pass the point threshold an
     }).sort();
   };
   // Cell 3 is hidden: edges 1-3 and 2-3 are not visible.
-  assert.deepEqual(visibleAt(null, -1), [0, 1]);
+  assert.deepEqual(visibleAt(null), [0, 1]);
   // LOD level 1 admits cells 0, 1 and 3: edge 0-2 (cell 2 at level 2) goes.
-  assert.deepEqual(visibleAt(admissionLevels, 1), [0]);
-  assert.deepEqual(visibleAt(admissionLevels, 2), [0, 1]);
+  assert.deepEqual(visibleAt(admissionMembership(admissionLevels, 1)), [0]);
+  assert.deepEqual(visibleAt(admissionMembership(admissionLevels, 2)), [0, 1]);
+  // A rank-order level of the first two cells keeps only edge 0-1.
+  assert.deepEqual(visibleAt(prefixMembership(4, 2)), [0]);
+  assert.deepEqual(visibleAt(prefixMembership(4, 3)), [0, 1]);
 });
 
 test('each updated view refreshes its viewer-owned edge selection and active UI consumes those stats', () => {
@@ -231,6 +211,9 @@ test('each updated view refreshes its viewer-owned edge selection and active UI 
     'calls',
     `
       let edgesLoaded = true;
+      // The shown graph and the working set it counts in (memory-budget.js).
+      const loadedEdgeData = null;
+      const setWorkingSet = () => { throw new Error('no graph is published here'); };
       let activeConnectivityStatsViewId = null;
       let actualVisibleEdges = 0;
       const connectivityCheckbox = { checked: false };
@@ -330,6 +313,9 @@ test('full connectivity refresh completes every pane before publishing one share
     'calls',
     `
       let edgesLoaded = true;
+      // The shown graph and the working set it counts in (memory-budget.js).
+      const loadedEdgeData = null;
+      const setWorkingSet = () => { throw new Error('no graph is published here'); };
       let activeConnectivityStatsViewId = null;
       let actualVisibleEdges = 0;
       const getTotalEdges = () => 20;
@@ -507,7 +493,6 @@ test('application transparency rolls back to the accepted viewer owner on public
   const accepted = Uint8Array.from([1, 1, 0]);
   const categoryTransparency = Uint8Array.from([0, 0, 1]);
   const publicationError = new Error('synthetic GPU upload failure');
-  let alphaSyncs = 0;
   let countSyncs = 0;
   const state = {
     activeViewId: 'live',
@@ -525,9 +510,6 @@ test('application transparency rolls back to the accepted viewer owner on public
     _isLiveView() {
       return true;
     },
-    _syncColorsAlpha() {
-      alphaSyncs += 1;
-    },
     _updateActiveCategoryCounts() {
       countSyncs += 1;
     },
@@ -537,7 +519,7 @@ test('application transparency rolls back to the accepted viewer owner on public
     () => viewContextViewerSyncMethods._pushTransparencyToViewer.call(state),
     (error) => error === publicationError
   );
+  // The transparency is restored; the colors carry no visibility to restore.
   assert.deepEqual(Array.from(categoryTransparency), Array.from(accepted));
-  assert.equal(alphaSyncs, 1);
   assert.equal(countSyncs, 1);
 });

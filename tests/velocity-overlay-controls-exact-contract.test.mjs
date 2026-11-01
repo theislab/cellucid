@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { undoLater } from './helpers/teardown.mjs';
 
 import {
   initVelocityOverlayControls,
@@ -210,7 +211,7 @@ test('minimum flow speed is displayed and published without rounding away its va
   const previousCancelAnimationFrame = globalThis.cancelAnimationFrame;
   globalThis.requestAnimationFrame = callback => frames.push(callback);
   globalThis.cancelAnimationFrame = () => {};
-  t.after(() => {
+  undoLater(t, () => {
     globalThis.requestAnimationFrame = previousRequestAnimationFrame;
     globalThis.cancelAnimationFrame = previousCancelAnimationFrame;
   });
@@ -418,7 +419,7 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
       return makeElement();
     },
   };
-  t.after(() => {
+  undoLater(t, () => {
     if (previousDocument === undefined) {
       delete globalThis.document;
     } else {
@@ -444,7 +445,7 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
   notifications.error = (message, options) => {
     notificationEvents.push([message, options]);
   };
-  t.after(() => {
+  undoLater(t, () => {
     notifications.error = originalNotificationError;
   });
   const controls = initVelocityOverlayControls({
@@ -462,7 +463,7 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
     }),
     viewer: makeViewer(),
   });
-  t.after(() => controls.destroy());
+  undoLater(t, () => controls.destroy());
 
   assert.equal(typeof onEnabledChange, 'function');
   enabledCheckbox.checked = true;
@@ -484,7 +485,7 @@ test('velocity control destruction fences an in-flight field load before viewer 
       return makeElement();
     },
   };
-  t.after(() => {
+  undoLater(t, () => {
     if (previousDocument === undefined) {
       delete globalThis.document;
     } else {
@@ -558,7 +559,7 @@ test('dataset replacement releases an invalidated in-flight velocity enable owne
       return makeElement();
     },
   };
-  t.after(() => {
+  undoLater(t, () => {
     if (previousDocument === undefined) {
       delete globalThis.document;
     } else {
@@ -605,7 +606,7 @@ test('dataset replacement releases an invalidated in-flight velocity enable owne
       },
     }),
   });
-  t.after(() => controls.destroy());
+  undoLater(t, () => controls.destroy());
 
   enabledCheckbox.checked = true;
   const enabling = handleEnabledChange();
@@ -645,7 +646,7 @@ test('runtime velocity failure settlement remains coherent when cleanup retry fa
   notifications.error = (message, options) => {
     notificationEvents.push([message, options]);
   };
-  t.after(() => {
+  undoLater(t, () => {
     notifications.error = originalNotificationError;
     controls.destroy();
   });
@@ -654,7 +655,7 @@ test('runtime velocity failure settlement remains coherent when cleanup retry fa
   console.error = value => {
     diagnostics.push(value);
   };
-  t.after(() => {
+  undoLater(t, () => {
     console.error = originalConsoleError;
   });
 
@@ -714,7 +715,7 @@ test('the overlay loads a field once for every representation an open view shows
       return makeElement();
     },
   };
-  t.after(() => {
+  undoLater(t, () => {
     if (previousDocument === undefined) {
       delete globalThis.document;
     } else {
@@ -764,7 +765,7 @@ test('the overlay loads a field once for every representation an open view shows
       },
     }),
   });
-  t.after(() => controls.destroy());
+  undoLater(t, () => controls.destroy());
 
   enabledCheckbox.checked = true;
   await onEnabledChange();

@@ -2,8 +2,9 @@
  * Decoding chunks on other cores.
  *
  * The format readers run in one worker thread; decompressing a chunk there
- * (Zstandard, LZ4 and Blosc in JavaScript, DEFLATE through the platform's
- * stream) holds that thread for as long as it takes, so a background pass
+ * (Zstandard, LZ4 and Blosc in WebAssembly or JavaScript, DEFLATE through the
+ * platform's stream or fflate, whichever `decoder-choice.js` chose) holds
+ * that thread for as long as it takes, so a background pass
  * over a whole matrix would slow every other read behind it. This pool sends
  * a chunk's compressed bytes, with a description of how to decode them, to
  * one of a few decode workers, and gets the decoded bytes back.
@@ -22,6 +23,21 @@
  *   the small chunks waiting at once go to a worker as one message (their
  *   bytes copied into one buffer) when together they are worth one; a small
  *   chunk alone is decoded in this thread.
+ * - **Which decoder**: a family with more than one decoder (DEFLATE: the
+ *   platform's stream or fflate; Zstandard, LZ4, Blosc: WebAssembly or
+ *   JavaScript) is decoded with the one that gave the pool the most bytes
+ *   per millisecond with every worker decoding (`decoder-choice.js`), the
+ *   engine's prior until that is known: each message names its decoder.
+ *   The decoders are measured only while the pool has no other work: the
+ *   pool keeps copies of a few chunks of each key not yet decided (one per
+ *   worker), and sends them, one message a worker at a time, phase by
+ *   phase, once no chunk of a read has waited or been decoded for
+ *   `EXPLORE_AFTER_IDLE_MS`; a read's chunk then waits for one measuring
+ *   message at most. Chunks that only
+ *   travel together (smaller than `POOL_MIN_BYTES`) are not kept: their
+ *   keys stay with the prior. The decisions are
+ *   kept in this browser (`decoder-memory.js`): a later visit measures
+ *   nothing it decided before.
  * - **Priority**: a `background` task (a gene index being built while no one
  *   waits for it) waits behind every other: a field chosen meanwhile is
  *   decoded first.
@@ -37,12 +53,16 @@
  *   to start. A task a worker took and could not finish (the worker stopped)
  *   is decoded here from the caller's bytes; only a worker that has answered
  *   before is given bytes by transfer, and should it stop, those tasks fail.
- * - **Lifetime**: workers are made on the first chunk worth sending, or
- *   ahead of it when a store opens (`warmDecodePool()`), up to
+ * - **Lifetime**: workers are made as chunks worth sending queue for them
+ *   (one is made ahead of the first when a store opens: `warmDecodePool()`),
+ *   up to
  *   `navigator.hardwareConcurrency - 2` (a core each for the reader thread
  *   and the page) and to as many as the pool's memory holds (`memoryBytes`,
- *   at `DECODE_WORKER_BYTES` each), and terminated once none has had work
- *   for `IDLE_MS`, or at once when a store closes
+ *   at `DECODE_WORKER_BYTES` each, the budget as it is when one may be
+ *   made), and terminated once none has had work for `WORKER_IDLE_MS` (the
+ *   app's one worker lifetime rule, `workers/idle-retirement.js`), when the
+ *   memory model trims the decode-worker share (`trimDecodeWorkers`), or at
+ *   once when a store closes
  *   (`releaseIdleDecodeWorkers()`: a worker still decoding for another store
  *   is kept).
  *
@@ -61,9 +81,13 @@
  */
 
 
-import { onAbort } from './abort.js';
+import { onAbort, abortReason } from '../../utils/abort.js';
 import { decodeWorkerScript } from '../../../workers/scripts.js';
 import { startWorker } from '../../workers/worker-script.js';
+import { WORKER_IDLE_MS } from '../../workers/idle-retirement.js';
+import { fromWire } from '../../utils/error-wire.js';
+import { DecoderProbe, adoptDecidedDecoders, choiceKey, fixDecoders, forgetDecidedDecoders } from './decoder-choice.js';
+import { decoderMemoryStore, decoderMemoryVersion, keepDecoderDecisions, recallDecoderDecisions } from './decoder-memory.js';
 
 /**
  * Smallest decoded chunk worth sending (a scheduling choice, measured): a
@@ -82,8 +106,15 @@ export const POOL_MIN_BYTES = 32 * 1024;
  */
 export const DECODE_WORKER_BYTES = 40 * 1024 * 1024;
 
-/** How long workers with nothing to do are kept (a scheduling choice): consecutive reads do not pay start-up again. */
-const IDLE_MS = 10_000;
+
+/**
+ * How long the pool has had no chunk of a read to decode before it measures
+ * decoders (a scheduling choice): a read's chunks come in waves, from
+ * microseconds to a few hundred milliseconds apart on a link, and a
+ * measuring message between two waves delays the next one; a second with
+ * none is a person looking at the result, not a read under way.
+ */
+export const EXPLORE_AFTER_IDLE_MS = 1000;
 
 /** Tasks sent to one worker before its first result is back (a scheduling choice): the next is ready when one ends. */
 const TASKS_PER_WORKER = 2;
@@ -95,32 +126,6 @@ const TASKS_PER_WORKER = 2;
  */
 const BATCH_MESSAGES = 4;
 
-/**
- * An error as data: what a worker sends back.
- *
- * @param {unknown} error
- * @returns {{name: string, message: string, feature?: string, offset?: number|null}}
- */
-export function errorData(error) {
-  if (error instanceof Error) {
-    const data = { name: error.name, message: error.message };
-    if (typeof error.feature === 'string') data.feature = error.feature;
-    if (typeof error.offset === 'number' || error.offset === null) data.offset = error.offset;
-    return data;
-  }
-  return { name: 'Error', message: String(error) };
-}
-
-/** A generic error carrying `data`'s name and message, for names a caller does not rebuild. */
-export function genericError(data) {
-  const error = new Error(data.message);
-  error.name = data.name;
-  return error;
-}
-
-function abortReason(signal) {
-  return signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
-}
 
 /**
  * Decode workers to run: a core each for all but the page and the reader
@@ -146,11 +151,17 @@ function spansBuffer(input) {
 
 class DecodePool {
   /**
-   * @param {{createWorker: () => Worker, size: number, idleMs: number, minBytes: number}} options
+   * @param {{createWorker: () => Worker, size: number|(() => number), idleMs: number, minBytes: number,
+   *   memory: import('../../utils/indexed-db-store.js').KeyValueStore|null}} options -
+   *   `size`: the workers the pool may run, or a function read whenever it
+   *   may make one (its memory budget, which changes); `memory`: where the
+   *   decoder decisions are kept (`decoder-memory.js`), null for nowhere
    */
-  constructor({ createWorker, size, idleMs, minBytes }) {
+  constructor({ createWorker, size, idleMs, minBytes, memory }) {
     this.createWorker = createWorker;
-    this.size = size;
+    this._size = typeof size === 'function' ? size : () => size;
+    /** No more workers than this once one could not be made. */
+    this._made = Infinity;
     this.idleMs = idleMs;
     this.minBytes = minBytes;
     /** @type {Array<{worker: Worker, jobs: Map<number, Object|Object[]>, answered: boolean}>} */
@@ -165,6 +176,35 @@ class DecodePool {
     this.noWorkers = false;
     /** Contexts of work tasks by key: what a worker is sent once, before its first task that names it. */
     this.contexts = new Map();
+    /** Copies of chunks of each key not yet decided, what its decoders are measured on (by key). */
+    this.samples = new Map();
+    /** When a read's chunk was last sent or answered, and the timer that measures once the pool has been idle since. */
+    this.lastReadAt = -Infinity;
+    this.exploreTimer = null;
+    /** Where decisions are kept, under which version, and the writes in turn. */
+    this.memory = memory;
+    this.memoryVersion = memory === null ? null : decoderMemoryVersion();
+    this.keeping = Promise.resolve();
+    /** Which decoder each message of a family with several goes with, and what each measured. */
+    this.probe = new DecoderProbe(() => this.size, {
+      onDecided: (key, decoder) => {
+        this.samples.delete(key);
+        if (this.memory === null) return;
+        this.keeping = this.keeping.then(() => keepDecoderDecisions(this.memory, this.memoryVersion, { [key]: decoder }));
+      },
+    });
+    /** The decisions of earlier visits being read: nothing is measured until they are. */
+    this.recalling = memory === null ? null : recallDecoderDecisions(memory, this.memoryVersion).then(decisions => {
+      adoptDecidedDecoders(decisions);
+      for (const key of [...this.samples.keys()]) if (!this.probe.undecided(key)) this.samples.delete(key);
+      this.recalling = null;
+      this.pump();
+    });
+  }
+
+  /** The workers the pool may run now. */
+  get size() {
+    return Math.min(this._made, this._size());
   }
 
   /** Keep `data` as the context `key` names, for the work tasks that name it. */
@@ -298,7 +338,8 @@ class DecodePool {
       this.idleTimer = null;
     }
     for (let queue = this.peek(); queue !== null; queue = this.peek()) {
-      if (this.noWorkers) {
+      // No worker can be made, or the pool's memory holds none now.
+      if (this.noWorkers || (this.workers.length === 0 && this.size === 0)) {
         for (const waiting of this.queues) for (const job of waiting.splice(0)) this.runHere(job);
         return;
       }
@@ -325,6 +366,7 @@ class DecodePool {
       if (Array.isArray(next)) this.sendBatch(holder, next);
       else this.send(holder, next);
     }
+    this.explore();
     this.scheduleIdle();
   }
 
@@ -336,11 +378,11 @@ class DecodePool {
     } catch {
       // No more attempts: the workers there are stay; without any, chunks
       // are decoded here.
-      this.size = this.workers.length;
+      this._made = this.workers.length;
       if (this.workers.length === 0) this.noWorkers = true;
       return null;
     }
-    const holder = { worker, jobs: new Map(), answered: false, contexts: new Set() };
+    const holder = { worker, jobs: new Map(), answered: false, contexts: new Set(), lastAnswered: null };
     worker.addEventListener('message', event => this.onResult(holder, event.data));
     worker.addEventListener('error', event => {
       event.preventDefault?.();
@@ -351,17 +393,24 @@ class DecodePool {
     return holder;
   }
 
-  /** Make every worker the pool may run now, ahead of the first chunk. */
+  /**
+   * Make one worker ahead of the first chunk (its start is then not on the
+   * first chunk's path); the others are made as chunks queue for them
+   * (`pump`). A worker is a JavaScript engine of its own: warming every one
+   * the pool may run held six of them from opening on, for a file whose
+   * chunks one decodes. @private
+   */
   warm() {
-    if (this.noWorkers) return;
-    while (this.workers.length < this.size) {
-      if (this.spawn() === null) return;
-    }
+    if (this.noWorkers || this.workers.length > 0 || this.size === 0) return;
+    if (this.spawn() === null) return;
     this.scheduleIdle();
   }
 
   send(holder, job) {
     if (job.settled) return;
+    // A read's message: the measuring phase under way is not one decoder's any more.
+    this.probe.disturbed();
+    this.lastReadAt = performance.now();
     job.id = this.nextId++;
     job.holder = holder;
     job.startedAt = performance.now();
@@ -377,12 +426,106 @@ class DecodePool {
     const transfer = job.owned === true && holder.answered && spansBuffer(job.input);
     const input = transfer ? job.input : job.input.slice();
     job.transferred = transfer;
+    const { choices, check } = this.choose([job]);
+    this.keepSample(job);
     try {
-      holder.worker.postMessage({ id: job.id, kind: job.kind, description: job.description, input }, [input.buffer]);
+      holder.worker.postMessage({ id: job.id, kind: job.kind, description: job.description, input, choices, check }, [input.buffer]);
     } catch (error) {
       holder.jobs.delete(job.id);
       this.settle(job, null, error);
     }
+  }
+
+  /**
+   * Keep a copy of `job`'s chunk to measure its key's decoders on, while
+   * the key is not decided and holds fewer copies than the pool has
+   * workers.
+   */
+  keepSample(job) {
+    const key = job.choice?.key;
+    if (key === undefined || !this.probe.undecided(key)) return;
+    const samples = this.samples.get(key) ?? [];
+    if (samples.length >= Math.max(1, this.size)) return;
+    samples.push({ kind: job.kind, description: job.description, input: job.input.slice() });
+    this.samples.set(key, samples);
+  }
+
+  /**
+   * Measure decoders while the pool has nothing else to do: with no chunk
+   * of a read waiting or being decoded, each worker without a message
+   * (making them up to the pool's size) is sent one copy of a kept chunk
+   * with the decoder of the probe's phase (`DecoderProbe#explore`).
+   */
+  explore() {
+    if (this.recalling !== null || this.noWorkers || this.samples.size === 0 || this.peek() !== null) return;
+    for (const holder of this.workers) {
+      for (const job of holder.jobs.values()) if (!job.explore) return;
+    }
+    const wait = this.lastReadAt + EXPLORE_AFTER_IDLE_MS - performance.now();
+    if (wait > 0) {
+      // Not idle long enough: looked at again when it may be.
+      this.exploreTimer ??= setTimeout(() => {
+        this.exploreTimer = null;
+        this.pump();
+      }, wait);
+      this.exploreTimer.unref?.();
+      return;
+    }
+    for (;;) {
+      let holder = this.workers.find(candidate => candidate.jobs.size === 0) ?? null;
+      if (holder === null && this.workers.length < this.size) holder = this.spawn();
+      if (holder === null) return;
+      const choice = this.probe.explore(this.samples.keys());
+      if (choice === null) return;
+      const samples = this.samples.get(choice.key);
+      const sample = samples[(choice.phase.sent - 1) % samples.length];
+      const id = this.nextId++;
+      const job = { id, explore: true, sample, choice, holder, startedAt: performance.now() };
+      holder.jobs.set(id, job);
+      const input = sample.input.slice();
+      try {
+        holder.worker.postMessage({
+          id, kind: sample.kind, description: sample.description, input, choices: { [choice.key]: choice.decoder }, check: choice.check,
+        }, [input.buffer]);
+      } catch {
+        holder.jobs.delete(id);
+        this.probe.disturbed();
+        return;
+      }
+    }
+  }
+
+  /** A measuring message answered: an error drops its copy (the phase is measured again on the others). */
+  explored(job, message) {
+    if (message.error === undefined) return;
+    const samples = (this.samples.get(job.choice.key) ?? []).filter(sample => sample !== job.sample);
+    if (samples.length > 0) this.samples.set(job.choice.key, samples);
+    else this.samples.delete(job.choice.key);
+    this.probe.disturbed();
+  }
+
+  /**
+   * The decoders a message of `jobs` goes with (`choices`, by key), and
+   * whether its worker checks one chunk against the reference (`check`):
+   * one assignment per key the message holds, each job keeping its own
+   * (`job.choice`, with the probe phase it counts in).
+   */
+  choose(jobs) {
+    let choices = null;
+    let check = false;
+    const assigned = new Map();
+    for (const job of jobs) {
+      if (typeof job.family !== 'string') continue;
+      const key = choiceKey(job.family, job.size);
+      if (!assigned.has(key)) assigned.set(key, this.probe.assign(job.family, job.size));
+      const choice = assigned.get(key);
+      if (choice === null) continue;
+      choices ??= {};
+      choices[choice.key] = choice.decoder;
+      check ||= choice.check;
+      job.choice = choice;
+    }
+    return { choices, check };
   }
 
   /**
@@ -392,6 +535,8 @@ class DecodePool {
    * here should the worker stop).
    */
   sendRun(holder, job) {
+    this.probe.disturbed();
+    this.lastReadAt = performance.now();
     try {
       const key = job.context ?? null;
       if (key !== null && !holder.contexts.has(key)) {
@@ -427,8 +572,11 @@ class DecodePool {
       at += job.input.length;
     }
     holder.jobs.set(id, live);
+    this.probe.disturbed();
+    this.lastReadAt = performance.now();
+    const { choices, check } = this.choose(live);
     try {
-      holder.worker.postMessage({ id, items, input }, [input.buffer]);
+      holder.worker.postMessage({ id, items, input, choices, check }, [input.buffer]);
     } catch (error) {
       holder.jobs.delete(id);
       for (const job of live) this.settle(job, null, error);
@@ -440,7 +588,13 @@ class DecodePool {
     const job = holder.jobs.get(message?.id);
     if (job === undefined) return;
     holder.jobs.delete(message.id);
-    if (Array.isArray(job)) {
+    // A measuring message that failed voids its phase before it is counted.
+    if (job.explore === true) this.explored(job, message);
+    else this.lastReadAt = performance.now();
+    this.measured(holder, job, message);
+    if (job.explore === true) {
+      // Measured only: its bytes go nowhere.
+    } else if (Array.isArray(job)) {
       job.forEach((item, index) => {
         const result = message.results?.[index];
         if (result === undefined) this.runHere(item);
@@ -453,6 +607,34 @@ class DecodePool {
       this.settle(job, message.output, null);
     }
     this.pump();
+  }
+
+  /**
+   * A message answered: its worker's busy time for it (from when it was
+   * sent, or from the worker's previous answer while it was still busy, to
+   * now), shared among the probe phases it counted in by their bytes, and
+   * any decoder its worker found wrong.
+   */
+  measured(holder, job, message) {
+    const now = performance.now();
+    const jobs = [job].flat();
+    const busy = now - Math.max(jobs[0].startedAt ?? now, holder.lastAnswered ?? -Infinity);
+    holder.lastAnswered = now;
+    for (const key of message.dropped ?? []) {
+      const decoder = jobs.find(item => item.choice?.key === key)?.choice.decoder;
+      if (decoder !== undefined) this.probe.drop(key, decoder);
+    }
+    const outputs = Array.isArray(job) ? (message.results ?? []).map(result => result.output) : [message.output];
+    const phases = new Map();
+    let total = 0;
+    jobs.forEach((item, index) => {
+      const bytes = outputs[index]?.length ?? 0;
+      total += bytes;
+      const phase = item.choice?.phase;
+      if (phase === null || phase === undefined) return;
+      phases.set(phase, (phases.get(phase) ?? 0) + bytes);
+    });
+    for (const [phase, bytes] of phases) this.probe.answered(phase, bytes, total > 0 ? busy * bytes / total : busy / phases.size);
   }
 
   /**
@@ -470,8 +652,9 @@ class DecodePool {
       // Already stopped.
     }
     if (!holder.answered) this.noWorkers = true;
-    const jobs = [...holder.jobs.values()].flat();
+    const jobs = [...holder.jobs.values()].flat().filter(job => job.explore !== true);
     holder.jobs.clear();
+    this.probe.disturbed();
     for (const job of jobs) this.runHere(job);
     this.pump();
   }
@@ -486,10 +669,19 @@ class DecodePool {
     this.idleTimer.unref?.();
   }
 
-  /** Terminate every worker with no task under way. */
-  releaseIdle() {
+  /**
+   * Terminate every worker with no task of a read under way (one measuring
+   * decoders only is let go, its phase measured again later), beyond the
+   * first `keep`.
+   */
+  releaseIdle(keep = 0) {
+    let kept = 0;
     this.workers = this.workers.filter(holder => {
-      if (holder.jobs.size > 0) return true;
+      if ([...holder.jobs.values()].some(job => job.explore !== true) || kept < keep) {
+        kept++;
+        return true;
+      }
+      if (holder.jobs.size > 0) this.probe.disturbed();
       holder.worker.terminate();
       return false;
     });
@@ -499,11 +691,13 @@ class DecodePool {
   terminate() {
     if (this.idleTimer !== null) clearTimeout(this.idleTimer);
     this.idleTimer = null;
+    if (this.exploreTimer !== null) clearTimeout(this.exploreTimer);
+    this.exploreTimer = null;
     const workers = this.workers;
     this.workers = [];
     for (const holder of workers) {
       holder.worker.terminate();
-      for (const job of [...holder.jobs.values()].flat()) this.runHere(job);
+      for (const job of [...holder.jobs.values()].flat()) if (job.explore !== true) this.runHere(job);
       holder.jobs.clear();
     }
     for (const queue of this.queues) for (const job of queue.splice(0)) this.runHere(job);
@@ -512,11 +706,16 @@ class DecodePool {
   stats() {
     return {
       workers: this.workers.length,
-      running: this.workers.reduce((sum, holder) => sum + [...holder.jobs.values()].flat().length, 0),
+      // Chunks decoded at once: the workers the pool may run (one, this
+      // thread, without workers).
+      size: this.noWorkers ? 1 : this.size,
+      running: this.workers.reduce((sum, holder) => sum + [...holder.jobs.values()].flat().filter(job => job.explore !== true).length, 0),
       // Cancelled jobs stay in the queue until it reaches them; they do not wait.
       queued: this.queues.reduce((count, queue) => count + queue.reduce((n, job) => n + (job.settled ? 0 : 1), 0), 0),
       inThreadOnly: this.noWorkers,
       decodedBytesPerMs,
+      // What each family's decoders measured, and which was kept (by key).
+      decoders: this.probe.summary(),
     };
   }
 }
@@ -546,13 +745,16 @@ function sharedPool() {
     const createWorker = 'createWorker' in settings
       ? settings.createWorker
       : (typeof globalThis.Worker === 'function' ? defaultCreateWorker : null);
+    const memoryBytes = settings.memoryBytes ?? Infinity;
     pool = new DecodePool({
       createWorker,
-      size: settings.size ?? decodeWorkerCount(settings.memoryBytes ?? Infinity),
-      idleMs: settings.idleMs ?? IDLE_MS,
+      size: settings.size ?? (() => decodeWorkerCount(typeof memoryBytes === 'function' ? memoryBytes() : memoryBytes)),
+      idleMs: settings.idleMs ?? WORKER_IDLE_MS,
       minBytes: settings.minBytes ?? POOL_MIN_BYTES,
+      // A benchmark's fixed decoders measure nothing, and keep nothing.
+      memory: 'memory' in settings ? settings.memory : (settings.decoders === undefined ? decoderMemoryStore() : null),
     });
-    if (createWorker === null || pool.size === 0) pool.noWorkers = true;
+    if (createWorker === null) pool.noWorkers = true;
   }
   return pool;
 }
@@ -571,6 +773,9 @@ function sharedPool() {
  *   its whole buffer may be transferred instead of copied
  * @param {boolean} [task.background] - Waits behind every other task
  *   (a pass no one is waiting for)
+ * @param {string|null} [task.family] - The codec family that decompresses it
+ *   (`'deflate'`, `'zstd'`, …): a family with several decoders is decoded
+ *   with the one measured fastest (`decoder-choice.js`)
  * @param {(data: {name: string, message: string}) => Error} task.revive - The caller's error from a worker's error data
  * @param {() => (Uint8Array|Promise<Uint8Array>)} task.inThread - The same decoding, in this thread
  * @returns {Promise<Uint8Array>}
@@ -603,7 +808,7 @@ export function runOnDecodeWorker(task) {
     ...task,
     kind: 'run',
     owned: (task.transfer?.length ?? 0) > 0,
-    revive: task.revive ?? genericError,
+    revive: task.revive ?? (data => fromWire(data)),
   });
 }
 
@@ -622,30 +827,69 @@ export function warmDecodePool() {
   sharedPool().warm();
 }
 
-/** Terminate decode workers with nothing to do (a store's `close()` calls this). */
+/**
+ * Terminate decode workers with nothing to do (a store's `close()` calls
+ * this), and let the copies of chunks kept to measure decoders on go with
+ * the store they came from.
+ */
 export function releaseIdleDecodeWorkers() {
+  pool?.samples.clear();
   pool?.releaseIdle();
+}
+
+/** The memory the decode workers hold now, at `DECODE_WORKER_BYTES` each. */
+export function decodeWorkersHeldBytes() {
+  return (pool?.workers.length ?? 0) * DECODE_WORKER_BYTES;
+}
+
+/**
+ * Keep no more decode workers than `memoryBytes` holds: the idle ones
+ * beyond it are terminated (a worker decoding finishes first).
+ *
+ * @param {number} memoryBytes
+ * @returns {string|null} What was let go, in words
+ */
+export function trimDecodeWorkers(memoryBytes) {
+  if (pool === null) return null;
+  const before = pool.workers.length;
+  pool.releaseIdle(Math.floor(memoryBytes / DECODE_WORKER_BYTES));
+  const ended = before - pool.workers.length;
+  return ended > 0 ? `${ended === 1 ? 'an idle decode worker' : `${ended} idle decode workers`}` : null;
 }
 
 /**
  * Workers, tasks under way and tasks waiting, for diagnostics and tests, and
- * how fast chunks decode (`decodedBytesPerMs`, null until one has).
+ * how fast chunks decode (`decodedBytesPerMs`, null until one has) and how
+ * many at once (`size`; 0 before the pool is made).
  */
 export function decodePoolStats() {
-  return pool === null ? { workers: 0, running: 0, queued: 0, inThreadOnly: false, decodedBytesPerMs } : pool.stats();
+  return pool === null ? { workers: 0, size: 0, running: 0, queued: 0, inThreadOnly: false, decodedBytesPerMs, decoders: {} } : pool.stats();
 }
 
 /**
  * Replace the shared pool's settings: the memory its workers may hold
- * (`memoryBytes`, which sizes the pool; the app gives its decode-worker
- * budget), or for tests and benchmarks a worker factory over
+ * (`memoryBytes`, which sizes the pool: a number, or a function read
+ * whenever a worker may be made -- the app gives its decode-worker budget,
+ * which changes), or for tests and benchmarks a worker factory over
  * `node:worker_threads`, a pool size, a threshold. The current pool's
- * workers are terminated; the next chunk makes a new pool.
+ * workers are terminated; the next chunk makes a new pool, and how fast
+ * chunks decode is measured again.
  *
- * @param {{createWorker?: (() => Worker)|null, size?: number, memoryBytes?: number, idleMs?: number, minBytes?: number}} [options]
+ * `decoders` (by family: `{deflate: 'fflate'}`) decodes every chunk of a family with
+ * one decoder, the probe not run for it: how a benchmark measures each decoder in the pool.
+ * `memory` is where decoder decisions are kept across visits (`decoder-memory.js`;
+ * this browser's IndexedDB by default, null for nowhere: tests, benchmarks).
+ *
+ * @param {{createWorker?: (() => Worker)|null, size?: number, memoryBytes?: number|(() => number), idleMs?: number, minBytes?: number,
+ *   decoders?: Object<string, string>, memory?: import('../../utils/indexed-db-store.js').KeyValueStore|null}} [options]
  */
 export function configureDecodePool(options = {}) {
   pool?.terminate();
   pool = null;
   settings = { ...options };
+  // Other workers: their decoders are measured afresh (or set, for a benchmark).
+  forgetDecidedDecoders();
+  fixDecoders(options.decoders ?? {});
+  // Its workers are others: how fast they decode is measured afresh.
+  decodedBytesPerMs = null;
 }

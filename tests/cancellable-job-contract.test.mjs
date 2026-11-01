@@ -8,19 +8,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import {
-  CancellableJob,
-  JOB_READ_KINDS,
-  SharedWork,
-  awaitWithSignal,
-  cancelledError,
-  isCancellation,
-  isJobRead,
-} from '../assets/js/app/jobs/cancellable-job.js';
+import { CancellableJob, JOB_READ_KINDS, isJobRead } from '../assets/js/app/jobs/cancellable-job.js';
+import { awaitWithSignal, cancelled, isCancellation } from '../assets/js/utils/abort.js';
 import { ABANDONED_TASK_GRACE_MS, WorkerPool } from '../assets/js/app/analysis/compute/worker-pool.js';
 import { showReadProgress } from '../assets/js/app/read-progress-notifications.js';
 import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
+import { undoLater } from './helpers/teardown.mjs';
 
 const FIXTURE = new URL('./browser/fixtures/current-ui-smoke.h5ad', import.meta.url);
 
@@ -105,7 +99,7 @@ test('a cancelled job aborts its signal with an AbortError and is never a failur
 test('a job failing with an AbortError is cancelled; a real failure says why once', async () => {
   const notifications = fakeNotifications();
   const aborted = new CancellableJob({ title: 'Correlation', notifications, log: fakeLog(), notifyAfterMs: Infinity });
-  aborted.fail(cancelledError('Correlation'));
+  aborted.fail(cancelled('user', 'Correlation was cancelled.'));
   assert.equal(aborted.state, 'cancelled');
   assert.deepEqual(notifications.calls, [], 'a cancel that never showed shows nothing');
 
@@ -172,7 +166,7 @@ test('a job follows only its own reads, and the generic read notifications skip 
   generic.record({ ...read(5, null, 10), kind: 'genes', elapsedMs: 5000, requests: 1 });
   stop();
   assert.equal(shown.calls.length, 1, 'only the view read is shown generically');
-  assert.match(shown.calls[0][2], /^Reading 5 genes of X/);
+  assert.match(shown.calls[0][2], /^Reading genes/);
 });
 
 test('a job joining a gene load a view started adopts its reads: one notification for the run, the job\'s', async t => {
@@ -180,10 +174,10 @@ test('a job joining a gene load a view started adopts its reads: one notificatio
   const { createDataState } = await import('../assets/js/app/state/index.js');
   const log = getReadActivityLog();
   log.clear();
-  t.after(() => log.clear());
+  undoLater(t, () => log.clear());
   const generic = fakeNotifications();
   const stopShowing = showReadProgress({ log, notifications: generic });
-  t.after(stopShowing);
+  undoLater(t, stopShowing);
 
   const state = createDataState({ viewer: {}, labelLayer: null });
   state.pointCount = 2;
@@ -216,7 +210,7 @@ test('a job joining a gene load a view started adopts its reads: one notificatio
 
   // A differential expression run needs the same gene and joins the load.
   const job = new CancellableJob({ title: 'Differential expression', readKind: 'analysis', notifications: fakeNotifications(), log, notifyAfterMs: Infinity });
-  t.after(() => job.cancel());
+  undoLater(t, () => job.cancel());
   const joined = state.ensureVarFieldLoaded(0, { silent: true, owner: job.id });
   assert.equal(loads.length, 1, 'joined, not read again');
   log.flush();
@@ -246,43 +240,10 @@ test('awaitWithSignal lets one caller stop waiting while the work goes on', asyn
   const leaving = new AbortController();
   const left = awaitWithSignal(work, leaving.signal);
   const staying = awaitWithSignal(work, new AbortController().signal);
-  leaving.abort(cancelledError('Reading'));
+  leaving.abort(cancelled('user', 'Reading was cancelled.'));
   await assert.rejects(left, error => error.name === 'AbortError');
   finish('values');
   assert.equal(await staying, 'values');
-});
-
-test('shared work goes on for the callers left and stops when none is', async () => {
-  let started = 0;
-  let workSignal = null;
-  let finish;
-  const shared = new SharedWork(signal => {
-    started++;
-    workSignal = signal;
-    return new Promise(resolve => {
-      finish = resolve;
-    });
-  });
-  const a = new AbortController();
-  const b = new AbortController();
-  const first = shared.join(a.signal);
-  const second = shared.join(b.signal);
-  a.abort(cancelledError('A'));
-  await assert.rejects(first, error => error.name === 'AbortError');
-  assert.equal(workSignal.aborted, false, 'one caller left: the work goes on');
-  finish('result');
-  assert.equal(await second, 'result');
-  assert.equal(started, 1);
-
-  const alone = new SharedWork(signal => new Promise((_resolve, reject) => {
-    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-  }));
-  const c = new AbortController();
-  const only = alone.join(c.signal);
-  c.abort(cancelledError('C'));
-  await assert.rejects(only, error => error.name === 'AbortError');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(alone.abandoned, true, 'the last caller gone, the work stops');
 });
 
 // ---------------------------------------------------------------------------
@@ -322,12 +283,12 @@ function poolOverFakeWorkers(t, size = 2) {
     }
   }
   globalThis.Worker = FakeWorker;
-  t.after(() => {
+  undoLater(t, () => {
     if (originalWorker === undefined) delete globalThis.Worker;
     else globalThis.Worker = originalWorker;
   });
-  const pool = new WorkerPool({ poolSize: size, defaultTimeout: 5_000 });
-  t.after(() => pool.terminate());
+  const pool = new WorkerPool({ poolSize: size });
+  undoLater(t, () => pool.terminate());
   return { pool, created };
 }
 
@@ -341,7 +302,7 @@ test('a cancelled queued task is never sent; the pool and other callers go on', 
   const queued = pool.execute('COMPUTE_CORRELATION', { a: 2 }, { transfer: false, signal: run.signal });
   const other = pool.execute('COMPUTE_CORRELATION', { a: 3 }, { transfer: false });
   await tick();
-  run.abort(cancelledError('Differential expression'));
+  run.abort(cancelled('user', 'Differential expression was cancelled.'));
   await assert.rejects(queued, error => error.name === 'AbortError');
   created[0].answer({ value: 1 });
   assert.deepEqual(await busy, { value: 1 });
@@ -360,7 +321,7 @@ test('a cancelled running task answers its caller at once and its late result is
   const running = pool.execute('COMPUTE_CORRELATION', { a: 1 }, { transfer: false, signal: run.signal });
   const next = pool.execute('COMPUTE_CORRELATION', { a: 2 }, { transfer: false });
   await tick();
-  run.abort(cancelledError('Marker genes'));
+  run.abort(cancelled('user', 'Marker genes was cancelled.'));
   await assert.rejects(running, error => error.name === 'AbortError');
   // The worker comes back within its grace: it is kept and takes the next task.
   created[0].answer({ value: 'dropped' });
@@ -396,7 +357,7 @@ test('a cancelled task outliving its grace is cut short: its worker is replaced 
   const afterwards = pool.executeOnWorker(0, 'COMPUTE_CORRELATION', { a: 2 }, { transfer: false });
   const elsewhere = pool.executeOnWorker(1, 'COMPUTE_CORRELATION', { a: 3 }, { transfer: false });
   await tick();
-  run.abort(cancelledError('Clustering'));
+  run.abort(cancelled('user', 'Clustering was cancelled.'));
   await assert.rejects(stuck, error => error.name === 'AbortError');
   await wait(ABANDONED_TASK_GRACE_MS + 50);
 
@@ -432,7 +393,7 @@ test('an analysis read carries its job as owner, reads of two jobs are separate,
     return worker;
   });
   const client = new AnnDataReaderClient();
-  t.after(() => {
+  undoLater(t, () => {
     client.close();
     setAnnDataReaderWorkerFactory(() => createInProcessAnnDataReaderWorker());
   });
@@ -443,7 +404,7 @@ test('an analysis read carries its job as owner, reads of two jobs are separate,
   const unsubscribe = log.subscribe(activity => {
     if (activity.status !== 'running') seen.push(activity);
   });
-  t.after(unsubscribe);
+  undoLater(t, unsubscribe);
   const sent = () => worker.messages.filter(message => message.method === 'getMatrixColumnsSparse');
 
   const expected = await client.getMatrixColumnSparse('X', 4);
@@ -455,7 +416,7 @@ test('an analysis read carries its job as owner, reads of two jobs are separate,
   worker.postMessage = (message, transfer) => {
     post(message, transfer);
     if (message.method === 'getMatrixColumnsSparse' && message.args.at(-1) === 'job-a') {
-      a.abort(cancelledError('Job A'));
+      a.abort(cancelled('user', 'Job A was cancelled.'));
     }
   };
   const fromA = client.getMatrixColumnSparse('X', 4, { signal: a.signal, owner: 'job-a' });
@@ -473,9 +434,9 @@ test('an analysis read carries its job as owner, reads of two jobs are separate,
   assert.equal(own.length, 1);
   assert.equal(own[0].kind, 'analysis', 'an analysis read is a job read');
   assert.equal(own[0].status, 'done');
-  const cancelled = seen.filter(activity => activity.owner === 'job-a');
-  assert.equal(cancelled.length, 1);
-  assert.equal(cancelled[0].status, 'cancelled', 'the cancelled job\'s read stopped in the worker');
+  const ofJobA = seen.filter(activity => activity.owner === 'job-a');
+  assert.equal(ofJobA.length, 1);
+  assert.equal(ofJobA[0].status, 'cancelled', 'the cancelled job\'s read stopped in the worker');
   assert.ok(worker.messages.some(message => message.cancel !== undefined), 'the worker was told to stop');
 
   // A view's gene read names the shared loads it serves, so a job joining
@@ -503,7 +464,7 @@ function pageDataLayer(t) {
     enablePrefetch: false,
     enableVersionTracking: false,
   });
-  t.after(() => layer.destroy());
+  undoLater(t, () => layer.destroy());
   layer.refreshPageVersions = () => {};
   layer._getCacheKey = () => 'score:page-1';
   const fetches = [];
@@ -522,7 +483,7 @@ test('a page-data request goes on for the caller left and is cached once complet
   const fromA = layer.getDataForPages(pageRequest(a.signal));
   const fromB = layer.getDataForPages(pageRequest(new AbortController().signal));
   assert.equal(fetches.length, 1, 'asked twice, read once');
-  a.abort(cancelledError('Correlation'));
+  a.abort(cancelled('user', 'Correlation was cancelled.'));
   await assert.rejects(fromA, error => error.name === 'AbortError');
   assert.equal(fetches[0].signal.aborted, false, 'the other caller still waits');
   fetches[0].resolve(['page data']);
@@ -534,7 +495,7 @@ test('a page-data request every caller cancelled is stopped and never cached', a
   const { layer, fetches } = pageDataLayer(t);
   const a = new AbortController();
   const only = layer.getDataForPages(pageRequest(a.signal));
-  a.abort(cancelledError('Detailed analysis'));
+  a.abort(cancelled('user', 'Detailed analysis was cancelled.'));
   await assert.rejects(only, error => error.name === 'AbortError');
   await tick();
   assert.equal(fetches[0].signal.aborted, true, 'nobody waits: its read stops');
@@ -559,6 +520,8 @@ function differentialHarness({ execute }) {
   analysis.dataLayer = {
     state: { pointCount: 6 },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return ['Gene A', 'Gene B', 'Gene C'].map(key => ({ key, name: key }));

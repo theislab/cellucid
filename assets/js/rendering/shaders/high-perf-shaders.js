@@ -15,6 +15,7 @@
 
 import { FOG_GLSL } from './fog-shaders.js';
 import { LINEAR_TEXEL_GLSL } from '../linear-texture.js';
+import { UNPLACED_GLSL } from '../unplaced-positions.js';
 
 // ============================================================================
 // WEBGL2 SHADERS (GLSL ES 3.0)
@@ -96,12 +97,39 @@ ${FOG_GLSL}
 uniform lowp sampler2DArray u_alphaTex;
 uniform ivec2 u_alphaLayout;
 uniform bool u_useAlphaTex;
-// The draw order's permutation (slot -> source point), R32UI, so the alpha of
-// a point drawn from a reordered store is found exactly at any index.
+// The store order's slot map (slot -> source point), R32UI, so the alpha of
+// a point drawn from a reordered store is found exactly at any index. Slots
+// from u_orderedSlots on hold their own point (rendering/high-perf/
+// store-order.js); 0 for a store in source order.
 uniform highp usampler2DArray u_lodIndexTex;
 uniform ivec2 u_lodIndexLayout;
-uniform bool u_useLodIndexTex;
+uniform int u_orderedSlots;
+// The first slot of the store segment drawn: gl_VertexID counts from it
+// (rendering/high-perf/point-store-segments.js).
+uniform int u_slotBase;
+// Which cells this pass draws, by the layer their colour's alpha byte names
+// (alpha-visibility.js): 0 every one; 1 the grey beneath the coloured cells
+// (BENEATH_ALPHA_BYTE, 254); 2 the coloured cells (255); 3 the cells not read
+// (UNREAD_ALPHA_BYTE, 253). A field with lower layers is drawn a layer a
+// pass, bottom first (3, 1, 2), so each lies over the one before in 2-D
+// blending and wins depth ties in 3-D, at every level of detail and culled
+// range.
+uniform int u_drawPass;
+// The colour of a cell not read: the background's, faded toward the grey
+// for 0 (rendering/read-cell-layer.js, unreadCellColor). Its own RGB bytes
+// are not drawn.
+uniform vec3 u_unreadColor;
+// The grey of the cells beneath (no value: a gene's 0, a missing value), made
+// from the background (rendering/read-cell-layer.js, zeroCellColor). Their
+// own RGB bytes are not drawn.
+uniform vec3 u_zeroColor;
+// The cells of this draw lie beneath the others (pass 1, or a figure's first
+// range): with depth tested, each yields to any cell up to one drawn point
+// diameter behind it, so an expressing cell on the same surface as the grey
+// around it shows in 3-D too, while a cell well in front still occludes.
+uniform bool u_yieldDepth;
 ${LINEAR_TEXEL_GLSL}
+${UNPLACED_GLSL}
 
 flat out vec3 v_color;
 flat out float v_alpha;
@@ -122,9 +150,10 @@ void main() {
   float alpha;
   if (u_useAlphaTex) {
     // Integer addressing throughout: a float index loses exactness at 2^24.
-    int origIdx = u_useLodIndexTex
-      ? int(texelFetch(u_lodIndexTex, linearTexel(gl_VertexID, u_lodIndexLayout), 0).r)
-      : gl_VertexID;
+    int slot = u_slotBase + gl_VertexID;
+    int origIdx = slot < u_orderedSlots
+      ? int(texelFetch(u_lodIndexTex, linearTexel(slot, u_lodIndexLayout), 0).r)
+      : slot;
     alpha = texelFetch(u_alphaTex, linearTexel(origIdx, u_alphaLayout), 0).r;
   } else {
     alpha = a_color.a;
@@ -143,7 +172,17 @@ void main() {
   // throws it away. Moving the vertex outside the clip volume rejects it up
   // front, which is what makes hiding cells cheaper than showing them instead
   // of more expensive. The size is still zeroed as a second line of defence.
-  if (alpha < 0.01) {
+  if (u_yieldDepth) {
+    // One drawn diameter in eye units at this depth (u_pointScale: pixels
+    // per world unit at unit depth, over 100), the depth moved back by it.
+    float diameter = gl_PointSize * eyeDepth / max(100.0 * u_pointScale, 1e-6);
+    vec4 yielded = u_projectionMatrix * vec4(eyePos.xy, eyePos.z - diameter, 1.0);
+    gl_Position.z = clamp(yielded.z / yielded.w, -1.0, 1.0) * gl_Position.w;
+  }
+  // The layer byte, exact: a normalized byte is k / 255.
+  int layer = int(a_color.a * 255.0 + 0.5);
+  if (alpha < 0.01 || isUnplacedPosition(a_position)
+    || (u_drawPass == 1 && layer != 254) || (u_drawPass == 2 && layer != 255) || (u_drawPass == 3 && layer != 253)) {
     gl_PointSize = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   }
@@ -151,7 +190,9 @@ void main() {
   v_fogT = fogTransmittance(length(eyePos.xyz));
   v_fogOpacity = fogOpacity(v_fogT);
 
-  v_color = a_color.rgb;
+  // The passes of the lower layers draw them in their own colours (a
+  // figure's raster bakes those into the colours and draws in pass 0).
+  v_color = u_drawPass == 3 ? u_unreadColor : (u_drawPass == 1 ? u_zeroColor : a_color.rgb);
   v_alpha = alpha;
   // Sprite radius in pixels, for the antialiased rim of the no-depth fragment
   // shaders (see HP_FS_FULL_NO_DEPTH).
@@ -299,12 +340,39 @@ uniform float u_pointScale;
 uniform lowp sampler2DArray u_alphaTex;
 uniform ivec2 u_alphaLayout;
 uniform bool u_useAlphaTex;
-// The draw order's permutation (slot -> source point), R32UI, so the alpha of
-// a point drawn from a reordered store is found exactly at any index.
+// The store order's slot map (slot -> source point), R32UI, so the alpha of
+// a point drawn from a reordered store is found exactly at any index. Slots
+// from u_orderedSlots on hold their own point (rendering/high-perf/
+// store-order.js); 0 for a store in source order.
 uniform highp usampler2DArray u_lodIndexTex;
 uniform ivec2 u_lodIndexLayout;
-uniform bool u_useLodIndexTex;
+uniform int u_orderedSlots;
+// The first slot of the store segment drawn: gl_VertexID counts from it
+// (rendering/high-perf/point-store-segments.js).
+uniform int u_slotBase;
+// Which cells this pass draws, by the layer their colour's alpha byte names
+// (alpha-visibility.js): 0 every one; 1 the grey beneath the coloured cells
+// (BENEATH_ALPHA_BYTE, 254); 2 the coloured cells (255); 3 the cells not read
+// (UNREAD_ALPHA_BYTE, 253). A field with lower layers is drawn a layer a
+// pass, bottom first (3, 1, 2), so each lies over the one before in 2-D
+// blending and wins depth ties in 3-D, at every level of detail and culled
+// range.
+uniform int u_drawPass;
+// The colour of a cell not read: the background's, faded toward the grey
+// for 0 (rendering/read-cell-layer.js, unreadCellColor). Its own RGB bytes
+// are not drawn.
+uniform vec3 u_unreadColor;
+// The grey of the cells beneath (no value: a gene's 0, a missing value), made
+// from the background (rendering/read-cell-layer.js, zeroCellColor). Their
+// own RGB bytes are not drawn.
+uniform vec3 u_zeroColor;
+// The cells of this draw lie beneath the others (pass 1, or a figure's first
+// range): with depth tested, each yields to any cell up to one drawn point
+// diameter behind it, so an expressing cell on the same surface as the grey
+// around it shows in 3-D too, while a cell well in front still occludes.
+uniform bool u_yieldDepth;
 ${LINEAR_TEXEL_GLSL}
+${UNPLACED_GLSL}
 
 flat out vec3 v_color;
 flat out float v_alpha;
@@ -323,9 +391,10 @@ void main() {
   float alpha;
   if (u_useAlphaTex) {
     // Integer addressing throughout: a float index loses exactness at 2^24.
-    int origIdx = u_useLodIndexTex
-      ? int(texelFetch(u_lodIndexTex, linearTexel(gl_VertexID, u_lodIndexLayout), 0).r)
-      : gl_VertexID;
+    int slot = u_slotBase + gl_VertexID;
+    int origIdx = slot < u_orderedSlots
+      ? int(texelFetch(u_lodIndexTex, linearTexel(slot, u_lodIndexLayout), 0).r)
+      : slot;
     alpha = texelFetch(u_alphaTex, linearTexel(origIdx, u_alphaLayout), 0).r;
   } else {
     alpha = a_color.a;
@@ -346,12 +415,24 @@ void main() {
   // also backs the ultralight program, whose fragment shader does not discard,
   // so without the clip rejection a hidden point still writes depth and
   // occludes the visible points behind it.
-  if (alpha < 0.01) {
+  if (u_yieldDepth) {
+    // One drawn diameter in eye units at this depth (u_pointScale: pixels
+    // per world unit at unit depth, over 100), the depth moved back by it.
+    float diameter = gl_PointSize * eyeDepth / max(100.0 * u_pointScale, 1e-6);
+    vec4 yielded = u_projectionMatrix * vec4(eyePos.xy, eyePos.z - diameter, 1.0);
+    gl_Position.z = clamp(yielded.z / yielded.w, -1.0, 1.0) * gl_Position.w;
+  }
+  // The layer byte, exact: a normalized byte is k / 255.
+  int layer = int(a_color.a * 255.0 + 0.5);
+  if (alpha < 0.01 || isUnplacedPosition(a_position)
+    || (u_drawPass == 1 && layer != 254) || (u_drawPass == 2 && layer != 255) || (u_drawPass == 3 && layer != 253)) {
     gl_PointSize = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   }
 
-  v_color = a_color.rgb;
+  // The passes of the lower layers draw them in their own colours (a
+  // figure's raster bakes those into the colours and draws in pass 0).
+  v_color = u_drawPass == 3 ? u_unreadColor : (u_drawPass == 1 ? u_zeroColor : a_color.rgb);
   v_alpha = alpha;
   // Sprite radius in pixels, for the antialiased rim of the no-depth fragment
   // shaders (see HP_FS_FULL_NO_DEPTH).
@@ -748,6 +829,7 @@ uniform float u_pointScale;
 uniform float u_highlightScale; // How much larger the highlight ring is (e.g., 1.5)
 
 ${FOG_GLSL}
+${UNPLACED_GLSL}
 flat out float v_alpha;
 flat out float v_fogOpacity; // The opacity fog leaves this ring (fog-shaders.js)
 
@@ -781,7 +863,7 @@ void main() {
   // app/ui/modules/figure-export/utils/webgl-point-rasterizer.js); and both draw
   // sites run depthMask(false). A producer that stops compacting, or a pass that
   // starts writing depth, is then a change to those files and not to this one.
-  if (a_color.a < 0.01) {
+  if (a_color.a < 0.01 || isUnplacedPosition(a_position)) {
     gl_PointSize = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   }

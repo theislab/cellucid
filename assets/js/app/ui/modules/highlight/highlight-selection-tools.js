@@ -8,7 +8,7 @@
  */
 
 import { getSelectionRangeLabel } from '../../core/selection-range-label.js';
-import { createHighlightSelectionState } from './selection-state.js';
+import { countHistory, createHighlightSelectionState } from './selection-state.js';
 import { initHighlightSelectionSync } from './selection-sync.js';
 import { initHighlightModeUI } from './mode-ui.js';
 import { initAnnotationSelection } from './annotation-selection.js';
@@ -139,6 +139,8 @@ export function initHighlightSelectionTools(options) {
     ['appendChild']
   );
   const selectionState = createHighlightSelectionState();
+  // Its undo steps count in the memory model's `undoHistory` share.
+  const stopCountingHistory = countHistory(selectionState);
 
   const { show: showRangeLabel, hide: hideRangeLabel } = getSelectionRangeLabel();
 
@@ -223,6 +225,7 @@ export function initHighlightSelectionTools(options) {
       const failures = [];
       const pending = [];
       for (const operation of [
+        () => stopCountingHistory(),
         () => sync.destroy(),
         () => modeUi.destroy(),
         () => continuousPreview.destroy(),

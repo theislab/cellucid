@@ -22,5 +22,7 @@ export const DATA_LOAD_METHODS = Object.freeze({
   DATA_URL_PARAM: 'data-url-param',
   LINK_CONNECT: 'link-connect',
   SESSION_SOURCE: 'session-source',
+  // The open dataset read again with other cells (Open data, Cells to open).
+  SUBSAMPLE: 'subsample',
   VIEWER_HOST_AUTO: 'jupyter-auto'
 });

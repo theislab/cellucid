@@ -15,12 +15,14 @@
  * @module formats/hdf5/decode
  */
 
+import { needsSwap, swapBytes } from '../io/byte-order.js';
 import { decodeText, readUintLE } from './binary.js';
 import { isBooleanEnum, storeDtype } from './datatype.js';
 import { collectionEntryBytes, findCollection, objectStart } from './heaps.js';
 import { formatError } from './errors.js';
 import { valueArrayClass } from '../store.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
 
 /* ---------- half precision ---------- */
 
@@ -45,48 +47,138 @@ function halfToFloatTable() {
 
 /* ---------- byte order ---------- */
 
-/** Reverse the byte order of every `size`-byte element of `bytes`, in place. */
-export function swapBytes(bytes, size) {
-  if (size === 1) return;
-  const aligned = bytes.byteOffset % size === 0 && bytes.length % size === 0;
-  if (aligned && size === 2) {
-    const words = new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2);
-    for (let i = 0; i < words.length; i++) {
-      const v = words[i];
-      words[i] = ((v & 0xff) << 8) | (v >>> 8);
-    }
-    return;
-  }
-  if (aligned && (size === 4 || size === 8)) {
-    const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
-    for (let i = 0; i < words.length; i++) {
-      const v = words[i];
-      words[i] = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | (v >>> 24);
-    }
-    if (size === 8) {
-      for (let i = 0; i < words.length; i += 2) {
-        const low = words[i];
-        words[i] = words[i + 1];
-        words[i + 1] = low;
-      }
-    }
-    return;
-  }
-  for (let start = 0; start + size <= bytes.length; start += size) {
-    for (let a = start, b = start + size - 1; a < b; a++, b--) {
-      const t = bytes[a];
-      bytes[a] = bytes[b];
-      bytes[b] = t;
-    }
-  }
-}
-
 /** Bytes of `bytes` that a typed array of `size`-byte elements can view in place. */
 function ownedAligned(bytes, size) {
-  return bytes.byteOffset % size === 0 ? bytes : bytes.slice();
+  return bytes.byteOffset % size === 0 ? bytes : copyTypedArray(Uint8Array, bytes, 'HDF5 values');
 }
 
 /* ---------- heap references ---------- */
+
+/**
+ * How much more than the referenced objects' mean size the objects before
+ * the furthest one are taken to take, on average: strings of one column vary
+ * in length around their mean.
+ */
+const PREFIX_SPREAD = 1.125;
+
+/**
+ * The global heap collections the elements `rows` (`[from, to, ...]`, in
+ * elements of `bytes`) of a variable-length `type` point to, with the bytes
+ * of each they need, measured from every element of `bytes` (`count`).
+ *
+ * A collection is parsed from its start, so what is read of it is its
+ * prefix up to the furthest object asked for. The elements around the rows
+ * asked for (the rest of their chunk of references) point into the same
+ * collections and name the other objects' lengths: the bytes before an
+ * object are those of the objects of lower index (objects lie in index
+ * order), known exactly where these elements name them, and taken at the
+ * named ones' mean size (with `PREFIX_SPREAD`) where not. A column's
+ * elements need not name their objects in index order (libhdf5 numbers a
+ * conversion buffer's objects from its end: a chunk's first element names
+ * the highest index of its collection), so the furthest object asked for is
+ * found by index, not by element. An object past what is read still decodes:
+ * the collection is completed for it (`IncompleteCollectionError`).
+ *
+ * @param {import('./context.js').FileContext} file
+ * @param {Object} type - A variable-length datatype
+ * @param {Uint8Array} bytes - The references of `count` elements
+ * @param {number} count
+ * @param {ArrayLike<number>} rows - Element ranges asked for, `[from, to, ...]`
+ * @param {Array<{bytes: Uint8Array, count: number}>} [beside] - Other
+ *   references (the neighbouring chunks'), naming objects only
+ * @returns {Map<number, number> & {unnamed: number}} Collection address ->
+ *   bytes of it to read; `unnamed`: the objects asked for some of whose
+ *   predecessors no element names (their bytes taken from the mean)
+ */
+export function rowHeapNeeds(file, type, bytes, count, rows, beside = []) {
+  const size = type.size;
+  const unit = type.variable === 'string' ? 1 : type.base.size;
+  const fail = problem => {
+    throw formatError('Variable-length data', NaN, problem);
+  };
+  const header = 8 + file.lengthSize;
+  // Every element's object, by collection: its index and the bytes it takes;
+  // the elements beside (`beside`: the neighbouring chunks' references) name
+  // more objects of the collections these point into (one collection holds
+  // the end of a chunk's strings and the start of the next's).
+  const objects = new Map();
+  const name = (from, n, only) => {
+    for (let i = 0; i < n; i++) {
+      const at = i * size;
+      const address = readUintLE(from, at + 4, file.offsetSize, fail);
+      if (address === null || address === 0) continue;
+      let list = objects.get(address);
+      if (list === undefined) {
+        if (only) continue;
+        objects.set(address, list = []);
+      }
+      const length = readUintLE(from, at, 4, fail);
+      const index = readUintLE(from, at + 4 + file.offsetSize, 4, fail) ?? 0;
+      list.push(index, collectionEntryBytes(file, length * unit));
+    }
+  };
+  name(bytes, count, false);
+  for (const other of beside) name(other.bytes, other.count, true);
+  // Per collection: its named indexes ascending, and the bytes before each.
+  const placed = new Map();
+  for (const [address, list] of objects) {
+    const n = list.length / 2;
+    // Object indexes are 16-bit, as are a collection's objects: (index,
+    // element) in one 32-bit key, sorted as numbers (elements naming
+    // anything else are ordered one by one).
+    let order;
+    let small = n <= 65536;
+    for (let k = 0; small && k < n; k++) small = list[2 * k] <= 0xffff;
+    if (small) {
+      const keys = allocateTypedArray(Uint32Array, n, 'Heap object order');
+      for (let k = 0; k < n; k++) keys[k] = list[2 * k] * 65536 + k;
+      keys.sort();
+      order = k => keys[k] & 0xffff;
+    } else {
+      const sorted = Array.from({ length: n }, (_, k) => k).sort((a, b) => list[2 * a] - list[2 * b]);
+      order = k => sorted[k];
+    }
+    const indexes = allocateTypedArray(Float64Array, n, 'Heap object order');
+    const before = allocateTypedArray(Float64Array, n + 1, 'Heap object order');
+    // An object named twice (rows read twice) counts once.
+    let m = 0;
+    for (let k = 0; k < n; k++) {
+      const element = order(k);
+      if (m > 0 && indexes[m - 1] === list[2 * element]) continue;
+      indexes[m] = list[2 * element];
+      before[m + 1] = before[m] + list[2 * element + 1];
+      m++;
+    }
+    placed.set(address, { indexes: indexes.subarray(0, m), before: before.subarray(0, m + 1), mean: before[m] / m });
+  }
+  const needs = new Map();
+  /** Objects asked for whose bytes before them were taken in part from the mean. */
+  needs.unnamed = 0;
+  for (let r = 0; r < rows.length; r += 2) {
+    for (let i = rows[r]; i < rows[r + 1]; i++) {
+      const at = i * size;
+      const length = readUintLE(bytes, at, 4, fail);
+      if (length === 0) continue;
+      const address = readUintLE(bytes, at + 4, file.offsetSize, fail);
+      if (address === null || address === 0) continue;
+      const index = readUintLE(bytes, at + 4 + file.offsetSize, 4, fail) ?? 0;
+      const { indexes, before, mean } = placed.get(address);
+      // Named objects of lower index, and how many lower indexes none names.
+      let lo = 0;
+      let hi = indexes.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (indexes[mid] < index) lo = mid + 1;
+        else hi = mid;
+      }
+      const unnamed = Math.max(0, index - 1 - lo);
+      if (unnamed > 0) needs.unnamed++;
+      const end = header + before[lo] + Math.ceil(unnamed * mean * PREFIX_SPREAD) + collectionEntryBytes(file, length * unit);
+      if (end > (needs.get(address) ?? 0)) needs.set(address, end);
+    }
+  }
+  return needs;
+}
 
 /**
  * Add to `into` every global heap collection the `count` elements of `type`
@@ -100,29 +192,49 @@ export function heapAddresses(file, type, bytes, count, into = new Map()) {
     const fail = problem => {
       throw formatError('Variable-length data', NaN, problem);
     };
+    // Per collection: the bytes of the objects referenced, and how far into
+    // the collection the furthest of them lies. A collection is parsed from
+    // its start (objects have no index), so what is read of it is its prefix
+    // up to the furthest object: estimated from that object's index and the
+    // referenced objects' mean size (objects are written in order, so the
+    // ones before it are like them), a little more for the spread of sizes.
+    // One read then usually holds every object asked for, without reading a
+    // large collection whole (a string column's) or a second, dependent
+    // round trip for what lies past the objects' own bytes.
+    const seen = new Map();
+    let last = null;
     let lastAddress = -1;
-    let lastBytes = 0;
     for (let i = 0; i < count; i++) {
       const at = i * size;
       const length = readUintLE(bytes, at, 4, fail);
       if (length === 0) continue;
       const address = readUintLE(bytes, at + 4, file.offsetSize, fail);
       if (address === null || address === 0) continue;
-      // Neighbouring elements usually share a collection: sum locally.
+      const index = readUintLE(bytes, at + 4 + file.offsetSize, 4, fail) ?? 0;
+      // Neighbouring elements usually share a collection.
       if (address !== lastAddress) {
-        if (lastAddress >= 0) into.set(lastAddress, lastBytes);
+        last = seen.get(address);
+        if (last === undefined) {
+          last = { bytes: 0, objects: 0, maxIndex: 0 };
+          seen.set(address, last);
+        }
         lastAddress = address;
-        lastBytes = into.get(address) ?? 8 + file.lengthSize;
       }
-      lastBytes += collectionEntryBytes(file, length * unit);
+      last.bytes += collectionEntryBytes(file, length * unit);
+      last.objects++;
+      if (index > last.maxIndex) last.maxIndex = index;
     }
-    if (lastAddress >= 0) into.set(lastAddress, lastBytes);
+    for (const [address, entry] of seen) {
+      const header = 8 + file.lengthSize;
+      const prefix = header + Math.ceil(entry.maxIndex * (entry.bytes / entry.objects) * PREFIX_SPREAD);
+      into.set(address, Math.max(into.get(address) ?? 0, header + entry.bytes, prefix));
+    }
   } else if (type.class === 'compound') {
     for (const member of type.members) {
       if (!hasHeapData(member.type)) continue;
       const width = member.type.size;
       const perElement = member.shape.reduce((a, b) => a * b, 1);
-      const column = new Uint8Array(count * perElement * width);
+      const column = allocateTypedArray(Uint8Array, count * perElement * width, 'HDF5 compound member');
       for (let i = 0; i < count; i++) {
         column.set(bytes.subarray(i * type.size + member.offset, i * type.size + member.offset + perElement * width), i * perElement * width);
       }
@@ -354,25 +466,25 @@ export function numericValues(dtype, bytes, count) {
   const size = dtype.bytes;
   if (dtype.name === 'float16') {
     const table = halfToFloatTable();
-    const out = new Float32Array(count);
+    const out = allocateTypedArray(Float32Array, count, 'HDF5 float16 values');
     const source = ownedAligned(bytes, 2);
-    if (dtype.littleEndian === false) swapBytes(source, 2);
+    if (needsSwap(dtype.littleEndian !== false, 2)) swapBytes(source, 2);
     const words = new Uint16Array(source.buffer, source.byteOffset, count);
     for (let i = 0; i < count; i++) out[i] = table[words[i]];
     return out;
   }
   const Type = valueArrayClass(dtype);
   const owned = ownedAligned(bytes, size);
-  if (dtype.littleEndian === false) swapBytes(owned.subarray(0, count * size), size);
+  if (needsSwap(dtype.littleEndian !== false, size)) swapBytes(owned.subarray(0, count * size), size);
   return new Type(owned.buffer, owned.byteOffset, count);
 }
 
 function booleanValues(dtype, bytes, count) {
-  const out = dtype.bytes === 1 ? bytes.subarray(0, count) : new Uint8Array(count);
+  const out = dtype.bytes === 1 ? bytes.subarray(0, count) : allocateTypedArray(Uint8Array, count, 'HDF5 booleans');
   if (dtype.bytes === 1) {
     for (let i = 0; i < count; i++) if (out[i] > 1) out[i] = 1;
     if (out.byteOffset === 0 && out.length === out.buffer.byteLength) return out;
-    return out.slice();
+    return copyTypedArray(Uint8Array, out, 'HDF5 booleans');
   }
   const base = numericValues(dtype.base, bytes, count);
   for (let i = 0; i < count; i++) out[i] = base[i] ? 1 : 0;
@@ -388,7 +500,7 @@ export function decodeField(file, type, member, bytes, count, collections) {
   const perElement = member.shape.reduce((a, b) => a * b, 1);
   const width = member.type.size * perElement;
   const stride = type.size;
-  const column = new Uint8Array(count * width);
+  const column = allocateTypedArray(Uint8Array, count * width, 'HDF5 compound member');
   // Strided gather of the member's bytes: short members copy byte by byte,
   // long ones by subarray.
   if (width <= 16) {

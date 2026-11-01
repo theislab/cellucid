@@ -16,6 +16,7 @@ import {
   SPLAT_VS,
 } from '../shaders/density-shaders.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../alpha-visibility.js';
+import { cellLayerColors } from '../read-cell-layer.js';
 import { requireCleanWebGLState, requireLiveContext } from '../gl-errors.js';
 import {
   createProgram,
@@ -190,6 +191,8 @@ function getOrCreateGPUSplatResources(gl) {
       u_atlasWidth: requireUniform(colorSplatProgram, 'u_atlasWidth'),
       u_atlasHeight: requireUniform(colorSplatProgram, 'u_atlasHeight'),
       u_slicesPerRow: requireUniform(colorSplatProgram, 'u_slicesPerRow'),
+      u_zeroColor: requireUniform(colorSplatProgram, 'u_zeroColor'),
+      u_unreadColor: requireUniform(colorSplatProgram, 'u_unreadColor'),
     };
     const reduceMaxProgram = createProgramFromSources(
       NORMALIZE_VS,
@@ -516,17 +519,29 @@ function requireExactColors(colors, pointCount) {
   return colors;
 }
 
+/**
+ * The colours of the lower layers (`cellLayerColors`): `{zero, unread}`,
+ * three bytes each.
+ */
+export function requireSmokeLayerColors(layerColors) {
+  const isBytes = rgb => Array.isArray(rgb) && rgb.length === 3 && rgb.every(channel => Number.isInteger(channel) && channel >= 0 && channel <= 255);
+  if (layerColors === null || typeof layerColors !== 'object' || !isBytes(layerColors.zero) || !isBytes(layerColors.unread)) {
+    throw new TypeError('GPU smoke density layer colours must be {zero, unread}, three bytes each.');
+  }
+  return layerColors;
+}
+
 function requireExactVisibility(visibility, pointCount) {
   if (visibility === null) return null;
+  // The fields read below are checked, not the set of keys: a producer may
+  // carry more than this consumer reads.
   if (
     typeof visibility !== 'object'
+    || visibility === undefined
     || Array.isArray(visibility)
-    || Object.getPrototypeOf(visibility) !== Object.prototype
-    || Object.keys(visibility).sort().join(',') !==
-      'alpha,outlierQuantiles,outlierThreshold'
   ) {
     throw new TypeError(
-      'GPU smoke density visibility must be null or contain exactly alpha, outlierQuantiles, and outlierThreshold.'
+      'GPU smoke density visibility must be null or an object of alpha, outlierQuantiles, and outlierThreshold.'
     );
   }
   if (
@@ -586,6 +601,9 @@ function inspectDensitySource(positions, dimension, visibility) {
     // Axes the embedding does not have are exactly zero.
     const y = dimension > 1 ? positions[positionIndex + 1] : 0;
     const z = dimension > 2 ? positions[positionIndex + 2] : 0;
+    // A cell its embedding does not place (NaN in every axis,
+    // `unplaced-positions.js`) is in no volume.
+    if (x !== x && (dimension < 2 || y !== y) && (dimension < 3 || z !== z)) continue;
     if (!Number.isFinite(x)) {
       throw new RangeError(
         `GPU smoke density position component ${positionIndex} must be finite.`
@@ -740,6 +758,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       key !== 'dimension' &&
       key !== 'gamma' &&
       key !== 'gridSize' &&
+      key !== 'layerColors' &&
       key !== 'visibility'
   );
   if (unexpectedOption !== undefined) {
@@ -786,6 +805,11 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     );
   }
   const colors = requireExactColors(options.colors, pointCount);
+  // The colours of the lower layers over the view's background
+  // (`rendering/read-cell-layer.js` `cellLayerColors`); a white view's without.
+  const layerColors = requireSmokeLayerColors(
+    Object.hasOwn(options, 'layerColors') ? options.layerColors : cellLayerColors([1, 1, 1])
+  );
   const visibility = requireExactVisibility(
     Object.hasOwn(options, 'visibility') ? options.visibility : null,
     pointCount
@@ -1000,6 +1024,10 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       gl.uniform1f(locations.u_atlasHeight, atlasHeight);
       gl.uniform1f(locations.u_slicesPerRow, slicesPerRow);
       gl.uniform3f(locations.u_flatAxes, ...flatAxes);
+      if (program === resources.colorSplatProgram) {
+        gl.uniform3f(locations.u_zeroColor, ...layerColors.zero.map(channel => channel / 255));
+        gl.uniform3f(locations.u_unreadColor, ...layerColors.unread.map(channel => channel / 255));
+      }
       gl.uniform1f(
         locations.u_slabHalfThickness,
         SMOKE_SLAB_HALF_THICKNESS
@@ -1059,13 +1087,15 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     } else {
       const batchPositions = new Float32Array(splatBatchCapacity * dimension);
       const batchColors = new Uint8Array(splatBatchCapacity * 4);
-      const alpha = visibility.alpha;
-      const outlierQuantiles = visibility.outlierQuantiles;
-      const outlierThreshold = visibility.outlierThreshold;
+      const alpha = visibility?.alpha ?? null;
+      const outlierQuantiles = visibility?.outlierQuantiles ?? null;
+      const outlierThreshold = visibility?.outlierThreshold ?? null;
       let batchPointCount = 0;
       let submittedPointCount = 0;
       for (let pointIndex = 0; pointIndex < pointCount; pointIndex++) {
-        if (alpha[pointIndex] < POINT_VISIBILITY_THRESHOLD) continue;
+        if (alpha !== null && alpha[pointIndex] < POINT_VISIBILITY_THRESHOLD) continue;
+        // Unplaced (NaN positions): counted out by the preflight above.
+        if (positions[pointIndex * dimension] !== positions[pointIndex * dimension]) continue;
         if (outlierQuantiles !== null) {
           const quantile = outlierQuantiles[pointIndex];
           if (quantile >= 0 && quantile > outlierThreshold) continue;
@@ -1368,30 +1398,28 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
 // Native 3D Texture (WebGL2) - Primary, high-performance path
 // ============================================================================
 
-export function createDensityTexture3D(gl, volumeDesc) {
-  if (!gl || typeof gl !== 'object') {
-    throw new TypeError('Smoke density texture creation requires WebGL2.');
+/**
+ * Require a smoke volume record (`{data, gridSize, boundsMin, boundsMax}`):
+ * a gridSize³ Float32Array of densities and the box it fills. The one check
+ * of the record, made before anything is allocated; it reads the fields it
+ * names and ignores any others.
+ *
+ * @param {{data: Float32Array, gridSize: number, boundsMin: ArrayLike<number>, boundsMax: ArrayLike<number>}} volumeDesc
+ * @param {string} owner
+ * @returns {{data: Float32Array, gridSize: number, boundsMin: ArrayLike<number>, boundsMax: ArrayLike<number>}}
+ */
+export function requireSmokeVolume(volumeDesc, owner) {
+  if (volumeDesc === null || typeof volumeDesc !== 'object' || Array.isArray(volumeDesc)) {
+    throw new TypeError(`${owner} volume must be an object of data, gridSize, boundsMin, and boundsMax.`);
   }
-  if (
-    volumeDesc === null ||
-    typeof volumeDesc !== 'object' ||
-    Array.isArray(volumeDesc) ||
-    Object.getPrototypeOf(volumeDesc) !== Object.prototype ||
-    Object.keys(volumeDesc).sort().join(',') !==
-      'boundsMax,boundsMin,data,gridSize'
-  ) {
-    throw new TypeError(
-      'Smoke density volume descriptor must contain exactly boundsMax, boundsMin, data, and gridSize.'
-    );
-  }
-  const { data: volume, gridSize } = volumeDesc;
+  const { data: volume, gridSize, boundsMin, boundsMax } = volumeDesc;
   if (
     !Number.isInteger(gridSize)
     || gridSize < 8
     || gridSize > MAX_SMOKE_GRID_SIZE
   ) {
     throw new RangeError(
-      `Smoke density texture gridSize must be an integer from 8 through ${MAX_SMOKE_GRID_SIZE}.`
+      `${owner} volume gridSize must be an integer from 8 through ${MAX_SMOKE_GRID_SIZE}.`
     );
   }
   if (
@@ -1399,9 +1427,33 @@ export function createDensityTexture3D(gl, volumeDesc) {
     volume.length !== gridSize * gridSize * gridSize
   ) {
     throw new TypeError(
-      'Smoke density texture data must be an exact gridSize³ Float32Array.'
+      `${owner} volume data must be an exact gridSize³ Float32Array.`
     );
   }
+  for (const [bound, name] of [[boundsMin, 'boundsMin'], [boundsMax, 'boundsMax']]) {
+    if (
+      !(Array.isArray(bound) || bound instanceof Float32Array)
+      || bound.length !== 3
+      || Array.from(bound).some(entry => !Number.isFinite(entry))
+    ) {
+      throw new TypeError(`${owner} volume ${name} must contain exactly three finite numbers.`);
+    }
+  }
+  for (let axis = 0; axis < 3; axis++) {
+    if (boundsMin[axis] >= boundsMax[axis]) {
+      throw new RangeError(
+        `${owner} volume boundsMin[${axis}] must be smaller than boundsMax[${axis}].`
+      );
+    }
+  }
+  return volumeDesc;
+}
+
+export function createDensityTexture3D(gl, volumeDesc) {
+  if (!gl || typeof gl !== 'object') {
+    throw new TypeError('Smoke density texture creation requires WebGL2.');
+  }
+  const { data: volume, gridSize } = requireSmokeVolume(volumeDesc, 'Smoke density texture');
 
   // Convert float [0,1] to the GPU build's RGBA8 layout: density in red and
   // white, density-premultiplied, in the colour channels.

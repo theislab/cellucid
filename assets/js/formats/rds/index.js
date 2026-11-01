@@ -26,7 +26,7 @@ import { hostValues, parseItem, readHeader } from './parse.js';
 import { compressionOf, decompressed, rContainerOf, readInOrder } from './stream.js';
 
 export { RdsFormatError, RdsUnsupportedError } from './errors.js';
-export { NA_INTEGER, NULL_NODE, INLINE_ELEMENTS, SEXP, parseItem, readHeader, deferredStrings, formatRealAsR, hostValues } from './parse.js';
+export { NA_INTEGER, NULL_NODE, INLINE_ELEMENTS, SEXP, itemFlagsOf, parseItem, readHeader, deferredStrings, formatRealAsR, hostValues } from './parse.js';
 export { XdrReader } from './xdr.js';
 export { compressionOf, decompressed, isUncompressed, rContainerOf, readInOrder } from './stream.js';
 export { bunzip2 } from './bzip2.js';
@@ -63,33 +63,42 @@ export async function readRFile(file, { plan = {}, sink = null, signal = null, a
   let reader;
   let container;
   let compressions = [];
-  if (outer === 'none') {
-    const kind = rContainerOf(head);
-    if (kind === null) throw new RdsFormatError('This file is not an R file: it is neither compressed nor starts as saveRDS() or save() write.');
-    container = kind.container;
-    reader = XdrReader.ofRanges({
-      size: file.size,
-      read: (offset, length) => file.read(offset, length, { signal, activity }),
-    }, { offset: kind.streamOffset });
-    onBytes?.(file.size);
-  } else {
-    const unwrapped = await decompressed(readInOrder(file, { signal, activity, onBytes }), { signal, bytes: file.size });
-    compressions = unwrapped.compressions;
-    const kind = rContainerOf(unwrapped.head);
-    if (kind === null) {
-      throw new RdsFormatError(`This ${compressions[0]} file does not hold an R object: what it decompresses to starts as neither saveRDS() nor save() write.`);
+  /** The decompressed stream, closed however the pass ends: its decompressor and reads stop with it. */
+  let stream = null;
+  try {
+    if (outer === 'none') {
+      const kind = rContainerOf(head);
+      if (kind === null) throw new RdsFormatError('This file is not an R file: it is neither compressed nor starts as saveRDS() or save() write.');
+      container = kind.container;
+      reader = XdrReader.ofRanges({
+        size: file.size,
+        read: (offset, length) => file.read(offset, length, { signal, activity }),
+      }, { offset: kind.streamOffset });
+      onBytes?.(file.size);
+    } else {
+      const unwrapped = await decompressed(readInOrder(file, { signal, activity, onBytes }), { signal, bytes: file.size });
+      stream = unwrapped.pieces;
+      compressions = unwrapped.compressions;
+      const kind = rContainerOf(unwrapped.head);
+      if (kind === null) {
+        throw new RdsFormatError(`This ${compressions[0]} file does not hold an R object: what it decompresses to starts as neither saveRDS() nor save() write.`);
+      }
+      container = kind.container;
+      reader = XdrReader.ofStream(unwrapped.pieces);
+      if (kind.streamOffset > 0) await reader.transfer(kind.streamOffset, null);
     }
-    container = kind.container;
-    reader = XdrReader.ofStream(unwrapped.pieces);
-    if (kind.streamOffset > 0) await reader.transfer(kind.streamOffset, null);
+    const header = await readHeader(reader);
+    const root = await parseItem(reader, { plan, sink, nativeEncoding: header.nativeEncoding, signal, onProgress, inlineElements, container });
+    if (container === 'rda' && root.kind !== 'pairlist') {
+      throw new RdsFormatError('This save() file does not hold a list of named objects.');
+    }
+    await stream?.return?.();
+    stream = null;
+    await readAgain(file, rereadNodes(root), { sink, signal, activity, onBytes });
+    return { container, compressions, random: reader.random, header, root };
+  } finally {
+    await stream?.return?.().catch(() => {});
   }
-  const header = await readHeader(reader);
-  const root = await parseItem(reader, { plan, sink, nativeEncoding: header.nativeEncoding, signal, onProgress, inlineElements });
-  if (container === 'rda' && root.kind !== 'pairlist') {
-    throw new RdsFormatError('This save() file does not hold a list of named objects.');
-  }
-  await readAgain(file, rereadNodes(root), { sink, signal, activity, onBytes });
-  return { container, compressions, random: reader.random, header, root };
 }
 
 /** Every node a pass left to `reread` and the plan kept, in stream order. */
@@ -117,19 +126,22 @@ async function readAgain(file, nodes, { sink, signal, activity, onBytes }) {
   if (nodes.length === 0) return;
   const unwrapped = await decompressed(readInOrder(file, { signal, activity, onBytes }), { signal, bytes: file.size });
   const reader = XdrReader.ofStream(unwrapped.pieces);
-  for (const node of nodes) {
-    const { position, byteLength } = node.reread;
-    await reader.transfer(position - reader.position, null);
-    if (sink !== null) {
-      const writer = await sink.open(byteLength, { path: [], kind: node.kind, length: node.length });
-      await reader.transfer(byteLength, view => writer.write(view));
-      node.region = await writer.close();
-    } else {
-      node.values = hostValues(node.kind, await reader.bytes(byteLength), node.length);
+  try {
+    for (const node of nodes) {
+      const { position, byteLength } = node.reread;
+      await reader.transfer(position - reader.position, null);
+      if (sink !== null) {
+        const writer = await sink.open(byteLength, { path: [], kind: node.kind, length: node.length });
+        await reader.transfer(byteLength, view => writer.write(view));
+        node.region = await writer.close();
+      } else {
+        node.values = hostValues(node.kind, await reader.bytes(byteLength), node.length);
+      }
+      delete node.reread;
     }
-    delete node.reread;
+  } finally {
+    await unwrapped.pieces.return?.().catch(() => {});
   }
-  await unwrapped.pieces.return?.();
 }
 
 /**

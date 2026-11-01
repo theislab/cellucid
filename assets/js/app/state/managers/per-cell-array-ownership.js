@@ -24,13 +24,23 @@ import { fillNeutralGray } from '../core/constants.js';
 const SNAPSHOT_PUBLISHED_COLORS = new WeakSet();
 
 /**
- * How many times each transparency array and each cell visibility mask was
- * handed out for writing. A result derived from one array (a visibility pass,
- * `filter-manager.js`) records its count and stays valid while the count does,
- * whichever view holds the array by then.
+ * How many times each transparency array, each cell visibility mask and each
+ * colors array was handed out for writing. A result derived from one array (a
+ * visibility pass, `filter-manager.js`; a smoke volume, `getSmokeDensitySource`)
+ * records its count and stays valid while the count does, whichever view
+ * holds the array by then.
  */
 const TRANSPARENCY_WRITES = new WeakMap();
 const MASK_WRITES = new WeakMap();
+const COLOR_WRITES = new WeakMap();
+
+/**
+ * @param {Uint8Array} colors
+ * @returns {number} How many times `colors` was handed out for writing.
+ */
+export function colorArrayWrites(colors) {
+  return COLOR_WRITES.get(colors) ?? 0;
+}
 
 /**
  * @param {Uint8Array} transparency
@@ -95,16 +105,15 @@ export function writableColors(state) {
   ) {
     state.colorsArray = new Uint8Array(colors);
   }
-  NEUTRAL_COLORS.delete(state.colorsArray);
-  ALPHA_MIRRORS.delete(state.colorsArray);
-  return state.colorsArray;
+  const writable = state.colorsArray;
+  NEUTRAL_COLORS.delete(writable);
+  COLOR_WRITES.set(writable, colorArrayWrites(writable) + 1);
+  return writable;
 }
 
 /**
- * Colors arrays whose every cell holds the neutral gray (`fillNeutralGray`)
- * in its RGB bytes since they were last handed out by `writableColors`.
- * Their alpha bytes are the view's visibility (`writableColorAlphaBytes`),
- * so only the RGB bytes are proven.
+ * Colors arrays whose every cell holds the opaque neutral gray
+ * (`fillNeutralGray`) since they were last handed out by `writableColors`.
  */
 const NEUTRAL_COLORS = new WeakSet();
 
@@ -121,9 +130,8 @@ export function createNeutralColors(pointCount) {
 }
 
 /**
- * The active view's colors with neutral gray RGB bytes, written only when
- * they do not already hold it. The alpha bytes are left for the caller to
- * publish from the view's visibility.
+ * The active view's colors, opaque neutral gray, written only when they do
+ * not already hold it.
  *
  * @param {object} state
  * @returns {Uint8Array}
@@ -141,59 +149,6 @@ export function writableNeutralColors(state) {
   fillNeutralGray(writable);
   NEUTRAL_COLORS.add(writable);
   return writable;
-}
-
-/**
- * The active view's colors, safe for rewriting only their alpha bytes.
- *
- * The alpha byte of a colors array mirrors that view's own transparency. A
- * snapshot's renderer reads alpha from its own R8 texture and never from the
- * colors it keeps by reference, so a snapshot-held array may take its own
- * view's alpha bytes in place; only an array another view still holds is
- * copied first.
- *
- * @param {object} state
- * @returns {Uint8Array}
- */
-export function writableColorAlphaBytes(state) {
-  const colors = state.colorsArray;
-  if (isHeldByInactiveView(state, colors)) {
-    state.colorsArray = new Uint8Array(colors);
-  }
-  ALPHA_MIRRORS.delete(state.colorsArray);
-  return state.colorsArray;
-}
-
-/**
- * For a colors array, the transparency its alpha bytes were last published
- * from (`recordAlphaBytesMirror`) and that array's write count then. Any
- * handing out of the colors for writing withdraws the record.
- */
-const ALPHA_MIRRORS = new WeakMap();
-
-/**
- * Record that every alpha byte of `colors` is now `transparency * 255`.
- *
- * @param {Uint8Array} colors
- * @param {Uint8Array} transparency
- */
-export function recordAlphaBytesMirror(colors, transparency) {
-  ALPHA_MIRRORS.set(colors, { transparency, writes: transparencyArrayWrites(transparency) });
-}
-
-/**
- * Whether every alpha byte of `colors` is `transparency * 255`: they were
- * published from it, and neither array was handed out for writing since.
- *
- * @param {Uint8Array} colors
- * @param {Uint8Array} transparency
- * @returns {boolean}
- */
-export function alphaBytesMirror(colors, transparency) {
-  const entry = ALPHA_MIRRORS.get(colors);
-  return entry !== undefined
-    && entry.transparency === transparency
-    && entry.writes === transparencyArrayWrites(transparency);
 }
 
 /**

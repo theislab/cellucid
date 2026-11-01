@@ -89,7 +89,11 @@ async function extentsAt(browser, contextOptions) {
   );
   await dismissWelcome(page);
   await expect(page.locator('#filter-count')).toHaveText(`Showing all ${CORNERS.length} cells`);
-  await page.locator('#sidebar-toggle').click();
+  // A phone opens on the plot, its sidebar already hidden (the bar at its
+  // foot); elsewhere the sidebar is open and is hidden here.
+  if (!(await page.locator('#sidebar').evaluate(sidebar => sidebar.classList.contains('hidden')))) {
+    await page.locator('#sidebar-toggle').click();
+  }
   await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
   // The presented area is final once the sidebar's slide has finished.
   await expect.poll(() => page.evaluate(

@@ -38,8 +38,9 @@ test('the standalone pages are the brand card on the shared page stylesheet', as
     const html = await read(name);
     assert.match(html, /<html lang="en" data-theme="light" data-viewer-background="studio">/, name);
     assert.match(html, /<script src="\/assets\/js\/app\/ui\/core\/theme-init\.js\?v=[0-9a-f]{12}"><\/script>/, name);
+    // At the URL naming its bytes (CELLUCID_MODULE_VERSIONS in index.html).
     assert.deepEqual(
-      [...html.matchAll(/<link rel="stylesheet" href="([^"]+)"/g)].map(match => match[1]),
+      [...html.matchAll(/<link rel="stylesheet" href="([^"?]+)\?v=[0-9a-f]{12}"/g)].map(match => match[1]),
       ['/assets/css/page.css'],
       `${name} loads only the page stylesheet`
     );
@@ -77,7 +78,8 @@ test('the reading pages are one set: dated, one contact, linked to each other', 
 
 test('the page stylesheet is a subset of the app stylesheet, never a second copy', async () => {
   const page = await read('assets/css/page.css');
-  const imports = [...page.matchAll(/@import '([^']+)'/g)].map(match => match[1]);
+  // Each import names its file's bytes (`?v=`, written by the generator).
+  const imports = [...page.matchAll(/@import '([^'?]+)\?v=[0-9a-f]{12}'/g)].map(match => match[1]);
   assert.deepEqual(imports, [
     'tokens/_index.css',
     'themes/_index.css',
@@ -95,11 +97,11 @@ test('the page stylesheet is a subset of the app stylesheet, never a second copy
     'both entry points declare the same layer order'
   );
   for (const shared of ['tokens/_index.css', 'themes/_index.css', 'base/_index.css']) {
-    assert.ok(main.includes(`@import '${shared}'`), `main.css imports ${shared}`);
+    assert.ok(main.includes(`@import '${shared}?v=`), `main.css imports ${shared}`);
   }
-  assert.match(components, /@import '_welcome\.css';/);
-  assert.match(layouts, /@import '_page\.css';/);
-  assert.match(layouts, /@import '_responsive\.css';/);
+  assert.match(components, /@import '_welcome\.css\?v=[0-9a-f]{12}';/);
+  assert.match(layouts, /@import '_page\.css\?v=[0-9a-f]{12}';/);
+  assert.match(layouts, /@import '_responsive\.css\?v=[0-9a-f]{12}';/);
   const inventory = JSON.parse(await read('cellucid-web-assets.json'));
   for (const asset of [
     'assets/css/page.css',

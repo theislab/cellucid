@@ -159,6 +159,7 @@ function payload({
         lodMembership: null,
         drawOrder: null,
         lodSizeMultiplier: 1,
+        pointLayers: { readScale: 1, readEveryLevel: true },
         normTransform: {
           center: [0, 0, 0],
           scale: 1,
@@ -315,6 +316,7 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
     lodMembership: null,
     drawOrder: null,
     lodSizeMultiplier: 1,
+    pointLayers: { readSizeMultiplier: 1, readEveryLevel: true },
     renderState: renderState(),
   };
   const emptyViewContext = () => ({

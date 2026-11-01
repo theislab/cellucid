@@ -35,6 +35,23 @@ async function loadAtlas(page) {
   await loadSyntheticDataset(page, { pointCount: POINT_COUNT, pattern: 'atlas' });
 }
 
+/**
+ * 'pulse' once a pulse frame has been drawn, only the pulse is left, no
+ * change still owes a frame (the cause of the last frame drawn alone says
+ * nothing of that) and every pane's geometry is presented; otherwise what is
+ * still under way, so a poll that times out names it.
+ */
+function onlyThePulseLeft(page) {
+  return page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const schedule = viewer.getFrameScheduleState();
+    const presented = viewer.isPresentedGeometrySettled();
+    return schedule.lastCause === 'highlight' && schedule.animationCause === 'highlight' && !schedule.invalidated && presented
+      ? 'pulse'
+      : `${schedule.lastCause}/${schedule.animationCause}${schedule.invalidated ? '/invalidated' : ''}${presented ? '' : '/presenting'}`;
+  });
+}
+
 /** Capture the frame drawn whole, then over the kept base, at one pulse phase. */
 function compareLayers(page) {
   return page.evaluate(async () => {
@@ -44,16 +61,28 @@ function compareLayers(page) {
       const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
       requestAnimationFrame(step);
     });
-    const capture = async caching => {
-      viewer.setPulseLayerCaching(caching);
-      // Frames until a pulse frame has reused the base (pulse-only frames are
-      // paced: ambient-frame-pacing.js); then the next one is captured.
-      const startReused = viewer.getPulseLayerStats().basesReused;
+    // Frames until the change made is drawn: the viewer clears its
+    // invalidation when it draws the frame that shows it.
+    const drawn = async () => {
       for (let attempt = 0; attempt < 600; attempt += 1) {
         await frames(1);
-        if (!caching || viewer.getPulseLayerStats().basesReused >= startReused + 3) break;
+        if (!viewer.getFrameScheduleState().invalidated) return;
       }
-      if (!caching) await frames(6);
+      throw new Error('The change was never drawn.');
+    };
+    const capture = async caching => {
+      viewer.setPulseLayerCaching(caching);
+      if (caching) {
+        // Frames until a pulse frame has reused the base (pulse-only frames
+        // are paced: ambient-frame-pacing.js); then the next one is captured.
+        const startReused = viewer.getPulseLayerStats().basesReused;
+        for (let attempt = 0; attempt < 600; attempt += 1) {
+          await frames(1);
+          if (viewer.getPulseLayerStats().basesReused >= startReused + 3) break;
+        }
+      } else {
+        await drawn();
+      }
       const width = gl.drawingBufferWidth;
       const height = gl.drawingBufferHeight;
       const pixels = new Uint8Array(width * height * 4);
@@ -109,7 +138,7 @@ test('a pulse frame over the kept base is the frame drawn whole', async ({ page 
     for (let i = 0; i < cells.length; i++) cells[i] = i * 13;
     state.addHighlightDirect({ type: 'annotation', label: 'pulse', cellIndices: cells });
   }, POINT_COUNT);
-  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().lastCause)).toBe('highlight');
+  await expect.poll(() => onlyThePulseLeft(page)).toBe('pulse');
 
   const single = await compareLayers(page);
   expect(single.drawn).toBeGreaterThanOrEqual(1);
@@ -120,7 +149,7 @@ test('a pulse frame over the kept base is the frame drawn whole', async ({ page 
   // A grid of two views: each pane keeps its own base.
   await page.evaluate(() => document.getElementById('split-keep-view-btn').click());
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length)).toBe(1);
-  await page.waitForTimeout(500);
+  await expect.poll(() => onlyThePulseLeft(page)).toBe('pulse');
   const grid = await compareLayers(page);
   expect(grid.drawn).toBeGreaterThanOrEqual(2);
   expect(grid.reused).toBeGreaterThanOrEqual(3);
@@ -139,6 +168,15 @@ function compareMaskedSamples(page, from, phase) {
       const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
       requestAnimationFrame(step);
     });
+    // Frames until the change made is drawn: the viewer clears its
+    // invalidation when it draws the frame that shows it.
+    const drawn = async () => {
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        await frames(1);
+        if (!viewer.getFrameScheduleState().invalidated) return;
+      }
+      throw new Error('The change was never drawn.');
+    };
     // Frames until `count` more panes were drawn under their rings (pulse-only
     // frames are paced: ambient-frame-pacing.js).
     const maskedFrames = async count => {
@@ -158,7 +196,7 @@ function compareMaskedSamples(page, from, phase) {
     };
     viewer.setHighlightAnimationTime(phase);
     viewer.setPulseLayerCaching(false);
-    await frames(8);
+    await drawn();
     const whole = read();
     const before = viewer.getPulseLayerStats();
     // Caching on draws one whole frame (the change invalidates it), then
@@ -216,7 +254,7 @@ test('an antialiased pulse frame drawn only under its rings is the frame drawn w
     for (let i = 0; i < cells.length; i++) cells[i] = i * 13;
     state.addHighlightDirect({ type: 'annotation', label: 'pulse', cellIndices: cells });
   }, POINT_COUNT);
-  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().lastCause)).toBe('highlight');
+  await expect.poll(() => onlyThePulseLeft(page)).toBe('pulse');
 
   // Two phases far apart in the glow (0.83 and 0.15 of full).
   const report = label => (result => `${label}: ${result.mismatched} of ${result.lit} lit pixels differ, ` +
@@ -231,7 +269,7 @@ test('an antialiased pulse frame drawn only under its rings is the frame drawn w
   // A grid of two views: each pane is marked and drawn on its own.
   await page.evaluate(() => document.getElementById('split-keep-view-btn').click());
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length)).toBe(1);
-  await page.waitForTimeout(500);
+  await expect.poll(() => onlyThePulseLeft(page)).toBe('pulse');
   const grid = await compareMaskedSamples(page, 11.6, 12.375);
   expect(grid.masked).toBeGreaterThanOrEqual(6);
   expect(grid.mismatched, report('grid: under the rings vs whole')(grid)).toBe(0);
@@ -246,15 +284,24 @@ test('nothing is kept while highlights do not pulse, or while the frame is multi
       const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
       requestAnimationFrame(step);
     });
+    // Frames until the change made is drawn: the viewer clears its
+    // invalidation when it draws the frame that shows it.
+    const drawn = async () => {
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        await frames(1);
+        if (!viewer.getFrameScheduleState().invalidated) return;
+      }
+      throw new Error('The change was never drawn.');
+    };
     const start = viewer.getPulseLayerStats();
     viewer.setPointSize(5);
-    await frames(6);
+    await drawn();
     const still = viewer.getPulseLayerStats();
     const available = viewer.isAntialiasingAvailable();
     viewer.setAntialiasing(true);
     const cells = Uint32Array.from({ length: 500 }, (_, i) => i * 7);
     window._cellucidState.addHighlightDirect({ type: 'annotation', label: 'msaa', cellIndices: cells });
-    await frames(8);
+    await drawn();
     const multisampled = viewer.getPulseLayerStats();
     return { start, still, multisampled, available };
   });

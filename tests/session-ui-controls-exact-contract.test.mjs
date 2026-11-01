@@ -591,3 +591,35 @@ test('session file-picker cancellation terminates once without polling', async (
     fixture.restore();
   }
 });
+
+test('a slider whose range follows unread data saves and restores the preference its owner keeps, whatever its range is now', () => {
+  // The edge-count slider: its range is the graph's visible edges, 0 until
+  // the graph is read after a reload, while the session records 250,000.
+  const limit = new FakeControl({ id: 'connectivity-limit', type: 'range', value: '0' });
+  limit.min = '0';
+  limit.max = '0';
+  limit.dataset = { sessionPreference: '120000' };
+  const fixture = installDocument([limit]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    assert.deepEqual(serializer.collectUIControls()['connectivity-limit'], { type: 'range', value: '120000' }, 'the preference, not the value shown');
+    serializer.restoreUIControls({ 'connectivity-limit': { type: 'range', value: '250000' } });
+    assert.equal(limit.dataset.sessionPreference, '250000', 'kept above the range shown now');
+    assert.equal(limit.value, '0', 'the slider shows what the data allows; its owner does that');
+    assert.deepEqual(limit.events, ['session-preference']);
+    // Not a count a person can choose: the slider's smallest stop is one edge
+    // or more, and 0 is the value it shows while no graph is read (what saves
+    // recorded before the preference was saved), which restored would turn
+    // edges on with none shown.
+    for (const value of ['2.5', '0', '-1', '01', '']) {
+      assert.throws(
+        () => serializer.restoreUIControls({ 'connectivity-limit': { type: 'range', value } }),
+        /preference must be a positive whole number/,
+        `refuses ${JSON.stringify(value)}`,
+      );
+    }
+    assert.equal(limit.dataset.sessionPreference, '250000', 'a refused preference changes nothing');
+  } finally {
+    fixture.restore();
+  }
+});

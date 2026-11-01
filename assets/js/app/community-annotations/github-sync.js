@@ -40,6 +40,7 @@ import {
   parseCanonicalGitHubRepositoryReference,
 } from './github-reference.js';
 import { requireExactObjectKeys } from '../../utils/exact-record.js';
+import { isCancellation, cancelled, onAbort } from '../../utils/abort.js';
 
 const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
 const GITHUB_FORK_READINESS_ATTEMPTS = 5;
@@ -169,13 +170,7 @@ function createRequestAbortScope(signal, timeoutMs) {
     if (abortCause === null) abortCause = cause;
     controller.abort();
   };
-  const abortFromOwner = () => {
-    abortWithCause('owner');
-  };
-  if (ownerSignal !== null) {
-    if (ownerSignal.aborted) abortFromOwner();
-    else ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
-  }
+  const stopOwner = onAbort(ownerSignal, () => abortWithCause('owner'));
 
   /** @type {ReturnType<typeof setTimeout> | null} */
   let timeout = null;
@@ -192,23 +187,20 @@ function createRequestAbortScope(signal, timeoutMs) {
     timeoutMs: ms,
     cleanup() {
       if (timeout !== null) clearTimeout(timeout);
-      ownerSignal?.removeEventListener('abort', abortFromOwner);
+      stopOwner();
     },
   };
 }
 
-function createOwnedRequestAbortError(label, cause = undefined) {
-  const error = new Error(`${label} was cancelled`);
-  error.name = 'AbortError';
-  error.code = 'GITHUB_REQUEST_ABORTED';
-  if (cause !== undefined) error.cause = cause;
-  return error;
+/** The caller stopped a GitHub request: a cancellation naming what it was. */
+function ownedRequestCancelled(label, cause = undefined) {
+  return cancelled('user', `${label} was cancelled.`, cause);
 }
 
 function throwIfRequestAborted(scope, label, cause = undefined) {
   const abortCause = scope.abortCause();
   if (abortCause === 'owner') {
-    throw createOwnedRequestAbortError(
+    throw ownedRequestCancelled(
       label,
       scope.ownerSignal.reason ?? cause
     );
@@ -398,10 +390,6 @@ function assertAuthUserResponse(value) {
     id: value.id,
     login: assertGitHubLogin(value.login, 'GitHub auth user login'),
   };
-}
-
-function isAbortError(err) {
-  return err?.name === 'AbortError';
 }
 
 function deriveGitHubMutationKind(method, path) {
@@ -1190,7 +1178,7 @@ async function githubRequest(workerOrigin, path, {
     ) {
       err.github = { path, method };
     }
-    if (isAbortError(err) && mutationOperation === null) {
+    if (isCancellation(err) && mutationOperation === null) {
       const error = new Error(
         'GitHub request transport was interrupted independently'
       );
@@ -1273,7 +1261,7 @@ async function workerAuthRequest(workerOrigin, path, {
       ownedError.worker = { path, method };
       throw ownedError;
     }
-    if (isAbortError(err)) {
+    if (isCancellation(err)) {
       const error = new Error(
         'GitHub auth request transport was interrupted independently'
       );
@@ -1955,7 +1943,7 @@ async function selectOrCreateForkRepo({
       if (
         reconciliationError?.code === 'GITHUB_FORK_LOOKUP_LIMIT' ||
         reconciliationError?.code === 'GITHUB_FORK_NAME_CONFLICT' ||
-        reconciliationError?.code === 'GITHUB_REQUEST_ABORTED'
+        isCancellation(reconciliationError)
       ) {
         throw reconciliationError;
       }
@@ -1971,32 +1959,32 @@ function waitForForkReadinessDelay(delayMs, signal) {
     throw new Error('GitHub fork readiness delay must be a positive integer');
   }
   if (signal?.aborted === true) {
-    throw createOwnedRequestAbortError(
+    throw ownedRequestCancelled(
       'GitHub fork readiness',
       signal.reason
     );
   }
+  // Not aborted (checked above): the abort callback never runs before the
+  // timer and its remover exist.
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (callback, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
+      stopWaiting();
       callback(value);
     };
-    const onAbort = () => {
+    const timer = setTimeout(() => settle(resolve), delayMs);
+    const stopWaiting = onAbort(signal, () => {
       settle(
         reject,
-        createOwnedRequestAbortError(
+        ownedRequestCancelled(
           'GitHub fork readiness',
           signal.reason
         )
       );
-    };
-    const timer = setTimeout(() => settle(resolve), delayMs);
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (signal?.aborted === true) onAbort();
+    });
   });
 }
 

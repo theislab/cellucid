@@ -24,12 +24,14 @@
  * @module formats/io/activity
  */
 
+import { isCancellation } from '../../utils/abort.js';
+
 /**
  * @typedef {Object} ActivitySnapshot
  * @property {number} id
  * @property {string} label - What is read, as the app names it ("gene CD3E", "obs['cell_type']")
  * @property {string} kind - What sort of operation ("open", "field", "genes", "embedding", "index", "graph",
- *   or a job's: "analysis", "outliers")
+ *   "cells": the rows of cells a file is written from (a cell export), or a job's: "analysis", "outliers")
  * @property {string|null} owner - The job the operation reads for (`app/jobs/cancellable-job.js`), if any
  * @property {string[]} keys - The shared loads the operation reads for (`data/read-activity-log.js`,
  *   `adopt`): a job that joins one of them later takes the operation as its own
@@ -47,6 +49,10 @@
  * @property {number} startedAt - `performance.now()` when it started
  * @property {number} elapsedMs
  * @property {{done: number, total: number}|null} progress - Steps of a long operation
+ * @property {{text: string, untilMs: number|null}|null} waiting - A wait a host named that the operation's
+ *   requests wait for (its request budget, a `Retry-After`: a server preparing what was asked for, in its own
+ *   words; `byte-source.js` `HostWait`), `untilMs` from the snapshot (null: until the host answers more);
+ *   null while none is
  * @property {string|null} detail - A failure's message
  */
 
@@ -69,6 +75,14 @@ export class ReadActivity {
     this.owner = owner;
     this.keys = Array.isArray(keys) ? keys.filter(key => typeof key === 'string') : [];
     this.background = background === true;
+    /**
+     * Whether its bytes are read once, for a file written out (`cells`, a
+     * cell export): nothing reads them again, so they are not handed to the
+     * page's memory of fetched bytes (`range-cache.js`), where they would
+     * only push out what other reads use, and cost a copy and a message
+     * each (the 812 MB of an export of 21,285 cells of HLCA).
+     */
+    this.readOnce = kind === 'cells';
     this.status = 'running';
     this.requests = 0;
     this.bytesFetched = 0;
@@ -81,8 +95,12 @@ export class ReadActivity {
     this.finishedAt = null;
     this.progressDone = null;
     this.progressTotal = null;
+    /** The wait a host named, while requests wait for it: `{text, until}` (`until` on `performance.now()`, or null). */
+    this.waitingFor = null;
     this.detail = null;
     this._onUpdate = onUpdate;
+    /** Resolves once the operation ends (`finish`): what is held for it may go (`byte-reader.js`, its surplus). */
+    this.finished = new Promise(resolve => { this._resolveFinished = resolve; });
   }
 
   /**
@@ -94,6 +112,20 @@ export class ReadActivity {
   fetched(bytes, requests = 1) {
     this.bytesFetched += bytes;
     this.requests += requests;
+    // Bytes arriving: whatever a host asked to wait for is over.
+    if (bytes > 0) this.waitingFor = null;
+    this._changed();
+  }
+
+  /**
+   * A request of the operation waits for a wait its host named (`wait`,
+   * `byte-source.js` `HostWait`), or no longer does (null). Not a failure:
+   * the request is asked again exactly when the host said.
+   */
+  waiting(wait) {
+    this.waitingFor = wait === null
+      ? null
+      : { text: wait.text, until: Number.isFinite(wait.untilMs) ? performance.now() + wait.untilMs : null };
     this._changed();
   }
 
@@ -136,12 +168,13 @@ export class ReadActivity {
     this.finishedAt = performance.now();
     if (error === null) {
       this.status = 'done';
-    } else if (error?.name === 'AbortError') {
+    } else if (isCancellation(error)) {
       this.status = 'cancelled';
     } else {
       this.status = 'failed';
       this.detail = error?.message ?? String(error);
     }
+    this._resolveFinished();
     this._changed();
   }
 
@@ -181,6 +214,9 @@ export class ReadActivity {
       startedAt: this.startedAt,
       elapsedMs,
       progress: this.progressTotal === null ? null : { done: this.progressDone, total: this.progressTotal },
+      waiting: this.status !== 'running' || this.waitingFor === null
+        ? null
+        : { text: this.waitingFor.text, untilMs: this.waitingFor.until === null ? null : Math.max(0, this.waitingFor.until - performance.now()) },
       detail: this.detail,
     };
   }

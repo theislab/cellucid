@@ -63,10 +63,54 @@ async function reachable(url, init) {
   }
 }
 
+/**
+ * Whether `url` is the key of a chunk in a Zarr store (`<store>.zarr/<array>/0`,
+ * `0.1`, `0/1` or `c/0/1`).
+ */
+function isZarrChunkKey(url) {
+  return /\.zarr\/(?:[^?#]*\/)?(?:c\/)?\d+(?:[./]\d+)*$/.test(new URL(url).pathname);
+}
+
+/**
+ * Errors the page reports. A Zarr store leaves out a chunk holding nothing
+ * but its array's fill value (the published catalog's
+ * `uns/cellucid/priority/seed` of 0 is one), so a reader asks for it and is
+ * answered 404, which means the fill value (Zarr v2 and v3). WebKit logs
+ * every such answer as a console error ("Failed to load resource"), for a
+ * worker's request too; Chromium and Firefox do not. It is not an error of
+ * the page.
+ */
 function observeProductErrors(page) {
   const errors = [];
+  // GitHub's API refusing this network for its hourly budget (unauthenticated
+  // requests share 60 an hour per address; a hosted runner's address is
+  // shared with every other job on it): the GitHub provider asks it which
+  // commit last wrote a file and, refused, reads the file at its ref
+  // (`providers/github.js`, `lastCommitOf`). WebKit logs the refusal as a
+  // failed resource; it is the host's condition, not an error of the page.
+  // Only a refusal that says its budget is spent is set aside.
+  const refusedForBudget = new Set();
+  const loggedFailure = new Map();
+  const refusal = /^Failed to load resource: the server responded with a status of (403|429)\b/;
+  page.on('response', response => {
+    const url = response.url();
+    if (!url.startsWith('https://api.github.com/') || ![403, 429].includes(response.status())) return;
+    const headers = response.headers();
+    if (headers['x-ratelimit-remaining'] !== '0' && headers['retry-after'] === undefined) return;
+    refusedForBudget.add(url);
+    const at = errors.indexOf(loggedFailure.get(url));
+    if (at >= 0) errors.splice(at, 1);
+    loggedFailure.delete(url);
+  });
   page.on('console', message => {
-    if (message.type() === 'error') errors.push(`console: ${message.text()}`);
+    if (message.type() !== 'error') return;
+    const url = message.location().url;
+    if (/^Failed to load resource: the server responded with a status of 404\b/.test(message.text()) &&
+        isZarrChunkKey(url)) return;
+    if (refusal.test(message.text()) && refusedForBudget.has(url)) return;
+    const entry = `console: ${message.text()}`;
+    if (refusal.test(message.text()) && url.startsWith('https://api.github.com/')) loggedFailure.set(url, entry);
+    errors.push(entry);
   });
   page.on('pageerror', error => {
     errors.push(`page: ${error.stack || error.message}`);

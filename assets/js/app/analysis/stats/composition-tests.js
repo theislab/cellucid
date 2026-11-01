@@ -7,8 +7,10 @@
  * condition, so the replicates are samples, not cells:
  *
  * - `logit` (default, after propeller, Phipson et al. 2022): each unit's
- *   proportion `(count + 0.5) / (total + 1)` on the logit scale, then Welch's
- *   t-test for two conditions or a one-way ANOVA for more. propeller's limma
+ *   pseudo-proportions as propeller's `getTransformedProps` takes them,
+ *   `(count + 0.5) / (total + 0.5 · K)` over the K types with cells (the
+ *   row sums of the table plus 0.5), on the logit scale, then Welch's t-test
+ *   for two conditions or a one-way ANOVA for more. propeller's limma
  *   empirical-Bayes moderation is not applied, which is more conservative
  *   with few samples.
  * - `rank`: the proportions, Wilcoxon rank-sum (as R `wilcox.test`) for two
@@ -20,9 +22,17 @@
  * descriptive: a χ² test of type × condition, and for each type a 2 × k χ²
  * of that type against the rest (Fisher's exact test for a 2 × 2 table with
  * an expected count below 5; Yates's correction on a 2 × 2 χ², as
- * `scipy.stats.chi2_contingency`).
+ * `scipy.stats.chi2_contingency` and R `chisq.test`): the Detailed view's
+ * kernel (`categorical-tests.js`).
  *
  * p-values are adjusted over the types (Benjamini-Hochberg or Bonferroni).
+ *
+ * A type with no cells in any unit (a category the scope, a page or a
+ * subsample left out) is not tested: its transformed proportions would
+ * depend only on the unit totals, so an absent type would look changed
+ * whenever conditions differ in size. It stays out of the CLR centre, the
+ * tests and the multiple-testing family, with NaN statistics and the test
+ * `'no cells'`.
  *
  * @module analysis/stats/composition-tests
  */
@@ -35,11 +45,13 @@ import {
   oneWayANOVA,
   tTest
 } from './statistical-tests.js';
-import { chiSquaredPValue, gammaLn } from '../compute/math-utils.js';
+import { chiSquaredIndependence, fisherExact2x2 } from './categorical-tests.js';
 
 export const COMPOSITION_METHODS = Object.freeze(['logit', 'rank', 'clr']);
 export const COMPOSITION_CORRECTIONS = Object.freeze(['bh', 'bonferroni']);
 const PSEUDOCOUNT = 0.5;
+/** The test of a type with no cells in any unit: none, out of the family. */
+export const NO_CELLS = 'no cells';
 
 /**
  * Per-unit values of one type for a method.
@@ -49,28 +61,39 @@ const PSEUDOCOUNT = 0.5;
  * @param {number} typeCount
  * @param {number} unitCount
  * @param {Float64Array} totals - Cells per unit.
+ * @param {Uint8Array} present - 1 for a type with cells in some unit; an
+ *   absent type is left out of the CLR centre and its values are NaN.
  * @returns {Float64Array} `values[type * unitCount + unit]`
  */
-export function transformedProportions(method, counts, typeCount, unitCount, totals) {
-  const out = new Float64Array(typeCount * unitCount);
+export function transformedProportions(method, counts, typeCount, unitCount, totals, present) {
+  const out = new Float64Array(typeCount * unitCount).fill(NaN);
   if (method === 'clr') {
+    let presentCount = 0;
+    for (let type = 0; type < typeCount; type++) presentCount += present[type];
     for (let unit = 0; unit < unitCount; unit++) {
       let logSum = 0;
       for (let type = 0; type < typeCount; type++) {
-        logSum += Math.log(counts[type * unitCount + unit] + PSEUDOCOUNT);
+        if (present[type] === 1) logSum += Math.log(counts[type * unitCount + unit] + PSEUDOCOUNT);
       }
-      const centre = logSum / typeCount;
+      const centre = logSum / presentCount;
       for (let type = 0; type < typeCount; type++) {
-        out[type * unitCount + unit] = Math.log(counts[type * unitCount + unit] + PSEUDOCOUNT) - centre;
+        if (present[type] === 1) {
+          out[type * unitCount + unit] = Math.log(counts[type * unitCount + unit] + PSEUDOCOUNT) - centre;
+        }
       }
     }
     return out;
   }
+  // propeller's pseudo-proportions: every present type's count plus 0.5,
+  // over the unit's total plus 0.5 a present type.
+  let presentTypes = 0;
+  for (let type = 0; type < typeCount; type++) presentTypes += present[type];
   for (let type = 0; type < typeCount; type++) {
+    if (present[type] === 0) continue;
     for (let unit = 0; unit < unitCount; unit++) {
       const count = counts[type * unitCount + unit];
       if (method === 'logit') {
-        const p = (count + PSEUDOCOUNT) / (totals[unit] + 1);
+        const p = (count + PSEUDOCOUNT) / (totals[unit] + PSEUDOCOUNT * presentTypes);
         out[type * unitCount + unit] = Math.log(p / (1 - p));
       } else {
         out[type * unitCount + unit] = totals[unit] > 0 ? count / totals[unit] : NaN;
@@ -78,76 +101,6 @@ export function transformedProportions(method, counts, typeCount, unitCount, tot
     }
   }
   return out;
-}
-
-function logChoose(n, k) {
-  if (k < 0 || k > n) return -Infinity;
-  return gammaLn(n + 1) - gammaLn(k + 1) - gammaLn(n - k + 1);
-}
-
-/**
- * Fisher's exact test of a 2 × 2 table, two-sided as SciPy: the tables no
- * more probable than the observed one (relative tolerance 1e-7).
- *
- * @param {number} a
- * @param {number} b
- * @param {number} c
- * @param {number} d
- */
-export function fisherExact2x2(a, b, c, d) {
-  const row1 = a + b;
-  const row2 = c + d;
-  const col1 = a + c;
-  const total = row1 + row2;
-  if (total === 0) return { oddsRatio: NaN, pValue: 1 };
-  const denominator = logChoose(total, col1);
-  const logP = value => logChoose(row1, value) + logChoose(row2, col1 - value) - denominator;
-  const observed = logP(a);
-  const threshold = observed + Math.log1p(1e-7);
-  let p = 0;
-  for (let value = Math.max(0, col1 - row2); value <= Math.min(row1, col1); value++) {
-    const lp = logP(value);
-    if (lp <= threshold) p += Math.exp(lp);
-  }
-  const oddsRatio = b * c > 0 ? (a * d) / (b * c) : (a * d > 0 ? Infinity : NaN);
-  return { oddsRatio, pValue: Math.min(1, p) };
-}
-
-/**
- * Pearson's χ² test of independence of a rows × columns table, as
- * `scipy.stats.chi2_contingency` (Yates's correction when it has one degree
- * of freedom). Rows or columns with no cells are dropped first.
- *
- * @param {number[][]} table
- * @returns {{statistic: number, df: number, pValue: number, minExpected: number}}
- */
-export function chiSquaredIndependence(table) {
-  const rows = table.filter(row => row.some(value => value > 0));
-  const columnCount = rows[0]?.length ?? 0;
-  const keep = [];
-  for (let column = 0; column < columnCount; column++) {
-    if (rows.some(row => row[column] > 0)) keep.push(column);
-  }
-  const observed = rows.map(row => keep.map(column => row[column]));
-  const r = observed.length;
-  const c = keep.length;
-  if (r < 2 || c < 2) return { statistic: NaN, df: 0, pValue: NaN, minExpected: NaN };
-  const rowTotals = observed.map(row => row.reduce((sum, value) => sum + value, 0));
-  const columnTotals = keep.map((_, j) => observed.reduce((sum, row) => sum + row[j], 0));
-  const total = rowTotals.reduce((sum, value) => sum + value, 0);
-  const df = (r - 1) * (c - 1);
-  let statistic = 0;
-  let minExpected = Infinity;
-  for (let i = 0; i < r; i++) {
-    for (let j = 0; j < c; j++) {
-      const expected = (rowTotals[i] * columnTotals[j]) / total;
-      minExpected = Math.min(minExpected, expected);
-      let difference = Math.abs(observed[i][j] - expected);
-      if (df === 1) difference = Math.max(0, difference - 0.5);
-      statistic += (difference * difference) / expected;
-    }
-  }
-  return { statistic, df, pValue: chiSquaredPValue(statistic, df), minExpected };
 }
 
 function adjust(pValues, correction) {
@@ -198,8 +151,14 @@ export function testComposition(input) {
   }
 
   const totals = new Float64Array(unitCount);
+  // A type with cells in some unit; the others are not tested.
+  const present = new Uint8Array(typeCount);
   for (let type = 0; type < typeCount; type++) {
-    for (let unit = 0; unit < unitCount; unit++) totals[unit] += counts[type * unitCount + unit];
+    for (let unit = 0; unit < unitCount; unit++) {
+      const count = counts[type * unitCount + unit];
+      totals[unit] += count;
+      if (count > 0) present[type] = 1;
+    }
   }
   const unitsPerCondition = new Uint32Array(conditionCount);
   for (let unit = 0; unit < unitCount; unit++) unitsPerCondition[conditionOfUnit[unit]] += 1;
@@ -228,20 +187,22 @@ export function testComposition(input) {
   const statistic = new Float64Array(typeCount).fill(NaN);
   const pValue = new Float64Array(typeCount).fill(NaN);
   // The test each type's statistic belongs to: a 2 × 2 table with small
-  // counts takes Fisher's exact test (its statistic is the odds ratio).
-  const typeTest = new Array(typeCount).fill('none');
+  // counts takes Fisher's exact test (its statistic is the odds ratio); a
+  // type with no cells is not tested.
+  const typeTest = Array.from(present, isPresent => (isPresent === 1 ? 'none' : NO_CELLS));
   let test;
   let overall = null;
 
   if (conditionCount < 2) {
     test = 'none';
   } else if (samples) {
-    const values = transformedProportions(method, counts, typeCount, unitCount, totals);
+    const values = transformedProportions(method, counts, typeCount, unitCount, totals, present);
     const two = conditionCount === 2;
     test = method === 'rank'
       ? (two ? 'Wilcoxon rank-sum' : 'Kruskal-Wallis')
       : (two ? "Welch's t-test" : 'One-way ANOVA');
     for (let type = 0; type < typeCount; type++) {
+      if (present[type] === 0) continue;
       const groups = Array.from({ length: conditionCount }, () => []);
       for (let unit = 0; unit < unitCount; unit++) {
         groups[conditionOfUnit[unit]].push(values[type * unitCount + unit]);
@@ -267,6 +228,7 @@ export function testComposition(input) {
     const columnTotals = new Array(conditionCount).fill(0);
     for (const row of table) row.forEach((value, column) => { columnTotals[column] += value; });
     for (let type = 0; type < typeCount; type++) {
+      if (present[type] === 0) continue;
       const inType = table[type];
       const rest = columnTotals.map((total, column) => total - inType[column]);
       const pair = chiSquaredIndependence([inType, rest]);

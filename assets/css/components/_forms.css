@@ -79,6 +79,13 @@
   font-weight: var(--font-weight-semibold);
 }
 
+/* An empty-state message is shown whole, not cut to a list's scroll height
+   (`windowed-listbox.js` `showMessage`). */
+.dropdown-list[data-message] {
+  max-height: none;
+  overflow-y: visible;
+}
+
 .dropdown-no-results {
   padding: var(--space-2) var(--space-2-5);
   font-size: var(--type-hint);

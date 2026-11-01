@@ -24,7 +24,7 @@ test('the live centroid pass records attributes only into its own vertex array',
   assert.ok(draw > firstEnable && unbind > draw, 'the pass unbinds its VAO after drawing');
   assert.match(
     viewerSource,
-    /let centroidVao = gl\.createVertexArray\(\);/,
+    /centroidVao = gl\.createVertexArray\(\);/,
   );
   assert.match(
     viewerSource,

@@ -205,8 +205,27 @@ export function restorableTexture(texture) {
  * @param {string} deleteMethod - e.g. 'deleteBuffer'
  * @param {object} object
  */
+/**
+ * Whether a WebGL object (or a segmented point store or vertex array, which
+ * stand where one buffer or VAO stood) still holds GPU objects: asked after
+ * a deletion threw, to know whether it must be retried.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {string} livenessMethod - `isBuffer`, `isTexture`, `isVertexArray`, ...
+ * @param {object} object
+ * @returns {boolean}
+ */
+export function isGlObjectAlive(gl, livenessMethod, object) {
+  if (typeof object?.delete === 'function' && object.gl === gl) return object.deleted !== true;
+  return typeof gl[livenessMethod] === 'function' ? gl[livenessMethod](object) : true;
+}
+
 export function deleteGlObject(gl, deleteMethod, object) {
-  if (deleteMethod === 'deleteProgram') deleteProgramReleasingUse(gl, object);
+  // A segmented point store or its vertex arrays
+  // (`high-perf/point-store-segments.js`) stand where one buffer or VAO
+  // stood, and delete every object they hold.
+  if (typeof object?.delete === 'function' && object.gl === gl) object.delete();
+  else if (deleteMethod === 'deleteProgram') deleteProgramReleasingUse(gl, object);
   else if (deleteMethod === 'deleteTexture') deleteTextureTracked(gl, object);
   else gl[deleteMethod](object);
 }
@@ -354,6 +373,29 @@ export function configureStraightAlphaBlending(gl) {
 }
 
 /**
+ * Whether the GPU has passed `fence`, asked without waiting: every poll of a
+ * fence goes through here. A zero timeout returns at once in every engine,
+ * from the page's copy of the fence's status (updated between tasks).
+ *
+ * Every poll carries `SYNC_FLUSH_COMMANDS_BIT`. Firefox counts the polls of
+ * an unsignalled fence made without it (`getSyncParameter(SYNC_STATUS)`
+ * included) and warns at the hundredth ("called 100 times without
+ * SYNC_FLUSH_COMMANDS_BIT"), whatever `flush` followed the fence: a GPU that
+ * takes seconds a frame reaches it (the macOS Firefox runner, nightly run
+ * 41269083996; reproduced on an Apple M1 Pro with a frame of slow fragment
+ * work, where the flagged poll stays silent). The flag flushes only what is
+ * queued. `WAIT_FAILED` (a lost context, a deleted fence) counts as passed:
+ * nothing is left to wait for.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {WebGLSync} fence
+ * @returns {boolean}
+ */
+export function fenceHasPassed(gl, fence) {
+  return gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 0) !== gl.TIMEOUT_EXPIRED;
+}
+
+/**
  * Most vertices one point draw submits.
  *
  * Firefox refuses any draw over 30,000,000 vertex ids
@@ -387,6 +429,37 @@ export function drawPointsInSegments(gl, first, count) {
     calls++;
   }
   return calls;
+}
+
+/**
+ * Release vertex attribute `location` of the bound vertex array from the
+ * buffer it reads: point it at `holder` and disable it. Leaves no
+ * `ARRAY_BUFFER` bound.
+ *
+ * An attribute is never pointed at no buffer. Chromium's command-buffer
+ * client does not send `vertexAttribPointer` / `vertexAttribIPointer` to the
+ * GPU process while no `ARRAY_BUFFER` is bound (it keeps the pointer as a
+ * client-side array), so on Chromium that call leaves the vertex array
+ * holding the buffer it read, while `getVertexAttrib` says it holds none.
+ * The buffer then stays alive after `deleteBuffer`, and while that vertex
+ * array is bound a transform-feedback pass writing the buffer fails with
+ * INVALID_OPERATION ("A transform feedback buffer that would be written to
+ * is also bound to a non-transform-feedback target").
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {number} location
+ * @param {WebGLBuffer} holder - A buffer the vertex array may keep: one that
+ *   lives at least as long as it and that no transform-feedback pass writes
+ *   while it is bound (it already holds it, or owns it for this).
+ */
+export function releaseVertexAttribute(gl, location, holder) {
+  if (!holder) {
+    throw new TypeError('A vertex attribute is released onto a buffer the vertex array may keep, never onto none.');
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, holder);
+  gl.vertexAttribPointer(location, 1, gl.UNSIGNED_BYTE, false, 0, 0);
+  gl.disableVertexAttribArray(location);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
 }
 
 // Whether the browser can observe the device-pixel box, which also reports a

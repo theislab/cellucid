@@ -431,22 +431,23 @@ test('figure-export UI teardown aborts a pending renderer without download or te
   await page.waitForFunction(
     () => typeof window.__figureExportLateEncode === 'function'
   );
-  await page.evaluate(() => {
+  // The teardown stops the export; the PNG it waited for arrives after,
+  // and the export has ended once the teardown says so: nothing it would
+  // have done after the PNG can still come.
+  await page.evaluate(async () => {
     const controls = document.querySelector('#figure-export-controls');
     if (typeof controls?.__cellucidCleanup !== 'function') {
       throw new Error('Figure-export cleanup owner is unavailable.');
     }
-    controls.__cellucidCleanup();
-  });
-  await page.evaluate(() => {
+    const exportEnded = controls.__cellucidCleanup();
     const deliver = window.__figureExportLateEncode;
     window.Worker = window.__figureExportNativeWorker;
     deliver();
     delete window.__figureExportLateEncode;
     delete window.__figureExportNativeWorker;
+    await exportEnded;
   });
 
-  await page.waitForTimeout(500);
   expect(downloads).toEqual([]);
   await expect(
     page.locator('.notification-message').filter({
@@ -740,6 +741,19 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
     );
     return client.figureExportRasterizesOnPage();
   });
+  // The context the point passes draw with where they run now: renderer,
+  // granted attributes, samples (`describeRasterContext`).
+  const rasterContext = () => page.evaluate(async () => {
+    const client = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js'
+    );
+    const session = client.openFigureExportWorkerSession();
+    try {
+      return await session.request('rasterContext', { antialias: window._cellucidViewer.getAntialiasing() });
+    } finally {
+      session.close();
+    }
+  });
 
   const first = await exportOne({
     page,
@@ -749,7 +763,9 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
     artifactLabel: `${testInfo.project.name}-point-pass-measured`,
   });
   // The worker was asked; on this engine it answered either way.
-  expect(typeof await placement()).toBe('boolean');
+  const measuredOnPage = await placement();
+  expect(typeof measuredOnPage).toBe('boolean');
+  const measuredContext = await rasterContext();
 
   await page.evaluate(async () => {
     const client = await import(
@@ -766,8 +782,44 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
     artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
   });
   assertSvgArtifact(onPage.bytes, 'hybrid');
-  expect(pointRasters(onPage.bytes)).toEqual(pointRasters(first.bytes));
-  expect(pointRasters(onPage.bytes).length).toBeGreaterThan(0);
+  const pageContext = await rasterContext();
+  const [measuredRasters, pageRasters] = [pointRasters(first.bytes), pointRasters(onPage.bytes)];
+  if (JSON.stringify(measuredRasters) !== JSON.stringify(pageRasters) || JSON.stringify(measuredContext) !== JSON.stringify(pageContext)) {
+    // What each placement drew with, and where its pixels differ.
+    const differing = await page.evaluate(async ([left, right]) => {
+      const read = async url => {
+        const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        context.drawImage(bitmap, 0, 0);
+        return context.getImageData(0, 0, bitmap.width, bitmap.height);
+      };
+      return Promise.all(left.map(async (url, index) => {
+        const [a, b] = [await read(url), await read(right[index] ?? url)];
+        if (a.width !== b.width || a.height !== b.height) return { size: [a.width, a.height, b.width, b.height] };
+        let count = 0;
+        let drawn = 0;
+        const first = [];
+        for (let at = 0; at < a.data.length; at += 4) {
+          if (a.data[at + 3] !== 0) drawn++;
+          if (a.data[at] === b.data[at] && a.data[at + 1] === b.data[at + 1] && a.data[at + 2] === b.data[at + 2] && a.data[at + 3] === b.data[at + 3]) continue;
+          count++;
+          if (first.length < 32) {
+            first.push({ x: (at / 4) % a.width, y: Math.floor(at / 4 / a.width), measured: Array.from(a.data.subarray(at, at + 4)), onPage: Array.from(b.data.subarray(at, at + 4)) });
+          }
+        }
+        return { count, drawn, first };
+      }));
+    }, [measuredRasters, pageRasters]);
+    await testInfo.attach('point-pass-placements.json', {
+      body: JSON.stringify({ measuredOnPage, contexts: { measured: measuredContext, onPage: pageContext }, rasters: differing }, null, 2),
+      contentType: 'application/json',
+    });
+  }
+  // The inputs first: two contexts that differ need not draw the same pixels.
+  expect(pageContext, 'the page\'s raster context, as the one measured').toEqual(measuredContext);
+  expect(pageRasters).toEqual(measuredRasters);
+  expect(pageRasters.length).toBeGreaterThan(0);
 
   const png = await exportOne({
     page,

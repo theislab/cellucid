@@ -7,11 +7,14 @@
  *
  * What a series offers is read from two listings fetched together: its
  * supplementary folder, and `filelist.txt`, which names every file of the
- * series' `_RAW.tar` with its exact size. GEO keeps each of those files in
- * its sample's own folder (`/geo/samples/…/GSM…/suppl/`), so a sample's
- * files are read there, one by one, without the archive.
+ * series' `_RAW.tar`. GEO keeps each of those files in its sample's own
+ * folder (`/geo/samples/…/GSM…/suppl/`), so a sample's files are read there,
+ * one by one, without the archive. The listings name no file's content, so
+ * the files a dataset opens are probed, together, for their sizes and the
+ * validators that version them (`remote-file.js`).
  *
- * A dataset is one file Cellucid opens (`.h5ad`, `.rds.gz`, `.loom`, …), or
+ * A dataset is one file Cellucid opens (`.h5ad`, `.rds.gz`, `.loom`, …, or
+ * a gzip-compressed copy of one, `.h5ad.gz`, read whole), or
  * a MatrixMarket sample: a matrix and the feature and barcode lists its
  * name pairs it with (`GSM…_matrix.mtx.gz`, `_features.tsv.gz` or
  * `_genes.tsv.gz`, `_barcodes.tsv.gz`; `data/matrix-market-files.js`),
@@ -21,9 +24,15 @@
  * @module data/sources/providers/geo
  */
 
-import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy } from '../../data-source.js';
+import {
+  DataSourceError,
+  DataSourceErrorCode,
+  fetchWhenNotBusy,
+  hostFaultFailure,
+} from '../../data-source.js';
+import { hostFaultOfStatus } from '../../../formats/io/byte-source.js';
 import { describeRemoteFile, describeRemoteFileSet } from '../remote-file.js';
-import { compressedFormatOfName, fileFormatOfName, titleOfName } from '../../input-formats.js';
+import { fileFormatOfName, titleOfName } from '../../input-formats.js';
 import { cellTablesBySet, isMatrixMarketMatrix, matrixMarketFileSets } from '../../matrix-market-files.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
@@ -90,7 +99,8 @@ export function geoSupplementaryUrl(accession) {
 
 /** File names listed in a GEO FTP-over-HTTPS directory page. */
 export function parseGeoListing(html) {
-  const names = [];
+  // A Set: a series lists thousands of files, each linked more than once.
+  const names = new Set();
   for (const match of html.matchAll(/href="([^"?#/]+)"/g)) {
     let name;
     try {
@@ -98,9 +108,9 @@ export function parseGeoListing(html) {
     } catch {
       continue;
     }
-    if (safeFileName(name) && !names.includes(name)) names.push(name);
+    if (safeFileName(name)) names.add(name);
   }
-  return names;
+  return [...names];
 }
 
 /**
@@ -126,6 +136,9 @@ export function parseGeoFileList(text) {
 }
 
 function listingFailure(accession, status) {
+  if (hostFaultOfStatus(status) !== null) {
+    return hostFaultFailure({ host: new URL(GEO_FTP).host, status, what: `the file list of ${accession}` }, { accession });
+  }
   return new DataSourceError(
     status === 404
       ? `GEO ${accession} has no supplementary files. Check the accession on GEO.`
@@ -137,25 +150,71 @@ function listingFailure(accession, status) {
 }
 
 /**
- * Every file of an accession: the supplementary folder's (sizes unknown)
- * and, for a series, its `_RAW.tar` members in their samples' folders
- * (exact sizes). Both listings are asked for at once. Each file's `path`
- * groups it by the folder it is read from.
+ * Whether NCBI's file service is failing, asked before a listing's answer is
+ * taken to mean the accession lacks a file: while it fails, NCBI answers its
+ * folder listings with no files, or only some (measured 2026-10-31: a
+ * series' `suppl/` folder listed empty, or two of its files, while every
+ * file of `/geo/`, `filelist.txt` and `geo/README.txt` included, answered
+ * HTTP 500). The refusal that names the failing host, or null when NCBI
+ * answers: a series' `filelist.txt` that answered a host-side status says
+ * so at once; otherwise `geo/README.txt`, which NCBI keeps beside every
+ * accession, is asked for one byte (only on this path: a listing that holds
+ * what the link names costs nothing more).
  *
- * @returns {Promise<Array<{name: string, url: string, size: number|null, path: string}>>}
+ * @param {string} accession
+ * @param {number|null} archiveStatus - The status `filelist.txt` answered, or null
+ * @param {string} missing - What the listing lacked, as "no <thing>"
+ * @param {AbortSignal|null} signal
+ * @returns {Promise<DataSourceError|null>}
+ */
+async function geoFailing(accession, archiveStatus, missing, signal) {
+  const host = new URL(GEO_FTP).host;
+  const folder = geoSupplementaryUrl(accession);
+  if (hostFaultOfStatus(archiveStatus) !== null) {
+    return hostFaultFailure({ host, status: archiveStatus, what: `the file list of ${accession} (its folder listed ${missing})` }, {
+      accession,
+      cause: new Error(`${folder}filelist.txt: HTTP ${archiveStatus}; ${folder} listed ${missing}.`),
+    });
+  }
+  let status;
+  try {
+    status = (await fetch(`${GEO_FTP}README.txt`, { headers: { Range: 'bytes=0-0' }, cache: 'no-store', credentials: 'omit', signal })).status;
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return null;
+  }
+  return hostFaultOfStatus(status) !== null
+    ? hostFaultFailure({ host, status, what: `its own geo/README.txt, asked because the folder of ${accession} listed ${missing}` }, {
+      accession,
+      cause: new Error(`${GEO_FTP}README.txt (bytes=0-0): HTTP ${status}; ${folder} listed ${missing}.`),
+    })
+    : null;
+}
+
+/**
+ * Every file of an accession: the supplementary folder's and, for a series,
+ * its `_RAW.tar` members in their samples' folders. Both listings are asked
+ * for at once. Each file's `path` groups it by the folder it is read from.
+ * `archiveStatus`: the status `filelist.txt` answered (null for a sample),
+ * so a conclusion that a file is missing can ask whether NCBI is failing
+ * (`geoFailing`).
+ *
+ * @returns {Promise<{files: Array<{name: string, url: string, path: string}>, archiveStatus: number|null}>}
  */
 async function listAccession(accession, { signal, onStep }) {
   const folder = geoSupplementaryUrl(accession);
   onStep?.(`Listing the files of ${accession}`);
   const series = accession.startsWith('GSE');
+  // NCBI lets a browser keep its answers for a day: the listings are asked
+  // of it now, so a file added or replaced since is seen.
   const [listed, archived] = await Promise.all([
-    fetchWhenNotBusy(folder, { signal }),
-    series ? fetchWhenNotBusy(`${folder}filelist.txt`, { signal }) : Promise.resolve(null),
+    fetchWhenNotBusy(folder, { signal, cache: 'no-cache' }),
+    series ? fetchWhenNotBusy(`${folder}filelist.txt`, { signal, cache: 'no-cache' }) : Promise.resolve(null),
   ]);
   if (!listed.ok) throw listingFailure(accession, listed.status);
   const files = parseGeoListing(await listed.text())
     .filter(name => name !== 'filelist.txt')
-    .map(name => ({ name, url: `${folder}${encodeURIComponent(name)}`, size: null, path: `${accession}/${name}` }));
+    .map(name => ({ name, url: `${folder}${encodeURIComponent(name)}`, path: `${accession}/${name}` }));
   // A series without a `_RAW.tar` has no file list (404).
   if (archived !== null && archived.ok) {
     const known = new Set(files.map(file => file.name));
@@ -165,12 +224,11 @@ async function listAccession(accession, { signal, onStep }) {
       files.push({
         name: file.name,
         url: `${geoSupplementaryUrl(file.sample)}${encodeURIComponent(file.name)}`,
-        size: file.size,
         path: `${file.sample}/${file.name}`,
       });
     }
   }
-  return files;
+  return { files, archiveStatus: archived?.status ?? null };
 }
 
 /**
@@ -178,7 +236,13 @@ async function listAccession(accession, { signal, onStep }) {
  * MatrixMarket samples (complete, and those that are not, with why).
  */
 export function geoDatasets(files) {
-  const singles = files.filter(file => fileFormatOfName(file.name)?.layout === 'file');
+  // A compressed copy (`.h5ad.gz`, as GEO ships many) opens too, read whole;
+  // beside the file it is a copy of, it is that file.
+  const paths = new Set(files.map(file => file.path));
+  const singles = files.filter(file => {
+    const format = fileFormatOfName(file.name);
+    return format?.layout === 'file' && !(format.compression !== undefined && paths.has(file.path.slice(0, -3)));
+  });
   const byPath = new Map(files.map(file => [file.path, file]));
   const { sets, problems } = matrixMarketFileSets(files.map(file => file.path));
   const tables = cellTablesBySet(byPath.keys(), sets);
@@ -194,12 +258,42 @@ export function geoDatasets(files) {
   return { singles, samples, incomplete };
 }
 
+/** A matrix stored as text, one value a gene and cell (`GSE131907_…_raw_UMI_matrix.txt.gz`). */
+const DENSE_TEXT_MATRIX = /(count|umi|matrix|expression|exprs|tpm|fpkm|rpkm|cpm|dge)[^/]*\.(txt|csv|tsv)(\.gz|\.bz2|\.xz)?$/i;
+/** An archive other than the series' `_RAW.tar`, whose members GEO keeps in their samples' folders. */
+const ARCHIVE = /\.(tar|tar\.gz|tgz|zip)$/i;
+
+/**
+ * What a listing holds that Cellucid does not read, and what to do with it:
+ * a matrix stored as text (dense: every gene of every cell written out) and
+ * an archive. Empty when it holds neither.
+ */
+function unreadNote(files) {
+  const dense = files.filter(file => DENSE_TEXT_MATRIX.test(file.name) && !isMatrixMarketMatrix(file.name)).map(file => file.name);
+  const archives = files.filter(file => ARCHIVE.test(file.name) && !/_RAW\.tar$/i.test(file.name)).map(file => file.name);
+  let note = '';
+  if (dense.length > 0) {
+    note += ` ${dense.join(', ')} ${dense.length === 1 ? 'is a matrix' : 'are matrices'} stored as text, every gene of every cell written out, ` +
+      'which Cellucid does not read (no part of it can be read without reading all of it). Download it and read it ' +
+      'in Python with adata = sc.read_text(path) (sc.read_csv for a .csv; adata = adata.T when its rows are genes), ' +
+      'or in R with counts <- as.matrix(data.table::fread(path), rownames = 1) and Seurat::CreateSeuratObject(counts); ' +
+      'compute an embedding (sc.pp.normalize_total, sc.pp.log1p, sc.pp.pca, sc.pp.neighbors, sc.tl.umap; or Seurat\'s ' +
+      'NormalizeData, FindVariableFeatures, ScaleData, RunPCA, RunUMAP), save it with cellucid.prepare(path, format="h5ad", data=adata) ' +
+      'or cellucid::cellucid_prepare(path, data = obj), and open the file it writes.';
+  }
+  if (archives.length > 0) {
+    note += ` ${archives.join(', ')} ${archives.length === 1 ? 'is an archive' : 'are archives'}, which Cellucid does not open: ` +
+      'download and unpack it, then open the folder it holds with Open… › Folder… (a MatrixMarket folder or a Zarr store), or the file.';
+  }
+  return note;
+}
+
 /** The message a link to an incomplete MatrixMarket sample gets. */
 function incompleteMessage(accession, item) {
   const name = item.matrix.name;
   if (item.missing.length > 0) {
     return `GEO ${accession} has ${name}, but no ${item.missing.join(' and no ')} for it, so its ` +
-      `${item.missing.length === 2 ? 'rows and columns are' : /barcodes/.test(item.missing[0]) ? 'cells are' : 'features are'} not named. ` +
+      `${item.missing.length === 2 ? 'rows and columns are' : /barcodes|cell_annotat/.test(item.missing[0]) ? 'cells are' : 'features are'} not named. ` +
       'The submitter may have uploaded them under another name or inside an archive: download the files from the GEO page, ' +
       'put the three beside each other, and open the folder with Open… › Folder….';
   }
@@ -220,7 +314,7 @@ async function openSample(accession, sample, { signal, onStep }) {
   const members = [sample.matrix, sample.features, sample.cells, ...sample.tables];
   const title = `${accession} ${sample.prefix.replace(/[_.-]+$/, '') || titleOfName(sample.matrix.name)}`;
   const set = await describeRemoteFileSet({
-    files: members.map(file => ({ url: file.url, name: file.name, size: file.size })),
+    files: members.map(file => ({ url: file.url, name: file.name })),
     id: `geo:${accession}:${encodeURIComponent(sample.matrix.name)}`,
     rootName: title,
     title,
@@ -238,11 +332,16 @@ export default Object.freeze({
   capabilities: Object.freeze({
     folders: false,
     private: 'none',
+    public: true,
     versions: false,
     write: false,
   }),
   match(input) {
     return parseGeo(input);
+  },
+  /** A value carries nothing that grants access: it is shown as it is. */
+  publicValue(value) {
+    return value;
   },
   async open(value, { signal = null, onStep = null } = {}) {
     const parsed = parseGeo(value);
@@ -262,26 +361,45 @@ export default Object.freeze({
     const listed = requested === null || isMatrixMarketMatrix(requested) ||
       (accession.startsWith('GSE') && SAMPLE_PREFIX.test(requested));
     if (!listed) {
-      return openSingle(accession, { name: requested, url: `${folder}${encodeURIComponent(requested)}`, size: null }, { signal, onStep });
+      // A matrix stored as text, or an archive: said with what to do, before
+      // anything is read.
+      const note = unreadNote([{ name: requested }]);
+      if (note !== '') throw new DataSourceError(`GEO ${accession}:${note}`, DataSourceErrorCode.UNSUPPORTED, 'link', { accession, file: requested, explained: true });
+      return openSingle(accession, { name: requested, url: `${folder}${encodeURIComponent(requested)}` }, { signal, onStep });
     }
-    const files = await listAccession(accession, { signal, onStep });
+    const { files, archiveStatus } = await listAccession(accession, { signal, onStep });
     const { singles, samples, incomplete } = geoDatasets(files);
+    // A listing that lacks what is looked for may be NCBI failing: asked
+    // before it is said to be missing.
+    const unlessFailing = async (missing, refusal) => {
+      throw (await geoFailing(accession, archiveStatus, missing, signal)) ?? refusal;
+    };
     if (requested !== null) {
       const sample = samples.find(item => item.matrix.name === requested);
       if (sample !== undefined) return openSample(accession, sample, { signal, onStep });
       const broken = incomplete.find(item => item.matrix.name === requested);
       if (broken !== undefined) {
-        throw new DataSourceError(incompleteMessage(accession, broken), DataSourceErrorCode.VALIDATION_ERROR, 'link', { accession, file: requested });
+        await unlessFailing(
+          `no ${broken.missing.length > 0 ? broken.missing.join(' or ') : 'single list'} for ${requested}`,
+          new DataSourceError(incompleteMessage(accession, broken), DataSourceErrorCode.VALIDATION_ERROR, 'link', { accession, file: requested })
+        );
       }
       const single = singles.find(file => file.name === requested);
       if (single !== undefined) return openSingle(accession, single, { signal, onStep });
       const listedFile = files.find(file => file.name === requested);
+      if (listedFile === undefined) {
+        await unlessFailing(`no ${requested}`, new DataSourceError(
+          `GEO ${accession} has no file named ${requested}.`,
+          DataSourceErrorCode.NOT_FOUND,
+          'link',
+          { accession, file: requested }
+        ));
+      }
       throw new DataSourceError(
-        listedFile === undefined
-          ? `GEO ${accession} has no file named ${requested}.`
-          : `${requested} is not a dataset Cellucid opens on its own` +
-            (samples.length > 0 ? `. Open a MatrixMarket sample by its matrix: ${samples.map(item => `geo:${accession}/${item.matrix.name}`).join(', ')}.` : '.'),
-        listedFile === undefined ? DataSourceErrorCode.NOT_FOUND : DataSourceErrorCode.UNSUPPORTED,
+        `${requested} is not a dataset Cellucid opens on its own` +
+          (samples.length > 0 ? `. Open a MatrixMarket sample by its matrix: ${samples.map(item => `geo:${accession}/${item.matrix.name}`).join(', ')}.` : '.') +
+          unreadNote([listedFile]),
+        DataSourceErrorCode.UNSUPPORTED,
         'link',
         { accession, file: requested }
       );
@@ -306,25 +424,23 @@ export default Object.freeze({
       );
     }
     if (incomplete.length > 0) {
-      throw new DataSourceError(incompleteMessage(accession, incomplete[0]), DataSourceErrorCode.UNSUPPORTED, 'link', { accession });
+      await unlessFailing(
+        `no ${incomplete[0].missing.length > 0 ? incomplete[0].missing.join(' or ') : 'single list'} for ${incomplete[0].matrix.name}`,
+        new DataSourceError(incompleteMessage(accession, incomplete[0]), DataSourceErrorCode.UNSUPPORTED, 'link', { accession })
+      );
     }
     const names = files.map(file => file.name);
-    const compressed = names.filter(name => compressedFormatOfName(name)?.layout === 'file');
-    throw new DataSourceError(
-      compressed.length > 0
-        ? `GEO ${accession} ships its data only gzip-compressed ` +
-          `(${compressed.join(', ')}), which cannot be read in place. ` +
-          'Download and decompress it, then open the decompressed file in Cellucid.'
-        : `GEO ${accession} has no supplementary file Cellucid opens` +
-          (names.length > 0 ? ` (it has: ${names.join(', ')}).` : '.'),
+    return unlessFailing(files.length === 0 ? 'no files' : 'no file Cellucid opens', new DataSourceError(
+      `GEO ${accession} has no supplementary file Cellucid opens` +
+        (names.length > 0 ? ` (it has: ${names.join(', ')}).` : '.') + unreadNote(files),
       DataSourceErrorCode.UNSUPPORTED,
       'link',
       { accession, files: names }
-    );
+    ));
   },
 });
 
-/** Open one file of the accession, its size from the file list when it states one. */
+/** Open one file of the accession, probed for its size and version. */
 async function openSingle(accession, file, { signal, onStep }) {
   const described = await describeRemoteFile({
     url: file.url,
@@ -332,7 +448,6 @@ async function openSingle(accession, file, { signal, onStep }) {
     name: file.name,
     title: `${accession} ${titleOfName(file.name)}`,
     attribution: attributionOf(accession),
-    size: file.size,
     signal,
     onStep,
   });

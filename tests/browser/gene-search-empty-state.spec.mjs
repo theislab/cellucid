@@ -11,9 +11,8 @@ const CATALOG_DATASET_URL =
 /* The fixture publishes exactly these six gene names. */
 const PUBLISHED_GENE_COUNT = 6;
 const GENE_PANEL_NOTE =
-  `This dataset publishes ${PUBLISHED_GENE_COUNT} gene names, chosen when `
-  + 'its file was written and possibly a subset of the source data. '
-  + 'Check for typos too.';
+  `Searched the ${PUBLISHED_GENE_COUNT} genes of this dataset, named by its var index; `
+  + 'another var column of the file (symbols) can name them instead.';
 const HELP_URL =
   'https://docs.cellucid.com/en/latest/user_guide/web_app/'
   + 'd_fields_coloring_legends/05_troubleshooting_fields_legends.html'
@@ -139,7 +138,7 @@ test('a matching gene search shows results and no gene panel note', async ({
   await page.locator('#gene-expression-search').fill('CD3');
   await expect(dropdown.locator('.dropdown-item')).toHaveText(['CD3E']);
   await expect(dropdown.locator('.dropdown-no-results')).toHaveCount(0);
-  await expect(dropdown).not.toContainText('This dataset publishes');
+  await expect(dropdown).not.toContainText('Searched the');
 });
 
 test('the empty state reaches a screen reader through a live status', async ({

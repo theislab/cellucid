@@ -21,9 +21,12 @@ import {
   createField,
   createInfoTip,
   createInfoRow,
+  createDecimalInput,
   createSegmented,
   createSelect,
-  createSwitch
+  createSwitch,
+  readDecimalInput,
+  writeDecimalInput
 } from '../../ui/components/controls.js';
 import { createDomId } from '../../ui/components/dom-id.js';
 import { createGroupPicker } from '../ui/components/group-picker.js';
@@ -56,7 +59,7 @@ function labelBlock(entry, control) {
  *   choices, `when`, `check` and data-dependent defaults. For `groups`
  *   options: `groupsFor(entry, record)` → `[{id, name, count, color}]` and
  *   `minCellsFor(entry, record)`; for `gene-sets`: `getGenes()` and
- *   `getMarkerSets()`; for `variable`: `createVariableControl(entry, value,
+ *   `getMarkerSets()` and `getNotebookSets()`; for `variable`: `createVariableControl(entry, value,
  *   onChange)` → `{root, set, destroy?}`.
  * @param {{more?: boolean, groups?: string[]}} [options.view] - Open
  *   disclosures
@@ -160,15 +163,27 @@ export function renderOptionsForm({
         return { block: labelBlock(entry, segmented.root), set: v => segmented.setValue(v) };
       }
       case 'number': {
-        const input = document.createElement('input');
-        input.type = 'number';
-        input.className = 'obs-select analysis-number-input';
+        // A whole number in a number box; a decimal in a decimal box, read
+        // the same in every locale (`createDecimalInput`).
+        const integer = entry.integer === true;
+        let input;
+        if (integer) {
+          input = document.createElement('input');
+          input.type = 'number';
+          input.className = 'obs-select analysis-number-input';
+          input.step = '1';
+          if (entry.min !== undefined) input.min = String(entry.min);
+          if (entry.max !== undefined) input.max = String(entry.max);
+          input.inputMode = 'numeric';
+        } else {
+          input = createDecimalInput({ className: 'obs-select analysis-number-input' });
+        }
         input.name = key;
-        input.step = entry.integer === true ? '1' : 'any';
-        if (entry.min !== undefined) input.min = String(entry.min);
-        if (entry.max !== undefined) input.max = String(entry.max);
-        input.inputMode = entry.integer === true ? 'numeric' : 'decimal';
-        input.value = String(record[key]);
+        const write = value => {
+          if (integer) input.value = String(value);
+          else writeDecimalInput(input, value);
+        };
+        write(record[key]);
         const markInvalid = reason => {
           if (reason === null) {
             input.removeAttribute('aria-invalid');
@@ -179,12 +194,14 @@ export function renderOptionsForm({
           }
         };
         input.addEventListener('change', () => {
-          const parsed = input.value.trim() === '' ? NaN : Number(input.value);
+          const parsed = integer
+            ? (input.value.trim() === '' ? NaN : Number(input.value))
+            : readDecimalInput(input);
           commit(key, parsed);
           if (!Number.isFinite(parsed)) markInvalid(`${entry.label} must be a number`);
         }, { signal: abort.signal });
         const block = createField({ label: entry.label, control: input, tip: entry.tip });
-        return { block, set: v => { input.value = String(v); markInvalid(null); }, markInvalid, focus: () => input.focus() };
+        return { block, set: v => { write(v); markInvalid(null); }, markInvalid, focus: () => input.focus() };
       }
       case 'boolean': {
         const toggle = createSwitch({ label: entry.label, checked: record[key], onChange: next => commit(key, next) });
@@ -268,7 +285,9 @@ export function renderOptionsForm({
         const editor = createGeneSetEditor({
           value: record[key],
           getGenes: () => currentContext.getGenes(),
+          getIdentities: typeof currentContext.getGeneIdentities === 'function' ? () => currentContext.getGeneIdentities() : null,
           getMarkerSets: typeof currentContext.getMarkerSets === 'function' ? () => currentContext.getMarkerSets() : null,
+          getNotebookSets: typeof currentContext.getNotebookSets === 'function' ? () => currentContext.getNotebookSets() : null,
           onChange: next => commit(key, next),
         });
         return {

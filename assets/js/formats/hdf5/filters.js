@@ -12,6 +12,10 @@
  * | 2 | shuffle | byte un-interleaving (io/shuffle.js) |
  * | 3 | fletcher32 | checksum verified, then stripped |
  * | 32000 | LZF (h5py) | lzf.js |
+ * | 32001 | Blosc (hdf5plugin) | a Blosc 1 frame: c-blosc in WebAssembly (zarr/codecs/blosc.js) |
+ * | 32004 | LZ4 (hdf5plugin) | the filter's block framing over LZ4 blocks: lz4 in WebAssembly (zarr/codecs/lz4.js) |
+ * | 32008 | bitshuffle (hdf5plugin) | bit-transposed blocks, each stored as it is or compressed with LZ4 or zstd: in WebAssembly (io/wasm-codecs.js `bitshuffleChunk`) |
+ * | 32015 | Zstandard (hdf5plugin) | one zstd frame: zstd in WebAssembly (zarr/codecs/zstd.js) |
  *
  * `unfilter` runs wherever a chunk is decoded: in the reader thread, or on a
  * decode worker (io/decode-pool.js), whose errors `reviveHdf5Error` turns
@@ -24,10 +28,9 @@
  * LZF can expand to). A stream that inflates past it is refused as soon as
  * it does, never decompressed in full.
  *
- * Any other filter (szip, nbit, scale-offset, Blosc, Zstandard, LZ4,
- * bitshuffle, bzip2, …) raises `Hdf5UnsupportedError` naming it, when a chunk
- * that needs it is read: the file still opens and everything else in it
- * still reads.
+ * Any other filter (szip, nbit, scale-offset, bzip2, Blosc2, …) raises
+ * `Hdf5UnsupportedError` naming it, when a chunk that needs it is read: the
+ * file still opens and everything else in it still reads.
  *
  * @module formats/hdf5/filters
  */
@@ -37,10 +40,14 @@ import { byteUnshuffle } from '../io/shuffle.js';
 import { fletcher32 } from './checksum.js';
 import { Hdf5FormatError, Hdf5UnsupportedError } from './errors.js';
 import { lzfDecompress } from './lzf.js';
-import { genericError } from '../io/decode-pool.js';
+import { bloscDecode, bloscFamily } from '../zarr/codecs/blosc.js';
+import { lz4DecodeBlocks } from '../zarr/codecs/lz4.js';
+import { zstdDecompress } from '../zarr/codecs/zstd.js';
+import { WasmCodecError, wasmCodecs } from '../io/wasm-codecs.js';
+import { fromWire } from '../../utils/error-wire.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
-export const FILTER = Object.freeze({ DEFLATE: 1, SHUFFLE: 2, FLETCHER32: 3, LZF: 32000 });
+export const FILTER = Object.freeze({ DEFLATE: 1, SHUFFLE: 2, FLETCHER32: 3, LZF: 32000, BLOSC: 32001, LZ4: 32004, BITSHUFFLE: 32008, ZSTD: 32015 });
 
 /** Names of filters this reader does not undo, for messages. */
 const KNOWN_FILTERS = new Map([
@@ -52,7 +59,7 @@ const KNOWN_FILTERS = new Map([
   [32023, 'BitGroom'], [32024, 'Granular BitRound'], [32025, 'SZ3'], [32026, 'Blosc2'], [32028, 'Delta-Rice'],
 ]);
 
-const SUPPORTED = new Set([FILTER.DEFLATE, FILTER.SHUFFLE, FILTER.FLETCHER32, FILTER.LZF]);
+const SUPPORTED = new Set([FILTER.DEFLATE, FILTER.SHUFFLE, FILTER.FLETCHER32, FILTER.LZF, FILTER.BLOSC, FILTER.LZ4, FILTER.BITSHUFFLE, FILTER.ZSTD]);
 
 /** A filter's display name. */
 export function filterName(filter) {
@@ -60,6 +67,10 @@ export function filterName(filter) {
   if (filter.id === FILTER.SHUFFLE) return 'shuffle';
   if (filter.id === FILTER.FLETCHER32) return 'fletcher32';
   if (filter.id === FILTER.LZF) return 'lzf';
+  if (filter.id === FILTER.BLOSC) return 'Blosc';
+  if (filter.id === FILTER.LZ4) return 'LZ4';
+  if (filter.id === FILTER.BITSHUFFLE) return 'bitshuffle';
+  if (filter.id === FILTER.ZSTD) return 'Zstandard';
   return KNOWN_FILTERS.get(filter.id) ?? (filter.name || `filter ${filter.id}`);
 }
 
@@ -69,6 +80,29 @@ function unsupportedFilter(filter, label) {
     `filter:${name}`,
     `${label} is compressed with the ${name} filter (HDF5 filter id ${filter.id}), which this reader cannot decompress.`
   );
+}
+
+/** The codec family of each decompressing filter (`io/decoder-choice.js`). */
+const FAMILIES = new Map([[FILTER.DEFLATE, 'deflate'], [FILTER.ZSTD, 'zstd'], [FILTER.LZ4, 'lz4'], [FILTER.BLOSC, 'blosc'], [FILTER.BITSHUFFLE, 'bitshuffle']]);
+
+/**
+ * The family of the filter that decompresses a chunk (the first undone of
+ * those applied that is one), or null: what the decode pool chooses a
+ * decoder for. A Blosc frame whose streams are zlib is DEFLATE's
+ * (`bloscFamily`).
+ *
+ * @param {import('./messages.js').Filter[]} filters
+ * @param {number} mask - Bit i set: filter i was not applied
+ * @param {Uint8Array} stored - The chunk as stored
+ * @returns {string|null}
+ */
+export function filterFamily(filters, mask, stored) {
+  for (let i = filters.length - 1; i >= 0; i--) {
+    if (mask & (1 << i)) continue;
+    const family = FAMILIES.get(filters[i].id);
+    if (family !== undefined) return family === 'blosc' ? bloscFamily(stored) : family;
+  }
+  return null;
 }
 
 /** Whether every filter of `filters` can be undone. */
@@ -129,6 +163,20 @@ function sizeBefore(filters, mask, i, chunkBytes, label) {
         size = lzfBound(size);
         exact = false;
         break;
+      case FILTER.BITSHUFFLE:
+        // Uncompressed, it keeps the size; compressed, it states it.
+        if ((filters[j].clientData[4] ?? 0) === 0) break;
+        size = Number.MAX_SAFE_INTEGER;
+        exact = false;
+        break;
+      case FILTER.BLOSC:
+      case FILTER.LZ4:
+      case FILTER.ZSTD:
+        // Each states the size it decodes to; a filter undone before it
+        // checks that against what it can hold.
+        size = Number.MAX_SAFE_INTEGER;
+        exact = false;
+        break;
       default:
         throw unsupportedFilter(filters[j], label);
     }
@@ -144,9 +192,10 @@ function sizeBefore(filters, mask, i, chunkBytes, label) {
  * @param {number} mask - Bit i set: filter i was not applied
  * @param {number} chunkBytes - Size of the chunk once every filter is undone
  * @param {string} label - What is read, for messages
+ * @param {Object<string, string>|null} [choices] - The decoders a decode task names (`io/decoder-choice.js`)
  * @returns {Promise<Uint8Array>}
  */
-export async function unfilter(stored, filters, mask, chunkBytes, label) {
+export async function unfilter(stored, filters, mask, chunkBytes, label, choices = null) {
   let bytes = stored;
   for (let i = filters.length - 1; i >= 0; i--) {
     if (mask & (1 << i)) continue;
@@ -156,8 +205,8 @@ export async function unfilter(stored, filters, mask, chunkBytes, label) {
       case FILTER.DEFLATE:
         try {
           bytes = await inflate(bytes, before.exact
-            ? { format: 'deflate', expectedSize: before.size, label }
-            : { format: 'deflate', maxSize: before.size, label });
+            ? { format: 'deflate', expectedSize: before.size, label, choices }
+            : { format: 'deflate', maxSize: before.size, label, choices });
         } catch (error) {
           if (error instanceof InflateError) throw new Hdf5FormatError(error.message, { cause: error });
           throw error;
@@ -183,6 +232,16 @@ export async function unfilter(stored, filters, mask, chunkBytes, label) {
         bytes = output;
         break;
       }
+      case FILTER.BLOSC:
+      case FILTER.ZSTD:
+        bytes = await decodedBy(filter, bytes, before, label, choices);
+        break;
+      case FILTER.LZ4:
+        bytes = await hdf5Lz4Decode(bytes, before, label, choices);
+        break;
+      case FILTER.BITSHUFFLE:
+        bytes = await hdf5BitshuffleDecode(bytes, filter, before, label);
+        break;
       default:
         throw unsupportedFilter(filter, label);
     }
@@ -191,6 +250,100 @@ export async function unfilter(stored, filters, mask, chunkBytes, label) {
     throw new Hdf5FormatError(`${label} holds ${formatCountOf(bytes.length, 'byte')} once decoded, not the ${chunkBytes} of a chunk.`);
   }
   return bytes;
+}
+
+/**
+ * One chunk through hdf5plugin's Blosc or Zstandard filter: the stored chunk
+ * is a Blosc 1 frame, or one zstd frame, exactly what the Zarr reader's
+ * decoders read; each states its decoded size, checked against what the
+ * chunk can hold.
+ */
+async function decodedBy(filter, bytes, before, label, choices) {
+  const name = filterName(filter);
+  try {
+    const output = filter.id === FILTER.BLOSC
+      ? await bloscDecode(bytes, before.exact ? before.size : null, choices)
+      : await zstdDecompress(bytes, before.exact ? before.size : null, { bound: before.size, choices });
+    if (output.length > before.size) {
+      throw new Hdf5FormatError(`${label} decodes with the ${name} filter to ${formatCountOf(output.length, 'byte')}, more than its chunk holds.`);
+    }
+    return output;
+  } catch (error) {
+    if (error instanceof Hdf5FormatError) throw error;
+    throw new Hdf5FormatError(`${label} could not be decompressed with the ${name} filter: ${error?.message ?? error}`, { cause: error });
+  }
+}
+
+/**
+ * One chunk through hdf5plugin's LZ4 filter (id 32004): an 8-byte
+ * big-endian decoded size and a 4-byte big-endian block size, then each
+ * block as a 4-byte big-endian length and that many bytes: an LZ4 block, or
+ * the block stored as it is when its length is the block's size.
+ */
+async function hdf5Lz4Decode(bytes, before, label, choices = null) {
+  const corrupt = detail => new Hdf5FormatError(`${label} is not a valid LZ4 filter chunk: ${detail}.`);
+  if (bytes.length < 12) throw corrupt('it is shorter than its header');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const total = view.getUint32(0) * 4294967296 + view.getUint32(4);
+  const blockSize = view.getUint32(8);
+  if ((before.exact && total !== before.size) || total > before.size) throw corrupt(`it decodes to ${formatCountOf(total, 'byte')}, not its chunk's ${before.size}`);
+  if (blockSize === 0 && total > 0) throw corrupt('its block size is zero');
+  const segments = [];
+  let at = 12;
+  for (let start = 0; start < total; start += blockSize) {
+    const size = Math.min(blockSize, total - start);
+    if (at + 4 > bytes.length) throw corrupt('a block is missing');
+    const stored = view.getUint32(at);
+    at += 4;
+    if (at + stored > bytes.length) throw corrupt('a block runs past the chunk');
+    segments.push({ at, stored, start, size });
+    at += stored;
+  }
+  try {
+    // Each block fills its bytes exactly, or the chunk is refused.
+    return await lz4DecodeBlocks(bytes, segments, total, choices);
+  } catch (error) {
+    if (error instanceof Hdf5FormatError) throw error;
+    throw corrupt(error?.message ?? String(error));
+  }
+}
+
+/** The bitshuffle filter's compression parameter: none, LZ4, zstd (bshuf_h5filter.h). */
+const BITSHUFFLE_COMPRESSION = new Map([[0, 'none'], [2, 'LZ4'], [3, 'zstd']]);
+
+/**
+ * One chunk through the bitshuffle filter (id 32008, as hdf5plugin writes
+ * it): its parameters are the filter's version (two values), the element
+ * size, the block size in elements (0: bitshuffle's default) and the
+ * compression (0 none, 2 LZ4, 3 zstd, then zstd's level). The chunk's
+ * decoded size is its own (it is the size the filter records when
+ * compressed); every block, its compression and the elements left after the
+ * last are checked and undone in WebAssembly (`bitshuffleChunk`).
+ */
+async function hdf5BitshuffleDecode(bytes, filter, before, label) {
+  const [, , elemSize = 0, blockElems = 0, compression = 0] = filter.clientData;
+  if (!BITSHUFFLE_COMPRESSION.has(compression)) {
+    throw new Hdf5UnsupportedError('filter:bitshuffle', `${label} is compressed with the bitshuffle filter's compression ${compression}, which this reader does not decode (none, LZ4 and zstd are read).`);
+  }
+  if (!(elemSize > 0)) throw new Hdf5FormatError(`${label}: the bitshuffle filter names no element size.`);
+  let size = before.size;
+  if (compression !== 0) {
+    if (bytes.length < 12) throw new Hdf5FormatError(`${label} is not a valid bitshuffle chunk: it is shorter than its header.`);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    size = view.getUint32(0) * 4294967296 + view.getUint32(4);
+  } else if (!before.exact) {
+    size = bytes.length;
+  }
+  if ((before.exact && size !== before.size) || size > before.size) {
+    throw new Hdf5FormatError(`${label} is not a valid bitshuffle chunk: it decodes to ${formatCountOf(size, 'byte')}, not its chunk's ${before.size}.`);
+  }
+  const codecs = await wasmCodecs();
+  try {
+    return codecs.bitshuffleChunk(bytes, size, elemSize, blockElems, compression);
+  } catch (error) {
+    if (!(error instanceof WasmCodecError)) throw error;
+    throw new Hdf5FormatError(`${label} is not a valid bitshuffle chunk (${BITSHUFFLE_COMPRESSION.get(compression)}): ${error.code}.`, { cause: error });
+  }
 }
 
 /**
@@ -203,5 +356,5 @@ export async function unfilter(stored, filters, mask, chunkBytes, label) {
 export function reviveHdf5Error(data) {
   if (data.name === 'Hdf5FormatError') return new Hdf5FormatError(data.message, { offset: data.offset ?? null });
   if (data.name === 'Hdf5UnsupportedError') return new Hdf5UnsupportedError(data.feature, data.message);
-  return genericError(data);
+  return fromWire(data);
 }

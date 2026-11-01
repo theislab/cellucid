@@ -17,7 +17,9 @@ import { LayoutRefusal } from './refusal.js';
 import { inputFormat } from '../../input-formats.js';
 
 export const H5SEURAT_VIEW = Object.freeze({
-  recognize: root => isGroup(root) && root.has('cell.names') && isGroup(root.get('assays')),
+  recognize: async root => isGroup(root) && root.has('cell.names') && isGroup(root.get('assays')),
+  // Refused from its root's names: nothing more is read.
+  openingPaths: Object.freeze([]),
   view() {
     // The registry's words, which cellucid serve and cellucid_serve() use too.
     throw new LayoutRefusal(inputFormat('h5seurat').refusal, { reason: 'h5seurat' });

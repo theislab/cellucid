@@ -86,7 +86,7 @@ test('every static info button opens a registry tip, with no inline copy', () =>
       live.push(liveId);
     }
   }
-  assert.deepEqual(live.sort(), ['highlight-tool-hint', 'hp-antialias-status']);
+  assert.deepEqual(live.sort(), ['highlight-tool-hint', 'hp-antialias-status', 'hp-performance-status']);
   assert.doesNotMatch(indexHtml, /info-tooltip-content|info-step/, 'tip text lives in the registry only');
 });
 
@@ -115,10 +115,15 @@ const PINNED_LINKS = [
   'b_data_loading/13_data_mapping#genes-and-expression',
   'b_data_loading/13_data_mapping#latent-space',
   'b_data_loading/13_data_mapping#vector-fields',
+  'b_data_loading/21_subsampled_loading#cells-to-open',
+  'b_data_loading/21_subsampled_loading#genes-on-a-sample-of-the-cells',
+  'b_data_loading/21_subsampled_loading#genes-read-for',
+  'b_data_loading/21_subsampled_loading#how-the-cells-are-chosen',
   'f_highlighting_selection/02_selection_tools_document_each_tool#tool-4-knn-drag-alt-click-drag-degree',
   'a_orientation/03_quick_tour_60_seconds#fast-path-click-by-click',
   'b_data_loading/01_loading_options_overview#at-a-glance',
   'b_data_loading/01_loading_options_overview#fast-path-choose-a-workflow-decision-tree',
+  'b_data_loading/01_loading_options_overview#stored-in-this-browser',
   'b_data_loading/03_browser_file_picker_tutorial#fast-path-wet-lab-friendly',
   'b_data_loading/03_browser_file_picker_tutorial#hidden-metadata-files',
   'b_data_loading/04_server_tutorial#fast-path-cli',
@@ -170,6 +175,7 @@ const PINNED_LINKS = [
   'd_fields_coloring_legends/03_color_by_behavior#log-scale-coloring-only',
   'd_fields_coloring_legends/03_color_by_behavior#rescale-to-range-contrast-control',
   'd_fields_coloring_legends/04_legend_behavior#categorical-legend-checkboxes-swatches-category-tools',
+  'd_fields_coloring_legends/04_legend_behavior#gray-for-zero',
   'd_fields_coloring_legends/04_legend_behavior#log-scale-toggle',
   'e_filtering/01_filtering_mental_model#mental-model-one-sentence',
   'e_filtering/02_outlier_filtering_per_active_field#what-this-filter-is-and-is-not',
@@ -246,6 +252,7 @@ const PINNED_LINKS = [
   'n_benchmarking_performance/05_benchmark_tools#quick-start-3-minutes',
   'n_benchmarking_performance/06_edge_cases_performance#edge-case-multiview-on-a-large-dataset',
   'n_benchmarking_performance/06_edge_cases_performance#edge-case-two-settings-changed-themselves-when-you-opened-another-dataset',
+  'o_accessibility_privacy_security/02_privacy_model#origin-private-file-system-dataset-derived-kept-across-visits',
 ];
 
 const usedLinks = [...new Set(Object.values(INFO_TIPS).flatMap(tip => tip.links.map(link => `${link.page}#${link.anchor}`)))].sort();

@@ -20,11 +20,12 @@ import {
   memoryStore,
   openZarr,
 } from '../assets/js/formats/zarr/index.js';
-import { lz4DecodeBlockInto } from '../assets/js/formats/zarr/codecs/lz4.js';
-import { vlenDecode } from '../assets/js/formats/zarr/codecs/vlen.js';
+import { lz4DecodeBlocks } from '../assets/js/formats/zarr/codecs/lz4.js';
+import { vlenItems } from '../assets/js/formats/zarr/codecs/vlen.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
-import { readSparseMatrix, sparseContract } from '../assets/js/data/anndata/sparse.js';
+import { sparseContract } from '../assets/js/data/anndata/sparse.js';
+import { gatheredGraph, sparseGraphLines } from '../assets/js/data/anndata/graph-lines.js';
 import { nullableContract } from '../assets/js/data/anndata/dataframe.js';
 import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import { BaseAnnDataAdapter } from '../assets/js/data/base-anndata-adapter.js';
@@ -300,8 +301,8 @@ function captureDownloadNotifications(t) {
 }
 
 /** One gene's column of X, found by its stored var name. */
-function geneColumnByName(reader, name) {
-  const index = reader.varNames.indexOf(name);
+async function geneColumnByName(reader, name) {
+  const index = (await reader.readVarNames('X', null)).index.indexOf(name);
   assert.notEqual(index, -1, `gene '${name}' is on the var index`);
   return reader.getMatrixColumn('X', index);
 }
@@ -332,6 +333,21 @@ function completeTree({ embeddingValues, geneValues }) {
     genes: ['A', 'B'],
     X: dense(Float32Array.from(geneValues), [2, 2]),
     obsm: mapping({ X_umap_2d: dense(Float32Array.from(embeddingValues), [2, 2]) }),
+  });
+}
+
+/**
+ * `completeTree` whose var index is a nullable string array: opening reads
+ * its mask (it checks that no gene name is missing), so a held mask chunk
+ * keeps the opening in flight. (A plain string index is not read at opening.)
+ */
+function slowOpeningTree(values) {
+  return minimalAnnData({
+    nObs: 2,
+    genes: ['A', 'B'],
+    X: dense(Float32Array.from(values.geneValues), [2, 2]),
+    obsm: mapping({ X_umap_2d: dense(Float32Array.from(values.embeddingValues), [2, 2]) }),
+    extra: { var: dataFrame({ _index: nullable('nullable-string-array', ['A', 'B'], [0, 0]) }) },
   });
 }
 
@@ -508,7 +524,8 @@ test('AnnData string arrays accept any string storage, and object arrays need a 
   await t.test('exact VLenUTF8 storage is accepted', async () => {
     const { reader } = await openAnnData(storeWith({ nObs: 1, obs: { label: strings(['α']) } }));
     const field = await reader.getObsField('label');
-    assert.equal(field.dtype, 'string');
+    assert.equal(field.dtype, 'categorical', 'a text column is coded as it is read');
+    assert.equal(field.discovered, true);
     assert.deepEqual(field.values, ['α']);
   });
 });
@@ -525,8 +542,10 @@ test('categorical ordered is a JSON boolean or the integer 0 or 1', async t => {
     ['an integer other than 0 or 1', { 'encoding-type': 'categorical', 'encoding-version': '0.2.0', ordered: 2 }, /ordered must be a boolean attribute/],
     ['wrong categorical version', { 'encoding-type': 'categorical', 'encoding-version': '0.1.0', ordered: false }, /encoding-version must be exactly '0\.2\.0'/],
   ]) {
-    await t.test(`${name} is refused when the store opens`, async () => {
-      await assert.rejects(openAnnData(withOrdered(attrs)), pattern);
+    await t.test(`${name} leaves the column out when the store opens`, async () => {
+      const { reader } = await openAnnData(withOrdered(attrs));
+      assert.deepEqual(reader.obsKeys, []);
+      assert.match(reader.notes[0], pattern);
     });
   }
 
@@ -690,8 +709,10 @@ test('rejects unsupported dtypes and filters instead of returning plausible corr
     'encoding-type': 'dataframe', 'encoding-version': '0.2.0', _index: '_index', 'column-order': ['complex'],
   }));
   setArray(entries, 'obs/complex', metadata({ dtype: '<c8' }), { 0: bytesFromHex('0000000000000000') });
-  const opening = openAnnData(entries);
-  await assert.rejects(opening, /Observation dataframe column 'complex' uses an unsupported element type/);
+  // One such column is left out with the reason; the dataset opens.
+  const { reader: opened } = await openAnnData(entries);
+  assert.deepEqual(opened.obsKeys, []);
+  assert.deepEqual([...opened.notes], ["obs column 'complex' uses an unsupported element type; the column was not read."]);
 
   await assert.rejects(
     readArray('filtered', metadata({ filters: [{ id: 'delta' }] }), { 0: bytesFromHex('01000000') }),
@@ -760,11 +781,11 @@ test('treats Blosc metadata blocksize as an encoder hint, not a frame invariant'
   assert.ok(values.every(value => value === 0));
 });
 
-test('rejects an LZ4 stream that omits the required final literal sequence', () => {
-  assert.throws(
-    () => lz4DecodeBlockInto(bytesFromHex('10410100'), new Uint8Array(5)),
-    /final literal/i
-  );
+/** One LZ4 block that must fill `size` bytes. */
+const lz4Block = (block, size) => lz4DecodeBlocks(block, [{ at: 0, stored: block.length, start: 0, size }], size);
+
+test('rejects an LZ4 stream that omits the required final literal sequence', async () => {
+  await assert.rejects(lz4Block(bytesFromHex('10410100'), 5), /LZ4 data is corrupt/);
 });
 
 test('decodes a real multi-block Blosc chunk with a final partial unsplit block', async () => {
@@ -809,10 +830,10 @@ test('public observation APIs preserve signed bytes and classify booleans', asyn
     obs: { flag: array([false, true, true], { dtype: '|b1' }) },
   }));
   assert.deepEqual(await bool.getObsFieldInfo('flag'), { dtype: 'bool' });
-  assert.deepEqual(await bool.getObsField('flag'), {
-    dtype: 'bool',
-    values: [false, true, true]
-  });
+  // Coded as it is read: false before true.
+  const flag = await bool.getObsField('flag');
+  assert.deepEqual([flag.dtype, flag.discovered, flag.categories, Array.from(flag.codes)], ['categorical', true, [false, true], [0, 1, 1]]);
+  assert.deepEqual(flag.values, [false, true, true]);
 });
 
 test('rejects invalid boolean bytes and malformed fixed-string UTF-8', async () => {
@@ -859,23 +880,25 @@ test('rejects categorical codes outside missing-or-category bounds', async () =>
   );
 });
 
-test('requires a signed-integer dtype for categorical codes', async () => {
+test('categorical codes of a non-integer dtype refuse that column when it is read, with the reason', async () => {
   const tree = storeWith({ obs: { cell_type: categorical(new Float32Array([0, 1]), ['A', 'B'], { codesDtype: '<f4' }) } });
-  await assert.rejects(
-    openAnnData(tree),
-    /categorical codes.*signed integer dtype/i
-  );
+  const { reader } = await openAnnData(tree);
+  // Opening checks the column's own encoding; its parts, when it is read.
+  assert.deepEqual(reader.obsKeys, ['cell_type']);
+  assert.deepEqual(reader.notes, []);
+  await assert.rejects(reader.getObsField('cell_type'), /categorical codes.*integer dtype/i);
 });
 
-test('rejects oversized category dictionaries before code or label payloads', async () => {
+test('refuses oversized category dictionaries when read, before code or label payloads', async () => {
   const entries = zarrEntries(storeWith({ nObs: 1, obs: { group: categorical([0], array(new Int32Array([0]), { dtype: '<i4' })) } }));
   // Metadata of 2^32 categories: no chunk is written, and none may be read.
   setArray(entries, 'obs/group/categories', metadata({ shape: [4_294_967_296], chunks: [1_048_576], dtype: '<i4' }));
   const { root, fetched } = await openRoot(entries);
-  await assert.rejects(
-    new AnnDataReader().open(root, { format: ZARR_FORMAT, name: 'oversized.zarr' }),
-    /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i
-  );
+  const reader = new AnnDataReader();
+  await reader.open(root, { format: ZARR_FORMAT, name: 'oversized.zarr' });
+  assert.deepEqual(reader.obsKeys, ['group']);
+  assert.deepEqual(reader.notes, []);
+  await assert.rejects(reader.getObsField('group'), /4,294,967,296 categories.*at most 4,294,967,295.*reduce or merge/i);
   assert.deepEqual(chunksOf(fetched, 'obs/group/categories'), []);
   assert.deepEqual(chunksOf(fetched, 'obs/group/codes'), []);
 });
@@ -898,7 +921,8 @@ test('Zarr dataset metadata counts categorical fields without label payloads', a
   }), { name: 'metadata-only.zarr' });
   const dataset = await reader.getDatasetMetadata();
   assert.equal(dataset.stats.n_categorical_fields, 1);
-  assert.deepEqual(dataset.probes, await reader.probeMapping());
+  // The opening's probes read no matrix value (`first-view-reads-no-matrix.test.mjs`).
+  assert.deepEqual(dataset.probes, await reader.probeMapping({ counts: false }));
   assert.equal(Object.hasOwn(dataset, 'embeddings'), false);
   assert.deepEqual(readsOf(reads, 'obs/label/categories'), []);
   assert.deepEqual(readsOf(reads, 'obs/label/codes'), []);
@@ -1112,7 +1136,7 @@ test('rejects unpaired surrogates in fixed-Unicode fill metadata', async () => {
 
 test('VLen item counts are bounded by their payload, and chunks by their declared shape alone', async t => {
   assert.throws(
-    () => vlenDecode(bytesFromHex('ffffff7f'), 0x7fffffff, 'labels'),
+    () => vlenItems(bytesFromHex('ffffff7f'), 0x7fffffff, 'labels'),
     /truncated/i
   );
 
@@ -1157,20 +1181,14 @@ test('validates fill metadata before any value is allocated', async () => {
   }
 });
 
-test('bounds extended LZ4 lengths against remaining output during parsing', () => {
-  assert.throws(
-    () => lz4DecodeBlockInto(
-      Uint8Array.from([0xf0, ...new Array(20).fill(0xff), 0x00]),
-      new Uint8Array(10)
-    ),
-    /exceeds/i
-  );
+test('bounds extended LZ4 lengths against remaining output during parsing', async () => {
+  await assert.rejects(lz4Block(Uint8Array.from([0xf0, ...new Array(20).fill(0xff), 0x00]), 10), /LZ4 data is corrupt/);
 });
 
-test('supports overlapping LZ4 matches followed by a final literal sequence', () => {
-  const out = new Uint8Array(6);
-  lz4DecodeBlockInto(bytesFromHex('106101001058'), out);
-  assert.deepEqual(Array.from(out), [97, 97, 97, 97, 97, 88]);
+test('supports overlapping LZ4 matches followed by a final literal sequence', async () => {
+  // Twelve final literals: LZ4's end-of-block rule, which lz4 enforces.
+  const block = bytesFromHex(`13610100c0${'58'.repeat(12)}`);
+  assert.deepEqual(Array.from(await lz4Block(block, 20)), [...new Array(8).fill(97), ...new Array(12).fill(88)]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1375,14 +1393,13 @@ test('an embedding value float32 cannot hold is refused; a gene value becomes an
   const { reader: denseFill } = await openAnnData(entries);
   assert.deepEqual(Array.from(await denseFill.getMatrixColumn('X', 0)), [Number.POSITIVE_INFINITY]);
 
-  const { root } = await openRoot(zarrEntries(sparseStore({
+  const { reader: sparseX } = await openAnnData(sparseStore({
     data: new Float64Array([1e308]),
     dataDtype: '<f8',
     indices: new Int32Array([0]),
     indptr: new Int32Array([0, 1, 1]),
-  })));
-  const sparse = await readSparseMatrix(root.get('X'), ZARR_FORMAT, 'Sparse X', 'float32');
-  assert.deepEqual(Array.from(sparse.data), [Number.POSITIVE_INFINITY]);
+  }));
+  assert.deepEqual(Array.from(await sparseX.getMatrixColumn('X', 0)), [Number.POSITIVE_INFINITY, 0]);
 });
 
 /**
@@ -1455,11 +1472,11 @@ test('Zarr obsm column reads decode only the chunks that hold a selected column'
     );
   });
 
-  await t.test('an absent chunk with no fill value is refused', async () => {
+  await t.test('an absent chunk with no fill value reads as its type\'s default, as zarr-python 3 writes it', async () => {
     const { reader } = await openAnnData(chunkedObsmEntries({ fill_value: null, absent: ['1.1'] }));
-    await assert.rejects(
-      reader.readObsmColumns('X_pca', [1, 3]),
-      /The Zarr array '\/obsm\/X_pca' has an absent chunk while its fill_value is null/
+    assert.deepEqual(
+      Array.from(await reader.readObsmColumns('X_pca', [1, 3])),
+      [1, 3, 11, 13, 21, 0]
     );
   });
 });
@@ -1498,7 +1515,10 @@ test('Zarr mapping probes describe every element from metadata, with the catalog
   const before = fetched.length;
 
   const described = describeAnnDataProbes(await reader.probeMapping());
-  assert.equal(fetched.length, before, 'probes read no chunk');
+  // No chunk but the first of each float matrix holding values, once: X's
+  // scale decides between it and raw, and each says whether it holds counts
+  // (raw.X holds no value; layers['counts'] is counts by its dtype).
+  assert.equal(fetched.length, before + 2, 'probes read no chunk but the first of X and of layers[\'wide\']');
   // A Zarr store lists its children in code-point order.
   assert.deepEqual(
     described.obsm.map(({ key, storage, shape, dtype, usable, reason }) =>
@@ -1527,17 +1547,18 @@ test('Zarr mapping probes describe every element from metadata, with the catalog
       { key: 'score', dtype: 'float32', usable: false, reason: 'floating-point values cannot name genes' },
     ],
   });
-  assert.deepEqual(described.X, { storage: 'dense', dtype: 'float32' });
+  // No uns['log1p'] here: nothing for the values to refute (`notLog1p` null).
+  assert.deepEqual(described.X, { storage: 'dense', dtype: 'float32', scaled: false, counts: true, notLog1p: null });
   assert.deepEqual(
-    described.layers.map(({ key, dtype, usable, reason }) => [key, dtype, usable, reason]),
+    described.layers.map(({ key, dtype, counts, usable, reason }) => [key, dtype, counts, usable, reason]),
     [
-      ['counts', 'int32', true, null],
-      ['wide', 'float32', false, 'has shape 3 x 2, expected 3 x 1'],
+      ['counts', 'int32', true, true, null],
+      ['wide', 'float32', true, false, 'has shape 3 x 2, expected 3 x 1'],
     ]
   );
   assert.deepEqual(described.raw, {
     n_vars: 4,
-    X: { storage: 'csr', dtype: 'float32' },
+    X: { storage: 'csr', dtype: 'float32', scaled: null, counts: null, notLog1p: null },
     var: { columns: [] },
   });
 });
@@ -1568,9 +1589,10 @@ test('sparse components are checked for kind and length, never for size', async 
   assert.deepEqual(sparseContract(root.get('X'), ZARR_FORMAT, 'Sparse X').shape, [50_000_000, 50_000_000]);
 });
 
-test('validates sparse matrix structure before narrowing or conversion', async t => {
+test('validates sparse matrix structure before narrowing or conversion, read line by line', async t => {
   const sparseX = async options => (await openRoot(zarrEntries(sparseStore(options)))).root.get('X');
-  const valid = await readSparseMatrix(await sparseX({}), ZARR_FORMAT, 'Sparse X', 'float32');
+  const read = async group => gatheredGraph(await sparseGraphLines(group, ZARR_FORMAT, 'Sparse X'), 'Sparse X');
+  const valid = await read(await sparseX({}));
   assert.deepEqual({
     format: valid.format,
     shape: valid.shape,
@@ -1636,7 +1658,7 @@ test('validates sparse matrix structure before narrowing or conversion', async t
   for (const [name, options, expectedError] of cases) {
     await t.test(name, async () => {
       await assert.rejects(
-        async () => readSparseMatrix(await sparseX(options), ZARR_FORMAT, 'Sparse X', 'float32'),
+        async () => read(await sparseX(options)),
         expectedError
       );
     });
@@ -1715,6 +1737,61 @@ test('rejects X dimensions that disagree with obs or var, including zero axes', 
 });
 
 /** Open a working store, then try a replacement that must fail and leave the working data in place. */
+/**
+ * A store whose one column `mutate` breaks opens without that column: it is
+ * left out of the dataset (obs keys, or var columns), and the reader's notes
+ * say why (`expected`).
+ */
+async function assertColumnLeftOut(mutate, expected, { frame }) {
+  const files = completeZarrStoreFiles({ embeddingValues: [10, 20, 30, 40], geneValues: [5, 6, 7, 8] });
+  files.set(`${frame}/.zattrs`, json({
+    'encoding-type': 'dataframe',
+    'encoding-version': '0.2.0',
+    _index: '_index',
+    'column-order': ['missing'],
+  }));
+  mutate(files);
+  const { root } = await openRoot(files, { name: 'one-odd-column.zarr' });
+  const reader = new AnnDataReader();
+  await reader.open(root, { format: ZARR_FORMAT, name: 'one-odd-column.zarr' });
+  assert.equal(reader.nObs, 2);
+  assert.equal(reader.obsKeys.includes('missing'), false);
+  if (frame === 'var') assert.equal((await reader.probeMapping()).varColumns.some(column => column.key === 'missing'), false);
+  assert.equal(reader.notes.length, 1);
+  assert.match(reader.notes[0], expected);
+  assert.match(reader.notes[0], /; the column was not read\.$/);
+  // The rest of the dataset reads.
+  assert.deepEqual(Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])), [10, 20, 30, 40]);
+}
+
+/**
+ * One column whose own encoding is right but whose parts are not: listed at
+ * open (its parts are checked when it is read, `ANNDATA_OPENING_PATHS`),
+ * refused when read, with the reason; the rest of the dataset reads.
+ */
+async function assertColumnRefusedWhenRead(mutate, expected, { frame }) {
+  const files = completeZarrStoreFiles({ embeddingValues: [10, 20, 30, 40], geneValues: [5, 6, 7, 8] });
+  files.set(`${frame}/.zattrs`, json({
+    'encoding-type': 'dataframe',
+    'encoding-version': '0.2.0',
+    _index: '_index',
+    'column-order': ['missing'],
+  }));
+  mutate(files);
+  const { root } = await openRoot(files, { name: 'one-odd-column.zarr' });
+  const reader = new AnnDataReader();
+  await reader.open(root, { format: ZARR_FORMAT, name: 'one-odd-column.zarr' });
+  assert.equal(reader.nObs, 2);
+  assert.deepEqual(reader.notes, []);
+  if (frame === 'obs') {
+    assert.equal(reader.obsKeys.includes('missing'), true);
+    await assert.rejects(reader.getObsField('missing'), expected);
+  } else {
+    await assert.rejects(reader.readVarNames('X', 'missing'), expected);
+  }
+  assert.deepEqual(Array.from(await reader.readObsmColumns('X_umap_2d', [0, 1])), [10, 20, 30, 40]);
+}
+
 async function assertReplacementRefused(mutate, expectedError, { columnOrder = null } = {}) {
   const { reader } = await openAnnData(completeTree({
     embeddingValues: [0, 0, 2, 4],
@@ -1919,7 +1996,7 @@ test('requires the canonical AnnData obs dataframe contract without replacing wo
   }
 });
 
-test('validates every observation column declared by column-order before adoption', async t => {
+test('validates every observation column declared by column-order, leaving out one it cannot read', async t => {
   await t.test('valid primitive column is accepted', async () => {
     const { reader } = await openAnnData(storeWith({ obs: { score: array(new Float32Array([1, 2])) } }));
     assert.deepEqual(reader.obsKeys, ['score']);
@@ -1929,7 +2006,7 @@ test('validates every observation column declared by column-order before adoptio
     [
       'missing declared column',
       () => {},
-      /AnnData Zarr obs declared column 'missing' was not found/
+      /^obs declared column 'missing' was not found/
     ],
     [
       'unsupported declared column representation',
@@ -1940,7 +2017,7 @@ test('validates every observation column declared by column-order before adoptio
           'encoding-version': '0.1.0'
         }));
       },
-      /Observation dataframe column 'missing' uses unsupported encoding 'unsupported-column'/
+      /^obs column 'missing' uses unsupported encoding 'unsupported-column'/
     ],
     [
       'incomplete supported categorical column',
@@ -1952,7 +2029,8 @@ test('validates every observation column declared by column-order before adoptio
           ordered: false
         }));
       },
-      /Categorical field 'missing' must contain codes and categories/
+      /Categorical field 'missing' must contain codes and categories/,
+      'when read'
     ],
     [
       'categorical children cannot imply a missing parent encoding',
@@ -1963,14 +2041,12 @@ test('validates every observation column declared by column-order before adoptio
           shape: [1], chunks: [1], dtype: '|O', fill_value: null, filters: [{ id: 'vlen-utf8' }],
         }));
       },
-      /Observation dataframe column 'missing' uses unsupported encoding 'unknown'/
+      /^obs column 'missing' uses unsupported encoding 'unknown'/
     ]
   ];
 
-  for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, () => assertReplacementRefused(mutate, expectedError, {
-      columnOrder: { frame: 'obs', columns: ['missing'] },
-    }));
+  for (const [name, mutate, expected, when = 'at open'] of invalidCases) {
+    await t.test(name, () => (when === 'when read' ? assertColumnRefusedWhenRead : assertColumnLeftOut)(mutate, expected, { frame: 'obs' }));
   }
 });
 
@@ -2075,19 +2151,19 @@ test('requires the canonical AnnData var dataframe contract without replacing wo
   }
 });
 
-test('validates every variable column declared by column-order before adoption', async t => {
+test('validates every variable column declared by column-order, leaving out one it cannot read', async t => {
   await t.test('valid primitive column is accepted', async () => {
     const tree = storeWith();
     tree.children.var = stringFrame(['A', 'B'], { score: array(new Float32Array([1, 2])) });
     const { reader } = await openAnnData(tree);
-    assert.deepEqual(reader.varNames, ['A', 'B']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['A', 'B']);
   });
 
   const invalidCases = [
     [
       'missing declared column',
       () => {},
-      /AnnData Zarr var declared column 'missing' was not found/
+      /^var declared column 'missing' was not found/
     ],
     [
       'unsupported declared column representation',
@@ -2098,7 +2174,7 @@ test('validates every variable column declared by column-order before adoption',
           'encoding-version': '0.1.0'
         }));
       },
-      /Variable dataframe column 'missing' uses unsupported encoding 'unsupported-column'/
+      /^var column 'missing' uses unsupported encoding 'unsupported-column'/
     ],
     [
       'incomplete supported categorical column',
@@ -2110,19 +2186,18 @@ test('validates every variable column declared by column-order before adoption',
           ordered: false
         }));
       },
-      /Categorical field 'missing' must contain codes and categories/
+      /Categorical field 'missing' must contain codes and categories/,
+      'when read'
     ],
     [
       'variable-axis length mismatch',
       files => setArray(files, 'var/missing', metadata({ shape: [1], chunks: [1], dtype: '<f4' })),
-      /Variable dataframe column 'missing' length 1 does not match 2/
+      /^var column 'missing' length 1 does not match 2/
     ]
   ];
 
-  for (const [name, mutate, expectedError] of invalidCases) {
-    await t.test(name, () => assertReplacementRefused(mutate, expectedError, {
-      columnOrder: { frame: 'var', columns: ['missing'] },
-    }));
+  for (const [name, mutate, expected, when = 'at open'] of invalidCases) {
+    await t.test(name, () => (when === 'when read' ? assertColumnRefusedWhenRead : assertColumnLeftOut)(mutate, expected, { frame: 'var' }));
   }
 });
 
@@ -2201,7 +2276,7 @@ test('Zarr opening supports official nullable-string dataframe indices', async t
     const { reader } = await openAnnData(withIndices(names(['cell-a', 'cell-b']), names(['gene-a', 'gene-b'])));
     assert.equal(reader.nObs, 2);
     assert.equal(reader.nVars, 2);
-    assert.deepEqual(reader.varNames, ['gene-a', 'gene-b']);
+    assert.deepEqual((await reader.readVarNames('X', null)).index, ['gene-a', 'gene-b']);
   });
 
   await t.test('missing observation names are rejected', async () => {
@@ -2232,30 +2307,30 @@ test('Zarr opening supports official nullable-string dataframe indices', async t
   });
 });
 
-test('requires every observation field to be one-dimensional and cell-aligned', async t => {
-  await t.test('ordinary field length', async () => {
-    await assert.rejects(
-      openAnnData(storeWith({ obs: { batch: array(new Int32Array([7]), { dtype: '<i4' }) } })),
-      /Observation dataframe column 'batch' length 1 does not match 2/
-    );
-  });
+test('an observation field that is not one-dimensional and cell-aligned is left out, with the reason', async t => {
+  const leftOut = async (tree, pattern) => {
+    const { reader } = await openAnnData(tree);
+    assert.deepEqual(reader.obsKeys, []);
+    assert.match(reader.notes[0], pattern);
+  };
+  await t.test('ordinary field length', () => leftOut(
+    storeWith({ obs: { batch: array(new Int32Array([7]), { dtype: '<i4' }) } }),
+    /^obs column 'batch' length 1 does not match 2; the column was not read\.$/
+  ));
 
-  await t.test('ordinary field rank', async () => {
-    await assert.rejects(
-      openAnnData(storeWith({ obs: { batch: dense(new Int32Array([7, 8]), [2, 1], { dtype: '<i4' }) } })),
-      /Observation dataframe column 'batch' must have exactly 1 dimension/
-    );
-  });
+  await t.test('ordinary field rank', () => leftOut(
+    storeWith({ obs: { batch: dense(new Int32Array([7, 8]), [2, 1], { dtype: '<i4' }) } }),
+    /^obs column 'batch' must have exactly 1 dimension/
+  ));
 
-  await t.test('categorical codes metadata', async () => {
-    await assert.rejects(
-      openAnnData(storeWith({ obs: { batch: categorical([0], ['A', 'B']) } })),
-      /Categorical codes for 'batch' length 1 does not match 2/
-    );
+  await t.test('categorical codes metadata: listed, refused when read', async () => {
+    const { reader } = await openAnnData(storeWith({ obs: { batch: categorical([0], ['A', 'B']) } }));
+    assert.deepEqual(reader.obsKeys, ['batch']);
+    await assert.rejects(reader.getObsField('batch'), /Categorical codes for 'batch' length 1 does not match 2/);
   });
 });
 
-test('normalizes continuous int64 and Float64 obs through the public adapter seam', async t => {
+test('normalizes continuous int64 and Float64 obs through the public adapter seam: integers stay exact', async t => {
   async function adapterFor(values, dtype, key) {
     const { reader } = await openAnnData(storeWith({
       nObs: values.length,
@@ -2266,22 +2341,31 @@ test('normalizes continuous int64 and Float64 obs through the public adapter sea
     return adapter;
   }
 
-  await t.test('safe signed int64', async () => {
-    const adapter = await adapterFor(new BigInt64Array([1n, 2n]), '<i8', 'count');
+  await t.test('safe signed int64 stays exact, as float64', async () => {
+    const adapter = await adapterFor(new BigInt64Array([1n, 2n, 16_777_217n]), '<i8', 'count');
     const field = await adapter.getObsFieldData('count');
     assert.equal(field.kind, 'continuous');
-    assert.deepEqual(Array.from(new Float32Array(field.data)), [1, 2]);
+    assert.equal(field.dtype, 'float64');
+    assert.deepEqual(Array.from(new Float64Array(field.data)), [1, 2, 16_777_217]);
   });
 
-  await t.test('int64 beyond 2^53 reads as the nearest float32', async () => {
+  await t.test('int64 beyond 2^53 reads as the nearest double', async () => {
     const adapter = await adapterFor(new BigInt64Array([9_007_199_254_740_993n, 2n ** 63n - 1n]), '<i8', 'count');
     const field = await adapter.getObsFieldData('count');
-    assert.deepEqual(Array.from(new Float32Array(field.data)), [Math.fround(2 ** 53), Math.fround(2 ** 63)]);
+    assert.deepEqual(Array.from(new Float64Array(field.data)), [2 ** 53, 2 ** 63]);
+  });
+
+  await t.test('8- and 16-bit integers, which float32 holds exactly, stay float32', async () => {
+    const adapter = await adapterFor(new Int16Array([-32768, 7]), '<i2', 'small');
+    const field = await adapter.getObsFieldData('small');
+    assert.equal(field.dtype, 'float32');
+    assert.deepEqual(Array.from(new Float32Array(field.data)), [-32768, 7]);
   });
 
   await t.test('a Float64 value beyond float32 becomes an infinity, as numpy converts it', async () => {
     const adapter = await adapterFor(new Float64Array([1e308, 2.5]), '<f8', 'score');
     const field = await adapter.getObsFieldData('score');
+    assert.equal(field.dtype, 'float32');
     assert.deepEqual(Array.from(new Float32Array(field.data)), [Number.POSITIVE_INFINITY, 2.5]);
   });
 });
@@ -2326,7 +2410,7 @@ test('propagates malformed connectivity and enforces obs-aligned square shape', 
       async readConnectivityMatrix() {
         throw new Error('malformed connectivity payload');
       }
-    });
+    }, { defaults: { knn: 'connectivities' } });
     await assert.rejects(
       adapter.getConnectivityEdges(),
       /malformed connectivity payload/i
@@ -2383,6 +2467,30 @@ test('public Zarr loading best-guesses a file without a UMAP and records the gue
         }
       });
     }
+
+    await t.test('a store whose obsm holds no array of cell coordinates is refused before its cells are read, as every format refuses one', async () => {
+      const source = new AnnDataFileSource();
+      try {
+        const files = completeZarrStoreFiles({
+          embeddingValues: [0, 0, 1, 1],
+          geneValues: [1, 0, 2, 0]
+        });
+        for (const path of [...files.keys()]) if (path.startsWith('obsm/X_umap_2d/')) files.delete(path);
+        const read = [];
+        const listed = fileListFromMap(files, 'bare.zarr').map(file => ({
+          ...file,
+          arrayBuffer: () => { read.push(file.webkitRelativePath.slice('bare.zarr/'.length)); return file.arrayBuffer(); },
+        }));
+        const error = await source.loadFolder(listed).then(() => null, rejection => rejection);
+        assert.match(error?.message ?? '', /^bare\.zarr has no cell embedding, and Cellucid draws cells at embedding coordinates/);
+        assert.match(error.message, /cellucid_prepare\(/);
+        // Only metadata was read: no value of a cell (X, obs columns) nor of the matrix.
+        const values = read.filter(path => !/(^|\/)\.z(group|attrs|array|metadata)$|(^|\/)zarr\.json$/.test(path));
+        assert.deepEqual(values, []);
+      } finally {
+        source.clear();
+      }
+    });
 
     await t.test('a file with nothing plottable is refused and the working source kept', async () => {
       const source = new AnnDataFileSource();
@@ -2784,9 +2892,10 @@ test('loads standard nullable integer and boolean observation groups with missin
     ]
   );
 
-  const count = new Float32Array(
-    (await adapter.getObsFieldData('nullable_count')).data
-  );
+  const countData = await adapter.getObsFieldData('nullable_count');
+  // A 64-bit integer column stays exact: float64.
+  assert.equal(countData.dtype, 'float64');
+  const count = new Float64Array(countData.data);
   assert.equal(count[0], 1);
   assert.equal(Number.isNaN(count[1]), true);
   assert.equal(count[2], 3);
@@ -2876,17 +2985,24 @@ test('does not publish an invalidated in-flight sparse matrix into replacement s
 
 // Both writers store every continuous value as Float32 and round integers
 // above 2^24 to the nearest Float32, so a file read directly reads the same.
-test('integer observation values round to Float32 exactly as the writers export them', async () => {
+test('integer observation values past 2^24 stay exact: two ids float32 would merge stay two', async () => {
   const { reader } = await openAnnData(storeWith({
-    nObs: 1,
-    obs: { count: array(new BigInt64Array([16_777_217n]), { dtype: '<i8' }) },
+    nObs: 2,
+    obs: {
+      donor: array(new Int32Array([16_777_216, 16_777_217]), { dtype: '<i4' }),
+      count: nullable('nullable-integer', new BigInt64Array([16_777_217n, 0n]), [0, 1]),
+    },
   }));
   const adapter = new BaseAnnDataAdapter(reader);
-  adapter._obsFieldsMetadata = [{ key: 'count', kind: 'continuous' }];
+  adapter._obsFieldsMetadata = [{ key: 'donor', kind: 'continuous' }, { key: 'count', kind: 'continuous' }];
 
-  const field = await adapter.getObsFieldData('count');
-  assert.equal(field.kind, 'continuous');
-  assert.deepEqual(Array.from(new Float32Array(field.data)), [16_777_216]);
+  const donor = await adapter.getObsFieldData('donor');
+  assert.equal(donor.kind, 'continuous');
+  assert.deepEqual(Array.from(new Float64Array(donor.data)), [16_777_216, 16_777_217]);
+  assert.equal(donor.max, 16_777_217);
+  const count = new Float64Array((await adapter.getObsFieldData('count')).data);
+  assert.equal(count[0], 16_777_217);
+  assert.ok(Number.isNaN(count[1]));
 });
 
 test('rejects duplicate connectivity coordinates instead of summing them', () => {
@@ -3093,11 +3209,11 @@ test('opens official-writer float16 X and embedding through public methods', asy
 });
 
 test('keeps the latest concurrent Zarr open request', async () => {
-  // The first open is still reading its var index when the second is asked for.
-  const hold = holdFirst('var/_index/0');
+  // The first open is still checking its var index when the second is asked for.
+  const hold = holdFirst('var/_index/mask/0');
   const reader = new AnnDataReader();
   const firstRequest = openAnnData(
-    completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }),
+    slowOpeningTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }),
     { reader, name: 'first-slow.zarr', onChunk: hold.onChunk }
   );
   const firstAssertion = assert.rejects(
@@ -3126,9 +3242,9 @@ test('the Zarr reader publishes no notifications and a newer store supersedes an
   await openAnnData(createStore([0, 0, 1, 1]), { name: 'direct.zarr' });
   assert.deepEqual(events, [], 'the reader runs in a worker; the data source owns notifications');
 
-  const hold = holdFirst('var/_index/0');
+  const hold = holdFirst('var/_index/mask/0');
   const overlapping = new AnnDataReader();
-  const older = openAnnData(createStore([1, 2, 3, 4]), { reader: overlapping, name: 'older.zarr', onChunk: hold.onChunk });
+  const older = openAnnData(slowOpeningTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }), { reader: overlapping, name: 'older.zarr', onChunk: hold.onChunk });
   const olderAssertion = assert.rejects(older, /superseded/i);
   await hold.started;
   await openAnnData(createStore([9, 10, 11, 12]), { reader: overlapping, name: 'newer.zarr' });
@@ -3258,7 +3374,7 @@ test('a superseded Zarr candidate leaves the opening to the newer one, which end
   released.resolve();
   await olderAssertion;
 
-  assert.equal(newer.id, 'zarr_newer');
+  assert.match(newer.id, /^zarr_newer_[0-9a-f]{8}$/);
   // One opening on screen for both: the newer joined it, and the older's
   // supersession neither failed nor ended it.
   const ids = new Set(states.map(state => state.split(':')[0]));
@@ -3412,4 +3528,14 @@ test('a Zarr store names itself by uns["title"], as AnnData writes it', async ()
     await titleOf({ title: scalarString('corrupt') }, entries => entries.set('uns/title/0', new Uint8Array([1, 2, 3]))),
     null
   );
+});
+
+test('opening reads no gene name; the var index is read when the names are first asked for', async () => {
+  const { reader, reads } = await openAnnData(completeTree({ embeddingValues: [1, 2, 3, 4], geneValues: [1, 0, 2, 0] }), { name: 'names-later.zarr' });
+  assert.equal(readsOf(reads, 'var/_index').length, 0, 'opening checks the var index without reading its names');
+  assert.equal(reader.nVars, 2);
+  assert.deepEqual((await reader.readVarNames('X', null)).index, ['A', 'B']);
+  assert.equal(readsOf(reads, 'var/_index').length, 1, 'read once, when asked for');
+  await reader.readVarNames('X', null);
+  assert.equal(readsOf(reads, 'var/_index').length, 1, 'and kept');
 });

@@ -42,7 +42,7 @@
  * @module data/fetch-scheduler
  */
 
-import { onAbort } from '../formats/io/abort.js';
+import { onAbort, abortReason, cancelled } from '../utils/abort.js';
 import { REMOTE_POLICY } from '../formats/io/byte-source.js';
 
 /** @typedef {'high'|'normal'|'bulk'|'low'} DownloadPriority */
@@ -92,10 +92,6 @@ export function requirePriority(priority) {
     );
   }
   return /** @type {DownloadPriority} */ (priority);
-}
-
-function abortReason(signal) {
-  return signal.reason ?? new DOMException('The download was cancelled.', 'AbortError');
 }
 
 /**
@@ -154,7 +150,7 @@ export class FetchScheduler {
    */
   close(reason) {
     if (this._closedReason !== null) return;
-    this._closedReason = reason ?? new DOMException('The downloads were closed.', 'AbortError');
+    this._closedReason = reason ?? cancelled('closed', 'The downloads were closed.');
     followers.delete(this);
     for (const download of [...this._downloads.values()]) {
       download.controller.abort(this._closedReason);

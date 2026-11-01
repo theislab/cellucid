@@ -45,8 +45,14 @@ const ACCOUNTS = Object.freeze({
  * the sources that read with it, and its (i).
  */
 const SIGNED_IN = Object.freeze([
-  Object.freeze({ name: 'Google', auth: () => getGoogleAuth(), providers: ['gdrive'], tip: 'sign-in-google' }),
-  Object.freeze({ name: 'Microsoft', auth: () => getMicrosoftAuth(), providers: ['onedrive'], tip: 'sign-in-microsoft' }),
+  Object.freeze({
+    name: 'Google', auth: () => getGoogleAuth(), providers: ['gdrive'], tip: 'sign-in-google',
+    notRevoked: 'Signed out of Google here, but Google could not be reached to revoke the sign-in: it stops working when it expires, within the hour.',
+  }),
+  Object.freeze({
+    name: 'Microsoft', auth: () => getMicrosoftAuth(), providers: ['onedrive'], tip: 'sign-in-microsoft',
+    notRevoked: 'Signed out of Microsoft here. Microsoft offers no way for Cellucid to revoke its sign-in: it stops working when it expires, within the hour.',
+  }),
 ]);
 
 function signedInAccounts() {
@@ -88,9 +94,12 @@ export function showSourceSignIn({ notifications, documentRef = document, steps 
       steps.run(shown.id);
       return;
     }
-    // Sign out of every account the line names.
+    // Sign out of every account the line names; a sign-in the provider did
+    // not revoke is said, never left silent.
     for (const account of signedInAccounts()) {
-      account.auth().signOut();
+      void account.auth().signOut().then(revoked => {
+        if (!revoked) notifications.warning(account.notRevoked, { category: 'connectivity', duration: 8000 });
+      });
       for (const provider of account.providers) revokeSourceAccess(provider);
     }
     renderLine(null);

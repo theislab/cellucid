@@ -25,7 +25,7 @@
  * - A **format** is what the container holds, by its id (`INPUT_FORMATS`:
  *   `h5ad`, `zarr`, `loom`, `tenx-h5`, `tenx-outs`, `h5mu`, `mudata-zarr`,
  *   `rds`, `rda`, `h5seurat`, `mtx`). The id is stable: sessions (a dataset
- *   that states no id is `<format>_<name>`), a server's `anndata.file.kind`,
+ *   that states no id is `<format>_<name>_<structure>`), a server's `anndata.file.kind`,
  *   its health `format`, and the tests name it. A format other than `h5ad`
  *   and `zarr` is presented as AnnData by a layout view
  *   (`anndata/views/index.js`, read in place) or a transcoder
@@ -70,12 +70,15 @@ export const INPUT_FORMATS_SCHEMA = 1;
 /**
  * Container signatures: bytes at the start of one file (at any of
  * `offsets`), and the layout and container they make it. HDF5's signature
- * sits after a user block when the file has one (`formats/hdf5/superblock.js`
- * looks at 0, 512, 1024 and 2048 in its first read, then further); a user
- * block longer than these is told by the file's name.
+ * sits at 0, or after a user block at any power of two from 512 (the HDF5
+ * file format specification); the offsets are every such place within the
+ * HDF5 reader's first read of a file (`HEAD_BYTES`, 512 KiB), where
+ * `formats/hdf5/superblock.js` looks for it by the same rule before it
+ * searches further, so a file is told by its content wherever its head can
+ * tell it. A user block longer than that is told by the file's name.
  */
 const SIGNATURES = Object.freeze([
-  Object.freeze({ offsets: Object.freeze([0, 512, 1024, 2048]), hex: '894844460d0a1a0a', layout: 'file', container: 'hdf5' }),
+  Object.freeze({ offsets: Object.freeze([0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]), hex: '894844460d0a1a0a', layout: 'file', container: 'hdf5' }),
   Object.freeze({ offsets: Object.freeze([0]), hex: '504b0304', layout: 'zip', container: 'zarr' }),
   // An empty archive is its end record alone.
   Object.freeze({ offsets: Object.freeze([0]), hex: '504b0506', layout: 'zip', container: 'zarr' }),
@@ -90,19 +93,29 @@ const SIGNATURES = Object.freeze([
 const FOLDER_MARKERS = Object.freeze({
   zarr: Object.freeze(['.zarray', '.zattrs', '.zgroup', '.zmetadata', 'zarr.json']),
   'tenx-outs': Object.freeze(['filtered_feature_bc_matrix.h5', 'sample_filtered_feature_bc_matrix.h5', 'filtered_gene_bc_matrices_h5.h5']),
-  mtx: Object.freeze(['matrix.mtx.gz', 'matrix.mtx', 'cells_x_genes.mtx', 'quants_mat.mtx', 'count_matrix.mtx', 'DGE.mtx']),
 });
 
 /**
- * Folder formats whose marker files may carry a sample prefix, and the
- * characters such a prefix ends with: GEO's `GSM123_matrix.mtx.gz` beside
- * `GSM123_barcodes.tsv.gz`. A prefixed marker makes the folder the format's
- * when another file of the same folder starts with the prefix's first part
- * (`GSM123_`): a prefix the files share, not a name that merely ends alike.
+ * Folder formats known by the name of a file they hold: regular expressions
+ * a file's name matches, compared without case, written in the syntax
+ * JavaScript, Python (`re`) and R (PCRE) share. A MatrixMarket matrix is a
+ * `.mtx` file whatever its producer named it (`matrix.mtx.gz`, kb-python's
+ * `cells_x_genes.mtx`, GEO's `GSM123_matrix.mtx.gz` and
+ * `GSE158055_covid19_counts.mtx.gz`), or a sci-RNA-seq3 matrix of the Cao
+ * and Shendure labs, MatrixMarket under a `.txt` name
+ * (`GSE119945_gene_count.txt.gz`). A folder on this computer and a listing
+ * on a host are told by these same names (`isFolderMarkerName`); which lists
+ * go with a matrix is the transcoder's to find (`matrix-market-files.js`),
+ * and a matrix without them is refused saying which are missing. Tried
+ * after the format's markers, in registry order.
  */
-const FOLDER_MARKER_PREFIXES = Object.freeze({
-  mtx: '_-.',
+const FOLDER_MARKER_PATTERNS = Object.freeze({
+  mtx: Object.freeze(['^.+\\.mtx(\\.gz|\\.bz2|\\.xz)?$', '^.*gene_count(\\.[^.]+)?\\.txt(\\.gz|\\.bz2|\\.xz)?$']),
 });
+
+/** `FOLDER_MARKER_PATTERNS` compiled, by format id. */
+const FOLDER_MARKER_EXPRESSIONS = new Map(Object.entries(FOLDER_MARKER_PATTERNS)
+  .map(([id, patterns]) => [id, patterns.map(pattern => new RegExp(pattern, 'i'))]));
 
 /** @type {ReadonlyArray<Readonly<InputFormat>>} */
 export const INPUT_FORMATS = Object.freeze([
@@ -273,14 +286,15 @@ function matchName(name, layouts) {
 
 /**
  * What one file's name says it is: its format and layout (`file` or `zip`),
- * or null for a name no format has.
+ * a compressed copy's with its `compression` (`compressedFormatOfName`), or
+ * null for a name no format has.
  *
  * @param {string} name
- * @returns {Readonly<{format: string, layout: InputLayout}>|null}
+ * @returns {Readonly<{format: string, layout: InputLayout, compression?: 'gzip'}>|null}
  */
 export function fileFormatOfName(name) {
   const match = matchName(name, ['file', 'zip']);
-  return match === null ? null : Object.freeze({ format: match.format.id, layout: match.layout });
+  return match === null ? compressedFormatOfName(name) : Object.freeze({ format: match.format.id, layout: match.layout });
 }
 
 /**
@@ -297,15 +311,24 @@ export function folderFormatOfName(name) {
 }
 
 /**
- * Whether a file's name is a format's name with `.gz` added (an `.h5ad.gz`
- * as GEO ships some): a compressed copy, which cannot be read in place.
+ * Whether a file's name is the name of a file read in parts with `.gz`
+ * added (an `.h5ad.gz`, as GEO ships many): a compressed copy, its format,
+ * layout and `compression`. A gzip stream has no index, so a compressed
+ * copy cannot be read in place: it is read once from its start,
+ * decompressed as it arrives into this browser's storage, and read in parts
+ * from there (`data/whole-download.js`). A format read as one stream names
+ * its compressed endings itself (`.rds.gz`: its reader takes the
+ * compression off by content).
  *
  * @param {string} name
- * @returns {Readonly<{format: string, layout: InputLayout}>|null}
+ * @returns {Readonly<{format: string, layout: InputLayout, compression: 'gzip'}>|null}
  */
 export function compressedFormatOfName(name) {
   const text = String(name);
-  return /\.gz$/i.test(text) ? fileFormatOfName(text.slice(0, -3)) : null;
+  if (!/\.gz$/i.test(text)) return null;
+  const match = matchName(text.slice(0, -3), ['file', 'zip']);
+  if (match === null || match.format.access !== 'ranges') return null;
+  return Object.freeze({ format: match.format.id, layout: match.layout, compression: 'gzip' });
 }
 
 /**
@@ -317,7 +340,9 @@ export function compressedFormatOfName(name) {
  * @returns {string}
  */
 export function titleOfName(name) {
-  const text = String(name).replace(/\/+$/, '');
+  const plain = String(name).replace(/\/+$/, '');
+  // A compressed copy is named by the file it is a copy of.
+  const text = matchName(plain, LAYOUTS) === null && compressedFormatOfName(plain) !== null ? plain.slice(0, -3) : plain;
   const match = matchName(text, LAYOUTS);
   if (match === null) return text;
   const title = text.slice(0, text.length - match.ending.length);
@@ -325,15 +350,58 @@ export function titleOfName(name) {
 }
 
 /**
- * The id of a dataset that states none: `<format>_<name>`, as every
- * session saved on such a dataset records it.
+ * Eight hexadecimal digits naming what a dataset holds, from facts every
+ * opening reads: its cell and gene counts and its gene names (the var
+ * index), each name by its length and UTF-16 code units (FNV-1a, then
+ * MurmurHash3's `fmix32`).
+ *
+ * @param {{nObs: number, nVars: number, varNames: ArrayLike<string>}} structure
+ * @returns {string}
+ */
+function structureDigestOf({ nObs, nVars, varNames }) {
+  if (!Number.isSafeInteger(nObs) || nObs < 0 || !Number.isSafeInteger(nVars) || nVars < 0 || varNames?.length !== nVars) {
+    throw new TypeError('A dataset structure is its cell and gene counts and one name per gene.');
+  }
+  let h = 0x811c9dc5;
+  const add = word => {
+    h = Math.imul(h ^ (word & 0xffff), 0x01000193);
+    h = Math.imul(h ^ (word >>> 16), 0x01000193);
+  };
+  add(nObs % 0x100000000);
+  add(Math.floor(nObs / 0x100000000));
+  add(nVars % 0x100000000);
+  add(Math.floor(nVars / 0x100000000));
+  for (let gene = 0; gene < nVars; gene++) {
+    const name = String(varNames[gene]);
+    add(name.length);
+    for (let i = 0; i < name.length; i++) h = Math.imul(h ^ name.charCodeAt(i), 0x01000193);
+  }
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * The id of a dataset that states none (`uns['cellucid']['id']`), as every
+ * session and community annotation saved on it records it:
+ * `<format>_<name>_<structure>`, its format, its file or folder name and
+ * eight hexadecimal digits of its cell and gene counts and gene names. Two
+ * files of the same name holding other data are two datasets; the same data
+ * written again (an obs column added) keeps its id. The id names the
+ * dataset, never its version: what is kept of a file is filed under its size
+ * and modification time beside it (`anndata/open.js`).
  *
  * @param {string} format
  * @param {string} name - Its file or folder name
+ * @param {{nObs: number, nVars: number, varNames: ArrayLike<string>}} structure -
+ *   `nObs`: the cells of the file (every cell, whichever are open)
  * @returns {string}
  */
-export function defaultDatasetIdOf(format, name) {
-  return `${inputFormat(format).id}_${titleOfName(name)}`;
+export function defaultDatasetIdOf(format, name, structure) {
+  return `${inputFormat(format).id}_${titleOfName(name)}_${structureDigestOf(structure)}`;
 }
 
 /**
@@ -369,7 +437,7 @@ export function openableNamePhrases() {
       if (names === undefined) continue;
       if (names.length > 0) phrases.push(`${names.find(standsAlone) ?? names[0]} ${LAYOUT_NOUNS[layout]}`);
       // A folder known by the files it holds, not by its name.
-      else if (layout === 'folder' && FOLDER_MARKERS[format.id] !== undefined) phrases.push(format.label);
+      else if (layout === 'folder' && (FOLDER_MARKERS[format.id] !== undefined || FOLDER_MARKER_PATTERNS[format.id] !== undefined)) phrases.push(format.label);
     }
   }
   return phrases;
@@ -432,6 +500,12 @@ export function filePickerAccept() {
     if (last === ending || all.includes(last)) endings.add(last);
     else endings.add(ending);
   }
+  // Compressed copies of the files read in parts (`compressedFormatOfName`),
+  // offered whole, as `.rds.gz` is: an `.h5ad.gz`, never a bare `.gz`.
+  for (const format of INPUT_FORMATS) {
+    if (format.access !== 'ranges' || format.refusal !== undefined) continue;
+    for (const ending of format.names.file ?? []) endings.add(`${ending}.gz`);
+  }
   return [...endings].join(',');
 }
 
@@ -439,7 +513,8 @@ export function filePickerAccept() {
  * Whether a list of paths (a picked or dropped folder's files, each
  * `<folder>/<path inside>`) is one format's folder: a folder's name names
  * one (`.zarr`), or it holds one of a format's marker files
- * (`FOLDER_MARKERS`, tried in registry order).
+ * (`FOLDER_MARKERS`) or a file whose name marks it (`isFolderMarkerName`),
+ * formats tried in registry order.
  *
  * @param {Iterable<string>} paths
  * @returns {Readonly<{format: string, layout: 'folder'}>|null}
@@ -458,8 +533,7 @@ export function folderFormatOfPaths(paths) {
     if (markers !== undefined && markers.some(marker => leaves.has(marker))) {
       return Object.freeze({ format: format.id, layout: 'folder' });
     }
-    if (markers !== undefined && FOLDER_MARKER_PREFIXES[format.id] !== undefined &&
-        hasPrefixedMarker(split, markers, FOLDER_MARKER_PREFIXES[format.id])) {
+    if ([...leaves].some(leaf => isFolderMarkerName(format.id, leaf))) {
       return Object.freeze({ format: format.id, layout: 'folder' });
     }
   }
@@ -467,31 +541,17 @@ export function folderFormatOfPaths(paths) {
 }
 
 /**
- * Whether one folder of the list holds a marker under a prefix that ends
- * with one of `separators`, and another file whose name starts with the
- * prefix's first part.
+ * Whether a file's name (or path: its last part is compared) marks a folder
+ * of format `format` (`FOLDER_MARKER_PATTERNS`): for `mtx`, whether it is a
+ * MatrixMarket matrix.
+ *
+ * @param {string} format
+ * @param {string} name
+ * @returns {boolean}
  */
-function hasPrefixedMarker(split, markers, separators) {
-  const byFolder = new Map();
-  for (const parts of split) {
-    const folder = parts.slice(0, -1).join('/');
-    if (!byFolder.has(folder)) byFolder.set(folder, []);
-    byFolder.get(folder).push(parts.at(-1));
-  }
-  for (const names of byFolder.values()) {
-    for (const name of names) {
-      for (const marker of markers) {
-        if (name.length <= marker.length || !name.endsWith(marker)) continue;
-        const prefix = name.slice(0, name.length - marker.length);
-        if (!separators.includes(prefix.at(-1))) continue;
-        let cut = 0;
-        while (cut < prefix.length && !separators.includes(prefix[cut])) cut++;
-        const first = prefix.slice(0, cut + 1);
-        if (names.some(other => other !== name && other.startsWith(first))) return true;
-      }
-    }
-  }
-  return false;
+export function isFolderMarkerName(format, name) {
+  const leaf = String(name).replace(/\\/g, '/').split('/').at(-1);
+  return (FOLDER_MARKER_EXPRESSIONS.get(format) ?? []).some(expression => expression.test(leaf));
 }
 
 /** The marker files of one format's folders (`zarr`: `.zgroup`, `zarr.json`, …). */
@@ -530,13 +590,14 @@ export function layoutOfHead(head) {
 /**
  * Whether a remote file's first read is its head (`HEAD_BYTES`, read beside
  * the probe of its size): a container whose structure starts at byte 0
- * (HDF5) is; a ZIP archive, read from its end, is not.
+ * (HDF5) is; a ZIP archive, read from its end, is not, nor a compressed
+ * copy (`compressedFormatOfName`), read whole.
  *
  * @param {Readonly<{format: string, layout: InputLayout}>|null} named
  * @returns {boolean}
  */
 export function readsFromHead(named) {
-  return named !== null && named.layout === 'file' && inputFormat(named.format).container === 'hdf5';
+  return named !== null && named.layout === 'file' && named.compression === undefined && inputFormat(named.format).container === 'hdf5';
 }
 
 /**
@@ -550,7 +611,7 @@ export function inputFormatsDocument() {
     schema: INPUT_FORMATS_SCHEMA,
     signatures: SIGNATURES.map(item => ({ ...item, offsets: [...item.offsets] })),
     folderMarkers: Object.fromEntries(Object.entries(FOLDER_MARKERS).map(([key, value]) => [key, [...value]])),
-    folderMarkerPrefixes: { ...FOLDER_MARKER_PREFIXES },
+    folderMarkerPatterns: Object.fromEntries(Object.entries(FOLDER_MARKER_PATTERNS).map(([key, value]) => [key, [...value]])),
     formats: INPUT_FORMATS.map(format => ({
       id: format.id,
       label: format.label,

@@ -125,6 +125,16 @@ test(
         );
       }
 
+      // The welcome's Start exploring never waits for startup: it only
+      // closes the dialog, leaving these controls and their line in view.
+      const start = page.locator('#welcome-start-btn');
+      await expect(page.locator('#welcome-modal')).toBeVisible();
+      await expect(start).toBeEnabled();
+      await start.click();
+      await expect(page.locator('#welcome-modal')).toBeHidden();
+      await expect(status).toBeInViewport();
+      await expect(status).toContainText('Starting Cellucid');
+
       releaseCatalog();
     });
 

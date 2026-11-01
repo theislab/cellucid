@@ -441,6 +441,8 @@ export function initVisualizationReset(options) {
 
     backgroundSelect.value = initialUIState.background;
     viewer.setBackground(initialUIState.background);
+    // Smoke's lower-layer colours follow the background (`rendering/read-cell-layer.js`).
+    renderControls.markSmokeDirty();
 
     // Navigation mode has no useful app-init capture: the page starts on Orbit
     // before any dataset exists, so restoring that value drops a 1-D or 2-D

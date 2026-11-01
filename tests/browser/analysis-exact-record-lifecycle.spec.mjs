@@ -171,11 +171,11 @@ test(
       const [
         { encodeTypedJson, decodeTypedJson },
         { DataLayer },
-        { getMemoryMonitor },
+        { memoryReport },
       ] = await Promise.all([
         import('/assets/js/app/session/codecs/typed-json.js'),
         import('/assets/js/app/analysis/data/data-layer.js'),
-        import('/assets/js/app/analysis/shared/memory-monitor.js'),
+        import('/assets/js/data/memory-budget.js'),
       ]);
 
       const layers = new Set();
@@ -224,8 +224,7 @@ test(
           }
         }
 
-        const monitor = getMemoryMonitor();
-        const baselineCleanupHandlers = monitor.getCleanupHandlerCount();
+        const baselineHolders = memoryReport().holders;
         const state = {
           getHighlightPages() {
             return [];
@@ -284,8 +283,8 @@ test(
 
         await destroyLayer(createLayer());
 
-        if (monitor.getCleanupHandlerCount() !== baselineCleanupHandlers) {
-          fail('DataLayer destroy leaked a memory-monitor cleanup handler');
+        if (memoryReport().holders !== baselineHolders) {
+          fail('DataLayer destroy left a cache counted by the memory model');
         }
         if (document.body.innerHTML !== bodyMarkup) {
           fail('The module lifecycle mutated the test document');

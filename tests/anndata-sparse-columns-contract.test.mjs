@@ -405,3 +405,175 @@ test('switching expression matrices keeps each built gene index: switching back 
   await second.reader.getMatrixColumns('layers/counts', [0]);
   assert.deepEqual([...second.reader._matrices.keys()], ['layers/counts']);
 });
+
+/** A view of an opened matrix whose array reads count how many are in flight at once. */
+function concurrencyView(node, stats) {
+  if (node.kind === 'array') {
+    return Object.freeze({
+      ...node,
+      async read(selection, options) {
+        stats.calls++;
+        stats.inFlight++;
+        stats.max = Math.max(stats.max, stats.inFlight);
+        try {
+          await new Promise(resolve => setImmediate(resolve));
+          return await node.read(selection, options);
+        } finally {
+          stats.inFlight--;
+        }
+      },
+    });
+  }
+  return Object.freeze({
+    ...node,
+    get(name) {
+      const child = node.get(name);
+      return child === null ? null : concurrencyView(child, stats);
+    },
+  });
+}
+
+test('a scattered cell subset of an array read in part costs requests as the link prices them, never one in flight per cell', async () => {
+  const nObs = 6000;
+  const nVars = 20;
+  const csr = randomCsr(nObs, nVars, 5);
+  // Uncompressed: any range of an array costs only its bytes (`partialChunks`),
+  // so no chunk joins the rows; only the link's price of a request does.
+  const tree = treeWithX(sparse({ ...csr, shape: [nObs, nVars], chunks: 1000 }), nObs, nVars);
+  const { root } = await openStore(tree);
+  const genes = Array.from({ length: nVars }, (_, gene) => gene);
+  const entries = csr.indptr[nObs];
+  const inFlightEntries = 4096;
+  // A link whose merge gap is 512 entries (8 bytes an entry) and whose round
+  // trip is worth 2,048: what `formats/io/link.js` reports for a disk.
+  const link = { measured: true, readsAhead: true, bytesPerMs: 1_000_000, mergeGapBytes: 4096, roundTripBytes: 16384, shapingConcurrency: 4, concurrency: 4 };
+  const open = async (stats, withLink) => openMatrixRows(concurrencyView(root.get('X'), stats), {
+    format: ZARR_FORMAT,
+    label: 'X',
+    nObs,
+    nVars,
+    decodedChunkBytes: 64 * 1024 * 1024,
+    indexOptions: withLink ? { link: () => link } : {},
+    inFlightEntries,
+  });
+  assert.equal(root.get('X').get('indices').partialChunks, true, 'the fixture is read in part');
+
+  // Every seventh cell: rows a few entries apart are read as one range.
+  const near = Array.from({ length: Math.floor(nObs / 7) }, (_, k) => k * 7);
+  const priced = { calls: 0, inFlight: 0, max: 0 };
+  const unpriced = { calls: 0, inFlight: 0, max: 0 };
+  const merged = await (await open(priced, true)).subset(near, genes, {});
+  const apart = await (await open(unpriced, false)).subset(near, genes, {});
+  assert.deepEqual(Array.from(merged.pointers), Array.from(apart.pointers));
+  assert.deepEqual(Array.from(merged.cellIndex), Array.from(apart.cellIndex));
+  assert.deepEqual(Array.from(merged.values), Array.from(apart.values));
+  assert.ok(unpriced.calls >= near.length, 'unpriced, a request a cell');
+  assert.ok(priced.calls <= 2 * (Math.ceil(entries / inFlightEntries) + 1), `priced, a few requests (${priced.calls})`);
+
+  // Every 400th cell (about 1,200 entries apart): a run a cell, but no more in
+  // flight than the in-flight entries hold at a request's worth each.
+  const far = Array.from({ length: Math.floor(nObs / 400) }, (_, k) => k * 400);
+  const bounded = { calls: 0, inFlight: 0, max: 0 };
+  const rows = await open(bounded, true);
+  await rows.subset(far, genes, {});
+  const stored = far.filter(cell => csr.indptr[cell + 1] > csr.indptr[cell]).length;
+  // The row pointers once, then the indices and values of a run a cell with entries.
+  assert.equal(bounded.calls, 1 + 2 * stored, 'a run a cell with entries');
+  assert.ok(bounded.max <= 2 * Math.floor(inFlightEntries / 2048), `in flight at once: ${bounded.max}`);
+
+  // The cost of reading by rows counts every request at its price.
+  const runsCost = rows.readCost(far);
+  const bytesOnly = (await open({ calls: 0, inFlight: 0, max: 0 }, false)).readCost(far);
+  assert.equal(runsCost - bytesOnly, stored * 2048 * 8);
+});
+
+test('a run reading genes of the same cells by rows reads their rows once, then copies its genes out', async () => {
+  // A CSR matrix whose cells are read by rows (a DE over every gene asks for
+  // the same cells in batches, saying how many genes the run has left): each
+  // batch re-read every row of the cells (a 10M-cell file, 30,000 genes: 470
+  // reads of ~130 MB). The run's first read keeps every gene of the cells.
+  const nObs = 60;
+  const nVars = 40;
+  const csr = randomCsr(nObs, nVars, 5, { duplicates: true, zeros: true });
+  const X = sparse({ format: 'csr', ...csr, shape: [nObs, nVars], chunks: 8 });
+  const { reader, reads } = await openReader(treeWithX(X, nObs, nVars));
+  const genes = Array.from({ length: nVars }, (_, gene) => gene);
+  const columns = await reader.getMatrixColumns('X', genes);
+  const cells = [3, 4, 5, 6, 20, 21, 22, 40, 41, 59];
+  const counts = [];
+  for (let from = 0; from < nVars; from += 8) {
+    const asked = genes.slice(from, from + 8).reverse();
+    reads.length = 0;
+    const block = await reader.getMatrixCellSubset('X', cells, asked, { runGenes: nVars - from });
+    counts.push(reads.length);
+    asked.forEach((gene, g) => {
+      const actual = new Array(cells.length).fill(0);
+      for (let entry = block.pointers[g]; entry < block.pointers[g + 1]; entry++) actual[block.cellIndex[entry]] = block.values[entry];
+      assert.deepEqual(actual, cells.map(cell => columns[gene][cell]), `gene ${gene}`);
+    });
+  }
+  assert.deepEqual(counts.slice(1), [0, 0, 0, 0], 'batches after the first read nothing');
+  // Other cells are read afresh, and the kept genes are counted and trimmed.
+  assert.ok(reader.residentBytes() > 0);
+  reader.trimResident(0);
+  const other = await reader.getMatrixCellSubset('X', [0, 1], [2]);
+  assert.equal(other.pointers.length, 2);
+  await assert.rejects(reader.getMatrixCellSubset('X', [0, 1], [2, 3], { runGenes: 1 }), /run genes/);
+});
+
+test('a run over a cell subset reads the matrix\'s entries once whatever its batches; reads on their own decode the rows each time', async () => {
+  // 10M-shaped: cells in runs of one type (a DE of two types holds about a
+  // fifth of them), many genes read in small batches, no gene index built.
+  // Priced read by read, every batch decodes the cells' rows again; priced
+  // over the run (`runGenes`), the run reads X's entries once -- the rows
+  // kept, or the gene index built -- and no later batch reads X at all.
+  const nObs = 2000;
+  const nVars = 120;
+  const run = 50;
+  let state = 17;
+  const next = () => ((state = (state * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const indptr = [0];
+  const indices = [];
+  const data = [];
+  for (let row = 0; row < nObs; row++) {
+    for (let gene = 0; gene < nVars; gene++) {
+      if (next() < 0.06) {
+        indices.push(gene);
+        data.push(Math.fround(1 + Math.floor(next() * 7)));
+      }
+    }
+    indptr.push(data.length);
+  }
+  const nnz = data.length;
+  const csr = { data: Float32Array.from(data), indices: Int32Array.from(indices), indptr: Int32Array.from(indptr) };
+  const cells = [];
+  for (let row = 0; row < nObs; row++) if (Math.floor(row / run) % 5 === 0) cells.push(row);
+  const batch = 6;
+  const xEntries = reads => reads
+    .filter(read => /(^|\/)X\/(indices|data)$/.test(read.path))
+    .reduce((sum, read) => sum + (read.selection === null ? nnz : read.selection[0][1] - read.selection[0][0]), 0);
+  const drive = async runAware => {
+    const X = sparse({ format: 'csr', ...csr, shape: [nObs, nVars], chunks: 512 });
+    const { reader, reads } = await openReader(treeWithX(X, nObs, nVars));
+    const perBatch = [];
+    for (let from = 0; from < nVars; from += batch) {
+      const asked = Array.from({ length: Math.min(batch, nVars - from) }, (_, g) => from + g);
+      reads.length = 0;
+      const block = await reader.getMatrixCellSubset('X', cells, asked, runAware ? { runGenes: nVars - from } : {});
+      perBatch.push(xEntries(reads));
+      // Each gene's entries in the cells, as stored.
+      asked.forEach((gene, g) => {
+        let expected = 0;
+        for (const cell of cells) for (let e = indptr[cell]; e < indptr[cell + 1]; e++) if (indices[e] === gene) expected++;
+        assert.equal(block.pointers[g + 1] - block.pointers[g], expected, `gene ${gene}`);
+      });
+    }
+    return perBatch;
+  };
+  const alone = await drive(false);
+  assert.ok(alone.every(entries => entries > 0), `read by read, every batch decodes the cells' rows (${alone.join(', ')})`);
+  const priced = await drive(true);
+  const total = priced.reduce((sum, entries) => sum + entries, 0);
+  assert.ok(total <= nnz, `over the run, X's entries are read once at most: ${total} of ${nnz} (read by read: ${alone.reduce((a, b) => a + b, 0)})`);
+  assert.deepEqual(priced.slice(1), new Array(priced.length - 1).fill(0), 'no batch after the first reads X');
+});

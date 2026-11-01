@@ -213,7 +213,7 @@ export function extractDominantColors(colors, visibility, count = 3, maxSamples 
   let sampled = 0;
   for (let i = 0; i < pointCount; i += stride) {
     // Point transparency is exactly 0 (filtered out) or 1 (shown).
-    if (visibility === null ? colors[i * 4 + 3] === 0 : visibility[i] === 0) continue;
+    if (visibility !== null && visibility[i] === 0) continue;
     const r = colors[i * 4];
     const g = colors[i * 4 + 1];
     const b = colors[i * 4 + 2];

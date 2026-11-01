@@ -42,7 +42,7 @@ adata = ad.AnnData(
 # The viewer without its own server (which would establish the web build):
 # the data server below is the one the browser reaches.
 viewer = object.__new__(jupyter.AnnDataViewer)
-viewer._init_state(port=None, height=600, client_server_url=None,
+viewer._init_state(port=None, client_server_url=None,
                    web_source_url=CELLUCID_WEB_URL, web_cache_dir=None,
                    allowed_hosts=None)
 viewer._activate()
@@ -98,6 +98,11 @@ test('a one-million-cell selection reaches the notebook whole, through the brows
         viewerToken: config.viewerToken,
       });
       if (!(await source.initialize())) throw new Error('the bridge did not connect');
+      const { createCellIdentity } = await import('/assets/js/data/cell-identity.js');
+      const identity = createCellIdentity({ nObs: 4_000_003 });
+      source.setCellIdentityProvider(() => identity);
+      // The host's dataset is the one shown.
+      source.setShownDatasetProvider(() => 'selection');
       // Spread over 4M indices; 7,919 is prime, so every index is distinct.
       // The selection tools hand over a cell list: ascending.
       const cells = new Uint32Array(count);

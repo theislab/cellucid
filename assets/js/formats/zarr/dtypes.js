@@ -216,7 +216,8 @@ export function parseV2Dtype(descr, what) {
       break;
     case 'M':
     case 'm':
-      if (size === 8) return numericType('int', 8, littleEndian);
+      // `time`: its default ("not a time", NaT) is the smallest int64.
+      if (size === 8) return { ...numericType('int', 8, littleEndian), time: true };
       break;
     case 'S':
       if (size !== null) return bytesStringType(elementBytes(size, what, descr));
@@ -576,6 +577,41 @@ function encodeElement(value, type, what) {
 }
 
 /**
+ * The fill of a Zarr v2 array whose `fill_value` is null: its data type's
+ * default value, as zarr-python 3 reads it (`fill_value_or_default`, the
+ * type's `default_scalar()`): 0 for numbers, false, empty text (fixed or
+ * variable length), empty or zero bytes (fixed, raw, structured, complex),
+ * and "not a time" (NaT, the smallest int64) for NumPy dates and durations.
+ *
+ * zarr-python 3 writes such arrays without every chunk equal to that
+ * default (`write_empty_chunks` false, its default), so anndata 0.12 on
+ * zarr 3 leaves out, for instance, a scalar `0` or `False` in `uns`, an
+ * all-zero obs column, or an all-empty text array: each absent chunk is
+ * the default, never undefined. zarr-python 2 never leaves such a chunk out
+ * itself, reads an absent 0-d one as zeros and leaves an absent chunk of a
+ * larger array unset; the default is the only reading both agree on.
+ *
+ * @returns {{value: unknown, raw: Uint8Array|null}}
+ */
+function defaultFill(type, what) {
+  if (type.unsupported) return { value: null, raw: null };
+  switch (type.form) {
+    case 'numeric':
+      return { value: type.time === true ? -(1n << 63n) : numericFill(0, type, what), raw: null };
+    case 'float16':
+    case 'bool':
+      return { value: numericFill(0, type, what), raw: null };
+    case 'vlen':
+      return { value: '', raw: null };
+    default: {
+      const raw = new Uint8Array(type.itemSize);
+      const decoded = decodeRaw(raw, 0, 1, type, what);
+      return { value: type.form === 'opaque' ? decoded : decoded[0], raw };
+    }
+  }
+}
+
+/**
  * Decode a fill value.
  *
  * @param {unknown} json - `fill_value` as stored
@@ -583,12 +619,13 @@ function encodeElement(value, type, what) {
  * @param {2|3} version
  * @param {string} what
  * @returns {{value: unknown, raw: Uint8Array|null}} The value as reads return
- *   it (null: undefined contents), and for raw-assembled types its bytes
+ *   it (null for a type this reader does not read), and for raw-assembled
+ *   types its bytes; a null `fill_value` (Zarr v2) is `defaultFill`
  */
 export function decodeFill(json, type, version, what) {
   if (json === null) {
     if (version === 3) throw new ZarrFormatError(`${what}: a Zarr v3 array needs a fill_value.`);
-    return { value: null, raw: null };
+    return defaultFill(type, what);
   }
   if (type.unsupported) return { value: null, raw: null };
   switch (type.form) {

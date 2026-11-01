@@ -14,14 +14,20 @@
    Welcome dialog: the card over the viewer
    ========================================================================= */
 
+/* The dialog fills what the screen shows: `100dvh`, not the layout
+   viewport, so on a phone no part of it sits under the browser's toolbars.
+   `touch-action: manipulation` keeps a double tap on it from zooming the
+   page. */
 .welcome-modal {
   position: fixed;
   inset: 0;
+  height: 100dvh;
   z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: var(--space-5);
+  touch-action: manipulation;
 }
 
 .welcome-modal.hidden {
@@ -51,6 +57,9 @@
      bottom past the screen edges. */
   max-height: 100%;
   overflow-y: auto;
+  /* A scroll that reaches the card's end stops there, never moving the page
+     behind it. */
+  overscroll-behavior: contain;
 }
 
 .welcome-header {
@@ -298,5 +307,80 @@
 
   .welcome-body {
     padding: var(--space-2-5);
+  }
+}
+
+/* A narrow phone, or a phone with its text made larger (the browser's text
+   size or zoom leaves fewer CSS pixels across): the dialog's gutters and the
+   insets of its rows narrow, so the tagline and each choice's lines keep to
+   one line from 360 px at 130 % (277 CSS px across) up. */
+@media (max-width: 340px) {
+  .welcome-modal {
+    padding: var(--space-3);
+  }
+
+  .welcome-modal .welcome-content {
+    margin: 0;
+  }
+
+  .welcome-modal .welcome-header {
+    margin: var(--space-2) var(--space-2) 0;
+    padding-inline: var(--space-2);
+  }
+
+  .welcome-modal .welcome-btn {
+    gap: var(--space-2);
+    padding-inline: var(--space-2-5);
+  }
+
+  .welcome-modal .welcome-btn-icon {
+    width: var(--space-5);
+  }
+}
+
+/* A short screen (a phone on its side): the wordmark and the spacing shrink
+   so the intro and both choices are on screen together; the quote below
+   them is reached by scrolling the card. */
+@media (max-height: 480px) {
+  .welcome-modal {
+    padding: var(--space-2);
+  }
+
+  .welcome-modal .welcome-content {
+    margin: 0;
+  }
+
+  .welcome-modal .welcome-header {
+    margin: var(--space-2) var(--space-2) 0;
+    padding: var(--space-2);
+  }
+
+  .welcome-modal .welcome-logo {
+    width: 120px;
+    margin-bottom: var(--space-1);
+  }
+
+  .welcome-modal .welcome-body {
+    padding: var(--space-2-5);
+  }
+
+  .welcome-modal .welcome-intro {
+    margin-bottom: var(--space-2);
+  }
+}
+
+/* A very short screen (a small phone on its side with larger text, under
+   320 CSS px tall): smaller still, so both choices stay on screen. */
+@media (max-height: 320px) {
+  .welcome-modal .welcome-header {
+    padding: var(--space-1-5);
+  }
+
+  .welcome-modal .welcome-logo {
+    width: 96px;
+  }
+
+  .welcome-modal .welcome-body {
+    padding: var(--space-2);
   }
 }

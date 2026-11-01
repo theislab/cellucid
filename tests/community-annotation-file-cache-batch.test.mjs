@@ -206,7 +206,7 @@ test('caller abort physically aborts the owned cache batch transaction', async (
     controller.abort();
     await assert.rejects(
       operation,
-      error => error?.code === 'LOCAL_RAW_CACHE_WRITE_ABORTED'
+      error => error?.name === 'AbortError'
     );
     assert.equal(state.transactions, 1);
     assert.equal(state.aborts, 1);
@@ -249,7 +249,7 @@ test('a pre-aborted cache owner opens no transaction or SHA-index generation', a
         }],
         signal: controller.signal,
       }),
-      error => error?.code === 'LOCAL_RAW_CACHE_WRITE_ABORTED'
+      error => error?.name === 'AbortError'
     );
     assert.equal(state.transactions, 0);
     assert.equal(indexReads, 0);

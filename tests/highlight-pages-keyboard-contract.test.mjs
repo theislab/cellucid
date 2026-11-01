@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { initHighlightPagesUI } from '../assets/js/app/ui/modules/highlight/highlight-pages-ui.js';
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 
 class FakeClassList {
   constructor(element) {
@@ -350,6 +351,16 @@ function createState() {
       this.onChange();
       return page;
     },
+    highlightPageRecord(pageId) {
+      const index = this.pages.findIndex(page => page.id === pageId);
+      return index < 0 ? null : { page: this.pages[index], index, active: this.activePageId === pageId, cells: null };
+    },
+    restoreHighlightPage(record) {
+      operations.push(['restore', record.page.id]);
+      this.pages.splice(record.index, 0, record.page);
+      this.onChange();
+      return true;
+    },
     deleteHighlightPage(pageId) {
       operations.push(['delete', pageId]);
       this.pages = this.pages.filter(page => page.id !== pageId);
@@ -513,9 +524,25 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     ).find(control => control.getAttribute('aria-selected') === 'true');
     assert.equal(document.activeElement, activeTab);
 
-    activeTab.dispatch('keydown', { key: 'Delete' });
+    // Deleting offers Undo (audit F-9); taking it puts the very page back.
+    const notifications = getNotificationCenter();
+    const shown = [];
+    const show = notifications.show;
+    notifications.show = notice => shown.push(notice);
+    try {
+      activeTab.dispatch('keydown', { key: 'Delete' });
+    } finally {
+      notifications.show = show;
+    }
     assert.equal(state.pages.length, 2);
     assert.equal(state.activePageId, 'page_1');
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].action.label, 'Undo');
+    const deleted = operations.at(-1)[1];
+    shown[0].action.run();
+    assert.deepEqual(operations.at(-1), ['restore', deleted]);
+    assert.ok(state.pages.some(page => page.id === deleted));
+    state.deleteHighlightPage(deleted);
     activeTab = tabs.querySelectorAll(
       '.highlight-page-tab-activate'
     ).find(control => control.getAttribute('aria-selected') === 'true');

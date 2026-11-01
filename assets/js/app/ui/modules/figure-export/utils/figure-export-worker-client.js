@@ -8,7 +8,8 @@
  * copied to the worker once per session (a view's positions cross once
  * however many passes read them), and closing the session releases them.
  *
- * The point passes (`spriteZoomLimit`, `rasterizePoints`) draw with WebGL2 on
+ * The point passes (`spriteZoomLimit`, `rasterizePoints`, and `rasterContext`,
+ * which describes the context they draw with) draw with WebGL2 on
  * an OffscreenCanvas. Before the first of them the worker is asked once
  * whether it can create such a context (`webgl2`), and the answer holds for
  * the page's lifetime. Where it cannot -- WebKitGTK and WPE have no WebGL in
@@ -30,13 +31,18 @@ import { yieldToMacrotask } from '../../../../../utils/yield-macrotask.js';
 import { loadAppCode } from '../../../../app-code.js';
 import { figureExportWorkerScript } from '../../../../../../workers/scripts.js';
 import { startWorker } from '../../../../../workers/worker-script.js';
+import { workerFailureReason } from '../../../../../workers/worker-failure.js';
+import { PieceSender, placeArrays } from '../../../../../utils/large-arrays.js';
+import { registerIdleWorkers } from '../../../../../workers/idle-retirement.js';
+import { fromWire } from '../../../../../utils/error-wire.js';
+import { abortReason, awaitWithSignal, onAbort } from '../../../../../utils/abort.js';
 
 function createDefaultWorker() {
   return startWorker(figureExportWorkerScript(), { type: 'module' });
 }
 
 /** The operations that draw with WebGL2, run where a WebGL2 context exists. */
-const POINT_PASS_OPERATIONS = new Set(['spriteZoomLimit', 'rasterizePoints']);
+const POINT_PASS_OPERATIONS = new Set(['spriteZoomLimit', 'rasterizePoints', 'rasterContext']);
 
 let workerFactory = createDefaultWorker;
 /** @type {Worker|null} */
@@ -58,6 +64,21 @@ let nextRequestId = 1;
 let nextSessionId = 1;
 /** @type {Map<number, {resolve: Function, reject: Function}>} */
 const pending = new Map();
+/** Sessions not yet closed: the worker holds their arrays. */
+let openSessions = 0;
+
+/**
+ * With no session open and nothing asked, the worker -- with the WebGL
+ * contexts it draws with, which the browser caps -- and the page's own
+ * drawing host end after a while (`workers/idle-retirement.js`); the next
+ * export starts them again. Whether the worker can draw stays known.
+ */
+const idleExport = registerIdleWorkers(() => {
+  if (openSessions > 0 || pending.size > 0) return;
+  retireWorker(new Error('The figure-export worker ended while idle.'));
+  pageHost = null;
+  pageHostCreation = null;
+});
 
 /**
  * Replace how the worker is created (Node contract tests run the same
@@ -101,30 +122,6 @@ export function figureExportRasterizesOnPage() {
   return workerWebgl2 === null ? null : !workerWebgl2;
 }
 
-const ERROR_TYPES = { RangeError, TypeError, SyntaxError };
-
-/**
- * Rebuild an error the worker serialized, with its original class.
- *
- * @param {object} record
- * @returns {Error}
- */
-function rebuildWorkerError(record) {
-  const cause = record.cause === undefined ? undefined : rebuildWorkerError(record.cause);
-  const options = cause === undefined ? undefined : { cause };
-  if (record.name === 'AggregateError') {
-    return new AggregateError(
-      (record.errors ?? []).map(rebuildWorkerError),
-      record.message,
-      options
-    );
-  }
-  const ErrorType = ERROR_TYPES[record.name] ?? Error;
-  const error = new ErrorType(record.message, options);
-  if (!(record.name in ERROR_TYPES) && record.name !== 'Error') error.name = record.name;
-  return error;
-}
-
 /** Close whatever an abandoned answer still owns. */
 function discardResult(result) {
   if (typeof ImageBitmap === 'function' && result instanceof ImageBitmap) result.close();
@@ -138,7 +135,7 @@ function receive(data) {
     return;
   }
   pending.delete(data.id);
-  if (data.error !== undefined) entry.reject(rebuildWorkerError(data.error));
+  if (data.error !== undefined) entry.reject(fromWire(data.error));
   else entry.resolve(data.result);
 }
 
@@ -158,7 +155,7 @@ function ensureWorker() {
   created.onerror = (event) => {
     event.preventDefault?.();
     retireWorker(new Error(
-      `Figure-export worker failed: ${event.message || 'the worker could not run'}`
+      `Figure-export worker failed: ${workerFailureReason(event)}`
     ));
   };
   created.onmessageerror = () => {
@@ -180,6 +177,11 @@ async function createPageHost() {
   const host = {
     onmessage: null,
     postMessage(message) {
+      // A cancel is heard at once, ahead of the queue it stops (as in the worker).
+      if (message?.op === 'cancel') {
+        void handle(message);
+        return;
+      }
       queue = queue.then(async () => {
         const answer = await handle(message);
         if (answer !== null) host.onmessage?.({ data: answer.reply });
@@ -236,22 +238,6 @@ function askWorkerWebgl2() {
   return workerWebgl2Answer;
 }
 
-/** `promise`, or the export's abort if that comes first. */
-function untilAborted(promise, signal) {
-  if (signal === null) return promise;
-  return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      try {
-        throwIfFigureExportAborted(signal);
-      } catch (error) {
-        reject(error);
-      }
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
-  });
-}
-
 /**
  * Open one file's worker session.
  *
@@ -261,6 +247,7 @@ function untilAborted(promise, signal) {
  */
 export function openFigureExportWorkerSession({ signal = null } = {}) {
   const session = nextSessionId++;
+  openSessions++;
   /** Every array this session has named, by id. @type {Map<ArrayBufferView, number>} */
   const ids = new Map();
   /** @type {Map<number, ArrayBufferView>} */
@@ -269,6 +256,13 @@ export function openFigureExportWorkerSession({ signal = null } = {}) {
   const held = new WeakMap();
   let nextArrayId = 1;
   let closed = false;
+  // Stopped: the threads skip every request of the session still queued
+  // (the one running ends its pass; its answer is dropped here).
+  const stopQueued = onAbort(signal, () => {
+    if (closed) return;
+    worker?.postMessage({ op: 'cancel', session });
+    pageHost?.postMessage({ op: 'cancel', session });
+  });
 
   /**
    * Refer to `array` in a request; its bytes travel with the first request
@@ -317,33 +311,39 @@ export function openFigureExportWorkerSession({ signal = null } = {}) {
 
   function send(target, op, args, transfer) {
     const id = nextRequestId++;
-    const message = { id, op, session, uploads: uploadsFor(target, args), args };
+    let uploads = uploadsFor(target, args);
+    if (target !== pageHost) {
+      // An array larger than one ArrayBuffer (a WebAssembly memory's,
+      // `utils/large-arrays.js`) would be cloned whole: it crosses in
+      // pieces before the request instead, assembled by the worker.
+      const sender = new PieceSender((piece, pieceTransfer) => target.postMessage({ session, piece }, pieceTransfer));
+      uploads = placeArrays(uploads, view => sender.send(view));
+    }
+    const message = { id, op, session, uploads, args };
     return new Promise((resolve, reject) => {
-      const onAbort = () => {
-        if (!pending.has(id)) return;
-        pending.delete(id);
-        try {
-          throwIfFigureExportAborted(signal);
-        } catch (error) {
-          reject(error);
-        }
-      };
+      let stopListening = () => {};
       pending.set(id, {
         resolve: (value) => {
-          signal?.removeEventListener('abort', onAbort);
+          stopListening();
           resolve(value);
         },
         reject: (error) => {
-          signal?.removeEventListener('abort', onAbort);
+          stopListening();
           reject(error);
         },
       });
-      signal?.addEventListener('abort', onAbort, { once: true });
+      stopListening = onAbort(signal, () => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        reject(abortReason(signal));
+      });
+      // Stopped already: the request is not sent.
+      if (!pending.has(id)) return;
       try {
         target.postMessage(message, transfer);
       } catch (error) {
         pending.delete(id);
-        signal?.removeEventListener('abort', onAbort);
+        stopListening();
         reject(error);
       }
     });
@@ -362,7 +362,7 @@ export function openFigureExportWorkerSession({ signal = null } = {}) {
       return send(ensureWorker(), op, args, transfer);
     }
     return (async () => {
-      const rasterizeOnPage = !(await untilAborted(askWorkerWebgl2(), signal));
+      const rasterizeOnPage = !(await awaitWithSignal(askWorkerWebgl2(), signal));
       if (closed) throw new Error('Figure-export worker session is closed.');
       throwIfFigureExportAborted(signal);
       const target = rasterizeOnPage ? await ensurePageHost() : ensureWorker();
@@ -378,10 +378,13 @@ export function openFigureExportWorkerSession({ signal = null } = {}) {
     close() {
       if (closed) return;
       closed = true;
+      stopQueued();
       ids.clear();
       arrays.clear();
       worker?.postMessage({ op: 'close', session });
       pageHost?.postMessage({ op: 'close', session });
+      openSessions--;
+      if (openSessions === 0) idleExport.idle();
     },
   };
 }
@@ -418,14 +421,17 @@ export function pointPassRenderState(renderState) {
 }
 
 /**
- * A LOD descriptor as a session request carries it.
+ * A figure's LOD record (`LodMembership` with its drawn cells) as a session
+ * request carries it; the worker freezes it again (`reviveLodMembership`).
  *
  * @param {ReturnType<typeof openFigureExportWorkerSession>} session
- * @param {import('./lod-membership.js').LodMembership|null} membership
+ * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} membership
  */
-function shareLodMembership(session, membership) {
+export function shareLodMembership(session, membership) {
   if (membership === null) return null;
   return {
+    admissionLevels: session.share(membership.admissionLevels),
+    count: membership.count,
     dimensionLevel: membership.dimensionLevel,
     indices: session.share(membership.indices),
     lodLevel: membership.lodLevel,
@@ -488,6 +494,7 @@ export function pointRasterArgs(session, {
   highlightArray,
   emphasizeSelection,
   selectionMutedOpacity,
+  pointLayers = null,
 }) {
   return {
     positions: session.share(positions),
@@ -505,6 +512,7 @@ export function pointRasterArgs(session, {
     highlightArray: session.share(highlightArray),
     emphasizeSelection,
     selectionMutedOpacity,
+    pointLayers,
   };
 }
 

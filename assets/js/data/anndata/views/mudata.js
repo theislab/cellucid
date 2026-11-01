@@ -30,8 +30,9 @@
 
 import { isArrayNode, isGroup } from '../../../formats/store.js';
 import { defaultModality } from '../../data-mapping.js';
-import { attributeValue, encodingType } from '../elements.js';
+import { annDataOpeningPaths, attributeValue, encodingType } from '../elements.js';
 import { currentLayoutView, isOlderAnnDataLayout } from '../older-layouts.js';
+import { loadFrameStructure } from '../dataframe.js';
 import { LayoutRefusal } from './refusal.js';
 import {
   cellMapOf,
@@ -68,35 +69,45 @@ function modalityNames(mod) {
 function extendedFrame(frame, added) {
   const order = attributeValue(frame, 'column-order');
   const columns = Array.isArray(order) ? order.map(String) : [];
-  const children = new Map(frame.keys().map(key => [key, () => frame.get(key)]));
-  for (const [key, make] of added) children.set(key, make);
   return viewGroup({
     path: frame.path,
     real: frame,
     attrs: { ...frame.attrs, 'column-order': [...columns, ...added.keys()] },
     ownAttributes: ['column-order'],
-    children,
+    children: () => {
+      const children = new Map(frame.keys().map(key => [key, () => frame.get(key)]));
+      for (const [key, make] of added) children.set(key, make);
+      return children;
+    },
   });
 }
 
 /** A mapping group with more children. */
 function extendedMapping(path, real, added, drop = new Set()) {
-  const children = new Map();
-  if (isGroup(real)) {
-    for (const key of real.keys()) if (!drop.has(key)) children.set(key, () => real.get(key));
-  }
-  for (const [key, make] of added) children.set(key, make);
+  const children = () => {
+    const named = new Map();
+    if (isGroup(real)) {
+      for (const key of real.keys()) if (!drop.has(key)) named.set(key, () => real.get(key));
+    }
+    for (const [key, make] of added) named.set(key, make);
+    return named;
+  };
   return viewGroup({ path, real: isGroup(real) ? real : null, attrs: encodingAttrs('dict'), children });
 }
 
 /**
  * The AnnData view of a MuData store.
  *
+ * Building it reads the store's structure only (`MUDATA_OPENING_PATHS`,
+ * loaded first); a modality's columns, embeddings and graphs are presented
+ * from their metadata, their parts loaded when they are read.
+ *
  * @param {Object} root
- * @param {{name: string}} context
- * @returns {Object}
+ * @param {{name: string, signal?: AbortSignal|null, activity?: Object|null}} context
+ * @returns {Promise<Object>}
  */
-export function muDataView(root, { name }) {
+export async function muDataView(root, { name, signal = null, activity = null }) {
+  await root.load(MUDATA_OPENING_PATHS, { signal, activity });
   const axis = Number(attributeValue(root, 'axis') ?? 0);
   if (axis !== 0) {
     throw new LayoutRefusal(
@@ -110,10 +121,13 @@ export function muDataView(root, { name }) {
   if (names.length === 0) {
     throw new LayoutRefusal(`${name} is a MuData store with no modalities.`, { reason: 'no-modalities' });
   }
-  const groups = new Map(names.map(item => {
+  const groups = new Map(await Promise.all(names.map(async item => {
     const group = mod.get(item);
-    return [item, isOlderAnnDataLayout(group) ? currentLayoutView(group) : group];
-  }));
+    return [item, isOlderAnnDataLayout(group) ? await currentLayoutView(group, { signal, activity }) : group];
+  })));
+  // Each obs frame's index (its rows) and nested column names.
+  await Promise.all([root.get('obs'), ...[...groups.values()].map(group => group.get('obs'))]
+    .map(frame => loadFrameStructure(frame, { signal, activity })));
   const obsmaps = root.get('obsmap');
   const modalities = modalityList(names.map(item => ({
     name: item,
@@ -202,7 +216,7 @@ export function muDataView(root, { name }) {
     attrs: encodingAttrs('anndata'),
     ownAttributes: ['encoding-type', 'encoding-version'],
     children,
-    close: () => root.close?.(),
+    close: reason => root.close?.(reason),
     extra: { modalities, defaultModality: chosen },
   });
 }
@@ -226,8 +240,29 @@ function viewArrayColumn(mask, path) {
   });
 }
 
+/**
+ * What the MuData view reads of a store before presenting it: every global
+ * element's own node (the root to depth 2: `obs` columns, `obsm`, `obsp`,
+ * `obsmap` and `uns` entries, each modality's group) and each modality as an
+ * AnnData store's opening reads it (`ANNDATA_OPENING_PATHS`).
+ */
+export const MUDATA_OPENING_PATHS = Object.freeze([
+  { path: '', depth: 2 },
+  ...annDataOpeningPaths('mod/*'),
+].map(Object.freeze));
+
 /** The `.h5mu` entry of `LAYOUT_VIEWS`. */
-export const H5MU_VIEW = Object.freeze({ recognize: isMuDataRoot, view: muDataView, readerFormat: H5MU_FORMAT });
+export const H5MU_VIEW = Object.freeze({
+  recognize: async root => isMuDataRoot(root),
+  openingPaths: MUDATA_OPENING_PATHS,
+  view: muDataView,
+  readerFormat: H5MU_FORMAT,
+});
 
 /** The MuData Zarr entry of `LAYOUT_VIEWS`. */
-export const MUDATA_ZARR_VIEW = Object.freeze({ recognize: isMuDataRoot, view: muDataView, readerFormat: MUDATA_ZARR_FORMAT });
+export const MUDATA_ZARR_VIEW = Object.freeze({
+  recognize: async root => isMuDataRoot(root),
+  openingPaths: MUDATA_OPENING_PATHS,
+  view: muDataView,
+  readerFormat: MUDATA_ZARR_FORMAT,
+});

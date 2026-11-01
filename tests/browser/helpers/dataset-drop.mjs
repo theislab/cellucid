@@ -5,7 +5,7 @@
  * given the directory entry a real folder drop would carry, built from the
  * fixture files (hidden ones included, as a dropped folder lists them).
  */
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { chooseDirectory } from './directory-upload.mjs';
 
@@ -25,6 +25,9 @@ export async function folderPayload(directory) {
           path: entryPath,
           base64: (await readFile(path.join(absolute, entry.name)))
             .toString('base64'),
+          // Its modification time, as a dropped file carries it: the same
+          // file dropped again is the same file (its identity).
+          lastModified: Math.trunc((await stat(path.join(absolute, entry.name))).mtimeMs),
         });
       }
     }
@@ -43,7 +46,7 @@ export async function createDrag(page, { files = [], folder = null }) {
     const decode = base64 => Uint8Array.from(atob(base64), c => c.charCodeAt(0));
     const dataTransfer = new DataTransfer();
     for (const file of files) {
-      dataTransfer.items.add(new File([decode(file.base64)], file.name));
+      dataTransfer.items.add(new File([decode(file.base64)], file.name, file.lastModified === undefined ? {} : { lastModified: file.lastModified }));
     }
     if (folder !== null) {
       const root = { name: folder.name, children: new Map() };
@@ -57,7 +60,7 @@ export async function createDrag(page, { files = [], folder = null }) {
           node = node.children.get(part);
         }
         const name = parts.at(-1);
-        node.children.set(name, { name, file: new File([decode(file.base64)], name) });
+        node.children.set(name, { name, file: new File([decode(file.base64)], name, file.lastModified === undefined ? {} : { lastModified: file.lastModified }) });
       }
       const toEntry = node => (node.file !== undefined
         ? {

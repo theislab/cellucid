@@ -36,6 +36,7 @@ import {
   assertUserDocument,
   parseExactJson,
 } from './wire-contract.js';
+import { abortReason, onAbort, throwIfAborted } from '../../utils/abort.js';
 
 const DB_NAME = 'cellucid_community_annotation_file_cache';
 const DB_VERSION = 1;
@@ -136,11 +137,6 @@ function assertAbortSignalOrNull(signal) {
   return signal;
 }
 
-function cacheWriteAborted() {
-  const error = new Error('Community annotation cache batch write aborted');
-  error.code = 'LOCAL_RAW_CACHE_WRITE_ABORTED';
-  return error;
-}
 
 function assertCacheRecord(record, { key, scopeKey, path }) {
   if (
@@ -447,9 +443,9 @@ export class CommunityAnnotationFileCache {
     signal = null,
   }) {
     const ownerSignal = assertAbortSignalOrNull(signal);
-    if (ownerSignal?.aborted) throw cacheWriteAborted();
+    throwIfAborted(ownerSignal);
     await this.init();
-    if (ownerSignal?.aborted) throw cacheWriteAborted();
+    throwIfAborted(ownerSignal);
     if (!Array.isArray(records)) {
       throw new TypeError(
         'Community annotation cache batch records must be an array'
@@ -505,10 +501,11 @@ export class CommunityAnnotationFileCache {
     await new Promise((resolve, reject) => {
       let settled = false;
       let tx = null;
+      let stopWaiting = () => {};
       const settle = (callback, value) => {
         if (settled) return;
         settled = true;
-        ownerSignal?.removeEventListener('abort', abort);
+        stopWaiting();
         callback(value);
       };
       const abort = () => {
@@ -521,7 +518,7 @@ export class CommunityAnnotationFileCache {
           }
           tx.abort();
         } catch {
-          settle(reject, cacheWriteAborted());
+          settle(reject, abortReason(ownerSignal));
         }
       };
       try {
@@ -544,11 +541,11 @@ export class CommunityAnnotationFileCache {
         tx.onabort = () => settle(
           reject,
           ownerSignal?.aborted
-            ? cacheWriteAborted()
+            ? abortReason(ownerSignal)
             : (tx.error || new Error('IndexedDB cache batch write aborted'))
         );
-        ownerSignal?.addEventListener('abort', abort, { once: true });
-        if (ownerSignal?.aborted) abort();
+        // Already aborted: the transaction is aborted at once, before it commits.
+        stopWaiting = onAbort(ownerSignal, abort);
       } catch (error) {
         settle(
           reject,
@@ -563,7 +560,7 @@ export class CommunityAnnotationFileCache {
       }
     });
 
-    if (ownerSignal?.aborted) throw cacheWriteAborted();
+    throwIfAborted(ownerSignal);
     // Update the SHA index only after every JSON record is safely stored.
     const idx = readShaIndex(scope);
     for (const record of exactRecords) {

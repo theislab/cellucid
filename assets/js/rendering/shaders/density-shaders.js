@@ -152,8 +152,15 @@ export const SPLAT_COLOR_VS = `#version 300 es
 precision highp float;
 
 layout(location = 0) in vec3 a_position;
-// Per-cell display colour (normalized RGBA8; alpha is not used).
+// Per-cell display colour (normalized RGBA8; its alpha byte names the cell's
+// layer, rendering/alpha-visibility.js).
 layout(location = 1) in vec4 a_color;
+// The colours of the lower layers, made from the view's background
+// (rendering/read-cell-layer.js, cellLayerColors): the grey of the cells with
+// no value (254) and the fade of the cells not read (253). Their own RGB bytes
+// are not drawn.
+uniform vec3 u_zeroColor;
+uniform vec3 u_unreadColor;
 ${SPLAT_COMMON}
 out vec4 v_color;
 
@@ -167,7 +174,8 @@ void main() {
   }
   vec3 fp = (position + 1.0) * 0.5 * (gridSize - 1.0);
   ivec3 iv = clamp(ivec3(floor(fp + 0.5)), ivec3(0), ivec3(int(gridSize) - 1));
-  v_color = vec4(a_color.rgb, 1.0);
+  int layer = int(a_color.a * 255.0 + 0.5);
+  v_color = vec4(layer == 254 ? u_zeroColor : (layer == 253 ? u_unreadColor : a_color.rgb), 1.0);
   gl_Position = atlasClipPosition(iv, gridSize);
   gl_PointSize = 1.0;
 }

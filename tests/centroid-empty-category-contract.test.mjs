@@ -153,7 +153,19 @@ async function createScene(t, obsFields) {
 
   const centroidPublications = [];
   const labelPublications = [];
+  // Labels shown: they are elements only while a view shows them.
+  const flags = { points: true, labels: true };
+  const overlayListeners = [];
   const viewer = {
+    getCentroidFlags: () => ({ ...flags }),
+    onPresentedViewStateChanged(listener) {
+      overlayListeners.push(listener);
+      return () => {};
+    },
+    showLabels(show) {
+      flags.labels = show;
+      for (const listener of overlayListeners) listener({ generation: 1, reason: 'overlay', viewId: 'live' });
+    },
     hasVectorFieldForLayout: () => false,
     isDisposed: () => false,
     resetVectorFieldOverlay() {},
@@ -174,7 +186,7 @@ async function createScene(t, obsFields) {
   state.initVarData({ fields: [] });
   manager.setViewLayout('live', 'X_umap_2d');
   state.initScene(manager.getResidentPositions('X_umap_2d'), { fields: obsFields });
-  return { centroidPublications, labelPublications, layer, manager, state };
+  return { centroidPublications, labelPublications, layer, manager, state, viewer };
 }
 
 /** What the state drew for the active field: its centroids, one entry each. */
@@ -192,7 +204,7 @@ function drawn(state, layer) {
 }
 
 function expectedRgb(field, categoryIndex) {
-  return field._categoryColors[categoryIndex].map(channel => Math.round(channel * 255));
+  return Array.from(field._categoryColors.subarray(categoryIndex * 3, categoryIndex * 3 + 3));
 }
 
 test('a 70,000-category field draws one point and one label per category with cells', async t => {
@@ -318,4 +330,19 @@ test('a centroid that names no cells is refused where centroids are drawn', asyn
     () => state.buildCentroidsForField(field, { viewId: 'live', layoutKey: 'X_umap_2d' }),
     /Centroid 1 must contain an exact 2D position and a positive point count/
   );
+});
+
+test('centroid labels are elements only while the view shows them', async t => {
+  // A field of a million categories made an element a category on every
+  // switch and filter, shown or not: they are made when labels are on.
+  const { categories, codes } = largeInventory();
+  const { state, viewer } = await createScene(t, [
+    { key: 'cell_type', kind: 'category', categories, codes },
+  ]);
+  viewer.showLabels(false);
+  state.setActiveField(0);
+  assert.equal(state.centroidCount, 3, 'the centroids are drawn');
+  assert.equal(state.centroidLabels.length, 0, 'no label element while labels are off');
+  viewer.showLabels(true);
+  assert.deepEqual(state.centroidLabels.map(label => label.el.textContent), ['gamma', 'alpha', 'beta']);
 });

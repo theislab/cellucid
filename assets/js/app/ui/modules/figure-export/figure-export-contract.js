@@ -12,6 +12,7 @@ import { assertReferenceGridAppearance } from './utils/viewer-background.js';
 import { SHADER_QUALITIES } from '../../../../rendering/shader-quality.js';
 import { isBackdropLook } from '../../../../rendering/backdrops/backdrop-looks.js';
 import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
+import { abortReason, onAbort } from '../../../../utils/abort.js';
 
 const FORMATS = new Set(['png', 'svg']);
 const STRATEGIES = new Set(['full-vector', 'optimized-vector', 'hybrid']);
@@ -107,6 +108,7 @@ const SCIENTIFIC_STATE_KEYS = Object.freeze([
   'lodMembership',
   'lodSizeMultiplier',
   'normTransform',
+  'pointLayers',
 ]);
 const META_VIEW_KEYS = Object.freeze([
   'fieldKey',
@@ -275,13 +277,7 @@ export function isFigureExportSignalAborted(signal) {
 export function throwIfFigureExportAborted(signal) {
   if (signal === null) return;
   if (!readFigureExportAbortState(signal, 'Figure export signal')) return;
-  if (signal.reason !== undefined) throw signal.reason;
-  if (typeof DOMException === 'function') {
-    throw new DOMException('Figure export was aborted.', 'AbortError');
-  }
-  const error = new Error('Figure export was aborted.');
-  error.name = 'AbortError';
-  throw error;
+  throw abortReason(signal);
 }
 
 /**
@@ -300,41 +296,23 @@ export function awaitFigureExportAbortable(signal, operation) {
   throwIfFigureExportAborted(signal);
   return new Promise((resolve, reject) => {
     let settled = false;
-    const cleanup = () => {
-      signal.removeEventListener('abort', onAbort);
-    };
+    let stopListening = () => {};
     const settle = (callback, value) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      stopListening();
       callback(value);
     };
-    const onAbort = () => {
-      try {
-        throwIfFigureExportAborted(signal);
-      } catch (error) {
-        settle(reject, error);
-      }
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-    if (isFigureExportSignalAborted(signal)) {
-      onAbort();
-      return;
-    }
+    const settleAborted = () => settle(reject, abortReason(signal));
+    stopListening = onAbort(signal, settleAborted);
     Promise.resolve(operation).then(
       (value) => {
-        if (isFigureExportSignalAborted(signal)) {
-          onAbort();
-          return;
-        }
-        settle(resolve, value);
+        if (isFigureExportSignalAborted(signal)) settleAborted();
+        else settle(resolve, value);
       },
       (error) => {
-        if (isFigureExportSignalAborted(signal)) {
-          onAbort();
-          return;
-        }
-        settle(reject, error);
+        if (isFigureExportSignalAborted(signal)) settleAborted();
+        else settle(reject, error);
       }
     );
   });
@@ -552,6 +530,8 @@ function assertOwnedLegendValue(value, context, seen = new Set()) {
       `${context} must contain only acyclic, owned legend data.`
     );
   }
+  // A categorical's colours and visibility: bytes (`utils/category-state.js`).
+  if (value instanceof Uint8Array) return;
   seen.add(value);
   if (Array.isArray(value)) {
     const ownKeys = Reflect.ownKeys(value);
@@ -831,6 +811,14 @@ function assertScientificState(scientificState, data, context) {
     `${context}.lodSizeMultiplier`,
     Number.MIN_VALUE
   );
+  if (
+    scientificState.pointLayers === null
+    || typeof scientificState.pointLayers !== 'object'
+    || !(Number.isFinite(scientificState.pointLayers.readScale) && scientificState.pointLayers.readScale >= 1)
+    || typeof scientificState.pointLayers.readEveryLevel !== 'boolean'
+  ) {
+    throw new TypeError(`${context}.pointLayers must be {readScale >= 1, readEveryLevel}.`);
+  }
   requireExactKeys(
     scientificState.normTransform,
     NORM_TRANSFORM_KEYS,

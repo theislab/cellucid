@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
+import { RankLevels } from '../assets/js/rendering/high-perf/lod-levels.js';
+import { requireLodMembership } from '../assets/js/rendering/high-perf/renderer-contracts.js';
 import {
   getPresentedPane,
   resolvePresentedLayout,
@@ -508,51 +510,24 @@ test('LOD observer identity stays O(1) and changes with the spatial owner', () =
   );
 });
 
-test('sequential LOD ownership stays O(K) without materializing random membership', () => {
-  const renderer = Object.create(HighPerfRenderer.prototype);
-  renderer._perViewState = new Map([
-    ['live', { lastLodLevel: 0 }],
-  ]);
-  renderer.snapshotBuffers = new Map();
-  renderer._lodSpatialOwnerTokens = new WeakMap();
-  renderer._lodSequentialMemberships = new WeakMap();
-  const admitted = Uint32Array.from([7, 1, 9]);
-  const reducedLevel = {
-    indices: admitted,
-    isFullDetail: false,
-    pointCount: admitted.length,
-  };
-  const spatialOwner = {
-    dimensionLevel: 2,
-    lodLevels: [reducedLevel],
-    pointCount: 10_000_000,
-  };
-  renderer.spatialIndices = new Map([[2, spatialOwner]]);
-
-  const membership =
-    renderer.getCurrentLodSequentialMembership('live', 2);
+test('a rank-order level is published by its count: O(1), nothing built per cell', () => {
+  const levels = new RankLevels(10_000_000, 2, { minX: -1, maxX: 1, minY: -1, maxY: 1, minZ: 0, maxZ: 0 });
+  const membership = levels.getLodMembership(0);
   assert.ok(Object.isFrozen(membership));
-  assert.deepEqual(
-    Reflect.ownKeys(membership).sort(),
-    [
-      'dimensionLevel',
-      'generationToken',
-      'indices',
-      'lodLevel',
-      'pointCount',
-    ],
-  );
-  assert.equal(membership.indices, admitted);
-  assert.equal(membership.pointCount, spatialOwner.pointCount);
   assert.equal(
-    renderer.getCurrentLodSequentialMembership('live', 2),
+    requireLodMembership(membership, { pointCount: 10_000_000, dimensionLevel: 2, owner: 'test' }),
     membership,
-    'one stable descriptor must be reused for the same spatial level',
   );
+  assert.deepEqual(
+    [membership.count, membership.admissionLevels, membership.indices],
+    [levels.lodLevels[0].pointCount, null, null],
+  );
+  assert.equal(levels.getLodMembership(0), membership, 'one stable record a level');
+  assert.equal(levels.getLodMembership(levels.lodLevels.length - 1), null, 'full detail');
   assert.equal(
-    spatialOwner._lodMembershipOwner,
-    undefined,
-    'sequential ownership must not allocate the N-byte admission table',
+    Object.values(levels).some(value => ArrayBuffer.isView(value)),
+    false,
+    'no per-cell array is held',
   );
 });
 
@@ -631,8 +606,8 @@ test('presented state owns renderer-equivalent layout, camera, fog, and LOD cert
   );
   assert.match(
     viewerSource,
-    /hpRenderer\.getCurrentLodSequentialMembership\(/,
-    'borrowed preview/export ownership must consume the compact K-prefix descriptor',
+    /const lodMembership = hpRenderer\.getCurrentLodMembership\(/,
+    'borrowed preview/export ownership consumes the renderer\'s one LodMembership record',
   );
   assert.match(
     publicationSource,

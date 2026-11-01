@@ -10,7 +10,7 @@
  * an `AbortError` at once and stops its work (`worker-pool.js`); it is not
  * a failure and never retires the pool.
  *
- * A terminal worker pool (crash or timeout) fails the
+ * A terminal worker pool (a worker that crashed or cannot be reached) fails the
  * operations it owned and is then retired: `getStatus()` keeps reporting the
  * failure, and the next `init()` or `execute()` discovers a fresh pool rather
  * than rejecting every later worker operation until the page reloads.
@@ -24,7 +24,7 @@ import {
 import { executeOperation } from './operation-handlers.js';
 import { debug } from '../shared/debug-utils.js';
 // A cancelled operation never starts.
-import { throwIfAborted } from '../../jobs/cancellable-job.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 import { requireClonedRecord, requireKeys } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
@@ -32,8 +32,8 @@ let workerPoolModule = null;
 let computeManagerInstance = null;
 
 const BACKENDS = new Set(['worker', 'cpu']);
-const EXECUTION_OPTIONS = new Set(['backend', 'timeout', 'signal', 'transfer', 'onTiming', 'worker']);
-const BROADCAST_OPTIONS = new Set([...EXECUTION_OPTIONS, 'retainAs', 'releases']);
+const EXECUTION_OPTIONS = new Set(['backend', 'signal', 'transfer', 'onTiming', 'worker']);
+const BROADCAST_OPTIONS = new Set([...EXECUTION_OPTIONS, 'retainAs', 'releases', 'heldBytes']);
 
 function now() {
   if (
@@ -160,12 +160,6 @@ export class ComputeManager {
     requireKeys(options, [], allowed, 'Execution options');
     if (Object.hasOwn(options, 'backend') && !BACKENDS.has(options.backend)) {
       throw new TypeError(`Unknown compute backend: ${options.backend}`);
-    }
-    if (
-      Object.hasOwn(options, 'timeout')
-      && (!Number.isSafeInteger(options.timeout) || options.timeout <= 0)
-    ) {
-      throw new TypeError('Compute timeout must be a positive safe integer');
     }
     if (
       Object.hasOwn(options, 'signal')
@@ -295,9 +289,11 @@ export class ComputeManager {
    * @param {(threadIndex: number) => Object} payloadFor - A payload per thread
    *   (each is transferred, so each must own its buffers)
    * `retainAs` / `releases` name state a worker keeps for later tasks, which
-   * a worker replaced after a cancelled task gets again (`WorkerPool.broadcast`).
+   * a worker replaced after a cancelled task gets again (`WorkerPool.broadcast`);
+   * `heldBytes`, what each worker holds for that state (counted in the
+   * `analysis` share while it is kept).
    *
-   * @param {{backend?: 'worker'|'cpu', timeout?: number, signal?: AbortSignal|null, retainAs?: string, releases?: string}} [options]
+   * @param {{backend?: 'worker'|'cpu', signal?: AbortSignal|null, retainAs?: string, releases?: string, heldBytes?: number}} [options]
    * @returns {Promise<Object[]>} One result per thread
    */
   async broadcast(operation, payloadFor, options = {}) {
@@ -313,12 +309,13 @@ export class ComputeManager {
     }
     const pool = this._workerBackend;
     if (!pool) throw new Error('Web Worker backend is unavailable');
-    const { timeout = 30000, signal = null, retainAs, releases } = options;
+    const { signal = null, retainAs, releases, heldBytes } = options;
     const kept = {};
     if (retainAs !== undefined) kept.retainAs = retainAs;
     if (releases !== undefined) kept.releases = releases;
+    if (heldBytes !== undefined) kept.heldBytes = heldBytes;
     try {
-      return await pool.broadcast(operation, payloadFor, { timeout, signal, ...kept });
+      return await pool.broadcast(operation, payloadFor, { signal, ...kept });
     } finally {
       this._retireTerminalWorker();
     }
@@ -346,8 +343,8 @@ export class ComputeManager {
       throw new Error('Web Worker backend is unavailable');
     }
 
-    const { timeout = 30000, signal = null, transfer, onTiming, worker } = options;
-    const workerOptions = { timeout, signal };
+    const { signal = null, transfer, onTiming, worker } = options;
+    const workerOptions = { signal };
     if (transfer !== undefined) workerOptions.transfer = transfer;
     if (onTiming !== undefined) workerOptions.onTiming = onTiming;
     try {

@@ -10,16 +10,67 @@
  * measures each request (`begin()` / `end()`) and every decision follows
  * the measurement:
  *
- * - **Round trip** (`latencyMs`): the shortest request seen, an upper bound
- *   on a round trip (and, on a fast link, the cost of one request).
- * - **Bandwidth** (`bytesPerMs`): the fastest delivery seen, over one request
- *   (its bytes over its whole time, round trip included: a lower bound) or
- *   over a period with requests continuously in flight, once the period has
- *   lasted a round trip past its first bytes.
+ * - **Round trip** (`latencyMs`): the shortest of the latest requests whose
+ *   time is mostly a round trip (their bytes' transfer at their share of the
+ *   bandwidth at most half of it; every request until the bandwidth is
+ *   measured), `RECENT_REQUESTS` of them: an upper bound on a round trip now
+ *   (and, on a fast link, the cost of one request). A request mostly
+ *   transfer says little of the round trip, and counted would make long
+ *   requests look like a slow round trip, which lengthens requests more.
+ * - **Round trip under load** (`loadedLatencyMs`): what a request takes as
+ *   the reads go, less its bytes' transfer at its share of the bandwidth
+ *   (the requests in flight sharing it): the median of the latest
+ *   requests' made on a connection already set up (a request that opened
+ *   one waited for its handshakes too: an export priced from an opening's
+ *   requests took the round trip under load at 883 ms, 365 ms as it ran). A host answers slower under load than idle (S3 us-west-2
+ *   from Europe: 230 ms the shortest, 0.35-0.5 s a small request with 42
+ *   in flight), and what a read will take is priced at this
+ *   (`loadedRoundTripMs`: the gene sample, Genes read for, an export,
+ *   a progressive first view); shaping (which gaps a plan fetches, how
+ *   long a request is) keeps the shortest.
+ * - **Requests a host completes under load** (`loadedRequestMs`): with at
+ *   least `backgroundConcurrency` requests in flight and requests waiting, the time between completions less their bytes'
+ *   transfer, over the latest of them: what one more request really costs
+ *   when a read is request-bound. A path may complete only so many small
+ *   requests a second whatever the connections (CELLxGENE's S3 mirrors from
+ *   Europe: 70-88 a second with 42 in flight, 14 ms a request, where a
+ *   round trip over the connections said 6 ms), so plans price a request at
+ *   no less (`requestCostMs`, `requestMs`): the floor of a read is the
+ *   longer of its requests over that rate and its bytes over the bandwidth.
+ * - **Bandwidth** (`bytesPerMs`): the fastest of the latest requests'
+ *   deliveries, each over one request (its bytes over its whole time, round
+ *   trip included: a lower bound) or over the stretch of requests
+ *   continuously in flight it ended (at most the latest requests', once the
+ *   stretch has lasted a round trip past its first bytes).
+ *
+ * **A link changes while it is read** (a connection gets slower, then faster
+ * again), so each is measured over the latest requests only, a window that
+ * slides with every request: the shortest round trip and the fastest
+ * delivery of a window, as TCP BBR models a path (Cardwell et al., "BBR:
+ * Congestion-Based Congestion Control", ACM Queue 14(5), 2016: a windowed
+ * minimum of the round trip, a windowed maximum of the delivery rate). A
+ * link that gets faster is followed at its first faster request; one that
+ * gets slower once a window of requests has seen nothing faster; one odd
+ * request moves neither the shortest nor the fastest of a window the other
+ * way. Every decision that follows (merge gaps, request sizes, reading
+ * ahead, the price of a read) reads the window as it is now.
+ * - **The clock's resolution** (`clockTickMs`): a request is timed by a
+ *   clock that may tick in whole milliseconds (`performance.now()` in
+ *   WebKit and Firefox, measured in their workers: 1 ms; Chromium 0.1 ms).
+ *   One request's measured time is right on average, but the shortest of
+ *   many is the one the ticks cut shortest: below the true shortest by up to
+ *   a tick, and 0 for a request that ended within one (a server on the same
+ *   machine), which priced every round trip at nothing (no gap merged, no
+ *   ask of the page's range cache, `range-cache.js`). Each request is
+ *   counted half a tick longer than measured: the shortest then lies in the
+ *   middle of where the true one does, and no request takes no time.
  *
  * Until both are measured, the link is the source's prior (`ReadPolicy`:
  * what a file of its kind is assumed to be): a local file a disk, read ahead
  * from the start; a web host nothing, read ahead only once measured.
+ * A local file's reads measure only a lower bound of its bandwidth (a read
+ * of a few hundred bytes is mostly its fixed cost): what follows is priced
+ * at no less than its prior's bandwidth.
  *
  * What follows from the link:
  *
@@ -32,11 +83,17 @@
  *   byte reader prices each plan's gaps under every concurrency the host
  *   may have (`concurrencies`) instead (`byte-reader.js`, `planMergeGap`).
  * - `maxRequestBytes`: a large read is split into requests this long, so it
- *   runs on every slot; each request is long enough that its round trip is
- *   covered by the other requests' transfers (bandwidth x latency x
- *   concurrency), and never shorter than the source's prior: on a fast link
- *   more, shorter requests only add per-request work and the copies that
- *   join their pieces.
+ *   runs on every slot. The bandwidth measured is the whole link's, shared
+ *   by every request in flight: a request of one round trip's worth of bytes
+ *   (bandwidth x latency) already keeps the link busy for as long as its own
+ *   round trip, so a longer one only serialises its bytes on one connection
+ *   (over HTTP/1.1, behind nothing else) while other slots idle. Never
+ *   shorter than the source's prior: on a fast link more, shorter requests
+ *   only add per-request work and the copies that join their pieces. Where
+ *   one connection carries only part of the link (`connectionBytesPerMs`,
+ *   a transfer-bound request's own delivery: Amazon S3), a plan's long
+ *   requests are split further, over every connection, down to one
+ *   connection's round trip of bytes (`byte-reader.js` `requestPieceBytes`).
  * - `roundTripBytes`: what one round trip is worth in bytes of transfer
  *   (bandwidth x latency), the price of a request in the read cost models.
  * - `readsAhead`: whether the link delivers bytes at least as fast as the
@@ -102,7 +159,33 @@
  */
 export const READ_AHEAD_BYTES_PER_MS = 64 * 1000;
 
-const now = () => performance.now();
+/** The clock links are measured with unless given another: `performance.now()`. */
+export const performanceNow = () => performance.now();
+
+/** This realm's `performance.now()` resolution, once measured (`clockTickMs`). */
+let realmTickMs = null;
+
+/**
+ * The resolution, in milliseconds, of `performance.now()` in this realm: the
+ * smallest step it is seen to take in a few steps (`clock` itself: a few
+ * ticks of busy reading, once per realm).
+ *
+ * @returns {number}
+ */
+export function clockTickMs() {
+  if (realmTickMs !== null) return realmTickMs;
+  let smallest = Infinity;
+  let last = performanceNow();
+  for (let steps = 0, reads = 0; steps < 3 && reads < 10_000_000; reads++) {
+    const at = performanceNow();
+    if (at === last) continue;
+    if (at > last) smallest = Math.min(smallest, at - last);
+    last = at;
+    steps++;
+  }
+  realmTickMs = Number.isFinite(smallest) ? smallest : 0;
+  return realmTickMs;
+}
 
 /**
  * Runs `callback` once `ms` milliseconds have passed (`setTimeout`) and
@@ -117,6 +200,19 @@ export function afterRealTime(ms, callback) {
   return () => clearTimeout(timer);
 }
 
+/** The shortest a request may stay silent before it is stalled, once its link has answered: RFC 6298's floor (2.4). */
+export const MIN_STALL_TIMEOUT_MS = 1000;
+
+/**
+ * How long a request may stay silent before its link has answered once: its
+ * first answer waits for the connection to be made too (DNS, TCP and TLS,
+ * and any redirect), which a round trip's timeout never covered: RFC 6298
+ * 5.7 and RFC 1122 4.2.3.1 give connection set-up 3 s. Measured: a
+ * Dropbox share link's first byte took 2.1–2.2 s, S3 us-west-2's 0.7–2.4 s,
+ * EBI's over 1 s, each healthy, each aborted as stalled at 1 s before.
+ */
+export const FIRST_ANSWER_TIMEOUT_MS = 3000;
+
 /**
  * How long a request to a web host may stay silent before it is taken for
  * stalled, from the answers measured on the link: TCP's retransmission
@@ -124,16 +220,21 @@ export function afterRealTime(ms, callback) {
  *
  * - Each answer's wait `R` updates the smoothed wait and its variation
  *   (`SRTT`, `RTTVAR`; alpha 1/8, beta 1/4); the timeout is
- *   `SRTT + 4 * RTTVAR`, never under one second (RFC 6298 2.4), and one
- *   second until the first answer (2.1).
+ *   `SRTT + 4 * RTTVAR`, never under one second (RFC 6298 2.4), and three
+ *   seconds until the first answer (`FIRST_ANSWER_TIMEOUT_MS`: that answer
+ *   waits for the connection to be made, RFC 6298 5.7).
  * - Each stall doubles it (5.5), and the next answer computes it afresh
  *   (5.7): a host that has slowed down is given longer, at once.
  *
- * A request is stalled only when neither it nor any other request of the
- * link has received anything for a whole timeout (`lastActivityAt`): while
- * the link delivers bytes, a request waiting behind them (in a browser's
- * HTTP/1.1 queue, or behind an HTTP/2 host's other streams) is waiting, not
- * stalled; once the link falls silent, every request still open is.
+ * A request is stalled only when neither it, nor any other request of the
+ * link (`lastActivityAt`), nor any request to its host anywhere in this site
+ * (`hosts.js`: the browser's connections to a host are shared by every
+ * reader) has received anything for a whole timeout: while the host
+ * delivers bytes, a request waiting behind them (in a browser's HTTP/1.1
+ * queue, or behind an HTTP/2 host's other streams) is waiting, not stalled;
+ * once the host falls silent, every request still open is. A host's first
+ * answer time seeds a link's timeout (`hosts.js` `rememberedAnswer`,
+ * `ResponseClock.answered`).
  */
 export class ResponseClock {
   /**
@@ -143,7 +244,7 @@ export class ResponseClock {
    *   a virtual clock and its timers); `bandwidth`, the link's measured bytes
    *   per millisecond (0 until measured)
    */
-  constructor({ clock = now, after = afterRealTime, bandwidth = () => 0 } = {}) {
+  constructor({ clock = performanceNow, after = afterRealTime, bandwidth = () => 0 } = {}) {
     this.now = clock;
     this.after = after;
     this._bandwidth = bandwidth;
@@ -156,6 +257,12 @@ export class ResponseClock {
     this.onReceived = null;
     /** Told of each request made again after a transient failure: `(error, attempts)`. */
     this.onRetry = null;
+    /**
+     * Told when a request waits for a wait its host named (a request
+     * budget's, a `Retry-After`: `byte-source.js` `HostWait`), and null once
+     * it no longer does.
+     */
+    this.onWait = null;
   }
 
   /** A request was answered `waitedMs` after it was sent. */
@@ -196,9 +303,96 @@ export class ResponseClock {
 
   /** How long a request and its link may stay silent before the request is stalled. */
   get timeoutMs() {
-    const base = this._smoothed === null ? 1000 : this._smoothed + 4 * this._variation;
-    return Math.max(1000, base) * this._backoff;
+    const base = this._smoothed === null ? FIRST_ANSWER_TIMEOUT_MS : this._smoothed + 4 * this._variation;
+    return Math.max(MIN_STALL_TIMEOUT_MS, base) * this._backoff;
   }
+}
+
+/**
+ * The latest requests the link is measured over (its round trip, the round
+ * trip under load and its bandwidth): enough that one odd request moves no
+ * estimate (the shortest, the median and the fastest of sixteen), few enough
+ * that a slower or faster link is followed within a few rounds of requests.
+ * A measuring choice.
+ */
+export const RECENT_REQUESTS = 16;
+
+/**
+ * A request whose time is at least this many round trips is bounded by the
+ * link's transfer, not by its round trip: its delivery measures the link
+ * (`LinkMeter._rate`). Two round trips of transfer past its own round trip,
+ * so a host answering slower under load (S3: 0.35-0.5 s against 230 ms
+ * idle) is not taken for a slower link. A measuring choice.
+ */
+const TRANSFER_BOUND = 3;
+
+/**
+ * One connection carries only part of the link when a transfer-bound
+ * request alone on the link (nothing else in flight from its start to its
+ * end) delivered less than this share of the most the link has delivered,
+ * which requests together have shown (Amazon S3: 0.5 MB/s a connection, tens of
+ * MB/s in all). A request's delivery while others share the link is its share
+ * of a busy link, not what a connection can carry: counted as a
+ * connection's, it made `requestPieceBytes` split the next plan finer, which
+ * shared the link among more requests, whose deliveries were smaller again
+ * (a 10M-cell export over an emulated 30 MB/s HTTP/2 link: 255 → 7,556
+ * requests of 16-40 KB, +18 % time, +45 % CPU, the same bytes). A
+ * measuring choice (the margin keeps a lone request a little below the
+ * link's best for the link's).
+ */
+const CONNECTION_BOUND_SHARE = 0.8;
+
+/**
+ * Transfer-bound deliveries at or above a rate before it counts as what the
+ * link can carry for that rule (`connectionRoundTripBytes`): requests in
+ * flight together end one after another, each a delivery of the stretch, so
+ * a link that carries more than a connection shows it many times over; one
+ * delivery timed over a stretch little longer than the clock's tick (a
+ * loopback host, bytes a cache had) can be any rate, and taken alone it
+ * split every later plan of the page (a 1 % share's `.h5ad` export of a 10M
+ * file on a local web host: 473 → 3,135 requests, 6.2 → 18.2 s, the same
+ * bytes, after one such delivery). A measuring choice.
+ */
+const LINK_EVIDENCE = 4;
+
+/** The smallest (`sign` 1) or largest (-1) of a ring's first `count` values. */
+function extremeOf(ring, count, sign) {
+  let best = sign > 0 ? Infinity : 0;
+  for (let i = 0; i < Math.min(count, ring.length); i++) best = sign > 0 ? Math.min(best, ring[i]) : Math.max(best, ring[i]);
+  return best;
+}
+
+/**
+ * What one round trip to a link is worth in bytes of transfer: measured
+ * (`roundTripBytes`: bandwidth x latency), else the merge gap per request
+ * that really runs at once (`shapingConcurrency`: a host's connections
+ * until it is known to multiplex -- six over HTTP/1.1, each mirror its own
+ * -- never the streams requests are dispatched at, which priced an
+ * HTTP/1.1 host's round trip at 100 requests' gaps). The one rule every
+ * read price uses (`sparse-column-index.js`, `formats/hdf5/chunk-index.js`,
+ * `data/anndata/matrix-access.js`). `link`: a `LinkMeter`, its snapshot,
+ * or costs of the same names; 0 without one.
+ *
+ * @param {{roundTripBytes?: number|null, mergeGapBytes?: number, shapingConcurrency?: number, concurrency?: number}|null|undefined} link
+ * @returns {number}
+ */
+export function roundTripBytesOf(link) {
+  if (link === null || link === undefined) return 0;
+  return link.roundTripBytes ?? (link.mergeGapBytes ?? 0) * (link.shapingConcurrency ?? link.concurrency ?? 1);
+}
+
+/**
+ * The round trip a read is priced at over `link` (a `LinkMeter` or its
+ * snapshot): its round trip under load once measured, never shorter than
+ * its shortest; the shortest until then.
+ *
+ * @param {{latencyMs: number|null, loadedLatencyMs?: number|null}} link
+ * @returns {number}
+ */
+export function loadedRoundTripMs(link) {
+  const shortest = link.latencyMs;
+  const loaded = link.loadedLatencyMs;
+  return Number.isFinite(loaded) && loaded > shortest ? loaded : shortest;
 }
 
 export class LinkMeter {
@@ -208,13 +402,20 @@ export class LinkMeter {
    *   connections), its streams (a web host's start before its protocol is
    *   known; none for a local file) and block size always, its merge gap,
    *   request size and bandwidth until the link is measured
-   * @param {{clock?: () => number, after?: (ms: number, callback: () => void) => () => void}} [options] -
+   * @param {{clock?: () => number, after?: (ms: number, callback: () => void) => () => void, tickMs?: number}} [options] -
    *   `clock` in milliseconds, and `after`, the timers of its requests
-   *   (`ResponseClock`; tests)
+   *   (`ResponseClock`; tests); `tickMs`, the clock's resolution
+   *   (`clockTickMs` for `performance.now`, else 0: a virtual clock is exact)
    */
-  constructor(prior, { clock = now, after = afterRealTime } = {}) {
+  constructor(prior, { clock = performanceNow, after = afterRealTime, tickMs = clock === performanceNow ? clockTickMs() : 0, requestCost = null } = {}) {
+    if (!(tickMs >= 0)) throw new TypeError('A clock tick is a duration of 0 or more milliseconds.');
+    if (requestCost !== null && typeof requestCost !== 'function') throw new TypeError('A request cost is a function of no argument.');
     this._prior = prior;
+    /** What the host's request budget makes one more request cost (`hosts.js` `requestCostMs`), read when priced. */
+    this._requestCost = requestCost;
     this._clock = clock;
+    /** Half the clock's resolution: what each measured request is counted longer by. */
+    this._halfTick = tickMs / 2;
     /** Requests an HTTP/1.1 host answers at once (the browser's connections). */
     this._connections = prior.concurrency;
     /** Where the concurrency starts: the host's streams, or a local file's concurrency. */
@@ -229,11 +430,80 @@ export class LinkMeter {
     this.multiplexed = prior.streams === undefined ? true : null;
     /** The highest concurrency known to pay, which background work stays under. */
     this._paid = this._start;
-    /** The shortest request so far (Infinity until one completes). */
-    this.latencyMs = Infinity;
-    /** The fastest delivery over a busy period (0 until measured). */
-    this.bytesPerMs = 0;
+    /** The latest requests' times that were mostly a round trip, a ring of `RECENT_REQUESTS`: `latencyMs` is their shortest. */
+    this._roundTrips = new Float64Array(RECENT_REQUESTS);
+    this._roundTripCount = 0;
+    this._latency = null;
+    /**
+     * The latest requests' round trips under load (each request's time less
+     * its bytes' transfer at its share of the bandwidth), a ring of
+     * `RECENT_REQUESTS`: `loadedLatencyMs` is their median (null: stale).
+     */
+    this._turns = new Float64Array(RECENT_REQUESTS);
+    this._turnCount = 0;
+    this._loaded = null;
+    /** The latest deliveries (bytes a millisecond), a ring of `RECENT_REQUESTS`: `bytesPerMs` is their fastest. */
+    this._rates = new Float64Array(RECENT_REQUESTS);
+    this._rateCount = 0;
+    this._bandwidth = null;
+    /** Whether each of `_rates` kept the link full (`_rate`): `bandwidthMeasured` once one of the window did. */
+    this._rateFull = new Uint8Array(RECENT_REQUESTS);
+    /**
+     * Requests begun at each time on a connection already set up (`begin`):
+     * the others set one up first, and their time is no round trip under load.
+     */
+    this._warmAt = new Map();
+    /**
+     * The latest ends while every request slot was busy, without a break
+     * (`at`, bytes), a ring of `RECENT_REQUESTS`: `loadedRequestMs` (null: stale).
+     */
+    this._saturatedAt = new Float64Array(RECENT_REQUESTS);
+    this._saturatedBytes = new Float64Array(RECENT_REQUESTS);
+    this._saturatedCount = 0;
+    this._loadedRequest = null;
+    /** The fastest delivery measured on this link (bytes a millisecond), whenever it was. */
+    this._fastestBytesPerMs = 0;
+    /** The `LINK_EVIDENCE` fastest transfer-bound deliveries, one an end, whenever they were, descending: `connectionRoundTripBytes`. */
+    this._fastestBound = new Float64Array(LINK_EVIDENCE);
+    /** The transfer-bound delivery of the request ending now (its own or its stretch's), 0 when none: `_noteBound`. */
+    this._endBound = 0;
+    /** One request's own delivery when its time was mostly transfer, a ring of `RECENT_REQUESTS`: `connectionBytesPerMs`. */
+    this._requestRates = new Float64Array(RECENT_REQUESTS);
+    this._requestRateCount = 0;
+    /** The latest requests' round trips on a connection already made, a ring: `warmLatencyMs` is their shortest. */
+    this._warmTrips = new Float64Array(RECENT_REQUESTS);
+    this._warmCount = 0;
+    /** Whether the request ending now added its own delivery (`_rate`): its stretch's then raises that entry. */
+    this._sampled = false;
+    /**
+     * Requests begun at each time that found a connection at once (`begin`):
+     * the rest waited in the browser's queue, and their time is no round trip.
+     */
+    this._onConnection = new Map();
+    /** Whether the request ending now was bounded by transfer (`TRANSFER_BOUND`). */
+    this._transferBound = false;
+    /** The latest ends of the stretch in flight now (`at`, its bytes so far), a ring: a delivery over the latest of it. */
+    this._stretchAt = new Float64Array(RECENT_REQUESTS);
+    this._stretchBytes = new Float64Array(RECENT_REQUESTS);
+    this._stretchCount = 0;
+    /** When the link first completed a request (null until then). */
+    this._firstEndAt = null;
+    /**
+     * Bytes the link delivered in the requests it measured: how much its
+     * measurement rests on (`data/host-link-memory.js` weighs what a host
+     * delivered on an earlier visit against it).
+     */
+    this.deliveredBytes = 0;
+    /**
+     * Milliseconds with at least one request in flight: `deliveredBytes`
+     * over it is the rate the link sustained for the reads made of it,
+     * round trips and all (what a host really delivered to them; the
+     * fastest delivery, `bytesPerMs`, is the best moment of it).
+     */
+    this.busyMs = 0;
     this._inFlight = 0;
+    /** The start of the one request in flight while no other has begun beside it, else null (`end`: `alone`). */
+    this._aloneSince = null;
     this._completedCount = 0;
     this._busySince = 0;
     this._busyBytes = 0;
@@ -252,6 +522,13 @@ export class LinkMeter {
      * search has ended.
      */
     this._search = { settled: false, previousRate: null, since: null, completed: 0 };
+    /** Requests waiting for a slot, as the scheduler last said (`waiting`). */
+    this._queued = 0;
+    /**
+     * Requests the host lets run at once since it said it was busy
+     * (`throttled`): Infinity until it does.
+     */
+    this._cap = Infinity;
     /** When a request to this link is stalled (`ResponseClock`). */
     this.responses = new ResponseClock({ clock, after, bandwidth: () => this.bytesPerMs });
   }
@@ -272,10 +549,30 @@ export class LinkMeter {
   }
 
   /**
+   * The host answered that it is busy: the requests let run at once are
+   * halved, from what was running, and then grow back by one for every round
+   * of requests the host answers (additive increase, multiplicative decrease,
+   * as TCP does with a congested path), until they reach the concurrency
+   * again. Nothing calls this today: a busy host is asked less at once by
+   * the realm's host book instead (`hosts.js` `slowDown`, on a 429 or a 403
+   * that names a limit), so `admitted` equals `concurrency`.
+   */
+  throttled() {
+    const running = Math.min(this.admitted, Math.max(1, this._inFlight));
+    this._cap = Math.max(1, Math.floor(running / 2));
+  }
+
+  /** Requests to start at once: the concurrency, under the cap a busy host set (`throttled`). */
+  get admitted() {
+    return Math.max(1, Math.min(this.concurrency, Math.floor(this._cap)));
+  }
+
+  /**
    * Requests waiting for a slot (`count`), as a scheduler sees them each time
    * it starts requests: while some wait, the concurrency is being measured.
    */
   waiting(count) {
+    this._queued = count;
     const search = this._search;
     if (!this._searching()) return;
     if (count > 0) {
@@ -412,10 +709,23 @@ export class LinkMeter {
   /** A request starts; returns its start time, for `end`. */
   begin() {
     const started = this._clock();
+    // Begun with every connection the host is known to give busy (six an
+    // address over HTTP/1.1, the file's mirrors each their own six), it
+    // waits in the browser's queue first: its time is not a round trip.
+    if (this.multiplexed === true || this._inFlight < this._connections) {
+      this._onConnection.set(started, (this._onConnection.get(started) ?? 0) + 1);
+    }
+    // On a connection set up already: one request has completed on each
+    // connection a request finds free (a host that multiplexes: on its one).
+    const established = this.multiplexed === true ? Math.min(1, this._completedCount) : Math.min(this._connections, this._completedCount);
+    if (this._inFlight < established) this._warmAt.set(started, (this._warmAt.get(started) ?? 0) + 1);
     if (this._inFlight === 0) {
       this._busySince = started;
       this._busyBytes = 0;
+      this._stretchCount = 0;
     }
+    // A request begun with nothing in flight is alone until another begins.
+    this._aloneSince = this._inFlight === 0 ? started : null;
     this._inFlight++;
     if (this.multiplexed === null) {
       // A burst is watched once a connection is open (a request completed
@@ -436,30 +746,253 @@ export class LinkMeter {
 
   /**
    * A request that began at `started` ended with `bytes` delivered (null
-   * when it failed or was cancelled: it measures nothing).
+   * when it failed or was cancelled: it measures nothing). `begun` is what
+   * `begin()` returned for it, when its round trip is timed from later (a
+   * source that first asked the page for the bytes, `range-cache.js`): the
+   * request belongs to the burst it began in, whenever it reached the host.
    */
-  end(started, bytes) {
+  end(started, bytes, begun = started) {
+    // Every slot busy as it ended (its own included) and requests waiting
+    // for one: the reads asked more than the host was taking, so the time
+    // between completions is the host's, not the reads' own pauses.
+    const saturated = this._inFlight >= Math.max(1, this.backgroundConcurrency) && this._queued > 0;
+    // Alone on the link from its start to its end (`connectionBytesPerMs`).
+    const alone = this._aloneSince === begun && this._inFlight === 1;
+    this._aloneSince = null;
     this._inFlight = Math.max(0, this._inFlight - 1);
-    const at = this._clock();
-    if (bytes !== null) {
-      this._completed();
-      this._measure(at - started, bytes);
-      this._busyBytes += bytes;
-      // The period's first bytes arrived a round trip after it began.
-      const transferring = at - this._busySince - this.latencyMs;
-      if (transferring >= this.latencyMs && transferring > 0) {
-        this.bytesPerMs = Math.max(this.bytesPerMs, this._busyBytes / transferring);
-      }
+    const warmAt = this._warmAt.get(begun) ?? 0;
+    if (warmAt === 1) this._warmAt.delete(begun);
+    else if (warmAt > 1) this._warmAt.set(begun, warmAt - 1);
+    if (bytes === null) {
+      const onConnection = this._onConnection.get(begun) ?? 0;
+      if (onConnection === 1) this._onConnection.delete(begun);
+      else if (onConnection > 1) this._onConnection.set(begun, onConnection - 1);
     }
-    if (this._burst !== null && this.multiplexed === null) this._burstEnded(this._burst, started, at, bytes);
+    const at = this._clock();
+    if (this._inFlight === 0) this.busyMs += Math.max(0, at - this._busySince);
+    if (bytes !== null) {
+      // A host answering again earns back one request at once per round.
+      if (this._cap !== Infinity) {
+        this._cap += 1 / this._cap;
+        if (this._cap >= this.concurrency) this._cap = Infinity;
+      }
+      this._completed();
+      // It shared the bandwidth with the requests in flight as it ended. Of
+      // the requests begun together, those that found a connection end first.
+      const onConnection = this._onConnection.get(begun) ?? 0;
+      if (onConnection > 0) {
+        if (onConnection === 1) this._onConnection.delete(begun);
+        else this._onConnection.set(begun, onConnection - 1);
+      }
+      this._measure(at - started, bytes, this._inFlight + 1, onConnection > 0, warmAt > 0, alone);
+      this._noteSaturated(saturated, at, bytes);
+      // Begun once a request had completed: on a connection already made.
+      if (this._firstEndAt !== null && begun >= this._firstEndAt) {
+        this._warmTrips[this._warmCount % RECENT_REQUESTS] = at - started + this._halfTick;
+        this._warmCount++;
+      }
+      this._firstEndAt ??= at;
+      this._busyBytes += bytes;
+      // The stretch's first bytes arrived a round trip after it began (the
+      // stretch, as each request, counted half a tick longer: `clockTickMs`);
+      // past a window of ends, its delivery is that of its latest ends only,
+      // so a stretch that outlasts a change of the link measures the link now.
+      const latency = this.latencyMs;
+      const oldest = this._stretchCount >= RECENT_REQUESTS ? this._stretchCount % RECENT_REQUESTS : -1;
+      const transferring = oldest < 0 ? at - this._busySince + this._halfTick - latency : at - this._stretchAt[oldest];
+      const delivered = oldest < 0 ? this._busyBytes : this._busyBytes - this._stretchBytes[oldest];
+      if (transferring >= latency && transferring > 0) this._rate(delivered / transferring, this._transferBound, false);
+      this._noteBound();
+      this._stretchAt[this._stretchCount % RECENT_REQUESTS] = at;
+      this._stretchBytes[this._stretchCount % RECENT_REQUESTS] = this._busyBytes;
+      this._stretchCount++;
+    }
+    if (this._burst !== null && this.multiplexed === null) this._burstEnded(this._burst, begun, at, bytes);
     if (this._inFlight === 0 && this._burst?.done === false) this._burst.done = true;
   }
 
-  /** One completed request's round trip and delivery. @private */
-  _measure(duration, bytes) {
+  /**
+   * An end with every slot busy (`saturated`) or not: a break starts the
+   * window of ends again (`loadedRequestMs`). @private
+   */
+  _noteSaturated(saturated, at, bytes) {
+    if (!saturated) {
+      this._saturatedCount = 0;
+      return;
+    }
+    this._saturatedAt[this._saturatedCount % RECENT_REQUESTS] = at;
+    this._saturatedBytes[this._saturatedCount % RECENT_REQUESTS] = bytes;
+    this._saturatedCount++;
+    this._loadedRequest = null;
+  }
+
+  /**
+   * The time one more request takes the host under load (module doc): over
+   * the latest ends with every slot busy, without a break, the time between
+   * the first and the last less the transfer of the bytes the others
+   * delivered (at the fastest delivery seen), a request; 0 until a window of `RECENT_REQUESTS` ends is seen
+   * (a few saturated ends say little of the rate).
+   */
+  get loadedRequestMs() {
+    if (this._saturatedCount < RECENT_REQUESTS) return 0;
+    if (this._loadedRequest === null) {
+      const last = (this._saturatedCount - 1) % RECENT_REQUESTS;
+      const first = this._saturatedCount % RECENT_REQUESTS;
+      let bytes = 0;
+      for (let i = 0; i < RECENT_REQUESTS; i++) if (i !== first) bytes += this._saturatedBytes[i];
+      // At the fastest delivery this link has shown: these small requests'
+      // own delivery is their pace (taking their transfer at it would explain
+      // their whole time away), and a transfer counted at the fastest is the
+      // least it can be. With nothing faster seen than them, nothing is left
+      // to price: a request is priced as before.
+      const fastest = Math.max(this.bytesPerMs, this._fastestBytesPerMs);
+      const transfer = fastest > 0 ? bytes / fastest : 0;
+      this._loadedRequest = Math.max(0, this._saturatedAt[last] - this._saturatedAt[first] - transfer) / (RECENT_REQUESTS - 1);
+    }
+    return this._loadedRequest;
+  }
+
+  /** One completed request's round trip and delivery; `sharing`: the requests it shared the bandwidth with, itself included; `warm`: begun on a connection set up already; `alone`: nothing else was in flight from its start to its end. @private */
+  _measure(measured, bytes, sharing = 1, onConnection = true, warm = true, alone = false) {
     this._completedCount++;
-    this.latencyMs = Math.min(this.latencyMs, duration);
-    if (duration > 0) this.bytesPerMs = Math.max(this.bytesPerMs, bytes / duration);
+    this.deliveredBytes += bytes;
+    // Half a tick longer than the clock says (`clockTickMs`).
+    const duration = measured + this._halfTick;
+    // A round trip when its bytes' transfer, at its share of the bandwidth as
+    // known before it, is at most half its time (or nothing is known yet).
+    const before = this.bytesPerMs;
+    if (onConnection && (before <= 0 || bytes * sharing / before <= duration / 2)) {
+      this._roundTrips[this._roundTripCount % RECENT_REQUESTS] = duration;
+      this._roundTripCount++;
+      this._latency = null;
+    }
+    // Its time mostly transfer (at least twice a round trip past its round
+    // trip): the link, not the round trip, bounded it.
+    this._transferBound = Number.isFinite(this.latencyMs) && duration >= TRANSFER_BOUND * this.latencyMs;
+    if (duration > 0) this._rate(bytes / duration, this._transferBound, true, alone);
+    // Its round trip under load: its time less its bytes' transfer at its
+    // share of the bandwidth (a large read waits for the bytes before it,
+    // which the price counts as bytes, not as round trips).
+    // A request that waited for a connection first is not one (its wait is
+    // the reads' own queue, which a price counts as rounds of requests).
+    // Nor is one that set up its connection (its handshakes are no part of
+    // what a read made on the connections then open takes).
+    if (!onConnection || !warm) return;
+    const transfer = this.bytesPerMs > 0 ? bytes * sharing / this.bytesPerMs : 0;
+    this._turns[this._turnCount % RECENT_REQUESTS] = Math.max(this.latencyMs, duration - transfer);
+    this._turnCount++;
+    this._loaded = null;
+  }
+
+  /** The end just measured counted once among the fastest transfer-bound deliveries (`LINK_EVIDENCE`). @private */
+  _noteBound() {
+    const rate = this._endBound;
+    this._endBound = 0;
+    if (!(rate > this._fastestBound[LINK_EVIDENCE - 1])) return;
+    let at = LINK_EVIDENCE - 1;
+    while (at > 0 && this._fastestBound[at - 1] < rate) {
+      this._fastestBound[at] = this._fastestBound[at - 1];
+      at--;
+    }
+    this._fastestBound[at] = rate;
+  }
+
+  /**
+   * One delivery measured, in bytes a millisecond: over one request
+   * (`request`), or over the stretch in flight it ended (the request's own
+   * entry raised to it, never a second entry). `bound`: the request's time
+   * was mostly transfer (`TRANSFER_BOUND`), so the delivery is the link's.
+   * Otherwise the round trip bounded it and its delivery is only a lower
+   * bound of the bandwidth (BBR's "application-limited" sample), which may
+   * raise the bandwidth but never takes part in lowering it: small requests
+   * alone (a subsample's kept rows, chunk index pages) would otherwise
+   * measure the link at the pace they were asked. `alone`: nothing else
+   * was in flight from its start to its end, so its delivery is what one
+   * connection carries, or the link (`connectionBytesPerMs`). @private
+   */
+  _rate(rate, bound, request, alone = false) {
+    if (rate > this._fastestBytesPerMs) this._fastestBytesPerMs = rate;
+    // The end's delivery: its own, or its stretch's when faster (`_noteBound`).
+    if (request) this._endBound = bound ? rate : 0;
+    else if (bound && rate > this._endBound) this._endBound = rate;
+    if (request && bound && alone) this._requestRates[this._requestRateCount++ % RECENT_REQUESTS] = rate;
+    const known = this.bytesPerMs;
+    const full = known <= 0 || bound;
+    if (request) this._sampled = false;
+    if (!full && rate <= known) return;
+    // Measured against a bandwidth known before it: the link's own delivery.
+    const measuredFull = full && known > 0;
+    if (!request && this._sampled) {
+      const latest = (this._rateCount - 1) % RECENT_REQUESTS;
+      this._rates[latest] = Math.max(this._rates[latest], rate);
+      this._rateFull[latest] ||= measuredFull ? 1 : 0;
+    } else {
+      this._rates[this._rateCount % RECENT_REQUESTS] = rate;
+      this._rateFull[this._rateCount % RECENT_REQUESTS] = measuredFull ? 1 : 0;
+      this._rateCount++;
+      this._sampled = request;
+    }
+    this._bandwidth = null;
+  }
+
+  /**
+   * The round trip now: the shortest of the latest requests that were
+   * mostly a round trip (`_roundTrips`); Infinity until a request completed.
+   */
+  get latencyMs() {
+    if (this._roundTripCount === 0) return Infinity;
+    this._latency ??= extremeOf(this._roundTrips, this._roundTripCount, 1);
+    return this._latency;
+  }
+
+  /**
+   * The shortest of the latest requests that began once the link had
+   * completed one (Infinity until one does): a round trip on a connection
+   * already made, which a cold one (connection set-up included) is not; what
+   * a link is compared to another visit's by (`data/host-link-memory.js`).
+   */
+  get warmLatencyMs() {
+    return this._warmCount === 0 ? Infinity : extremeOf(this._warmTrips, this._warmCount, 1);
+  }
+
+  /**
+   * Whether the bandwidth now rests on a delivery that kept the link full
+   * (`_rate`), not only on lower bounds: what a remembered rate gives way to
+   * (`data/host-link-memory.js` `pricingLink`).
+   */
+  get bandwidthMeasured() {
+    for (let i = 0; i < Math.min(this._rateCount, RECENT_REQUESTS); i++) if (this._rateFull[i] === 1) return true;
+    return false;
+  }
+
+  /** The bandwidth now: the fastest of the latest deliveries (`_rate`); 0 until measured. */
+  get bytesPerMs() {
+    this._bandwidth ??= extremeOf(this._rates, this._rateCount, -1);
+    return this._bandwidth;
+  }
+
+  /** A bandwidth known from elsewhere (tests, a measured link carried over): the latest requests' deliveries, all of them. */
+  set bytesPerMs(rate) {
+    if (!(rate >= 0)) throw new TypeError('A bandwidth is 0 or more bytes a millisecond.');
+    this._rates.fill(rate);
+    this._rateFull.fill(1);
+    this._rateCount = RECENT_REQUESTS;
+    this._bandwidth = null;
+  }
+
+  /**
+   * The round trip under load: the median of the latest requests' times
+   * less their transfer (`_measure`), never shorter than the shortest
+   * (`latencyMs`); Infinity until a request completed.
+   */
+  get loadedLatencyMs() {
+    if (this._turnCount === 0) return Infinity;
+    if (this._loaded === null) {
+      const turns = this._turns.slice(0, Math.min(this._turnCount, RECENT_REQUESTS)).sort();
+      const middle = turns.length >> 1;
+      this._loaded = turns.length % 2 === 1 ? turns[middle] : (turns[middle - 1] + turns[middle]) / 2;
+    }
+    return Math.max(this.latencyMs, this._loaded);
   }
 
   /**
@@ -471,7 +1004,27 @@ export class LinkMeter {
     if (!(durationMs >= 0) || !Number.isSafeInteger(bytes) || bytes < 0) {
       throw new TypeError('A recorded request needs its duration and its bytes.');
     }
-    this._measure(durationMs, bytes);
+    // Made on a connection of its own, set up for it.
+    this._measure(durationMs, bytes, 1, true, false);
+    this.busyMs += durationMs;
+  }
+
+  /**
+   * The bandwidth gaps are priced at when the byte reader decides which to
+   * fetch (`planMergeGap`, coalescing to the link): the measured bandwidth,
+   * or twice it while requests wait for a slot. A link measured only while
+   * its slots were full of small requests (the kept rows of a subsample,
+   * the row slabs of a gene index) measured its round trips, not its
+   * bandwidth: what it delivered is a lower bound, and priced at that, no
+   * gap would ever be fetched and the requests would stay small. Priced at
+   * twice it, the gaps that would pay on a link that fast are fetched, the
+   * larger requests measure the link again, and the price follows the link
+   * up to its bandwidth; on a link already at its bandwidth a gap costs at
+   * most twice what it is priced.
+   */
+  get pricingBytesPerMs() {
+    const bandwidth = this._pricedBytesPerMs();
+    return this._queued > 0 ? 2 * bandwidth : bandwidth;
   }
 
   /** Whether both the round trip and the bandwidth are measured. */
@@ -504,19 +1057,113 @@ export class LinkMeter {
     return [this._connections, this._start];
   }
 
+  /**
+   * The least time one more request costs, in milliseconds: what the host's
+   * request budget makes it (`hosts.js` `requestCostMs`; 0 while it states
+   * none or it does not bind) or what the host takes a request under load
+   * (`loadedRequestMs`), whichever is more; 0 while neither is known.
+   */
+  get requestCostMs() {
+    const cost = this._requestCost?.() ?? 0;
+    return Math.max(cost > 0 ? cost : 0, this.loadedRequestMs);
+  }
+
+  /**
+   * The time one more request of a plan costs: its share of a round trip
+   * among the requests that run at once, or, once the host's request budget
+   * binds, the budget's interval (Zenodo: 60 s over 133, 0.45 s) -- whichever
+   * is more. `mergeGapBytes` prices a gap at this; `byte-reader.js`
+   * (`planMergeGap`, the requests a waiting one takes along) computes the same
+   * expression itself, once for each concurrency it plans under.
+   */
+  get requestMs() {
+    const share = Number.isFinite(this.latencyMs) ? this.latencyMs / this.shapingConcurrency : 0;
+    return Math.max(share, this.requestCostMs);
+  }
+
   get mergeGapBytes() {
     if (!this.measured) return this._prior.mergeGapBytes;
-    return Math.floor(this.bytesPerMs * this.latencyMs / this.shapingConcurrency);
+    const measured = Math.floor(this._pricedBytesPerMs() * this.requestMs);
+    // A local file's reads may end within the clock's resolution (a round
+    // trip of 0): one more read never costs less than its prior says.
+    return this._readsAheadPrior() ? Math.max(this._prior.mergeGapBytes, measured) : measured;
+  }
+
+  /** Whether the prior is a source read ahead whatever is measured (a local file). @private */
+  _readsAheadPrior() {
+    return (this._prior.bytesPerMs ?? 0) >= READ_AHEAD_BYTES_PER_MS;
+  }
+
+  /**
+   * The bandwidth reads are priced at: the measured one, and for a local
+   * file never less than its prior's. A local file's reads measure only a
+   * lower bound of its bandwidth (`readsAhead`): reads of a few hundred
+   * bytes each (a gene's counted entries) measured a disk at 141 MB/s, so a
+   * gap of a few kilobytes looked dearer than another read, every gene was
+   * read alone, and nothing larger was read to measure it again (a
+   * subsample's every gene, 1 % of 40,000 cells: 4,004 reads in 270 ms,
+   * 534 in 150 ms with its chunk files' gaps read). @private
+   */
+  _pricedBytesPerMs() {
+    return this._readsAheadPrior() ? Math.max(this._prior.bytesPerMs, this.bytesPerMs) : this.bytesPerMs;
+  }
+
+  /**
+   * The request size of the source's policy, whatever the link measures: a
+   * size a choice that must not change between visits is made against
+   * (`AnnDataReader._categoryCoding`: whether a category dictionary is read
+   * whole).
+   */
+  get policyRequestBytes() {
+    return this._prior.maxRequestBytes;
   }
 
   get maxRequestBytes() {
     if (!this.measured) return this._prior.maxRequestBytes;
-    return Math.max(this._prior.maxRequestBytes, Math.floor(this.bytesPerMs * this.latencyMs * this.shapingConcurrency));
+    return Math.max(this._prior.maxRequestBytes, Math.floor(this._pricedBytesPerMs() * this.latencyMs));
+  }
+
+  /**
+   * What one connection delivers, in bytes a millisecond: the fastest of the
+   * latest requests whose time was mostly transfer and that were alone on
+   * the link from start to end (a request sharing the link delivers its share
+   * of it, which says nothing of a connection); 0 until one is measured. On a
+   * host whose throughput is per connection (Amazon S3: each connection a
+   * fraction of the link) one long request moves only this while the other
+   * connections idle; on most hosts it is the link's bandwidth.
+   */
+  get connectionBytesPerMs() {
+    let fastest = 0;
+    const count = Math.min(this._requestRateCount, RECENT_REQUESTS);
+    for (let i = 0; i < count; i++) if (this._requestRates[i] > fastest) fastest = this._requestRates[i];
+    return fastest;
+  }
+
+  /**
+   * The bytes one connection moves in a round trip (`connectionBytesPerMs`
+   * x the round trip), null until both are measured, and null where one
+   * connection carries about the link's whole bandwidth
+   * (`CONNECTION_BOUND_SHARE`: splitting a read then only shares the link
+   * among more requests; the link's carrying taken from `LINK_EVIDENCE`
+   * transfer-bound deliveries, never one): a request longer than
+   * this spends most of its time on one connection's transfer, so a read
+   * split into pieces no shorter than it, over the free connections, ends
+   * sooner and costs each piece at most one round trip of overhead
+   * (`requestPieceBytes`).
+   */
+  get connectionRoundTripBytes() {
+    const rate = this.connectionBytesPerMs;
+    // A connection carrying about the whole link: nothing to spread.
+    // The link's bandwidth here is the most it has delivered, shown by
+    // `LINK_EVIDENCE` transfer-bound deliveries (the latest deliveries can
+    // be lone requests', one connection's; a single one can be any rate).
+    const link = this._fastestBound[LINK_EVIDENCE - 1];
+    return this.measured && rate > 0 && rate < CONNECTION_BOUND_SHARE * link ? rate * this.latencyMs : null;
   }
 
   /** Bytes one round trip is worth (null until measured). */
   get roundTripBytes() {
-    return this.measured ? this.bytesPerMs * this.latencyMs : null;
+    return this.measured ? this._pricedBytesPerMs() * this.latencyMs : null;
   }
 
   /**
@@ -527,17 +1174,30 @@ export class LinkMeter {
    * under the line. A web host is read ahead once measured at or above it.
    */
   get readsAhead() {
-    if ((this._prior.bytesPerMs ?? 0) >= READ_AHEAD_BYTES_PER_MS) return true;
+    if (this._readsAheadPrior()) return true;
     return this.measured && this.bytesPerMs >= READ_AHEAD_BYTES_PER_MS;
   }
 
-  /** The link as measured, as plain data. */
+  /**
+   * The link as measured, as plain data. Its bandwidth is the one reads are
+   * priced at (`_pricedBytesPerMs`), as its round trip's bytes and merge gap
+   * are: a local file's never below its prior's. Reported as measured, a
+   * local file's few small opening reads (a lower bound: `readsAhead`)
+   * priced its first gene past the gene time, and genes were read for a
+   * sample of a file whose every cell reads in milliseconds (in Node, a
+   * 2,000-cell share sampled at 100-200 cells).
+   */
   snapshot() {
+    const bytesPerMs = this._pricedBytesPerMs();
     return {
       measured: this.measured,
       latencyMs: Number.isFinite(this.latencyMs) ? this.latencyMs : null,
-      bytesPerMs: this.bytesPerMs > 0 ? this.bytesPerMs : null,
+      loadedLatencyMs: Number.isFinite(this.loadedLatencyMs) ? this.loadedLatencyMs : null,
+      warmLatencyMs: Number.isFinite(this.warmLatencyMs) ? this.warmLatencyMs : null,
+      bytesPerMs: bytesPerMs > 0 ? bytesPerMs : null,
+      bandwidthMeasured: this.bandwidthMeasured,
       concurrency: this.concurrency,
+      admitted: this.admitted,
       shapingConcurrency: this.shapingConcurrency,
       backgroundConcurrency: this.backgroundConcurrency,
       multiplexed: this.multiplexed,
@@ -545,7 +1205,16 @@ export class LinkMeter {
       mergeGapBytes: this.mergeGapBytes,
       maxRequestBytes: this.maxRequestBytes,
       roundTripBytes: this.roundTripBytes,
+      connectionBytesPerMs: this.connectionBytesPerMs > 0 ? this.connectionBytesPerMs : null,
+      requestCostMs: this.requestCostMs,
+      loadedRequestMs: this.loadedRequestMs,
       readsAhead: this.readsAhead,
+      // A local file (its prior is a disk): priced as this machine at rest,
+      // whatever a busy machine made its reads measure
+      // (`data/host-link-memory.js` `pricingLink`).
+      onThisMachine: this._readsAheadPrior(),
+      deliveredBytes: this.deliveredBytes,
+      busyMs: this.busyMs,
     };
   }
 }

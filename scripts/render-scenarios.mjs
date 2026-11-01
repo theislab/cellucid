@@ -45,6 +45,9 @@
  *   --port N             loopback port (47931)
  *   --dpr N              device scale factor (1)
  *   --headed             show the browser
+ *   --software-gl        allow a software renderer (no timing is valid then;
+ *                        every run records the renderer it drew with and
+ *                        refuses a software one without this flag)
  *   --force              skip the machine-quietness check
  *
  * Machine rules (16 GB development machines): one heavy job at a time. The
@@ -63,6 +66,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium, firefox, webkit } from '@playwright/test';
 
 import { openCollapsedPanels } from '../tests/browser/helpers/panels.mjs';
+import { browserLaunchOptions, requireHardwareRenderer } from './lib/browser-launch.mjs';
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROBES_MODULE = '/assets/js/app/ui/modules/benchmark/index.js';
@@ -142,6 +146,7 @@ function parseArguments(argv) {
     port: 47931,
     dpr: 1,
     headed: false,
+    softwareGl: false,
     force: false,
     list: false
   };
@@ -171,6 +176,7 @@ function parseArguments(argv) {
       case '--port': options.port = Number(value()); break;
       case '--dpr': options.dpr = Number(value()); break;
       case '--headed': options.headed = true; break;
+      case '--software-gl': options.softwareGl = true; break;
       case '--force': options.force = true; break;
       case '--list': options.list = true; break;
       default: throw new Error(`Unknown option ${flag}; see the header of ${path.basename(fileURLToPath(import.meta.url))}.`);
@@ -301,24 +307,9 @@ function startServer(port, dataRoot) {
 
 // ------------------------------------------------------------------ browser
 
-function launchBrowser(engine, headed) {
-  if (engine === 'chromium') {
-    const args = ['--enable-gpu', '--ignore-gpu-blocklist', '--enable-precise-memory-info'];
-    if (os.platform() === 'darwin') args.push('--use-angle=metal');
-    return chromium.launch({ headless: !headed, args });
-  }
-  if (engine === 'firefox') {
-    return firefox.launch({
-      headless: !headed,
-      firefoxUserPrefs: {
-        'webgl.disabled': false,
-        'webgl.enable-webgl2': true,
-        'webgl.forbid-software': false,
-        'webgl.force-enabled': true
-      }
-    });
-  }
-  return webkit.launch({ headless: !headed });
+function launchBrowser(engine, headed, softwareGl) {
+  const engines = { chromium, firefox, webkit };
+  return engines[engine].launch(browserLaunchOptions(engine, { headless: !headed, softwareGl }));
 }
 
 function sourceUrl(origin, source) {
@@ -952,7 +943,7 @@ async function main() {
 
   const server = await startServer(options.port, options.dataRoot);
   const origin = `http://127.0.0.1:${options.port}`;
-  const browser = await launchBrowser(options.engine, options.headed);
+  const browser = await launchBrowser(options.engine, options.headed, options.softwareGl);
   const report = {
     tool: 'scripts/render-scenarios.mjs',
     startedAt: new Date().toISOString(),
@@ -980,6 +971,7 @@ async function main() {
       const entry = { source, pageErrors };
       try {
         await loadSource(page, origin, source, options);
+        entry.renderer = await requireHardwareRenderer(page, { softwareGl: options.softwareGl });
         await page.evaluate(({ culling, antialias, quality }) => {
           const viewer = window._cellucidViewer;
           viewer.setAdaptiveLOD(culling === 'lod+frustum' || culling === 'lod');

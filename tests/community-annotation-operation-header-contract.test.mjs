@@ -717,8 +717,8 @@ test(
         },
       },
       {
-        label: 'caller then timeout remains GITHUB_REQUEST_ABORTED',
-        expectedCode: 'GITHUB_REQUEST_ABORTED',
+        label: 'caller then timeout remains a cancellation',
+        expectedCode: 'cancelled',
         run(clock, owner, callerReason) {
           owner.abort(callerReason);
           clock.fire(0);
@@ -755,13 +755,11 @@ test(
               const rejection = assert.rejects(
                 pending,
                 error => {
-                  assert.equal(error?.code, schedule.expectedCode);
-                  if (
-                    schedule.expectedCode ===
-                    'GITHUB_REQUEST_ABORTED'
-                  ) {
+                  if (schedule.expectedCode === 'cancelled') {
                     assert.equal(error?.name, 'AbortError');
                     assert.equal(error?.cause, callerReason);
+                  } else {
+                    assert.equal(error?.code, schedule.expectedCode);
                   }
                   return true;
                 },
@@ -801,7 +799,7 @@ test(
           }),
           error => {
             assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
-            assert.notEqual(error?.code, 'GITHUB_REQUEST_ABORTED');
+            assert.notEqual(error?.name, 'AbortError');
             assert.equal(error?.cause, transportError);
             assert.deepEqual(error?.operation, {
               id: OPERATION_ID,

@@ -28,12 +28,27 @@
   gap: var(--space-1);
 }
 
-/* Highlighted groups header with count and clear button */
+/* Highlighted groups header: the count, then CSV, .h5ad and Clear.
+   The count changes on its own (with level of detail on it counts the
+   highlighted cells the level draws, and the page turns level of detail on
+   and off by itself), so it holds one line of its own whatever it says:
+   beside the buttons it wrapped over two or three lines, and every control
+   under it moved 22 px under the pointer. Cut, it says the whole count in
+   its title (highlight-summary-ui.js). */
 .highlighted-groups-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
+  gap: var(--space-1) var(--space-2);
+}
+
+.highlighted-groups-header > #highlight-count {
+  flex: 1 0 100%;
+  min-width: 0;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ========================================================================

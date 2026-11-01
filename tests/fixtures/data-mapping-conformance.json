@@ -1,6 +1,6 @@
 {
-  "_about": "Shared conformance cases for the Cellucid data mapping. The same file is kept byte-for-byte in cellucid-python (tests/fixtures/data_mapping_conformance.json), cellucid-r (tests/testthat/fixtures/data_mapping_conformance.json) and the web app (tests/fixtures/data-mapping-conformance.json); each repository pins its SHA-256. Every 'expected' value is the canonical output of the reference rule; an 'error' value is the stable reason code, not a message. Version 5 adds the 'modality' key, present only in the mapping of a dataset of several modalities (feature spaces over the same cells), with defaultModality (the modality a dataset opens with) and mappingModality (a mapping's modality checked against the dataset's).",
-  "version": 6,
+  "_about": "Shared conformance cases for the Cellucid data mapping. The same file is kept byte-for-byte in cellucid-python (tests/fixtures/data_mapping_conformance.json), cellucid-r (tests/testthat/fixtures/data_mapping_conformance.json) and the web app (tests/fixtures/data-mapping-conformance.json); each repository pins its SHA-256. Every 'expected' value is the canonical output of the reference rule; an 'error' value is the stable reason code, not a message. Version 5 adds the 'modality' key, present only in the mapping of a dataset of several modalities (feature spaces over the same cells), with defaultModality (the modality a dataset opens with) and mappingModality (a mapping's modality checked against the dataset's). Version 7 adds MuData namespaces: an obsm key '<modality>:<key>' is read within its modality's namespace (vectorFieldKeys entries name their embeddingKey; embeddingSlots cases may name the modality the dataset opens with, whose representations follow the dataset's own); defaultExpression reads raw when it holds more genes than X or X is scaled, and says why (reason); and defaultGraph, the neighbour graph a dataset opens with.",
+  "version": 7,
   "makeUniqueNames": [
     {
       "name": "already unique names come back unchanged",
@@ -654,6 +654,14 @@
     {
       "key": "Xumap",
       "tier": 0
+    },
+    {
+      "key": "spatial:X_pca",
+      "tier": 8
+    },
+    {
+      "key": "rna:X_umap",
+      "tier": 0
     }
   ],
   "embeddingSlots": [
@@ -1017,7 +1025,7 @@
       ],
       "latentKey": null,
       "loadFailures": {
-        "X_tsne": "NaN at cell 17"
+        "X_tsne": "not representable as float32 at cell 17"
       },
       "expected": {
         "slots": {
@@ -1037,7 +1045,7 @@
         "rejected": [
           [
             "X_tsne",
-            "NaN at cell 17"
+            "not representable as float32 at cell 17"
           ]
         ]
       }
@@ -1097,7 +1105,7 @@
       ],
       "latentKey": null,
       "loadFailures": {
-        "X_tsne": "Infinity at cell 3"
+        "X_tsne": "every cell's coordinates are missing (NaN or infinite)"
       },
       "expected": {
         "slots": {
@@ -1117,7 +1125,7 @@
         "rejected": [
           [
             "X_tsne",
-            "Infinity at cell 3"
+            "every cell's coordinates are missing (NaN or infinite)"
           ]
         ]
       }
@@ -1394,6 +1402,117 @@
         ],
         "rejected": []
       }
+    },
+    {
+      "name": "without a UMAP of its own, a MuData opens on the default modality's",
+      "obsm": [
+        {
+          "key": "atac:X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "rna:X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "rna:velocity_umap",
+          "width": 2,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {},
+      "modality": "rna",
+      "expected": {
+        "slots": {
+          "1d": null,
+          "2d": {
+            "key": "rna:X_umap",
+            "columns": [
+              0,
+              1
+            ]
+          },
+          "3d": null
+        },
+        "guessed": [],
+        "rejected": []
+      }
+    },
+    {
+      "name": "the dataset's own UMAP comes before a modality's",
+      "obsm": [
+        {
+          "key": "X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "rna:X_umap",
+          "width": 2,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {},
+      "modality": "rna",
+      "expected": {
+        "slots": {
+          "1d": null,
+          "2d": {
+            "key": "X_umap",
+            "columns": [
+              0,
+              1
+            ]
+          },
+          "3d": null
+        },
+        "guessed": [],
+        "rejected": []
+      }
+    },
+    {
+      "name": "the best guess ranks the default modality after the dataset's own, before the others",
+      "obsm": [
+        {
+          "key": "atac:X_tsne",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "rna:X_tsne",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "prot:X_pca",
+          "width": 30,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {},
+      "modality": "rna",
+      "expected": {
+        "slots": {
+          "1d": null,
+          "2d": {
+            "key": "rna:X_tsne",
+            "columns": [
+              0,
+              1
+            ]
+          },
+          "3d": null
+        },
+        "guessed": [
+          "embeddings.2d"
+        ],
+        "rejected": []
+      }
     }
   ],
   "enabledEmbeddings": [
@@ -1621,7 +1740,7 @@
       ],
       "latentKey": null,
       "loadFailures": {
-        "X_tsne": "NaN at cell 17"
+        "X_tsne": "not representable as float32 at cell 17"
       },
       "expected": [
         {
@@ -1990,7 +2109,48 @@
       ],
       "expected": {
         "expression": "X",
-        "guessed": false
+        "guessed": false,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
+    },
+    {
+      "hasX": true,
+      "hasRaw": true,
+      "layers": [
+        "counts"
+      ],
+      "rawHasMoreGenes": true,
+      "xScaled": false,
+      "expected": {
+        "expression": "raw",
+        "guessed": false,
+        "reason": "raw-more-genes"
+      }
+    },
+    {
+      "hasX": true,
+      "hasRaw": true,
+      "layers": [],
+      "rawHasMoreGenes": false,
+      "xScaled": true,
+      "expected": {
+        "expression": "raw",
+        "guessed": false,
+        "reason": "x-scaled"
+      }
+    },
+    {
+      "hasX": true,
+      "hasRaw": false,
+      "layers": [],
+      "rawHasMoreGenes": false,
+      "xScaled": true,
+      "expected": {
+        "expression": "X",
+        "guessed": false,
+        "reason": null
       }
     },
     {
@@ -2001,8 +2161,11 @@
       ],
       "expected": {
         "expression": "raw",
-        "guessed": true
-      }
+        "guessed": true,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
     },
     {
       "hasX": false,
@@ -2012,8 +2175,11 @@
       ],
       "expected": {
         "expression": "layer:counts",
-        "guessed": true
-      }
+        "guessed": true,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
     },
     {
       "hasX": false,
@@ -2025,8 +2191,11 @@
       ],
       "expected": {
         "expression": "layer:log1p_norm",
-        "guessed": true
-      }
+        "guessed": true,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
     },
     {
       "hasX": false,
@@ -2039,8 +2208,11 @@
       ],
       "expected": {
         "expression": "layer:a",
-        "guessed": true
-      }
+        "guessed": true,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
     },
     {
       "hasX": false,
@@ -2051,8 +2223,11 @@
       ],
       "expected": {
         "expression": "layer:Normalized",
-        "guessed": true
-      }
+        "guessed": true,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
     },
     {
       "hasX": false,
@@ -2060,8 +2235,11 @@
       "layers": [],
       "expected": {
         "expression": null,
-        "guessed": false
-      }
+        "guessed": false,
+        "reason": null
+      },
+      "rawHasMoreGenes": false,
+      "xScaled": false
     }
   ],
   "vectorFieldKeys": [
@@ -2082,27 +2260,32 @@
         {
           "key": "velocity_umap",
           "field": "velocity",
-          "basis": "umap"
+          "basis": "umap",
+          "embeddingKey": "X_umap"
         },
         {
           "key": "velocity_umap_3d",
           "field": "velocity",
-          "basis": "umap_3d"
+          "basis": "umap_3d",
+          "embeddingKey": "X_umap_3d"
         },
         {
           "key": "velocity_branches",
           "field": "velocity",
-          "basis": "branches"
+          "basis": "branches",
+          "embeddingKey": "X_branches"
         },
         {
           "key": "velocity_pca",
           "field": "velocity",
-          "basis": "pca"
+          "basis": "pca",
+          "embeddingKey": "X_pca"
         },
         {
           "key": "T_fwd_umap",
           "field": "T_fwd",
-          "basis": "umap"
+          "basis": "umap",
+          "embeddingKey": "X_umap"
         }
       ]
     },
@@ -2120,12 +2303,14 @@
         {
           "key": "velocity_umap_3d",
           "field": "velocity",
-          "basis": "umap_3d"
+          "basis": "umap_3d",
+          "embeddingKey": "X_umap_3d"
         },
         {
           "key": "T_fwd_umap",
           "field": "T",
-          "basis": "fwd_umap"
+          "basis": "fwd_umap",
+          "embeddingKey": "X_fwd_umap"
         }
       ]
     },
@@ -2163,7 +2348,8 @@
         {
           "key": "velocity__umap",
           "field": "velocity_",
-          "basis": "umap"
+          "basis": "umap",
+          "embeddingKey": "X_umap"
         }
       ]
     },
@@ -2179,7 +2365,8 @@
         {
           "key": "Velocity_UMAP",
           "field": "Velocity",
-          "basis": "UMAP"
+          "basis": "UMAP",
+          "embeddingKey": "X_UMAP"
         }
       ]
     },
@@ -2194,12 +2381,56 @@
         {
           "key": "v\u00e9locit\u00e9_\u00fcmap",
           "field": "v\u00e9locit\u00e9",
-          "basis": "\u00fcmap"
+          "basis": "\u00fcmap",
+          "embeddingKey": "X_\u00fcmap"
         },
         {
           "key": "\u901f\u5ea6_\u00fcmap",
           "field": "\u901f\u5ea6",
-          "basis": "\u00fcmap"
+          "basis": "\u00fcmap",
+          "embeddingKey": "X_\u00fcmap"
+        }
+      ]
+    },
+    {
+      "name": "a modality's keys are read within its own namespace",
+      "keys": [
+        "X_umap",
+        "rna:X_umap",
+        "atac:X_umap",
+        "rna:velocity_umap",
+        "atac:velocity_pca",
+        "rna:X_pca_umap",
+        "velocity_umap",
+        "prot:T_fwd_umap",
+        "prot:X_umap",
+        ":velocity_umap",
+        "rna:"
+      ],
+      "expected": [
+        {
+          "key": "rna:velocity_umap",
+          "field": "rna:velocity",
+          "basis": "umap",
+          "embeddingKey": "rna:X_umap"
+        },
+        {
+          "key": "velocity_umap",
+          "field": "velocity",
+          "basis": "umap",
+          "embeddingKey": "X_umap"
+        },
+        {
+          "key": "prot:T_fwd_umap",
+          "field": "prot:T_fwd",
+          "basis": "umap",
+          "embeddingKey": "prot:X_umap"
+        },
+        {
+          "key": ":velocity_umap",
+          "field": ":velocity",
+          "basis": "umap",
+          "embeddingKey": "X_umap"
         }
       ]
     }
@@ -2590,6 +2821,66 @@
           }
         }
       ]
+    },
+    {
+      "name": "a modality's velocity binds to its own UMAP, never to the joint one",
+      "obsm": [
+        {
+          "key": "X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "rna:X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "atac:X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "rna:velocity_umap",
+          "width": 2,
+          "usable": true
+        }
+      ],
+      "enabled": [
+        {
+          "key": "X_umap",
+          "columns": [
+            0,
+            1
+          ]
+        },
+        {
+          "key": "atac:X_umap",
+          "columns": [
+            0,
+            1
+          ]
+        },
+        {
+          "key": "rna:X_umap",
+          "columns": [
+            0,
+            1
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "key": "rna:velocity_umap",
+          "embedding": {
+            "key": "rna:X_umap",
+            "columns": [
+              0,
+              1
+            ]
+          }
+        }
+      ]
     }
   ],
   "nothingPlottable": [
@@ -2612,10 +2903,10 @@
             10000,
             2
           ],
-          "defect": "NaN at cell 17"
+          "defect": "not representable as float32 at cell 17"
         }
       ],
-      "expected": "Cellucid found nothing to plot. It needs an obsm array with one row per cell (10,000) and at least one numeric column. obsm holds: X_df (table), spatial (10,000 \u00d7 2, NaN at cell 17). Add a 2-D embedding to obsm (for example with sc.tl.umap in Scanpy), then open the data again."
+      "expected": "Cellucid found nothing to plot. It needs an obsm array with one row per cell (10,000) and at least one numeric column. obsm holds: X_df (table), spatial (10,000 \u00d7 2, not representable as float32 at cell 17). Add a 2-D embedding to obsm (for example with sc.tl.umap in Scanpy), then open the data again."
     },
     {
       "nObs": 1234567,
@@ -6258,6 +6549,57 @@
       "expected": {
         "error": "modality_unknown"
       }
+    }
+  ],
+  "defaultGraph": [
+    {
+      "name": "Scanpy's connectivities first",
+      "keys": [
+        "distances",
+        "RNA_snn",
+        "connectivities"
+      ],
+      "modality": null,
+      "expected": "connectivities"
+    },
+    {
+      "name": "Seurat's shared-nearest-neighbour graph, never its directed one",
+      "keys": [
+        "RNA_nn",
+        "RNA_snn"
+      ],
+      "modality": null,
+      "expected": "RNA_snn"
+    },
+    {
+      "name": "the modality the dataset opens with first",
+      "keys": [
+        "ADT_snn",
+        "RNA_snn",
+        "RNA_nn"
+      ],
+      "modality": "RNA",
+      "expected": "RNA_snn"
+    },
+    {
+      "name": "else the first in code-point order, in any case",
+      "keys": [
+        "b_snn",
+        "SNN",
+        "a_SNN"
+      ],
+      "modality": "RNA",
+      "expected": "SNN"
+    },
+    {
+      "name": "no undirected neighbour graph: none",
+      "keys": [
+        "distances",
+        "RNA_nn",
+        "_snn"
+      ],
+      "modality": null,
+      "expected": null
     }
   ]
 }

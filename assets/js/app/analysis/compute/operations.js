@@ -220,7 +220,7 @@ const Operations = {
   [OperationType.GROUP_SUMMARY_COMPUTE_GENES]: {
     id: OperationType.GROUP_SUMMARY_COMPUTE_GENES,
     name: 'Group Summary of Genes',
-    description: 'Per-group sum, cells above the expression cutoff and their sum, for a run of genes',
+    description: 'Per-group cells with a value, sum, cells above the expression cutoff and their sum, for a run of genes',
     workerCapable: true,
     cpuCapable: true
   },

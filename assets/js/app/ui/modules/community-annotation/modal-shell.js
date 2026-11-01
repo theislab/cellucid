@@ -53,6 +53,7 @@ import { claimCommunityAnnotationModal } from '../community-annotation-modal-own
 import { el } from './dom.js';
 import { createDomId } from '../../components/dom-id.js';
 import { releaseExactModalDocumentLayer, runExactCleanup } from './cleanup.js';
+import { onAbort } from '../../../../utils/abort.js';
 
 const COMMUNITY_MODAL_LOCAL_CLOSE = Symbol('communityModalLocalClose');
 export const COMMUNITY_MODAL_ESCAPE_OWNER = Symbol('communityModalEscapeOwner');
@@ -406,15 +407,12 @@ export function confirmAsync({ title, message, confirmText, tone = 'danger', sig
   return new Promise((resolve) => {
     let settled = false;
     let cancelDialog = null;
+    let stopWaiting = () => {};
     const settle = value => {
       if (settled) return;
       settled = true;
-      signal?.removeEventListener('abort', onAbort);
+      stopWaiting();
       resolve(value);
-    };
-    const onAbort = () => {
-      if (cancelDialog !== null) cancelDialog();
-      else settle(false);
     };
     cancelDialog = showConfirmDialog({
       title,
@@ -424,7 +422,9 @@ export function confirmAsync({ title, message, confirmText, tone = 'danger', sig
       onConfirm: () => settle(true),
       onCancel: () => settle(false)
     });
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (signal?.aborted) onAbort();
+    stopWaiting = onAbort(signal, () => {
+      if (cancelDialog !== null) cancelDialog();
+      else settle(false);
+    });
   });
 }

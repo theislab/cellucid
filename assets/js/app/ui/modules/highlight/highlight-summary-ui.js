@@ -24,6 +24,7 @@ import {
 } from '../../components/controls.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { removeWithUndo } from './undo-removal.js';
 
 function requireDomElementList(elements, label, methods = []) {
   if (!Array.isArray(elements) || elements.length === 0) {
@@ -55,7 +56,9 @@ export function initHighlightSummaryUI(options) {
       'getHighlightedCellCount',
       'getHighlightedGroups',
       'getTotalHighlightedCellCount',
+      'highlightGroupRecord',
       'removeHighlightGroup',
+      'restoreHighlightGroup',
       'toggleHighlightEnabled'
     ]
   );
@@ -147,8 +150,14 @@ export function initHighlightSummaryUI(options) {
     const id = rowGroupId(button);
     if (id === null) return;
     event.stopPropagation();
+    const record = state.highlightGroupRecord(id);
     requireStateOperation(
-      state.removeHighlightGroup(id),
+      removeWithUndo({
+        record,
+        remove: () => state.removeHighlightGroup(id),
+        restore: removed => state.restoreHighlightGroup(removed),
+        removed: `Highlight "${record === null ? id : record.group.label}"`
+      }),
       'Highlight removal'
     );
   });
@@ -193,8 +202,13 @@ export function initHighlightSummaryUI(options) {
     } else {
       countText = `${formatCount(visibleCount)} of ${formatCount(totalCount)} highlighted cells visible`;
     }
+    // One line each (CSS): the whole count is the title too, for a line
+    // too narrow for it.
     for (const countEl of highlightCountEls) {
-      if (countEl.textContent !== countText) countEl.textContent = countText;
+      if (countEl.textContent !== countText) {
+        countEl.textContent = countText;
+        countEl.title = countText;
+      }
     }
     // Clear hides itself once nothing is highlighted: the focus it had
     // moves to the list, not to the page.

@@ -28,6 +28,9 @@ import { mappingLatentOutlierPath } from '../assets/js/data/data-mapping-candida
 import { OutlierQuantileSource } from '../assets/js/data/outlier-quantile-source.js';
 import { categoricalStorageForDtype } from '../assets/js/data/categorical-storage-contract.js';
 import { getReadActivityLog } from '../assets/js/data/read-activity-log.js';
+import { recordReadActivities } from './helpers/read-activities.mjs';
+
+const recorded = recordReadActivities();
 
 const FIXTURES = new URL('./browser/fixtures/', import.meta.url);
 const EXPECTED = JSON.parse(await readFile(new URL('outliers-stored.expected.json', FIXTURES), 'utf8'));
@@ -67,7 +70,7 @@ function routes(adapter) {
 }
 
 function outlierActivities() {
-  return getReadActivityLog().entries().filter(activity => activity.kind === 'outliers');
+  return recorded.all().filter(activity => activity.kind === 'outliers');
 }
 
 for (const name of ['outliers-stored.h5ad', 'outliers-stored.zarr.zip']) {
@@ -77,6 +80,7 @@ for (const name of ['outliers-stored.h5ad', 'outliers-stored.zarr.zip']) {
     assert.equal(adapter.getStoredOutlierLatentKey(), 'X_scVI');
     assert.equal(adapter.getObsFields().stored_outlier_latent_key, 'X_scVI');
     getReadActivityLog().clear();
+    recorded.clear();
 
     for (const field of EXPECTED.stored) {
       const plan = await adapter.describeLatentOutlierQuantiles(route('X_scVI', field));
@@ -118,6 +122,7 @@ test('another latent space is computed, every field in one pass, with the refere
   assert.equal(plan.kept, true);
   assert.ok(plan.valueBytes > 0);
   getReadActivityLog().clear();
+  recorded.clear();
   const fields = ['cell_type', 'batch', 'rare', 'doublet'];
   const results = await Promise.all(fields.map(field => adapter.getLatentOutlierQuantiles(route('X_pca', field))));
   fields.forEach((field, index) => assert.equal(sha256(results[index]), EXPECTED.quantiles.X_pca[field], field));

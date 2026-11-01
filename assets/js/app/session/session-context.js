@@ -29,7 +29,6 @@ import {
   resolveEmbeddingRefLayout,
   UNCHANGEABLE_GROUP_CLAUSE,
 } from '../../data/dataset-mapping.js';
-import { MappingLoadError } from '../../data/data-mapping-candidates.js';
 import { sameJson } from '../utils/same-json.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf, countNoun } from '../../utils/format-units.js';
@@ -579,9 +578,10 @@ export function describeMissingRequiredFields(state, requires) {
  * The dataset a session belongs to, whatever it was opened from: its identity
  * id (the id its file states in `uns['cellucid']['id']`, else the one its
  * source gives it), its
- * counts, the digest of its cell order, and its data mapping. The cell-order
- * digest is what proves two copies hold their cells in the same order, so a
- * session saved on one host applies to the same dataset opened from another.
+ * counts, the digest of its cells' coordinates, and its data mapping. The
+ * cell-order digest is what proves two copies hold the same cells at the
+ * same coordinates, so a session saved on one host applies to the same
+ * dataset opened from another.
  */
 const DATASET_FINGERPRINT_KEYS = Object.freeze([
   'datasetId',
@@ -591,124 +591,6 @@ const DATASET_FINGERPRINT_KEYS = Object.freeze([
   'cellOrder',
   'dataMapping'
 ]);
-
-/**
- * Digest of every cell coordinate in dataset row order.
- *
- * The fingerprint scalars (dataset id, cell count, gene count) are all
- * preserved when a dataset is re-exported at the same id from re-sorted input,
- * so they cannot tell one row order from another. Positions are the only
- * per-cell payload the viewer always holds in memory, and a re-ordered export
- * permutes them, so digesting them in row order is what makes a restored
- * selection provably denote the cells it was drawn around.
- *
- * Two independent 32-bit accumulators are folded over the coordinate words and
- * emitted as one 64-bit hex value. Both are updated with a multiply and a
- * rotation per word, so the digest depends on the order of the words, not only
- * on their multiset. Measured on 842k cells (9.64 MiB of Float32 coordinates):
- * 4.3 ms for the digest, 5.6 ms for the complete fingerprint.
- *
- * The digest is defined over XYZ triples. The viewer holds a 1-D or 2-D
- * embedding with only its own components per cell (see
- * `rendering/position-layout.js`), so the axes it does not have are folded in
- * as the zero word they are — `+0.0` is the all-zero bit pattern — without
- * materializing a padded copy. A digest therefore does not depend on how the
- * coordinates are laid out in memory, and every published preset and saved
- * session keeps matching.
- *
- * A matching digest therefore proves the coordinates are the same ones in the
- * same order. A differing digest proves only that they are not: it cannot
- * separate permuted rows from re-computed coordinates, which is why
- * `describeDatasetFingerprintMismatch()` names both.
- *
- * The result is memoized against the coordinate array itself. The array is
- * replaced, never rewritten, when the dataset or the displayed embedding
- * changes, so the capture guard can re-derive the fingerprint once per
- * contributor for 0.06 ms in total instead of re-reading 9.64 MiB nine times.
- *
- * @type {WeakMap<Float32Array, string>}
- */
-const CELL_ORDER_DIGESTS = new WeakMap();
-
-/**
- * Exported for the publishing step in `cellucid-datasets`, which recomputes a
- * generation's digest from the coordinates it ships to prove a capture belongs
- * to it. That check has to run the function the application runs, not a
- * transcription of it: a transcription that drifted would approve exactly the
- * presets the reader then refuses.
- *
- * @param {Float32Array} positions - `dimension` components per cell.
- * @param {1|2|3} [dimension=3]
- * @returns {string} 16 lowercase hexadecimal characters.
- */
-export function digestCellOrder(positions, dimension = 3) {
-  if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
-    throw new RangeError('Cell-order digest dimension must be exactly 1, 2, or 3.');
-  }
-  if (
-    !(positions instanceof Float32Array)
-    || positions.length % dimension !== 0
-  ) {
-    throw new TypeError(
-      `Cell-order digest requires a Float32Array with ${formatCountOf(dimension, 'value')} per cell.`
-    );
-  }
-  const memoized = CELL_ORDER_DIGESTS.get(positions);
-  if (memoized !== undefined) return memoized;
-  // A Float32Array is always 4-byte aligned, so its buffer can be read as
-  // 32-bit words without copying.
-  const words = new Uint32Array(
-    positions.buffer,
-    positions.byteOffset,
-    positions.length
-  );
-  const cellCount = positions.length / dimension;
-  const wordCount = cellCount * 3;
-  let low = 0x9e3779b1 ^ wordCount;
-  let high = 0x85ebca6b ^ wordCount;
-  // One fold step per XYZ word, in cell order. The axes a 1D or 2D
-  // embedding lacks fold the zero word: `word ^ 0` is the accumulator itself.
-  // A 3D array already holds exactly that word sequence.
-  if (dimension === 3) {
-    for (let index = 0; index < words.length; index++) {
-      const word = words[index];
-      low = Math.imul(low ^ word, 0x85ebca77);
-      high = Math.imul(high ^ word, 0xc2b2ae3d);
-      low = (low << 13) | (low >>> 19);
-      high = (high << 17) | (high >>> 15);
-    }
-  } else {
-    // Each cell folds its `dimension` words, then 3 - dimension zero words.
-    const zeroWords = 3 - dimension;
-    for (let index = 0; index < words.length; index++) {
-      const word = words[index];
-      low = Math.imul(low ^ word, 0x85ebca77);
-      high = Math.imul(high ^ word, 0xc2b2ae3d);
-      low = (low << 13) | (low >>> 19);
-      high = (high << 17) | (high >>> 15);
-      if (dimension === 1 || (index & 1) === 1) {
-        low = Math.imul(low, 0x85ebca77);
-        high = Math.imul(high, 0xc2b2ae3d);
-        low = (low << 13) | (low >>> 19);
-        high = (high << 17) | (high >>> 15);
-        if (zeroWords === 2) {
-          low = Math.imul(low, 0x85ebca77);
-          high = Math.imul(high, 0xc2b2ae3d);
-          low = (low << 13) | (low >>> 19);
-          high = (high << 17) | (high >>> 15);
-        }
-      }
-    }
-  }
-  low = Math.imul(low ^ (low >>> 16), 0x2c1b3c6d)
-    ^ Math.imul(high ^ (high >>> 13), 0x297a2d39);
-  high = Math.imul(high ^ (high >>> 16), 0x2c1b3c6d)
-    ^ Math.imul(low ^ (low >>> 13), 0x297a2d39);
-  const digest = (high >>> 0).toString(16).padStart(8, '0')
-    + (low >>> 0).toString(16).padStart(8, '0');
-  CELL_ORDER_DIGESTS.set(positions, digest);
-  return digest;
-}
 
 function assertCellOrder(value, context) {
   requireExactKeys(value, ['embedding', 'dimension', 'digest'], context);
@@ -828,23 +710,11 @@ function currentFingerprintScalars(ctx) {
 }
 
 /**
- * Create the exact current dataset fingerprint.
- *
- * All five fields are mandatory; the dataset id may be explicitly null only
- * when no data-source manager owns the loaded state. The cell-order digest is
- * taken over the layout the live view shows, and `cellOrder.embedding` names
- * that layout under the dataset's data mapping.
- *
- * @param {object} ctx
- * @returns {{
- *   datasetId: string|null,
- *   cellCount: number,
- *   varCount: number,
- *   cellOrder: { embedding: {key: string, columns: number[]}, dimension: number, digest: string },
- *   dataMapping: object
- * }}
+ * The current dataset fingerprint without its cell-order digest, and the
+ * layout the digest is taken over: the one the live view shows, which
+ * `cellOrder.embedding` names under the dataset's data mapping. @private
  */
-export function getDatasetFingerprint(ctx) {
+function describeCurrentFingerprint(ctx) {
   const scalars = currentFingerprintScalars(ctx);
   const state = ctx.state;
   const dataMapping = requireCurrentDataMapping(state);
@@ -872,17 +742,66 @@ export function getDatasetFingerprint(ctx) {
     'Dataset fingerprint DataState'
   ).call(state, 'live');
   const embedding = layoutEmbeddingRef(state.dimensionManager, layoutKey);
+  return { scalars, dataMapping, embedding, dimension, layoutKey };
+}
+
+/**
+ * Create the exact current dataset fingerprint.
+ *
+ * All five fields are mandatory; the dataset id may be explicitly null only
+ * when no data-source manager owns the loaded state. The cell-order digest is
+ * taken over the stored values of the embedding the live view shows, each
+ * open cell named by its original position (`data/cell-order-digest.js`),
+ * and `cellOrder.embedding` names that embedding under the dataset's data
+ * mapping. The reader worker summed the values as it read them, so this
+ * folds nothing on the page.
+ *
+ * @param {object} ctx
+ * @returns {Promise<{
+ *   datasetId: string|null,
+ *   cellCount: number,
+ *   varCount: number,
+ *   cellOrder: { embedding: {key: string, columns: number[]}, dimension: number, digest: string },
+ *   dataMapping: object
+ * }>}
+ */
+export async function getDatasetFingerprint(ctx) {
+  const { scalars, dataMapping, embedding, dimension, layoutKey } = describeCurrentFingerprint(ctx);
+  const dimensionManager = ctx.state.dimensionManager;
+  const digest = await requireMethod(
+    dimensionManager,
+    'getCellOrderDigest',
+    'Dataset fingerprint DimensionManager'
+  ).call(dimensionManager, layoutKey);
   return {
     ...scalars,
     cellOrder: Object.freeze({
       embedding: Object.freeze(embedding),
       dimension,
-      digest: digestCellOrder(positions, dimension)
+      digest
     }),
     dataMapping
   };
 }
 
+/**
+ * Whether `fingerprint` (taken with `getDatasetFingerprint`) still names the
+ * open dataset: every field but the digest compared with the current ones.
+ * The digest is a function of the cells open and the embedding shown, so
+ * while those and the dataset generation stand, it stands too.
+ *
+ * @param {object} ctx
+ * @param {object} fingerprint
+ * @returns {boolean}
+ */
+export function datasetFingerprintStillCurrent(ctx, fingerprint) {
+  const { scalars, dataMapping, embedding, dimension } = describeCurrentFingerprint(ctx);
+  return datasetFingerprintMatches(fingerprint, {
+    ...scalars,
+    cellOrder: { embedding, dimension, digest: fingerprint.cellOrder.digest },
+    dataMapping
+  });
+}
 
 /**
  * Compare two dataset fingerprints.
@@ -905,21 +824,26 @@ export function datasetFingerprintMatches(a, b) {
 }
 
 /**
- * Name one side of an identity mismatch the way the person reading it would,
- * never as a bare `null`.
+ * Name one side of an identity mismatch the way the person reading it would:
+ * by the name the Dataset box shows for it, quoted, never by its identity id
+ * (an internal key: a link's is its encoded address); null when the dataset
+ * gave no name.
  *
- * @param {{datasetId: string|null}} fingerprint
- * @returns {string}
+ * @param {{name?: string|null}} fingerprint
+ * @returns {string|null}
  */
 function describeDatasetIdentity(fingerprint) {
-  const hasId = typeof fingerprint.datasetId === 'string' && fingerprint.datasetId !== '';
-  const hasName = typeof fingerprint.name === 'string'
-    && fingerprint.name !== ''
-    && fingerprint.name !== fingerprint.datasetId;
-  if (hasId && hasName) return `"${fingerprint.name}" (id "${fingerprint.datasetId}")`;
-  if (hasId) return `"${fingerprint.datasetId}"`;
-  if (hasName) return `"${fingerprint.name}"`;
-  return 'a dataset that recorded no id';
+  return typeof fingerprint.name === 'string' && fingerprint.name !== '' ? `"${fingerprint.name}"` : null;
+}
+
+/** Where a session was saved, against what is open, when both have the same counts. */
+function describeOtherDataset(saved, current) {
+  const savedName = describeDatasetIdentity(saved);
+  const currentName = describeDatasetIdentity(current);
+  if (savedName !== null && savedName === currentName) {
+    return `another dataset also called ${savedName} than the one open now`;
+  }
+  return `${savedName ?? 'another dataset'} and ${currentName ?? 'another one'} is open now`;
 }
 
 /**
@@ -1017,14 +941,14 @@ function describeDatasetIdentityMismatch(saved, current) {
     );
   }
   // The counts are the evidence in the message above, so it can only be used
-  // where they differ; two datasets with equal counts are told apart by id.
+  // where they differ; two datasets with equal counts are told apart by
+  // their identity, and named by the names they show.
   if (saved.datasetId !== current.datasetId) {
     return (
       'This session was saved on a different dataset. It has the same '
       + `${formatCountOf(saved.cellCount, 'cell')} and `
       + `${formatCountOf(saved.varCount, 'gene')}, but it was saved on `
-      + `${describeDatasetIdentity(saved)} and `
-      + `${describeDatasetIdentity(current)} is open now. Open the dataset `
+      + `${describeOtherDataset(saved, current)}. Open the dataset `
       + 'the session was saved on, then load the session again.'
     );
   }
@@ -1034,17 +958,20 @@ function describeDatasetIdentityMismatch(saved, current) {
 /**
  * The refusal shown when a session's cell-order digest does not match.
  *
- * `cellOrder.digest` is a one-way fold over the coordinate bytes in row order.
- * It changes when the rows are permuted and it changes when the coordinate
- * values change, and a hash cannot say which happened, so the message states
- * the one thing that is established and offers both causes.
+ * `cellOrder.digest` is a one-way hash of the embedding's stored values,
+ * each cell named by its original position (`data/cell-order-digest.js`).
+ * It changes when another cell sits at an original position (the cells
+ * listed in another order) and when the coordinate values change, and a
+ * hash cannot say which happened, so the message states the one thing that
+ * is established and offers both causes. How the cells were opened (whole,
+ * grown, cut, in priority order) never changes it.
  */
 const CELL_ORDER_MISMATCH_MESSAGE =
   'This dataset is not the one this session was saved on. It has the same '
   + 'name and the same number of cells and genes, but the cell coordinates '
   + 'differ from the ones the session was saved against, so Cellucid cannot '
   + 'confirm that a saved selection still marks the same cells. Either the '
-  + 'cells are stored in a different order, or the same cells were exported '
+  + 'cells are listed in a different order, or the same cells were exported '
   + 'again from a re-computed embedding. The session was not opened. Load '
   + 'the version of the dataset the session was saved on, or re-create the '
   + 'selections on this one.';
@@ -1054,24 +981,44 @@ const CELL_ORDER_MISMATCH_MESSAGE =
  * changing anything the user sees.
  *
  * In order: the dataset's counts and identity, its data mapping, then the
- * cell-order digest of the very layout the session names, whose positions are
- * loaded (pinned, so no view's cache is disturbed) whichever layout the live
- * view shows now. Nothing is applied before all of them pass.
+ * cell-order digest of the very embedding the session names, over the open
+ * cells, whichever layout the live view shows now (the reader worker's sums,
+ * `DimensionManager.getCellOrderDigest`: no layout is loaded for it).
+ * Nothing is applied before all of them pass.
+ *
+ * A session names the cells it was saved on, which are opened before it is
+ * restored (`session-controls.js`): the digest of those cells is the same
+ * however they are opened now -- whole, grown, cut in place from a larger
+ * share, in priority order or as the file gives them.
+ *
+ * A dataset's published starting view (`profile` 'published-default') is
+ * saved on every cell and holds no per-cell state (its seven static chunks,
+ * `published-default.js`): it applies to any subsample of its dataset --
+ * fitted to the device, or named in the link -- as it does to every cell.
+ * The cell count is then the dataset's (`nOriginal` of the open cells'
+ * identity), and the cell-order digest, a sum over every cell, cannot be
+ * taken from the cells a subsample holds: the catalog binds the view to its
+ * dataset's generation by SHA-256 instead.
  *
  * @param {object} ctx
  * @param {any} saved - A validated `manifest.datasetFingerprint`.
+ * @param {{profile?: 'published-default'|null}} [options]
  * @returns {Promise<string|null>} The refusal to show, or null when it matches.
  */
-export async function verifySessionFingerprint(ctx, saved) {
+export async function verifySessionFingerprint(ctx, saved, { profile = null } = {}) {
   assertDatasetFingerprint(saved, 'Saved dataset fingerprint');
-  const scalars = currentFingerprintScalars(ctx);
+  const opened = currentFingerprintScalars(ctx);
+  const cells = ctx.state.cellIdentity ?? null;
+  const ontoSubsample = profile === 'published-default' && cells?.isSubset === true && cells.nOriginal === saved.cellCount;
+  const scalars = ontoSubsample ? { ...opened, cellCount: cells.nOriginal } : opened;
   // Choosing None leaves a runtime of zero cells and no data mapping. That is
   // no dataset at all, so quoting its zero counts as "the one that is open
   // now" would be untrue.
   if (scalars.cellCount === 0) {
+    const savedName = describeDatasetIdentity(saved);
     return (
-      'No dataset is open. Open the dataset the session was saved on '
-      + `(${describeDatasetIdentity(saved)}), then load the session again.`
+      'No dataset is open. Open the dataset the session was saved on'
+      + `${savedName === null ? '' : ` (${savedName})`}, then load the session again.`
     );
   }
   const dataMapping = requireCurrentDataMapping(ctx.state);
@@ -1111,6 +1058,7 @@ export async function verifySessionFingerprint(ctx, saved) {
     if (mapping !== null) return mapping;
   }
 
+  if (ontoSubsample) return null;
   const dimensionManager = ctx.state.dimensionManager;
   const layoutKey = resolveEmbeddingRefLayout(
     dimensionManager,
@@ -1126,20 +1074,11 @@ export async function verifySessionFingerprint(ctx, saved) {
       + ' Open the dataset version the session was saved on, then load the session again.'
     );
   }
-  const release = dimensionManager.pinLayout(layoutKey);
-  let digest;
-  try {
-    const positions = await dimensionManager.getPositions(layoutKey);
-    digest = digestCellOrder(positions, saved.cellOrder.dimension);
-  } catch (error) {
-    if (!(error instanceof MappingLoadError)) throw error;
-    return (
-      `This session recorded its cell order on ${describeEmbeddingRef(saved.cellOrder.embedding)}, `
-      + `which this dataset cannot plot (${error.reason}). The session was not opened.`
-    );
-  } finally {
-    release();
-  }
+  const digest = await requireMethod(
+    dimensionManager,
+    'getCellOrderDigest',
+    'Session restore DimensionManager'
+  ).call(dimensionManager, layoutKey);
   return digest === saved.cellOrder.digest ? null : CELL_ORDER_MISMATCH_MESSAGE;
 }
 

@@ -12,49 +12,66 @@
 
 /**
  * Append the entries `from..to` of one gene that fall in a cell subset to
- * `outPositions`/`outValues` at `at`: each entry whose row has a subset
- * position (`positionOf[row] >= 0`), with its value as float32, unless that
- * is zero (a stored zero is no entry, as `sparseColumnOf` leaves it out).
- * The rows must ascend strictly within `nObs` (one entry per cell, as scipy
- * and anndata write a canonical matrix); returns the new end, or -1 when
- * they do not (a duplicate coordinate, an unsorted gene), and the gene is
- * then read through `sparseColumnOf`.
+ * `outPositions`/`outValues` at `at`: each entry whose row is a subset
+ * cell's (`subset`: their rows ascending and each one's position,
+ * `matrix-access.js` `subsetCells`), at that cell's position, with its value
+ * as float32, unless that is zero (a stored zero is no entry, as
+ * `sparseColumnOf` leaves it out). The rows must ascend strictly within
+ * `nObs` (one entry per cell, as scipy and anndata write a canonical
+ * matrix); returns the new end, or -1 when they do not (a duplicate
+ * coordinate, an unsorted gene), and the gene is then read through
+ * `sparseColumnOf`. The gene's rows and the subset's are walked together,
+ * the subset's by galloping past the rows the gene skips: a few cells of a
+ * gene of many entries cost the entries, many cells of a sparse gene about
+ * its entries' logarithms.
  *
  * @param {ArrayLike<number>} rows
  * @param {ArrayLike<number>} values
  * @param {number} from
  * @param {number} to
- * @param {Int32Array} positionOf - Each cell's subset position, or -1
+ * @param {{rows: Uint32Array, positions: Int32Array}} subset
  * @param {number} nObs
  * @param {Int32Array} outPositions
  * @param {Float32Array} outValues
  * @param {number} at
  * @returns {number}
  */
-export function keepSubsetEntries(rows, values, from, to, positionOf, nObs, outPositions, outValues, at) {
+export function keepSubsetEntries(rows, values, from, to, subset, nObs, outPositions, outValues, at) {
+  const cellRows = subset.rows;
+  const cells = cellRows.length;
   let previous = -1;
   let kept = at;
-  // Every entry is written and kept only when its cell is in the subset
-  // (`~position >>> 31` is 1 for a position, 0 for -1): no branch on which
-  // entries a subset keeps, which no predictor guesses.
+  let c = 0;
   for (let entry = from; entry < to; entry++) {
     const row = rows[entry];
     if (!(row > previous && row < nObs)) return -1;
     previous = row;
-    const position = positionOf[row];
-    outPositions[kept] = position;
-    outValues[kept] = values[entry];
-    kept += ~position >>> 31;
-  }
-  // A stored zero is no entry: the few kept are dropped.
-  let end = at;
-  for (let entry = at; entry < kept; entry++) {
-    if (outValues[entry] !== 0) {
-      outPositions[end] = outPositions[entry];
-      outValues[end++] = outValues[entry];
+    if (c < cells && cellRows[c] < row) {
+      // Gallop to the first subset row at or past this one.
+      let step = 1;
+      let low = c;
+      while (c + step < cells && cellRows[c + step] < row) {
+        low = c + step;
+        step *= 2;
+      }
+      let high = Math.min(cells, c + step);
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (cellRows[middle] < row) low = middle + 1;
+        else high = middle;
+      }
+      c = low;
+    }
+    if (c < cells && cellRows[c] === row) {
+      const value = values[entry];
+      if (value !== 0) {
+        outPositions[kept] = subset.positions[c];
+        outValues[kept++] = value;
+      }
+      c++;
     }
   }
-  return end;
+  return kept;
 }
 
 /**
@@ -85,11 +102,11 @@ export function sortSubsetEntries(positions, values, from, to) {
  * to read through `sparseColumnOf`.
  *
  * @param {{rows: ArrayLike<number>, values: ArrayLike<number>, ranges: Float64Array, nObs: number, ascending: boolean}} run
- * @param {Int32Array} positionOf - Each cell's subset position, or -1
+ * @param {{rows: Uint32Array, positions: Int32Array}} subset - The subset's cells (`keepSubsetEntries`)
  * @returns {{positions: Int32Array, values: Float32Array, counts: Float64Array,
  *   refused: Array<{gene: number, rows: ArrayLike<number>, values: ArrayLike<number>}>}}
  */
-export function keepSubsetRun({ rows, values, ranges, nObs, ascending }, positionOf) {
+export function keepSubsetRun({ rows, values, ranges, nObs, ascending }, subset) {
   const genes = ranges.length / 2;
   let entries = 0;
   for (let k = 0; k < genes; k++) entries += ranges[2 * k + 1] - ranges[2 * k];
@@ -101,7 +118,7 @@ export function keepSubsetRun({ rows, values, ranges, nObs, ascending }, positio
   for (let k = 0; k < genes; k++) {
     const from = ranges[2 * k];
     const to = ranges[2 * k + 1];
-    const end = keepSubsetEntries(rows, values, from, to, positionOf, nObs, positions, kept, at);
+    const end = keepSubsetEntries(rows, values, from, to, subset, nObs, positions, kept, at);
     if (end < 0) {
       refused.push({ gene: k, rows: rows.slice(from, to), values: values.slice(from, to) });
       continue;

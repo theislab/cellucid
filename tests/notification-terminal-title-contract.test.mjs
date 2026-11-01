@@ -46,6 +46,13 @@ class FakeNode {
     return child;
   }
 
+  insertBefore(child, reference) {
+    if (reference === null) return this.appendChild(child);
+    child.parent = this;
+    this.children.splice(this.children.indexOf(reference), 0, child);
+    return child;
+  }
+
   remove() {
     if (this.parent === null) return;
     this.parent.children = this.parent.children.filter(node => node !== this);
@@ -113,6 +120,16 @@ function createCenter(t) {
   center._createNotificationElement = (id, options) =>
     fakeNotificationElement(options);
   center._scheduleDismiss = () => {};
+  // Work in progress is shown at once here, as it is once it has run
+  // NOTICE_AFTER_MS: these contracts are about what a shown card says.
+  const show = center.show.bind(center);
+  center.show = options => {
+    const id = show(options);
+    const notification = center.notifications.get(id);
+    if (notification.element.hidden) center._reveal(notification);
+    return id;
+  };
+  t.after(() => center.dismissAll());
   return center;
 }
 

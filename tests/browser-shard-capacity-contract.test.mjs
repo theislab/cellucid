@@ -6,16 +6,26 @@
  * count"). That refusal is decided by the spec files themselves, so a new
  * spec can push a shard over its bound without touching the workflow. This
  * plans every shard of the workflow's matrix, for every engine on every
- * runner the matrix uses, from Playwright's own shard listing — the same
- * plan the runner makes — so the overflow is caught here instead of in CI.
+ * runner the matrix uses, from Playwright's own sharding -- the same plan
+ * the runner makes -- so the overflow is caught here instead of in CI.
+ *
+ * One listing plans every shard of every project
+ * (`tests/helpers/shard-plan-reporter.mjs`, Playwright's `createTestGroups`
+ * and `filterForShard` replicated for the pinned version), and real
+ * `--shard` listings of one engine (every other shard and the last: every
+ * boundary between two shards) are compared with their plans, test for
+ * test, so a change of Playwright's sharding is caught: 5 processes. It listed each of the 21 shards in a
+ * process of its own before: 26 s on an idle machine and 166 s at a load
+ * average of 42, past the suite's 120 s a test, in 4 of 13 loaded runs
+ * (2026-11-01).
  */
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { cp, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { availableParallelism, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -25,31 +35,21 @@ import {
   resolveBrowserShardLimits,
   shouldIsolateProcessIntensiveFiles,
 } from '../scripts/run-browser-shard-bounded.mjs';
+import { PINNED_PLAYWRIGHT_VERSION } from './helpers/shard-plan-reporter.mjs';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const playwrightCli = createRequire(import.meta.url).resolve('@playwright/test/cli');
 
-/**
- * Every listing loads every spec file, so Playwright's compilation cache is
- * what a listing mostly costs: cold, one takes about four times the CPU of a
- * warm one. Concurrent listings must not share that cache, though: on
- * Windows two processes renaming the same cache entry fail. So the first
- * listing runs alone and fills a cache, each concurrent listing gets its own
- * copy of it, and every later listing reads warm entries only.
- */
-const LISTING_CONCURRENCY = Math.max(1, availableParallelism() - 1);
+const shardPlanReporter = fileURLToPath(new URL('./helpers/shard-plan-reporter.mjs', import.meta.url));
 
-function listShard(project, shard, cacheDirectory) {
+/** Run Playwright's CLI on the repository; resolve its stdout. */
+function playwright(args, env) {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      [playwrightCli, 'test', '--list', '--reporter=json', `--project=${project}`, `--shard=${shard}`],
-      {
-        cwd: repositoryRoot,
-        env: { ...process.env, FORCE_COLOR: '0', PWTEST_CACHE_DIR: cacheDirectory },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+    const child = spawn(process.execPath, [playwrightCli, 'test', ...args], {
+      cwd: repositoryRoot,
+      env: { ...process.env, FORCE_COLOR: '0', ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk; });
@@ -57,17 +57,26 @@ function listShard(project, shard, cacheDirectory) {
     child.on('error', reject);
     child.on('close', code => {
       if (code === 0) {
-        resolve(JSON.parse(stdout));
+        resolve(stdout);
         return;
       }
       // The JSON reporter writes configuration and load errors to stdout.
-      let reported = stdout.slice(-4000);
-      try {
-        reported = JSON.stringify(JSON.parse(stdout).errors ?? []);
-      } catch {}
-      reject(new Error(`playwright --list ${project} ${shard} exited ${code}: ${stderr}${reported}`));
+      reject(new Error(`playwright ${args.join(' ')} exited ${code}: ${stderr}${stdout.slice(-4000)}`));
     });
   });
+}
+
+/** Every spec of a JSON shard report, as file and title. */
+function listedTests(report, testDir) {
+  const tests = [];
+  const walk = suites => {
+    for (const suite of suites ?? []) {
+      for (const spec of suite.specs ?? []) tests.push(`${resolve(testDir, spec.file)} › ${spec.title}`);
+      walk(suite.suites);
+    }
+  };
+  walk(report.suites);
+  return tests.sort();
 }
 
 test('every browser shard of the CI matrix fits its runner\'s bounded processes', async () => {
@@ -77,28 +86,37 @@ test('every browser shard of the CI matrix fits its runner\'s bounded processes'
   const shards = JSON.parse(matrixShards[1]);
   assert.ok(shards.length > 0);
 
-  const reports = new Map();
-  const pending = ['chromium', 'firefox', 'webkit'].flatMap(project => shards.map(shard => [project, shard]));
   const cacheRoot = await mkdtemp(join(tmpdir(), 'cellucid-shard-capacity-'));
+  let reports;
+  let compared;
   try {
-    const listNext = async cacheDirectory => {
-      const [project, shard] = pending.shift();
-      reports.set(`${project} ${shard}`, await listShard(project, shard, cacheDirectory));
-    };
-    const warmCache = join(cacheRoot, '0');
-    await listNext(warmCache);
-    const workers = Math.min(LISTING_CONCURRENCY, pending.length);
-    const caches = [warmCache];
-    for (let worker = 1; worker < workers; worker += 1) {
-      const cacheDirectory = join(cacheRoot, String(worker));
-      await cp(warmCache, cacheDirectory, { recursive: true });
-      caches.push(cacheDirectory);
+    const planFile = join(cacheRoot, 'plan.json');
+    const environment = { PWTEST_CACHE_DIR: join(cacheRoot, 'cache') };
+    await playwright(['--list', `--reporter=${shardPlanReporter}`], {
+      ...environment,
+      CELLUCID_SHARD_PLAN_OUTPUT: planFile,
+      CELLUCID_SHARD_PLAN_TOTAL: String(shards.length),
+    });
+    const plan = JSON.parse(await readFile(planFile, 'utf8'));
+    assert.equal(plan.version, PINNED_PLAYWRIGHT_VERSION, 'the plan replicates the installed Playwright');
+    reports = new Map(Object.entries(plan.plans));
+    // Real shards, test for test, against the plan: every other shard and
+    // the last, whose first and last tests are every boundary between two
+    // shards, of the engine whose files carry the isolation tags. A change
+    // of Playwright's sharding moves a boundary.
+    const testDir = plan.plans[`webkit ${shards[0]}`].config.projects[0].testDir;
+    compared = [];
+    for (const [index, shard] of shards.entries()) {
+      if (index % 2 !== 0 && index !== shards.length - 1) continue;
+      const real = JSON.parse(await playwright(['--list', '--reporter=json', '--project=webkit', `--shard=${shard}`], environment));
+      compared.push({ shard, real: listedTests(real, testDir), planned: listedTests(reports.get(`webkit ${shard}`), testDir) });
     }
-    await Promise.all(caches.map(async cacheDirectory => {
-      while (pending.length > 0) await listNext(cacheDirectory);
-    }));
   } finally {
     await rm(cacheRoot, { recursive: true, force: true });
+  }
+  for (const { shard, real, planned } of compared) {
+    assert.ok(real.length > 0, `webkit ${shard} lists tests`);
+    assert.deepEqual(planned, real, `the plan of webkit ${shard} is Playwright's own shard`);
   }
 
   let files = 0;

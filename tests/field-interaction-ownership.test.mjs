@@ -9,8 +9,6 @@ import {
   FieldOverlayPublicMethods,
 } from '../assets/js/app/state/managers/field/overlay-public.js';
 import {
-  isSessionRestoreCanceledError,
-  isSessionRestoreSupersededError,
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import {
@@ -29,6 +27,7 @@ import {
 import {
   showConfirmDialog,
 } from '../assets/js/app/ui/components/confirm-dialog.js';
+import { cancellationKind, cancelled, isCancellation } from '../assets/js/utils/abort.js';
 
 function deferred() {
   let reject;
@@ -397,7 +396,7 @@ test(
       manager.activeDatasetId = previousDatasetId;
     });
     const controller = new AbortController();
-    controller.abort(new Error('configured field-loader owner retired'));
+    controller.abort(cancelled('closed', 'The configured field-loader owner retired.'));
     const options = { signal: controller.signal };
     const obsField = {
       key: 'score',
@@ -419,8 +418,9 @@ test(
       'anndata://configured-owner/var',
       options,
     );
-    await assert.rejects(obsLoader(obsField), error => error?.name === 'AbortError');
-    await assert.rejects(varLoader(varField), error => error?.name === 'AbortError');
+    // The owner's own cancellation, its kind kept, whichever loader stops on it.
+    await assert.rejects(obsLoader(obsField), error => cancellationKind(error) === 'closed');
+    await assert.rejects(varLoader(varField), error => cancellationKind(error) === 'closed');
     assert.equal(directCalls, 0);
   },
 );
@@ -511,7 +511,7 @@ test(
       return load.promise;
     };
     const controller = new AbortController();
-    const exactAbort = new Error('exact field interaction supersession');
+    const exactAbort = cancelled('superseded', 'Exact field interaction supersession.');
 
     const loadTask = state.ensureFieldLoaded(0, {
       signal: controller.signal,
@@ -786,10 +786,7 @@ test('unloading a gene aborts its shared backend generation immediately', async 
 test(
   'the shared interaction owner is latest-wins, abortable, drainable, and exact',
   async () => {
-    const {
-      createFieldInteractionOwner,
-      isFieldInteractionSupersededError,
-    } = await import(
+    const { createFieldInteractionOwner } = await import(
       '../assets/js/app/ui/modules/field-interaction-owner.js'
     );
     const owner = createFieldInteractionOwner();
@@ -812,7 +809,7 @@ test(
 
     assert.equal(firstSignal.aborted, true);
     firstGate.resolve();
-    await assert.rejects(first, isFieldInteractionSupersededError);
+    await assert.rejects(first, isCancellation);
 
     let settled = false;
     const settlement = owner.settleCurrent().then(() => {
@@ -826,11 +823,11 @@ test(
     await settlement;
     assert.deepEqual(published, ['second']);
 
-    const releaseSuspension = owner.acquireSuspension();
+    const releaseSuspension = owner.acquireSuspension('the view is being saved');
     assert.equal(owner.isSuspended(), true);
     assert.throws(
       () => owner.run(async () => {}),
-      isFieldInteractionSupersededError,
+      isCancellation,
     );
     releaseSuspension();
     assert.equal(owner.isSuspended(), false);
@@ -858,10 +855,7 @@ test(
 test(
   'session suspension drains the current token and intent without invalidating either',
   async () => {
-    const {
-      createFieldInteractionOwner,
-      isFieldInteractionSupersededError,
-    } = await import(
+    const { createFieldInteractionOwner } = await import(
       '../assets/js/app/ui/modules/field-interaction-owner.js'
     );
     const tokenOwner = createFieldInteractionOwner();
@@ -886,19 +880,19 @@ test(
     })();
     intentOwner.track(intentTask);
 
-    const releaseTokenSuspension = tokenOwner.acquireSuspension();
-    const releaseIntentSuspension = intentOwner.acquireSuspension();
+    const releaseTokenSuspension = tokenOwner.acquireSuspension('the view is being saved');
+    const releaseIntentSuspension = intentOwner.acquireSuspension('the view is being saved');
     assert.equal(tokenOwner.isSuspended(), true);
     assert.equal(intentOwner.isSuspended(), true);
     assert.equal(tokenSignal.aborted, false);
     assert.equal(intentOwner.isIntentCurrent(intent), true);
     assert.throws(
       () => tokenOwner.run(async () => {}),
-      isFieldInteractionSupersededError,
+      isCancellation,
     );
     assert.throws(
       () => intentOwner.beginIntent(),
-      isFieldInteractionSupersededError,
+      isCancellation,
     );
 
     let tokenDrained = false;
@@ -935,10 +929,7 @@ test(
 test(
   'restore suspension retires the current token and intent before draining',
   async () => {
-    const {
-      createFieldInteractionOwner,
-      isFieldInteractionSupersededError,
-    } = await import(
+    const { createFieldInteractionOwner } = await import(
       '../assets/js/app/ui/modules/field-interaction-owner.js'
     );
     const tokenOwner = createFieldInteractionOwner();
@@ -951,11 +942,11 @@ test(
     });
     const tokenRejection = assert.rejects(
       tokenTask,
-      isFieldInteractionSupersededError,
+      isCancellation,
     );
 
     const releaseTokenSuspension =
-      tokenOwner.acquireRetiringSuspension();
+      tokenOwner.acquireRetiringSuspension('a saved view is being restored');
     assert.equal(tokenOwner.isSuspended(), true);
     assert.equal(tokenSignal.aborted, true);
     tokenGate.resolve();
@@ -965,7 +956,7 @@ test(
     const intentOwner = createFieldInteractionOwner();
     const intent = intentOwner.beginIntent();
     const releaseIntentSuspension =
-      intentOwner.acquireRetiringSuspension();
+      intentOwner.acquireRetiringSuspension('a saved view is being restored');
     assert.equal(intentOwner.isSuspended(), true);
     assert.equal(intentOwner.isIntentCurrent(intent), false);
     releaseIntentSuspension();
@@ -1078,10 +1069,7 @@ test(
 test(
   'a deferred duplicate intent cannot publish after a newer field selection',
   async () => {
-    const {
-      createFieldInteractionOwner,
-      isFieldInteractionSupersededError,
-    } = await import(
+    const { createFieldInteractionOwner } = await import(
       '../assets/js/app/ui/modules/field-interaction-owner.js'
     );
     const owner = createFieldInteractionOwner();
@@ -1103,7 +1091,7 @@ test(
     assert.equal(await selection, 'newer-selection');
     await assert.rejects(
       duplicateTask,
-      isFieldInteractionSupersededError,
+      isCancellation,
     );
     assert.equal(duplicatePublications, 0);
   },
@@ -1140,6 +1128,11 @@ function withFingerprintOwners(state, mapping = SESSION_DATA_MAPPING) {
     origin: 'identity',
   }]);
   dimensionManager.setRepresentations(['X_umap_3d'], new Map([[3, 'X_umap_3d']]));
+  // The reader worker's cell-order digest of that layout (`cell-order-digest.js`).
+  dimensionManager.getCellOrderDigest = async layoutKey => {
+    assert.equal(layoutKey, 'X_umap_3d');
+    return '0123456789abcdef';
+  };
   state.dimensionManager = dimensionManager;
   state.dataMapping = mapping;
   state.getDataMapping = () => state.dataMapping;
@@ -1212,8 +1205,9 @@ test(
     assert.deepEqual(events, ['settle:start']);
 
     settlement.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Every turn the capture takes before its contributor runs (the open
+    // cells taken in use, the fingerprint asked for) passes.
+    await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(events, [
       'settle:start',
       'settle:done',
@@ -1493,7 +1487,7 @@ test(
     });
 
     const firstBundle = serializer.createSessionBundle();
-    await Promise.resolve();
+    await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(events, ['capture:1:start']);
     const restoreTask = serializer._runOwnedRestore(
       async () => {
@@ -1564,7 +1558,7 @@ test(
     );
     await Promise.resolve();
     await serializer.cancelRestore();
-    await assert.rejects(canceled, isSessionRestoreCanceledError);
+    await assert.rejects(canceled, (error => cancellationKind(error) === 'user'));
     assert.deepEqual({ acquisitions, releases }, {
       acquisitions: 2,
       releases: 2,
@@ -1585,7 +1579,7 @@ test(
       async () => {},
       { signal: null },
     );
-    await assert.rejects(first, isSessionRestoreSupersededError);
+    await assert.rejects(first, (error => cancellationKind(error) === 'superseded'));
     await second;
     assert.deepEqual({ acquisitions, releases }, {
       acquisitions: 4,
@@ -1625,13 +1619,15 @@ test(
       ),
       'utf8',
     );
+    // Each waits first for the gene list of a dataset just shown (read
+    // after its first view), then holds the shared field owner.
     assert.match(
       coordinatorSource,
-      /sessionSerializer\.setCaptureSettlement\(\s*fieldSelector\.acquireSessionCaptureOperation\s*\)/,
+      /sessionSerializer\.setCaptureSettlement\(async \(\) => \{\s*await state\.whenGenesListed\(\);\s*return fieldSelector\.acquireSessionCaptureOperation\(\);\s*\}\)/,
     );
     assert.match(
       coordinatorSource,
-      /sessionSerializer\.setRestoreSettlement\(\s*fieldSelector\.acquireSessionRestoreOperation\s*\)/,
+      /sessionSerializer\.setRestoreSettlement\(async \(\) => \{\s*await state\.whenGenesListed\(\);\s*return fieldSelector\.acquireSessionRestoreOperation\(\);\s*\}\)/,
     );
     assert.match(
       coordinatorSource,

@@ -19,6 +19,8 @@
 
 import { forEachProjectedPoint } from '../utils/point-projector.js';
 import { reducePointsByDensity } from '../utils/density-reducer.js';
+import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, colorLayersOf } from '../../../../../rendering/alpha-visibility.js';
+import { requireFigurePointLayers } from '../utils/lod-membership.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
@@ -176,7 +178,7 @@ function writeCircle(sink, x, y, radius, shaded, highlightArray, index) {
  * @param {1|2|3} options.dimension
  * @param {Uint8Array} options.colors
  * @param {Uint8Array|null} options.transparency
- * @param {import('../utils/lod-membership.js').LodMembership|null} options.lodMembership
+ * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} options.lodMembership
  * @param {Uint32Array|null} options.drawOrder
  * @param {object} options.renderState - the panel's presented render state
  * @param {object} options.fogRenderState - the render state whose fog the
@@ -191,6 +193,9 @@ function writeCircle(sink, x, y, radius, shaded, highlightArray, index) {
  * @param {boolean} [options.sortByDepth] - Full Vector: draw back to front
  * @param {number} [options.targetCount] - Optimized Vector: the exact point count
  * @param {number} [options.seed] - Optimized Vector: the reduction's seed
+ * @param {import('../utils/lod-membership.js').FigurePointLayers|null} [options.pointLayers] -
+ *   While some cells are not read: their colour, and the cells read drawn
+ *   larger (`readScale`) and whatever the level when the pane drew them so
  * @returns {Blob}
  */
 export function writeSvgPointMarkup({
@@ -213,7 +218,9 @@ export function writeSvgPointMarkup({
   sortByDepth,
   targetCount,
   seed,
+  pointLayers = null,
 }) {
+  const layers = requireFigurePointLayers(pointLayers, 'SVG point layers');
   // Vector circles carry no shader, so the depth cue the viewer paints with
   // fog has to be reproduced here or the figure loses its depth axis.
   const shadeVectorPoint = createVectorPointShader({
@@ -227,39 +234,77 @@ export function writeSvgPointMarkup({
   const sink = createMarkupSink();
 
   if (strategy === 'optimized-vector') {
-    const reduced = reducePointsByDensity({
+    const reduce = (mask, membership, count) => reducePointsByDensity({
       positions,
       dimension,
       colors,
-      transparency,
-      lodMembership,
+      transparency: mask,
+      lodMembership: membership,
       highlightArray,
       renderState,
-      targetCount,
+      targetCount: count,
       seed,
       crop
     });
+    // While some cells are not read, the read cells are what the figure is
+    // for: every one shown is kept (up to the target), whatever the level
+    // when the pane drew them so, and the cells not read fill the rest of the
+    // exact target by density, as the pane draws them beneath.
+    let reductions;
+    if (layers === null || colorLayersOf(colors).unread === 0) {
+      reductions = [reduce(transparency, lodMembership, targetCount)];
+    } else {
+      const n = positions.length / dimension;
+      const readMask = new Uint8Array(n);
+      const unreadMask = new Uint8Array(n);
+      for (let cell = 0; cell < n; cell++) {
+        if (transparency !== null && transparency[cell] === 0) continue;
+        if (colors[cell * 4 + 3] === UNREAD_ALPHA_BYTE) unreadMask[cell] = 1;
+        else readMask[cell] = 1;
+      }
+      const read = reduce(readMask, layers.readEveryLevel ? null : lodMembership, targetCount);
+      const rest = targetCount - read.x.length;
+      reductions = rest > 0 ? [reduce(unreadMask, lodMembership, rest), read] : [read];
+    }
+    const { viewportWidth, viewportHeight } = reductions[0];
     const scale = Math.min(
-      plotRect.width / reduced.viewportWidth,
-      plotRect.height / reduced.viewportHeight
+      plotRect.width / viewportWidth,
+      plotRect.height / viewportHeight
     );
-    const offsetX = plotRect.x + (plotRect.width - reduced.viewportWidth * scale) / 2;
-    const offsetY = plotRect.y + (plotRect.height - reduced.viewportHeight * scale) / 2;
+    const offsetX = plotRect.x + (plotRect.width - viewportWidth * scale) / 2;
+    const offsetY = plotRect.y + (plotRect.height - viewportHeight * scale) / 2;
     const pointRadiusPx = pointRadiusViewportPx * scale;
 
-    for (let i = 0; i < reduced.x.length; i++) {
-      const srcIndex = reduced.index?.[i] ?? i;
-      const x = offsetX + reduced.x[i] * scale;
-      const y = offsetY + reduced.y[i] * scale;
-      const j = i * 4;
-      const shaded = shadeVectorPoint(
-        srcIndex,
-        reduced.rgba[j],
-        reduced.rgba[j + 1],
-        reduced.rgba[j + 2],
-        reduced.alpha[i] ?? 1.0
-      );
-      writeCircle(sink, x, y, pointRadiusPx, shaded, highlightArray, srcIndex);
+    // The layers are written bottom first, as the pane draws them: cells not
+    // read (in their own colour, at the normal size), the grey beneath, the
+    // coloured cells (the cells read larger while some are not read).
+    const layered = colors !== null && colorLayersOf(colors).layered;
+    const unreadRgb = layers === null ? null : layers.unreadColor.map(channel => Math.round(channel * 255));
+    const zeroRgb = layers === null ? null : layers.zeroColor.map(channel => Math.round(channel * 255));
+    const readRadiusPx = pointRadiusPx * (layers === null ? 1 : layers.readScale);
+    const passBytes = [UNREAD_ALPHA_BYTE, BENEATH_ALPHA_BYTE, 255];
+    for (let pass = layered ? 0 : 2; pass < 3; pass++) {
+      for (const reduced of reductions) {
+        for (let i = 0; i < reduced.x.length; i++) {
+          const srcIndex = reduced.index?.[i] ?? i;
+          const byte = colors === null ? 255 : colors[srcIndex * 4 + 3];
+          const layer = byte === UNREAD_ALPHA_BYTE ? 0 : byte === BENEATH_ALPHA_BYTE ? 1 : 2;
+          if (layered && passBytes[layer] !== passBytes[pass]) continue;
+          const x = offsetX + reduced.x[i] * scale;
+          const y = offsetY + reduced.y[i] * scale;
+          const j = i * 4;
+          // The lower layers in the figure's own colours (`cellLayerColors`).
+          const own = layer === 0 ? unreadRgb : layer === 1 ? zeroRgb : null;
+          const shaded = shadeVectorPoint(
+            srcIndex,
+            own !== null ? own[0] : reduced.rgba[j],
+            own !== null ? own[1] : reduced.rgba[j + 1],
+            own !== null ? own[2] : reduced.rgba[j + 2],
+            reduced.alpha[i] ?? 1.0
+          );
+          writeCircle(sink, x, y, layer === 0 ? pointRadiusPx : readRadiusPx, shaded, highlightArray, srcIndex);
+        }
+      }
     }
     return sink.finish();
   }
@@ -273,6 +318,8 @@ export function writeSvgPointMarkup({
     positions,
     dimension,
     colors,
+    // The cells' colours: the alpha byte is their layer.
+    colorAlpha: 'layer',
     transparency,
     lodMembership,
     drawOrder,
@@ -281,6 +328,7 @@ export function writeSvgPointMarkup({
     radiusPx,
     crop,
     sortByDepth,
+    pointLayers: layers,
     onPoint: (x, y, r, g, b, a, radius, index) => {
       const shaded = shadeVectorPoint(index, r, g, b, a);
       writeCircle(sink, x, y, radius, shaded, highlightArray, index);

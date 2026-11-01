@@ -12,9 +12,12 @@
  * only ever reads.
  *
  * The access token (about an hour) is kept for the tab in the shared sign-in
- * store (`token-store.js`). A token cannot be renewed without a click (the
- * token model has no refresh token), so an expired one shows the calm "Sign
- * in again" step and the reads waiting on it resume after the click.
+ * store (`token-store.js`, the tab's `sessionStorage`: it survives a reload
+ * of the tab until it expires). A token cannot be renewed without a click
+ * (the token model has no refresh token), so an expired one shows the calm
+ * "Sign in again" step and the reads waiting on it resume after the click.
+ * Sign out revokes the token at Google's revocation endpoint
+ * (`REVOKE_URL`), whether or not Google's scripts were loaded in this page.
  *
  * @module data/sources/auth/google
  */
@@ -24,10 +27,13 @@ import { embeddingOrigin, isLocalOrigin, pageOrigin } from './page-context.js';
 import { finalSignInFailure, getSignInSteps } from './sign-in.js';
 import { readSignInRecord, removeSignIn, setSignInExpiry, writeSignInRecord } from './token-store.js';
 import { whileWaitingOnPerson } from '../../../utils/person-wait.js';
+import { onAbort, throwIfAborted } from '../../../utils/abort.js';
 
 export const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 export const GIS_SCRIPT_URL = 'https://accounts.google.com/gsi/client';
 export const GAPI_SCRIPT_URL = 'https://apis.google.com/js/api.js';
+/** Google's OAuth 2.0 token revocation endpoint (RFC 7009). */
+export const REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 const STORE_NAME = 'google';
 
 function validRecord(record) {
@@ -117,12 +123,14 @@ export function describeGoogleError(error) {
 }
 
 /**
- * @param {{config?: Object, steps?: import('./sign-in.js').SignInSteps, win?: Object, now?: () => number}} [options]
+ * @param {{config?: Object, steps?: import('./sign-in.js').SignInSteps, win?: Object,
+ *   fetchImpl?: typeof fetch, now?: () => number}} [options]
  */
 export function createGoogleAuth({
   config = PROVIDER_CONFIG.google,
   steps = getSignInSteps(),
   win = globalThis,
+  fetchImpl = (...args) => globalThis.fetch(...args),
   now = () => Date.now(),
 } = {}) {
   let session = readSignInRecord(STORE_NAME, validRecord);
@@ -144,12 +152,14 @@ export function createGoogleAuth({
     const here = pageOrigin(win);
     if (config.registeredOrigins.includes(here)) return null;
     if (!isLocalOrigin(here)) return `Google Drive works on www.cellucid.com, not on ${here}.`;
-    // A notebook embeds its viewer; `cellucid serve` opens in a tab of its own.
+    // A notebook widget frames the app from its web_source_url (by default
+    // www.cellucid.com, a registered origin); `cellucid serve` opens in a tab
+    // of its own.
     return embeddingOrigin(win) === null
       ? `Google Drive works on a local cellucid serve only on its default port, 8765 (this page is ${here}). ` +
         'Start it without --port, or open www.cellucid.com.'
-      : `Google Drive works in a notebook viewer only on port 8765 (this one is ${here}). ` +
-        'Another server held 8765 when it started: stop that one and show the data again, or open www.cellucid.com.';
+      : `Google Drive works in a notebook viewer that loads the app from www.cellucid.com (the default web_source_url), ` +
+        `or from a copy served at port 8765; this one loads it from ${here}.`;
   }
 
   /** Why public Drive files cannot be read on this page, or null. */
@@ -307,17 +317,18 @@ export function createGoogleAuth({
     await loadScripts();
     const token = validToken();
     if (token === null) throw new GoogleSignInError('Google sign-in expired.', 'EXPIRED');
+    // Stopped while the scripts loaded: no picker is shown.
+    throwIfAborted(signal);
     const pickerApi = win.google.picker;
     return whileWaitingOnPerson(new Promise((resolve, reject) => {
       const view = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
         .setFileIds(fileId)
         .setMode(pickerApi.DocsViewMode.LIST);
       let picker = null;
-      const onAbort = () => {
+      const stopWaiting = onAbort(signal, () => {
         picker?.setVisible(false);
         reject(signal.reason);
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
+      });
       picker = new pickerApi.PickerBuilder()
         .addView(view)
         .setOAuthToken(token)
@@ -327,12 +338,12 @@ export function createGoogleAuth({
         .setCallback(data => {
           const action = data?.[pickerApi.Response.ACTION];
           if (action === pickerApi.Action.PICKED) {
-            signal?.removeEventListener('abort', onAbort);
+            stopWaiting();
             const picked = data[pickerApi.Response.DOCUMENTS]?.[0]?.[pickerApi.Document.ID] ?? null;
             if (picked === null) reject(new GoogleSignInError('Google\'s file picker returned no file.', 'NOT_PICKED'));
             else resolve(picked);
           } else if (action === pickerApi.Action.CANCEL) {
-            signal?.removeEventListener('abort', onAbort);
+            stopWaiting();
             reject(new GoogleSignInError(
               'Google\'s file picker was closed without choosing the file, so Cellucid cannot read it. ' +
               'If the picker showed no file, your Google account has no access to it: ask its owner to share it with you.',
@@ -345,7 +356,11 @@ export function createGoogleAuth({
     }));
   }
 
-  /** Forget the sign-in, and revoke the token at Google. */
+  /**
+   * Forget the sign-in, and revoke the token at Google.
+   *
+   * @returns {Promise<boolean>} Whether Google revoked it (true with nothing to revoke)
+   */
   function signOut() {
     const token = session?.accessToken ?? null;
     session = null;
@@ -354,7 +369,25 @@ export function createGoogleAuth({
     } catch {
       // Nothing stored that could be read back either.
     }
-    if (token !== null) win.google?.accounts?.oauth2?.revoke?.(token, () => {});
+    if (token === null) return Promise.resolve(true);
+    // A form body is a simple request (no preflight); sent even when the page
+    // closes right after. A revocation that fails leaves a token that expires
+    // within its hour, which the caller says.
+    return (async () => {
+      try {
+        const response = await fetchImpl(REVOKE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ token }).toString(),
+          credentials: 'omit',
+          referrerPolicy: 'no-referrer',
+          keepalive: true,
+        });
+        return response.ok;
+      } catch {
+        return false;
+      }
+    })();
   }
 
   /** Signed in now (a token that has not expired). */

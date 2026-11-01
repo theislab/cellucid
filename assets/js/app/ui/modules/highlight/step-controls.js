@@ -265,6 +265,8 @@ export function showStepControls(options) {
     mirror.selection.textContent = readout.candidateCount === 0
       ? 'No cells selected'
       : cellCountText(readout.candidateCount);
+    // One line (CSS): the whole text is its title too.
+    mirror.selection.title = mirror.selection.textContent;
     mirror.undo.disabled = undoButton.disabled;
     mirror.confirm.disabled = confirmButton.disabled;
     publishSelectBarNotice(mirror, readout.notice);

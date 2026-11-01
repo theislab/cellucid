@@ -13,6 +13,7 @@ import {
   assertLodMembership,
   drawnSequence,
   matchesLodMembershipPresentation,
+  ownedLodMembership,
 } from '../assets/js/app/ui/modules/figure-export/utils/lod-membership.js';
 import {
   forEachProjectedPoint,
@@ -20,6 +21,8 @@ import {
 import {
   rasterizePointsWebgl,
 } from '../assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js';
+import { allocateLargeArray } from '../assets/js/utils/large-arrays.js';
+import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, colorLayersOf, requireColorAlphaMeaning } from '../assets/js/rendering/alpha-visibility.js';
 
 const figureExportRoot = new URL(
   '../assets/js/app/ui/modules/figure-export/',
@@ -43,7 +46,7 @@ const POSITIONS = Float32Array.from([
 test('presented LOD freshness compares only opaque generation and scalar shape', () => {
   const membership = createMembership();
   const presented = Object.freeze({
-    admittedCount: membership.indices.length,
+    admittedCount: membership.count,
     dimensionLevel: membership.dimensionLevel,
     generationToken: membership.generationToken,
     lodLevel: membership.lodLevel,
@@ -109,6 +112,7 @@ function createMembership({
     : Uint32Array.from(indices);
   return Object.freeze({
     admissionLevels: exactAdmissionLevels,
+    count: exactIndices.length,
     dimensionLevel,
     generationToken,
     indices: exactIndices,
@@ -151,52 +155,47 @@ async function collectJavascriptSources(directoryUrl) {
   return sources;
 }
 
-test('figure-export validates one exact frozen LOD membership owner', () => {
+test('figure-export validates its LOD record with the shared LodMembership contract', () => {
   const membership = createMembership();
   assert.equal(assertLodMembership(null, { pointCount: 4, dimensionLevel: 2 }), null);
   assert.equal(
     assertLodMembership(membership, { pointCount: 4, dimensionLevel: 2 }),
     membership
   );
-  const compactExportMembership = Object.freeze({
-    dimensionLevel: membership.dimensionLevel,
+  // A figure's copy of a rank-order level: the first cells, named in draw
+  // order, with no admission bytes.
+  const rankCopy = Object.freeze({
+    admissionLevels: null,
+    count: 2,
+    dimensionLevel: 2,
     generationToken: Object.freeze({}),
-    indices: new Uint32Array(membership.indices),
-    lodLevel: membership.lodLevel,
-    pointCount: membership.pointCount,
+    indices: Uint32Array.of(1, 0),
+    lodLevel: 0,
+    pointCount: 4,
   });
-  assert.equal(
-    assertLodMembership(compactExportMembership, {
-      pointCount: 4,
-      dimensionLevel: 2,
-    }),
-    compactExportMembership,
-    'atomic export owns only the K admitted IDs, not another dense N-byte array'
+  assert.equal(assertLodMembership(rankCopy, { pointCount: 4, dimensionLevel: 2 }), rankCopy);
+  // The viewer's record of a rank-order level names no cells: a figure
+  // makes its own copy first (`ownedLodMembership`).
+  assert.throws(
+    () => assertLodMembership(Object.freeze({ ...rankCopy, indices: null }), { pointCount: 4 }),
+    /indices must be the level's 2 cells/
   );
-
   assert.throws(
     () => assertLodMembership({ ...membership }, { pointCount: 4 }),
-    /exact frozen descriptor/
-  );
-  assert.throws(
-    () => assertLodMembership(Object.freeze({
-      ...membership,
-      [Symbol('unexpected')]: true,
-    }), { pointCount: 4 }),
-    /exact frozen descriptor/
+    /frozen/
   );
   assert.throws(
     () => assertLodMembership(createMembership({ pointCount: 3 }), {
       pointCount: 4,
     }),
-    /one Uint8 admission level|pointCount/
+    /describes 3 cells/
   );
   assert.throws(
     () => assertLodMembership(createMembership({ dimensionLevel: 3 }), {
       pointCount: 4,
       dimensionLevel: 2,
     }),
-    /dimensionLevel/
+    /in 3D/
   );
   assert.throws(
     () => assertLodMembership(createMembership({ generationToken: null }), {
@@ -208,21 +207,50 @@ test('figure-export validates one exact frozen LOD membership owner', () => {
     () => assertLodMembership(createMembership({ lodLevel: -1 }), {
       pointCount: 4,
     }),
-    /lodLevel/
+    /reduced level/
   );
   assert.throws(
     () => assertLodMembership(Object.freeze({
       ...membership,
       indices: Float32Array.from([0, 1]),
     }), { pointCount: 4 }),
-    /Uint32 prefix/
+    /indices/
   );
   assert.throws(
-    () => assertLodMembership(createMembership({
-      indices: [0, 1, 2, 3, 0],
+    () => assertLodMembership(Object.freeze({
+      ...membership,
+      indices: Uint32Array.from([0, 1, 2, 3, 0]),
     }), { pointCount: 4 }),
-    /Uint32 prefix/
+    /indices/
   );
+});
+
+test('a figure copies a level in the pane draw order: a tree names it, a rank level is the store prefix', () => {
+  const label = 'Figure export LOD membership';
+  const expected = { pointCount: 4, dimensionLevel: 2, label };
+  const tree = createMembership();
+  const treeCopy = ownedLodMembership(tree, null, expected);
+  assert.deepEqual(Array.from(treeCopy.indices), Array.from(tree.indices));
+  assert.notEqual(treeCopy.indices, tree.indices, 'the figure owns its copy');
+  assert.equal(treeCopy.admissionLevels, tree.admissionLevels);
+  const rank = Object.freeze({
+    admissionLevels: null,
+    count: 2,
+    dimensionLevel: 2,
+    generationToken: Object.freeze({}),
+    indices: null,
+    lodLevel: 0,
+    pointCount: 4,
+  });
+  // Source order: the first cells as they are.
+  assert.deepEqual(Array.from(ownedLodMembership(rank, null, expected).indices), [0, 1]);
+  // A store mid-adoption holds them in another order: its first slots.
+  const drawOrder = Uint32Array.of(1, 0, 3, 2);
+  const copy = ownedLodMembership(rank, drawOrder, expected);
+  assert.deepEqual(Array.from(copy.indices), [1, 0]);
+  assert.equal(copy.count, 2);
+  assert.equal(assertLodMembership(copy, { pointCount: 4, dimensionLevel: 2 }), copy);
+  assert.equal(ownedLodMembership(null, drawOrder, expected), null);
 });
 
 test('projection admits source points at or below the active LOD level', () => {
@@ -233,6 +261,7 @@ test('projection admits source points at or below the active LOD level', () => {
       positions: POSITIONS,
       dimension: 3,
       colors: COLORS,
+      colorAlpha: 'layer',
       lodMembership: membership,
       drawOrder: null,
       renderState: renderState(),
@@ -252,6 +281,7 @@ test('projection admits source points at or below the active LOD level', () => {
     positions: POSITIONS,
     dimension: 3,
     colors: COLORS,
+    colorAlpha: 'layer',
     lodMembership: null,
     drawOrder: null,
     renderState: renderState(),
@@ -278,6 +308,7 @@ test('depth-sorted projection packs only in-crop points before assigning bins', 
     positions,
     dimension: 3,
     colors,
+    colorAlpha: 'layer',
     renderState: renderState(),
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     crop: {
@@ -383,6 +414,7 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
       positions,
       dimension: 3,
       colors,
+      colorAlpha: 'layer',
       lodMembership: membership,
       drawOrder: null,
       renderState: renderState(),
@@ -592,6 +624,7 @@ test('fast density preview preserves only renderer-visible sparse highlights out
   for (const pointIndex of admittedIds) admissionLevels[pointIndex] = 0;
   const lodMembership = Object.freeze({
     admissionLevels,
+    count: admittedIds.length,
     dimensionLevel: 2,
     generationToken: Object.freeze({}),
     indices: admittedIds,
@@ -636,15 +669,14 @@ test('compact LOD preview never leaks an unadmitted sparse highlight', () => {
       (Math.floor(pointIndex / 25) + 0.5) / 20 - 1;
   }
   highlightArray[998] = 255;
-  const admittedIds = Uint32Array.from(
-    Array.from({ length: pointCount - 1 }, (_, index) =>
-      index < 998 ? index : 999
-    )
-  );
+  // The viewer's record of a rank-order level: the first 998 cells, named
+  // by count alone. Cell 998 is not drawn, so its highlight is not shown.
   const lodMembership = Object.freeze({
+    admissionLevels: null,
+    count: 998,
     dimensionLevel: 2,
     generationToken: Object.freeze({}),
-    indices: admittedIds,
+    indices: null,
     lodLevel: 0,
     pointCount,
   });
@@ -665,7 +697,26 @@ test('compact LOD preview never leaks an unadmitted sparse highlight', () => {
   });
 
   assert.equal(Array.from(reduced.index).includes(998), false);
-  assert.equal(reduced.scannedSourceCount, 10);
+  // The stride's 10, and the one highlight it missed, tested and refused.
+  assert.equal(reduced.scannedSourceCount, 11);
+  assert.ok(Array.from(reduced.index).every(index => index < 998));
+
+  // One more cell and the highlight is drawn: the preview keeps it.
+  const wider = reducePointsByDensity({
+    positions,
+    dimension: 3,
+    colors,
+    transparency,
+    lodMembership: Object.freeze({ ...lodMembership, count: 999 }),
+    highlightArray,
+    highlightedIndices: [998],
+    renderState: renderState(),
+    targetCount: 10,
+    gridSize: 32,
+    maxScanPoints: 10,
+    seed: 97,
+  });
+  assert.equal(Array.from(wider.index).includes(998), true);
 });
 
 test('reduced figure export consumes only the exact K-point prefix for large N', () => {
@@ -700,6 +751,7 @@ test('reduced figure export consumes only the exact K-point prefix for large N',
   });
   const membership = Object.freeze({
     admissionLevels: observedAdmissionOwner,
+    count: admittedIds.length,
     dimensionLevel: 2,
     generationToken: Object.freeze({}),
     indices: admittedIds,
@@ -712,6 +764,7 @@ test('reduced figure export consumes only the exact K-point prefix for large N',
     positions,
     dimension: 3,
     colors,
+    colorAlpha: 'layer',
     lodMembership: membership,
     drawOrder: null,
     renderState: renderState(),
@@ -763,9 +816,13 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
   assert.notEqual(end, -1);
   const packBuffers = new Function(
     'drawnSequence',
+    'allocateLargeArray',
+    'requireColorAlphaMeaning',
+    'BENEATH_ALPHA_BYTE',
+    'UNREAD_ALPHA_BYTE',
     `${rasterizerSource.slice(start, end)}
      return packBuffers;`
-  )(drawnSequence);
+  )(drawnSequence, allocateLargeArray, requireColorAlphaMeaning, BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE);
 
   const membership = createMembership({
     admissionLevels: [0, 2, 1, 255],
@@ -774,6 +831,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
     positions: POSITIONS,
     dimension: 3,
     colors: COLORS,
+    colorAlpha: 'layer',
     transparency: null,
     lodMembership: membership,
     drawOrder: null,
@@ -803,6 +861,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
     positions: POSITIONS,
     dimension: 3,
     colors: COLORS,
+    colorAlpha: 'layer',
     transparency: null,
     lodMembership: null,
     drawOrder: null,
@@ -844,6 +903,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
   for (const pointIndex of admittedIds) admissionLevels[pointIndex] = 0;
   const largeMembership = Object.freeze({
     admissionLevels,
+    count: admittedIds.length,
     dimensionLevel: 2,
     generationToken: Object.freeze({}),
     indices: admittedIds,
@@ -854,6 +914,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
     positions: observedPositions,
     dimension: 2,
     colors: observedColors,
+    colorAlpha: 'layer',
     transparency: null,
     lodMembership: largeMembership,
     highlightArray: null,
@@ -863,6 +924,7 @@ test('WebGL packing compacts only the admitted prefix and borrows presented fog'
   });
   assert.equal(compact.count, admittedIds.length);
   assert.equal(positionReads, admittedIds.length * 2);
+  // RGB, and the alpha byte for its layer (beneath or not), never visibility.
   assert.equal(colorReads, admittedIds.length * 4);
 });
 
@@ -881,7 +943,7 @@ test('WebGL export rejects a descriptor from a different point generation', () =
       outputHeightPx: 16,
       pointSizePx: 2,
     }),
-    /pointCount/
+    /describes 2 cells/
   );
 });
 
@@ -894,7 +956,7 @@ test('figure-export source has no dense LOD mask API or hot-loop conversion', as
     /visibilityMask|getLodVisibilityMask|getLodVisibilityArray/
   );
   assert.ok(
-    (combined.match(/lodMembership\?\.indices|drawnSequence\(lodMembership, drawOrder\)/g) ?? []).length >= 6,
+    (combined.match(/lodMembership\?\.indices|drawnSequence\(lodMembership, drawOrder(, [^)]*)?\)/g) ?? []).length >= 6,
     'all sequential exporter hot paths must consume the exact admitted prefix'
   );
   // Every pass whose output depends on paint order draws the pane's order:
@@ -902,7 +964,9 @@ test('figure-export source has no dense LOD mask API or hot-loop conversion', as
   for (const file of ['utils/webgl-point-rasterizer.js', 'utils/point-projector.js']) {
     const source = await readFile(new URL(file, figureExportRoot), 'utf8');
     assert.doesNotMatch(source, /lodMembership\?\.indices/, file);
-    assert.match(source, /drawnSequence\(lodMembership, drawOrder\)/, file);
+    // With the cells' colours: the layers come bottom first (UX-8, cells not
+    // read); a marker's colours (an alpha byte of opacity) are not layered.
+    assert.match(source, /drawnSequence\(lodMembership, drawOrder, (alphaIsLayer \? colors : null|alphaIsOpacity \? null : colors)(, [^)]*)?\)/, file);
   }
   assert.doesNotMatch(
     combined,
@@ -1007,13 +1071,18 @@ test('full detail packs points in the pane draw order, and a reduced level in it
   const end = rasterizerSource.indexOf('/**\n * Render a point cloud', start);
   const packBuffers = new Function(
     'drawnSequence',
+    'allocateLargeArray',
+    'requireColorAlphaMeaning',
+    'BENEATH_ALPHA_BYTE',
+    'UNREAD_ALPHA_BYTE',
     `${rasterizerSource.slice(start, end)}
      return packBuffers;`
-  )(drawnSequence);
+  )(drawnSequence, allocateLargeArray, requireColorAlphaMeaning, BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE);
   const pack = (lodMembership, drawOrder) => packBuffers({
     positions: POSITIONS,
     dimension: 3,
     colors: COLORS,
+    colorAlpha: 'layer',
     transparency: null,
     lodMembership,
     drawOrder,
@@ -1038,4 +1107,46 @@ test('full detail packs points in the pane draw order, and a reduced level in it
   assert.equal(drawnSequence(null, null), null);
   assert.equal(drawnSequence(null, order), order);
   assert.equal(drawnSequence(membership, order), membership.indices);
+});
+
+test('a figure draws cells beneath the others (a field\'s no-value grey) first, each group in the pane\'s order (UX-8)', () => {
+  const colors = new Uint8Array(6 * 4).fill(255);
+  assert.equal(drawnSequence(null, null, colors), null, 'every cell opaque: the sequence as it is');
+  // Cells 1 and 4 are grey, beneath.
+  colors[1 * 4 + 3] = BENEATH_ALPHA_BYTE;
+  colors[4 * 4 + 3] = BENEATH_ALPHA_BYTE;
+  assert.equal(colorLayersOf(colors).layered, true);
+  assert.equal(colorLayersOf(new Uint8Array(new ArrayBuffer(25), 1, 24).fill(255)).layered, false, 'unaligned colours read bytewise');
+  assert.deepEqual(Array.from(drawnSequence(null, null, colors)), [1, 4, 0, 2, 3, 5]);
+  const drawOrder = Uint32Array.of(5, 4, 3, 2, 1, 0);
+  assert.deepEqual(Array.from(drawnSequence(null, drawOrder, colors)), [4, 1, 5, 3, 2, 0]);
+  const level = Object.freeze({
+    admissionLevels: null, count: 3, dimensionLevel: 2, generationToken: Object.freeze({}),
+    indices: Uint32Array.of(2, 1, 0), lodLevel: 0, pointCount: 6,
+  });
+  assert.deepEqual(Array.from(drawnSequence(level, drawOrder, colors)), [1, 2, 0]);
+});
+
+test('a centroid\'s alpha byte is its opacity, a cell\'s its layer: each consumer names which', () => {
+  const project = (colorAlpha, colors) => {
+    const seen = [];
+    forEachProjectedPoint({
+      positions: POSITIONS.subarray(0, 9),
+      dimension: 3,
+      colors,
+      colorAlpha,
+      renderState: renderState(),
+      plotRect: { x: 0, y: 0, width: 100, height: 100 },
+      onPoint: (x, y, r, g, b, a, radius, index) => seen.push([index, Number(a.toFixed(4))]),
+    });
+    return seen;
+  };
+  // Centroids: hidden (0), translucent (180), opaque; never layered.
+  const markers = Uint8Array.from([10, 10, 10, 0, 20, 20, 20, 180, 30, 30, 30, 255]);
+  assert.deepEqual(project('opacity', markers), [[1, Number((180 / 255).toFixed(4))], [2, 1]]);
+  // Cells: 254 is drawn beneath, first, and every cell is shown.
+  const cells = Uint8Array.from([10, 10, 10, 255, 20, 20, 20, BENEATH_ALPHA_BYTE, 30, 30, 30, 255]);
+  assert.deepEqual(project('layer', cells), [[1, 1], [0, 1], [2, 1]]);
+  assert.throws(() => project(undefined, cells), /'layer' or 'opacity'/);
+  assert.equal(requireColorAlphaMeaning('opacity', 'x'), 'opacity');
 });

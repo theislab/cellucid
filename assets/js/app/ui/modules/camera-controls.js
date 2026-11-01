@@ -202,7 +202,8 @@ export function initCameraControls({ viewer, dom, callbacks }) {
         if (result.status === 'ready') {
           notifications.complete(
             readyNotifId,
-            'Projectiles ready! Click to shoot, hold to charge.'
+            'Projectiles ready! Click to shoot, hold to charge.',
+            { announce: true }
           );
           return;
         }

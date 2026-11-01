@@ -6,7 +6,7 @@ title: "Cellucid: GPU-accelerated single-cell atlas viewer"
 # (theislab/cellucid-python) and R (theislab/cellucid-r) packages, bumped
 # together at every CELLUCID_VERSION marker. A deployment is additionally
 # identified by the build id printed beside it in the application footer.
-version: 0.9.5  # CELLUCID_VERSION
+version: 0.9.6  # CELLUCID_VERSION
 authors:
   - family-names: Inecik
     given-names: Kemal

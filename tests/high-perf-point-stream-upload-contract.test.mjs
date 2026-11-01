@@ -18,6 +18,9 @@ import {
   HighPerfRenderer,
 } from '../assets/js/rendering/high-perf-renderer.js';
 import { createCpuPermuter } from './helpers/cpu-permuter.mjs';
+import { bufferOf, vaoOf } from './helpers/point-stores.mjs';
+import { SegmentedVertexArray } from '../assets/js/rendering/high-perf/point-store-segments.js';
+import { StoreOrder } from '../assets/js/rendering/high-perf/store-order.js';
 
 const CHUNK_POINTS = 65_536;
 
@@ -53,9 +56,17 @@ function makeColors(pointCount) {
 }
 
 /** A deterministic gather order over `[0, pointCount)`, standing in for a draw order. */
-/** A draw-order record over `indices`, as `_createDrawOrderRecord` returns it. */
+/** A store holding the order `indices` whole, as `_createStoreOrder` returns it. */
 function makeRecord(indices) {
-  return { drawOrder: { indices, pointCount: indices.length }, texture: {}, width: indices.length, height: 1 };
+  return new StoreOrder({
+    pointCount: indices.length,
+    target: { indices, pointCount: indices.length },
+    adopted: indices.length,
+    base: null,
+    baseEnd: indices.length,
+    map: { texture: {}, plan: null, byteLength: indices.length * 4 },
+    ranked: false,
+  });
 }
 
 function makeOrder(count, pointCount) {
@@ -235,7 +246,7 @@ function createStreamFixture(pointCount, options = {}) {
     stats: { gpuMemoryMB: 0 },
     useAdaptiveLOD: false,
     useFrustumCulling: false,
-    vao: { id: 'vao' },
+    vao: new SegmentedVertexArray(tracker.gl),
     _colors: colors,
     _colorGpuByteLength: 0,
     _positionGpuByteLength: 0,
@@ -252,8 +263,8 @@ test('full detail publishes each stream straight from the published array', () =
 
   renderer._createPointStreams(positions, colors, 3);
 
-  const { positions: positionBuffer, colors: colorBuffer } =
-    renderer.buffers;
+  const positionBuffer = bufferOf(renderer.buffers.positions);
+  const colorBuffer = bufferOf(renderer.buffers.colors);
   assert.notEqual(positionBuffer, colorBuffer);
   assert.deepEqual(
     tracker.calls.bufferData.map(call => [call.buffer, call.data, call.size, call.usage]),
@@ -297,7 +308,7 @@ test('full detail publishes each stream straight from the published array', () =
     size: 3,
     stride: 12,
     type: tracker.gl.FLOAT,
-    vao: renderer.vao,
+    vao: vaoOf(renderer.vao),
   });
   assert.deepEqual(tracker.attributes.get(1), {
     buffer: colorBuffer,
@@ -306,7 +317,7 @@ test('full detail publishes each stream straight from the published array', () =
     size: 4,
     stride: 4,
     type: tracker.gl.UNSIGNED_BYTE,
-    vao: renderer.vao,
+    vao: vaoOf(renderer.vao),
   });
 });
 
@@ -320,7 +331,7 @@ test('a 2D or 1D embedding publishes only its own components, with no padded axi
     renderer._positions = positions;
     renderer._createPointStreams(positions, colors, dimension);
     renderer._flushPendingPositionUpload();
-    const positionBuffer = renderer.buffers.positions;
+    const positionBuffer = bufferOf(renderer.buffers.positions);
     assert.ok(cellsEqual(tracker.stores.get(positionBuffer), bytesOf(positions)));
     assert.equal(
       renderer._positionGpuByteLength,
@@ -334,7 +345,7 @@ test('a 2D or 1D embedding publishes only its own components, with no padded axi
       size: dimension,
       stride: dimension * 4,
       type: tracker.gl.FLOAT,
-      vao: renderer.vao,
+      vao: vaoOf(renderer.vao),
     });
 
   }
@@ -347,7 +358,7 @@ test('a full-detail recolor rewrites only the color stream, in place', () => {
   renderer._createPointStreams(positions, colors, 3);
   renderer._flushPendingPositionUpload();
   const acceptedPositions =
-    tracker.stores.get(renderer.buffers.positions).slice();
+    tracker.stores.get(bufferOf(renderer.buffers.positions)).slice();
   assert.ok(cellsEqual(acceptedPositions, bytesOf(positions)));
   tracker.calls.bufferData.length = 0;
   tracker.calls.bufferSubData.length = 0;
@@ -360,17 +371,17 @@ test('a full-detail recolor rewrites only the color stream, in place', () => {
 
   assert.equal(tracker.calls.bufferData.length, 0, 'no reallocation');
   assert.deepEqual(tracker.calls.bufferSubData, [{
-    buffer: renderer.buffers.colors,
+    buffer: bufferOf(renderer.buffers.colors),
     dstByteOffset: 0,
     length: pointCount * 4,
     sourceBuffer: recolored.buffer,
   }]);
   assert.deepEqual(
-    tracker.stores.get(renderer.buffers.colors),
+    tracker.stores.get(bufferOf(renderer.buffers.colors)),
     bytesOf(recolored),
   );
   assert.deepEqual(
-    tracker.stores.get(renderer.buffers.positions),
+    tracker.stores.get(bufferOf(renderer.buffers.positions)),
     acceptedPositions,
   );
 });
@@ -511,8 +522,9 @@ test('the point-stream upload seams hold no client copy of a vertex store', () =
     '_publishLiveColors',
     '_writeOrderedColors',
     '_uploadSnapshotColors',
-    '_createDrawOrderRecord',
+    '_createStoreOrder',
     '_adoptDrawOrder',
+    '_advanceStoreOrder',
     '_ensureStoreDrawOrder',
     '_ensureSnapshotDrawOrder',
   ]) {

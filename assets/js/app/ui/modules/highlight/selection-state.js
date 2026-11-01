@@ -10,7 +10,7 @@
  */
 
 import { CellSet, cellListsEqual } from '../../../utils/cell-set.js';
-import { residencyBudgetBytes } from '../../../../data/memory-budget.js';
+import { registerResidentHolder, residencyBudgetBytes } from '../../../../data/memory-budget.js';
 
 const HISTORY_KEYS = Object.freeze([
   'annotationHistory',
@@ -55,6 +55,30 @@ export function pushHistoryStep(
     throw new TypeError(`Unknown selection history '${String(key)}'.`);
   }
   selectionState[key].push(entry);
+  trimHistory(selectionState, budgetBytes, key);
+}
+
+/** Bytes every tool's recorded steps hold. */
+export function historyBytes(selectionState) {
+  let total = 0;
+  for (const historyKey of HISTORY_KEYS) {
+    for (const recorded of selectionState[historyKey]) total += historyEntryBytes(recorded);
+  }
+  return total;
+}
+
+/**
+ * Drop the oldest step of whichever tool holds the most bytes, so one tool's
+ * huge selections cannot erase another tool's short trail, until every
+ * tool's steps together hold no more than `budgetBytes`; the newest step of
+ * `keep` (the one just recorded) stays.
+ *
+ * @param {ReturnType<typeof createHighlightSelectionState>} selectionState
+ * @param {number} budgetBytes
+ * @param {string|null} [keep]
+ * @returns {number} Steps dropped
+ */
+export function trimHistory(selectionState, budgetBytes, keep = null) {
   // Keyed by the four tool names, not by cells.
   const toolBytes = {};
   let total = 0;
@@ -63,12 +87,11 @@ export function pushHistoryStep(
       .reduce((sum, recorded) => sum + historyEntryBytes(recorded), 0);
     total += toolBytes[historyKey];
   }
-  // Evict the oldest step of whichever tool holds the most bytes, so one
-  // tool's huge selections cannot erase another tool's short trail.
+  let dropped = 0;
   while (total > budgetBytes) {
     let victimKey = null;
     for (const historyKey of HISTORY_KEYS) {
-      const keepNewest = historyKey === key ? 1 : 0;
+      const keepNewest = historyKey === keep ? 1 : 0;
       if (selectionState[historyKey].length <= keepNewest) continue;
       if (victimKey === null || toolBytes[historyKey] > toolBytes[victimKey]) {
         victimKey = historyKey;
@@ -78,7 +101,28 @@ export function pushHistoryStep(
     const evicted = historyEntryBytes(selectionState[victimKey].shift());
     toolBytes[victimKey] -= evicted;
     total -= evicted;
+    dropped++;
   }
+  return dropped;
+}
+
+/**
+ * Count `selectionState`'s undo steps in the memory model's `undoHistory`
+ * share (`data/memory-budget.js`): kept to the share as it changes, never
+ * let go on their own (they are the person's work).
+ *
+ * @param {ReturnType<typeof createHighlightSelectionState>} selectionState
+ * @returns {() => void} Stop counting
+ */
+export function countHistory(selectionState) {
+  return registerResidentHolder('undoHistory', {
+    label: 'selection undo steps',
+    bytes: () => historyBytes(selectionState),
+    trim: budget => {
+      const dropped = trimHistory(selectionState, budget);
+      return dropped === 0 ? null : `${dropped === 1 ? 'the oldest selection undo step' : `the ${dropped} oldest selection undo steps`}`;
+    },
+  });
 }
 
 /**

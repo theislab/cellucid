@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { REMOTE_POLICY, httpByteSource, statedLifetimeMs } from '../assets/js/formats/io/byte-source.js';
 import { LinkMeter } from '../assets/js/formats/io/link.js';
+import { createHostBook } from '../assets/js/formats/io/hosts.js';
 import { createAnnDataReaderHandler } from '../assets/js/data/anndata-reader-worker.js';
 import {
   confirmSourceUnreadable,
@@ -13,6 +14,7 @@ import {
 } from '../assets/js/data/sources/access.js';
 
 import { virtualTime } from './helpers/virtual-time.mjs';
+import { undoLater } from './helpers/teardown.mjs';
 
 const SIZE = 1 << 20;
 const DISPLAY = 'https://graph.microsoft.com/v1.0/drives/d1/items/i1/content';
@@ -135,12 +137,17 @@ function heldBackHost(time, ms = 7500) {
   return { calls, fetchImpl };
 }
 
-/** How long one read takes to fail, on virtual time, and how; `onTime` is given the clock first. */
+/**
+ * How long one read takes to fail, on virtual time, and how; `onTime` is
+ * given the clock first. Each read is a page of its own: what a host lost
+ * for one is not counted for the next (`hosts.js`).
+ */
 async function failureOf(access, onTime = () => {}) {
   const time = virtualTime();
   onTime(time);
   const { calls, fetchImpl } = heldBackHost(time);
-  const source = httpByteSource({ url: DISPLAY, size: SIZE, name: 'a.h5ad' }, { fetch: fetchImpl, access });
+  const hosts = createHostBook({ now: time.now, after: time.after, channel: null });
+  const source = httpByteSource({ url: DISPLAY, size: SIZE, name: 'a.h5ad' }, { fetch: fetchImpl, access, hosts });
   const link = new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after });
   const error = await source.read(0, 10, { link }).then(() => null, failure => failure);
   return { error, ms: time.now(), requests: calls.length, time };
@@ -168,9 +175,10 @@ test('a read the provider confirms unreadable fails at once in its words, withou
   assert.equal(confirmed.error.code, 'unreadable');
   assert.equal(confirmed.error.message, `a.h5ad: ${HELD_TEXT}`);
   assert.ok(!JSON.stringify({ m: confirmed.error.message, d: confirmed.error.details }).includes(SECRET));
-  // The first request stalls (1 s, the link's first timeout), the check then
-  // answers 7.5 s later; the generic repeats run their whole course.
-  assert.equal(confirmed.ms, 8500);
+  // The first request stalls (3 s, the link's timeout before its first
+  // answer, `FIRST_ANSWER_TIMEOUT_MS`), the check then answers 7.5 s later;
+  // the generic repeats run their whole course.
+  assert.equal(confirmed.ms, 10500);
   assert.ok(generic.ms > 2 * confirmed.ms, `generic ${generic.ms} ms, confirmed ${confirmed.ms} ms`);
   assert.ok(confirmed.requests < generic.requests);
   assert.notEqual(generic.error.code, 'unreadable');
@@ -214,6 +222,7 @@ test('reads failing together share one check; an access naming an unreadable tex
   let checks = 0;
   const source = httpByteSource({ url: DISPLAY, size: SIZE, name: 'a.h5ad' }, {
     fetch: fetchImpl,
+    hosts: createHostBook({ now: time.now, after: time.after, channel: null }),
     access: {
       target: async () => ({ url: 'https://dl.example.org/x' }),
       unreadable: HELD_TEXT,
@@ -318,7 +327,7 @@ test('the page owns each access; a sign-out reaches every listener by ref', asyn
     stale: [403, 404],
     target: async ({ refresh }) => ({ url: `https://dl.example.org/${refresh ? 'fresh' : 'first'}` }),
   });
-  assert.deepEqual(Object.keys(descriptor).sort(), ['provider', 'ref', 'stale', 'unreadable']);
+  assert.deepEqual(Object.keys(descriptor).sort(), ['changed', 'limited', 'provider', 'ref', 'stale', 'unreadable', 'versioned']);
   assert.equal(descriptor.unreadable, null);
   assert.throws(() => registerSourceAccess({ provider: 'gdrive', target: async () => ({ url: 'https://x.test/' }), unreadable: { text: ' ', confirm: async () => true } }),
     /unreadable text is a sentence/);
@@ -435,7 +444,7 @@ test('a reader client answers the worker from the provider\'s check: an unanswer
   globalThis.fetch = async () => {
     throw new TypeError('Failed to fetch');
   };
-  t.after(() => {
+  undoLater(t, () => {
     globalThis.fetch = original;
   });
   let checks = 0;
@@ -451,7 +460,7 @@ test('a reader client answers the worker from the provider\'s check: an unanswer
     },
   });
   const client = new AnnDataReaderClient();
-  t.after(() => client.close());
+  undoLater(t, () => client.close());
   await assert.rejects(client.open({ file: { url: DISPLAY, size: SIZE, name: 'a.h5ad', access } }), error => {
     assert.match(error.message, /holds back downloads without a sign-in/);
     assert.ok(!error.message.includes(SECRET));

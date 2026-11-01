@@ -21,6 +21,7 @@
  */
 
 import { formatCountOf } from '../utils/format-units.js';
+import { allocateTypedArray } from './sparse-column-index.js';
 
 /**
  * @typedef {Object} CategoricalCodeStorage
@@ -200,7 +201,7 @@ export function missingCategoryCode(codes) {
  */
 export function narrowCategoricalCodes(codes, nCategories, label) {
   const { TypedArrayClass, missingValue } = categoricalStorageForCount(nCategories, label);
-  const narrowed = new TypedArrayClass(codes.length);
+  const narrowed = allocateTypedArray(TypedArrayClass, codes.length, label);
   for (let index = 0; index < codes.length; index++) {
     const code = codes[index];
     if (code === -1) {

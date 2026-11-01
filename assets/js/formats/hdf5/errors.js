@@ -48,9 +48,3 @@ export function formatError(what, offset, problem, options = {}) {
   return new Hdf5FormatError(`${what}${where}: ${problem}`, { ...options, offset });
 }
 
-/** Throw the abort reason when `signal` has been aborted. */
-export function throwIfAborted(signal) {
-  if (signal?.aborted) {
-    throw signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
-  }
-}

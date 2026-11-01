@@ -5,7 +5,8 @@ categorical columns, numeric, boolean and nullable columns), embeddings, a
 neighbour graph, and X in each layout the readers treat differently — CSR,
 CSC, dense chunked by gene strips, dense contiguous — as `.h5ad` (gzip, the
 way CELLxGENE and most portals ship them, and uncompressed, the anndata
-default) and as Zarr (v2 and v3, each as a folder and as a ZIP).
+default) and as Zarr (v2 and v3, each as a folder and as a ZIP; v3 also
+sharded, where the anndata installed writes it).
 
     python scripts/benchmark-anndata/generate.py OUT_DIR [--cells N] [--genes G] [--density D]
 
@@ -149,6 +150,13 @@ def main() -> None:
         record(f"{layout}-v3.zarr", layout, "zarr-v3-folder")
         zip_folder(folder3, out / f"{layout}-v3.zarr.zip")
         record(f"{layout}-v3.zarr.zip", layout, "zarr-v3-zip")
+        # Zarr v3 sharded (anndata's `auto_shard_zarr_v3`), when this anndata writes it.
+        if hasattr(ad.settings, "auto_shard_zarr_v3"):
+            sharded = out / f"{layout}-v3-sharded.zarr"
+            shutil.rmtree(sharded, ignore_errors=True)
+            with ad.settings.override(zarr_write_format=3, auto_shard_zarr_v3=True):
+                adata.write_zarr(sharded)
+            record(f"{layout}-v3-sharded.zarr", layout, "zarr-v3-sharded-folder")
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 

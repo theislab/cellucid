@@ -37,7 +37,7 @@ import {
   parseRangeInput
 } from '../../core/numeric-input-contract.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
-import { ICONS } from '../../components/controls.js';
+import { ICONS, readDecimalInput } from '../../components/controls.js';
 
 // Keyframe action glyphs. They are drawn at the shared icon-button size
 // (`.icon-btn svg`); delete uses the one shared delete glyph.
@@ -570,23 +570,13 @@ export function initCinematicCamera({
    * @returns {{ valid: true, value: number|null } | { valid: false }}
    */
   function readTransitionDurationInput(input, revertValue) {
-    let value;
-    try {
-      if (input.validity?.badInput) {
-        throw new TypeError('Camera Path transition duration must be a number.');
-      }
-      value = input.value === ''
-        ? null
-        : parseRangeInput(input.value, {
-            minimum: MIN_TRANSITION_DURATION_SECONDS,
-            // No longest transition: any finite number of seconds.
-            maximum: Number.MAX_VALUE,
-            label: 'Camera Path transition duration'
-          });
-    } catch (error) {
-      if (!(error instanceof RangeError || error instanceof TypeError)) {
-        throw error;
-      }
+    // A decimal box (`createDecimalInput`): "1.5" or "1,5" in any locale;
+    // empty is auto. No longest transition: any finite number of seconds.
+    const typed = input.value.trim() === '' ? null : readDecimalInput(input);
+    const value = typed === null || (Number.isFinite(typed) && typed >= MIN_TRANSITION_DURATION_SECONDS)
+      ? typed
+      : undefined;
+    if (value === undefined) {
       input.value = revertValue;
       input.setCustomValidity(
         `Enter a duration of at least ${MIN_TRANSITION_DURATION_SECONDS} ` +
@@ -702,7 +692,7 @@ export function initCinematicCamera({
         const val = dur != null ? dur : '';
         html += `<div class="cinematic-timing-row" data-pair="${i}">
   <span class="cinematic-timing-label" title="${escapeHtml(kf.label)} → ${escapeHtml(keyframes[i + 1].label)}">${escapeHtml(kf.label)} → ${escapeHtml(keyframes[i + 1].label)}</span>
-  <input type="number" class="obs-select cinematic-duration-input" min="0.1" step="0.1"
+  <input type="text" inputmode="decimal" class="obs-select cinematic-duration-input" autocomplete="off" spellcheck="false"
          value="${val}" placeholder="auto" data-pair-index="${i}" title="Duration in seconds (leave empty for auto)" />
   <span class="cinematic-timing-unit">s</span>
 </div>`;

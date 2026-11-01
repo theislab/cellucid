@@ -84,6 +84,8 @@ export function renderSvgCentroidOverlay({
     // Centroids are XYZ triples in every dimension.
     dimension: 3,
     colors,
+    // A centroid's alpha byte is its opacity (0: its category is hidden).
+    colorAlpha: 'opacity',
     transparency: null,
     renderState,
     plotRect,
@@ -181,6 +183,8 @@ export function drawCanvasCentroidOverlay({
     // Centroids are XYZ triples in every dimension.
     dimension: 3,
     colors,
+    // A centroid's alpha byte is its opacity (0: its category is hidden).
+    colorAlpha: 'opacity',
     transparency: null,
     renderState,
     plotRect,

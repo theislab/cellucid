@@ -12,12 +12,10 @@ import {
   restoreCurrentDatasetState,
 } from '../assets/js/app/session/catalog-default-session.js';
 import {
-  createSessionRestoreCanceledError,
-} from '../assets/js/app/session/session-serializer.js';
-import {
   STARTUP_STALL_CODE,
   createStartupPhaseOwner,
 } from '../assets/js/app/startup-phase.js';
+import { cancelled } from '../assets/js/utils/abort.js';
 
 const STATE_BYTES = Uint8Array.from([1, 2, 3, 4]);
 const STATE_SHA256 = createHash('sha256').update(STATE_BYTES).digest('hex');
@@ -25,7 +23,7 @@ const FIXED_PUBLICATION_REVISION = () => 11;
 const SESSION_URL = 'https://datasets.example/anndata/suo.cellucid-session';
 
 test('advertised state user cancel has one non-error ready outcome', () => {
-  const canceled = createSessionRestoreCanceledError();
+  const canceled = cancelled('user', 'Session restore was canceled by the user.');
   assert.deepEqual(
     classifyAdvertisedDatasetStateRestoreError(canceled, {
       ownerAborted: false,

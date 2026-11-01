@@ -15,7 +15,8 @@ import { AnnDataFileSource } from '../assets/js/data/anndata-file-source.js';
 import {
   extractConnectivityEdges,
 } from '../assets/js/data/connectivity-edges.js';
-import { connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
+import { connectivityEdgeBytes, connectivityEdgesFromLines, connectivityEdgesOf } from '../assets/js/data/connectivity-edges.js';
+import { memoryReport, resetMemoryModel } from '../assets/js/data/memory-budget.js';
 import { edgeWeightsFrom, edgeWeightsOf, edgeListOf } from './helpers/connectivity-edges.mjs';
 
 function dense(values) {
@@ -59,7 +60,7 @@ test('official AnnData-style weighted connectivity is preserved exactly', () => 
   assert.deepEqual(edgeWeightsOf(edges), edgeWeightsFrom([1, 2]));
 });
 
-test('dense direct connectivity requires exact weighted symmetry and zero diagonal', async t => {
+test('dense direct connectivity requires exact weighted symmetry; its diagonal is no edge', async t => {
   const valid = dense([
     0, 1,
     1, 0,
@@ -87,14 +88,6 @@ test('dense direct connectivity requires exact weighted symmetry and zero diagon
         0, 0,
       ]),
       /exactly symmetric/i,
-    ],
-    [
-      'diagonal',
-      dense([
-        1, 0,
-        0, 0,
-      ]),
-      /diagonal.*exactly zero/i,
     ],
     [
       'non-finite',
@@ -153,15 +146,6 @@ test('sparse direct connectivity is exact, canonical, and non-mutating', async t
         indptr: [0, 1, 1],
       }),
       /exactly symmetric/i,
-    ],
-    [
-      'diagonal',
-      sparse({
-        data: [1],
-        indices: [0],
-        indptr: [0, 1, 1],
-      }),
-      /diagonal.*exactly zero/i,
     ],
     [
       'duplicate coordinate',
@@ -339,14 +323,6 @@ test('H5AD and Zarr open without reading the graph and refuse an inexact one whe
       /exactly symmetric/i,
     ],
     [
-      'diagonal',
-      dense([
-        1, 0,
-        0, 0,
-      ]),
-      /diagonal.*exactly zero/i,
-    ],
-    [
       'malformed sparse storage',
       {
         format: 'csr',
@@ -508,4 +484,146 @@ test('symmetry is checked entry by entry in one pass, in CSR and CSC, unsorted l
   assert.deepEqual([Array.from(edgeListOf(zero).sources), Array.from(edgeListOf(zero).destinations)], [[0], [1]]);
   // A duplicate coordinate, even unsorted.
   assert.throws(() => extractConnectivityEdges(csr([0, 2, 3, 3], [1, 1, 0], [2, 2, 2]), 3), /duplicate coordinate/);
+});
+
+test('a self-loop is no edge: a unit diagonal (Seurat SNN) is left out, in dense, CSR and CSC alike', () => {
+  // Seurat's FindNeighbors counts each cell among its own neighbours: RNA_snn
+  // has 1 on its diagonal. The edges are the off-diagonal pairs.
+  const withDiagonal = {
+    format: 'csr',
+    shape: [3, 3],
+    data: Float64Array.from([1, 0.5, 0.5, 1, 0.25, 0.25, 1]),
+    indices: Int32Array.from([0, 1, 0, 1, 2, 1, 2]),
+    indptr: Int32Array.from([0, 2, 5, 7]),
+  };
+  const without = {
+    format: 'csr',
+    shape: [3, 3],
+    data: Float64Array.from([0.5, 0.5, 0.25, 0.25]),
+    indices: Int32Array.from([1, 0, 2, 1]),
+    indptr: Int32Array.from([0, 1, 3, 4]),
+  };
+  const expected = extractConnectivityEdges(without, 3);
+  for (const matrix of [withDiagonal, { ...withDiagonal, format: 'csc' }, dense3([1, 0.5, 0, 0.5, 1, 0.25, 0, 0.25, 1])]) {
+    const edges = extractConnectivityEdges(matrix, 3);
+    assert.deepEqual(edgeListOf(edges), edgeListOf(expected), matrix.format);
+    assert.deepEqual(Array.from(edges.forwardOffsets), Array.from(expected.forwardOffsets), `${matrix.format}: no cell is its own neighbour`);
+    assert.equal(edges.maxNeighbors, 2);
+  }
+  // A diagonal alone: no edge, and nothing refused.
+  assert.equal(extractConnectivityEdges(dense([1, 0, 0, 1]), 2).nEdges, 0);
+});
+
+function dense3(values) {
+  return { format: 'dense', shape: [3, 3], data: Float64Array.from(values) };
+}
+
+test('a graph read line by line gives the same edges as the graph held whole, one slab at a time', async () => {
+  // 40 cells on a ring with two neighbours each side, weights by distance; a unit diagonal.
+  const n = 40;
+  const rows = Array.from({ length: n }, (_, row) => [-2, -1, 0, 1, 2]
+    .map(step => [(row + step + n) % n, step === 0 ? 1 : 1 / Math.abs(step)])
+    .sort((a, b) => a[0] - b[0]));
+  const indptr = Float64Array.from([0, ...rows.map((_, i) => rows.slice(0, i + 1).reduce((sum, row) => sum + row.length, 0))]);
+  const indices = Int32Array.from(rows.flat().map(([column]) => column));
+  const data = Float32Array.from(rows.flat().map(([, weight]) => weight));
+  const whole = extractConnectivityEdges({ format: 'csr', shape: [n, n], indptr, indices, data }, n);
+  for (const slabRows of [1, 7, n]) {
+    async function* slabs() {
+      for (let start = 0; start < n; start += slabRows) {
+        const end = Math.min(n, start + slabRows);
+        const from = indptr[start];
+        yield {
+          start,
+          end,
+          pointers: Float64Array.from(indptr.subarray(start, end + 1), pointer => pointer - from),
+          indices: indices.subarray(from, indptr[end]),
+          data: data.subarray(from, indptr[end]),
+        };
+      }
+    }
+    let runs = 0;
+    const streamed = await connectivityEdgesFromLines({ nnz: indices.length, float32: true, slabs: slabs() }, n, { run: work => { runs++; return work(); } });
+    assert.deepEqual(streamed, whole, `${slabRows} rows a slab`);
+    assert.equal(runs, Math.ceil(n / slabRows) + 1, 'each slab and the strengths ran as the caller runs work');
+  }
+  // An asymmetry across slabs is found.
+  async function* broken() {
+    yield { start: 0, end: 1, pointers: [0, 1], indices: Int32Array.of(1), data: Float32Array.of(1) };
+    yield { start: 1, end: 2, pointers: [0, 0], indices: new Int32Array(0), data: new Float32Array(0) };
+  }
+  await assert.rejects(connectivityEdgesFromLines({ nnz: 1, float32: true, slabs: broken() }, 2), /exactly symmetric/);
+});
+
+test('the edges are the forward adjacency: 8 bytes an edge and 4 a cell held, the build counted in the working set while it runs and released however it ends', async () => {
+  resetMemoryModel();
+  const n = 300;
+  const rows = Array.from({ length: n }, (_, row) => [-3, -2, -1, 1, 2, 3]
+    .map(step => [(row + step + n) % n, 1 / Math.abs(step)])
+    .sort((a, b) => a[0] - b[0]));
+  const indptr = Float64Array.from([0, ...rows.map((_, i) => rows.slice(0, i + 1).reduce((sum, row) => sum + row.length, 0))]);
+  const indices = Int32Array.from(rows.flat().map(([column]) => column));
+  const data = Float32Array.from(rows.flat().map(([, weight]) => weight));
+  const plan = connectivityEdgeBytes({ nCells: n, nnz: indices.length, float32: true });
+  const seen = [];
+  async function* slabs() {
+    for (let start = 0; start < n; start += 50) {
+      seen.push(memoryReport().workingSet['graph build'] ?? 0);
+      const from = indptr[start];
+      yield {
+        start,
+        end: start + 50,
+        pointers: Float64Array.from(indptr.subarray(start, start + 51), pointer => pointer - from),
+        indices: indices.subarray(from, indptr[start + 50]),
+        data: data.subarray(from, indptr[start + 50]),
+      };
+    }
+  }
+  const edges = await connectivityEdgesFromLines({ nnz: indices.length, float32: true, slabs: slabs() }, n);
+  assert.deepEqual(new Set(seen), new Set([plan.build]), 'counted while it builds');
+  assert.equal(memoryReport().workingSet['graph build'], undefined, 'released when built');
+  assert.deepEqual(Object.keys(edges), ['forwardOffsets', 'partners', 'strengths', 'maxWeight', 'nCells', 'nEdges', 'maxNeighbors']);
+  assert.equal(edges.nEdges, 3 * n);
+  assert.equal(edges.forwardOffsets.byteLength + edges.partners.byteLength + edges.strengths.byteLength, plan.held);
+  assert.equal(plan.held, 4 * (n + 1) + 8 * edges.nEdges);
+  // Every array is a whole buffer of its own: it crosses to the page by transfer, never copied.
+  for (const array of [edges.forwardOffsets, edges.partners, edges.strengths]) {
+    assert.equal(array.byteOffset, 0);
+    assert.equal(array.byteLength, array.buffer.byteLength);
+  }
+  assert.equal(new Set([edges.forwardOffsets.buffer, edges.partners.buffer, edges.strengths.buffer]).size, 3);
+  // A build that fails part way gives its working set back.
+  async function* broken() {
+    yield { start: 0, end: 1, pointers: [0, 1], indices: Int32Array.of(1), data: Float32Array.of(1) };
+    yield { start: 1, end: 2, pointers: [0, 0], indices: new Int32Array(0), data: new Float32Array(0) };
+  }
+  await assert.rejects(connectivityEdgesFromLines({ nnz: 1, float32: true, slabs: broken() }, 2), /exactly symmetric/);
+  assert.equal(memoryReport().workingSet['graph build'], undefined);
+  // float64 weights: exact strengths of their own, the weights let go.
+  const wide = await connectivityEdgesFromLines({ nnz: indices.length, float32: false, slabs: (async function* () {
+    yield { start: 0, end: n, pointers: indptr, indices, data: Float64Array.from(data) };
+  })() }, n);
+  assert.deepEqual(Array.from(wide.strengths.subarray(0, wide.nEdges)), Array.from(edges.strengths.subarray(0, edges.nEdges)));
+  assert.equal(wide.strengths.length, wide.nEdges);
+  resetMemoryModel();
+});
+
+test('a graph whose build needs more than the device allows is refused before any array is made, naming its bytes', () => {
+  const plan = connectivityEdgeBytes({ nCells: 50_000_000, nnz: 700_000_000, float32: true });
+  const refused = (() => {
+    try {
+      // The edges of a 50M-cell graph on a device the browser reports as 4 GiB.
+      const nav = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+      Object.defineProperty(globalThis, 'navigator', { value: { deviceMemory: 4 }, configurable: true });
+      try {
+        return connectivityEdgesFromLines({ nnz: 700_000_000, float32: true, slabs: [][Symbol.iterator]() }, 50_000_000);
+      } finally {
+        if (nav) Object.defineProperty(globalThis, 'navigator', nav);
+        else delete globalThis.navigator;
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  })();
+  return assert.rejects(refused, error => error.code === 'TOO_LARGE' && error.bytes === plan.build && /3\.\d GB to build/.test(error.message));
 });

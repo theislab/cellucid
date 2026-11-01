@@ -25,6 +25,8 @@ import {
 import {
   getCategoryColor,
 } from '../assets/js/data/palettes.js';
+import { drawn, rgbAt } from './helpers/category-state.mjs';
+import { withCategoryChanges, withCategoryColor, withCategoryVisibility } from '../assets/js/app/utils/category-state.js';
 
 const POINT_COUNT = 8;
 const CELL_TYPES = ['B cell', 'T cell', 'Monocyte'];
@@ -77,11 +79,15 @@ function createHarness() {
     },
     setVisibilityForCategory(field, categoryIndex, visible) {
       this.ensureCategoryMetadata(field);
-      field._categoryVisible[categoryIndex] = visible;
+      withCategoryVisibility(field, categoryIndex, visible);
     },
     setColorForCategory(field, categoryIndex, color) {
       this.ensureCategoryMetadata(field);
-      field._categoryColors[categoryIndex] = [...color];
+      withCategoryColor(field, categoryIndex, color);
+    },
+    setCategoryStates(field, changes) {
+      this.ensureCategoryMetadata(field);
+      withCategoryChanges(field, changes);
     },
   };
 
@@ -103,10 +109,10 @@ function snapshotEffectiveState(state) {
       snapshot[`${source}:${field.key}`] = {
         categoryColors: field._categoryColors === undefined
           ? null
-          : field._categoryColors.map(color => [...color]),
+          : Array.from(field._categoryColors),
         categoryVisible: field._categoryVisible === undefined
           ? null
-          : { ...field._categoryVisible },
+          : Array.from(field._categoryVisible),
         categoryFilterEnabled: field._categoryFilterEnabled ?? null,
         colormapId: field._colormapId ?? null,
         continuousFilter: field._continuousFilter === undefined
@@ -159,7 +165,7 @@ test('restoring a session reproduces its exact state instead of merging onto the
 
   // --- Load session A back into that same tab.
   const outcome = await serializer.restoreFilters(sessionA, { signal: null });
-  assert.deepEqual(outcome, { restored: 1, outliersNotRestored: [] });
+  assert.deepEqual(outcome, { restored: 1, outliersNotRestored: [], categoriesNotOpen: [] });
 
   assert.deepEqual(
     snapshotEffectiveState(state),
@@ -175,7 +181,7 @@ test('restoring a session reproduces its exact state instead of merging onto the
   // The individual leaks the merge used to carry across, spelled out.
   assert.equal(
     cellType._categoryVisible[1],
-    true,
+    1,
     'A category hidden after the save must be shown again by the restore.',
   );
   assert.equal(cellType._categoryFilterEnabled, true);
@@ -183,11 +189,11 @@ test('restoring a session reproduces its exact state instead of merging onto the
   assert.equal(score._colormapId, 'viridis');
   assert.deepEqual(score._continuousFilter, { min: 1, max: 8 });
   assert.deepEqual(
-    cellType._categoryColors[2],
-    [0.1, 0.2, 0.3],
+    rgbAt(cellType, 2),
+    drawn([0.1, 0.2, 0.3]),
     'The recolour that session A did record must still be applied.',
   );
-  assert.deepEqual(cellType._categoryColors[1], getCategoryColor(1));
+  assert.deepEqual(rgbAt(cellType, 1), drawn(getCategoryColor(1)));
 });
 
 test('restoring a session clears fields the bundle never mentions', async () => {
@@ -246,4 +252,54 @@ test('a narrowed filter does not drag the restored color range with it', async (
     'A fresh restore must reproduce the saved state exactly.',
   );
   assert.deepEqual(loadingSerializer.serializeFilters(), sessionB);
+});
+
+test('gray for zero is written with every continuous entry, restored, and off when a session has no such key (0.9.6)', async () => {
+  const saving = createHarness();
+  const savingSerializer = createFilterSerializer({ state: saving.state });
+  saving.state.ensureContinuousMetadata(saving.gene);
+  saving.gene._zeroGray = true;
+  saving.gene._continuousFilter = { min: 4, max: 12 };
+  saving.state.ensureContinuousMetadata(saving.score);
+  saving.score._continuousFilter = { min: 3, max: 6 };
+  const session = savingSerializer.serializeFilters();
+  const entries = Object.values(session).filter(entry => entry?.kind === 'continuous');
+  assert.ok(entries.length >= 2 && entries.every(entry => Object.hasOwn(entry, 'zeroGray')), 'the writer always writes the key');
+
+  const loading = createHarness();
+  const loadingSerializer = createFilterSerializer({ state: loading.state });
+  // Gray for zero on, restored.
+  await loadingSerializer.restoreFilters(session, { signal: null });
+  assert.equal(loading.gene._zeroGray, true);
+
+  // A session written by 0.9.6: no `zeroGray` key at all. It restores, gray for zero off.
+  const without = JSON.parse(JSON.stringify(session), (key, value) => {
+    if (value !== null && typeof value === 'object' && value.kind === 'continuous') {
+      const { zeroGray: _dropped, ...rest } = value;
+      return rest;
+    }
+    return value;
+  });
+  const older = createHarness();
+  older.gene._zeroGray = true;
+  const olderSerializer = createFilterSerializer({ state: older.state });
+  await olderSerializer.restoreFilters(without, { signal: null });
+  older.state.ensureContinuousMetadata(older.gene);
+  assert.equal(older.gene._zeroGray, false, 'absent means off, the default');
+  assert.deepEqual(older.gene._continuousFilter, { min: 4, max: 12 }, 'the rest of the entry restores');
+  assert.deepEqual(older.score._continuousFilter, { min: 3, max: 6 });
+});
+
+test('a gray for zero that is not a boolean is refused', async () => {
+  const saving = createHarness();
+  const savingSerializer = createFilterSerializer({ state: saving.state });
+  saving.state.ensureContinuousMetadata(saving.gene);
+  saving.gene._zeroGray = true;
+  const session = JSON.parse(JSON.stringify(savingSerializer.serializeFilters()), (key, value) => (
+    value !== null && typeof value === 'object' && value.kind === 'continuous' && value.zeroGray === true ? { ...value, zeroGray: 'yes' } : value
+  ));
+  const loading = createHarness();
+  const loadingSerializer = createFilterSerializer({ state: loading.state });
+  await assert.rejects(loadingSerializer.restoreFilters(session, { signal: null }), /zeroGray/);
+  assert.equal(loading.gene._zeroGray, undefined, 'nothing restored');
 });

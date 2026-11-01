@@ -33,7 +33,7 @@
 import { getNotificationCenter } from './notification-center.js';
 import { createButton } from './ui/components/controls.js';
 import { getOpeningProgress } from '../data/opening-progress.js';
-import { isExplainedFailure } from '../data/data-source.js';
+import { describeHostFault, isExplainedFailure } from '../data/data-source.js';
 import { formatBytes, formatDuration } from '../utils/format-units.js';
 
 /** Updates are drawn at most this often; a second's tick keeps the elapsed time live. */
@@ -81,7 +81,10 @@ function failureNotice(snapshot) {
   if (isExplainedFailure(error)) {
     return { message: error.message, details: rawText(error?.cause ?? error?.details?.cause) };
   }
-  return { message: `Could not open ${snapshot.title}.`, details: rawText(error) };
+  // A host's answer says whose problem it is; only a cause nobody can name
+  // is the generic sentence.
+  const fault = describeHostFault(error);
+  return { message: fault?.sentence ?? `Could not open ${snapshot.title}.`, details: rawText(error) };
 }
 
 function buildOverlay(documentOwner, onCancel) {
@@ -109,6 +112,11 @@ function buildOverlay(documentOwner, onCancel) {
   bar.appendChild(fill);
   const detail = documentOwner.createElement('p');
   detail.className = 'opening-detail tabular-nums';
+  // How the opening reads its data, when the person should know it up front
+  // (a file that cannot be read in parts).
+  const note = documentOwner.createElement('p');
+  note.className = 'opening-note';
+  note.hidden = true;
   const cancel = createButton({ label: 'Cancel', className: 'btn-compact opening-cancel', onClick: onCancel });
   // A failed opening: the failure's own message, folded (the brand card's
   // Details, components/_welcome.css), and the ways on.
@@ -121,9 +129,9 @@ function buildOverlay(documentOwner, onCancel) {
   failure.append(failureSummary, failureText);
   const actions = documentOwner.createElement('div');
   actions.className = 'opening-actions';
-  panel.append(title, step, bar, detail, failure, actions, cancel);
+  panel.append(title, step, bar, detail, note, failure, actions, cancel);
   root.appendChild(panel);
-  return { root, panel, title, step, bar, fill, detail, cancel, failure, failureText, actions };
+  return { root, panel, title, step, bar, fill, detail, note, cancel, failure, failureText, actions };
 }
 
 /**
@@ -154,7 +162,13 @@ export function showOpeningProgress({
   let tick = null;
 
   function notificationMessage(snapshot) {
-    return snapshot.detail ? `${stepText(snapshot)} ${snapshot.detail}` : stepText(snapshot);
+    const running = snapshot.detail ? `${stepText(snapshot)} ${snapshot.detail}` : stepText(snapshot);
+    return snapshot.note ? `${running}\n${snapshot.note}` : running;
+  }
+
+  function drawNote(snapshot) {
+    overlay.note.textContent = snapshot.note ?? '';
+    overlay.note.hidden = !snapshot.note;
   }
 
   /** The person's pick among a file's objects, in the panel, whatever the mode. */
@@ -201,6 +215,7 @@ export function showOpeningProgress({
       overlay.title.textContent = `Opening ${snapshot.title}`;
       overlay.step.textContent = stepText(snapshot);
       overlay.detail.textContent = snapshot.detail ?? '';
+      drawNote(snapshot);
       const percent = snapshot.percent;
       overlay.bar.classList.toggle('indeterminate', percent === null);
       overlay.fill.style.width = percent === null ? '' : `${percent}%`;
@@ -237,7 +252,8 @@ export function showOpeningProgress({
     overlay.title.textContent = 'The data could not be opened';
     overlay.step.textContent = snapshot.summary;
     overlay.failure.open = false;
-    overlay.failureText.textContent = snapshot.message ?? '';
+    // The failure's message and what caused it (a host's failure: the requests made).
+    overlay.failureText.textContent = rawText(snapshot.error) || (snapshot.message ?? '');
     overlay.actions.replaceChildren(...snapshot.actions.map((action, index) => createButton({
       label: action.label,
       variant: index === 0 ? 'primary' : 'secondary',
@@ -284,18 +300,34 @@ export function showOpeningProgress({
       case 'done':
         // Over the empty viewer, the dataset appearing says it opened; a
         // message of the layer that opened it (`User data ready: …`) is
-        // still kept.
-        if (!settleNotification(id => notifications.complete(id, finishedText(snapshot))) && snapshot.message !== null) {
+        // still kept. Over a dataset already shown, the outcome is said even
+        // when the opening was too quick for its card to appear: the person
+        // chose it, and what opened (and how many cells) is news.
+        if (!settleNotification(id => notifications.complete(id, finishedText(snapshot), { announce: true })) && snapshot.message !== null) {
           notifications.success(snapshot.message, { category: 'data' });
         }
         break;
       case 'failed': {
-        // The layer that failed logged its error to the console.
+        // The layer that failed logged its error to the console. Over the
+        // empty viewer the failure is said there, once, with its ways on;
+        // a card saying it again beside it would only repeat it.
+        if (failedHere) {
+          settleNotification(id => notifications.dismiss(id));
+          drawFailure(snapshot);
+          break;
+        }
         const { message, details } = failureNotice(snapshot);
+        // Ways on the failing layer offered (Try again, for a host's
+        // problem that may pass) ride on the card as its action.
+        const way = snapshot.actions[0] ?? null;
+        if (way !== null) {
+          settleNotification(id => notifications.dismiss(id));
+          notifications.error(message, { category: 'data', details, action: { label: way.label, run: way.run } });
+          break;
+        }
         if (!settleNotification(id => notifications.fail(id, message, { details }))) {
           notifications.error(message, { category: 'data', details });
         }
-        if (failedHere) drawFailure(snapshot);
         break;
       }
       case 'cancelled':

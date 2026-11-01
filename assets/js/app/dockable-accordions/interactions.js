@@ -86,6 +86,7 @@ export function createAccordionInteractions({
   raiseToTop,
   undock,
   dock,
+  floatingArea,
   constants
 }) {
   const {
@@ -217,10 +218,6 @@ export function createAccordionInteractions({
     };
   }
 
-  function viewport() {
-    return { viewportWidth: window.innerWidth, viewportHeight: window.innerHeight };
-  }
-
   function sidebarBox() {
     if (sidebar.classList.contains('hidden')) return { right: 0, width: 0 };
     const rect = sidebar.getBoundingClientRect();
@@ -235,7 +232,7 @@ export function createAccordionInteractions({
     }
     const side = sidebarBox();
     return floatingSnapTargets({
-      ...viewport(),
+      ...floatingArea(),
       sidebarRight: side.right,
       sidebarWidth: side.width,
       others,
@@ -334,7 +331,7 @@ export function createAccordionInteractions({
     const state = getState(details);
     const rect = knownRect ?? frameRect(frame);
     const { minWidth, minHeight } = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = viewport();
+    const { viewportWidth, viewportHeight } = floatingArea();
     const width = Math.round(rect.width);
     const height = Math.round(rect.height);
     for (const handle of handles) {
@@ -394,7 +391,7 @@ export function createAccordionInteractions({
       applyRect(details, maximizedFloatingRect({
         sidebarRight: sidebarBox().right,
         minWidth,
-        ...viewport()
+        ...floatingArea()
       }));
     }
     raiseToTop(frame);
@@ -410,7 +407,7 @@ export function createAccordionInteractions({
     const state = getState(details);
     const start = frameRect(frame);
     const { minWidth, minHeight } = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = viewport();
+    const { viewportWidth, viewportHeight } = floatingArea();
     let dx = 0;
     let dy = 0;
     if (edge.includes('n') || edge.includes('s')) {
@@ -457,7 +454,7 @@ export function createAccordionInteractions({
       top: state.floatTop + travel[1],
       width: rect.width,
       height: rect.height,
-      ...viewport()
+      ...floatingArea()
     });
     clearMaximized(details);
     StyleManager.setPosition(frame, { x, y });
@@ -477,7 +474,7 @@ export function createAccordionInteractions({
       handle.dataset.edge,
       e.key,
       e.shiftKey ? KEY_STEP_LARGE_PX : KEY_STEP_PX,
-      viewport()
+      floatingArea()
     );
     if (travel === null) return;
     e.preventDefault();
@@ -488,7 +485,7 @@ export function createAccordionInteractions({
       edge: handle.dataset.edge,
       ...travel,
       ...sizeLimits(details, state),
-      ...viewport()
+      ...floatingArea()
     });
     clearMaximized(details);
     applyRect(details, rect);
@@ -512,7 +509,7 @@ export function createAccordionInteractions({
     const startY = e.clientY;
     const start = frameRect(frame);
     const limits = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = viewport();
+    const { viewportWidth, viewportHeight } = floatingArea();
     const snap = snapTargetsFor(
       details,
       frame,
@@ -739,8 +736,7 @@ export function createAccordionInteractions({
       const pointerId = e.pointerId;
 
       const preRect = frame.getBoundingClientRect();
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
+      const { viewportWidth, viewportHeight } = floatingArea();
 
       const offsetX = startX - preRect.left;
       const offsetY = startY - preRect.top;

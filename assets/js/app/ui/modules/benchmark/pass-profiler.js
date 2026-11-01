@@ -13,10 +13,13 @@
  * - draw calls, ranges, vertices and instances are attributed to the pass that
  *   was current when they were issued, read as deltas of the upload counter;
  * - with `timing` on, one `TIME_ELAPSED` query brackets each run of one pass
- *   label. Queries cannot nest, so this cannot be combined with a harness that
- *   times the whole frame with its own query. Timing perturbs the frame it
- *   measures (a query per pass), so frame-time numbers from a timed window are
- *   not comparable with untimed ones.
+ *   label. Queries cannot nest: a pass that begins while another owner's
+ *   query times the frame (the viewer's own frame-cost measurement,
+ *   `rendering/full-detail-frame-cost.js`, a few frames after each opening)
+ *   is not timed, and counted (`untimedPasses`); the viewer likewise times
+ *   no frame while a pass query is open. Timing perturbs the frame it
+ *   measures (a query per pass), so frame-time numbers from a timed window
+ *   are not comparable with untimed ones.
  *
  * Programs are classified once, at their first `useProgram`, from
  * `getActiveUniform`. Shader sources are no use for this: the application
@@ -206,6 +209,7 @@ export function createPassProfiler(gl, options = {}) {
   let activeQuery = null;
   let disjointFrames = 0;
   let abandonedQueries = 0;
+  let untimedPasses = 0;
   let installed = true;
 
   function cumulative(field) {
@@ -244,6 +248,11 @@ export function createPassProfiler(gl, options = {}) {
 
   function beginQuery(label) {
     if (!timing || windows.size === 0) return;
+    if (gl.getQuery(timerExtension.TIME_ELAPSED_EXT, gl.CURRENT_QUERY) !== null) {
+      // Another owner's query times the frame: queries cannot nest.
+      untimedPasses++;
+      return;
+    }
     const query = gl.createQuery();
     if (query === null) return;
     gl.beginQuery(timerExtension.TIME_ELAPSED_EXT, query);
@@ -400,6 +409,7 @@ export function createPassProfiler(gl, options = {}) {
         timing,
         disjointFrames,
         abandonedQueries,
+        untimedPasses,
         passes
       };
     },

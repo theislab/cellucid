@@ -100,9 +100,17 @@ test('every pane draws exactly the first K of its own visible edges from K recor
     viewer.setViewLayout('grid', 'live');
     viewer.setShowConnectivity(true);
 
+    // Both panes' visible counts, reported as they land after the selection.
     const counts = [];
+    const reported = new Set();
+    let bothReported;
+    const countsLanded = new Promise(resolve => {
+      bothReported = resolve;
+    });
     const unsubscribe = viewer.onConnectivityVisibleCount((viewId, stats) => {
       counts.push([viewId, stats.visibleCount]);
+      reported.add(viewId);
+      if (reported.has('live') && reported.has(snapshot.id)) bothReported();
     });
     const capture = async () => {
       const original = prototype.drawArraysInstanced;
@@ -123,8 +131,7 @@ test('every pane draws exactly the first K of its own visible edges from K recor
       return submissions;
     };
     const frames = await capture();
-    // The counts are reported after the selection.
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await countsLanded;
     unsubscribe();
 
     const order = createConnectivityEdgeOrder(edgeCount);

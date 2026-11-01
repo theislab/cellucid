@@ -70,7 +70,10 @@ test('one pass writes one kept directory whose store reads as the store kept in 
   assert.equal(directory, events[0].directory);
   const files = readdirSync(path.join(disk.root, TRANSCODED_DIRECTORY, directory)).sort();
   const manifest = JSON.parse(readFileSync(path.join(disk.root, TRANSCODED_DIRECTORY, directory, 'manifest.json'), 'utf8'));
-  assert.deepEqual(files, [...manifest.blobs, 'manifest.json'].sort(), 'only what the store refers to is kept');
+  // Each file it refers to, with its page checksums (`formats/io/page-checks.js`).
+  const blobs = Object.keys(manifest.blobs);
+  assert.deepEqual(Object.keys(manifest.checks.files).sort(), blobs.sort(), 'every kept file is checked');
+  assert.deepEqual(files, [...blobs, ...blobs.map(name => `${name}.sums`), 'manifest.json', 'used'].sort(), 'only what the store refers to is kept');
   assert.deepEqual(await allKeys(kept.store), await allKeys(memory.store));
 });
 
@@ -172,8 +175,8 @@ test('the start-up sweep removes directories nobody holds and keeps the held one
   await TRANSCODERS.rds.transcode({ file: await fileOf('seurat5_gzip.rds') }, { byteReaderOf, environment: disk.environment, onStore: event => events.push(event) });
   mkdirSync(path.join(disk.root, TRANSCODED_DIRECTORY, 'crashed-tab'));
   writeFileSync(path.join(disk.root, TRANSCODED_DIRECTORY, 'crashed-tab', 'p0.bin'), new Uint8Array(8));
-  holdTranscodedStore(events.at(-1).directory, disk.environment);
-  await new Promise(resolve => setTimeout(resolve, 10));
+  // Held once the page's lock is granted (`holdTranscodedStore` resolves then).
+  await holdTranscodedStore(events.at(-1).directory, disk.environment);
   await sweepAbandonedTranscodes(disk.environment);
   assert.deepEqual(directories(disk.root), [events.at(-1).directory]);
   // No OPFS: nothing to do, nothing thrown.

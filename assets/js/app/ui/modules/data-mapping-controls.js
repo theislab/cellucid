@@ -36,9 +36,11 @@ import {
   validateEmbeddingColumns,
 } from '../../../data/data-mapping.js';
 import { EmbeddingLoadError, MappingLoadError, obsmWidth } from '../../../data/data-mapping-candidates.js';
-import { LOG1P_AS_STORED, log1pChoiceOf, withLog1pChoice } from '../../../data/dataset-mapping.js';
+import { LOG1P_AS_STORED, describeLog1pRefuted, log1pChoiceOf, withLog1pChoice } from '../../../data/dataset-mapping.js';
 import { representationName } from '../../../data/representation-names.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { revealSidebar } from './sidebar-controls.js';
+import { expandSessionSection } from './session-sections.js';
 import {
   buildDataMappingPanel,
   createRepresentationRow,
@@ -60,15 +62,11 @@ import {
 import { sameJson } from '../../utils/same-json.js';
 import { PLACES, placePath } from '../place-names.js';
 
-// Var columns that usually hold gene symbols (the Ensembl hint names one).
-const SYMBOL_COLUMNS = Object.freeze([
-  'gene_symbols',
-  'gene_symbol',
-  'symbol',
-  'feature_name',
-  'gene_name',
-  'gene_names',
-]);
+/** Why genes are read from `raw` (`defaultExpression`'s reason), as the genes line says it. */
+const RAW_REASON_TEXT = Object.freeze({
+  'raw-more-genes': 'Expression: raw, as Scanpy reads genes: it holds more genes than X.',
+  'x-scaled': 'Expression: raw, as Scanpy reads genes: X holds scaled values.',
+});
 
 const REQUIRED_STATE_METHODS = Object.freeze([
   'applyDataMapping',
@@ -77,11 +75,12 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'describeDataMappingRefusal',
   'getDataMapping',
   'getDataMappingOrigin',
-  'getDatasetGeneration',
   'getDimensionManager',
   'getGeneNameChoices',
   'getHighlyVariableChoices',
+  'getExpressionReason',
   'getGuessedMappingGroups',
+  'getLog1pRefuted',
   'getMappingCandidates',
   'getMappingGroupChoices',
   'getRepresentationChoices',
@@ -141,10 +140,12 @@ export function describeBestGuess(mapping, guessed, widthOf) {
 }
 
 /**
- * @param {{state: Object, root: HTMLElement}} options
+ * @param {{state: Object, root: HTMLElement, onSummary?: (text: string) => void}} options -
+ *   `onSummary`: what the mapping is, in one line, for the collapsed Data
+ *   mapping section's header (`session-sections.js`)
  * @returns {{datasetPublished: () => void, render: () => void, reveal: (options?: {openSidebar?: boolean}) => void, destroy: () => void}}
  */
-export function initDataMappingControls({ state, root }) {
+export function initDataMappingControls({ state, root, onSummary = () => {} }) {
   for (const method of REQUIRED_STATE_METHODS) {
     if (typeof state?.[method] !== 'function') {
       throw new TypeError(`Data mapping controls require state.${method}().`);
@@ -167,6 +168,8 @@ export function initDataMappingControls({ state, root }) {
   const groupErrors = new Map();
   // Genes the last gene-list change dropped from a view's colouring.
   let droppedGenes = [];
+  // How many datasets were published here (`datasetPublished`).
+  let publications = 0;
 
   /**
    * The staged checklist: one row per representation the panel lists, and
@@ -353,8 +356,10 @@ export function initDataMappingControls({ state, root }) {
           error: groupErrors.get(group) ?? '',
         });
       }
-      const hint = fields.size > 0 && section.id === 'genes' ? genesHint(mapping) : '';
-      renderGroupSection(groupNodes.get(section.id), { summary: summary.join(' · '), fields, hint });
+      const genes = fields.size > 0 && section.id === 'genes';
+      const refuted = genes ? log1pRefutedHint(mapping) : { text: '', detail: '' };
+      const hint = genes ? [refuted.text, genesHint(mapping)].filter(Boolean).join(' ') : '';
+      renderGroupSection(groupNodes.get(section.id), { summary: summary.join(' · '), fields, hint, hintDetail: refuted.detail });
     }
     // The vector fields of every embedding the panel shows, staged or not.
     const groups = state.getVectorBindingChoices(nextMapping(mapping));
@@ -372,8 +377,19 @@ export function initDataMappingControls({ state, root }) {
   }
 
   /**
-   * The one line under the genes: what making the names in use unique
-   * changed, else the Ensembl hint.
+   * The matrices read as stored although the file records `uns['log1p']`,
+   * their values refuting it (`getLog1pRefuted`): a short clause for the
+   * genes line and why, behind it. Nothing while Values is being changed.
+   */
+  function log1pRefutedHint(mapping) {
+    if (changedGroups(mapping).length > 0) return { text: '', detail: '' };
+    return describeLog1pRefuted(state.getLog1pRefuted());
+  }
+
+  /**
+   * The one line under the genes: why the expression matrix is raw (when
+   * the default chose it over X), what was guessed, and what making the
+   * names in use unique changed.
    */
   function genesHint(mapping) {
     const pending = changedGroups(mapping).some(group => group === 'geneNames' || group === 'expression' || group === 'modality');
@@ -394,32 +410,13 @@ export function initDataMappingControls({ state, root }) {
       guessedGroups.includes('highlyVariable') ? 'highly variable genes' : null,
     ].filter(Boolean);
     const guess = guessed.length === 0 ? '' : `Guessed: ${guessed.join(', ')}.`;
-    return [guess, note ?? ensemblHint(mapping)].filter(Boolean).join(' ');
+    const reason = pending ? null : RAW_REASON_TEXT[state.getExpressionReason()] ?? null;
+    return [reason, guess, note].filter(Boolean).join(' ');
   }
 
   /** The gene-name set the gene list in use was made from. */
   function namesInUse() {
     return state.varData?.geneNames ?? null;
-  }
-
-  /**
-   * A hint when the genes are named by Ensembl ids and the axis has a symbol
-   * column: at least 90% of a 200-name sample match `ENS…G<digits>`.
-   */
-  function ensemblHint(mapping) {
-    if (shownGroupValue(mapping, 'geneNames') !== 'index') return '';
-    const keys = (state.varData?.fields ?? [])
-      .filter(field => field?._isUserDefined !== true)
-      .slice(0, 200)
-      .map(field => field.key);
-    if (keys.length === 0) return '';
-    const ensembl = keys.filter(key => /^ENS[A-Z]*G\d+/.test(key)).length;
-    if (ensembl < 0.9 * keys.length) return '';
-    const symbol = state.getGeneNameChoices(shownGroupValue(mapping, 'expression'))
-      .find(choice => choice.usable && SYMBOL_COLUMNS.includes(choice.label));
-    return symbol === undefined
-      ? ''
-      : `Gene names are Ensembl ids; '${symbol.label}' holds symbols.`;
   }
 
   /** The groups whose staged value differs from the mapping's. */
@@ -532,6 +529,26 @@ export function initDataMappingControls({ state, root }) {
     return parts.join(' · ');
   }
 
+  /**
+   * The mapping in one line, for the collapsed section's header: how many
+   * embeddings are on and the default of each dimension, an embedding named
+   * once with its dimensions ("4 embeddings · UMAP 3D/2D/1D"), and whether
+   * it was guessed.
+   */
+  function describeSection(mapping) {
+    const dimensionManager = state.getDimensionManager();
+    const byName = new Map();
+    for (const slot of [...DIMENSION_SLOTS].reverse()) {
+      const ref = mapping.embeddings.defaults[slot];
+      if (ref === null) continue;
+      const name = representationName(dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref)));
+      byName.set(name, [...(byName.get(name) ?? []), slot.toUpperCase()]);
+    }
+    const parts = [formatCountOf(mapping.embeddings.enabled.length, 'embedding'), ...[...byName].map(([name, slots]) => `${name} ${slots.join('/')}`)];
+    if (state.getGuessedMappingGroups().some(group => group.startsWith('embeddings.'))) parts.push('guessed');
+    return parts.join(' · ');
+  }
+
   function render() {
     if (destroyed) return;
     const focused = ownerDocument.activeElement;
@@ -544,6 +561,7 @@ export function initDataMappingControls({ state, root }) {
       previousRows = [];
       rowNodes.clear();
       setText(panel.description, '—');
+      onSummary('');
       panel.rows.replaceChildren();
       panel.more.content.replaceChildren();
       for (const node of [...groupNodes.values(), vectorNode]) node.root.hidden = true;
@@ -551,6 +569,7 @@ export function initDataMappingControls({ state, root }) {
     }
     stagedRows(mapping);
     setText(panel.description, describeCurrent(mapping));
+    onSummary(describeSection(mapping));
     const guessed = new Set(state.getGuessedMappingGroups());
     const bound = boundRefs(mapping);
     const enabledCount = staged.rows.filter(row => row.usable && row.enabled).length;
@@ -828,8 +847,9 @@ export function initDataMappingControls({ state, root }) {
     // The apply belongs to the dataset shown now. Once another one is
     // published (`datasetPublished` has reset the panel for it), the outcome
     // -- the transaction refuses to finish -- writes nothing into its panel.
-    const generation = state.getDatasetGeneration();
-    const superseded = () => destroyed || state.getDatasetGeneration() !== generation;
+    // The open cells grown or cut in place are the same dataset.
+    const publication = publications;
+    const superseded = () => destroyed || publications !== publication;
     droppedGenes = [];
     busy = true;
     panel.status.set('Loading…', 'muted');
@@ -892,25 +912,23 @@ export function initDataMappingControls({ state, root }) {
   }
 
   /**
-   * Show the checklist: open the Session section and the Embeddings
-   * disclosure, and on request the sidebar (the phone sheet), then bring it
-   * into view. `focusGroup` (a group such as `latent`) brings that group's
+   * Show the checklist: open the Session panel, its Data mapping section and
+   * the Embeddings disclosure, and on request the sidebar (the phone sheet),
+   * then bring it into view. `focusGroup` (a group such as `latent`) brings that group's
    * choice into view and focuses it instead.
    */
   function reveal({ openSidebar = false, focusGroup = null } = {}) {
     if (destroyed) return;
-    const sidebar = ownerDocument.getElementById('sidebar');
-    if (openSidebar && sidebar?.classList.contains('hidden')) {
-      ownerDocument.getElementById('sidebar-toggle')?.click();
-    }
-    const section = ownerDocument.getElementById('session-section');
-    if (section instanceof HTMLDetailsElement && !section.open) section.open = true;
+    if (openSidebar) revealSidebar(ownerDocument);
+    expandSessionSection(ownerDocument, 'dataMapping');
     setExpanded(true);
-    const target = focusGroup === null ? null : ownerDocument.getElementById(`data-mapping-${focusGroup}`);
+    // The group's choice, by the id its field is drawn with (`data-mapping-gene-names` for `geneNames`).
+    const groupSection = focusGroup === null ? undefined : GROUP_SECTIONS.find(entry => entry.fields.some(field => field.group === focusGroup));
+    const fieldId = groupSection?.fields.find(field => field.group === focusGroup).id ?? null;
+    const target = fieldId === null ? null : ownerDocument.getElementById(fieldId);
     if (target !== null) {
       // The group's own disclosure opens too.
-      const section = GROUP_SECTIONS.find(entry => entry.fields.some(field => field.group === focusGroup));
-      if (section !== undefined) groupNodes.get(section.id)?.disclosure.setExpanded(true);
+      groupNodes.get(groupSection.id)?.disclosure.setExpanded(true);
       target.scrollIntoView({ block: 'center' });
       target.focus({ preventScroll: true });
       return;
@@ -959,6 +977,7 @@ export function initDataMappingControls({ state, root }) {
    */
   function datasetPublished() {
     if (destroyed) return;
+    publications += 1;
     // Every dataset starts collapsed: the notification's Show opens it.
     setExpanded(false);
     panel.more.setExpanded(false);
@@ -990,6 +1009,9 @@ export function initDataMappingControls({ state, root }) {
   // A choice found unusable when it was read (a latent space with a NaN)
   // is offered no more.
   const unsubscribeChoices = state.on('mapping:choices-changed', () => render());
+  // The gene list of a dataset just shown, read after its first view: the
+  // gene-name hint reads it.
+  const unsubscribeGenesListed = state.on('genes:listed', () => render());
 
   datasetPublished();
 
@@ -1002,6 +1024,7 @@ export function initDataMappingControls({ state, root }) {
       destroyed = true;
       lifecycle.abort();
       unsubscribeMapping();
+      unsubscribeGenesListed();
       unsubscribeChoices();
       unsubscribeVarAxis();
       root.replaceChildren();

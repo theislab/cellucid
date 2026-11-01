@@ -90,10 +90,20 @@ function toggleCounter(page, panelId) {
   }, panelId);
 }
 
-/** `toggle` is dispatched from a queued task, so let pending ones arrive. */
+/**
+ * `toggle` is dispatched from a task queued on the DOM manipulation task
+ * source, so every pending one has arrived once a sentinel `<details>`
+ * opened after them has had its own `toggle` (same task source, in order).
+ */
 function toggles(page, panelId) {
   return page.evaluate(async (id) => {
-    await new Promise(resolve => setTimeout(resolve, 50));
+    const sentinel = document.createElement('details');
+    sentinel.hidden = true;
+    document.body.append(sentinel);
+    const toggled = new Promise(resolve => sentinel.addEventListener('toggle', resolve, { once: true }));
+    sentinel.open = true;
+    await toggled;
+    sentinel.remove();
     return window.__panelToggleCounts[id].count;
   }, panelId);
 }

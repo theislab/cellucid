@@ -52,7 +52,7 @@ test('one Open… button opens a File… / Folder… menu, the same in every bro
   // control is wired, so the list has one source.
   assert.doesNotMatch(fileInput, /\baccept=/);
   assert.match(connectionSource, /userDataFileInput\.accept = filePickerAccept\(\);/);
-  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat');
+  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
   assert.doesNotMatch(fileInput, /\b(?:webkitdirectory|directory|multiple)\b/);
   const folderInput = tag(/<input\b[^>]*id="user-data-folder-input"[^>]*>/, 'folder input');
   assert.match(folderInput, /\bwebkitdirectory\b/);

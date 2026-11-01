@@ -52,12 +52,13 @@
  */
 
 import { DataSourceError, DataSourceErrorCode, explainedFailure } from '../../data-source.js';
-import { describeRemoteFile } from '../remote-file.js';
+import { describeRemoteFile, headBytesFor } from '../remote-file.js';
 import { requestJson } from '../api-request.js';
 import { registerSourceAccess, revokeSourceAccess } from '../access.js';
 import { getGoogleAuth } from '../auth/google.js';
 import { HEAD_BYTES, headOfFile, isUnanswered, readFileHead } from '../../../formats/io/byte-source.js';
 import { openableNamesText } from '../../input-formats.js';
+import { cancel, cancelled } from '../../../utils/abort.js';
 
 const FILES = 'https://www.googleapis.com/drive/v3/files/';
 const FIELDS = 'id,name,size,md5Checksum,mimeType,headRevisionId,capabilities/canDownload';
@@ -120,6 +121,21 @@ const FOLDER_REFUSAL =
   'This link is a Google Drive folder. Cellucid opens single files from Google Drive: share the file itself ' +
   `(${openableNamesText({ layouts: ['file', 'zip'] })}) and paste its link.`;
 
+/**
+ * What a rate limit means for a public file read with Cellucid's API key
+ * (Drive answers it with 403 `rateLimitExceeded`, which the byte layer asks
+ * again, `isLimitAnswer`): the key's quota is shared by every visitor who
+ * reads a public Drive file without a sign-in.
+ */
+const KEY_LIMITED =
+  'Google is limiting how fast public Drive files are read through this site\'s Google API key, whose quota every ' +
+  'visitor reading a public Drive file without a Google sign-in shares; reading goes on as Google allows. Signed in to ' +
+  'Google (open the file again after signing in), it is read with your own account\'s quota instead.';
+
+/** What a rate limit means for a file read with the person's Google sign-in. */
+const SIGNED_LIMITED =
+  'Google is limiting how fast your Google account reads Drive files for now; reading goes on as Google allows.';
+
 /** What a download Google holds back from a page without a sign-in looks like to the page. */
 const HELD_BACK =
   'Google Drive is not sending this file to this browser without a Google sign-in for now: Google holds ' +
@@ -162,28 +178,43 @@ async function heldBack(headRead, media, headers, signal) {
 }
 
 /** The reason a Drive API error names (`userRateLimitExceeded`, `notFound`, …), or null. */
-function reasonOf(body) {
+function driveErrorReasonOf(body) {
   return body?.error?.errors?.[0]?.reason ?? body?.error?.status ?? null;
 }
 
-/** Drive answers its rate limits with 403: those are asked again. */
-function transientDriveAnswer(status, body) {
-  return status === 403 && ['userRateLimitExceeded', 'rateLimitExceeded'].includes(reasonOf(body));
+/**
+ * The version a Drive item names: its checksum, else its head revision, with
+ * its size; `size:` (no version) when it names neither.
+ */
+function versionOf(item) {
+  const size = Number(item?.size);
+  if (typeof item?.md5Checksum === 'string' && item.md5Checksum !== '') return `md5:${item.md5Checksum}:${size}`;
+  if (typeof item?.headRevisionId === 'string' && item.headRevisionId !== '') return `revision:${item.headRevisionId}:${size}`;
+  return `size:${size}`;
 }
 
 /** An answer that only says the file is private, or not granted to Cellucid. */
 function isPrivateAnswer(answer) {
   if (answer.status === 404) return true;
   if (answer.status !== 403) return false;
-  return !['downloadQuotaExceeded', 'cannotDownloadAbusiveFile', 'dailyLimitExceeded'].includes(reasonOf(answer.body));
+  return !['downloadQuotaExceeded', 'cannotDownloadAbusiveFile', 'dailyLimitExceeded'].includes(driveErrorReasonOf(answer.body));
 }
 
 /** The refusal of a Drive answer that is neither the file nor "private". */
 function driveFailure(answer, id) {
-  const reason = reasonOf(answer.body);
+  const reason = driveErrorReasonOf(answer.body);
   if (reason === 'downloadQuotaExceeded') {
     return refusal(
       'Google has limited downloads of this file for now. Try again later, or ask its owner to share a copy.',
+      DataSourceErrorCode.NETWORK_ERROR,
+      { id, reason }
+    );
+  }
+  if (reason === 'dailyLimitExceeded') {
+    return refusal(
+      'Google\'s daily limit of reads through this site\'s Google API key is spent (every visitor reading a public ' +
+      'Drive file without a Google sign-in shares it). Sign in to Google to read the file with your own account, or ' +
+      'try again tomorrow.',
       DataSourceErrorCode.NETWORK_ERROR,
       { id, reason }
     );
@@ -244,11 +275,13 @@ export function createDriveProvider({ google = null } = {}) {
    */
   function readHead(id, resourceKey, token, signal) {
     const headers = headersOf(id, resourceKey, token);
-    const head = readFileHead(urls(id, token !== null).media, HEAD_BYTES, {
+    // Its whole head, or one byte when this browser keeps the file's parts
+    // (`headBytesFor`: a shorter head is no head, `headOfFile`).
+    const head = headBytesFor(`gdrive:${id}`).then(length => readFileHead(urls(id, token !== null).media, length, {
       signal,
       once: true,
       fetchImpl: (url, init) => globalThis.fetch(url, { ...init, headers: { ...init.headers, ...headers } }),
-    });
+    }));
     head.catch(() => {});
     return head;
   }
@@ -265,7 +298,6 @@ export function createDriveProvider({ google = null } = {}) {
       label: 'Google Drive',
       headers: headersOf(id, resourceKey, token),
       signal,
-      transient: transientDriveAnswer,
     });
     return { answer, head, stop: reason => early.abort(reason) };
   }
@@ -307,7 +339,10 @@ export function createDriveProvider({ google = null } = {}) {
       name: String(item.name ?? ''),
       size: Number.isSafeInteger(size) ? size : null,
       head,
-      version: typeof item.md5Checksum === 'string' ? `md5:${item.md5Checksum}:${size}` : `revision:${item.headRevisionId ?? ''}:${size}`,
+      // A validator only where Drive states one (a checksum, a revision):
+      // without one the file has no version (`size:`), never a probe of its
+      // display link, which only its access reads.
+      version: versionOf(item),
       attribution: { title: String(item.name ?? id), url: `https://drive.google.com/file/d/${id}/view` },
       signal,
       onStep,
@@ -329,7 +364,6 @@ export function createDriveProvider({ google = null } = {}) {
       label: 'Google Drive',
       headers,
       signal: settled.signal,
-      transient: transientDriveAnswer,
     }).then(answer => answer.ok, () => false);
     const bytes = oneByteFails(media, headers, settled.signal).catch(() => false);
     return new Promise(resolve => {
@@ -337,7 +371,7 @@ export function createDriveProvider({ google = null } = {}) {
       const told = yes => {
         if (!yes) {
           resolve(false);
-          settled.abort(new DOMException('Google answered: not held back.', 'AbortError'));
+          cancel(settled, 'superseded', 'Google answered: not held back.');
         } else if (++held === 2) {
           resolve(true);
         }
@@ -347,12 +381,31 @@ export function createDriveProvider({ google = null } = {}) {
     });
   }
 
-  /** The reads of a public file: the API key, no sign-in. */
-  function publicAccess(id, resourceKey) {
+  /**
+   * Whether the version a file was opened as (`versionOf` its item) is still
+   * the file's: its item asked again (with the key, or the sign-in).
+   */
+  function versionHolds(id, resourceKey, token, item) {
+    return requestJson(urls(id, token !== null).metadata, {
+      label: 'Google Drive',
+      headers: headersOf(id, resourceKey, token),
+      cache: 'no-cache',
+    }).then(answer => answer.ok && versionOf(answer.body) === versionOf(item), () => false);
+  }
+
+  /**
+   * The reads of a public file: the API key, no sign-in. The key may not
+   * read a revision (Drive answers 401, measured), and Drive's answers carry
+   * no validator, so the version opened is confirmed by its item before
+   * anything read of it is kept under it (`version`, `sources/access.js`).
+   */
+  function publicAccess(id, resourceKey, item) {
     const { media } = urls(id, false);
     return registerSourceAccess({
       provider: 'gdrive',
       target: async () => ({ url: media, headers: keyHeaders(id, resourceKey) }),
+      limited: KEY_LIMITED,
+      version: { confirm: () => versionHolds(id, resourceKey, null, item) },
       unreadable: {
         // Opened again, the file is read with the person's Google account,
         // which Google lets through: after a sign-in, or straight from the
@@ -365,14 +418,23 @@ export function createDriveProvider({ google = null } = {}) {
 
   /**
    * The reads of a file opened signed in: the token, renewed with one click
-   * when it expires. A read carrying the token is preflighted; each request
-   * in flight goes to its own stable URL (`lane`, a query parameter Drive
-   * ignores: `byte-source.js`), so the browser keeps every lane's preflight
-   * instead of asking one per request. Drive's downloads are never reusable
-   * from a cache (`private, max-age=0, must-revalidate`, no validators).
+   * when it expires. They read the revision the item named
+   * (`revisions/<headRevisionId>?alt=media`), whose bytes never change: a
+   * file replaced since it opened is not read under the version it opened
+   * as, and a revision gone (404) fails the read as changed. A read carrying
+   * the token is preflighted; each request in flight goes to its own stable
+   * URL (`lane`, a query parameter Drive ignores: `byte-source.js`), so the
+   * browser keeps every lane's preflight instead of asking one per request.
+   * Drive's downloads are never reusable from a cache (`private, max-age=0,
+   * must-revalidate`, no validators). An item naming no revision (none of the
+   * files Cellucid opens lacks one) is read as it is now, its version
+   * confirmed before anything read is kept under it, as a public file's.
    */
-  function signedAccess(id, resourceKey) {
-    const { media } = urls(id, true);
+  function signedAccess(id, resourceKey, item) {
+    const revision = typeof item?.headRevisionId === 'string' && item.headRevisionId !== '' ? item.headRevisionId : null;
+    const media = revision === null
+      ? urls(id, true).media
+      : `${FILES}${encodeURIComponent(id)}/revisions/${encodeURIComponent(revision)}?alt=media`;
     let given = null;
     return registerSourceAccess({
       provider: 'gdrive',
@@ -385,6 +447,9 @@ export function createDriveProvider({ google = null } = {}) {
         });
         return { url: media, headers: { ...keyHeaders(id, resourceKey), Authorization: `Bearer ${given}` }, lane: 'lane' };
       },
+      changed: revision === null ? [] : [404],
+      limited: SIGNED_LIMITED,
+      version: revision === null ? { confirm: () => versionHolds(id, resourceKey, auth().validToken(), item) } : null,
     });
   }
 
@@ -415,9 +480,9 @@ export function createDriveProvider({ google = null } = {}) {
         const request = ask(id, resourceKey, token, signal);
         const answer = await request.answer;
         if (answer.ok) {
-          return describe(id, resourceKey, answer.body ?? {}, request.head, signedAccess(id, resourceKey), signal, onStep);
+          return describe(id, resourceKey, answer.body ?? {}, request.head, signedAccess(id, resourceKey, answer.body ?? {}), signal, onStep);
         }
-        request.stop(new DOMException('The file is not readable yet.', 'AbortError'));
+        request.stop(cancelled('superseded', 'The file is not readable yet.'));
         if (answer.status === 401) {
           google.refused(token);
           onStep?.('Waiting for you to sign in to Google again');
@@ -480,6 +545,7 @@ export function createDriveProvider({ google = null } = {}) {
     capabilities: Object.freeze({
       folders: false,
       private: 'sign-in',
+      public: false,
       versions: false,
       write: false,
     }),
@@ -490,6 +556,10 @@ export function createDriveProvider({ google = null } = {}) {
     }),
     match(input, { explicit = true } = {}) {
       return parseDrive(input, explicit);
+    },
+    /** A file without its link-share resource key, which grants access to it. */
+    publicValue(value) {
+      return value.split('~')[0];
     },
     async open(value, { signal = null, onStep = null } = {}) {
       const parsed = parseDrive(value);
@@ -521,9 +591,9 @@ export function createDriveProvider({ google = null } = {}) {
         throw error;
       });
       if (!answer.ok) {
-        open.stop(new DOMException('The file is not public.', 'AbortError'));
+        open.stop(cancelled('superseded', 'The file is not public.'));
         if (!isPrivateAnswer(answer)) {
-          signed?.stop(new DOMException('The file cannot be read.', 'AbortError'));
+          signed?.stop(cancelled('superseded', 'The file cannot be read.'));
           throw driveFailure(answer, id);
         }
       }
@@ -534,9 +604,9 @@ export function createDriveProvider({ google = null } = {}) {
         // A sign-in that fails here is asked for again below, when it is needed.
         const signedAnswer = await signed.answer.catch(() => null);
         if (signedAnswer?.ok === true) {
-          return opened(await describe(id, resourceKey, signedAnswer.body ?? {}, signed.head, signedAccess(id, resourceKey), signal, onStep));
+          return opened(await describe(id, resourceKey, signedAnswer.body ?? {}, signed.head, signedAccess(id, resourceKey, signedAnswer.body ?? {}), signal, onStep));
         }
-        signed.stop(new DOMException('The file is not granted yet.', 'AbortError'));
+        signed.stop(cancelled('superseded', 'The file is not granted yet.'));
         if (signedAnswer?.status === 401) google.refused(token);
         else if (signedAnswer !== null && isPrivateAnswer(signedAnswer)) notGrantedTo = token;
       }
@@ -545,7 +615,7 @@ export function createDriveProvider({ google = null } = {}) {
         // Its head was read beside the item only when nobody was signed in.
         const head = open.head ?? readHead(id, resourceKey, null, signal);
         if (await heldBack(head, urls(id, false).media, keyHeaders(id, resourceKey), signal)) return null;
-        return describe(id, resourceKey, answer.body ?? {}, head, publicAccess(id, resourceKey), signal, onStep);
+        return describe(id, resourceKey, answer.body ?? {}, head, publicAccess(id, resourceKey, answer.body ?? {}), signal, onStep);
       };
       if (readPublic !== null && google.validToken() === null) {
         const file = await readPublic();

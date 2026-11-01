@@ -1,6 +1,7 @@
 /**
  * A session restores in an engine other than the one that saved it, and a
- * restore announces its outcome once.
+ * restore announces its outcome once — except a sample's own view, which is
+ * part of opening the sample and restores without a word.
  *
  * A camera state carries two representations: the orbit half and the
  * free-fly half. Only the one its navigation mode drives is authoritative; the
@@ -22,7 +23,9 @@
  * published "Session fully restored." twice — once as its own progress entry
  * and once as a second toast — and Load State then added "Session loaded
  * successfully" on top. A failed published sample view was announced twice as
- * well: by the restore's progress entry and by "Sample view unavailable".
+ * well: by the restore's progress entry and by "Sample view unavailable". A
+ * published sample view that applies says nothing: the person opened a
+ * sample, not a session, so its camera landing is the only sign.
  */
 import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
 import { createHash } from 'node:crypto';
@@ -33,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
 import { writeBundle } from '../../assets/js/app/session/bundle/writer.js';
-import { NOT_A_SESSION_FILE_MESSAGE } from '../../assets/js/app/session/bundle/format.js';
+import { NOT_A_SESSION_FILE_MESSAGE, otherSessionFormatMessage } from '../../assets/js/app/session/bundle/format.js';
 import {
   gzipCompress,
   gzipDecompress,
@@ -59,17 +62,18 @@ const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
 
 const RESTORED = 'Session fully restored.';
 
+// Errors of the page. The loads its navigations stop in the document they
+// leave never reach these listeners (`helpers/leaving-document.mjs`).
 function observeProductErrors(page) {
   const errors = [];
   page.on('console', message => {
     if (message.type() === 'error') errors.push(`console: ${message.text()}`);
   });
-  page.on('pageerror', error => {
-    errors.push(`page: ${error.stack || error.message}`);
-  });
+  page.on('pageerror', error => errors.push(`page: ${error.stack || error.message}`));
   return errors;
 }
 
+/** Open the start dataset. */
 async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
@@ -437,7 +441,7 @@ async function servePublishedDefault(page, stateBytes) {
   );
 }
 
-test('a published sample view saved by another engine applies, and says so once', async ({
+test('a published sample view saved by another engine applies, without a word', async ({
   page,
 }, testInfo) => {
   const productErrors = observeProductErrors(page);
@@ -459,16 +463,17 @@ test('a published sample view saved by another engine applies, and says so once'
     'data-startup-phase',
     'ready',
   );
-  await expectAnnounced(
-    page,
-    restored,
-    1,
-    'the applied sample view is announced exactly once',
-  );
+  await expect.poll(
+    () => readLiveOrbit(page),
+    { message: 'the sample view moves the camera to its saved pose' },
+  ).toEqual(savedOrbit);
   const published = await publishedNotifications(page);
+  expect(
+    published.filter(restored),
+    'a sample view is part of opening the sample, not a session to announce',
+  ).toEqual([]);
   expect(published.filter(sampleViewUnavailable)).toEqual([]);
   expect(published.filter(loadingFailed)).toEqual([]);
-  expect(await readLiveOrbit(page)).toEqual(savedOrbit);
   expect(productErrors).toEqual([]);
 });
 
@@ -535,38 +540,49 @@ test('a published sample view applies when its catalog is opened from a link', a
   await openCollapsedPanels(page);
   await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
-  await expectAnnounced(page, restored, 1, 'the linked catalog applies its starting view');
-  expect(await readLiveOrbit(page)).toEqual(savedOrbit);
+  await expect.poll(
+    () => readLiveOrbit(page),
+    { message: 'the linked catalog applies its starting view' },
+  ).toEqual(savedOrbit);
+  expect(
+    (await publishedNotifications(page)).filter(restored),
+    'a starting view restores without a word',
+  ).toEqual([]);
   expect(productErrors).toEqual([]);
 });
 
-test('a file without the format-2 signature is refused, and nothing changes', async ({
+test('a file without the format-3 signature is refused, and nothing changes', async ({
   page,
 }, testInfo) => {
-  // Format 2 carries its version in the signature. A file with any other
-  // signature (here the unversioned "CELLUCID_SESSION\n") is refused with the
-  // one sentence naming the expected format; nothing of it is restored.
+  // Format 3 carries its version in the signature. A session of format 2
+  // (saved by an earlier Cellucid, its cell check taken over drawn
+  // coordinates) is refused naming its format; a file with any other
+  // signature (here the unversioned "CELLUCID_SESSION\n") with the one
+  // sentence naming the expected format. Nothing of either is restored.
   const productErrors = observeProductErrors(page);
   await recordNotifications(page);
   await openDataset(page);
   await poseCamera(page);
   const orbit = await readLiveOrbit(page);
   const current = await saveSession(page, testInfo, 'current.cellucid-session');
-  const signature = Buffer.from('CELLUCID_SESSION/2\n');
+  const signature = Buffer.from('CELLUCID_SESSION/3\n');
   expect(current.subarray(0, signature.length).equals(signature)).toBe(true);
-  const unversioned = Buffer.concat([
-    Buffer.from('CELLUCID_SESSION\n'),
-    current.subarray(signature.length),
-  ]);
-  await forgetNotifications(page);
-  await loadSessionFile(page, 'unversioned.cellucid-session', unversioned);
-  await expectAnnounced(
-    page,
-    ({ message }) => message.includes(NOT_A_SESSION_FILE_MESSAGE),
-    1,
-    'the file is refused once, naming the expected format',
-  );
-  expect((await publishedNotifications(page)).filter(restored)).toEqual([]);
-  expect(await readLiveOrbit(page)).toEqual(orbit);
-  expect(productErrors.filter(line => !line.includes(NOT_A_SESSION_FILE_MESSAGE))).toEqual([]);
+  const refusals = [
+    ['format2.cellucid-session', 'CELLUCID_SESSION/2\n', otherSessionFormatMessage(2)],
+    ['unversioned.cellucid-session', 'CELLUCID_SESSION\n', NOT_A_SESSION_FILE_MESSAGE],
+  ];
+  for (const [name, prefix, sentence] of refusals) {
+    const other = Buffer.concat([Buffer.from(prefix), current.subarray(signature.length)]);
+    await forgetNotifications(page);
+    await loadSessionFile(page, name, other);
+    await expectAnnounced(
+      page,
+      ({ message }) => message.includes(sentence),
+      1,
+      `${name} is refused once, naming the format`,
+    );
+    expect((await publishedNotifications(page)).filter(restored)).toEqual([]);
+    expect(await readLiveOrbit(page)).toEqual(orbit);
+  }
+  expect(productErrors.filter(line => !refusals.some(([, , sentence]) => line.includes(sentence)))).toEqual([]);
 });

@@ -17,8 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { openCollapsedPanels } from './helpers/panels.mjs';
+import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+
+// Cells to open, Genes read for and the data mapping are in the Session
+// panel's sections, collapsed by default: open, as a viewer who opened them.
+test.beforeEach(async ({ page }) => {
+  await openSessionSectionsOnLoad(page);
+});
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const CROWDED_H5AD = path.join(FIXTURES, 'data-mapping-crowded.h5ad');
@@ -105,8 +111,9 @@ for (const [layout, viewport] of [
     test('the checklist is one compact row per array, its editors closed, nothing overflowing', async ({ page }) => {
       const errors = collectBrowserErrors(page);
       await openCrowded(page);
+      // Closed: on a phone the panel waits as its peek bar, elsewhere behind its toggle.
       if (await page.locator('#sidebar').evaluate(element => element.classList.contains('hidden'))) {
-        await page.locator('#sidebar-toggle').click();
+        await page.locator((await page.locator('#phone-sheet-bar').isVisible()) ? '#phone-sheet-bar' : '#sidebar-toggle').click();
       }
       const rows = page.locator('.data-mapping-row');
       await expect(rows).toHaveCount(12);
@@ -231,7 +238,8 @@ test('every control the panel had is still there and works', async ({ page }) =>
   await expect(spatialEdit).toBeFocused();
 
   // The other groups keep their selects.
-  await expect(page.locator('#data-mapping-expression option')).toHaveText(['None', 'X', "layers['counts']"]);
+  // The integer-valued layer is listed as counts (`holdsCounts`).
+  await expect(page.locator('#data-mapping-expression option')).toHaveText(['None', 'X', "layers['counts'] · counts"]);
   await page.locator('#data-mapping-expression').selectOption('layer:counts');
   await expect(page.locator('#data-mapping-gene-names')).toHaveValue('index');
   await expect(page.locator('#data-mapping-knn')).toHaveValue('connectivities');

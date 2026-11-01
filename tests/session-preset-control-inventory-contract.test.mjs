@@ -156,6 +156,17 @@ class ParsedElement {
     return this.attributes.min ?? '';
   }
 
+  /** `data-*` attributes by camel-cased name, as `HTMLElement.dataset` reads them. */
+  get dataset() {
+    const entries = Object.entries(this.attributes)
+      .filter(([name]) => name.startsWith('data-'))
+      .map(([name, value]) => [
+        name.slice('data-'.length).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()),
+        value,
+      ]);
+    return Object.freeze(Object.fromEntries(entries));
+  }
+
   get max() {
     return this.attributes.max ?? '';
   }
@@ -739,6 +750,61 @@ test('every published preset records the current control inventory', async (t) =
       `${preset.label} declares a control type the markup no longer has; the `
         + 'loader refuses each of these with `must declare current type`, and '
         + 'the preset has to be re-saved and repinned',
+    );
+  }
+});
+
+/**
+ * A control marked `data-session-preference` records a preference its owner
+ * keeps rather than the value it shows (`holdsPreference` in `ui-controls.js`),
+ * and the loader checks that record in full whatever the control's range is
+ * now — so, unlike other values, it is decidable from the markup. A save taken
+ * before the preference was recorded holds the value the slider showed, `0`
+ * while no graph is read; restored, it would switch edges on with none shown,
+ * and the loader refuses it instead. This asks the loader about each preset's
+ * preference records against a sidebar of exactly those controls, as
+ * `index.html` declares them, so no other control's runtime value is judged.
+ */
+test('every published preset records each preference the loader accepts', async (t) => {
+  const presets = await readPublishedPresets();
+  if (presets === null) {
+    t.skip(
+      'the cellucid-datasets repository is not checked out beside this one, '
+        + 'so the published presets cannot be read here',
+    );
+    return;
+  }
+  // Accordion records are keyed `accordion:<id>`; none holds a preference.
+  const preferenceElements = currentInventoryKeys
+    .map(id => findById(currentMarkup.documentRoot, id))
+    .filter(element => element?.dataset.sessionPreference !== undefined);
+  assert.ok(
+    preferenceElements.length > 0,
+    'index.html marks no control data-session-preference; this guard then has '
+      + 'nothing to check and must go with the last such control',
+  );
+  const preferenceMarkup = deriveInventory(
+    `<div id="sidebar">${preferenceElements.map(element => {
+      const attributes = Object.entries(element.attributes)
+        .map(([name, value]) => `${name}="${value.replaceAll('"', '&quot;')}"`)
+        .join(' ');
+      return `<${element.tagName} ${attributes}>`;
+    }).join('')}</div>`,
+  );
+  assert.deepEqual(
+    Object.keys(preferenceMarkup.controls).sort(),
+    preferenceElements.map(element => element.id).sort(),
+    'the sidebar of preference controls must inventory exactly those controls',
+  );
+  for (const preset of presets) {
+    const candidate = Object.fromEntries(
+      preferenceElements.map(element => [element.id, preset.controls[element.id]]),
+    );
+    assert.equal(
+      loaderRefusalFor(preferenceMarkup, candidate),
+      null,
+      `${preset.label} records a preference the loader refuses; re-save and `
+        + 'repin every published preset (see the header of this file)',
     );
   }
 });

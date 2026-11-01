@@ -249,7 +249,6 @@ test('dummy texture disposal settles delete-then-throw without retaining or doub
     _firstRenderDone: false,
     _boundingSphere: null,
     _colorsDirty: false,
-    _alphaTexData: null,
     _useAlphaTexture: false,
     _currentAlphas: null,
   });

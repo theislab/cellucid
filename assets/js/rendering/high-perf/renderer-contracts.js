@@ -1,10 +1,11 @@
 /**
  * Renderer input contracts.
  *
- * Every validator that guards a public HighPerfRenderer entry point, moved
- * verbatim out of high-perf-renderer.js. Pure: no WebGL, no renderer state, no
- * spatial index. The renderer and the spatial index both depend on this module;
- * it depends on neither.
+ * Every validator that guards a public HighPerfRenderer entry point, and the
+ * records the renderer publishes to the rest of the app (`LodMembership`)
+ * with the one validator of each that every consumer uses. Pure: no WebGL, no
+ * renderer state, no spatial index. The renderer and the spatial index both
+ * depend on this module; it depends on neither.
  */
 
 import {
@@ -237,6 +238,148 @@ function requireSnapshotColors(pointCount, colors, owner) {
   return colors;
 }
 
+/**
+ * The admission level of a cell drawn only at full detail
+ * (`LodMembership.admissionLevels`); the ladder's bands are counted in the
+ * same byte, so a ladder has fewer.
+ */
+const LOD_FULL_DETAIL_ADMISSION_LEVEL = 0xff;
+
+/**
+ * @typedef {Readonly<{
+ *   admissionLevels: Uint8Array|null,
+ *   count: number,
+ *   dimensionLevel: number,
+ *   generationToken: object,
+ *   indices: Uint32Array|null,
+ *   lodLevel: number,
+ *   pointCount: number,
+ * }>} LodMembership
+ *
+ * The cells one reduced level of detail of one view draws: the one record
+ * every consumer of a level reads (picking, highlights, connectivity edges,
+ * the velocity overlay's spawn sources, the highlight count, figure export),
+ * made by the owner of the levels (`SpatialIndex`, `RankLevels`) and
+ * published by `HighPerfRenderer#getCurrentLodMembership`. Null means full
+ * detail: every cell. A record is frozen, and the same object for as long as
+ * the view draws the same level of the same owner, so consumers key what
+ * they derive from it on its identity.
+ *
+ * - `pointCount`, `dimensionLevel`: the view's cells and dimension.
+ * - `lodLevel`: the level, 0 the coarsest, below the full-detail level.
+ * - `count`: the cells the level draws.
+ * - `generationToken`: a frozen object, one per owner of the levels.
+ * - `admissionLevels`: null when the level's cells are the first `count`
+ *   open cells. That holds whenever the open cells are in priority order
+ *   (`data/cell-priority.js`, `OPEN_ORDER_PRIORITY`): a cell's rank is its
+ *   open position, and every level is the cells of the ranks below its
+ *   count, drawn as the first `count` slots of any store holding the cells
+ *   by rank. Otherwise one byte a cell, the coarsest level admitting it
+ *   (`LOD_FULL_DETAIL_ADMISSION_LEVEL` for a cell drawn only at full
+ *   detail), shared by every level of the owner. A cell is admitted when
+ *   `admissionLevels === null ? cell < count : admissionLevels[cell] <= lodLevel`
+ *   (`lodMembershipAdmits`, and the hot loops that inline it).
+ * - `indices`: the level's cells in the order they are drawn, when the owner
+ *   holds that order (a tree: a view of its draw order, no copy); null for a
+ *   level drawn by rank from a store as it is (`RankLevels`), whose cells are
+ *   `[0, count)` in whatever order the store holds them
+ *   (`HighPerfRenderer#getViewDrawOrder` names it).
+ *
+ * Consumers check the fields they read, never the set of keys, so an owner
+ * may carry more than this record names.
+ */
+
+/** A count of cells for a message, whatever value a malformed record holds. */
+function cellsOf(value) {
+  return Number.isFinite(value) ? formatCountOf(value, 'cell') : `${String(value)} (not a count of cells)`;
+}
+
+/**
+ * Require a level-of-detail membership (`LodMembership`) for a view of
+ * `pointCount` cells (and `dimensionLevel`, when given). Null passes as full
+ * detail. `requireIndices` asks for the drawn order as well (figure export
+ * owns its copy of it).
+ *
+ * @param {LodMembership|null} membership
+ * @param {{pointCount: number, dimensionLevel?: number|null, requireIndices?: boolean, owner: string}} expected
+ * @returns {LodMembership|null}
+ */
+function requireLodMembership(
+  membership,
+  { pointCount, dimensionLevel = null, requireIndices = false, owner }
+) {
+  if (membership === null) return null;
+  if (
+    membership === undefined ||
+    typeof membership !== 'object' ||
+    Array.isArray(membership) ||
+    !Object.isFrozen(membership)
+  ) {
+    throw new TypeError(`${owner} must be null or one frozen level-of-detail membership.`);
+  }
+  const { admissionLevels, count, generationToken, indices, lodLevel } = membership;
+  if (
+    !Number.isSafeInteger(membership.pointCount) ||
+    membership.pointCount !== pointCount ||
+    !SUPPORTED_DIMENSION_LEVELS.has(membership.dimensionLevel) ||
+    (dimensionLevel !== null && membership.dimensionLevel !== dimensionLevel)
+  ) {
+    throw new RangeError(
+      `${owner} describes ${cellsOf(membership.pointCount)} in ${String(membership.dimensionLevel)}D, `
+        + `not the view's ${cellsOf(pointCount)}${dimensionLevel === null ? '' : ` in ${dimensionLevel}D`}.`
+    );
+  }
+  if (
+    !Number.isInteger(lodLevel) ||
+    lodLevel < 0 ||
+    lodLevel >= LOD_FULL_DETAIL_ADMISSION_LEVEL ||
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    count > pointCount
+  ) {
+    throw new RangeError(
+      `${owner} must name a reduced level below ${LOD_FULL_DETAIL_ADMISSION_LEVEL} drawing at most ${cellsOf(pointCount)}.`
+    );
+  }
+  if (
+    generationToken === null ||
+    typeof generationToken !== 'object' ||
+    !Object.isFrozen(generationToken)
+  ) {
+    throw new TypeError(`${owner} generationToken must be one frozen object.`);
+  }
+  if (
+    admissionLevels !== null &&
+    (!(admissionLevels instanceof Uint8Array) || admissionLevels.length !== pointCount)
+  ) {
+    throw new TypeError(`${owner} admissionLevels must be null or one byte a cell.`);
+  }
+  if (
+    (indices !== null && (!(indices instanceof Uint32Array) || indices.length !== count)) ||
+    (requireIndices && indices === null)
+  ) {
+    throw new TypeError(
+      `${owner} indices must be ${requireIndices ? '' : 'null or '}the level's ${cellsOf(count)} as a Uint32Array.`
+    );
+  }
+  return membership;
+}
+
+/**
+ * Whether a level of detail draws `cell` (null: full detail, every cell).
+ * For per-cell loops over millions of cells the consumers inline the same
+ * test (see `LodMembership`).
+ *
+ * @param {LodMembership|null} membership
+ * @param {number} cell
+ * @returns {boolean}
+ */
+function lodMembershipAdmits(membership, cell) {
+  if (membership === null) return true;
+  const admissionLevels = membership.admissionLevels;
+  return admissionLevels === null ? cell < membership.count : admissionLevels[cell] <= membership.lodLevel;
+}
+
 function requireSnapshotAlphas(pointCount, alphas, owner) {
   if (
     !(alphas instanceof Uint8Array) ||
@@ -249,4 +392,17 @@ function requireSnapshotAlphas(pointCount, alphas, owner) {
   return alphas;
 }
 
-export { requireDimensionLevel, requireViewId, requireShaderQuality, requireFiniteNumber, requireNumericVector, requireRenderContract, requireSnapshotPointData, requireSnapshotColors, requireSnapshotAlphas };
+export {
+  LOD_FULL_DETAIL_ADMISSION_LEVEL,
+  lodMembershipAdmits,
+  requireDimensionLevel,
+  requireLodMembership,
+  requireViewId,
+  requireShaderQuality,
+  requireFiniteNumber,
+  requireNumericVector,
+  requireRenderContract,
+  requireSnapshotPointData,
+  requireSnapshotColors,
+  requireSnapshotAlphas,
+};

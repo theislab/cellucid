@@ -74,8 +74,11 @@
  * @module formats/rds/parse
  */
 
+import { needsSwap, swapBytes } from '../io/byte-order.js';
 import { RdsFormatError, RdsUnsupportedError } from './errors.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 /** SEXP types (`Rinternals.h`) and serialization pseudo-types (`serialize.c`). */
 export const SEXP = Object.freeze({
@@ -119,6 +122,34 @@ const PAIRLIKE = new Map([
 export const NULL_NODE = Object.freeze({ kind: 'null', attributes: null });
 const SKIPPED = Object.freeze({ kind: 'skipped', attributes: null });
 
+/** What R calls each item type (`typeof()`), by SEXP type. */
+const TYPE_NAMES = new Map([
+  [SEXP.NIL, 'NULL'], [SEXP.NILVALUE, 'NULL'], [SEXP.SYM, 'symbol'], [SEXP.LIST, 'pairlist'],
+  [SEXP.CLO, 'closure'], [SEXP.ENV, 'environment'], [SEXP.PROM, 'promise'], [SEXP.LANG, 'language'],
+  [SEXP.SPECIAL, 'special'], [SEXP.BUILTIN, 'builtin'], [SEXP.CHAR, 'char'], [SEXP.LGL, 'logical'],
+  [SEXP.INT, 'integer'], [SEXP.REAL, 'double'], [SEXP.CPLX, 'complex'], [SEXP.STR, 'character'],
+  [SEXP.DOT, '...'], [SEXP.VEC, 'list'], [SEXP.EXPR, 'expression'], [SEXP.BCODE, 'bytecode'],
+  [SEXP.EXTPTR, 'externalptr'], [SEXP.WEAKREF, 'weakref'], [SEXP.RAW, 'raw'], [SEXP.S4, 'S4'],
+  [SEXP.ALTREP, 'altrep'], [SEXP.GLOBALENV, 'environment'], [SEXP.EMPTYENV, 'environment'],
+  [SEXP.BASEENV, 'environment'], [SEXP.BASENAMESPACE, 'environment'], [SEXP.NAMESPACE, 'environment'],
+  [SEXP.PACKAGE, 'environment'], [SEXP.REF, 'reference'],
+]);
+
+/**
+ * What an item's first word says of it (`RdsItemFlags`).
+ *
+ * @param {number} flags
+ * @returns {Readonly<RdsItemFlags>}
+ */
+export function itemFlagsOf(flags) {
+  const type = flags & 0xff;
+  return Object.freeze({
+    type: TYPE_NAMES.get(type) ?? `type ${type}`,
+    s4: type === SEXP.S4 || ((flags >> 12) & S4_MASK) !== 0,
+    classed: (flags & IS_OBJECT) !== 0,
+  });
+}
+
 /** The singletons, by pseudo-type: what each stands for. */
 const SINGLETONS = new Map([
   [SEXP.NILVALUE, NULL_NODE],
@@ -147,24 +178,14 @@ const SINGLETONS = new Map([
 export function hostValues(kind, bytes, length, owned = false) {
   let copy = bytes;
   if (!owned || bytes.byteOffset % 8 !== 0) {
-    copy = new Uint8Array(bytes.length);
-    copy.set(bytes);
+    copy = copyTypedArray(Uint8Array, bytes, `An R ${kind} vector`);
   }
   if (kind === 'raw') return copy;
-  const words = new Uint32Array(copy.buffer, copy.byteOffset, copy.byteLength >>> 2);
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    words[i] = ((w & 0xff) << 24) | ((w & 0xff00) << 8) | ((w >>> 8) & 0xff00) | (w >>> 24);
-  }
-  if (kind === 'double' || kind === 'complex') {
-    // Each 8-byte value's two words also trade places.
-    for (let i = 0; i < words.length; i += 2) {
-      const high = words[i];
-      words[i] = words[i + 1];
-      words[i + 1] = high;
-    }
-    return new Float64Array(copy.buffer, copy.byteOffset, kind === 'double' ? length : length * 2);
-  }
+  // XDR is big-endian: each 4-byte (integer, logical) or 8-byte (double,
+  // each part of a complex) value is swapped into the host's order.
+  const size = kind === 'double' || kind === 'complex' ? 8 : 4;
+  if (needsSwap(false, size)) swapBytes(copy, size);
+  if (size === 8) return new Float64Array(copy.buffer, copy.byteOffset, kind === 'double' ? length : length * 2);
   return new Int32Array(copy.buffer, copy.byteOffset, length);
 }
 
@@ -246,6 +267,22 @@ export async function readHeader(reader) {
  *   For the list at `path`, which of its elements are dropped by their name
  *   (null: none); called when the list starts, the predicate when its names
  *   arrive after its elements. A dropped element becomes a `skipped` node.
+ * @property {(path: string[], item: RdsItemFlags) => ('read'|'drop')} [object] -
+ *   Told of each object the file holds from its first word alone, before
+ *   anything else of it is read: an `.rds`'s root (path `[]`) and each
+ *   object of a `save()` file (path `['$name']`). `'drop'` passes it over (a
+ *   `skipped` node whose `item` is this record); an error thrown here ends
+ *   the read at once, so a file holding nothing the caller reads is refused
+ *   from its first bytes, not after its whole download.
+ */
+
+/**
+ * @typedef {Object} RdsItemFlags - What an item's first word says of it
+ * @property {string} type - Its type (`TYPE_NAMES`: `S4`, `list`, `double`, …)
+ * @property {boolean} s4 - An S4 object: of type `S4`, or a basic type with
+ *   the S4 bit (a class that contains `list`)
+ * @property {boolean} classed - The object bit: it has a class attribute
+ *   (a data frame, a factor), which comes after its payload
  */
 
 /**
@@ -263,10 +300,12 @@ export async function readHeader(reader) {
  * @param {import('./xdr.js').XdrReader} reader
  * @param {{plan?: RdsPlan, sink?: RdsSink|null, inlineElements?: number,
  *          nativeEncoding?: string|null, signal?: AbortSignal|null,
- *          onProgress?: ((position: number) => void)|null}} [options]
+ *          onProgress?: ((position: number) => void)|null, container?: 'rds'|'rda'}} [options]
  *   `sink`: where kept payloads larger than `inlineElements` go in stream
  *   mode (over ranges they are referred to in the file, `store: 'file'`);
- *   without one they are kept in memory.
+ *   without one they are kept in memory. `container`: whose objects
+ *   `plan.object` is told of (an `.rds`'s root; a `save()` file's root
+ *   pairlist's elements).
  * @returns {Promise<Object>} The root node
  */
 export async function parseItem(reader, {
@@ -276,6 +315,7 @@ export async function parseItem(reader, {
   nativeEncoding = null,
   signal = null,
   onProgress = null,
+  container = 'rds',
 } = {}) {
   const refs = [];
   const path = [];
@@ -283,6 +323,9 @@ export async function parseItem(reader, {
   const wantVector = typeof plan.vector === 'function' ? plan.vector : () => 'keep';
   const wantDrop = typeof plan.drop === 'function' ? plan.drop : () => false;
   const dropsByName = typeof plan.dropByName === 'function' ? plan.dropByName : () => null;
+  const wantObject = typeof plan.object === 'function' ? plan.object : null;
+  /** The depth of the objects `plan.object` is told of: the root, or a `save()` root pairlist's elements. */
+  const objectDepth = container === 'rda' ? 1 : 0;
   /** Depth of dropped subtrees around the item being read. */
   let dropping = 0;
   /**
@@ -334,21 +377,38 @@ export async function parseItem(reader, {
    * many bytes of the stream it spanned, and whether it held nothing (NULL,
    * or a vector or list of length 0), so a caller can say what was left out.
    */
-  async function readDropped() {
-    const from = reader.position;
+  async function readDropped(flags = null, item = null) {
+    // An item whose first word was read already (`readObject`) spans it too.
+    const from = reader.position - (flags === null ? 0 : 4);
     const elementsBefore = droppedElements;
     dropping++;
     try {
-      await readItem();
+      if (flags === null) await readItem();
+      else await readWith(flags);
     } finally {
       dropping--;
     }
-    return Object.freeze({
+    const node = {
       kind: 'skipped',
       attributes: null,
       bytes: reader.position - from,
       empty: droppedElements === elementsBefore,
-    });
+    };
+    if (item !== null) node.item = item;
+    return Object.freeze(node);
+  }
+
+  /**
+   * One object the file holds (`plan.object`): its first word told to the
+   * plan before anything else of it is read; dropped, or read.
+   */
+  async function readObject() {
+    const flags = await reader.int();
+    if (wantObject !== null && dropping === 0) {
+      const item = itemFlagsOf(flags);
+      if (wantObject([...path], item) === 'drop') return readDropped(flags, item);
+    }
+    return readWith(flags);
   }
 
   /**
@@ -381,9 +441,14 @@ export async function parseItem(reader, {
     return text;
   }
 
-  /** A STRSXP's elements: a run of CHARSXPs read without a promise each while they are buffered. */
+  /**
+   * A STRSXP's elements: a run of CHARSXPs read without a promise each while
+   * they are buffered. The array grows as each element is read, so what it
+   * holds is bounded by the bytes the file really has (8 or more per
+   * element), never by the length it declares.
+   */
   async function readStrings(length) {
-    const values = dropping > 0 ? null : new Array(length);
+    const values = dropping > 0 ? null : [];
     for (let index = 0; index < length; index++) {
       if (reader.available >= 8) {
         const flags = reader.view.getInt32(reader.pos, false);
@@ -470,6 +535,8 @@ export async function parseItem(reader, {
         try {
           if (dropping === 0 && wantDrop(path)) {
             value = await readDropped();
+          } else if (prefix === '$' && path.length === objectDepth) {
+            value = await readObject();
           } else {
             value = await readItem();
           }
@@ -534,7 +601,7 @@ export async function parseItem(reader, {
         const step = Number(numbers[2]);
         let values = null;
         if (length <= inlineElements && wantVector(path, { type: kind, length }) !== 'skip') {
-          values = kind === 'integer' ? new Int32Array(length) : new Float64Array(length);
+          values = allocateTypedArray(kind === 'integer' ? Int32Array : Float64Array, length, 'An R sequence');
           for (let i = 0; i < length; i++) values[i] = start + i * step;
         }
         return { kind, length, values, region: null, sequence: { start, step }, attributes, s4, skipped: false };
@@ -647,32 +714,36 @@ export async function parseItem(reader, {
     }
   }
 
+  /**
+   * Byte code is passed over (it is code, never kept): its count of shared
+   * expressions is read and not used, so nothing is allocated by it.
+   */
   async function readBytecode() {
-    const reps = new Array(Math.max(0, await reader.int()));
+    await reader.int();
     dropping++;
     try {
-      await readBytecodeOne(reps);
+      await readBytecodeOne();
     } finally {
       dropping--;
     }
   }
 
-  async function readBytecodeOne(reps) {
+  async function readBytecodeOne() {
     await readItem();
     const count = await reader.int();
     for (let index = 0; index < count; index++) {
       const type = await reader.int();
-      if (type === SEXP.BCODE) await readBytecodeOne(reps);
+      if (type === SEXP.BCODE) await readBytecodeOne();
       else if (type === SEXP.LANG || type === SEXP.LIST || type === SEXP.BCREPDEF ||
                type === SEXP.BCREPREF || type === SEXP.ATTRLANG || type === SEXP.ATTRLIST) {
-        await readBytecodeLanguage(type, reps);
+        await readBytecodeLanguage(type);
       } else {
         await readItem();
       }
     }
   }
 
-  async function readBytecodeLanguage(type, reps) {
+  async function readBytecodeLanguage(type) {
     if (type === SEXP.BCREPREF) {
       await reader.int();
       return;
@@ -686,8 +757,8 @@ export async function parseItem(reader, {
       }
       if (kind === SEXP.ATTRLANG || kind === SEXP.ATTRLIST) await readItem();
       await readItem();
-      await readBytecodeLanguage(await reader.int(), reps);
-      await readBytecodeLanguage(await reader.int(), reps);
+      await readBytecodeLanguage(await reader.int());
+      await readBytecodeLanguage(await reader.int());
       return;
     }
     await readItem();
@@ -706,7 +777,7 @@ export async function parseItem(reader, {
   }
 
   async function readWith(flags) {
-    if (signal?.aborted) throw signal.reason ?? new DOMException('The read was aborted.', 'AbortError');
+    throwIfAborted(signal);
     if ((++items & 0x3fff) === 0) onProgress?.(reader.position);
     const type = flags & 0xff;
     const singleton = SINGLETONS.get(type);
@@ -818,7 +889,9 @@ export async function parseItem(reader, {
         countDropped(length);
         const elements = dropping > 0 ? null : [];
         byName = dropping > 0 ? null : dropsByName(path);
-        spans = byName === null ? null : new Float64Array(length);
+        // Each element's byte span, grown as the element is read: bounded by
+        // the bytes the file really has, never by the length it declares.
+        spans = byName === null ? null : [];
         const outerAwaiting = awaitingName;
         for (let index = 0; index < length; index++) {
           path.push(`[${index}]`);
@@ -861,7 +934,7 @@ export async function parseItem(reader, {
     return node;
   }
 
-  const root = await readItem();
+  const root = objectDepth === 0 ? await readObject() : await readItem();
   onProgress?.(reader.position);
   return root;
 }

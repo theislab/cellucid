@@ -27,6 +27,7 @@ The Worker exposes only these routes:
 | `/` | `GET` | None | Health response, contract version, and route inventory |
 | `/auth/login` | `GET` | None | Start OAuth with an explicit `return_to` URL |
 | `/auth/callback` | `GET` | OAuth state, PKCE verifier, and GitHub code | Complete OAuth |
+| `/auth/revoke` | `POST` | GitHub bearer token; exact allowed `Origin` | Revoke that token at GitHub with the app's credentials (`DELETE /applications/{client_id}/token`); answers `204`, also for a token GitHub no longer knows |
 | `/auth/user` | `GET` | GitHub bearer token | Return `{id, login}` |
 | `/auth/installations` | `GET` | GitHub bearer token | Return every accessible app installation |
 | `/auth/installation-repos` | `POST` | GitHub bearer token | Return every repository in one installation |
@@ -34,7 +35,7 @@ The Worker exposes only these routes:
 | `/cap/lookup-cells` | `POST` | None; exact allowed `Origin` required | Run the fixed persisted CAP cell lookup and return a bounded projection |
 
 The root health document and every successful CAP response carry
-`"contractVersion": 1`. The checked-in client pins that exact value as well as
+`"contractVersion": 2`. The checked-in client pins that exact value as well as
 the service identity and ordered route inventory. Increment the Worker and
 client contract version together whenever a required Worker semantic change
 would make an older deployment incompatible without changing its routes.
@@ -42,9 +43,14 @@ would make an older deployment incompatible without changing its routes.
 Each sign-in stores its random 256-bit state in the name of one secure,
 HTTP-only, host-only, `SameSite=Lax` callback cookie for ten minutes. That
 cookie's strict JSON value owns the exact return URL and PKCE verifier. The
-callback returns exactly one access token or error in the Cellucid URL
-fragment. Cellucid removes that fragment immediately and stores the token in
-`sessionStorage`.
+callback returns exactly one access token with its lifetime
+(`cellucid_github_token_expires_in`, seconds: 8 hours for a GitHub App with
+token expiration), or one error, in the Cellucid URL fragment. GitHub's refresh
+token is never used and never leaves the Worker. Cellucid removes that fragment
+immediately and stores the token and when it expires in the tab's
+`sessionStorage`: a reload keeps the sign-in until the token expires, and then
+it is forgotten. **Sign out** sends the token to `/auth/revoke`, so it stops
+working at GitHub, and forgets it.
 
 All request and response bodies are JSON with duplicate-key detection. Unknown
 installation-request fields, wrong JSON types, malformed GitHub responses,
@@ -73,7 +79,7 @@ it never accepts a query, operation, variables object, bearer token, cookie, or
 caller-selected upstream. It follows no upstream redirect and sends no
 credentials.
 
-Both routes return `{ "contractVersion": 1, "results": [...],
+Both routes return `{ "contractVersion": 2, "results": [...],
 "omittedInvalidCount": number }`. Results contain only the fields required by
 Cellucid. A malformed or oversized item is omitted as a whole and increments
 `omittedInvalidCount`; scientific strings or marker arrays are never clipped or
@@ -167,9 +173,13 @@ App**, then configure:
    established above.
 3. Select **Request user authorization (OAuth) during installation**.
 4. Clear **Webhook active**. This Worker has no webhook route.
-5. In **Optional Features**, opt out of **User-to-server token expiration**.
-   The current Cellucid session contract accepts one non-expiring user access
-   token and does not accept refresh-token documents.
+5. Keep **Expire user authorization tokens** on (GitHub's default for a new
+   GitHub App; in an existing app, under **Optional Features**, opt in to
+   **User-to-server token expiration**). The Worker accepts only an expiring
+   user token (`access_token`, `expires_in`, `refresh_token`,
+   `refresh_token_expires_in`, `scope`, `token_type`) and refuses a token that
+   never expires, so a sign-in lasts hours, not until the authorization is
+   revoked.
 6. Set repository permissions:
    - **Metadata: Read-only**
    - **Contents: Read and write**
@@ -323,10 +333,11 @@ return:
 {
   "status": "ok",
   "service": "Cellucid GitHub Auth",
-  "contractVersion": 1,
+  "contractVersion": 2,
   "endpoints": [
     "/auth/login",
     "/auth/callback",
+    "/auth/revoke",
     "/auth/user",
     "/auth/installations",
     "/auth/installation-repos",
@@ -394,8 +405,8 @@ targets.
 5. Complete GitHub authorization and confirm that the browser returns to the
    same Cellucid dataset URL.
 6. Confirm that the address bar contains no
-   `cellucid_github_token`, `cellucid_github_error`, or
-   `cellucid_github_auth` fragment.
+   `cellucid_github_token`, `cellucid_github_token_expires_in`,
+   `cellucid_github_error`, or `cellucid_github_auth` fragment.
 7. Open **Choose repo** and confirm that every expected installation and
    repository appears.
 8. Select the annotation repository and run **Pull**.
@@ -413,7 +424,10 @@ targets.
     resulting fork, deterministic branch, commit, and one new open Pull
     Request. Confirm that no source-repository write was attempted.
 15. Sign out and confirm that the session token and user identity disappear
-    from `sessionStorage`.
+    from `sessionStorage`, that the browser sent `POST /auth/revoke` (answered
+    `204`), and that the old token now fails at GitHub
+    (`curl -H "Authorization: Bearer <token>" https://api.github.com/user`
+    answers `401`).
 
 The OAuth flow uses top-level redirects rather than pop-up APIs. Worker cookies
 are secure, HTTP-only, host-only, short-lived, and used only on the callback
@@ -537,7 +551,9 @@ explicit error.
   publishing paths offered by the deployment.
 - Rotate the client secret in GitHub, update the Cloudflare secret, verify
   sign-in, and then remove the superseded GitHub secret.
-- Revoke a user's GitHub App authorization when its token must stop working.
+- Revoke a user's GitHub App authorization when every token it issued must
+  stop working (a single sign-in's token is revoked by **Sign out**, and
+  expires by itself after 8 hours).
 - Inspect Cloudflare logs without recording authorization headers, OAuth codes,
   access tokens, or cookie values.
 - Keep the GitHub App callback list and `ALLOWED_ORIGINS` limited to active,

@@ -4,7 +4,8 @@
  * a dense reference built from the shared definitions in math-utils — the
  * same comparisons the dense kernels made before — with `Object.is`: the same
  * IEEE-754 doubles, not merely close ones. Where the numbers are not defined
- * by one summation order (the one-vs-rest Welch moments), the bound is stated.
+ * by one summation order (Welch's sums of squares, whose zeros' terms are one
+ * product: audit NS-2; the one-vs-rest Welch moments), the bound is stated.
  *
  * The inputs are expression-shaped (mostly zeros, few distinct values) and
  * also carry every edge the kernels have to get right: negative values, -0,
@@ -114,8 +115,21 @@ function rowOf(batch, k) {
   return Object.fromEntries(DE_KEYS.map(key => [key, batch[key][k]]));
 }
 
+/**
+ * The same numbers: means, counts, fold change and every rank-test number
+ * exactly; Welch's t within 1e-12 relative (its sums of squares add the
+ * zeros' terms in one product, not one by one: audit NS-2) and its p within
+ * 1e-9 (the incomplete beta's continued fraction stops within 1e-10).
+ */
 function assertSameDifferential(actual, expected, label) {
   for (const key of DE_KEYS) {
+    if (expected.method === 'ttest' && (key === 'statistic' || key === 'pValue') && !Object.is(actual[key], expected[key])) {
+      // t relative to its size or 1: the dense reference subtracts its means
+      // less its first value (`welchTTest`), the sparse kernel at 0.
+      const relative = Math.abs(actual[key] - expected[key]) / Math.max(Math.abs(expected[key]), key === 'statistic' ? 1 : Number.MIN_VALUE);
+      assert.ok(relative <= (key === 'statistic' ? 1e-12 : 1e-9), `${label} ${key}: ${actual[key]} vs ${expected[key]} (relative ${relative})`);
+      continue;
+    }
     assert.ok(Object.is(actual[key], expected[key]), `${label} ${key}: ${actual[key]} !== ${expected[key]}`);
   }
 }

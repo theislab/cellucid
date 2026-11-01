@@ -408,7 +408,6 @@ function makeRendererFixture({
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: null,
       _alphaTexHeight: 0,
       _alphaTexWidth: 0,
       _alphaTexture: null,
@@ -505,7 +504,7 @@ test('draw-order R32UI staging allocates without a padded host duplicate and str
   const hostileState = makeHostileUnpackState('order-success');
   fixture.gl._setUnpackState(hostileState);
 
-  const record = fixture.renderer._createDrawOrderRecord(
+  const record = fixture.renderer._createStoreOrder(
     fixture.drawOrder,
     'test draw order',
   );
@@ -565,7 +564,7 @@ test('draw-order R32UI staging allocates without a padded host duplicate and str
 
 test('failed streamed R32UI replacement rolls back publication, restores unpack state, and byte-accounts a retry-owned texture exactly', () => {
   const fixture = makeRendererFixture();
-  const accepted = fixture.renderer._createDrawOrderRecord(
+  const accepted = fixture.renderer._createStoreOrder(
     fixture.drawOrder,
     'accepted draw order',
   );
@@ -584,7 +583,7 @@ test('failed streamed R32UI replacement rolls back publication, restores unpack 
   fixture.gl._state.fail.deleteTextureBefore = true;
 
   assert.throws(
-    () => fixture.renderer._createDrawOrderRecord(
+    () => fixture.renderer._createStoreOrder(
       replacement,
       'replacement draw order',
     ),
@@ -629,7 +628,6 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
   const renderer = Object.assign(
     Object.create(HighPerfRenderer.prototype),
     {
-      _alphaTexData: null,
       _alphaTexHeight: 0,
       _alphaTexWidth: 0,
       _alphaTexture: null,
@@ -657,7 +655,9 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
   // A power-of-two width: 2 (the largest at most MAX_TEXTURE_SIZE = 3).
   assert.equal(renderer._alphaTexWidth, 2);
   assert.equal(renderer._alphaTexHeight, 3);
-  assert.equal(renderer._alphaTexData.length, 6);
+  // No CPU image of the texture is kept (the accepted bytes are the
+  // published values themselves).
+  assert.equal(renderer._alphaTexData, undefined);
   assertExactKnownGpuBytes(renderer, 6);
   const allocation = gl._state.textureOperations.find(
     operation => (
@@ -688,11 +688,11 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
   assertNeutralUploadState(updateUpload, 1);
   assertExactUnpackState(gl._state.snapshotUnpack(), hostileState);
   assert.deepEqual(
-    Array.from(renderer._alphaTexData),
+    Array.from(updateUpload.data.subarray(updateUpload.srcOffset, updateUpload.srcOffset + 6)),
     [0, 255, 0, 255, 0, 255],
   );
   assert.equal(renderer._useAlphaTexture, true);
-  const acceptedAlphaData = renderer._alphaTexData;
+  const acceptedAlphaData = renderer._currentAlphas;
   const acceptedAlphaBytes = Array.from(acceptedAlphaData);
   const acceptedAlphaTexture = renderer._alphaTexture;
 
@@ -710,9 +710,9 @@ test('odd-width multi-row R8 creation and update use alignment 1, neutral unpack
     ),
     /WebGL|alpha|publication/i,
   );
-  assert.equal(renderer._alphaTexData, acceptedAlphaData);
+  assert.equal(renderer._currentAlphas, acceptedAlphaData);
   assert.deepEqual(
-    Array.from(renderer._alphaTexData),
+    Array.from(renderer._currentAlphas),
     acceptedAlphaBytes,
   );
   assert.equal(renderer._alphaTexture, acceptedAlphaTexture);

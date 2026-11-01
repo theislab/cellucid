@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 import {
   VelocityOverlay,
@@ -770,6 +771,7 @@ test('velocity simulation restores transform-feedback state after draw failure',
     },
     uniform1f() {},
     uniform1i() {},
+    uniform2i() {},
     useProgram() {},
   };
   const overlay = Object.assign(Object.create(VelocityOverlay.prototype), {
@@ -782,14 +784,14 @@ test('velocity simulation restores transform-feedback state after draw failure',
       u_dt: {},
       u_forceRespawn: {},
       u_lifetime: {},
-      u_positionTexWidth: {},
+      u_positionLayout: {},
       u_spawnTableSize: {},
-      u_spawnTableWidth: {},
+      u_spawnTableLayout: {},
       u_speedMultiplier: {},
       u_time: {},
       u_turbulence: {},
       u_velocityBlend: {},
-      u_velocityTexWidth: {},
+      u_velocityLayout: {},
     },
     config: {
       dropRate: 0,
@@ -812,9 +814,9 @@ test('velocity simulation restores transform-feedback state after draw failure',
     () => overlay._simulate(
       0.016,
       { frameId: 1, time: 1 },
-      { texture: {}, width: 2 },
-      { texture: {}, width: 2 },
-      { tableSize: 2, tableWidth: 2, textureInfo: { texture: {} } },
+      { texture: {}, plan: planLinearTexture(2, 4096, 256) },
+      { texture: {}, plan: planLinearTexture(2, 4096, 256) },
+      { tableSize: 2, textureInfo: { texture: {}, plan: planLinearTexture(2, 4096, 256) } },
       particleState,
     ),
     error => error === drawFailure,

@@ -19,8 +19,9 @@ import { HEAD_BYTES } from '../io/byte-source.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 const SIGNATURE = [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a];
-/** Where the signature is looked for after offsets 0 to 2048: 4096, 8192 and so on. */
-const FIRST_SEARCH_BYTES = 4096;
+
+/** The smallest user block HDF5 allows: the signature's places are 0 and every power of two from it. */
+const FIRST_USER_BLOCK_BYTES = 512;
 
 function hasSignature(bytes, offset) {
   if (offset + 8 > bytes.length) return false;
@@ -52,18 +53,18 @@ export async function readSuperblock(reader, signal = null, activity = null) {
   const options = activity ? { cache: true, signal, activity } : { cache: true, signal };
   const size = reader.size;
   if (size < 8) throw new Hdf5FormatError(`${reader.name} is not an HDF5 file: it is only ${formatCountOf(size, 'byte')} long.`);
-  // The first read is the file's head (`HEAD_BYTES`): offsets 0, 512, 1024
-  // and 2048, and in a file that gathers its metadata at its start,
-  // everything opening reads.
+  // The first read is the file's head (`HEAD_BYTES`): the signature at 0 or
+  // at any power of two from 512 it holds (the specification's places, as
+  // the input-format registry lists them), and in a file that gathers its
+  // metadata at its start, everything opening reads. Beyond it, each place
+  // is read on its own.
   const head = await reader.read(0, Math.min(size, HEAD_BYTES), options);
-  let offset = -1;
-  for (const candidate of [0, 512, 1024, 2048]) {
-    if (hasSignature(head, candidate)) {
-      offset = candidate;
-      break;
-    }
+  let offset = hasSignature(head, 0) ? 0 : -1;
+  let candidate = FIRST_USER_BLOCK_BYTES;
+  for (; offset < 0 && candidate + 8 <= head.length; candidate *= 2) {
+    if (hasSignature(head, candidate)) offset = candidate;
   }
-  for (let candidate = FIRST_SEARCH_BYTES; offset < 0 && candidate + 8 <= size; candidate *= 2) {
+  for (; offset < 0 && candidate + 8 <= size; candidate *= 2) {
     const bytes = await reader.read(candidate, 8, options);
     if (hasSignature(bytes, 0)) offset = candidate;
   }

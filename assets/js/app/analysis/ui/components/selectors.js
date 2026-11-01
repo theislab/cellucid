@@ -11,6 +11,7 @@ import { createIntentPrefetcher } from '../../../utils/intent-prefetch.js';
 import { NONE_VALUE } from '../../shared/dom-utils.js';
 import { createField } from '../../../ui/components/controls.js';
 import { createWindowedListbox } from '../../../ui/components/windowed-listbox.js';
+import { describeUnavailableGene, rankGeneMatches } from '../../../utils/gene-lookup.js';
 
 // =============================================================================
 // PLOT REGISTRY - Imported from centralized location
@@ -195,25 +196,33 @@ export function createGeneExpressionSelector(options = {}) {
     geneList.setActive(-1);
   }
 
+  // Lower-cased once per list, so a keystroke allocates nothing per gene.
+  const loweredKeys = genes.map(gene => gene.key.toLowerCase());
+
   /**
    * Open the list for the search in the input (every gene while the input
-   * shows the chosen one), with the chosen gene active wherever it is listed,
-   * None otherwise.
+   * is empty or shows the chosen one), best match first
+   * (`utils/gene-lookup.js`). What Enter would choose is active: the best
+   * match of what is typed, else the chosen gene wherever it is listed, else
+   * None. (Typing a gene used to leave None active, so Enter cleared the
+   * choice instead of taking the gene typed.)
    */
   const openDropdown = () => {
     dropdown.hidden = false;
     input.setAttribute('aria-expanded', 'true');
-    const filter = input.value;
-    const lowerFilter = filter.toLowerCase();
+    const filter = input.value.trim();
     const isShowingSelection = currentSelectedGene && input.value === currentSelectedGene;
-    matches = isShowingSelection
-      ? genes
-      : genes.filter(g => g.key.toLowerCase().includes(lowerFilter));
+    const searching = filter.length > 0 && !isShowingSelection;
+    matches = searching
+      ? rankGeneMatches(loweredKeys, filter).map(index => genes[index])
+      : genes;
 
-    if (matches.length === 0 && filter) {
+    if (matches.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'dropdown-no-results';
-      empty.textContent = 'No matches.';
+      empty.textContent = searching
+        ? describeUnavailableGene(filter, { kind: 'absent' })
+        : 'This dataset has no gene expression.';
       empty.setAttribute('role', 'option');
       empty.setAttribute('aria-disabled', 'true');
       empty.setAttribute('aria-selected', 'false');
@@ -222,6 +231,10 @@ export function createGeneExpressionSelector(options = {}) {
     }
 
     geneList.reset(matches.length + 1);
+    if (searching) {
+      geneList.setActive(1);
+      return;
+    }
     const currentIndex = currentSelectedGene
       ? matches.findIndex(match => match.key === currentSelectedGene)
       : -1;
@@ -266,8 +279,14 @@ export function createGeneExpressionSelector(options = {}) {
       return;
     }
     if (event.key === 'Enter') {
-      if (!isOpen() || geneList.getActiveIndex() < 0) return;
       event.preventDefault();
+      // A list closed, or showing why nothing matches, is opened on what is
+      // typed: Enter never leaves the box as if nothing happened.
+      if (!isOpen()) {
+        if (input.value === currentSelectedGene) return;
+        openDropdown();
+      }
+      if (geneList.getActiveIndex() < 0) return;
       commit(entryKey(geneList.getActiveIndex()));
       return;
     }

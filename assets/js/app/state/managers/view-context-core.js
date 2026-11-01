@@ -175,16 +175,18 @@ export const viewContextCoreMethods = {
   _cloneFieldState(field) {
     if (!field) return null;
     const clone = { ...field };
-    if (field._categoryColors) clone._categoryColors = field._categoryColors.map((c) => (c ? [...c] : c));
-    if (field._categoryVisible) clone._categoryVisible = { ...field._categoryVisible };
+    // Category colours and visibility are shared: neither array is ever
+    // written, a change makes a new one (`category-state.js`).
     if (field._continuousStats) clone._continuousStats = { ...field._continuousStats };
     if (field._continuousFilter) clone._continuousFilter = { ...field._continuousFilter };
     if (field._continuousColorRange) clone._continuousColorRange = { ...field._continuousColorRange };
     if (field._positiveStats) clone._positiveStats = { ...field._positiveStats };
     if (field._useFilterColorRange != null) clone._useFilterColorRange = field._useFilterColorRange;
     if (field._useLogScale != null) clone._useLogScale = field._useLogScale;
+    if (field._zeroGray != null) clone._zeroGray = field._zeroGray;
     if (field._filterEnabled != null) clone._filterEnabled = field._filterEnabled;
     if (field._categoryFilterEnabled != null) clone._categoryFilterEnabled = field._categoryFilterEnabled;
+    if (field._missingVisible != null) clone._missingVisible = field._missingVisible;
     if (field._outlierFilterEnabled != null) clone._outlierFilterEnabled = field._outlierFilterEnabled;
     if (field._outlierThreshold != null) clone._outlierThreshold = field._outlierThreshold;
     if (field._categoryCounts) {
@@ -364,7 +366,7 @@ export const viewContextCoreMethods = {
     const activeId = String(this.activeViewId);
     for (const [viewId, ctx] of this.viewContexts) {
       if (viewId === activeId) continue;
-      const rows = collectViewFilters(ctx);
+      const rows = collectViewFilters(ctx, { geneSampled: (this.getGeneSample?.() ?? null) !== null });
       const filters = rows.length > 0
         ? rows.map((row) => row.text)
         : ['No filters active'];
@@ -593,6 +595,17 @@ export const viewContextCoreMethods = {
     }
 
     this._reinitializeActiveField();
+    // Genes were read for more cells while another view was focused
+    // (`gene-sample.js` `_fillGeneRows`): the gene shown is drawn, and its
+    // range judged, on the values read.
+    if (ctx.geneValuesRead === true) {
+      ctx.geneValuesRead = false;
+      const field = this.getActiveField();
+      if (this.activeFieldSource === 'var' && field?.loaded === true && field.kind === 'continuous') {
+        this.updateColorsContinuous(field);
+        this.computeGlobalVisibility();
+      }
+    }
     this._rebuildLabelLayerFromCentroids();
     this._pushColorsToViewer();
     this._pushTransparencyToViewer();

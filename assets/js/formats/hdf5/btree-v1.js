@@ -5,8 +5,8 @@
  * Older-format files index a group's links (node type 0, leaves pointing at
  * symbol table nodes) and a chunked dataset's chunks (node type 1, leaves
  * pointing at chunks) with them. A tree is read level by level, all nodes of
- * a level fetched together: whole (`walkBtreeV1`), or a chunk tree down to
- * its leaves' parents, its leaves read as their chunks are needed
+ * a level fetched together: whole (`walkBtreeV1`), or a chunk tree from its
+ * root, each node read when the chunks below it are first needed
  * (`chunk-index.js`).
  *
  * A node's allocated size depends on the tree's 'K' (from the superblock);

@@ -368,7 +368,7 @@
   },
   "latent": {
     "X_broken": {
-      "refused": "NaN at cell 5"
+      "refused": "not representable as float32 at cell 5"
     },
     "X_pca": {
       "batch": "33532b10ce20b7bd51be15598b2ce4dc49fa7728e08dce6775f3f44c48548dfc",

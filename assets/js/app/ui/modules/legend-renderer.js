@@ -13,40 +13,25 @@
  */
 
 import { StyleManager } from '../../../utils/style-manager.js';
-import { clamp } from '../../utils/number-utils.js';
 import { initCategoricalLegend } from './legend/categorical-legend.js';
+import { createGeneReadLink } from './gene-read-control.js';
+import { geneSampleLayersNote } from '../../../data/gene-read-plan.js';
 import { createVisibilityGatedRender } from '../core/visibility-gate.js';
 import {
+  coalesceToFrame,
   createButton,
   createInfoRow,
   createInfoTip,
-  createSliderField,
   createSwitch
 } from '../components/controls.js';
+import { SLIDER_STEPS, boundText, createRangeScale, parseBound } from './legend/range-bounds.js';
+import { createDomId } from '../components/dom-id.js';
 import { initOutlierFilterControl } from './outlier-filter-control.js';
 import { PLACES } from '../place-names.js';
+import { formatSignificant } from '../../../utils/format-units.js';
 
 let colormapMenuIdCounter = 0;
 
-/**
- * A legend value: three significant figures, scientific notation outside
- * 0.01 to 10,000.
- */
-function formatLegendNumber(value) {
-  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
-  if (value === 0) return '0';
-  const abs = Math.abs(value);
-  const sign = value < 0 ? '-' : '';
-  if (abs >= 10000 || abs < 0.01) {
-    const exp = Math.floor(Math.log10(abs));
-    const mantissa = abs / Math.pow(10, exp);
-    const m = mantissa < 10 ? mantissa.toFixed(1).replace(/\.0$/, '') : Math.round(mantissa);
-    return `${sign}${m}e${exp}`;
-  }
-  if (abs >= 100) return sign + abs.toFixed(0);
-  if (abs >= 10) return sign + abs.toFixed(1);
-  return sign + abs.toFixed(2);
-}
 
 export function initLegendRenderer({ state, viewer, dom, dataSourceManager = null, onChooseLatent = () => {} }) {
   const displayOptionsContainer = dom?.optionsContainer || null;
@@ -129,6 +114,9 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     legendEl.replaceChildren();
 
     if (model.kind === 'continuous') {
+      // How the range sliders map onto values, re-drawn when the log switch
+      // changes it (set with the range filter below).
+      let remapSliders = null;
       const colorSection = document.createElement('div');
       colorSection.className = 'legend-section';
       const colorHeader = document.createElement('h3');
@@ -238,11 +226,38 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       const colorbarMin = model.colorbar?.min ?? model.stats.min;
       const colorbarMax = model.colorbar?.max ?? model.stats.max;
       const minSpan = document.createElement('span');
-      minSpan.textContent = formatLegendNumber(colorbarMin);
+      minSpan.textContent = formatSignificant(colorbarMin);
       const maxSpan = document.createElement('span');
-      maxSpan.textContent = formatLegendNumber(colorbarMax);
+      maxSpan.textContent = formatSignificant(colorbarMax);
       ticks.appendChild(minSpan);
       ticks.appendChild(maxSpan);
+
+      // Gray for zero (`setContinuousZeroGray`): off, a gene's 0 takes the
+      // scale's lowest colour; on, the theme's gray beneath the expressing
+      // cells. Offered for a gene with no negative value (`zeroGray.applies`);
+      // on a log scale a 0 has no logarithm and is gray either way.
+      const zeroGraySwitch = createSwitch({
+        label: 'Gray for zero',
+        checked: Boolean(model.zeroGray?.enabled),
+        onChange: next => {
+          state.setContinuousZeroGray(state.activeFieldIndex, next);
+          refreshColorbarLabels();
+        }
+      });
+      zeroGraySwitch.root.classList.add('switch-compact', 'legend-zero-gray-switch');
+      const zeroGrayRow = createInfoRow(
+        zeroGraySwitch.root,
+        createInfoTip({ tip: 'zero-gray', label: 'About gray for zero' })
+      );
+      const syncZeroGray = activeModel => {
+        const zeroGray = activeModel.zeroGray ?? null;
+        zeroGrayRow.hidden = zeroGray?.applies !== true;
+        zeroGraySwitch.setChecked(Boolean(zeroGray?.enabled));
+        // On a log scale a 0 has no colour: the switch has nothing to change.
+        zeroGraySwitch.root.disabled = Boolean(activeModel.logEnabled);
+        zeroGraySwitch.root.title = activeModel.logEnabled ? 'On a log scale 0 has no logarithm, so it is gray either way.' : '';
+      };
+      syncZeroGray(model);
 
       const logSwitch = createSwitch({
         label: 'Log color scale',
@@ -250,6 +265,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         onChange: next => {
           state.setContinuousLogScale(state.activeFieldIndex, next);
           refreshColorbarLabels();
+          remapSliders?.(state.getLegendModel(state.getActiveField()));
         }
       });
       logSwitch.root.classList.add('switch-compact');
@@ -260,8 +276,8 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         onChange: next => {
           state.setContinuousColorRescale(state.activeFieldIndex, next);
           if (next) {
-            const { newMin, newMax } = getSliderValues();
-            state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
+            const filter = state.getLegendModel(state.getActiveField()).filter;
+            state.setContinuousColorRange(state.activeFieldIndex, filter.min, filter.max);
           }
           refreshColorbarLabels();
         }
@@ -274,9 +290,12 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         if (!activeModel || activeModel.kind !== 'continuous') return;
         const cMin = activeModel.colorbar?.min ?? activeModel.stats.min;
         const cMax = activeModel.colorbar?.max ?? activeModel.stats.max;
-        minSpan.textContent = formatLegendNumber(cMin);
-        maxSpan.textContent = formatLegendNumber(cMax);
+        minSpan.textContent = formatSignificant(cMin);
+        maxSpan.textContent = formatSignificant(cMax);
         colorHeader.textContent = `Color scale (${activeModel.colormap?.label || 'Viridis'})`;
+        syncLayerNote(activeModel);
+        syncZeroGray(activeModel);
+        syncCentreNote(activeModel);
         logSwitch.setChecked(Boolean(activeModel.logEnabled));
         rescaleSwitch.setChecked(Boolean(activeModel.colorbar?.usingFilter));
       }
@@ -284,6 +303,50 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       colorSection.appendChild(colorHeader);
       colorSection.appendChild(colorBarWrapper);
       colorSection.appendChild(ticks);
+      // A gene read for a sample of the open cells: one line naming each
+      // state beside a dot of the colour it is drawn in, made from the
+      // view's background (`--cell-zero-color`, `--cell-unread-color`:
+      // `rendering/read-cell-layer.js`, set by the viewer): cells not read,
+      // and, when its zeros are gray (`zeroGray.drawn`), the gray for 0
+      // (`geneSampleLayersNote`). Without a sample the switch says it.
+      const layerNote = document.createElement('p');
+      layerNote.className = 'field-help legend-layer-note';
+      const layerSwatch = layer => {
+        const swatch = document.createElement('span');
+        swatch.className = `legend-layer-swatch is-${layer}`;
+        swatch.setAttribute('aria-hidden', 'true');
+        return swatch;
+      };
+      const syncLayerNote = activeModel => {
+        const sampled = activeModel.geneSample != null;
+        layerNote.hidden = !sampled;
+        if (!sampled) return;
+        const [unreadWords, zeroWords = null] = geneSampleLayersNote(activeModel.zeroGray?.drawn === true).split(' · ');
+        layerNote.replaceChildren(layerSwatch('unread'), unreadWords, ...(zeroWords === null ? [] : [' · ', layerSwatch('zero'), zeroWords]));
+      };
+      syncLayerNote(model);
+      colorSection.appendChild(layerNote);
+      // How many open cells a gene is read for, as a link to where that is
+      // chosen (Session › Open data, `gene-read-control.js`).
+      const geneReadLink = createGeneReadLink(state, renderSignal);
+      if (geneReadLink !== null) colorSection.appendChild(geneReadLink);
+      // A diverging map over data spanning 0 is centred there: said here.
+      const centreNote = document.createElement('p');
+      centreNote.className = 'field-help legend-centre-note';
+      centreNote.textContent = 'Centred at 0: the scale runs from −max to max of |value|, so 0 is its middle.';
+      const syncCentreNote = activeModel => {
+        centreNote.hidden = activeModel.colorbar?.centered !== true;
+      };
+      syncCentreNote(model);
+      colorSection.appendChild(centreNote);
+      // A column with no value among the open cells draws every cell as missing.
+      if (!Number.isFinite(model.stats?.min)) {
+        const emptyNote = document.createElement('p');
+        emptyNote.className = 'field-help legend-empty-note';
+        emptyNote.textContent = 'No value among the open cells: every cell is drawn gray, as missing.';
+        colorSection.appendChild(emptyNote);
+      }
+      colorSection.appendChild(zeroGrayRow);
       colorSection.appendChild(createInfoRow(
         logSwitch.root,
         createInfoTip({ tip: 'log-color-scale', label: 'About the log color scale' })
@@ -293,9 +356,17 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         createInfoTip({ tip: 'color-rescale', label: 'About rescaling colors' })
       ));
 
-      // A constant field has a zero-width range; every slider position then
-      // maps onto its one value instead of past the end of the data range.
-      const range = model.stats.max - model.stats.min;
+      // The bounds of the filter, exact: a slider moves one, a number box
+      // types one, and only the bound moved changes (`legend/range-bounds.js`).
+      const dataRange = { min: model.stats.min, max: model.stats.max };
+      const scaleOf = activeModel => createRangeScale({
+        min: activeModel.stats.min,
+        max: activeModel.stats.max,
+        positiveMin: activeModel.positiveStats?.min ?? null,
+        log: Boolean(activeModel.logEnabled)
+      });
+      let sliderScale = scaleOf(model);
+      const bounds = { min: model.filter.min, max: model.filter.max };
       const filterSection = document.createElement('div');
       filterSection.className = 'legend-section legend-filter';
       const filterHeader = document.createElement('h3');
@@ -310,20 +381,18 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         checked: true,
         onChange: next => {
           setLiveFiltering(next);
-          if (next) applyFilterFromSliders();
+          if (next) applyFilter();
         }
       });
       liveSwitch.root.classList.add('switch-compact');
 
+      // Filter is offered only while Live filtering is off: with it on, every
+      // move already applies the range, and a disabled Filter beside the
+      // switch said the same thing twice.
       function setLiveFiltering(enabled) {
         liveFilteringEnabled = enabled;
         liveSwitch.setChecked(enabled);
-        if (filterBtn) {
-          filterBtn.disabled = enabled;
-          filterBtn.title = enabled
-            ? 'Turn off Live filtering to use Filter'
-            : 'Apply the current range';
-        }
+        if (filterBtn) filterBtn.hidden = enabled;
       }
 
       filterSection.appendChild(createInfoRow(
@@ -331,58 +400,79 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         createInfoTip({ tip: 'live-filtering', label: 'About live filtering' })
       ));
 
-      const percentOf = value => (range > 0 ? ((value - model.stats.min) / range) * 100 : 0);
-      // The filter is applied before the colour range follows the sliders:
-      // filtering is in data units and never depends on the colour scale.
-      // Each slider's work runs at most once per frame (createSliderField),
-      // so a fast drag recomputes visibility once per frame, not per event.
-      const onRangeInput = moved => {
-        const other = moved === minField ? maxField : minField;
-        const minPct = Number(minField.input.value);
-        const maxPct = Number(maxField.input.value);
-        if (minPct > maxPct) other.setValue(moved === minField ? minPct : maxPct);
-        if (liveFilteringEnabled) applyFilterFromSliders();
-        updateDisplayFromSliders();
+      /**
+       * A bound's control: a slider and a number box. The slider's work runs
+       * at most once per frame (`coalesceToFrame`), so a fast drag recomputes
+       * visibility once per frame, not per event; the box applies what is
+       * typed when it is committed (Enter, or leaving it).
+       */
+      const boundField = (which, label) => {
+        // A minted id (`createDomId`): it names nothing on another page, so
+        // the session's control inventory leaves the box out; the bound it
+        // holds is the field's filter, which the session saves.
+        const id = createDomId(`legend-range-${which}`);
+        const labelEl = document.createElement('label');
+        labelEl.className = 'legend-range-label';
+        labelEl.htmlFor = id;
+        labelEl.textContent = label;
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = '0';
+        slider.max = String(SLIDER_STEPS);
+        slider.step = '1';
+        slider.setAttribute('aria-label', `${label}, slider`);
+        const box = document.createElement('input');
+        box.type = 'text';
+        box.id = id;
+        box.className = 'obs-select slider-number';
+        box.setAttribute('inputmode', 'decimal');
+        box.setAttribute('autocomplete', 'off');
+        box.setAttribute('spellcheck', 'false');
+        // Label, slider and box on one row of the bounds' grid.
+        boundsGrid.append(labelEl, slider, box);
+        const slid = coalesceToFrame(() => setBound(which, sliderScale.valueAt(Number(slider.value)), 'slider'));
+        listen(slider, 'input', () => slid(), renderSignal);
+        listen(slider, 'change', () => slid.flush(), renderSignal);
+        const commitBox = () => {
+          const typed = parseBound(box.value, dataRange);
+          if (typed === null) {
+            showBox(box, bounds[which]);
+            return;
+          }
+          setBound(which, typed, 'box');
+        };
+        listen(box, 'change', commitBox, renderSignal);
+        listen(box, 'keydown', event => {
+          if (event.key === 'Enter') commitBox();
+        }, renderSignal);
+        return { slider, box };
       };
-      const minField = createSliderField({
-        label: 'Minimum',
-        min: 0,
-        max: 100,
-        step: 1,
-        value: Math.round(clamp(percentOf(model.filter.min), 0, 100)),
-        format: pct => formatLegendNumber(valueAtPercent(pct)),
-        onInput: () => onRangeInput(minField)
-      });
-      const maxField = createSliderField({
-        label: 'Maximum',
-        min: 0,
-        max: 100,
-        step: 1,
-        value: range > 0 ? Math.round(clamp(percentOf(model.filter.max), 0, 100)) : 100,
-        format: pct => formatLegendNumber(valueAtPercent(pct)),
-        onInput: () => onRangeInput(maxField)
-      });
-      const minSlider = minField.input;
-      const maxSlider = maxField.input;
-      filterSection.appendChild(minField.root);
-      filterSection.appendChild(maxField.root);
+      // The two bounds in one grid: their labels, sliders and boxes aligned
+      // in columns, a row each (`.legend-range-bounds`).
+      const boundsGrid = document.createElement('div');
+      boundsGrid.className = 'slider-row legend-range-bounds';
+      const minField = boundField('min', 'Minimum');
+      const maxField = boundField('max', 'Maximum');
+      filterSection.appendChild(boundsGrid);
 
       const actions = document.createElement('div');
       actions.className = 'legend-actions';
       filterBtn = createButton({
         label: 'Filter',
         variant: 'primary',
+        title: 'Apply the current range',
         className: 'btn-compact',
-        onClick: () => applyFilterFromSliders()
+        onClick: () => applyFilter()
       });
       const resetBtn = createButton({
         label: 'Reset',
         className: 'btn-compact',
         onClick: () => {
-          minField.setValue(0);
-          maxField.setValue(100);
+          bounds.min = dataRange.min;
+          bounds.max = dataRange.max;
+          showBounds();
           state.resetContinuousFilter(state.activeFieldIndex);
-          updateDisplayFromSliders();
+          followColorRange();
         }
       });
       actions.appendChild(filterBtn);
@@ -391,58 +481,70 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       legendEl.appendChild(colorSection);
       legendEl.appendChild(filterSection);
 
-      function getSliderValues() {
-        let minValPct = parseFloat(minSlider.value);
-        let maxValPct = parseFloat(maxSlider.value);
-        if (!isFinite(minValPct)) minValPct = 0;
-        if (!isFinite(maxValPct)) maxValPct = 100;
-        if (minValPct > maxValPct) {
-          minValPct = Math.min(minValPct, 100);
-          maxValPct = minValPct;
-          maxField.setValue(Math.round(maxValPct));
+      /**
+       * A number box shows its bound in as many figures as it holds
+       * (`boundText`); the exact value is its title.
+       */
+      function showBox(box, value) {
+        box.value = boundText(value);
+        box.title = String(value);
+      }
+
+      /** The sliders and boxes show the bounds; a box being typed in is left alone. */
+      function showBounds() {
+        minField.slider.value = String(sliderScale.positionOf(bounds.min, 'min'));
+        maxField.slider.value = String(sliderScale.positionOf(bounds.max, 'max'));
+        showBox(minField.box, bounds.min);
+        showBox(maxField.box, bounds.max);
+      }
+
+      /**
+       * Set one bound exactly; the other moves only when it would cross it.
+       * The filter applies (live), then the colour range follows when
+       * rescaling: filtering is in data units and never depends on the
+       * colour scale.
+       */
+      function setBound(which, value, from) {
+        bounds[which] = value;
+        if (bounds.min > bounds.max) {
+          if (which === 'min') bounds.max = bounds.min;
+          else bounds.min = bounds.max;
         }
-        return {
-          newMin: valueAtPercent(minValPct),
-          newMax: valueAtPercent(maxValPct)
-        };
+        if (from === 'box') {
+          (which === 'min' ? minField : maxField).slider.value = String(sliderScale.positionOf(value, which));
+        }
+        // The slider that moved keeps its position; everything else shows the bounds.
+        const moved = from === 'slider' ? (which === 'min' ? minField : maxField) : null;
+        for (const field of [minField, maxField]) {
+          const bound = field === minField ? bounds.min : bounds.max;
+          showBox(field.box, bound);
+          if (field !== moved && from === 'slider') field.slider.value = String(sliderScale.positionOf(bound, field === minField ? 'min' : 'max'));
+        }
+        if (liveFilteringEnabled) applyFilter();
+        followColorRange();
       }
 
-      // The ends of the track are the data bounds exactly; interior positions
-      // are clamped so float rounding can never step outside the data range.
-      function valueAtPercent(pct) {
-        if (pct <= 0) return model.stats.min;
-        if (pct >= 100) return model.stats.max;
-        return clamp(
-          model.stats.min + (pct / 100) * range,
-          model.stats.min,
-          model.stats.max
-        );
-      }
-
-      function showRangeReadouts(min, max) {
-        minField.readout.textContent = formatLegendNumber(min);
-        maxField.readout.textContent = formatLegendNumber(max);
-      }
-
-      function updateDisplayFromSliders() {
-        const { newMin, newMax } = getSliderValues();
-        showRangeReadouts(newMin, newMax);
+      function followColorRange() {
         if (isRescaling()) {
-          state.setContinuousColorRange(state.activeFieldIndex, newMin, newMax);
+          state.setContinuousColorRange(state.activeFieldIndex, bounds.min, bounds.max);
           refreshColorbarLabels();
         }
       }
 
-      function applyFilterFromSliders() {
-        const { newMin, newMax } = getSliderValues();
-        state.applyContinuousFilter(state.activeFieldIndex, newMin, newMax);
+      function applyFilter() {
+        state.applyContinuousFilter(state.activeFieldIndex, bounds.min, bounds.max);
       }
 
+      // The colour scale's switch changes how the sliders map (log or not),
+      // never the bounds.
+      remapSliders = activeModel => {
+        sliderScale = scaleOf(activeModel);
+        showBounds();
+      };
+
       setLiveFiltering(true);
-      // Rendering only reads state. Re-applying the slider positions here
-      // rounded a restored or programmatic filter to whole percent steps
-      // every time the legend was drawn.
-      showRangeReadouts(model.filter.min, model.filter.max);
+      // Rendering only reads state: the bounds shown are the filter's, exactly.
+      showBounds();
     }
   }
 

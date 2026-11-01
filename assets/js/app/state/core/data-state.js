@@ -10,6 +10,9 @@ import { EventEmitter } from '../../utils/event-emitter.js';
 import { RenameRegistry } from '../../registries/rename-registry.js';
 import { DeleteRegistry } from '../../registries/delete-registry.js';
 import { UserDefinedFieldsRegistry } from '../../registries/user-defined-fields.js';
+import { DerivedResultsRegistry } from '../../registries/derived-results.js';
+import { createCellIdentity } from '../../../data/cell-identity.js';
+import { DEFAULT_CELL_PRIORITY } from '../../../data/cell-priority.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { HighlightManager, highlightStateMethods } from '../managers/highlight-manager.js';
 import { FieldManager, DataStateFieldMethods } from '../managers/field-manager.js';
@@ -21,6 +24,9 @@ import { DataStateMappingGroupMethods } from '../managers/mapping-groups.js';
 import { DataStateVarAxisMethods } from '../managers/var-axis.js';
 import { DataStateLatentSpaceMethods } from '../managers/latent-space.js';
 import { DataStateOutlierQuantileMethods } from '../managers/outlier-quantiles.js';
+import { DataStateOpenCellsMethods } from '../managers/open-cells.js';
+import { inactiveFieldBytes, releaseInactiveFieldsOverBudget } from '../managers/field/residency.js';
+import { registerResidentHolder, setOpenCells, setWorkingSet } from '../../../data/memory-budget.js';
 
 export function createDataState({ viewer, labelLayer }) {
   return new DataState(viewer, labelLayer);
@@ -31,10 +37,24 @@ export class DataState extends EventEmitter {
     super();
     this.viewer = viewer;
     this.labelLayer = labelLayer;
+    // Centroid labels are elements only while a view shows them: turned on
+    // (an `overlay` change), the active view's are made.
+    viewer?.onPresentedViewStateChanged?.(event => {
+      if (event.reason === 'overlay') this._syncCentroidLabelsShown(event.viewId);
+    });
     this.fieldLoader = null;
     this.varFieldLoader = null;
 
-    this.pointCount = 0;
+    // The open cells drawn: the memory model's working set (`pointCount`).
+    this._pointCount = 0;
+    // Which of the dataset's cells are open, and their original positions
+    // (data/cell-identity.js): every cell named outside the app is named by
+    // it. Published with each scene (`initScene`, `setCellIdentity`).
+    this.cellIdentity = createCellIdentity({ nObs: 0 });
+    // The order every "first cells" sample is taken in (data/cell-priority.js):
+    // levels of detail and progressive analyses. Published with each scene
+    // (`initScene`, `setCellPriority`).
+    this.cellPriority = DEFAULT_CELL_PRIORITY;
     // Live view's normalized positions, `positionsDimension` components per
     // cell (see rendering/position-layout.js). The two are assigned together.
     this.positionsArray = new Float32Array(0);
@@ -91,6 +111,8 @@ export class DataState extends EventEmitter {
     this._mappingCandidates = null;
     this._mappingOrigin = null;
     this._mappingPublicationOrigin = null;
+    // How many datasets (or none) were published: a mapping change belongs to one.
+    this._mappingPublication = 0;
     // Embeddings that failed their load-time check: obsm key -> reason.
     // They stay unusable for the rest of the dataset's session.
     this._unusableEmbeddings = new Map();
@@ -132,9 +154,31 @@ export class DataState extends EventEmitter {
     this._renameRegistry = new RenameRegistry();
     this._deleteRegistry = new DeleteRegistry();
     this._userDefinedFields = new UserDefinedFieldsRegistry();
+    // Gene sets and scores besides the fields: a notebook's pushed sets, the
+    // shown marker and gene signature results (registries/derived-results.js).
+    this._derivedResults = new DerivedResultsRegistry();
 
     // Bind singleton registry for fast lookups.
     getFieldRegistry().bind(this);
+
+    // What the state keeps by choice is counted by the memory model
+    // (`data/memory-budget.js`) and trimmed by it: the arrays of fields no
+    // view uses, and the positions of layouts no view shows. Fields loaded
+    // during a batch (a session restore staging the fields it shows next)
+    // are trimmed at the next field change instead.
+    registerResidentHolder('inactiveFields', {
+      label: 'inactive field data',
+      bytes: () => inactiveFieldBytes(this),
+      trim: budget => {
+        if (this._batchMode === true) return null;
+        return releaseInactiveFieldsOverBudget(this, budget) > 0 ? 'data of fields no view shows' : null;
+      },
+    });
+    registerResidentHolder('positions', {
+      label: 'positions of layouts no view shows',
+      bytes: () => this.dimensionManager?.unshownBytes() ?? 0,
+      trim: budget => this.dimensionManager?.trimUnshown(budget) ?? null,
+    });
 
     // UI controls are initialized even when no dataset is selected. Publish
     // that zero-cell runtime as the same exact live-view contract used after
@@ -149,18 +193,48 @@ function applyMixin(targetProto, mixinProto) {
   Object.defineProperties(targetProto, descriptors);
 }
 
+Object.defineProperty(DataState.prototype, 'pointCount', {
+  configurable: true,
+  /** The open cells of the shown dataset. */
+  get() { return this._pointCount; },
+  /** Every change is the memory model's working set (`setOpenCells`). */
+  set(count) {
+    this._pointCount = count;
+    setOpenCells(count);
+  },
+});
+
+Object.defineProperty(DataState.prototype, 'cellIdentity', {
+  configurable: true,
+  /** Which cells of the file the open cells are (`data/cell-identity.js`). */
+  get() { return this._cellIdentity; },
+  /**
+   * Its arrays (the kept cells, their open order and its lookups: 4 to 16
+   * bytes an open cell, 800 MB for 50M cells in priority order) are the
+   * memory model's working set while the cells are open.
+   */
+  set(identity) {
+    this._cellIdentity = identity;
+    setWorkingSet('cell identity', identity?.byteLength ?? 0, identity);
+  },
+});
+
 applyMixin(DataState.prototype, DataStateViewMethods.prototype);
 applyMixin(DataState.prototype, DataStateMappingMethods.prototype);
 applyMixin(DataState.prototype, DataStateMappingGroupMethods.prototype);
 applyMixin(DataState.prototype, DataStateVarAxisMethods.prototype);
 applyMixin(DataState.prototype, DataStateLatentSpaceMethods.prototype);
 applyMixin(DataState.prototype, DataStateOutlierQuantileMethods.prototype);
+applyMixin(DataState.prototype, DataStateOpenCellsMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);
 Object.defineProperties(DataState.prototype, Object.getOwnPropertyDescriptors(highlightStateMethods));
 
 Object.defineProperties(DataState.prototype, {
+  getDerivedResults: {
+    value() { return this._derivedResults; }
+  },
   fields: {
     get() { return this._fieldsManager || (this._fieldsManager = new FieldManager(this)); }
   },

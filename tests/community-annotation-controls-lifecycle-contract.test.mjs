@@ -239,7 +239,7 @@ test('every async confirmation is physically owned by the exact context signal',
   }
   const confirm = slice(modalShellSource, 'function confirmAsync', null);
   assert.match(confirm, /cancelDialog = showConfirmDialog/);
-  assert.match(confirm, /signal\?\.addEventListener\('abort', onAbort/);
+  assert.match(confirm, /stopWaiting = onAbort\(signal, /);
   assert.match(confirm, /cancelDialog\(\)/);
 });
 

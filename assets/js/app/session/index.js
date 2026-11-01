@@ -11,6 +11,8 @@ import {
 } from './session-serializer.js';
 import * as fieldOverlays from './contributors/field-overlays.js';
 import * as userDefinedCodes from './contributors/user-defined-codes.js';
+import * as userDefinedValues from './contributors/user-defined-values.js';
+import * as geneSets from './contributors/gene-sets.js';
 import * as coreState from './contributors/core-state.js';
 import * as dockableLayout from './contributors/dockable-layout.js';
 import * as analysisWindows from './contributors/analysis-windows.js';
@@ -44,6 +46,8 @@ export function createSessionSerializer(options) {
   const contributors = [
     fieldOverlays,
     userDefinedCodes,
+    userDefinedValues,
+    geneSets,
     cinematicCamera,
     coreState,
     dockableLayout,

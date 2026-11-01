@@ -207,12 +207,18 @@ function compoundMapping(compound) {
 }
 
 /**
- * The current-layout view of an older AnnData store root.
+ * The current-layout view of an older AnnData store root. The store is
+ * loaded whole first (`formats/store.js`, `Group.load`): an older layout
+ * names its parts in other places (a column's categories under
+ * `__categories` or in `uns`, raw as root entries), which the view looks up
+ * as it presents each one.
  *
  * @param {Object} root - A store root group
- * @returns {Object} A store root group in the current layout
+ * @param {{signal?: AbortSignal|null, activity?: Object|null}} [options]
+ * @returns {Promise<Object>} A store root group in the current layout
  */
-export function currentLayoutView(root) {
+export async function currentLayoutView(root, options = {}) {
+  await root.load([''], options);
   const uns = root.has('uns') ? root.get('uns') : null;
   // anndata 0.6 keeps a categorical column's categories in uns.
   const categoriesOf = column => (isGroup(uns) && uns.has(`${column}_categories`)

@@ -22,6 +22,7 @@
  * @module session/codecs/typed-json
  */
 
+import { HOST_LITTLE_ENDIAN } from '../../../formats/io/byte-order.js';
 import { decodeUvarint, uvarintLength, writeUvarint } from './varint.js';
 import { isPlainRecord } from '../../../utils/exact-record.js';
 
@@ -36,7 +37,7 @@ const DTYPES = Object.freeze([
   Float64Array
 ]);
 
-if (new Uint8Array(new Uint16Array([1]).buffer)[0] !== 1) {
+if (!HOST_LITTLE_ENDIAN) {
   throw new Error('Typed JSON requires a little-endian platform.');
 }
 

@@ -11,7 +11,8 @@
  * @module formats/io/shuffle
  */
 
-const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+import { HOST_LITTLE_ENDIAN as LITTLE_ENDIAN } from './byte-order.js';
+
 
 /** Four elements' byte `b` (lanes `w0`..`w3`, one per element byte) as the elements' words. */
 function transposeInto(words, w, step, w0, w1, w2, w3) {

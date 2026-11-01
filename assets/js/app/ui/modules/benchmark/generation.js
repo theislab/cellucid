@@ -15,6 +15,9 @@ import {
 } from './generation-contract.js';
 import { benchmarkGenerationWorkerScript } from '../../../../../workers/scripts.js';
 import { startWorker } from '../../../../workers/worker-script.js';
+import { workerFailureReason } from '../../../../workers/worker-failure.js';
+import { PieceReceiver } from '../../../../utils/large-arrays.js';
+import { cancelled, onAbort } from '../../../../utils/abort.js';
 
 /**
  * Generate a synthetic dataset without blocking the main thread.
@@ -74,33 +77,43 @@ export function generateSyntheticDataOffThread(options = {}) {
     );
   }
 
+  const stopped = () => cancelled('user', 'Synthetic generation was stopped.');
+  // Stopped before it began: no worker is started.
+  if (signal?.aborted) return Promise.reject(stopped());
+
   return new Promise((resolve, reject) => {
     const worker = startWorker(benchmarkGenerationWorkerScript(), { type: 'module' });
     let settled = false;
+    let stopListening = () => {};
     const finish = (settle, value) => {
       if (settled) return;
       settled = true;
-      if (signal !== null) signal.removeEventListener('abort', onAbort);
+      stopListening();
       worker.terminate();
       settle(value);
     };
-    function onAbort() {
-      finish(
-        reject,
-        new DOMException('Synthetic generation aborted.', 'AbortError')
-      );
-    }
-    if (signal !== null) {
-      if (signal.aborted) {
-        worker.terminate();
-        reject(new DOMException('Synthetic generation aborted.', 'AbortError'));
+    stopListening = onAbort(signal, () => finish(reject, stopped()));
+
+    // Arrays larger than one ArrayBuffer arrive in pieces before the result.
+    const pieces = new PieceReceiver();
+    worker.addEventListener('message', event => {
+      let payload = event.data;
+      if (payload?.piece !== undefined && payload.requestId === request.requestId) {
+        try {
+          pieces.receive(payload.piece);
+        } catch (error) {
+          finish(reject, error);
+        }
         return;
       }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    worker.addEventListener('message', event => {
-      const payload = event.data;
+      if (payload?.ok === true) {
+        try {
+          payload = pieces.resolve(payload);
+        } catch (error) {
+          finish(reject, error);
+          return;
+        }
+      }
       if (payload?.ok !== true) {
         finish(
           reject,
@@ -128,7 +141,7 @@ export function generateSyntheticDataOffThread(options = {}) {
       finish(
         reject,
         new Error(
-          `Synthetic generation worker failed: ${event.message ?? 'unknown'}`
+          `Synthetic generation worker failed: ${workerFailureReason(event)}`
         )
       );
     });

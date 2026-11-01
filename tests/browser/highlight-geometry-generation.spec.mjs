@@ -3,6 +3,13 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
+/**
+ * What each engine calls a request the page cancelled: Chromium
+ * `net::ERR_ABORTED`, WebKit `cancelled` (hosted macOS WebKit reported five
+ * of the reader's module requests so).
+ */
+const CANCELLED_BY_THE_PAGE = new Set(['net::ERR_ABORTED', 'cancelled']);
+
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=highlight-geometry-generation-ci`;
 
@@ -141,11 +148,11 @@ test('highlight upload follows exact same-reference geometry generations', async
   });
   page.on('requestfailed', request => {
     // A superseded dataset load cancels its in-flight reads through
-    // the loader's own AbortSignal, so net::ERR_ABORTED is the designed
-    // cancellation rather than a load failure. A genuine failure still surfaces
+    // the loader's own AbortSignal: a request the page cancelled is the
+    // designed cancellation rather than a load failure. A genuine failure still surfaces
     // through responseFailures and pageErrors, which are asserted separately.
     const errorText = request.failure()?.errorText ?? '';
-    if (errorText === 'net::ERR_ABORTED') return;
+    if (CANCELLED_BY_THE_PAGE.has(errorText)) return;
     requestFailures.push(`${request.method()} ${request.url()} ${errorText}`);
   });
 
@@ -406,11 +413,11 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
   });
   page.on('requestfailed', request => {
     // A superseded dataset load cancels its in-flight reads through
-    // the loader's own AbortSignal, so net::ERR_ABORTED is the designed
-    // cancellation rather than a load failure. A genuine failure still surfaces
+    // the loader's own AbortSignal: a request the page cancelled is the
+    // designed cancellation rather than a load failure. A genuine failure still surfaces
     // through responseFailures and pageErrors, which are asserted separately.
     const errorText = request.failure()?.errorText ?? '';
-    if (errorText === 'net::ERR_ABORTED') return;
+    if (CANCELLED_BY_THE_PAGE.has(errorText)) return;
     requestFailures.push(`${request.method()} ${request.url()} ${errorText}`);
   });
 

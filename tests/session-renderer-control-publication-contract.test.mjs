@@ -176,7 +176,7 @@ function makeRendererControls() {
       type: 'range',
       value: '-1',
       min: '-1',
-      max: '17',
+      max: '0',
       step: '1',
     }),
     hpLodForceContainer: new FakeElement({ id: 'lod-force-container' }),
@@ -191,6 +191,7 @@ function makeRendererControls() {
       checked: true,
     }),
     hpAntialiasStatus: new FakeElement({ id: 'hp-antialias-status' }),
+    hpPerformanceStatus: new FakeElement({ id: 'hp-performance-status' }),
   };
 }
 
@@ -231,7 +232,13 @@ function makeViewer(overrides = {}) {
     setShaderQuality: value => calls.push(['setShaderQuality', value]),
     setAdaptiveLOD: value => calls.push(['setAdaptiveLOD', value]),
     setForceLOD: value => calls.push(['setForceLOD', value]),
+    getLODLevelCount: () => 18,
     setFrustumCulling: value => calls.push(['setFrustumCulling', value]),
+    onFullDetailFrameCost: () => () => {},
+    onPerformanceSettingsChanged: () => () => {},
+    measureFullDetailFrameCost: () => {},
+    verifyFullDetailFrameCost: () => {},
+    onPresentedViewStateChanged: () => () => {},
     setAntialiasing: value => {
       calls.push(['setAntialiasing', value]);
       return value;
@@ -517,8 +524,8 @@ test('the markup the renderer controls are validated against still holds', () =>
   // change here would fail the whole UI at runtime rather than in this suite.
   assert.match(
     indexHtml,
-    /<input id="hp-lod-force" type="range" min="-1" max="17" step="1" value="-1"/,
-    'the forced-LOD slider must keep its exact -1..17 contract'
+    /<input id="hp-lod-force" type="range" min="-1" max="0" step="1" value="-1"/,
+    'the forced-LOD slider starts at Auto; its top follows the ladder of the cells shown'
   );
   const shaderQuality = indexHtml.slice(
     indexHtml.indexOf('<select id="hp-shader-quality"'),

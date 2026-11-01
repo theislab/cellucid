@@ -18,6 +18,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { openPhoneSheet } from './helpers/panels.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -106,6 +107,9 @@ test.describe('phone 390×844', () => {
   }) => {
     test.setTimeout(120_000);
     await openDataset(page);
+    // A phone opens on the plot: the controls measured are the panel's, so
+    // it is opened from its bar first (and has finished rising).
+    await openPhoneSheet(page);
     const report = await page.evaluate(async () => {
       const CONTROLS = [
         '.btn', '.icon-btn:not(.legend-item .icon-btn)', '.segmented-btn',

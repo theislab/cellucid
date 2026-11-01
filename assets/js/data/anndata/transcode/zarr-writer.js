@@ -341,6 +341,23 @@ export class AnnDataStoreWriter {
   }
 
   /**
+   * A compressed sparse matrix that holds no entry yet: its shape, empty
+   * `data` and `indices`, and pointers that are all zero, stored as no chunk
+   * at all (an absent chunk reads as its array's fill value): the matrix of
+   * a store opened before its entries arrive (`matrix-market.js`).
+   *
+   * @param {string} path
+   * @param {{format: 'csr'|'csc', shape: [number, number]}} matrix
+   */
+  emptySparse(path, { format, shape }) {
+    this.group(path, { shape, ...encoding(`${format}_matrix`, '0.1.0') });
+    const pointers = (format === 'csr' ? shape[0] : shape[1]) + 1;
+    this._arrayMeta(`${path}/data`, { shape: [0], chunks: [1], dtype: '<f4', fill: 0 }, {});
+    this._arrayMeta(`${path}/indices`, { shape: [0], chunks: [1], dtype: '<i4', fill: 0 }, {});
+    this._arrayMeta(`${path}/indptr`, { shape: [pointers], chunks: [Math.max(1, Math.min(pointers, Math.floor(this.chunkBytes / 4)))], dtype: '<i4', fill: 0 }, {});
+  }
+
+  /**
    * Finish: the consolidated metadata, and every entry.
    *
    * @returns {{entries: Map<string, Object>, used: Set<string>}}

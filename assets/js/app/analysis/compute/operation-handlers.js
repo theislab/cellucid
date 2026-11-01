@@ -24,6 +24,7 @@ import {
   selectSorted
 } from './math-utils.js';
 import {
+  columnMoments,
   createTwoGroupContext,
   geneSampleOf,
   splitTwoGroups,
@@ -56,7 +57,9 @@ import {
  * @param {number[]} payload.xValues - X values
  * @param {number[]} payload.yValues - Y values
  * @param {string} [payload.method='pearson'] - 'pearson' or 'spearman'
- * @returns {Object} Correlation result with r, rSquared, pValue, n, method, slope, intercept
+ * @returns {Object} Correlation result with r, rSquared, pValue, n, method, slope, intercept;
+ *   `constant` ('x', 'y' or 'both') when a variable is constant in these
+ *   cells, and r, rSquared and pValue are then NaN (undefined)
  */
 export function computeCorrelation(payload) {
   const { xValues, yValues, method = 'pearson' } = payload;
@@ -81,6 +84,15 @@ export function computeCorrelation(payload) {
   const slope = moments.sxx > 0 ? moments.sxy / moments.sxx : 0;
   const intercept = moments.meanY - slope * moments.meanX;
 
+  // A variable constant in these cells (a gene expressed in none of them)
+  // has no correlation to report: undefined, said as such, never r = 0.
+  const constant = !(moments.sxx > 0) && !(moments.syy > 0)
+    ? 'both'
+    : !(moments.sxx > 0) ? 'x' : !(moments.syy > 0) ? 'y' : null;
+  if (constant !== null) {
+    return { r: NaN, rSquared: NaN, pValue: NaN, n, method, slope, intercept, constant };
+  }
+
   let r;
   if (method === 'spearman') {
     // For Spearman we need ranks; avoid allocating per-pair objects.
@@ -88,9 +100,11 @@ export function computeCorrelation(payload) {
       // Fast path: all pairs valid, rank inputs directly.
       r = pearsonCorrelation(computeRanks(xValues), computeRanks(yValues));
     } else {
-      // Compact to valid-only arrays, then rank.
-      const xValid = new Float32Array(n);
-      const yValid = new Float32Array(n);
+      // Compact to valid-only arrays, then rank: in doubles, so values wider
+      // than float32 (integers past 2^24, a float64 field) keep every
+      // distinction and gain no tie the all-finite path would not have.
+      const xValid = new Float64Array(n);
+      const yValid = new Float64Array(n);
       let k = 0;
       for (let i = 0; i < len; i++) {
         const x = xValues[i];
@@ -528,49 +542,47 @@ export function computeCsvExport(payload) {
 }
 
 /**
- * One gene column's moments over every cell (`shared/gene-moments-cache.js`):
- * the sum and the sum of squares of its finite values, its non-zero finite
- * values and its finite values (`n`).
+ * One gene column's moments over every cell (`gene-statistics.js`
+ * `columnMoments`: the mean and centred sum of squares of its finite values,
+ * exactly 0 for a constant column; its non-zero finite values; its finite
+ * values `n`) -- every cell genes are read for, when they are read for the
+ * first `readCells` open cells only (`shared/gene-sample-cells.js`): a
+ * sparse column has no entry past them, which is no value, not a zero.
  *
  * @param {Float32Array|import('./gene-statistics.js').GeneSample} column
- * @returns {{sum: number, sumSq: number, nonZero: number, n: number}}
+ * @param {number|null} [readCells]
+ * @returns {{mean: number, m2: number, nonZero: number, n: number}}
  */
-export function geneMomentsOf(column) {
+export function geneMomentsOf(column, readCells = null) {
   const sample = geneSampleOf(column, 0);
-  let sum = 0;
-  let sumSq = 0;
-  let nonZero = 0;
-  let nonFinite = 0;
-  const { values } = sample;
-  for (let k = 0; k < values.length; k++) {
-    const value = values[k];
-    if (!Number.isFinite(value)) {
-      nonFinite++;
-      continue;
-    }
-    if (value === 0) continue;
-    nonZero++;
-    sum += value;
-    sumSq += value * value;
-  }
-  return { sum, sumSq, nonZero, n: sample.length - nonFinite };
+  if (readCells === null || readCells >= sample.length) return columnMoments(sample);
+  // A dense column's cells past them are NaN (left out as missing); a
+  // sparse one's are no entries: the cells are those read.
+  const indices = sample.indices;
+  let count = indices.length;
+  while (count > 0 && indices[count - 1] >= readCells) count--;
+  return columnMoments({ length: readCells, indices: indices.subarray(0, count), values: sample.values.subarray(0, count) });
 }
 
 /**
  * The moments of each of a batch of gene columns (`geneMomentsOf`), packed.
  *
- * @param {{columns: Array<Float32Array|import('./gene-statistics.js').GeneSample>}} payload
- * @returns {{moments: Float64Array}} Four numbers a column: `sum, sumSq, nonZero, n`
+ * @param {{columns: Array<Float32Array|import('./gene-statistics.js').GeneSample>, readCells?: number|null}} payload -
+ *   `readCells`: genes are read for the first open cells only (`geneMomentsOf`)
+ * @returns {{moments: Float64Array}} Four numbers a column: `mean, m2, nonZero, n`
  */
 export function computeGeneMoments(payload) {
-  const { columns } = payload;
+  const { columns, readCells = null } = payload;
   if (!Array.isArray(columns) || columns.length === 0) {
     throw new TypeError('Gene moment columns must be a non-empty array');
   }
+  if (readCells !== null && !(Number.isSafeInteger(readCells) && readCells >= 0)) {
+    throw new TypeError('Gene moments read cells must be a count of open cells or null');
+  }
   const moments = new Float64Array(columns.length * 4);
   columns.forEach((column, gene) => {
-    const { sum, sumSq, nonZero, n } = geneMomentsOf(column);
-    moments.set([sum, sumSq, nonZero, n], gene * 4);
+    const { mean, m2, nonZero, n } = geneMomentsOf(column, readCells);
+    moments.set([mean, m2, nonZero, n], gene * 4);
   });
   return { moments };
 }

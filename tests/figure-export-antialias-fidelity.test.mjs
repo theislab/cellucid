@@ -201,6 +201,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
       lodMembership: null,
       drawOrder: null,
       lodSizeMultiplier: 1,
+      pointLayers: { readScale: 1, readEveryLevel: true },
       normTransform: { center: [0, 0, 0], scale: 1 },
     },
   };
@@ -436,4 +437,20 @@ test('both renderers resolve every raster point size through that one helper', a
       );
     }
   }
+});
+
+test('an export blocked only by layers a switch turns off names the switch, so the dialog unblocks it in one step', () => {
+  const documentWith = controls => ({ getElementById: id => controls[id] ?? null });
+  const edges = buildOverlayFidelityWarnings({
+    documentRef: documentWith({ 'velocity-overlay-enabled': { checked: true } }),
+    connectivityVisible: true,
+  });
+  assert.deepEqual(edges.map(warning => warning.fix), [
+    { label: 'edges', controlId: 'toggle-connectivity' },
+    { label: 'vector field', controlId: 'velocity-overlay-enabled' },
+  ]);
+  // A cause no switch turns off (an unreadable control) carries no fix: the dialog offers only Back.
+  const unknown = buildOverlayFidelityWarnings({ documentRef: null, connectivityVisible: false });
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0].fix, undefined);
 });

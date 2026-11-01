@@ -28,44 +28,43 @@
  * reads of the file. Cancel stops it where it is. The reader worker starts
  * loading as the link is resolved, so it is ready when the file is found.
  * A host that ignores range requests serves only the whole file: it is
- * downloaded once, with its progress shown, and read from memory.
+ * downloaded once into this browser's storage, said up front with its size
+ * and progress, and kept for later visits (`whole-download.js`).
  */
 
 import {
   DataSourceError,
   DataSourceErrorCode,
   explainedFailure,
+  hostFaultCause,
+  hostFaultFailure,
+  hostFaultOf,
   isExplainedFailure,
 } from './data-source.js';
-import { createMetadataAbortError } from './metadata-load-contract.js';
-import { formatLocator, getProviderRegistry } from './sources/registry.js';
+import { BYTE_SOURCE_FAILURES, isUnanswered } from '../formats/io/byte-source.js';
+import { realmHosts } from '../formats/io/hosts.js';
+import { formatLocator, getProviderRegistry, publicLocatorOf } from './sources/registry.js';
 import {
   AnnDataCatalog,
   CATALOG_FILENAME,
   fetchAnnDataCatalog,
 } from './sources/anndata-catalog.js';
-import { downloadRemoteFile } from './sources/remote-file.js';
+import { afterWholeFileOpened, downloadReason, wholeFileOf } from './whole-download.js';
+import { keptStoreManifest } from './anndata/transcode/space.js';
+import { matrixMarketSetIdentity } from './anndata/transcode/matrix-market.js';
 import { createAnnDataFileSource } from './anndata-file-source.js';
 import { getTransferLog } from './transfer-log.js';
 import { prewarmAnnDataReaderWorker } from './anndata-reader-client.js';
 import { beginOpening, openingCancelledError } from './opening-progress.js';
 import { openableNamesText } from './input-formats.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { isCancellation, cancel, cancelled } from '../utils/abort.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
 
 const LINK_SOURCE_TYPE = 'link';
-
-/**
- * What each provider said about a link this page opened, by its canonical
- * locator: opening the same link again in this page (Disconnect and open, a
- * session reopening its dataset) asks the provider nothing, and a file starts
- * from the first bytes read the first time. Only a link that opened is kept.
- * @type {Map<string, Object>}
- */
-const PROVIDER_OPENINGS = new Map();
 
 /**
  * Open one remote AnnData file completely, as a candidate. Its dataset id
@@ -135,7 +134,9 @@ async function openRemoteFileSet(set, signal) {
 /**
  * Open one Zarr store folder on a web host, as a candidate.
  *
- * @param {{url: string, name: string, title: string, id: string, attribution: Object}} store
+ * @param {{url: string, name: string, title: string, id: string, attribution: Object, version?: string, key?: string}} store -
+ *   `version`: what names the store's content, when its provider says (a commit it is read at);
+ *   `key`: where it is whatever its version, when its address names the version read (a link at a commit)
  * @param {AbortSignal} signal - Stops the opening where it is
  * @returns {Promise<{source: Object, metadata: DatasetMetadata}>}
  */
@@ -145,7 +146,12 @@ async function openZarrFolder(store, signal) {
   }
   const source = createAnnDataFileSource();
   try {
-    await source.loadRemoteFolder({ url: store.url, name: store.name }, {
+    await source.loadRemoteFolder({
+      url: store.url,
+      name: store.name,
+      ...(typeof store.version === 'string' ? { version: store.version } : {}),
+      ...(typeof store.key === 'string' ? { key: store.key } : {}),
+    }, {
       signal,
       defaultDatasetId: store.id,
       name: store.title,
@@ -160,28 +166,6 @@ async function openZarrFolder(store, signal) {
   }
 }
 
-/**
- * Download one remote file whole, its bytes counted into the Transfers log
- * as they arrive (the opening shows how much has arrived of it).
- */
-function downloadWhole(resource, signal) {
-  let counted = 0;
-  return downloadRemoteFile(resource, {
-    signal,
-    onBytes: received => {
-      getTransferLog().record(resource.url, { bytes: received - counted, requests: counted === 0 ? 1 : 0 });
-      counted = received;
-    },
-  });
-}
-
-/** Why a remote file is downloaded whole (`transport: 'download'`), in a few words. */
-function downloadReason(resource, host = new URL(resource.url).host) {
-  return resource.contentCoded === true
-    ? `${host} sends it compressed for transfer (Content-Encoding), which leaves no part of it readable on its own`
-    : `${host} does not serve parts of files`;
-}
-
 export class LinkDataSource {
   /**
    * @param {{registry?: import('./sources/registry.js').ProviderRegistry}} [options]
@@ -189,8 +173,15 @@ export class LinkDataSource {
   constructor({ registry = getProviderRegistry() } = {}) {
     this._registry = registry;
 
-    /** @type {string|null} Canonical locator of the open link */
+    /**
+     * @type {string|null} Canonical locator of the open link, as it is read:
+     * with any access key it carries. Held here and in the page address
+     * only (`getAddressLocator`).
+     */
     this._locator = null;
+
+    /** @type {string|null} The same link without what grants access to it */
+    this._publicLocator = null;
 
     /** @type {Object|null} What the provider opened */
     this._opening = null;
@@ -231,7 +222,7 @@ export class LinkDataSource {
     const controller = new AbortController();
     this._pendingController = controller;
     const revision = ++this._operationRevision;
-    previousController?.abort(new Error(reason));
+    cancel(previousController, 'superseded', reason);
     return { controller, revision };
   }
 
@@ -241,11 +232,18 @@ export class LinkDataSource {
       owner.controller !== this._pendingController ||
       owner.revision !== this._operationRevision
     ) {
-      throw createMetadataAbortError(label);
+      throw cancelled('superseded', `${label} was superseded.`);
     }
   }
 
-  _finishOperation(owner) {
+  /**
+   * An operation ended. One that failed stops every request it started that
+   * is still under way: nothing waits for them any more (a provider asks
+   * several at once, and one refusal ends the opening while the others
+   * would retry on, past the source's disconnect).
+   */
+  _finishOperation(owner, { failed = false } = {}) {
+    if (failed) cancel(owner.controller, 'superseded', 'The link\'s opening or refresh failed: nothing waits for its other requests.');
     if (this._pendingController === owner.controller) {
       this._pendingController = null;
     }
@@ -324,27 +322,30 @@ export class LinkDataSource {
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.files) {
-      // A member its host content-codes is downloaded whole first (the rest are read in place).
+      // A member its host content-codes is downloaded whole first (the rest
+      // are read once each, from the start), or opens from its kept copy;
+      // none is, when the set's own store is kept.
+      const setIdentity = matrixMarketSetIdentity(opening.files.files);
+      const kept = setIdentity === null ? null : await keptStoreManifest(setIdentity);
+      const storeKept = kept !== null && kept.whole !== false;
       const files = new Map();
       for (const [name, member] of opening.files.files) {
-        if (member.contentCoded !== true) {
-          files.set(name, member);
-          continue;
-        }
-        progress.step(`Downloading ${name}: ${downloadReason(member)}`);
-        files.set(name, await downloadWhole(member, signal));
+        files.set(name, member.contentCoded === true && !storeKept
+          ? await wholeFileOf(member, { signal, opening: { ...progress, step: text => progress.step(`${name}: ${text}`) } })
+          : member);
       }
       const annData = await openRemoteFileSet({ ...opening.files, files }, signal);
+      await afterWholeFileOpened(files.values(), annData.source.describeStorage()?.conversion ?? null);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.file) {
       let resource = opening.file.resource;
-      if (opening.file.transport === 'download') {
-        // The host serves no part of the file: all of it, once.
-        progress.step(`Downloading the whole file: ${downloadReason(resource)}`);
-        resource = await downloadWhole(resource, signal);
-      }
+      const format = opening.file.format?.format ?? null;
+      // The host serves no part of the file: all of it, once (or what an
+      // earlier visit kept of it).
+      if (opening.file.transport === 'download') resource = await wholeFileOf(resource, { format, signal, opening: progress });
       const annData = await openAnnDataFile({ ...opening.file, resource }, signal);
+      if (opening.file.transport === 'download') await afterWholeFileOpened([resource], annData.source.describeStorage()?.conversion ?? null);
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     throw new TypeError('A provider opening must hold a catalog, a file, a store or a file set.');
@@ -360,24 +361,35 @@ export class LinkDataSource {
     const owner = this._beginOperation('Opening a link was superseded');
     // The reader worker loads while the link is resolved.
     prewarmAnnDataReaderWorker();
+    // What is said about the link (the opening's title, a failure, the
+    // console) names it without its access key.
+    const shown = this._registry.publicFormOf(input);
     const progress = beginOpening({
-      title: String(input).trim() || 'a link',
+      title: shown || 'a link',
       step: 'Finding the file',
-      onCancel: () => owner.controller.abort(openingCancelledError(String(input).trim())),
+      onCancel: () => owner.controller.abort(openingCancelledError(shown)),
     });
     let loaded = null;
     let transfer = null;
+    // What a read of the opened data names when its host fails on its own
+    // side: the provider the host serves, and the data.
+    let opened = null;
+    let reading = shown;
+    let adopted = false;
     try {
-      const { provider, locator: asked, opening } = await this._openProvider(
+      const { provider, locator: asked, publicLocator: askedPublic, opening } = await this._openProvider(
         input,
         owner.controller.signal,
         progress
       );
       this._assertOperation(owner, 'Opening a link');
+      opened = provider;
+      reading = opening.title;
       // A provider may name what it opened canonically once it is open (a
       // OneDrive share link by its drive and item): sessions and `?data=`
       // then record that, and either opens it again in this page.
       const locator = typeof opening.locator === 'string' ? formatLocator(provider, opening.locator) : asked;
+      const publicLocator = typeof opening.locator === 'string' ? publicLocatorOf(provider, opening.locator) : askedPublic;
       progress.rename(opening.title);
       transfer = getTransferLog().begin(opening.file
         ? {
@@ -401,7 +413,8 @@ export class LinkDataSource {
                 // Every file of the set is in this folder.
                 key: new URL('.', opening.files.files.values().next().value.url).href,
                 label: opening.files.title,
-                why: 'reading each file once from the start: a MatrixMarket matrix has no index to read parts of',
+                why: 'reading the lists and cell tables first, then the matrix once from its start (a MatrixMarket matrix ' +
+                  'has no index to read parts of), keeping the rows of the cells genes are read for',
                 mode: 'download',
                 total: [...opening.files.files.values()].reduce((sum, file) => sum + file.size, 0),
               }
@@ -421,13 +434,12 @@ export class LinkDataSource {
           : `${formatCountOf(loaded.datasets.length, 'dataset')}`
       );
 
-      PROVIDER_OPENINGS.set(asked, opening);
-      PROVIDER_OPENINGS.set(locator, opening);
       this._releaseAll();
       if (this._transfer !== null) getTransferLog().finish(this._transfer);
       this._transfer = transfer;
       transfer = null;
       this._locator = locator;
+      this._publicLocator = publicLocator;
       this._opening = { ...opening, provider: provider.id };
       this._catalog = loaded.catalog;
       this._annData = loaded.annData;
@@ -436,10 +448,11 @@ export class LinkDataSource {
       this._connected = true;
       this._connectionRevision++;
       loaded = null;
+      adopted = true;
 
       progress.end();
       return {
-        locator,
+        locator: publicLocator,
         title: opening.title,
         datasets: this._datasets,
         // A catalog names the dataset it opens on; one file is its dataset.
@@ -447,7 +460,17 @@ export class LinkDataSource {
       };
     } catch (thrown) {
       // Cancel names itself as the reason, whatever the stopped read threw.
-      const error = progress.cancelled ? openingCancelledError(String(input).trim()) : thrown;
+      // A read its host did not answer as it should is said by who is at
+      // fault (`hostFaultFailure`), named with the provider the host serves,
+      // never as Cellucid's failure.
+      const fault = progress.cancelled ? null : hostFaultOf(thrown);
+      const said = thrown?.details?.hostFault ?? null;
+      const error = progress.cancelled
+        ? openingCancelledError(shown)
+        : fault !== null && (said === null || (fault.service === null && opened !== null && opened.id !== 'url'))
+          ? hostFaultFailure(providerFault(opened, { ...fault, what: said?.what ?? reading }),
+            { input: shown, cause: hostFaultCause(thrown) })
+          : thrown;
       if (transfer !== null) {
         getTransferLog().finish(transfer, { error });
         transfer = null;
@@ -456,7 +479,7 @@ export class LinkDataSource {
       // The caller reports the outcome (the Connect control, startup, a
       // session reopening its dataset), as for every other source.
       if (
-        error?.name === 'AbortError' ||
+        isCancellation(error) ||
         error instanceof DataSourceError ||
         isExplainedFailure(error)
       ) {
@@ -466,15 +489,15 @@ export class LinkDataSource {
       // else (a reader refusing what it read) keeps its own message.
       const unanswered = error instanceof TypeError && /fetch|network/i.test(error.message);
       throw new DataSourceError(
-        `Failed to open ${input}: ${error?.message ?? error}`,
+        `Failed to open ${shown}: ${error?.message ?? error}`,
         unanswered ? DataSourceErrorCode.NETWORK_ERROR : undefined,
         this.type,
-        { input, originalError: error?.message }
+        { input: shown, originalError: error?.message }
       );
     } finally {
       loaded?.annData?.source.clear();
       loaded?.catalog?.close();
-      this._finishOperation(owner);
+      this._finishOperation(owner, { failed: !adopted });
     }
   }
 
@@ -487,17 +510,52 @@ export class LinkDataSource {
    * @private
    */
   async _openProvider(input, signal, progress) {
+    let publicLocator = null;
+    // Whatever is said while the link is resolved -- its steps, a refusal --
+    // names it by its public form: the text as pasted, the provider's value
+    // and its locator never appear in it, whichever provider wrote the text
+    // (a OneDrive share id carries its share link whole).
+    let shown = text => text;
+    let provider = null;
     try {
-      const { provider, value, locator } = this._registry.resolve(input);
-      const known = PROVIDER_OPENINGS.get(locator);
-      if (known !== undefined) return { provider, value, locator, opening: known };
+      const resolved = this._registry.resolve(input);
+      provider = resolved.provider;
+      const { value, locator } = resolved;
+      publicLocator = resolved.publicLocator;
+      const publicValue = provider.publicValue(value);
+      const raws = [[input.trim(), publicLocator], [locator, publicLocator], [value, publicValue]]
+        .filter(([raw, shownAs]) => raw !== '' && raw !== shownAs)
+        .sort((left, right) => right[0].length - left[0].length);
+      shown = text => (typeof text === 'string' ? raws.reduce((said, [raw, shownAs]) => said.split(raw).join(shownAs), text) : text);
+      // Asked of the provider at every opening, never taken from an earlier
+      // one: the version it names is the source's now (`remote-file.js`).
       // A bare web address is its own host: the probe that follows names it.
       progress.step(provider.id === 'url' ? 'Finding the file' : `Finding the file on ${provider.label}`);
-      const opening = await provider.open(value, { signal, onStep: text => progress.step(text) });
-      return { provider, value, locator, opening };
+      const opening = await provider.open(value, { signal, onStep: text => progress.step(shown(text)) });
+      return { provider, value, locator, publicLocator, opening };
     } catch (error) {
+      if (provider !== null && provider.id !== 'url' && isUnanswered(error) && error.code === BYTE_SOURCE_FAILURES.NETWORK) {
+        // A provider's host lets other websites read it: no answer a page
+        // may read is no connection, a failing host, or one refusing this
+        // network for now (an "unusual traffic" page without CORS headers).
+        throw unansweredProviderError(provider, error, shown);
+      }
+      const fault = hostFaultOf(error);
+      if (fault !== null) {
+        // Who is at fault, named with the provider the host serves ("NCBI
+        // GEO (ftp.ncbi.nlm.nih.gov)"), whichever layer met it.
+        throw hostFaultFailure(providerFault(provider, { ...fault, what: shown(error.details.hostFault?.what ?? input.trim()) }),
+          { input: publicLocator, cause: hostFaultCause(error) });
+      }
       if (error instanceof DataSourceError) {
-        error.details = { ...error.details, explained: true };
+        // A provider's refusal names what it was given; it is kept, and
+        // logged, as the link's public form.
+        error.message = shown(error.message);
+        error.details = {
+          ...error.details,
+          ...(Object.hasOwn(error.details ?? {}, 'input') && publicLocator !== null ? { input: publicLocator } : {}),
+          explained: true,
+        };
       }
       throw error;
     }
@@ -521,12 +579,13 @@ export class LinkDataSource {
   /** @private */
   _cleanup() {
     this._operationRevision += 1;
-    this._pendingController?.abort(new Error('The link was closed'));
+    cancel(this._pendingController, 'closed', 'The link was closed.');
     this._pendingController = null;
     this._releaseAll();
     if (this._transfer !== null) getTransferLog().finish(this._transfer);
     this._transfer = null;
     this._locator = null;
+    this._publicLocator = null;
     this._opening = null;
     this._datasets = null;
     this.datasetId = null;
@@ -640,11 +699,22 @@ export class LinkDataSource {
     return this._opening?.attribution ?? null;
   }
 
+  /**
+   * What the open link is read by, with any access key it carries: for the
+   * page address alone (`url-state.js`), so a reload opens the same file.
+   * Everything else is given `getConnectionInfo().locator`, its public form.
+   *
+   * @returns {string|null}
+   */
+  getAddressLocator() {
+    return this._locator;
+  }
+
   getConnectionInfo() {
     return {
       connected: this._connected,
-      inputPath: this._locator,
-      locator: this._locator,
+      inputPath: this._publicLocator,
+      locator: this._publicLocator,
       provider: this._opening?.provider ?? null,
       title: this._opening?.title ?? null,
       baseUrl: this._catalog?.baseUrl ?? null,
@@ -667,6 +737,7 @@ export class LinkDataSource {
     const baseUrl = this._catalog.baseUrl;
     const connectionRevision = this._connectionRevision;
     const owner = this._beginOperation('Link refresh was superseded');
+    let refreshed = false;
     try {
       // A refresh is the person's retry: one request (fetchCatalogFile).
       const { catalog, datasets } = await this._loadCatalog(
@@ -682,11 +753,7 @@ export class LinkDataSource {
         this._connectionRevision !== connectionRevision
       ) {
         catalog.close();
-        throw new DataSourceError(
-          'The link changed during refresh',
-          DataSourceErrorCode.VALIDATION_ERROR,
-          this.type
-        );
+        throw cancelled('superseded', 'The link changed during refresh.');
       }
       this._retired?.close();
       this._retired = this._catalog;
@@ -695,24 +762,9 @@ export class LinkDataSource {
       if (this.datasetId !== null && !catalog.has(this.datasetId)) {
         this.datasetId = null;
       }
-    } catch (error) {
-      if (
-        error?.name === 'AbortError' &&
-        (
-          !this._connected ||
-          this._catalog?.baseUrl !== baseUrl ||
-          this._connectionRevision !== connectionRevision
-        )
-      ) {
-        throw new DataSourceError(
-          'The link changed during refresh',
-          DataSourceErrorCode.VALIDATION_ERROR,
-          this.type
-        );
-      }
-      throw error;
+      refreshed = true;
     } finally {
-      this._finishOperation(owner);
+      this._finishOperation(owner, { failed: !refreshed });
     }
   }
 
@@ -723,7 +775,7 @@ export class LinkDataSource {
    */
   clearCaches() {
     this._operationRevision += 1;
-    this._pendingController?.abort(new Error('Link caches were cleared'));
+    cancel(this._pendingController, 'released', 'The link\'s connect or refresh was superseded: its caches were cleared.');
     this._pendingController = null;
     this._annData?.source.clearCaches?.();
   }
@@ -736,4 +788,55 @@ export class LinkDataSource {
 /** @returns {LinkDataSource} */
 export function createLinkDataSource() {
   return new LinkDataSource();
+}
+
+/**
+ * A provider's request that got no answer a page may read, written for the
+ * person: the provider's host lets other websites read it (that is why it is
+ * a provider), so it is not CORS. Asked again once already (`withRetries`):
+ * the person decides when to try again.
+ */
+function unansweredProviderError(provider, error, shown) {
+  // The host the request went to (`details.host`; `details.url` may be a
+  // request's label, `api-request.js`).
+  let host = typeof error.details?.host === 'string' ? error.details.host : null;
+  if (host === null && URL.canParse(error.details?.url ?? '')) host = new URL(error.details.url).host;
+  if (globalThis.navigator?.onLine === false || (host !== null && realmHosts.connectionDown(`https://${host}/`))) {
+    return hostFaultFailure({
+      kind: globalThis.navigator?.onLine === false ? 'offline' : 'connection',
+      host: host ?? provider.label,
+      what: 'it',
+      service: provider.label,
+    }, { request: shown(error.message) });
+  }
+  const where = host === null ? provider.label : `${provider.label} (${host})`;
+  return new DataSourceError(
+    `${where} is not answering this site: no answer arrived. ${provider.label} lets other websites read it, so this ` +
+    `is a problem on ${provider.label}'s side (an outage, or a block of this network for a while after many ` +
+    'requests from it) or this computer\'s connection, not the link or Cellucid. Try again later.',
+    DataSourceErrorCode.NETWORK_ERROR,
+    'link',
+    { explained: true, host, request: shown(error.message) }
+  );
+}
+
+/**
+ * A host fault met while opening a provider's link, as said of that
+ * provider: named with it ("NCBI GEO (ftp.ncbi.nlm.nih.gov)"; a bare web
+ * address is its own host), and a refusal (401, 403) of a provider whose
+ * every file is public (`capabilities.public`: GEO, the CELLxGENE Census) is
+ * that host refusing this network for now (`refusing`), never the link's
+ * permissions: NCBI answered 403 for its files during its 2026-10-31 outage.
+ *
+ * @param {Object|null} provider
+ * @param {Object} fault - `hostFaultOf`'s fields with `what`
+ * @returns {Object}
+ */
+function providerFault(provider, fault) {
+  const named = provider !== null && provider.id !== 'url';
+  return {
+    ...fault,
+    service: fault.service ?? (named ? provider.label : null),
+    kind: fault.kind === 'refused' && provider?.capabilities.public === true ? 'refusing' : fault.kind,
+  };
 }

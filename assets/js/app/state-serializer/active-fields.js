@@ -9,6 +9,7 @@ import {
   requireMethod,
 } from '../session/schema-contract.js';
 import { requireExactKeys } from '../../utils/exact-record.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 const ACTIVE_FIELD_KEYS = ['activeFieldKey', 'activeFieldSource'];
 
@@ -21,12 +22,6 @@ function requireRestoreSignal(options) {
     );
   }
   return signal;
-}
-
-function throwIfAborted(signal) {
-  if (signal?.aborted !== true) return;
-  if (signal.reason instanceof Error) throw signal.reason;
-  throw new DOMException('Active-field restore was aborted.', 'AbortError');
 }
 
 function assertFieldInventory(fields, context) {

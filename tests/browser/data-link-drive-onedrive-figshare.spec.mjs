@@ -6,6 +6,13 @@ import { openableNamesText } from '../../assets/js/data/input-formats.js';
 import { APP_ORIGIN, ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
+/**
+ * The collapsed panels, but not the Session panel's sections: an opening that
+ * waits for a sign-in leaves Cellucid starting, and its section headers do
+ * not open until it is ready. Nothing here uses them.
+ */
+const openPanels = page => openCollapsedPanels(page, { sessionSections: false });
+
 // Figshare, Google Drive and OneDrive against fake hosts: Figshare's API and
 // file host, Google's Drive API, Identity Services and Picker (small stubs in
 // place of Google's scripts), and Microsoft's sign-in page, token endpoint,
@@ -116,7 +123,7 @@ test('a public Figshare item opens in place from ?data=, with Range-only reads',
   });
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent('https://figshare.com/articles/dataset/x/16566057')}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#data-link-connection-target')).toHaveAttribute('title', 'figshare:16566057');
   // The address names the item in Figshare's form, not the page link pasted.
@@ -174,7 +181,7 @@ test('a public Google Drive file opens with the key, no sign-in and no header bu
   const drive = await routeDrive(page.context(), bytes, { isPublic: true });
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent(`https://drive.google.com/file/d/${DRIVE_ID}/view?usp=sharing`)}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#data-link-connection-target')).toHaveAttribute('title', `gdrive:${DRIVE_ID}`);
   // The address names the file in Drive's form, not the sharing link pasted.
@@ -192,7 +199,7 @@ test('a private Google Drive file: Sign in to Google, the picker on that file, t
   const drive = await routeDrive(page.context(), bytes, { isPublic: false });
   const errors = watchErrors(page, { expected404: true });
   await page.goto(`/?${PINNED}data=gdrive:${DRIVE_ID}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   const step = page.locator('#data-sign-in-step');
   await expect(step).toBeVisible();
   await expect(page.locator('#data-sign-in-text')).toHaveText('Private file on Google Drive.');
@@ -221,11 +228,8 @@ test('a private Google Drive file: Sign in to Google, the picker on that file, t
   expect(storage.local).not.toContain(TOKEN);
 
   // A reload of the tab opens it again with no step: signed in, and granted.
-  // (Reloaded once the page has stopped loading: WebKit reports a module a
-  // reload cancels as refused by access control.)
-  await page.waitForLoadState('networkidle');
   await page.reload({ waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   await expect(page.locator('#data-sign-in-text')).toHaveText('Signed in to Google');
   expect(errors).toEqual([]);
@@ -246,7 +250,7 @@ test('a public Google Drive file whose download Google holds back opens after Si
     if (message.text().includes(TOKEN)) errors.push(`token in console: ${message.text()}`);
   });
   await page.goto(`/?${PINNED}data=gdrive:${DRIVE_ID}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-text')).toHaveText('Google Drive sends this file only with a Google sign-in for now.');
   await expect(page.locator('#data-sign-in-btn')).toHaveText('Sign in to Google');
   await page.locator('#data-sign-in-btn').click();
@@ -270,7 +274,7 @@ test('a sign-in that takes longer than the startup deadline: the opening waits f
   page.on('pageerror', error => errors.push(error.message));
   await page.clock.install();
   await page.goto(`/?${PINNED}data=gdrive:${DRIVE_ID}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-btn')).toHaveText('Sign in to Google');
   // Three startup deadlines pass while the person reads the step.
   await page.clock.fastForward('03:00');
@@ -296,7 +300,7 @@ test('signed in, a public file not granted yet whose download Google holds back:
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(`/?${PINNED}data=gdrive:${DRIVE_ID}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   expect(drive.picked).toBe(true);
   await expect(page.locator('#data-sign-in-text')).toHaveText('Signed in to Google');
@@ -389,7 +393,7 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   const errors = watchErrors(page);
   const share = 'https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc';
   await page.goto(`/?${PINNED}data=${encodeURIComponent(share)}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-text')).toHaveText('OneDrive file: sign in with Microsoft to open it.');
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   const popup = page.waitForEvent('popup');
@@ -425,7 +429,7 @@ test('the Microsoft sign-in window opens on this site inside the click, never be
   const opens = await recordWindowOpens(page);
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent('https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   // The opening asks for the click; it opens nothing by itself.
   expect(await opens()).toEqual([]);
@@ -460,7 +464,7 @@ test('a Microsoft sign-in window cut off from Cellucid (Cross-Origin-Opener-Poli
   });
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent('https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   const popup = page.waitForEvent('popup');
   await page.locator('#data-sign-in-btn').click();
@@ -493,7 +497,7 @@ test('a Microsoft sign-in window closed without signing in ends the attempt, and
   }));
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent('https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   const opened = page.waitForEvent('popup');
   await page.locator('#data-sign-in-btn').click();
@@ -521,7 +525,7 @@ test('a work account whose organisation lets only an administrator approve Cellu
   });
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent('https://hmgu-my.sharepoint.com/:u:/g/personal/x/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
-  await openCollapsedPanels(page);
+  await openPanels(page);
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   const first = page.waitForEvent('popup');
   await page.locator('#data-sign-in-btn').click();

@@ -11,8 +11,6 @@ import {
   getNotificationCenter,
 } from '../assets/js/app/notification-center.js';
 import {
-  isSessionRestoreCanceledError,
-  isSessionRestoreSupersededError,
   SessionSerializer,
 } from '../assets/js/app/session/session-serializer.js';
 import * as fieldOverlaysContributor from
@@ -30,6 +28,7 @@ import {
   inMemoryAnnDataMapping,
 } from './helpers/in-memory-anndata.mjs';
 import { untilEntered } from './helpers/entered.mjs';
+import { cancellationKind } from '../assets/js/utils/abort.js';
 
 const PUBLISHED_PROFILE = Object.freeze([
   Object.freeze({
@@ -1581,7 +1580,7 @@ test('published notification cancel reports one exact canceled outcome without f
       restore,
       error => (
         error?.name === 'AbortError'
-        && isSessionRestoreCanceledError(error)
+        && cancellationKind(error) === 'user'
       ),
     );
     await untilEntered(entered, restore, 'the contributor restore');
@@ -1644,7 +1643,7 @@ test('replacement and explicit cancellation await prior restore settlement', asy
       firstRestore,
       error => (
         error?.name === 'AbortError'
-        && isSessionRestoreSupersededError(error)
+        && cancellationKind(error) === 'superseded'
       ),
     );
     await firstEntry;

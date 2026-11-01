@@ -13,7 +13,7 @@ const REQUIRED_RENDERER_METHODS = Object.freeze([
   'getFogNear',
   'getFogFar',
   'getCurrentLODLevel',
-  'getCurrentLodIndices'
+  'getCurrentLodMembership'
 ]);
 const MATRIX_KEYS = Object.freeze([
   'mvpMatrix',
@@ -68,7 +68,8 @@ const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
  *   positions, `dimensionLevel` components per cell (no padded axis).
  * @property {() => Uint8Array|null} getViewTransparency
  * @property {() => number} getLodLevel
- * @property {() => Uint32Array|null} getLodIndices
+ * @property {() => import('../high-perf/renderer-contracts.js').LodMembership|null} getLodMembership -
+ *   The cells the view's level of detail draws (null: every cell).
  */
 
 /**
@@ -288,9 +289,9 @@ export function buildOverlayContext(options) {
       ctx._hpRenderer.getViewLODLevelCount(ctx.viewId, ctx.dimensionLevel)
     );
   }
-  if (typeof ctx.getLodIndices !== 'function') {
-    ctx.getLodIndices = () => (
-      ctx._hpRenderer.getCurrentLodIndices(ctx.viewId, ctx.dimensionLevel)
+  if (typeof ctx.getLodMembership !== 'function') {
+    ctx.getLodMembership = () => (
+      ctx._hpRenderer.getCurrentLodMembership(ctx.viewId, ctx.dimensionLevel)
     );
   }
 

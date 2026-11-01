@@ -28,6 +28,7 @@ import {
   compareEmbeddingRefs,
   defaultEnabledEmbeddings,
   defaultExpression,
+  defaultGraph,
   defaultModality,
   defaultVectorBindings,
   describeObsmEntry,
@@ -52,7 +53,7 @@ const FIXTURE_URL = new URL('./fixtures/data-mapping-conformance.json', import.m
 // (tests/testthat/test-data-mapping-conformance.R) pin this same digest.
 // Update all three together.
 const FIXTURE_SHA256 =
-  'cfc84c8c332f54824c6d8a438ee0c8ae014852674d7ae6bdc19dff1a8c84089e';
+  '6f7b7ff0e4392ea00c7e21c7a868ec68d3ec83a63558227f9f7d2c300a666c32';
 
 /**
  * A JSON number literal written with a fraction or an exponent, such as
@@ -122,7 +123,7 @@ test('the fixture is the pinned shared copy', () => {
     createHash('sha256').update(FIXTURE_BYTES).digest('hex'),
     FIXTURE_SHA256
   );
-  assert.equal(FIXTURE.version, 6);
+  assert.equal(FIXTURE.version, 7);
   assert.deepEqual(Object.keys(FIXTURE), [
     '_about',
     'version',
@@ -140,6 +141,7 @@ test('the fixture is the pinned shared copy', () => {
     'dataMapping',
     'defaultModality',
     'mappingModality',
+    'defaultGraph',
   ]);
   for (const section of Object.keys(FIXTURE).slice(2)) {
     assert.ok(FIXTURE[section].length > 0, section);
@@ -206,6 +208,7 @@ for (const testCase of cases('embeddingSlots')) {
     const guess = resolveEmbeddingSlots(entries, {
       latentKey: testCase.latentKey,
       loadCheck,
+      modality: testCase.modality ?? null,
     });
     assert.deepEqual(guess.slots, testCase.expected.slots);
     assert.deepEqual(guess.guessed, testCase.expected.guessed);
@@ -224,7 +227,9 @@ for (const testCase of cases('embeddingSlots')) {
  * read exactly once and never adopted, and a file with nothing plottable must
  * be refused.
  */
-for (const testCase of cases('embeddingSlots')) {
+// A case of a dataset of several modalities is a MuData's catalog, read through its view
+// (`data-mapping-modality-contract`): the adapter cases here are of one feature space.
+for (const testCase of cases('embeddingSlots').filter(item => (item.modality ?? null) === null)) {
   test(`embeddingSlots through the browser adapter: ${testCase.name}`, async () => {
     const nObs = 20;
     const widthByKey = new Map(testCase.obsm.map(entry => [entry.key, entry.width]));
@@ -263,10 +268,14 @@ for (const testCase of cases('embeddingSlots')) {
             values[cell * columns.length + index] = cell * (column + 1);
           });
         }
+        // A load failure the fixture names, made in the array: a value past
+        // float32 at its cell, or no placed cell (every row NaN).
         const failure = testCase.loadFailures[key];
         if (failure !== undefined) {
-          const [, kind, cell] = /^(NaN|-?Infinity) at cell (\d+)$/.exec(failure);
-          values[Number(cell) * columns.length] = Number(kind);
+          const past = /^not representable as float32 at cell (\d+)$/.exec(failure);
+          if (past !== null) values[Number(past[1]) * columns.length] = 1e300;
+          else if (failure === "every cell's coordinates are missing (NaN or infinite)") values.fill(Number.NaN);
+          else throw new Error(`No array fails its load check with '${failure}'.`);
         }
         return values;
       },
@@ -345,6 +354,8 @@ cases('defaultExpression').forEach((testCase, position) => {
         hasX: testCase.hasX,
         hasRaw: testCase.hasRaw,
         layers: testCase.layers,
+        rawHasMoreGenes: testCase.rawHasMoreGenes,
+        xScaled: testCase.xScaled,
       }),
       testCase.expected
     );
@@ -354,7 +365,7 @@ cases('defaultExpression').forEach((testCase, position) => {
 for (const testCase of cases('vectorFieldKeys')) {
   test(`vectorFieldKeys: ${testCase.name}`, () => {
     const found = [...vectorFieldKeys(testCase.keys)]
-      .map(([key, { field, basis }]) => ({ key, field, basis }));
+      .map(([key, { field, basis, embeddingKey }]) => ({ key, field, basis, embeddingKey }));
     assert.deepEqual(found, testCase.expected);
     const keys = new Set(testCase.keys);
     for (const key of testCase.keys) {
@@ -366,7 +377,7 @@ for (const testCase of cases('vectorFieldKeys')) {
         assert.deepEqual(parsed, {
           field: expected.field,
           basis: expected.basis,
-          embeddingKey: `X_${expected.basis}`,
+          embeddingKey: expected.embeddingKey,
         });
         assert.equal(`${parsed.field}_${parsed.basis}`, key);
       }
@@ -458,6 +469,12 @@ for (const testCase of cases('mappingModality')) {
       return;
     }
     assertDataMappingError(run, testCase.expected.error);
+  });
+}
+
+for (const testCase of cases('defaultGraph')) {
+  test(`defaultGraph: ${testCase.name}`, () => {
+    assert.equal(defaultGraph(testCase.keys, { modality: testCase.modality }), testCase.expected);
   });
 }
 

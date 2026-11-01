@@ -18,6 +18,7 @@
  */
 
 import { formatBytes, formatCountOf } from '../utils/format-units.js';
+import { PLACES, placePath } from '../app/ui/place-names.js';
 
 /**
  * @typedef {Object} TransferEntry
@@ -26,7 +27,6 @@ import { formatBytes, formatCountOf } from '../utils/format-units.js';
  * @property {string} from - Host and path, without a query string
  * @property {string} why - Why the bytes are read, in plain words
  * @property {'in-place'|'download'} mode
- * @property {'memory'} destination - Where the bytes go
  * @property {number} bytes - Bytes received so far
  * @property {number} requests - Requests made so far
  * @property {number|null} total - Size of the file, when known
@@ -34,12 +34,19 @@ import { formatBytes, formatCountOf } from '../utils/format-units.js';
  * @property {string|null} detail - The failure, for a failed entry
  * @property {number|null} lastArrivalAt - When bytes last arrived (`performance.now()`), null before any
  * @property {string|null} retrying - Why a request is being made again, naming it, until bytes arrive again
+ * @property {string|null} waiting - A wait the host named (its request budget, a `Retry-After`: a
+ *   server preparing what was asked for, in its own words), until it ends or bytes arrive again;
+ *   not a failure
  */
 
-/** Where the bytes go, as the console says it. */
-export const TRANSFER_DESTINATIONS = Object.freeze({
-  memory: 'memory only: nothing is saved to disk, and it is released when the dataset closes',
-});
+/**
+ * Where the bytes go, as the console says it: the same account as the privacy
+ * policy's (`privacy.html`, "Your data") and the documentation's privacy model.
+ */
+export const WHERE_READ_BYTES_GO =
+  'into this tab\'s memory; the downloaded parts of a file whose version its host names are also kept in ' +
+  'this browser\'s storage for the next visit (never for a server on this computer, a notebook or a ' +
+  `Python or R viewer); ${placePath(PLACES.session, PLACES.stored)} lists and removes them`;
 
 /** A URL's address without its query string or fragment: what the Dataset box names a file by. */
 function addressOf(url) {
@@ -85,7 +92,6 @@ export class TransferLog {
       from: describeOrigin(key),
       why,
       mode,
-      destination: 'memory',
       bytes: 0,
       requests: 0,
       total,
@@ -93,6 +99,7 @@ export class TransferLog {
       detail: null,
       lastArrivalAt: null,
       retrying: null,
+      waiting: null,
     };
     this._entries.delete(key);
     this._entries.set(key, entry);
@@ -100,7 +107,7 @@ export class TransferLog {
       `[cellucid:transfer] ${mode === 'download' ? 'downloading' : 'reading in place'} ` +
       `${label} from ${entry.from}` +
       (total === null ? '' : ` (${formatBytes(total)} file)`) +
-      ` — ${why}; ${TRANSFER_DESTINATIONS.memory}.`
+      ` — ${why}; ${WHERE_READ_BYTES_GO}.`
     );
     this._publish();
     return entry;
@@ -146,6 +153,27 @@ export class TransferLog {
     }
     entry.lastArrivalAt = performance.now();
     entry.retrying = null;
+    entry.waiting = null;
+    this._publish();
+  }
+
+  /**
+   * A request for a URL waits for a wait its host named (`formats/io/hosts.js`
+   * request budget, a `Retry-After`; `byte-source.js` `HostWait`): what it
+   * waits for, in a sentence (the host's own words when it sent some), until
+   * the wait ends (`message` null) or bytes arrive again. Not a failure: the
+   * request is asked again exactly when the host said.
+   *
+   * @param {string} url
+   * @param {string|null} message
+   */
+  waiting(url, message) {
+    const entry = this.entryFor(url);
+    if (entry === null) return;
+    const next = message === null ? null : String(message);
+    if (entry.waiting === next) return;
+    entry.waiting = next;
+    if (next !== null) this._console?.info?.(`[cellucid:transfer] ${entry.label}: ${next}`);
     this._publish();
   }
 
@@ -176,6 +204,7 @@ export class TransferLog {
     if (entry === null) return;
     entry.lastArrivalAt = performance.now();
     entry.retrying = null;
+    entry.waiting = null;
     this._publish();
   }
 

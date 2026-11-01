@@ -1,10 +1,11 @@
 /**
  * Connectivity (KNN graph) edges: what each pane shows and how it is drawn.
  *
- * The graph stays on the CPU as the reader worker built it: its edges as
- * 12-byte records already in the fixed random order the panes show them in
- * (connectivity-edge-selection.js), and its adjacency (forward offsets,
- * neighbours) for the visible-cell walk and the count. A pane shows the first K of its visible edges; only
+ * The graph stays on the CPU as the reader worker built it: its forward
+ * adjacency (forward offsets, each edge's partner and strength: 8 bytes an
+ * edge), from which the shown edges, in the fixed random order the panes
+ * show them in, are derived (connectivity-edge-selection.js). A pane shows
+ * the first K of its visible edges; only
  * those K records reach the GPU, in buffers owned by the pane: the 12-byte
  * selection records (both endpoints' cells and the strength), and the
  * 28-byte instance records the draw reads (both endpoints' positions,
@@ -28,6 +29,7 @@
  * known.
  */
 
+import { positionsForGpu, unplacedCountOf } from './unplaced-positions.js';
 import { glStateOf } from './gl-state-shadow.js';
 import {
   configureStraightAlphaBlending,
@@ -54,6 +56,7 @@ import {
 import { writeFogUniforms } from './shaders/fog-shaders.js';
 import {
   CONNECTIVITY_RECORD_WORDS,
+  connectivitySelectionScratchBytes,
   connectivityVisibleCells,
   countVisibleConnectivityEdges,
   createConnectivityEdgeIndex,
@@ -144,7 +147,7 @@ export function createConnectivityEdgeLayer({
   let graph = null;
   let target = 0;
   const views = new Map();
-  const scratch = createConnectivitySelectionScratch();
+  let scratch = createConnectivitySelectionScratch();
   /** Position textures by the positions they hold: {texture, plan, bytes, views: Set<string>}. */
   const positionTextures = new Map();
 
@@ -242,9 +245,26 @@ export function createConnectivityEdgeLayer({
     });
   }
 
+  /**
+   * Follow the pane's geometry: cells its embedding does not place (NaN
+   * positions) are no edge's endpoint there, so positions with unplaced
+   * cells are a visibility of their own (`connectivityVisibleCells`),
+   * re-selected and re-counted. Between geometries that place every cell
+   * the selection is kept.
+   */
+  function followPlacement(viewId, view) {
+    const { positions, dimension } = getViewGeometry(viewId);
+    const placement = unplacedCountOf(positions, dimension) > 0 ? { positions, dimension } : null;
+    const previous = view.placement ?? null;
+    if (previous === null ? placement === null : previous.positions === placement?.positions) return;
+    view.placement = placement;
+    view.revision += 1;
+    cancelCount(view);
+  }
+
   function maskOf(view) {
     if (view.maskRevision !== view.revision) {
-      const cells = connectivityVisibleCells(view.visibility, view.maskScratch);
+      const cells = connectivityVisibleCells(view.visibility, view.maskScratch, view.placement ?? null);
       view.mask = cells.mask;
       view.maskScratch = cells.scratch;
       view.maskRevision = view.revision;
@@ -426,7 +446,9 @@ export function createConnectivityEdgeLayer({
         gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
         gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
         allocateLinearTexture(gl, internalFormat, plan);
-        writeLinearTextureRows(gl, plan, format, gl.FLOAT, positions, dimension);
+        // A cell its embedding does not place goes up as the stand-in the
+        // edge shader rejects (`unplaced-positions.js`).
+        writeLinearTextureRows(gl, plan, format, gl.FLOAT, positionsForGpu(positions, dimension), dimension);
         error = gl.getError();
       } finally {
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, restorableTexture(previousTexture));
@@ -456,8 +478,8 @@ export function createConnectivityEdgeLayer({
   return {
     /**
      * Publish a graph (`ConnectivityEdges`, built by the reader worker).
-     * Its arrays are kept by reference, as loaded: the records arrive in
-     * draw order.
+     * Its arrays are kept by reference, as loaded; the shown edges are
+     * derived from them (`createConnectivityEdgeIndex`).
      */
     setGraph(edges) {
       const index = createConnectivityEdgeIndex(edges);
@@ -523,6 +545,7 @@ export function createConnectivityEdgeLayer({
       requireGraph('Connectivity refresh');
       const view = views.get(viewId);
       if (view === undefined) return null;
+      followPlacement(viewId, view);
       if (view.selectedRevision !== view.revision || view.selectedTarget !== target) {
         select(view);
       }
@@ -538,7 +561,8 @@ export function createConnectivityEdgeLayer({
         throw new RangeError(`Connectivity edge target must be an integer in [0, ${current.edgeCount}].`);
       }
       target = next;
-      for (const view of views.values()) {
+      for (const [viewId, view] of views) {
+        followPlacement(viewId, view);
         if (view.selectedTarget !== target || view.selectedRevision !== view.revision) select(view);
       }
       return true;
@@ -555,6 +579,7 @@ export function createConnectivityEdgeLayer({
     draw(viewId, frame) {
       const view = views.get(viewId);
       if (graph === null || view === undefined) return 0;
+      followPlacement(viewId, view);
       // A pane added or re-published since its last selection selects now.
       if (view.selectedRevision !== view.revision || view.selectedTarget !== target) {
         select(view);
@@ -603,8 +628,9 @@ export function createConnectivityEdgeLayer({
       for (const entry of positionTextures.values()) positionTextureBytes += entry.bytes;
       return Object.freeze({
         graphBytes: graph === null ? 0
-          : graph.records.byteLength + graph.forwardOffsets.byteLength +
-            graph.neighborOffsets.byteLength + graph.neighbors.byteLength,
+          : graph.forwardOffsets.byteLength + graph.partners.byteLength +
+            graph.strengthBits.byteLength + graph.blockSources.byteLength,
+        selectionBytes: connectivitySelectionScratchBytes(scratch, graph),
         gpuBytes: recordBytes + positionTextureBytes,
         positionTextureBytes,
         panes: Object.freeze(panes),
@@ -621,6 +647,8 @@ export function createConnectivityEdgeLayer({
       for (const [positions, entry] of positionTextures) deletePositionTexture(positions, entry);
       graph = null;
       target = 0;
+      // The selection's buffers grew with K; a next graph starts them again.
+      scratch = createConnectivitySelectionScratch();
     },
     dispose() {
       this.clear();
@@ -632,6 +660,40 @@ export function createConnectivityEdgeLayer({
       program = null;
       gatherProgram = null;
       gatherFeedback = null;
+    },
+    /**
+     * The context was lost: forget every GL handle (none can be deleted) and
+     * hand back what a layer made on the restored context needs to show the
+     * same edges (`resume`): the graph, the K, and each pane's visibility.
+     * The graph's arrays are the reader's, kept by reference.
+     *
+     * @returns {{graph: object|null, target: number, views: Array<{viewId: string, visibility: object|null}>}}
+     */
+    suspend() {
+      const kept = {
+        graph,
+        target,
+        views: Array.from(views, ([viewId, view]) => ({ viewId, visibility: view.visibility })),
+      };
+      this.abandon();
+      return kept;
+    },
+    /**
+     * Show what a lost layer's `suspend` handed back: its graph, K, panes
+     * and their visibility. Every pane selects again and uploads its records
+     * when next drawn.
+     */
+    resume(kept) {
+      this.clear();
+      if (kept.graph === null) return;
+      graph = kept.graph;
+      target = kept.target;
+      for (const { viewId, visibility } of kept.views) {
+        const view = createView();
+        view.visibility = visibility;
+        view.revision += 1;
+        views.set(viewId, view);
+      }
     },
     /** Forget every GL handle without deleting it (the context was lost). */
     abandon() {

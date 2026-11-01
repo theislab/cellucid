@@ -9,7 +9,10 @@
  *   start all decode in this thread;
  * - a damaged chunk fails with the same error class and message either way;
  * - a cancelled decode stops waiting at once (a waiting task is never sent),
- *   and the pool keeps working; idle workers are terminated.
+ *   and the pool keeps working; idle workers are terminated;
+ * - the decoder probe: a read goes with the engine's prior or the decision,
+ *   never an untested decoder; decoders are measured while the pool is
+ *   idle, on copies of its chunks; decisions are kept by version.
  *
  * And the fast paths the decoders share (the LZ77 match copy, the byte
  * unshuffle, LZ4's eight- and sixteen-byte copies) against plain reference
@@ -24,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { constants, deflateSync, zstdCompressSync } from 'node:zlib';
 
 import {
+  EXPLORE_AFTER_IDLE_MS,
   configureDecodePool,
   decodeChunkBytes,
   decodePoolStats,
@@ -41,14 +45,21 @@ import { openHdf5 } from '../assets/js/formats/hdf5/index.js';
 import { FILTER, reviveHdf5Error, unfilter } from '../assets/js/formats/hdf5/filters.js';
 import { directoryStore, openZarr } from '../assets/js/formats/zarr/index.js';
 import { decodeWithCodecs, reviveZarrError } from '../assets/js/formats/zarr/codecs/pipeline.js';
-import { lz4DecodeBlockInto } from '../assets/js/formats/zarr/codecs/lz4.js';
+import { lz4DecodeBlocks } from '../assets/js/formats/zarr/codecs/lz4.js';
 import { zstdDecompress } from '../assets/js/formats/zarr/codecs/zstd.js';
+import {
+  DecoderProbe, ENGINE_PRIORS, PHASE_MESSAGES_PER_WORKER, PROBE_PHASES, adoptDecidedDecoders, choiceKey, decidedDecoders, decoderFor,
+  engineOf, forgetDecidedDecoders, priorDecoder, usePriorsOf,
+} from '../assets/js/formats/io/decoder-choice.js';
+import {
+  DECODER_MEMORY_KEY, decoderMemoryVersion, forgetDecoderDecisions, keepDecoderDecisions, recallDecoderDecisions,
+} from '../assets/js/formats/io/decoder-memory.js';
 import { createNodeDecodeWorker } from './helpers/node-decode-worker.mjs';
 import { settle } from './helpers/virtual-time.mjs';
 import { corpusFolder } from './helpers/zarr-corpus.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ZARR_STORES = ['v2/cases.zarr', 'v3/cases.zarr', 'anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr',
+const ZARR_STORES = ['v2/cases.zarr', 'v2/blosc-delta.zarr', 'v3/cases.zarr', 'anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr', 'anndata/v3-sharded-shapes.zarr',
   'anndata/v2-uncompressed.zarr', 'anndata/v3-uncompressed.zarr'];
 const HDF5_FILES = [
   ...readdirSync(path.join(HERE, 'fixtures', 'hdf5')).filter(name => name.endsWith('.h5')).map(name => path.join(HERE, 'fixtures', 'hdf5', name)),
@@ -131,7 +142,7 @@ async function openZarrFolder(store) {
 }
 
 async function openHdf5File(file) {
-  return openHdf5(createByteReader(bytesByteSource(new Uint8Array(readFileSync(file)), { name: path.basename(file) })));
+  return openHdf5(createByteReader(bytesByteSource(new Uint8Array(readFileSync(file)), { name: path.basename(file) })), { load: [''] });
 }
 
 /** Every array of a store read whole: its values, or its error's class and message. */
@@ -504,12 +515,13 @@ test('background chunks wait behind every other; bytes given up are transferred 
   configureDecodePool();
 });
 
-test('warming makes the workers before the first chunk', async () => {
+test('warming makes one worker before the first chunk, the others as chunks need them', async () => {
   const { counts, createWorker } = countingWorkers();
   configureDecodePool({ createWorker, size: 3, minBytes: 0, idleMs: 30 });
   warmDecodePool();
-  assert.equal(counts.made, 3);
-  assert.equal(decodePoolStats().workers, 3);
+  warmDecodePool();
+  assert.equal(counts.made, 1);
+  assert.equal(decodePoolStats().workers, 1);
   await new Promise(resolve => setTimeout(resolve, 80));
   assert.equal(decodePoolStats().workers, 0, 'unused warm workers are let go when idle');
   inThreadOnly();
@@ -614,8 +626,10 @@ function lz4Block(seed, size) {
     if (matchLength - 4 >= 15) lengthBytes(matchLength - 4 - 15);
     for (let i = 0; i < matchLength; i++) out.push(out[out.length - offset]);
   }
-  // The final run: literals only.
-  const last = Math.floor(next() * 24);
+  // The final run: literals only, at least 12 (LZ4's end-of-block rule,
+  // which its decoder enforces: the last match ends 12 or more bytes before
+  // the end of the block).
+  const last = 12 + Math.floor(next() * 24);
   block.push(Math.min(last, 15) << 4);
   if (last >= 15) lengthBytes(last - 15);
   for (let i = 0; i < last; i++) {
@@ -626,26 +640,29 @@ function lz4Block(seed, size) {
   return { block: Uint8Array.from(block), expected: Uint8Array.from(out) };
 }
 
-test('LZ4 blocks decode exactly into any part of a buffer, never writing outside it', () => {
+test('LZ4 blocks decode exactly into any part of one output, beside blocks stored as they are', async () => {
   for (let seed = 1; seed <= 60; seed++) {
     const { block, expected } = lz4Block(seed, 200 + seed * 97);
     for (const start of [0, 1, 3, 4, 7]) {
-      const output = new Uint8Array(start + expected.length + 19).fill(0xa5);
-      lz4DecodeBlockInto(block, output, start, start + expected.length);
-      assert.deepEqual(output.subarray(start, start + expected.length), expected, `seed ${seed}, start ${start}`);
-      assert.ok(output.subarray(0, start).every(byte => byte === 0xa5), 'nothing before the region');
-      assert.ok(output.subarray(start + expected.length).every(byte => byte === 0xa5), 'nothing after the region');
+      // `start` bytes stored as they are, then the block, read from a view inside a larger buffer.
+      const raw = Uint8Array.from({ length: start }, (_, i) => 0xa0 + i);
+      const padded = new Uint8Array(20 + start + block.length + 40).fill(0x11);
+      padded.set(raw, 20);
+      padded.set(block, 20 + start);
+      const input = padded.subarray(20, 20 + start + block.length);
+      const output = await lz4DecodeBlocks(input, [
+        { at: 0, stored: start, start: 0, size: start },
+        { at: start, stored: block.length, start, size: expected.length },
+      ], start + expected.length);
+      assert.deepEqual(output.subarray(0, start), raw, `seed ${seed}, start ${start}`);
+      assert.deepEqual(output.subarray(start), expected, `seed ${seed}, start ${start}`);
     }
-    // The block as a view inside a larger buffer reads only its own bytes.
-    const padded = new Uint8Array(block.length + 40).fill(0x11);
-    padded.set(block, 20);
-    const output = new Uint8Array(expected.length);
-    lz4DecodeBlockInto(padded.subarray(20, 20 + block.length), output);
-    assert.deepEqual(output, expected);
+    // A block that does not fill its bytes exactly is refused.
+    await assert.rejects(lz4DecodeBlocks(block, [{ at: 0, stored: block.length, start: 0, size: expected.length + 1 }], expected.length + 1), /LZ4 data is corrupt/);
   }
 });
 
-test('Zstandard: short-period repeats, long matches and unknown sizes decode exactly', () => {
+test('Zstandard: short-period repeats, long matches and unknown sizes decode exactly', async () => {
   const next = random(10);
   const parts = [];
   for (let period = 1; period <= 17; period++) {
@@ -661,12 +678,288 @@ test('Zstandard: short-period repeats, long matches and unknown sizes decode exa
   }
   for (const level of [1, 3, 19]) {
     const frame = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_compressionLevel]: level } }));
-    assert.deepEqual(zstdDecompress(frame, data.length), data);
-    assert.deepEqual(zstdDecompress(frame, null), data);
+    assert.deepEqual(await zstdDecompress(frame, data.length), data);
+    assert.deepEqual(await zstdDecompress(frame, null), data);
     const unsized = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_contentSizeFlag]: 0, [constants.ZSTD_c_compressionLevel]: level } }));
     const twice = new Uint8Array([...unsized, ...unsized]);
-    const both = zstdDecompress(twice, null);
+    const both = await zstdDecompress(twice, null);
     assert.deepEqual(both.subarray(0, data.length), data);
     assert.deepEqual(both.subarray(data.length), data);
   }
+});
+
+test('engines are told apart by user agent, and each starts from its measured prior', () => {
+  const agents = {
+    gecko: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0',
+    blink: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+    webkit: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15',
+  };
+  for (const [engine, agent] of Object.entries(agents)) assert.equal(engineOf(agent), engine);
+  // Every browser on iOS is WebKit; Node and an unknown agent are no engine.
+  assert.equal(engineOf('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/120.0 Mobile/15E148'), 'webkit');
+  assert.equal(engineOf('Node.js/26'), null);
+  assert.equal(engineOf(undefined), null);
+  // Firefox's measured winners; every prior names a decoder of its family.
+  usePriorsOf('gecko');
+  assert.deepEqual(['deflate', 'zstd', 'lz4', 'blosc'].map(priorDecoder), ['fflate', 'js', 'js', 'js']);
+  for (const priors of Object.values(ENGINE_PRIORS)) {
+    for (const [family, decoder] of Object.entries(priors)) assert.ok(['native', 'fflate', 'wasm', 'js'].includes(decoder), `${family}: ${decoder}`);
+  }
+  // Undecided, this thread decodes with the prior; a stream of no known size with the reference.
+  forgetDecidedDecoders();
+  assert.equal(decoderFor('zstd', 1 << 19), 'js');
+  assert.equal(decoderFor('deflate', null), 'native');
+  // Chromium: JavaScript for Zstandard and Blosc (cold WebAssembly loses a gene's read), WebAssembly for LZ4.
+  usePriorsOf('blink');
+  assert.deepEqual(['deflate', 'zstd', 'lz4', 'blosc'].map(priorDecoder), ['native', 'js', 'wasm', 'js']);
+  usePriorsOf('webkit');
+  assert.deepEqual(['deflate', 'zstd', 'lz4', 'blosc'].map(priorDecoder), ['native', 'wasm', 'wasm', 'wasm']);
+  usePriorsOf(null);
+});
+
+test('a read never goes with an untested decoder; the probe measures on its own messages, phase by phase, the prior first, and keeps the faster', () => {
+  forgetDecidedDecoders();
+  usePriorsOf('gecko');
+  const decisions = [];
+  const width = 2;
+  const probe = new DecoderProbe(() => width, { onDecided: (key, decoder) => decisions.push([key, decoder]) });
+  const size = 40_000;
+  const key = choiceKey('deflate', size);
+  const perPhase = PHASE_MESSAGES_PER_WORKER * width;
+  // A read's chunk: the prior (fflate on Gecko), never decoded twice to check it on the read's path.
+  assert.deepEqual(probe.assign('deflate', size), { key, decoder: 'fflate', check: false, phase: null });
+  // One measuring phase: its messages sent, then answered, `bytes` in `busy` ms of worker time in all.
+  const run = (bytes, busy) => {
+    const sent = [];
+    for (let i = 0; i < perPhase; i++) sent.push(probe.explore([key]));
+    assert.equal(probe.explore([key]), null, 'a phase sends its own messages only');
+    assert.ok(sent.every(choice => choice.decoder === sent[0].decoder), 'a phase is one decoder');
+    for (const choice of sent) probe.answered(choice.phase, bytes / perPhase, busy / perPhase);
+    return sent[0];
+  };
+  // Warm-up phases, the prior first: they count in the rate (a short read pays them).
+  const prior = run(100_000_000, 1000);
+  assert.equal(prior.decoder, 'fflate');
+  assert.equal(prior.check, true, 'the first measuring message of a decoder other than the reference is checked');
+  const warm = run(300_000_000, 1000);
+  assert.equal(warm.decoder, 'native');
+  assert.equal(warm.check, false, 'the reference is never checked');
+  // A read's message voids the phase under way: it runs again, from the start.
+  const first = probe.explore([key]);
+  assert.equal(first.decoder, 'fflate');
+  probe.disturbed();
+  probe.answered(first.phase, 1e12, 1);
+  // Then counted phases in turn, the prior first: native at 300 MB/s, fflate at 100 MB/s.
+  for (let round = 0; round < PROBE_PHASES; round++) {
+    assert.equal(run(100_000_000, 1000).decoder, 'fflate');
+    if (round < PROBE_PHASES - 1) assert.equal(decoderFor('deflate', size), 'fflate', 'the prior until every decoder has its phases');
+    assert.equal(run(300_000_000, 1000).decoder, 'native');
+  }
+  assert.equal(decoderFor('deflate', size), 'native');
+  assert.deepEqual(decisions, [[key, 'native']]);
+  assert.equal(probe.explore([key]), null, 'nothing left to measure');
+  assert.deepEqual(probe.assign('deflate', size), { key, decoder: 'native', check: false, phase: null });
+  assert.deepEqual(probe.summary()[key], { decided: 'native', prior: 'fflate', MBps: { native: 300, fflate: 100 } });
+  // A task's own choice wins over this thread's; it holds for a part of its chunk in another size class.
+  assert.equal(decoderFor('deflate', size, { [key]: 'fflate' }), 'fflate');
+  assert.equal(decoderFor('deflate', 3000, { [key]: 'fflate' }), 'fflate');
+  // Another size class starts from the prior.
+  assert.equal(probe.assign('deflate', 4_000_000).decoder, 'fflate');
+  // A prior found wrong is dropped: the reference, decided at once (one decoder left).
+  probe.drop(choiceKey('deflate', 4_000_000), 'fflate');
+  assert.equal(probe.assign('deflate', 4_000_000).decoder, 'native');
+  assert.equal(decoderFor('deflate', 4_000_000), 'native');
+  assert.deepEqual(decisions.at(-1), [choiceKey('deflate', 4_000_000), 'native']);
+  // A family with one decoder is not chosen for.
+  assert.equal(probe.assign('bitshuffle', 1000), null);
+  assert.equal(decoderFor('bitshuffle', 1000), null);
+  // Decisions kept from an earlier visit are taken (not over this page's own), a decoder no longer listed is not.
+  forgetDecidedDecoders();
+  assert.equal(adoptDecidedDecoders({ 'zstd:19': 'js', 'lz4:20': 'gone', 'nofamily:3': 'js' }), 1);
+  assert.deepEqual(decidedDecoders(), { 'zstd:19': 'js' });
+  assert.equal(new DecoderProbe(() => 2).explore(['zstd:19']), null, 'a key decided before is not measured');
+  forgetDecidedDecoders();
+  usePriorsOf(null);
+});
+
+const ZLIB = [{ id: 'zlib', configuration: {} }];
+
+function zlibTask(data) {
+  const input = new Uint8Array(deflateSync(data));
+  return {
+    kind: 'zarr', description: { codecs: ZLIB, sizes: [data.length] }, input, size: data.length, family: 'deflate',
+    revive: reviveZarrError, inThread: () => decodeWithCodecs(input, ZLIB, [data.length]),
+  };
+}
+
+/** A worker factory that records every message the pool sends (`sent`), and what each worker answered first. */
+function recordingWorkers() {
+  const sent = [];
+  let made = 0;
+  const createWorker = () => {
+    const worker = createNodeDecodeWorker();
+    const index = made++;
+    return {
+      ...worker,
+      postMessage(message, transfer) {
+        sent.push({ worker: index, message });
+        worker.postMessage(message, transfer);
+      },
+    };
+  };
+  return { sent, createWorker };
+}
+
+/** Wait until `done()` holds, the pool left alone meanwhile (its idle time is when it measures). */
+async function until(done, what, ms = 20_000) {
+  const end = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > end) throw new Error(`Not ${what} within ${ms} ms.`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+/** A key-value store in memory (as `indexedDbKeyValueStore` answers). */
+function memoryStore() {
+  const map = new Map();
+  return {
+    map,
+    get: async key => map.get(key),
+    put: async (key, value) => { map.set(key, structuredClone(value)); },
+    delete: async key => { map.delete(key); },
+    entries: async () => [...map].map(([key, value]) => ({ key, value })),
+  };
+}
+
+test('a decoder fast only once warm loses to one fast cold when its warm-up costs more than it gains', () => {
+  forgetDecidedDecoders();
+  usePriorsOf('webkit');
+  const width = 2;
+  const probe = new DecoderProbe(() => width);
+  const size = 1 << 19;
+  const key = choiceKey('zstd', size);
+  const perPhase = PHASE_MESSAGES_PER_WORKER * width;
+  const run = (bytes, busy) => {
+    const sent = [];
+    for (let i = 0; i < perPhase; i++) sent.push(probe.explore([key]));
+    for (const choice of sent) probe.answered(choice.phase, bytes / perPhase, busy / perPhase);
+    return sent[0].decoder;
+  };
+  // WebAssembly (the prior here) cold: 100 MB in 4 s; JavaScript cold 100 MB in 1 s.
+  assert.equal(run(100e6, 4000), 'wasm');
+  assert.equal(run(100e6, 1000), 'js');
+  // Warm, WebAssembly is faster per phase (100 MB in 0.5 s against 0.8 s), but not by its cold cost.
+  for (let round = 0; round < PROBE_PHASES; round++) {
+    assert.equal(run(100e6, 500), 'wasm');
+    assert.equal(run(100e6, 800), 'js');
+  }
+  assert.equal(decoderFor('zstd', size), 'js');
+  assert.deepEqual(probe.summary()[key].MBps, { wasm: 60, js: 115 });
+  forgetDecidedDecoders();
+  usePriorsOf(null);
+});
+
+test('the pool measures the DEFLATE decoders while idle, on copies of its chunks: a read is only ever sent the prior or the decision', async () => {
+  usePriorsOf('gecko');
+  const { sent, createWorker } = recordingWorkers();
+  const memory = memoryStore();
+  configureDecodePool({ createWorker, size: 2, minBytes: 1024, memory });
+  const key = choiceKey('deflate', 64 * 1024);
+  const chunks = Array.from({ length: 12 }, (_, index) => floats(16 * 1024, 300 + index));
+  const results = await Promise.all(chunks.map(data => decodeChunkBytes(zlibTask(data))));
+  results.forEach((result, index) => assert.deepEqual(result, chunks[index]));
+  await until(() => decodePoolStats().decoders[key]?.decided != null, 'decided');
+  const summary = decodePoolStats().decoders[key];
+  assert.ok(['native', 'fflate'].includes(summary.decided), JSON.stringify(summary));
+  assert.deepEqual(Object.keys(summary.MBps).sort(), ['fflate', 'native']);
+  // Every chunk of the read went with the prior; the measuring messages carried both decoders.
+  const reads = new Set(Array.from({ length: chunks.length }, (_, i) => i + 1));
+  const readChoices = sent.filter(entry => reads.has(entry.message.id)).map(entry => entry.message.choices[key]);
+  assert.equal(readChoices.length, chunks.length);
+  assert.ok(readChoices.every(decoder => decoder === 'fflate'), JSON.stringify(readChoices));
+  const measuring = sent.filter(entry => entry.message.id > chunks.length);
+  assert.deepEqual([...new Set(measuring.map(entry => entry.message.choices[key]))].sort(), ['fflate', 'native']);
+  // What the pool decided, this thread decodes with too, and it is kept.
+  assert.equal(decoderFor('deflate', 64 * 1024), summary.decided);
+  await until(() => memory.map.get(DECODER_MEMORY_KEY)?.decided?.[key] === summary.decided, 'kept');
+  assert.equal(memory.map.get(DECODER_MEMORY_KEY).version, decoderMemoryVersion());
+  // A later visit (a new pool, the same browser): decided from the start, nothing measured, no copy kept.
+  sent.length = 0;
+  configureDecodePool({ createWorker, size: 2, minBytes: 1024, memory });
+  warmDecodePool();
+  await until(() => decodePoolStats().decoders[key]?.decided === summary.decided, 'recalled');
+  const again = await Promise.all(chunks.map(data => decodeChunkBytes(zlibTask(data))));
+  again.forEach((result, index) => assert.deepEqual(result, chunks[index]));
+  // The pool measures only once idle this long: past it, then a turn for a
+  // measuring message it would send then, nothing more is sent.
+  await new Promise(resolve => setTimeout(resolve, EXPLORE_AFTER_IDLE_MS));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const decodes = sent.filter(entry => entry.message.choices !== undefined);
+  assert.equal(decodes.length, chunks.length, 'no measuring message');
+  assert.ok(decodes.every(entry => entry.message.choices[key] === summary.decided));
+  // Without a store (tests, a browser that keeps nothing) a new pool starts from the prior.
+  configureDecodePool({ createWorker, size: 2, minBytes: 1024, memory: null });
+  assert.equal(decoderFor('deflate', 64 * 1024), 'fflate', 'a new pool measures afresh');
+  configureDecodePool();
+  usePriorsOf(null);
+});
+
+test('decisions are kept under their version only: another module, decoder list, browser or core count measures again', async () => {
+  const memory = memoryStore();
+  const version = decoderMemoryVersion({ navigator: { userAgent: 'A', hardwareConcurrency: 8 } });
+  assert.notEqual(version, decoderMemoryVersion({ navigator: { userAgent: 'B', hardwareConcurrency: 8 } }));
+  assert.notEqual(version, decoderMemoryVersion({ navigator: { userAgent: 'A', hardwareConcurrency: 4 } }));
+  assert.ok(JSON.parse(version).module.length > 0, 'the module digest is named');
+  await keepDecoderDecisions(memory, version, { 'zstd:19': 'js' }, 1);
+  await keepDecoderDecisions(memory, version, { 'lz4:20': 'wasm' }, 2);
+  assert.deepEqual(await recallDecoderDecisions(memory, version), { 'zstd:19': 'js', 'lz4:20': 'wasm' }, 'merged');
+  assert.deepEqual(await recallDecoderDecisions(memory, `${version}x`), {}, 'another version is not used');
+  await keepDecoderDecisions(memory, `${version}x`, { 'zstd:19': 'wasm' }, 3);
+  assert.deepEqual(memory.map.get(DECODER_MEMORY_KEY), { version: `${version}x`, decided: { 'zstd:19': 'wasm' }, at: 3 }, 'replaced');
+  // A damaged record, a store that fails, no store: nothing recalled, nothing thrown.
+  memory.map.set(DECODER_MEMORY_KEY, 'damaged');
+  assert.deepEqual(await recallDecoderDecisions(memory, version), {});
+  const failing = { get: async () => { throw new Error('refused'); }, put: async () => { throw new Error('refused'); }, delete: async () => { throw new Error('refused'); } };
+  assert.deepEqual(await recallDecoderDecisions(failing, version), {});
+  await keepDecoderDecisions(failing, version, { 'zstd:19': 'js' });
+  assert.deepEqual(await recallDecoderDecisions(null, version), {});
+  // Forgotten (the Stored dialog's Remove all).
+  await keepDecoderDecisions(memory, version, { 'zstd:19': 'js' });
+  assert.equal(await forgetDecoderDecisions(memory), true);
+  assert.equal(memory.map.has(DECODER_MEMORY_KEY), false);
+  assert.equal(await forgetDecoderDecisions(memory), false);
+  assert.equal(await forgetDecoderDecisions(failing), false);
+});
+
+test('a decoder its worker reports wrong is dropped for the size class, the reference kept', async () => {
+  usePriorsOf('blink');
+  const sent = new Map();
+  const createWorker = () => {
+    const worker = createNodeDecodeWorker();
+    return {
+      ...worker,
+      postMessage(message, transfer) {
+        sent.set(message.id, message.choices ?? {});
+        worker.postMessage(message, transfer);
+      },
+      addEventListener(type, listener) {
+        if (type !== 'message') return worker.addEventListener(type, listener);
+        // As a worker reports a decoder that gave other bytes than the reference.
+        return worker.addEventListener(type, event => {
+          const wrong = Object.entries(sent.get(event.data?.id) ?? {}).filter(([, decoder]) => decoder === 'fflate').map(([key]) => key);
+          listener(wrong.length > 0 ? { data: { ...event.data, dropped: wrong } } : event);
+        });
+      },
+    };
+  };
+  configureDecodePool({ createWorker, size: 2, minBytes: 1024, memory: null });
+  const chunks = Array.from({ length: 16 }, (_, index) => floats(16 * 1024, 400 + index));
+  const results = await Promise.all(chunks.map(data => decodeChunkBytes(zlibTask(data))));
+  results.forEach((result, index) => assert.deepEqual(result, chunks[index]));
+  await until(() => decodePoolStats().decoders[choiceKey('deflate', 64 * 1024)]?.decided != null, 'decided');
+  const summary = decodePoolStats().decoders[choiceKey('deflate', 64 * 1024)];
+  assert.equal(summary.decided, 'native', JSON.stringify(summary));
+  assert.ok(!('fflate' in summary.MBps), JSON.stringify(summary));
+  configureDecodePool();
+  usePriorsOf(null);
 });

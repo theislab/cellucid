@@ -2,7 +2,9 @@
  * Statistical Tests Module for Page Analysis
  *
  * Provides statistical comparison tests for categorical and continuous data:
- * - Categorical: Chi-squared test, Fisher's exact test (2x2)
+ * - Categorical: Chi-squared test (Yates's correction on a 2x2 table), Fisher's
+ *   exact test (2x2), both from the kernel Composition uses
+ *   (`categorical-tests.js`)
  * - Continuous: t-test, Mann-Whitney U, ANOVA, Kruskal-Wallis
  *
  * All tests return p-values, test statistics, and effect sizes where applicable.
@@ -10,17 +12,17 @@
 
 // Import mathematical functions from centralized math-utils (DRY principle)
 import {
-  mean,
+  centredMoments,
   sampleMoments,
   chiSquaredPValue,
   fDistributionPValue,
-  gammaLn,
   computeRanksWithTies,
   ascendingOrder,
   mannWhitneyU as computeMannWhitneyU,
   welchTTestFromMoments
 } from '../compute/math-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
+import { chiSquaredIndependence, fisherExact2x2 } from './categorical-tests.js';
 import { categoryCounts } from '../shared/category-counts.js';
 import { requireClonedRecord } from '../../../utils/exact-record.js';
 
@@ -252,21 +254,8 @@ function invalidCategoricalResult(testName, interpretation) {
   };
 }
 
-function hasExpectedCountBelow(table, minimum) {
-  const { observed, rowTotals, colTotals, grandTotal } = table;
-  if (grandTotal === 0) return false;
-
-  for (let row = 0; row < observed.length; row++) {
-    for (let column = 0; column < colTotals.length; column++) {
-      const expected = (rowTotals[row] * colTotals[column]) / grandTotal;
-      if (expected < minimum) return true;
-    }
-  }
-  return false;
-}
-
 function chiSquaredTestFromTable(table) {
-  const { categoryValues, observed, rowTotals, colTotals, grandTotal } = table;
+  const { categoryValues, observed, grandTotal } = table;
   if (grandTotal === 0) {
     return invalidCategoricalResult('Chi-squared test', 'No data available');
   }
@@ -282,30 +271,23 @@ function chiSquaredTestFromTable(table) {
       'Need at least 2 observed categories for comparison'
     );
   }
-  if (hasExpectedCountBelow(table, 5)) {
+  // The one kernel Composition tests a table with (`categorical-tests.js`):
+  // Yates's correction on a 2 x 2 table, as SciPy and R apply it.
+  const test = chiSquaredIndependence(observed);
+  if (test.minExpected < 5) {
     return invalidCategoricalResult(
       'Chi-squared test',
       'Pearson chi-squared inference is unavailable because an expected count ' +
         'is below 5; use an exact test or combine sparse categories'
     );
   }
+  const { statistic: chiSq, df, pValue } = test;
+  const testName = test.corrected ? "Chi-squared test (Yates's correction)" : 'Chi-squared test';
 
-  let chiSq = 0;
-  for (let row = 0; row < observed.length; row++) {
-    for (let column = 0; column < categoryValues.length; column++) {
-      const expected = (rowTotals[row] * colTotals[column]) / grandTotal;
-      if (expected > 0) {
-        chiSq += (observed[row][column] - expected) ** 2 / expected;
-      }
-    }
-  }
-
-  const df = (observed.length - 1) * (categoryValues.length - 1);
-  const pValue = chiSquaredPValue(chiSq, df);
-
+  // Cramér's V from the uncorrected statistic.
   const k = Math.min(observed.length, categoryValues.length);
   const cramersV = k > 1
-    ? Math.sqrt(chiSq / (grandTotal * (k - 1)))
+    ? Math.sqrt(test.pearson / (grandTotal * (k - 1)))
     : 0;
 
   let effectInterpretation = '';
@@ -316,7 +298,7 @@ function chiSquaredTestFromTable(table) {
 
   const significance = getSignificance(pValue);
   return {
-    testName: 'Chi-squared test',
+    testName,
     statistic: chiSq,
     pValue,
     significance,
@@ -348,45 +330,6 @@ export function chiSquaredTest(pageData) {
   return chiSquaredTestFromTable(buildCategoricalTable(pageData));
 }
 
-function logChoose(n, k) {
-  if (k < 0 || k > n) return -Infinity;
-  return gammaLn(n + 1) - gammaLn(k + 1) - gammaLn(n - k + 1);
-}
-
-function fisherExactTwoSided(observed) {
-  const [[a, b], [c, d]] = observed;
-  const row1 = a + b;
-  const row2 = c + d;
-  const col1 = a + c;
-  const total = row1 + row2;
-  const denominator = logChoose(total, col1);
-  const logProbability = value => (
-    logChoose(row1, value) +
-    logChoose(row2, col1 - value) -
-    denominator
-  );
-
-  const observedLogProbability = logProbability(a);
-  const minA = Math.max(0, col1 - row2);
-  const maxA = Math.min(row1, col1);
-  const included = [];
-  let maxLogProbability = -Infinity;
-
-  for (let value = minA; value <= maxA; value++) {
-    const logP = logProbability(value);
-    if (logP <= observedLogProbability + 1e-12) {
-      included.push(logP);
-      if (logP > maxLogProbability) maxLogProbability = logP;
-    }
-  }
-
-  const scaledSum = included.reduce(
-    (sum, logP) => sum + Math.exp(logP - maxLogProbability),
-    0
-  );
-  return Math.min(1, Math.exp(maxLogProbability) * scaledSum);
-}
-
 function fisherExactTestFromTable(table) {
   const { categoryValues, rowLabels, observed, grandTotal } = table;
   if (grandTotal === 0) {
@@ -400,11 +343,7 @@ function fisherExactTestFromTable(table) {
   }
 
   const [[a, b], [c, d]] = observed;
-  const crossProducts = { numerator: a * d, denominator: b * c };
-  const oddsRatio = crossProducts.denominator > 0
-    ? crossProducts.numerator / crossProducts.denominator
-    : (crossProducts.numerator > 0 ? Infinity : NaN);
-  const pValue = fisherExactTwoSided(observed);
+  const { oddsRatio, pValue } = fisherExact2x2(a, b, c, d);
   const significance = getSignificance(pValue);
   const oddsRatioContrast = `${rowLabels[0]} vs ${rowLabels[1]}; ` +
     `${categoryText(categoryValues[0])} vs ${categoryText(categoryValues[1])}`;
@@ -447,7 +386,7 @@ function shouldUseFisherExact(table) {
   if (observed.length !== 2 || categoryValues.length !== 2 || grandTotal === 0) {
     return false;
   }
-  return hasExpectedCountBelow(table, 5);
+  return chiSquaredIndependence(observed).minExpected < 5;
 }
 
 // ============================================================================
@@ -479,14 +418,16 @@ export function tTest(group1, group2) {
     };
   }
 
-  // One moment pair per group, shared by the test and by Cohen's d. The moments
-  // are accumulated in the order `mean()` and `variance(_, 1)` use, so t, df, p
-  // and d are the same numbers the separate calls produced — with two passes per
-  // group instead of four.
-  const momentsA = sampleMoments(values1);
-  const momentsB = sampleMoments(values2);
-  const m1 = momentsA.mean;
-  const m2 = momentsB.mean;
+  // One moment pair per group, shared by the test and by Cohen's d: two passes
+  // per group (`sampleMoments`).
+  // One pivot for both groups (the first value): t and d take the
+  // difference of the means less it, so a large common offset keeps its
+  // digits.
+  const pivot = values1[0];
+  const momentsA = sampleMoments(values1, pivot);
+  const momentsB = sampleMoments(values2, pivot);
+  const m1 = momentsA.shifted;
+  const m2 = momentsB.shifted;
   const v1 = momentsA.variance;
   const v2 = momentsB.variance;
 
@@ -658,8 +599,12 @@ export function oneWayANOVA(groups) {
     };
   }
 
-  // Calculate group means and sizes
-  const groupMeans = validGroups.map(g => mean(g));
+  // Group means less one pivot (the first value) and centred sums of
+  // squares, as SciPy's f_oneway shifts the data: a large common offset
+  // keeps its digits. And sizes.
+  const pivot = validGroups[0][0];
+  const groupMoments = validGroups.map(g => centredMoments(g, pivot));
+  const groupMeans = groupMoments.map(moments => moments.shifted);
   const groupSizes = validGroups.map(g => g.length);
   const N = groupSizes.reduce((a, b) => a + b, 0);
   const firstValue = validGroups[0][0];
@@ -674,12 +619,10 @@ export function oneWayANOVA(groups) {
     if (!allValuesIdentical) break;
   }
 
-  // Grand mean (nested iteration keeps Array and TypedArray inputs equivalent)
-  let grandSum = 0;
-  for (const group of validGroups) {
-    for (const value of group) grandSum += value;
-  }
-  const grandMean = grandSum / N;
+  // Grand mean less the pivot: the size-weighted group means
+  let weighted = 0;
+  for (let i = 0; i < validGroups.length; i++) weighted += groupSizes[i] * groupMeans[i];
+  const grandMean = weighted / N;
 
   // Sum of squares between groups (SSB)
   let SSB = 0;
@@ -689,11 +632,7 @@ export function oneWayANOVA(groups) {
 
   // Sum of squares within groups (SSW)
   let SSW = 0;
-  for (let i = 0; i < validGroups.length; i++) {
-    for (const x of validGroups[i]) {
-      SSW += Math.pow(x - groupMeans[i], 2);
-    }
-  }
+  for (const moments of groupMoments) SSW += moments.m2;
 
   // Degrees of freedom
   const dfB = validGroups.length - 1;

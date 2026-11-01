@@ -47,6 +47,8 @@ import {
   buildDeleteToUnassignedTransform,
   buildMergeCategoriesTransform,
 } from '../assets/js/app/utils/categorical-ops.js';
+import { colorsOf, drawn, rgbAt, visibleOf } from './helpers/category-state.mjs';
+import { withCategoryColor, withCategoryVisibility } from '../assets/js/app/utils/category-state.js';
 
 /**
  * A v3 dataset whose one embedding is the 2D item "X_umap_2d" (the layout key
@@ -86,12 +88,10 @@ function exactContinuousField(values) {
 }
 
 function exactCategoryMetadata(field) {
-  field._categoryColors = field.categories.map((_, index) => (
+  field._categoryColors = colorsOf(field.categories.map((_, index) => (
     index === 0 ? [0.1, 0.2, 0.3] : [0.7, 0.8, 0.9]
-  ));
-  field._categoryVisible = Object.fromEntries(
-    field.categories.map((_, index) => [index, true]),
-  );
+  )));
+  field._categoryVisible = visibleOf(field.categories.map(() => true));
   field._categoryFilterEnabled = true;
   return field;
 }
@@ -523,12 +523,12 @@ test('continuous color metadata preserves constant domains and rejects impossibl
 
 test('categorical color metadata rejects incomplete state without repairing it', () => {
   const state = Object.create(DataStateColorMethods.prototype);
-  const incompleteColors = [[0.1, 0.2, 0.3]];
+  const incompleteColors = colorsOf([[0.1, 0.2, 0.3]]);
   const fieldWithIncompleteColors = {
     kind: 'category',
     categories: ['alpha', 'beta'],
     _categoryColors: incompleteColors,
-    _categoryVisible: { 0: true, 1: true },
+    _categoryVisible: visibleOf([true, true]),
     _categoryFilterEnabled: true,
   };
 
@@ -538,11 +538,11 @@ test('categorical color metadata rejects incomplete state without repairing it',
   );
   assert.strictEqual(fieldWithIncompleteColors._categoryColors, incompleteColors);
 
-  const incompleteVisibility = { 0: true };
+  const incompleteVisibility = visibleOf([true]);
   const fieldWithIncompleteVisibility = {
     kind: 'category',
     categories: ['alpha', 'beta'],
-    _categoryColors: [[0.1, 0.2, 0.3], [0.7, 0.8, 0.9]],
+    _categoryColors: colorsOf([[0.1, 0.2, 0.3], [0.7, 0.8, 0.9]]),
     _categoryVisible: incompleteVisibility,
     _categoryFilterEnabled: true,
   };
@@ -558,7 +558,7 @@ test('categorical color metadata rejects incomplete state without repairing it',
   const malformedVisibilityWithoutColors = {
     kind: 'category',
     categories: ['alpha', 'beta'],
-    _categoryVisible: { 0: true },
+    _categoryVisible: visibleOf([true]),
   };
   assert.throws(
     () => state.ensureCategoryMetadata(malformedVisibilityWithoutColors),
@@ -716,7 +716,7 @@ test('observation filters compose across fields while cloned view state remains 
     codes: Uint8Array.from([0, 1, 0, 1]),
     loaded: true,
   });
-  categoryField._categoryVisible[1] = false;
+  categoryField._categoryVisible = visibleOf([true, false]);
   const continuousField = {
     ...exactContinuousField(Float32Array.from([0, 1, 2, 3])),
     _continuousStats: { min: 0, max: 3 },
@@ -745,7 +745,6 @@ test('observation filters compose across fields while cloned view state remains 
         DataStateColorMethods.prototype.ensureCategoryMetadata,
       ensureContinuousMetadata:
         DataStateColorMethods.prototype.ensureContinuousMetadata,
-      _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
       isOutlierFilterEnabledForActiveField() {
         return false;
       },
@@ -770,9 +769,13 @@ test('observation filters compose across fields while cloned view state remains 
     cloneOwner,
     obsData,
   );
-  clonedObsData.fields[0]._categoryVisible[0] = false;
+  // The clone shares the visibility until it changes it: the change is a
+  // new array of its own (copy on write).
+  assert.equal(clonedObsData.fields[0]._categoryVisible, obsData.fields[0]._categoryVisible);
+  withCategoryVisibility(clonedObsData.fields[0], 0, false);
   clonedObsData.fields[1]._continuousFilter.min = 2;
-  assert.equal(obsData.fields[0]._categoryVisible[0], true);
+  assert.equal(obsData.fields[0]._categoryVisible[0], 1);
+  assert.equal(clonedObsData.fields[0]._categoryVisible[0], 0);
   assert.equal(obsData.fields[1]._continuousFilter.min, 1);
 });
 
@@ -830,7 +833,6 @@ test('view switching moves cell masks between views and rejects invalid targets 
     setCellVisibility: DataStateFilterMethods.prototype.setCellVisibility,
     computeGlobalVisibility:
       DataStateFilterMethods.prototype.computeGlobalVisibility,
-    _syncColorsAlpha: DataStateColorMethods.prototype._syncColorsAlpha,
     _applyOverlaysToFields:
       FieldOverlayInternalMethods.prototype._applyOverlaysToFields,
     _injectUserDefinedFields() {},
@@ -950,7 +952,7 @@ test('visibility preflight rejects corrupt codes before changing view transparen
     codes: Uint8Array.from([0, 2]),
     loaded: true,
   });
-  categoryField._categoryVisible[1] = false;
+  categoryField._categoryVisible = visibleOf([true, false]);
   const previousTransparency = Uint8Array.from([0, 1]);
   const state = Object.assign(
     Object.create(DataStateFilterMethods.prototype),
@@ -1316,8 +1318,8 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
   }, state);
   state.obsData = { fields: [created.field] };
   state.ensureCategoryMetadata(created.field);
-  created.field._categoryColors[0] = [0.2, 0.3, 0.4];
-  created.field._categoryVisible[0] = false;
+  withCategoryColor(created.field, 0, [0.2, 0.3, 0.4]);
+  withCategoryVisibility(created.field, 0, false);
   const staleNormalizedLayouts = created.field._normalizedLayouts;
   assert.deepEqual([...staleNormalizedLayouts], ['X_umap_2d']);
   created.field._categoryCounts = {
@@ -1350,10 +1352,10 @@ test('categorical upsert replaces stale derived metadata as one exact update', (
   });
   assert.deepEqual(created.field.categories, ['Old', 'New']);
   assert.deepEqual(Array.from(created.field.codes), [0, 1]);
-  assert.deepEqual(created.field._categoryColors[0], [0.2, 0.3, 0.4]);
-  assert.equal(created.field._categoryVisible[0], false);
-  assert.equal(created.field._categoryVisible[1], true);
-  assert.equal(created.field._categoryColors.length, 2);
+  assert.deepEqual(rgbAt(created.field, 0), drawn([0.2, 0.3, 0.4]));
+  assert.equal(created.field._categoryVisible[0], 0);
+  assert.equal(created.field._categoryVisible[1], 1);
+  assert.equal(created.field._categoryColors.length, 2 * 3);
   // The upsert's centroids come from the resident normalized positions, so
   // they are recorded as normalized in a fresh set, never the stale one.
   assert.deepEqual([...created.field._normalizedLayouts], ['X_umap_2d']);

@@ -7,6 +7,7 @@
  * posting the old positions' slices, and the build's closures kept the old
  * positions alive until the worker answered.
  */
+import { DEFAULT_CELL_PRIORITY } from '../assets/js/data/cell-priority.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -45,7 +46,7 @@ function makeRenderer(positions) {
 function build(renderer, positions) {
   const outcome = { done: 0, failed: 0, cancelled: 0 };
   renderer._buildSpatialTreeJob(
-    positions, 3, true,
+    positions, 3, true, DEFAULT_CELL_PRIORITY,
     () => { outcome.done += 1; },
     () => { outcome.failed += 1; },
     () => { outcome.cancelled += 1; },
@@ -110,4 +111,70 @@ test('a build dropped before its first slice was sent sends nothing', async t =>
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(worker.posted, []);
   assert.deepEqual(outcome, { done: 0, failed: 0, cancelled: 1 });
+});
+
+test('one build at a time: a second geometry\'s positions are sent only once the worker answered the first', async t => {
+  const previousWorker = globalThis.Worker;
+  globalThis.Worker = FakeWorker;
+  t.after(() => { globalThis.Worker = previousWorker; });
+  const first = new Float32Array(30);
+  const second = new Float32Array(30);
+  const renderer = makeRenderer(first);
+  renderer.snapshotBuffers.set('snap_1', { positions: second });
+  const firstOutcome = build(renderer, first);
+  const secondOutcome = build(renderer, second);
+  const worker = FakeWorker.made.at(-1);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  // Only the first geometry is in the worker; the second waits on this side.
+  assert.deepEqual(worker.posted, ['positions', 'build']);
+  assert.equal(renderer._spatialTreeQueue.length, 1);
+  // The worker answers the first (here, with a failure: nothing to decode).
+  worker.onmessage({ data: { id: 1, error: 'stub' } });
+  assert.deepEqual(firstOutcome, { done: 0, failed: 1, cancelled: 0 });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(worker.posted, ['positions', 'build', 'positions', 'build']);
+  worker.onmessage({ data: { id: 2, error: 'stub' } });
+  assert.deepEqual(secondOutcome, { done: 0, failed: 1, cancelled: 0 });
+  assert.equal(renderer._spatialTreeActive, null);
+});
+
+test('a worker whose code does not load fails its builds once, saying so, and the next build starts a new one', async t => {
+  const previousWorker = globalThis.Worker;
+  globalThis.Worker = FakeWorker;
+  t.after(() => { globalThis.Worker = previousWorker; });
+  const positions = new Float32Array(30);
+  const renderer = makeRenderer(positions);
+  const errors = [];
+  renderer._buildSpatialTreeJob(
+    positions, 3, true, DEFAULT_CELL_PRIORITY,
+    () => assert.fail('nothing was built'),
+    error => errors.push(error.message),
+    () => assert.fail('nothing was dropped'),
+  );
+  const worker = FakeWorker.made.at(-1);
+  // Its script did not load (offline, say): a plain Event, no message.
+  worker.onerror(new Event('error'));
+  assert.deepEqual(errors, ['Background spatial index worker failed: its code could not be loaded']);
+  // Retired: kept, every later build was posted to it and never answered.
+  assert.equal(worker.terminated, true);
+  assert.equal(renderer._spatialTreeWorker, null);
+  assert.equal(renderer._spatialTreeActive, null);
+  // An error of the retired worker arriving late fails nothing more.
+  build(renderer, positions);
+  const next = FakeWorker.made.at(-1);
+  assert.notEqual(next, worker);
+  worker.onerror(new Event('error'));
+  assert.equal(renderer._spatialTreeWorker, next);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(next.posted, ['positions', 'build']);
+});
+
+test('a worker failure is said as what it is: the worker\'s own error, or code that could not be loaded (offline when it is)', async () => {
+  const { workerFailureReason } = await import('../assets/js/workers/worker-failure.js');
+  assert.equal(workerFailureReason({ message: 'RangeError: too many cells' }), 'RangeError: too many cells');
+  assert.equal(workerFailureReason(new Event('error'), { navigator: { onLine: true } }), 'its code could not be loaded');
+  assert.equal(workerFailureReason(new Event('error'), { navigator: { onLine: false } }), 'its code could not be loaded: this browser is offline');
+  assert.equal(workerFailureReason(null, {}), 'its code could not be loaded');
+  assert.equal(workerFailureReason({ message: '  ' }, {}), 'its code could not be loaded');
 });

@@ -142,3 +142,33 @@ test('a stacked violin\'s bins: every grouped cell once, zeros in the bin holdin
   // Without bins nothing is binned.
   assert.equal(summarizeGenesByGroup(ctx, genes, 0).histogram.length, 0);
 });
+
+test('a cell without a value (NaN, an infinity) is out of the mean, the share and the violin, as DE leaves it out (NS-1)', () => {
+  // Two groups of three cells; one unmeasured cell each.
+  const dense = Float32Array.of(0, 2, NaN, 1, Infinity, 4);
+  const ctx = createGroupSummaryContext(Int16Array.of(0, 0, 0, 1, 1, 1), 2);
+  const indices = Uint32Array.from([...dense.keys()].filter(cell => dense[cell] !== 0));
+  const stored = { length: dense.length, indices, values: Float32Array.from(indices, cell => dense[cell]) };
+  for (const gene of [dense, stored]) {
+    const summary = summarizeGenesByGroup(ctx, [gene], 0, 4);
+    assert.deepEqual([...summary.sizes], [3, 3]);
+    assert.deepEqual([...summary.measured], [2, 2]);
+    const values = groupSummaryValues(summary);
+    // DE over the same cells: means 1 and 2.5, 50 % and 100 % above 0.
+    assert.deepEqual([...values.mean], [1, 2.5]);
+    assert.deepEqual([...values.fraction], [0.5, 1]);
+    assert.deepEqual([...values.meanExpressing], [2, 2.5]);
+    // The violin bins every measured cell once, over the measured range.
+    assert.deepEqual([...summary.range], [0, 4]);
+    assert.deepEqual([...summary.histogram], [1, 0, 1, 0, 0, 1, 0, 1]);
+  }
+  // A cutoff below zero counts measured zeros only.
+  const below = groupSummaryValues(summarizeGenesByGroup(ctx, [dense], -1));
+  assert.deepEqual([...below.fraction], [1, 1]);
+  // A group with no measured cell has no value.
+  const none = groupSummaryValues(summarizeGenesByGroup(ctx, [Float32Array.of(NaN, NaN, NaN, 1, 2, 3)], 0));
+  assert.ok(Number.isNaN(none.mean[0]) && Number.isNaN(none.fraction[0]));
+  assert.deepEqual([none.mean[1], none.fraction[1]], [2, 1]);
+  // The summary must say how many cells each gene measured.
+  assert.throws(() => groupSummaryValues({ sum: new Float64Array(2), expressing: new Uint32Array(2), sumExpressing: new Float64Array(2), geneCount: 1, groupCount: 2 }), /measured cells/);
+});

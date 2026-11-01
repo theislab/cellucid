@@ -57,6 +57,13 @@ test('a page told another catalog opens no connection to the default one', () =>
   assert.deepEqual(runPage({ href: 'https://www.cellucid.com/?sampleCatalog=a&sampleCatalog=b' }), []);
 });
 
+test('a viewer page never reads the sample catalog and opens no connection to it', () => {
+  for (const search of ['?viewer=embedded', '?viewer=true&viewerId=v&viewerToken=t', '?viewer=true&viewerId=v&viewerToken=t&anndata=true']) {
+    assert.deepEqual(runPage({ href: `https://www.cellucid.com/${search}` }), [], search);
+    assert.deepEqual(runPage({ href: `http://127.0.0.1:8765/${search}` }), [], search);
+  }
+});
+
 test('no meta element, a same-origin catalog, or an unparsable one preconnects nothing', () => {
   assert.deepEqual(runPage({ href: 'https://www.cellucid.com/', meta: null }), []);
   assert.deepEqual(runPage({ href: 'https://lab.example.org/cellucid/', meta: 'https://lab.example.org/catalog/' }), []);
@@ -71,7 +78,8 @@ test('index.html loads the bootstrap from the head, after the catalog meta and b
   assert.equal(scripts.length, 1, 'exactly one preconnect bootstrap');
   const script = scripts[0].index;
   const meta = head.indexOf('<meta name="cellucid-sample-catalog"');
-  const stylesheet = head.indexOf('<link rel="stylesheet" href="assets/css/main.css"');
+  // The first stylesheet request: a preload of one main.css imports, or main.css.
+  const stylesheet = head.search(/<link rel="(?:preload" as="style"|stylesheet)" href="assets\/css\//);
   assert.ok(meta > -1 && meta < script, 'the meta element the bootstrap reads comes first');
   assert.ok(stylesheet > script, 'the connection starts before the stylesheet is requested');
   for (const [name, text] of [['index.html', INDEX], ['404.html', NOT_FOUND]]) {

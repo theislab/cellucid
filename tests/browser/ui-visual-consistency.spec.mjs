@@ -461,12 +461,15 @@ test.describe('a phone held sideways', () => {
     const box = await card.boundingBox();
     expect(box.y).toBeGreaterThanOrEqual(0);
     expect(box.y + box.height).toBeLessThanOrEqual(375);
-    const scrolls = await card.evaluate(element => {
+    // Whatever the card does not show it scrolls to (the welcome card fits
+    // a 375px-tall screen whole, so there is then nothing to scroll).
+    const { overflows, scrolls } = await card.evaluate(element => {
       element.scrollTop = element.scrollHeight;
-      return element.scrollHeight > element.clientHeight && element.scrollTop > 0;
+      return { overflows: element.scrollHeight > element.clientHeight, scrolls: element.scrollTop > 0 };
     });
-    expect(scrolls).toBe(true);
-    await expect(page.locator('.welcome-quote')).toBeInViewport();
+    expect(scrolls).toBe(overflows);
+    // The card's last part, its quote, is on the screen.
+    await expect(page.locator('#welcome-modal .welcome-quote')).toBeInViewport();
     await page.keyboard.press('Escape');
     await expect(welcome).toBeHidden();
 

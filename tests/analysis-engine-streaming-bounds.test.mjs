@@ -35,6 +35,8 @@ function fixedTuner(depth, perTask = 1, inFlight = 4) {
     pressure: 0,
     genesPerTask: () => perTask,
     prefetchDepth: () => depth,
+    bufferedTasks: () => depth,
+    taskBytes: () => 0,
     computeInFlight: () => inFlight,
     observeRead(read) { reads.push(read); },
     setReadsPending() {},

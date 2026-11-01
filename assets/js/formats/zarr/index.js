@@ -4,7 +4,7 @@
  *
  * ```js
  * const root = await openZarr(zipStore(await openZipArchive(createByteReader(blobByteSource(file)))));
- * const X = root.get('X');           // synchronous: the tree is read at open
+ * const X = root.get('X');           // synchronous: a Zarr tree is loaded whole at open
  * const column = await X.read([[0, X.shape[0]], [5, 6]]);
  * ```
  *

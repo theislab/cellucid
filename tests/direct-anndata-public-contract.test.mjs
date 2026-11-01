@@ -79,7 +79,6 @@ function createDirectLoader() {
     nObs: 3,
     nVars: 5,
     hasExpressionMatrix: false,
-    varNames: ['G0', 'G1', 'G2', 'G3', 'G4'],
     obsKeys: [
       'numeric_category',
       'boolean_category',
@@ -349,7 +348,7 @@ test('H5AD and Zarr publish one exact identity before direct adoption', async t 
       }
       const geneList = await adapter.getGeneList();
       assert.equal(Object.hasOwn(geneList, 'var_gene_id_column'), false);
-      assert.deepEqual(geneList.geneNames, { source: null, filledFromIndex: 0, renamed: [] });
+      assert.deepEqual(geneList.geneNames, { source: null, filledFromIndex: 0, renamed: [], ids: null });
 
       // The loader's adapter-construction descriptor carries the mapping
       // probes beside the stats; they decide the embeddings and never reach
@@ -365,12 +364,8 @@ test('H5AD and Zarr publish one exact identity before direct adoption', async t 
         'no identity member may carry the loader descriptor probes'
       );
 
+      // X=None keeps the var axis's count; its names are never read.
       assert.equal(loader.nVars, 5);
-      assert.deepEqual(
-        loader.varNames,
-        ['G0', 'G1', 'G2', 'G3', 'G4'],
-        'X=None retains the private var axis'
-      );
       assert.deepEqual(
         (await adapter.getGeneList()).fields,
         [],
@@ -613,7 +608,8 @@ test(
       });
       assert.strictEqual(generation.identity, fixture.identity);
       assert.equal(generation.obsFields.n_points, 3);
-      assert.equal(generation.geneList, null);
+      // No gene list: it is read after the first view.
+      assert.equal(Object.hasOwn(generation, 'geneList'), false);
       assert.equal(generation.connectivitySummary.n_edges, null);
       assert.equal(
         (

@@ -38,16 +38,15 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
     launchUrl(CORS_SAMPLE_ROOT, 'sample-cors-catalog'),
     { waitUntil: 'domcontentloaded' },
   );
-  await page.getByRole('button', { name: /Choose a dataset/ }).click();
+  await page.getByRole('button', { name: /Start exploring/ }).click();
+  await expect(page.locator('#welcome-modal')).toBeHidden();
 
   const datasetSelect = page.locator('#dataset-select');
   await expect(
     datasetSelect.locator(`option[value="${CORS_SAMPLE_SELECTION}"]`),
   ).toHaveText(/Current UI fixture/);
   await expect(datasetSelect).toHaveValue(CORS_SAMPLE_SELECTION);
-  // Onboarding leads to the Session panel, never into the dropdown itself;
-  // a click moves no focus, so nothing is ringed.
-  await expect(page.locator('#session-section > summary')).not.toBeFocused();
+  // Closing onboarding never moves focus into the dropdown.
   await expect(datasetSelect).not.toBeFocused();
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
@@ -106,7 +105,8 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
     launchUrl(missingRoot, 'sample-cors-failure'),
     { waitUntil: 'domcontentloaded' },
   );
-  await page.getByRole('button', { name: /Choose a dataset/ }).click();
+  await page.getByRole('button', { name: /Start exploring/ }).click();
+  await expect(page.locator('#welcome-modal')).toBeHidden();
 
   // One unreachable sample catalog is that catalog's failure. The selector
   // stays usable so a dataset opened from disk still needs no network at all.
@@ -124,7 +124,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
   // the loader reported reaches the user as an address to check, not as a
   // network problem to wait out.
   await expect(notice).toContainText(
-    /nothing is published at that address .*Check the address for a typo, then try again/,
+    /datasets\.json was not found at [^ ]+ \(HTTP 404, not found\): the link or record does not exist, or it moved\. Check the link/,
   );
   await expect(notice).not.toContainText(/Check your network/);
   // A transport diagnostic is never put in front of a biologist.
@@ -133,7 +133,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
   await expect(retry).toBeEnabled();
 
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
-  await expect(page.locator('#stats')).toHaveText('Points: 0 • Field: None');
+  await expect(page.locator('#stats')).toHaveText('0 cells • Field: None');
   await expect(page.locator('iframe')).toHaveCount(0);
   expect(
     await page.evaluate(() => window._cellucidViewer.getPointCount()),

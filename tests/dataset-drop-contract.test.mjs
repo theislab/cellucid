@@ -4,8 +4,8 @@ import test from 'node:test';
 import {
   carriesFiles,
   describeDatasetDrop,
-  readDroppedFolder,
 } from '../assets/js/app/ui/modules/dataset-drop.js';
+import { readFolderEntry } from '../assets/js/data/local-folder.js';
 
 function fileItem(name, entry = null) {
   const file = new File([new Uint8Array([1])], name);
@@ -101,7 +101,41 @@ test('a folder is listed across every batch its reader answers', async () => {
       };
     },
   };
-  const files = await readDroppedFolder(root);
+  const files = await readFolderEntry(root);
   assert.deepEqual(files.map(file => file.webkitRelativePath), ['big/a', 'big/b']);
   assert.equal(batches, 3);
+});
+
+test('a dropped folder is read through its handle where the drop gives one, else through its entries', async () => {
+  const handleOf = (name, children) => ({
+    kind: 'directory',
+    name,
+    async *values() {
+      for (const [childName, size] of children) {
+        yield { kind: 'file', name: childName, getFile: async () => new File([new Uint8Array(size)], childName) };
+      }
+    },
+  });
+  const entry = directoryEntry('cells.zarr', [fileEntry('.zgroup')]);
+  const item = (handle) => ({
+    kind: 'file',
+    getAsFile: () => new File([], 'cells.zarr'),
+    webkitGetAsEntry: () => entry,
+    getAsFileSystemHandle: () => Promise.resolve(handle),
+  });
+  // Chromium: the handle, asked for inside the drop event.
+  const withHandle = describeDatasetDrop(transfer([item(handleOf('cells.zarr', [['.zgroup', 1], ['.zmetadata', 2]]))]));
+  assert.equal(withHandle.kind, 'folder');
+  assert.equal((await withHandle.handle).kind, 'directory');
+  assert.deepEqual(
+    (await withHandle.readFiles()).map(file => file.webkitRelativePath),
+    ['cells.zarr/.zgroup', 'cells.zarr/.zmetadata'],
+  );
+  // A synthetic drop's item answers no handle (Chromium resolves undefined): its entries.
+  const without = describeDatasetDrop(transfer([item(undefined)]));
+  assert.equal(await without.handle, null);
+  assert.deepEqual((await without.readFiles()).map(file => file.webkitRelativePath), ['cells.zarr/.zgroup']);
+  // A browser without handles: none asked for.
+  const plain = describeDatasetDrop(transfer([fileItem('cells.zarr', entry)]));
+  assert.equal(plain.handle, null);
 });

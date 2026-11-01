@@ -22,9 +22,13 @@ values as stored (float32, widened exactly to float64):
 3. its quantile is the number of the category's cells at that distance or
    closer, divided by the cell count, both as float32.
 
-Every other cell (a missing code, -1, or a category under ``minPoints``) is
-NaN. The cases are drawn from seeded generators, so every run writes the same
-bytes.
+A cell whose latent row is not finite (NaN in any column) has no place in the
+latent space: it is left out as a cell with a missing code is, adding nothing
+to its category's centroid or size, and ``minPoints`` counts a category's
+placed cells. Every other cell (a missing code, -1, an unplaced cell, or a
+category under ``minPoints``) is NaN. A NaN latent value is written as JSON
+``null``. The cases are drawn from seeded generators, so every run writes the
+same bytes.
 
 Run from the repository root::
 
@@ -53,8 +57,9 @@ def latent_outlier_quantiles(
     """Per-cell outlier quantiles by the rule in the module docstring."""
     values = np.asarray(latent, dtype=np.float32)
     quantiles = np.full(values.shape[0], np.nan, dtype=np.float32)
+    placed = np.isfinite(values).all(axis=1)
     for code in range(n_categories):
-        members = np.nonzero(codes == code)[0]
+        members = np.nonzero((codes == code) & placed)[0]
         n = members.size
         if n < min_points:
             continue
@@ -78,13 +83,30 @@ def case(name: str, latent: np.ndarray, codes: np.ndarray, n_categories: int, mi
     return {
         "name": name,
         "width": int(latent.shape[1]),
-        # Row-major, one float32 value each, as the exact double it widens to.
-        "latent": [float(value) for value in latent.reshape(-1)],
+        # Row-major, one float32 value each, as the exact double it widens
+        # to; NaN (a cell the latent space does not place) as null.
+        "latent": [None if np.isnan(value) else float(value) for value in latent.reshape(-1)],
         "codes": [int(code) for code in codes],
         "nCategories": n_categories,
         "minPoints": min_points,
         "quantilesHex": quantiles.astype("<f4").tobytes().hex(),
     }
+
+
+def unplaced_latent(rng: np.random.Generator) -> np.ndarray:
+    """60 cells in 4 columns; some rows NaN in one column, some in every column.
+
+    Category 0 (cells 0, 3, ...) keeps 16 of its 20 cells, category 1 keeps 14,
+    and category 2 keeps 11, under ``minPoints`` 12.
+    """
+    latent = rng.normal(0.0, 2.0, size=(60, 4))
+    for cell in (0, 9, 30, 57):
+        latent[cell, 1] = np.nan
+    for cell in (1, 4, 7, 10, 13, 16):
+        latent[cell, :] = np.nan
+    for cell in (2, 5, 8, 11, 14, 17, 20, 23, 26):
+        latent[cell, 3] = np.nan
+    return latent
 
 
 def document() -> dict:
@@ -124,15 +146,24 @@ def document() -> dict:
             3,
             2,
         ),
+        case(
+            "cells the latent space does not place (NaN rows) are left out of their category, "
+            "which falls under minPoints when too few cells are placed",
+            unplaced_latent(rng),
+            np.arange(60) % 3,
+            3,
+            12,
+        ),
     ]
     return {
         "_about": (
             "Latent-space outlier quantiles: float32 values widened to float64, centroid sums "
             "in cell order, squared distances in column order, the share at that distance or "
-            "closer as float32. Written by scripts/generate-latent-outlier-conformance.py, "
+            "closer as float32; a cell whose latent row holds NaN (null here) is left out of its "
+            "category. Written by scripts/generate-latent-outlier-conformance.py, "
             "which computes them with numpy, independently of the browser's implementation."
         ),
-        "version": 1,
+        "version": 2,
         "cases": cases,
     }
 

@@ -30,6 +30,7 @@ import {
 } from './wire-contract.js';
 import { isExactOrcidId } from './profile-identifiers.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { throwIfAborted } from '../../utils/abort.js';
 
 const STORAGE_VERSION = 1;
 
@@ -3570,30 +3571,19 @@ export class CommunityAnnotationSession extends EventEmitter {
     const preserveLocalModeration =
       this.getModerationMerges().length > 0;
 
-    const throwIfAborted = () => {
-      if (signal === null || signal.aborted !== true) return;
-      if (signal.reason instanceof Error) throw signal.reason;
-      const error = new Error(
-        '[CommunityAnnotationSession] Pull application was aborted'
-      );
-      error.name = 'AbortError';
-      if (signal.reason !== undefined) error.cause = signal.reason;
-      throw error;
-    };
-
     return this._runPulledRepositoryStateTransaction(() => {
-      throwIfAborted();
+      throwIfAborted(signal);
 
       if (moderationDocument !== null && !preserveLocalModeration) {
         this.setModerationMergesFromDoc(moderationDocument);
       }
-      throwIfAborted();
+      throwIfAborted(signal);
 
       this.rebuildMergedViewFromUserFiles(remoteUserFiles, {
         preferLocalVotes: true,
         hydrateFromOwnFile: this.ownUserFileNeedsHydration(remoteFileShas),
       });
-      throwIfAborted();
+      throwIfAborted(signal);
 
       const enabled = new Set(exactFieldsToAnnotate);
       for (const key of exactCategoricalFieldKeys) {
@@ -3601,14 +3591,14 @@ export class CommunityAnnotationSession extends EventEmitter {
       }
       this.setAnnotatableConsensusSettingsMap(annotatableSettings);
       this.setClosedAnnotatableFields(closedFields);
-      throwIfAborted();
+      throwIfAborted(signal);
 
       this.recordDatasetAccess({
         datasetId,
         fieldsToAnnotate: this.getAnnotatedFields(),
       });
       this.setRemoteFileShas(remoteFileShas);
-      throwIfAborted();
+      throwIfAborted(signal);
       return true;
     });
   }

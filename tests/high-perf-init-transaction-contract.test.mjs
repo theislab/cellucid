@@ -181,7 +181,6 @@ function createInitializationGl(overrides = {}) {
     },
 
     createVertexArray() {
-      if (overrides.nullVertexArray) return null;
       const handle = createHandle('vertex-array');
       live.vertexArrays.add(handle);
       return handle;
@@ -263,7 +262,9 @@ test('renderer initialization publishes one complete resource generation', () =>
   // and sculpted.
   assert.equal(gl._state.live.programs.size, 7);
   assert.equal(gl._state.live.textures.size, 1);
-  assert.equal(gl._state.live.vertexArrays.size, 1);
+  // The live vertex arrays are one VAO a store segment, made when a
+  // publication binds its stores (point-store-segments.js): none yet.
+  assert.equal(gl._state.live.vertexArrays.size, 0);
   assert.equal(renderer.uniformLocations.size, 7);
   assert.equal(renderer.activeProgram, renderer.programs.full);
   assert.equal(gl._state.currentProgram, renderer.programs.full);
@@ -319,11 +320,6 @@ for (const scenario of [
     name: 'dummy texture WebGL publication',
     overrides: { textureUploadError: true },
     error: /candidate dummy LOD texture upload.*WebGL error/i,
-  },
-  {
-    name: 'main VAO allocation',
-    overrides: { nullVertexArray: true },
-    error: /could not allocate its vertex array/i,
   },
   {
     name: 'post-acquisition GL state setup',

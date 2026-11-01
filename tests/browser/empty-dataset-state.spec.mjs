@@ -182,7 +182,9 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
     hasText: 'No dataset is open.',
   });
   await expect(refusal).toHaveCount(1);
-  await expect(refusal).toContainText('"current-ui"');
+  // It names the dataset by the name it was saved under, never by its id.
+  await expect(refusal).toContainText('"Current UI fixture"');
+  await expect(refusal).not.toContainText('current-ui');
   await expect(refusal).not.toContainText('0 cells');
 
   // The modes built on gene expression say so instead of building a form.

@@ -63,7 +63,7 @@ export class GeneRoute {
           route._failure ??= error;
         }));
         return { route: id, generation, port: channel.port2 };
-      }, { timeout: 30000, signal, retainAs: id });
+      }, { signal, retainAs: id });
     } catch (error) {
       await dataLayer.closeGeneRoute(id).catch(() => {});
       throw error;

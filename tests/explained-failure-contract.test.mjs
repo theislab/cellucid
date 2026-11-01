@@ -8,7 +8,7 @@ import {
   explainedFailure,
   isExplainedFailure,
 } from '../assets/js/data/data-source.js';
-import { serializeReaderError } from '../assets/js/data/anndata-reader-worker.js';
+import { toWire } from '../assets/js/utils/error-wire.js';
 import { rebuildReaderError } from '../assets/js/data/anndata-reader-client.js';
 import { describeDataSourceFailure, describeOpeningFailure } from '../assets/js/app/ui/modules/dataset-connections.js';
 import { describeStartupFailure } from '../assets/js/app/startup-failure.js';
@@ -70,7 +70,7 @@ async function unsupportedZarrFailure(codec) {
 
 test('an AnnData refusal stays explained across the reader worker', async () => {
   const original = explainFormatError(await unsupportedHdf5Failure(), 'h5ad');
-  const rebuilt = rebuildReaderError(structuredClone(serializeReaderError(original)));
+  const rebuilt = rebuildReaderError(structuredClone(toWire(original)));
   assert.equal(isExplainedFailure(rebuilt), true);
   assert.equal(rebuilt.message, original.message);
 });
@@ -90,11 +90,13 @@ test('a compression the browser cannot decode is refused by name, before a read 
   assert.equal(scaleOffset.details.feature, 'filter:scaleoffset');
   assert.equal(isExplainedFailure(scaleOffset), true);
 
-  const zarrFailure = await unsupportedZarrFailure('lzma');
+  const zarrFailure = await unsupportedZarrFailure('snappy');
   assert.ok(zarrFailure instanceof ZarrUnsupportedError);
-  const lzma = explainFormatError(zarrFailure, 'zarr');
-  assert.match(lzma.message, /'lzma'.*write_zarr/);
-  assert.equal(isExplainedFailure(lzma), true);
+  const snappy = explainFormatError(zarrFailure, 'zarr');
+  assert.match(snappy.message, /'snappy'.*write_zarr/);
+  assert.equal(isExplainedFailure(snappy), true);
+  // lzma and bz2, refused by the earlier reader, are now read (`codec-layer-contract`).
+  assert.equal(await unsupportedZarrFailure('lzma').then(error => error instanceof ZarrUnsupportedError), false);
   // Blosc with Zstandard, refused by the earlier reader, is now read.
   assert.equal(await unsupportedZarrFailure('zstd').then(error => error instanceof ZarrUnsupportedError), false);
 

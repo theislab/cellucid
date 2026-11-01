@@ -1304,7 +1304,7 @@ test('analysis previews invoke their required full-view modal owner', async () =
         prototype: DEAnalysisUI.prototype,
         result: {
           plotType: '__missing-de-preview-plot__',
-          full: { summary: { groupAName: 'A', groupBName: 'B', groupASize: 3, groupBSize: 4, method: 'wilcox', genesTested: 5, lowN: [], minCells: 10 } },
+          full: { summary: { groupAName: 'A', groupBName: 'B', groupASize: 3, groupBSize: 4, method: 'wilcox', genesTested: 5, lowN: [], minCells: 10, replicates: null } },
         },
         clickClass: 'analysis-expand-btn',
         configure(ui) {

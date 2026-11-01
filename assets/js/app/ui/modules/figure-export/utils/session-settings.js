@@ -17,6 +17,7 @@
 
 import { assertCropRect01 } from './crop.js';
 import { requireExactKeys } from '../../../../../utils/exact-record.js';
+import { parseDecimalText } from '../../../../../utils/format-units.js';
 
 export const FIGURE_EXPORT_SESSION_SETTINGS_VERSION = 1;
 
@@ -217,7 +218,7 @@ export function assertFigureExportSessionSettings(settings) {
  * itself, with no event, is the one a fresh edit started from) and on every
  * `input` and `change` that leaves it valid.
  *
- * @param {{value: string, addEventListener: Function}} input
+ * @param {{value: string, addEventListener: Function}} input - A whole-number box, or a decimal box
  * @param {object} options
  * @param {string} options.label - named in the error of a value never valid
  * @param {readonly [number, number]} options.range - inclusive
@@ -227,14 +228,16 @@ export function assertFigureExportSessionSettings(settings) {
  */
 export function trackCommittedNumber(input, { label, range, integer, signal }) {
   const [minimum, maximum] = range;
-  const pattern = integer
-    ? /^(0|[1-9][0-9]*)$/
-    : /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
   let committed = null;
+  // A whole-number box holds digits; a decimal box (`createDecimalInput`)
+  // a point or a comma, read by its one rule (`parseDecimalText`), and one
+  // that ends in its separator ("1.", "0,") is still being typed.
   const parse = () => {
     const raw = input.value;
-    const value = Number(raw);
-    return pattern.test(raw) && value >= minimum && value <= maximum ? value : null;
+    const value = integer
+      ? (/^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : NaN)
+      : (/[.,]\s*$/.test(raw) ? NaN : parseDecimalText(raw));
+    return value >= minimum && value <= maximum ? value : null;
   };
   const commit = () => {
     const value = parse();

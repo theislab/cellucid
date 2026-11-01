@@ -2,9 +2,15 @@
  * GitHub App OAuth session (via Cloudflare Worker).
  *
  * - Starts OAuth via full-page redirect to `${WORKER_ORIGIN}/auth/login`
- * - Worker redirects back to the app with token in URL fragment
- * - Stores token in the tab's `sessionStorage` through the shared sign-in
- *   store (`data/sources/auth/token-store.js`; never `localStorage`)
+ * - Worker redirects back to the app with an expiring token (GitHub's user
+ *   tokens with expiration: 8 hours) and its lifetime in the URL fragment;
+ *   the refresh token stays in the worker and is not used
+ * - Stores the token and when it expires in the tab's `sessionStorage`
+ *   through the shared sign-in store (`data/sources/auth/token-store.js`;
+ *   never `localStorage`): a reload keeps the sign-in until the token
+ *   expires, then it is forgotten
+ * - Sign out revokes the token at GitHub through the worker
+ *   (`${WORKER_ORIGIN}/auth/revoke`), then forgets it
  * - Fetches user identity from `${WORKER_ORIGIN}/auth/user`
  *
  * This module is UI-agnostic (no DOM writes).
@@ -13,13 +19,20 @@
 import { EventEmitter } from '../utils/event-emitter.js';
 import { isLocalDevHost } from '../utils/local-dev.js';
 import { parseExactJson } from './wire-contract.js';
-import { readSignIn, removeSignIn, writeSignIn } from '../../data/sources/auth/token-store.js';
+import {
+  onSignInChange,
+  readSignIn,
+  removeSignIn,
+  setSignInExpiry,
+  writeSignIn,
+} from '../../data/sources/auth/token-store.js';
 import {
   isCanonicalGitHubAccount,
   isCanonicalGitHubRepositoryFullName,
 } from './github-reference.js';
 import { requireExactObjectKeys } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { isCancellation, cancelled, onAbort } from '../../utils/abort.js';
 
 const DEFAULT_WORKER_ORIGIN = 'https://cellucid-github-auth.benkemalim.workers.dev';
 
@@ -28,6 +41,7 @@ const SIGN_IN_NAME = 'github-app';
 
 const AUTH_FLAG_PARAM = 'cellucid_github_auth';
 const AUTH_TOKEN_PARAM = 'cellucid_github_token';
+const AUTH_TOKEN_EXPIRES_PARAM = 'cellucid_github_token_expires_in';
 const AUTH_ERROR_PARAM = 'cellucid_github_error';
 
 const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
@@ -35,10 +49,11 @@ const DEFAULT_AUTH_RESPONSE_MAX_BYTES = 5_000_000;
 const GITHUB_COLLECTION_MAX_ITEMS = 10_000;
 const WORKER_CAPABILITY_MAX_BYTES = 16_384;
 const WORKER_SERVICE = 'Cellucid GitHub Auth';
-const WORKER_CONTRACT_VERSION = 1;
+const WORKER_CONTRACT_VERSION = 2;
 const WORKER_ENDPOINTS = Object.freeze([
   '/auth/login',
   '/auth/callback',
+  '/auth/revoke',
   '/auth/user',
   '/auth/installations',
   '/auth/installation-repos',
@@ -55,10 +70,6 @@ function assertTimeoutMs(timeoutMs) {
     throw new Error('GitHub request timeout must be a positive safe integer');
   }
   return timeoutMs;
-}
-
-function isAbortError(err) {
-  return err?.name === 'AbortError';
 }
 
 function assertAbortSignalOrNull(signal) {
@@ -90,11 +101,7 @@ function createRequestAbortScope(signal, timeoutMs) {
     if (abortCause === null) abortCause = cause;
     controller.abort();
   };
-  const abortFromOwner = () => abortWithCause('owner');
-  if (ownerSignal !== null) {
-    if (ownerSignal.aborted) abortFromOwner();
-    else ownerSignal.addEventListener('abort', abortFromOwner, { once: true });
-  }
+  const stopOwner = onAbort(ownerSignal, () => abortWithCause('owner'));
 
   let timeout;
   try {
@@ -102,11 +109,7 @@ function createRequestAbortScope(signal, timeoutMs) {
       abortWithCause('timeout');
     }, ms);
   } catch (error) {
-    try {
-      ownerSignal?.removeEventListener('abort', abortFromOwner);
-    } catch {
-      // Timer creation remains the authoritative setup failure.
-    }
+    stopOwner();
     throw error;
   }
 
@@ -121,28 +124,22 @@ function createRequestAbortScope(signal, timeoutMs) {
       } catch {
         // Cleanup cannot replace the authoritative request outcome.
       }
-      try {
-        ownerSignal?.removeEventListener('abort', abortFromOwner);
-      } catch {
-        // Cleanup cannot replace the authoritative request outcome.
-      }
+      stopOwner();
     },
   };
 }
 
-function createRequestAbortedError(url, cause = undefined) {
-  const error = new Error('GitHub authentication request was cancelled');
-  error.name = 'AbortError';
-  error.code = 'GITHUB_REQUEST_ABORTED';
+/** The caller stopped a GitHub authentication request: a cancellation naming its address. */
+function requestCancelled(url, cause = undefined) {
+  const error = cancelled('user', 'GitHub authentication request was cancelled.', cause);
   if (url !== null) error.url = url;
-  if (cause !== undefined) error.cause = cause;
   return error;
 }
 
 function throwIfRequestAborted(scope, url, cause = undefined) {
   const abortCause = scope.abortCause();
   if (abortCause === 'owner') {
-    throw createRequestAbortedError(
+    throw requestCancelled(
       url,
       cause ?? scope.ownerSignal.reason
     );
@@ -228,9 +225,9 @@ function assertExactHttpOrigin(raw, label) {
   return raw;
 }
 
-function storageFailure(kind, operation, cause) {
+function storageFailure(operation, cause) {
   const error = new Error(
-    `${kind} ${operation} failed for the GitHub annotation session`
+    `The tab's sign-in store could not ${operation} the GitHub annotation session`
   );
   error.code = 'GITHUB_AUTH_STORAGE_FAILED';
   error.cause = cause;
@@ -337,7 +334,7 @@ function readSessionItem() {
   try {
     return readSignIn(SIGN_IN_NAME);
   } catch (cause) {
-    throw storageFailure('sessionStorage', 'read', cause);
+    throw storageFailure('read', cause);
   }
 }
 
@@ -346,7 +343,7 @@ function writeSessionItem(value) {
     writeSignIn(SIGN_IN_NAME, value);
     return true;
   } catch (cause) {
-    throw storageFailure('sessionStorage', 'write', cause);
+    throw storageFailure('write', cause);
   }
 }
 
@@ -355,7 +352,7 @@ function removeSessionItem() {
     removeSignIn(SIGN_IN_NAME);
     return true;
   } catch (cause) {
-    throw storageFailure('sessionStorage', 'remove', cause);
+    throw storageFailure('remove', cause);
   }
 }
 
@@ -531,9 +528,9 @@ async function fetchJson(url, {
     }
     return responseJson;
   } catch (err) {
-    if (isAbortError(err) || scope.controller.signal.aborted) {
+    if (isCancellation(err) || scope.controller.signal.aborted) {
       throwIfRequestAborted(scope, url, err);
-      throw createRequestAbortedError(url, err);
+      throw requestCancelled(url, err);
     }
     throw err;
   } finally {
@@ -703,6 +700,7 @@ function assertInstallationRepositoriesResponse(document) {
 const AUTH_FRAGMENT_PARAM_NAMES = new Set([
   AUTH_FLAG_PARAM,
   AUTH_TOKEN_PARAM,
+  AUTH_TOKEN_EXPIRES_PARAM,
   AUTH_ERROR_PARAM,
 ]);
 
@@ -751,14 +749,16 @@ function validateAuthFragment(params) {
     throw new Error('GitHub auth callback flag must occur once with value "1"');
   }
   const tokens = params.getAll(AUTH_TOKEN_PARAM);
+  const lifetimes = params.getAll(AUTH_TOKEN_EXPIRES_PARAM);
   const errors = params.getAll(AUTH_ERROR_PARAM);
   if (
     tokens.length > 1 ||
     errors.length > 1 ||
-    (tokens.length === 0) === (errors.length === 0)
+    (tokens.length === 0) === (errors.length === 0) ||
+    lifetimes.length !== tokens.length
   ) {
     throw new Error(
-      'GitHub auth callback must contain exactly one token or one error'
+      'GitHub auth callback must contain exactly one token with its lifetime, or one error'
     );
   }
   const token = tokens.length ? tokens[0] : null;
@@ -766,10 +766,17 @@ function validateAuthFragment(params) {
   if (token !== null && (!token || /^\s|\s$/.test(token))) {
     throw new Error('GitHub auth callback token must be an exact nonblank string');
   }
+  const expiresIn = lifetimes.length ? Number(lifetimes[0]) : null;
+  if (
+    expiresIn !== null &&
+    (!/^[1-9][0-9]*$/.test(lifetimes[0]) || !Number.isSafeInteger(expiresIn))
+  ) {
+    throw new Error('GitHub auth callback token lifetime must be a positive whole number of seconds');
+  }
   if (error !== null && (!error || /^\s|\s$/.test(error))) {
     throw new Error('GitHub auth callback error must be an exact nonblank string');
   }
-  return { token, error };
+  return { token, expiresIn, error };
 }
 
 function readAuthResultFromUrl(urlString) {
@@ -810,10 +817,10 @@ function readAuthResultFromUrl(urlString) {
     `${hasRetainedSegments ? `#${cleanedHash}` : ''}`;
 
   try {
-    const { token, error } = validateAuthFragment(params);
-    return { token, error, cleanedUrl, validationError: null };
+    const { token, expiresIn, error } = validateAuthFragment(params);
+    return { token, expiresIn, error, cleanedUrl, validationError: null };
   } catch (validationError) {
-    return { token: null, error: null, cleanedUrl, validationError };
+    return { token: null, expiresIn: null, error: null, cleanedUrl, validationError };
   }
 }
 
@@ -828,7 +835,14 @@ export class GitHubAuthSession extends EventEmitter {
     this._verifiedWorkerOrigin = null;
     this._token = null;
     this._user = null;
+    /** When the token expires (milliseconds since the epoch), or null. */
+    this._expiresAt = null;
     this._loadFromSessionStorage();
+    // A token that reaches its end is forgotten: the next annotation request
+    // asks for a new sign-in rather than failing at GitHub.
+    onSignInChange(({ name, change }) => {
+      if (name === SIGN_IN_NAME && change === 'expired' && this._token !== null) this._forget();
+    });
   }
 
   _advanceRequestGeneration() {
@@ -867,17 +881,13 @@ export class GitHubAuthSession extends EventEmitter {
       if (abortCause === null) abortCause = cause;
       controller.abort();
     };
-    const abortFromSession = () => abortWithCause('session');
-    const abortFromCaller = () => abortWithCause('caller');
-    if (sessionSignal.aborted) abortFromSession();
-    else sessionSignal.addEventListener('abort', abortFromSession, { once: true });
-    if (callerSignal.aborted) abortFromCaller();
-    else callerSignal.addEventListener('abort', abortFromCaller, { once: true });
+    const stopSession = onAbort(sessionSignal, () => abortWithCause('session'));
+    const stopCaller = onAbort(callerSignal, () => abortWithCause('caller'));
     owner.getAbortCause = () => abortCause;
     owner.signal = controller.signal;
     owner.cleanup = () => {
-      sessionSignal.removeEventListener('abort', abortFromSession);
-      callerSignal.removeEventListener('abort', abortFromCaller);
+      stopSession();
+      stopCaller();
     };
     return owner;
   }
@@ -902,7 +912,7 @@ export class GitHubAuthSession extends EventEmitter {
         !owner.sessionSignal.aborted
       )
     ) {
-      throw createRequestAbortedError(cause?.url ?? null, cause);
+      throw requestCancelled(cause?.url ?? null, cause);
     }
     if (!this._isRequestOwnerCurrent(owner)) {
       throw createAuthSupersededError(cause);
@@ -971,13 +981,14 @@ export class GitHubAuthSession extends EventEmitter {
 
     let token;
     let user;
+    let expiresAt;
     try {
       const session = parseExactJson(rawSession, {
         path: 'GitHub auth session',
       });
       requireExactObjectKeys(
         session,
-        ['token', 'user'],
+        ['expiresAt', 'token', 'user'],
         'Stored GitHub auth session'
       );
       if (
@@ -987,7 +998,11 @@ export class GitHubAuthSession extends EventEmitter {
       ) {
         throw new Error('Stored GitHub token must be an exact nonblank string');
       }
+      if (!Number.isSafeInteger(session.expiresAt) || session.expiresAt <= Date.now()) {
+        throw new Error('Stored GitHub token has expired');
+      }
       token = session.token;
+      expiresAt = session.expiresAt;
       user = Object.freeze({ ...assertStoredGitHubUser(session.user) });
     } catch {
       try {
@@ -1000,20 +1015,24 @@ export class GitHubAuthSession extends EventEmitter {
     }
     this._token = token;
     this._user = user;
+    this._expiresAt = expiresAt;
+    setSignInExpiry(SIGN_IN_NAME, expiresAt);
   }
 
-  _persistAuthenticatedState(token, user) {
+  _persistAuthenticatedState(token, user, expiresAt) {
     if (
       typeof token !== 'string' ||
       !token ||
-      /^\s|\s$/.test(token)
+      /^\s|\s$/.test(token) ||
+      !Number.isSafeInteger(expiresAt)
     ) {
       throw new Error(
-        'GitHub auth session requires one exact token and user identity'
+        'GitHub auth session requires one exact token, its expiry and user identity'
       );
     }
     writeSessionItem(
       JSON.stringify({
+        expiresAt,
         token,
         user: assertStoredGitHubUser(user),
       })
@@ -1062,7 +1081,7 @@ export class GitHubAuthSession extends EventEmitter {
     } catch (error) {
       this._assertRequestOwnerCurrent(owner, error);
       if (
-        error?.code === 'GITHUB_REQUEST_ABORTED' ||
+        isCancellation(error) ||
         error?.code === 'GITHUB_AUTH_SUPERSEDED'
       ) {
         throw error;
@@ -1083,12 +1102,15 @@ export class GitHubAuthSession extends EventEmitter {
         throw createAuthSupersededError();
       }
     }
-    this._persistAuthenticatedState(owner.token, user);
+    const expiresAt = owner.expiresAt ?? this._expiresAt;
+    this._persistAuthenticatedState(owner.token, user, expiresAt);
     if (publicationGeneration !== this._requestGeneration) {
       throw createAuthSupersededError();
     }
     this._token = owner.token;
     this._user = user;
+    this._expiresAt = expiresAt;
+    setSignInExpiry(SIGN_IN_NAME, expiresAt);
     if (!this._emitChanged()) {
       throw createAuthSupersededError();
     }
@@ -1133,10 +1155,14 @@ export class GitHubAuthSession extends EventEmitter {
     }
   }
 
-  async _acceptToken(token) {
+  async _acceptToken(token, expiresIn) {
     if (typeof token !== 'string' || !token || /^\s|\s$/.test(token)) {
       throw new Error('Missing or inexact GitHub token');
     }
+    if (!Number.isSafeInteger(expiresIn) || expiresIn < 1) {
+      throw new Error('A GitHub token needs its lifetime');
+    }
+    const expiresAt = Date.now() + expiresIn * 1000;
 
     const transitionGeneration = this._advanceRequestGeneration();
     if (transitionGeneration !== this._requestGeneration) {
@@ -1147,6 +1173,7 @@ export class GitHubAuthSession extends EventEmitter {
       token,
       { candidate: true }
     );
+    owner.expiresAt = expiresAt;
     try {
       const user = await this._fetchUserForOwner(owner);
       this._publishAuthenticatedOwner(owner, user);
@@ -1158,7 +1185,15 @@ export class GitHubAuthSession extends EventEmitter {
 
   async completeSignInFromRedirect({ url = null } = {}) {
     if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
-    const result = readAuthResultFromUrl(url);
+    // The head script (`app/ui/core/auth-fragment-init.js`) took the sign-in's
+    // fragment out of the address before anything else ran; it is read once.
+    let callbackUrl = url;
+    const taken = window.cellucidGitHubAuthFragment;
+    if (callbackUrl === null && typeof taken === 'string') {
+      delete window.cellucidGitHubAuthFragment;
+      callbackUrl = `${window.location.origin}${window.location.pathname}${window.location.search}${taken}`;
+    }
+    const result = readAuthResultFromUrl(callbackUrl);
     if (!result) return null;
 
     if (result.cleanedUrl) {
@@ -1188,7 +1223,7 @@ export class GitHubAuthSession extends EventEmitter {
       throw err;
     }
 
-    return this._acceptToken(result.token);
+    return this._acceptToken(result.token, result.expiresIn);
   }
 
   async signIn({ returnTo = null, signal = null } = {}) {
@@ -1233,7 +1268,25 @@ export class GitHubAuthSession extends EventEmitter {
     }
   }
 
+  /**
+   * Sign out: forget the token here at once, and revoke it at GitHub (through
+   * the worker, which holds the app's credentials). The revocation is sent
+   * whether or not it can be awaited (`keepalive`), so a page closed right
+   * after still ends the token.
+   *
+   * @returns {Promise<boolean>} Whether GitHub revoked it (true with nothing
+   *   to revoke). False when the worker could not (unreachable, or a worker
+   *   deployed before `/auth/revoke`): the token then stays valid until it
+   *   expires, which the caller says.
+   */
   signOut() {
+    const token = this._token;
+    this._forget();
+    return token === null ? Promise.resolve(true) : this._revoke(token);
+  }
+
+  /** Forget the sign-in in this tab (sign-out, or a token that expired). @private */
+  _forget() {
     const hadAuthenticatedState = this.isAuthenticated();
     const signOutGeneration = this._advanceRequestGeneration();
     if (signOutGeneration !== this._requestGeneration) return;
@@ -1242,10 +1295,30 @@ export class GitHubAuthSession extends EventEmitter {
     // never claim to be signed out while a reload would restore the token.
     removeSessionItem();
     if (signOutGeneration !== this._requestGeneration) return;
-    if (!hadAuthenticatedState) return;
+    this._expiresAt = null;
+    if (!hadAuthenticatedState) {
+      this._token = null;
+      return;
+    }
     this._token = null;
     this._user = null;
     this._emitChanged();
+  }
+
+  /** @private @returns {Promise<boolean>} */
+  async _revoke(token) {
+    try {
+      const response = await globalThis.fetch(`${this.getWorkerOrigin()}/auth/revoke`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        keepalive: true,
+      });
+      return response.status === 204;
+    } catch {
+      return false;
+    }
   }
 
   async listInstallations({ signal = null } = {}) {

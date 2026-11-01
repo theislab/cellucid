@@ -775,16 +775,18 @@ test('viewer invalidates smoke resources and requires reload after WebGL context
   expect(proof).toEqual({
     cacheAlreadyInvalidated: true,
   });
+  // The context is away and the viewer waits for it back
+  // (graphics-context-restore.spec.mjs): restoring, no Reload.
   await expect(page.locator('#cellucid-webgl-context-overlay')).toBeVisible();
   await expect(page.locator('#cellucid-webgl-context-overlay')).toContainText(
-    'WebGL context lost. Reload required to continue.',
+    'The graphics were reset by the browser. Restoring them',
   );
   await expect(
     page.locator('#cellucid-webgl-context-overlay').getByRole('button', {
       name: 'Reload',
       exact: true,
     }),
-  ).toBeVisible();
+  ).toBeHidden();
   const retirementFailure = await page.evaluate(async () => {
     try {
       await window._cellucidDispose();

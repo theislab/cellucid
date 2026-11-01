@@ -8,12 +8,13 @@
  * - **Cancel.** A job owns one `AbortController`; its `signal` goes to every
  *   read and compute task of the job, so cancelling stops them where they
  *   are (reads in the reader worker, tasks in the analysis workers).
- *   Cancelling rejects with `cancelledError()`, an `AbortError`, and is never
+ *   Cancelling rejects with a `user` cancellation (`utils/abort.js`), and is never
  *   a failure: it is not logged as one, not shown as one, and leaves nothing
  *   half-applied (the feature applies a result only once its job is done).
- * - **Shared work.** `awaitWithSignal` lets one caller stop waiting while the
- *   work goes on for others; `SharedWork` runs one piece of work for many
- *   callers and stops it only when the last of them has gone.
+ * - **Shared work.** `awaitWithSignal` (`utils/abort.js`) lets one caller
+ *   stop waiting while the work goes on for others; one piece of work run for
+ *   many callers is a `SharedWork` (`utils/abort.js`), stopped only when the
+ *   last of them has gone.
  * - **States.** `running` (with the cost, when it was known before starting:
  *   `plan`), then `done`, `failed` (with why) or `cancelled` (the view offers
  *   Run again). A job that has not started is the feature's own state.
@@ -29,9 +30,11 @@
  * @module app/jobs/cancellable-job
  */
 
-import { getNotificationCenter } from '../notification-center.js';
+import { NOTICE_AFTER_MS, getNotificationCenter } from '../notification-center.js';
 import { describeReadProgress, getReadActivityLog } from '../../data/read-activity-log.js';
 import { formatBytes, formatDuration, formatRemaining, formatCount } from '../../utils/format-units.js';
+import { trackCellWork } from '../../data/open-cells-work.js';
+import { cancel, isCancellation } from '../../utils/abort.js';
 
 /**
  * Read kinds a job owns (`ReadActivity.kind`): an analysis's gene reads, the
@@ -49,117 +52,8 @@ export function isJobRead(activity) {
   return JOB_READ_KINDS.has(activity?.kind) || (activity?.adoptedBy?.length ?? 0) > 0;
 }
 
-/** A job is shown as a progress notification once it has run this long. */
-const NOTIFY_AFTER_MS = 700;
-
 /** Notification and view updates are coalesced to at most this often. */
 const UPDATE_EVERY_MS = 200;
-
-/**
- * The error a cancelled job rejects with: an `AbortError` naming the work.
- *
- * @param {string} [what] - What was cancelled, as a sentence subject
- * @returns {DOMException}
- */
-export function cancelledError(what = 'The work') {
-  return new DOMException(`${what} was cancelled.`, 'AbortError');
-}
-
-/** Whether `error` is a cancellation (any `AbortError`), never a failure. */
-export function isCancellation(error) {
-  return error?.name === 'AbortError';
-}
-
-/** Why `signal` aborted, as an error: its reason, else an AbortError. */
-export function abortReasonOf(signal) {
-  return signal?.reason instanceof Error || isCancellation(signal?.reason)
-    ? signal.reason
-    : cancelledError();
-}
-
-/** Throw the abort reason when `signal` has aborted. */
-export function throwIfAborted(signal) {
-  if (signal?.aborted) throw abortReasonOf(signal);
-}
-
-/**
- * Wait for `task`, or reject at once when `signal` aborts. The task goes on:
- * other callers may still be waiting for it.
- *
- * @template T
- * @param {Promise<T>} task
- * @param {AbortSignal|null|undefined} signal
- * @returns {Promise<T>}
- */
-export function awaitWithSignal(task, signal) {
-  const work = Promise.resolve(task);
-  if (signal === null || signal === undefined) return work;
-  if (signal.aborted) {
-    // The work's own outcome is observed: nobody else may wait for it.
-    work.catch(() => {});
-    return Promise.reject(abortReasonOf(signal));
-  }
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(abortReasonOf(signal));
-    signal.addEventListener('abort', onAbort, { once: true });
-    work.then(
-      value => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(value);
-      },
-      error => {
-        signal.removeEventListener('abort', onAbort);
-        reject(error);
-      }
-    );
-  });
-}
-
-/**
- * One piece of work many callers wait for, stopped only when every caller
- * has stopped waiting: a caller whose signal aborts is answered at once, and
- * the work's own signal aborts when no caller is left.
- */
-export class SharedWork {
-  /**
-   * @param {(signal: AbortSignal) => Promise<*>} start - Starts the work
-   */
-  constructor(start) {
-    this._controller = new AbortController();
-    this._waiting = 0;
-    this.promise = start(this._controller.signal);
-    // A rejection nobody waits for any more is not unhandled.
-    this.promise.catch(() => {});
-  }
-
-  /** Whether the work was stopped because nobody waits for it. */
-  get abandoned() {
-    return this._controller.signal.aborted;
-  }
-
-  /**
-   * Wait for the work as one caller.
-   *
-   * @param {AbortSignal|null} [signal] - Ends this caller's wait
-   * @returns {Promise<*>}
-   */
-  join(signal = null) {
-    if (signal?.aborted) return Promise.reject(abortReasonOf(signal));
-    this._waiting += 1;
-    let left = false;
-    const leave = () => {
-      if (left) return;
-      left = true;
-      this._waiting -= 1;
-      if (this._waiting === 0 && signal?.aborted) {
-        this._controller.abort(abortReasonOf(signal));
-      }
-    };
-    const waited = awaitWithSignal(this.promise, signal);
-    waited.then(leave, leave);
-    return waited;
-  }
-}
 
 /**
  * A request generation: each `next()` supersedes every earlier one, so work
@@ -210,8 +104,11 @@ export class CancellableJob {
    *   `owner` is the job's `id` (pass `job.id` as the reads' owner)
    * @param {() => void} [options.onCancel] - Called once when the job is
    *   cancelled, by whatever means (Cancel, the notification, its owner)
-   * @param {number} [options.notifyAfterMs=NOTIFY_AFTER_MS] - When the
-   *   progress notification appears; `Infinity` never shows one
+   * @param {number} [options.notifyAfterMs=NOTICE_AFTER_MS] - When the
+   *   progress notification appears: once the job has run as long as any
+   *   work in progress must before its card is shown
+   *   (`notification-center.js`), so a job that ends sooner shows none.
+   *   `Infinity` never shows one
    * @param {boolean} [options.failureNotice=true] - Whether a failure before
    *   the progress notification appeared gets an error notification of its
    *   own (false where the feature's own view always says why)
@@ -225,7 +122,7 @@ export class CancellableJob {
     readKind = null,
     ownsRead = null,
     onCancel = () => {},
-    notifyAfterMs = NOTIFY_AFTER_MS,
+    notifyAfterMs = NOTICE_AFTER_MS,
     failureNotice = true,
     notifications = getNotificationCenter(),
     log = getReadActivityLog(),
@@ -277,6 +174,9 @@ export class CancellableJob {
     this._notifyTimer = Number.isFinite(notifyAfterMs)
       ? setTimeout(() => this._notify(), notifyAfterMs)
       : null;
+    // A job works on the open cells: changing them in place waits for it
+    // to end (`data/open-cells-work.js`).
+    trackCellWork(new Promise(resolve => { this._ended = resolve; }));
   }
 
   /** Aborts when the job is cancelled: pass it to every read and task. */
@@ -384,7 +284,7 @@ export class CancellableJob {
   cancel() {
     if (!this.running) return false;
     this._end('cancelled');
-    this._controller.abort(cancelledError(this.title));
+    cancel(this._controller, 'user', `${this.title} was cancelled.`);
     if (this._notificationId !== null) {
       this._closeNotification(id => this._notifications.dismiss(id));
     }
@@ -449,6 +349,7 @@ export class CancellableJob {
   _end(state) {
     this.state = state;
     this.endedAt = performance.now();
+    this._ended();
     clearTimeout(this._notifyTimer);
     this._notifyTimer = null;
     this._unsubscribeReads?.();
@@ -504,6 +405,8 @@ export class CancellableJob {
         this.cancel();
       },
     });
+    // The job has already run as long as work in progress waits to be shown.
+    this._notifications.reveal?.(this._notificationId);
   }
 
   /** @private */

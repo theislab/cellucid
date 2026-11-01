@@ -55,7 +55,8 @@ function page(id, cellIndices) {
       type: 'lasso',
       label: id,
       enabled: true,
-      cellIndices,
+      // A group holds a cell list, as the highlight manager publishes it.
+      cellIndices: Uint32Array.from(cellIndices),
       cellCount: cellIndices.length,
     }],
   };

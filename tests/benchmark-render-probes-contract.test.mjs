@@ -49,6 +49,7 @@ const ENUMS = Object.freeze({
   ACTIVE_UNIFORMS: 0x8b86,
   QUERY_RESULT: 0x8866,
   QUERY_RESULT_AVAILABLE: 0x8867,
+  CURRENT_QUERY: 0x8865,
   COLOR_BUFFER_BIT: 0x4000
 });
 
@@ -149,6 +150,10 @@ class FakeContext {
   getQueryParameter(query, parameter) {
     if (parameter === ENUMS.QUERY_RESULT_AVAILABLE) return query.ended;
     return 2_000_000; // 2 ms per query
+  }
+  getQuery(target, parameter) {
+    assert.equal(parameter, ENUMS.CURRENT_QUERY);
+    return this.activeQuery;
   }
   deleteQuery() {
     this.deletedQueries++;
@@ -343,6 +348,41 @@ test('timed passes use one query per run, never nested, and report GPU time', as
   assert.equal(summary.passes.points.gpuMs, 2);
   assert.equal(summary.passes.edges.instancesSubmitted, 100);
   assert.equal(gl.activeQuery, null);
+  assert.equal(summary.untimedPasses, 0);
+  profiler.restore();
+  uploads.restore();
+});
+
+test('a pass that begins while another owner times the frame is not timed, and is counted', async () => {
+  const pointsProgram = {};
+  const edgesProgram = {};
+  const gl = new FakeContext({
+    timing: true,
+    uniformsByProgram: new Map([
+      [pointsProgram, ['u_lodIndexTex']],
+      [edgesProgram, ['u_lineWidth', 'u_viewportSize']]
+    ])
+  });
+  const uploads = instrumentGlUploads(gl);
+  const profiler = createPassProfiler(gl, {
+    uploadCounters: uploads,
+    timing: true,
+    requestFrame: callback => setTimeout(callback, 0)
+  });
+  const token = profiler.openWindow();
+  // The viewer's frame-cost measurement times this frame
+  // (`rendering/full-detail-frame-cost.js`).
+  const frameQuery = gl.createQuery();
+  gl.beginQuery(gl.timer.TIME_ELAPSED_EXT, frameQuery);
+  gl.useProgram(pointsProgram);
+  gl.drawArrays(gl.POINTS, 0, 10);
+  gl.useProgram(edgesProgram);
+  gl.endQuery(gl.timer.TIME_ELAPSED_EXT);
+  profiler.endFrame();
+  const summary = await profiler.closeWindow(token);
+  assert.equal(summary.untimedPasses, 2);
+  assert.equal(summary.passes.points.gpuQueries, 0);
+  assert.equal(summary.passes.points.drawCalls, 1, 'still counted');
   profiler.restore();
   uploads.restore();
 });

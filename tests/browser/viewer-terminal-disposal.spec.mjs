@@ -2,6 +2,7 @@ import { expect, test } from './helpers/test.mjs';
 
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=viewer-terminal-disposal-ci`;
@@ -12,6 +13,11 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
+  // The opening is over before its owners are torn down. The fence's audit
+  // counts every animation frame the page asks for, whoever asks, and work
+  // the opening still has under way is not the viewer's (2 counted in Web
+  // contracts run 41269083996, macOS Firefox; who asked was not recorded).
+  await waitForPageAtRest(page);
   await page.evaluate(async () => {
     const ui = window._cellucidUi;
     if (
@@ -27,7 +33,7 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test('real WebGL loss is a permanent owner fence with no restoration or disposal GL work', async ({
+test('real WebGL loss fences every owner with no GL work while the context is away, and disposal during it makes none', async ({
   page,
 }) => {
   const pageErrors = [];
@@ -257,14 +263,16 @@ test('real WebGL loss is a permanent owner fence with no restoration or disposal
     };
   });
 
-  expect(proof.lossDefaultPrevented).toBe(false);
+  // The viewer asks for the context back (graphics-context-restore.spec.mjs
+  // restores it); here it never comes, and the viewer waits, fenced.
+  expect(proof.lossDefaultPrevented).toBe(true);
   expect(proof.contextLostAfterEvent).toBe(true);
   expect(proof.contextMenuDefaultPrevented).toBe(false);
-  expect(proof.repeatedLossDefaultPrevented).toBe(false);
-  expect(proof.resizeDisconnectCallsAfterLoss).toBeGreaterThanOrEqual(1);
-  expect(proof.resizeDisconnectCalls).toBe(
-    proof.resizeDisconnectCallsAfterLoss,
-  );
+  expect(proof.repeatedLossDefaultPrevented).toBe(true);
+  // Listeners and observers stay for the restored context; disposal
+  // retires them.
+  expect(proof.resizeDisconnectCallsAfterLoss).toBe(0);
+  expect(proof.resizeDisconnectCalls).toBeGreaterThanOrEqual(1);
   expect(proof.projectileCompletions).toHaveLength(1);
   const [projectileCompletion] = proof.projectileCompletions;
   // WEBGL_lose_context initiates loss, but engines do not promise that the

@@ -12,11 +12,10 @@ import { viewContextViewerSyncMethods } from './view-context-viewer-sync.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { MappingLoadError } from '../../../data/data-mapping-candidates.js';
 import { PLACES } from '../../ui/place-names.js';
+import { unplacedCellsText } from '../../unplaced-cells-notice.js';
+import { cancelled, isCancellation } from '../../../utils/abort.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
-export const DATASET_VIEW_LOAD_SUPERSEDED_CODE =
-  'CELLUCID_DATASET_VIEW_LOAD_SUPERSEDED';
-
 function requireDimensionLevel(level, label = 'Dimension') {
   if (!Number.isInteger(level) || !SUPPORTED_DIMENSIONS.has(level)) {
     throw new RangeError(`${label} must be exactly 1, 2, or 3.`);
@@ -66,17 +65,9 @@ function readDatasetGeneration(state) {
   return generation;
 }
 
-function createDatasetViewLoadSupersededError(operation) {
-  const error = new Error(
-    `${operation} was superseded by a dataset or runtime-owner replacement.`
-  );
-  error.name = 'AbortError';
-  error.code = DATASET_VIEW_LOAD_SUPERSEDED_CODE;
-  return error;
-}
-
-function isDatasetViewLoadSupersededError(error) {
-  return error?.code === DATASET_VIEW_LOAD_SUPERSEDED_CODE;
+/** A view load a newer dataset or runtime owner replaced: a `superseded` cancellation. */
+function datasetViewLoadSuperseded(operation) {
+  return cancelled('superseded', `${operation} was superseded by a dataset or runtime-owner replacement.`);
 }
 
 function viewerIsTerminal(viewer) {
@@ -102,13 +93,13 @@ function assertCurrentDimensionLoadOwner(state, owner) {
     try {
       currentField = state.getFieldForView(owner.targetViewId);
     } catch {
-      throw createDatasetViewLoadSupersededError(
+      throw datasetViewLoadSuperseded(
         'Dimension coordinate loading'
       );
     }
   }
   if (!ownerIsCurrent || currentField !== owner.field) {
-    throw createDatasetViewLoadSupersededError(
+    throw datasetViewLoadSuperseded(
       'Representation coordinate loading'
     );
   }
@@ -128,7 +119,7 @@ function isCurrentVectorLoadOwner(state, owner) {
 
 function assertCurrentVectorLoadOwner(state, owner) {
   if (!isCurrentVectorLoadOwner(state, owner)) {
-    throw createDatasetViewLoadSupersededError(
+    throw datasetViewLoadSuperseded(
       'Vector-field loading'
     );
   }
@@ -227,6 +218,13 @@ export class DataStateViewMethods {
       manager.setResidencyListener({
         onEvict: positions => this.viewer?.releaseRepresentationGeometry?.(positions),
         onPressure: () => this.viewer?.releaseRetainedGeometry?.(),
+      });
+    }
+    // Cells an embedding does not place (NaN rows) are said once, with the
+    // first of them named; views of it leave them out.
+    if (typeof manager.setUnplacedCellsListener === 'function') {
+      manager.setUnplacedCellsListener(({ label, count, names, added }) => {
+        getNotificationCenter().info(unplacedCellsText({ kind: 'layout', label, count, names, added }), { category: 'dimension' });
       });
     }
     const openingLayout = manager.getDefaultLayoutKey();
@@ -407,6 +405,12 @@ export class DataStateViewMethods {
       if (notifications !== null) {
         notifications.complete(notifId, `Loaded ${level}D ${descriptor.label}`);
         readReported = true;
+        // Cells without a vector (NaN rows) are drawn without an arrow.
+        if (fieldData.unplacedCount > 0) {
+          notifications.info(unplacedCellsText({
+            kind: 'vectors', label: descriptor.label, count: fieldData.unplacedCount, names: fieldData.unplacedNames,
+          }), { category: 'data' });
+        }
       }
       viewer.setVectorFieldData(fieldId, layoutKey, fieldData);
       return true;
@@ -415,14 +419,14 @@ export class DataStateViewMethods {
       // is superseded, whatever the aborted download rejected with.
       const terminalError = isCurrentVectorLoadOwner(this, loadOwner)
         ? error
-        : createDatasetViewLoadSupersededError('Vector-field loading');
+        : datasetViewLoadSuperseded('Vector-field loading');
       // A vector array whose values cannot be drawn stays unusable, with the
       // reason, in the data-mapping panel for the rest of this dataset.
       if (terminalError instanceof MappingLoadError) {
         this._markMappingChoiceUnusable('vectorFields', terminalError.key, terminalError.reason);
       }
       if (notifications !== null && !readReported) {
-        if (isDatasetViewLoadSupersededError(terminalError)) {
+        if (isCancellation(terminalError)) {
           notifications.dismiss(notifId);
         } else {
           const message = terminalError instanceof Error

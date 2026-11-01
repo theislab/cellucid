@@ -3,9 +3,10 @@
  * cellucid-r server (`cellucid_serve()`):
  *
  * - The app opens the object R serves from memory -- an uncompressed
- *   Cellucid-ready AnnData Zarr (no compressor, no shuffle), whose X R makes
- *   gene by gene from the object's genes x cells matrix -- and a gene read
- *   through the app's data layer holds exactly the values R holds.
+ *   Cellucid-ready AnnData Zarr (no compressor, no shuffle), its cells in
+ *   priority order, whose X R makes gene by gene from the object's genes x
+ *   cells matrix -- and a gene read through the app's data layer holds
+ *   exactly the values R holds, cell by original position.
  * - On the viewer channel, R's highlight and visibility commands arrive as
  *   binary frames, the cells R named, ascending; a selection the page makes
  *   reaches R whole; stopping the viewer ends the page's channel.
@@ -112,9 +113,12 @@ test('the R viewer serves its object uncompressed and talks binary frames on the
         got = new Float32Array(column.length);
         for (let index = 0; index < column.indices.length; index++) got[column.indices[index]] = column.values[index];
       }
+      // R serves its object in priority order (R/priority.R): open cell i
+      // is the cell at original position originalAt(i), R's values[that].
+      const identity = window._cellucidState.cellIdentity;
       let differ = 0;
       for (let index = 0; index < values.length; index++) {
-        if (got[index] !== Math.fround(values[index])) differ += 1;
+        if (got[index] !== Math.fround(values[identity.originalAt(index)])) differ += 1;
       }
       return { length: got.length, differ, nonzero: values.filter(value => value !== 0).length };
     }, { gene: config.gene, values: config.values });
@@ -143,6 +147,12 @@ test('the R viewer serves its object uncompressed and talks binary frames on the
       });
       source.onChannelEnd(end => window.__channel.ends.push(end.kind));
       if (!(await source.initialize())) throw new Error('the channel did not open');
+      // Every cell open: the channel names cells by their original positions.
+      const { createCellIdentity } = await import('/assets/js/data/cell-identity.js');
+      const identity = createCellIdentity({ nObs: config.cells });
+      source.setCellIdentityProvider(() => identity);
+      // The served dataset is the one shown.
+      source.setShownDatasetProvider(() => 'r-channel');
       source.acceptCommands();
     }, config);
     giveTurn();
@@ -151,12 +161,12 @@ test('the R viewer serves its object uncompressed and talks binary frames on the
     await expect.poll(() => page.evaluate(() => window.__channel.commands), { timeout: 30_000 })
       .toEqual(['setVisibility:false:0,2', 'setVisibility:true:all']);
     await page.evaluate(async cells => {
-      await window.__channel.source.notifyReady({ nCells: cells, dimensions: 2 });
+      await window.__channel.source.notifyReady({ dimensions: 2 });
       const selected = new Uint32Array(5000);
       for (let index = 0; index < selected.length; index++) selected[index] = index * 4;
       await window.__channel.source.notifySelection(selected, 'lasso');
     }, config.cells);
-    expect(await next()).toEqual({ ready: { n_cells: config.cells, dimensions: 2 } });
+    expect(await next()).toEqual({ ready: { n_cells: config.cells, n_obs: config.cells, dimensions: 2 } });
     expect(await next()).toEqual({ selection: { n: 5000, first: 1, last: 19997, name: 'cell1', source: 'lasso' } });
 
     giveTurn();

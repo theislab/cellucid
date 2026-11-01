@@ -11,6 +11,8 @@
  * @module formats/zip/crc32
  */
 
+import { HOST_LITTLE_ENDIAN as LITTLE_ENDIAN } from '../io/byte-order.js';
+
 const TABLES = (() => {
   const tables = new Uint32Array(16 * 256);
   for (let n = 0; n < 256; n++) {
@@ -28,8 +30,6 @@ const TABLES = (() => {
   return tables;
 })();
 
-/** Whether this host stores a 32-bit word low byte first, as CRC-32 consumes it. */
-const LITTLE_ENDIAN = new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
 
 /** Sixteen bytes per step, as four words `a b c d` (low byte first). */
 function step16(t, a, b, c, d) {

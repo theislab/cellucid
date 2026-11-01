@@ -167,6 +167,13 @@ test('decimal controls track the same way, and a value never valid is an error',
   opacity.value = '1.';
   opacity.dispatchEvent(new Event('input'));
   assert.equal(tracked.read(), 0.15);
+  // A decimal comma, as a German or Turkish keyboard types it, is the same number.
+  opacity.value = '0,3';
+  opacity.dispatchEvent(new Event('input'));
+  assert.equal(tracked.read(), 0.3);
+  opacity.value = '0,';
+  opacity.dispatchEvent(new Event('input'));
+  assert.equal(tracked.read(), 0.3, 'still being typed');
 
   const never = trackCommittedNumber(numberBox('abc'), {
     label: 'width',

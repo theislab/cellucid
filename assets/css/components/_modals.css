@@ -852,6 +852,73 @@
   user-select: text;
 }
 
+/* Stored in this browser (ui/modules/kept-stores-dialog.js): one section per
+   dataset (its name, host and size, with Remove), its kept kinds as rows. */
+.kept-stores-list {
+  max-height: min(60dvh, 480px);
+  overflow-y: auto;
+}
+
+.kept-dataset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.kept-dataset + .kept-dataset {
+  margin-top: var(--space-1-5);
+  padding-top: var(--space-1-5);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.kept-dataset-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.kept-dataset-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.kept-dataset-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--type-control);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.kept-dataset-facts {
+  font-size: var(--type-hint);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.kept-dataset-head > .btn {
+  flex: none;
+}
+
+/* Where it's kept: the dialog's foot, ruled off from the list. */
+.kept-stores-where {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--control-row-gap);
+  padding-top: var(--control-block-gap);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.kept-stores-where > .fact-list {
+  align-self: stretch;
+}
+
 /* Share this dataset */
 .share-item {
   display: flex;

@@ -23,7 +23,11 @@ export function createInProcessAnnDataReaderWorker() {
     if (!worker.terminated) worker.onmessage?.({ data });
   };
   const handle = createAnnDataReaderHandler({
-    post: message => queueMicrotask(() => deliver(structuredClone(message))),
+    post: message => queueMicrotask(() => {
+      deliver(structuredClone(message));
+      // A worker that left (`{leave: true}`) ends itself, as `close()` ends a browser's.
+      if (message?.event === 'left') worker.terminate();
+    }),
   });
   worker.postMessage = (message, transfer = []) => {
     // A transferred buffer is detached on the sending side, as in a browser.

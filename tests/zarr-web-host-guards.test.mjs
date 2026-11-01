@@ -13,6 +13,7 @@ import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 import { REMOTE_POLICY } from '../assets/js/formats/io/byte-source.js';
 import { LinkMeter } from '../assets/js/formats/io/link.js';
 
+import { until } from './helpers/until.mjs';
 import { virtualTime } from './helpers/virtual-time.mjs';
 
 import { corpusEntries } from './helpers/zarr-corpus.mjs';
@@ -27,7 +28,7 @@ const HIDDEN = /(^|\/)[_.]/;
  * virtual clock, so they count round trips in a row whatever the load on the
  * machine; without it, on real timers (a sweep of cancels at real moments).
  */
-function hostFetch(entries, { hides = null, latencyMs = 0, log = [], time = null } = {}) {
+function hostFetch(entries, { hides = null, latencyMs = 0, log = [], time = null, missingStatus = 404 } = {}) {
   const now = time?.now ?? (() => performance.now());
   return async (url, init = {}) => {
     const key = decodeURIComponent(new URL(url).pathname.replace(/^\/host\//, ''));
@@ -46,10 +47,34 @@ function hostFetch(entries, { hides = null, latencyMs = 0, log = [], time = null
     if (init.signal?.aborted) throw init.signal.reason;
     entry.end = now();
     const bytes = hides?.test(key) ? undefined : entries.get(key);
-    if (bytes === undefined) return new Response(null, { status: 404 });
+    if (bytes === undefined) return new Response(null, { status: missingStatus });
     return new Response(bytes, { status: 200 });
   };
 }
+
+test('an S3 or GCS bucket that answers 403 for a missing object: the root document a store lacks, and a chunk once the bucket served the store', async () => {
+  for (const store of ['anndata/v2.zarr', 'anndata/v3.zarr']) {
+    const entries = await corpusEntries(store);
+    const chunkKey = [...entries.keys()].find(key => /^obs\/n_genes\/(c\/)?0$/.test(key));
+    assert.ok(chunkKey, `${store}: a chunk to leave out`);
+    // zarr-python leaves out a chunk that holds only the fill value.
+    const withoutChunk = new Map([...entries].filter(([key]) => key !== chunkKey));
+    for (const host of ['https://bucket.s3.us-west-2.amazonaws.com/host/', 'https://storage.googleapis.com/host/']) {
+      const root = await openZarr(httpStore(host, { fetch: hostFetch(withoutChunk, { missingStatus: 403 }) }));
+      const array = root.get('obs/n_genes');
+      const values = await array.read();
+      assert.equal(values.length, array.shape[0], `${store} on ${host}`);
+      assert.ok(Array.from(values).every(value => Number(value) === Number(array.fillValue ?? 0)), `${store} on ${host}: the fill value`);
+    }
+    // Any other host's 403 is the host refusing, said as such (on opening, or on the read).
+    await assert.rejects((async () => {
+      const web = await openZarr(httpStore('https://pages.test/host/', { fetch: hostFetch(withoutChunk, { missingStatus: 403 }) }));
+      await web.get('obs/n_genes').read();
+    })(), /HTTP 403/);
+    // A bucket that refuses its metadata is private: refused, never read as empty.
+    await assert.rejects(openZarr(httpStore('https://bucket.s3.us-west-2.amazonaws.com/host/', { fetch: hostFetch(new Map(), { missingStatus: 403 }) })), /403/);
+  }
+});
 
 for (const store of ['anndata/v2.zarr', 'anndata/v3.zarr']) {
   test(`${store}: a host hiding "_" paths is refused, not read as empty names`, async () => {
@@ -109,12 +134,14 @@ test('cancelling remote opens and reads at any moment leaves no unhandled reject
   const onUnhandled = error => unhandled.push(error);
   process.on('unhandledRejection', onUnhandled);
   const platformFetch = globalThis.fetch;
+  const controllers = [];
   try {
     for (const store of ['anndata/v2.zarr', 'anndata/v3.zarr', 'anndata/v3-sharded.zarr']) {
       const entries = await corpusEntries(store);
       const fetch = hostFetch(entries, { latencyMs: 2 });
       for (const after of [0, 1, 3, 5, 8, 12]) {
         const controller = new AbortController();
+        controllers.push(controller);
         setTimeout(() => controller.abort(), after);
         const signal = controller.signal;
         globalThis.fetch = fetch;
@@ -134,10 +161,102 @@ test('cancelling remote opens and reads at any moment leaves no unhandled reject
         opened.root.close();
       }
     }
-    await new Promise(resolve => setTimeout(resolve, 50));
+    // Every cancel has come (an opening may end before its cancel does),
+    // and what it rejects has been handed on, a task later: a rejection
+    // nobody handles is reported by then.
+    await until(() => controllers.every(controller => controller.signal.aborted), 'every cancel made');
+    await new Promise(resolve => setTimeout(resolve, 0));
   } finally {
     process.off('unhandledRejection', onUnhandled);
     globalThis.fetch = platformFetch;
   }
   assert.deepEqual(unhandled.map(error => `${error?.name}: ${error?.message}`), []);
+});
+
+test('a store with mirrors spreads its requests over their hosts and drops a mirror that fails, reading every value', async () => {
+  const entries = await corpusEntries('anndata/v3.zarr');
+  const asked = [];
+  const served = hostFetch(entries);
+  const fetch = (url, init) => {
+    const host = new URL(url).host;
+    asked.push(host);
+    if (host === 'broken.test') return Promise.reject(new TypeError('Failed to fetch'));
+    // Each host serves the same folder under its own path.
+    return served(url.replace(/^https:\/\/[^/]+\/(mirror|host)\//, 'https://own.test/host/'), init);
+  };
+  const plain = await openZarr(httpStore('https://own.test/host/', { fetch: hostFetch(entries) }));
+  const store = httpStore('https://own.test/host/', {
+    fetch,
+    concurrency: 18,
+    mirrors: ['https://other.test/mirror/', 'https://broken.test/mirror/'],
+  });
+  // Objects asked for at once go to each address in turn.
+  const keys = [...entries.keys()].slice(0, 9);
+  const objects = await store.getMany(keys);
+  objects.forEach((bytes, i) => assert.deepEqual(bytes, entries.get(keys[i])));
+  const burst = asked.length;
+  // The failing mirror was given its share of the burst, and then no more.
+  assert.equal(asked.filter(host => host === 'broken.test').length, 3);
+  const mirrored = await openZarr(store);
+  const expected = await plain.get('obs/_index').read();
+  assert.deepEqual(await mirrored.get('obs/_index').read(), expected);
+  const reads = ['X', 'obsm/X_umap'].filter(path => plain.get(path)?.kind === 'array');
+  for (const path of reads) assert.deepEqual(await mirrored.get(path).read(), await plain.get(path).read());
+  const hosts = new Set(asked);
+  assert.ok(hosts.has('own.test') && hosts.has('other.test'), `requests went to ${[...hosts].join(', ')}`);
+  assert.ok(!asked.slice(burst).includes('broken.test'), 'a dropped mirror is not asked again');
+  assert.throws(() => httpStore('https://own.test/host/', { mirrors: ['ftp://x/'] }), /mirrors/);
+});
+
+test('a store refuses a range answered as another range', async () => {
+  const bytes = new Uint8Array(64).map((_, i) => i);
+  const fetch = async (url, init) => {
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
+    return new Response(bytes.slice(Number(start) + 1, Number(end) + 2), {
+      status: 206,
+      headers: { 'Content-Range': `bytes ${Number(start) + 1}-${Number(end) + 1}/64` },
+    });
+  };
+  const store = httpStore('https://own.test/host/', { fetch });
+  await assert.rejects(store.getRanges('shard', [{ offset: 8, length: 8 }]), { code: 'range-ignored' });
+});
+
+test('cancelling one read of a merged range leaves the others waiting for it; the request stops once all withdrew', async () => {
+  const data = new Uint8Array(100_000).map((_, i) => i & 255);
+  let aborted = 0;
+  const pending = [];
+  const fetch = (url, init) => new Promise((resolve, reject) => {
+    const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers.Range);
+    init.signal?.addEventListener('abort', () => {
+      aborted++;
+      reject(init.signal.reason);
+    }, { once: true });
+    pending.push(() => resolve(new Response(data.slice(Number(start), Number(end) + 1), { status: 206 })));
+  });
+  const store = httpStore('https://example.org/store.zarr/', { fetch });
+  const a = new AbortController();
+  const b = new AbortController();
+  const readA = store.getRanges('X/0', [{ offset: 0, length: 100 }], { signal: a.signal });
+  const readB = store.getRanges('X/0', [{ offset: 200, length: 100 }], { signal: b.signal });
+  // The reads asked in one task are planned together, on the next: every
+  // request of the plan is made at once.
+  await until(() => pending.length > 0, 'the request made');
+  assert.equal(pending.length, 1, 'the two ranges are one request');
+  a.abort(new DOMException('gene A no longer wanted', 'AbortError'));
+  await assert.rejects(readA, /gene A no longer wanted/);
+  assert.equal(aborted, 0, 'the request goes on for B');
+  pending[0]();
+  assert.deepEqual((await readB)[0], data.subarray(200, 300));
+  // Both withdraw: the request is cancelled.
+  const c = new AbortController();
+  const d = new AbortController();
+  const readC = store.getRanges('X/1', [{ offset: 0, length: 100 }], { signal: c.signal });
+  const readD = store.getRanges('X/1', [{ offset: 200, length: 100 }], { signal: d.signal });
+  await until(() => pending.length > 1, 'the second request made');
+  c.abort();
+  d.abort();
+  await assert.rejects(readC);
+  await assert.rejects(readD);
+  await until(() => aborted > 0, 'the shared request stopped');
+  assert.equal(aborted, 1, 'the shared request stopped once nobody waited');
 });

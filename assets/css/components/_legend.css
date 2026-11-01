@@ -315,6 +315,32 @@
   white-space: nowrap;
 }
 
+/* A dot of the colour a lower layer is drawn in (a gene's 0, a cell not read),
+   made from the view's background by the viewer (rendering/read-cell-layer.js):
+   the legend names each state beside the colour it shows as on this theme. */
+.legend-layer-swatch {
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  margin-right: var(--space-1);
+  border-radius: var(--radius-full);
+  border: var(--border-default);
+  vertical-align: -0.05em;
+  background: var(--cell-zero-color);
+}
+
+.legend-layer-swatch.is-unread {
+  background: var(--cell-unread-color);
+}
+
+/* The cells without a category: a checkbox to show or hide them and their
+   count, under the categories. */
+.legend-missing-row {
+  display: flex;
+  align-items: center;
+  margin-top: var(--control-row-gap);
+}
+
 .legend-item.legend-item-disabled {
   opacity: var(--opacity-55);
 }
@@ -418,4 +444,37 @@
    progress bar every cancellable job shows (components/_jobs.css). */
 .outlier-filter-action {
   flex: none;
+}
+
+/* A gene read for a sample of the open cells: the states drawn (one line,
+   `legend-layer-note`) and how many cells it is read for, a link to where
+   that is chosen (`gene-read-control.js`, `.gene-read-note`). Each one line,
+   spaced by the colour section's gap alone. */
+.legend-section > .legend-layer-note {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.legend-layer-note[hidden] {
+  display: none;
+}
+
+/* The bounds of Visible range: label, slider and number box on one row
+   each, in one grid so the two rows' columns align. */
+.legend-range-bounds {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-1-5);
+  row-gap: var(--control-row-gap);
+}
+
+.legend-range-label {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.legend-filter > .legend-actions {
+  margin-top: 0;
 }

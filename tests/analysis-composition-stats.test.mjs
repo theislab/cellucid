@@ -22,11 +22,8 @@ import {
   compositionCounts,
   presentCompositionUnits
 } from '../assets/js/app/analysis/compute/composition-counts.js';
-import {
-  chiSquaredIndependence,
-  fisherExact2x2,
-  testComposition
-} from '../assets/js/app/analysis/stats/composition-tests.js';
+import { testComposition } from '../assets/js/app/analysis/stats/composition-tests.js';
+import { chiSquaredIndependence, fisherExact2x2 } from '../assets/js/app/analysis/stats/categorical-tests.js';
 
 const FIXTURE = new URL('./fixtures/analysis/scanpy-reference.json', import.meta.url);
 const text = readFileSync(FIXTURE, 'utf8');
@@ -185,4 +182,84 @@ test('the small tests by hand: Fisher two-sided, Yates on 2 × 2, empty rows dro
   close(yates.pValue, 0.020136751550346364, 'Yates p', 1e-12);
   const dropped = chiSquaredIndependence([[10, 20, 0], [20, 10, 0], [0, 0, 0]]);
   assert.equal(dropped.df, 1);
+});
+
+test('a type with no cells is not tested and leaves every other type as without it', () => {
+  // Units of very different sizes (the audit's case: one condition's samples
+  // are fifty times the other's) make an absent type's transformed
+  // proportion differ between conditions; it must not be tested at all.
+  for (const kase of composition.cases) {
+    const present = countCase(kase);
+    const typeCount = composition.types.length;
+    const unitCount = present.unitCount;
+    const withAbsent = new Uint32Array((typeCount + 1) * unitCount);
+    withAbsent.set(present.counts, unitCount);
+    for (const method of ['logit', 'clr', 'rank']) {
+      for (const correction of ['bh', 'bonferroni']) {
+        const input = {
+          unitCount,
+          conditionOfUnit: present.unitCondition,
+          conditionCount: kase.conditionNames.length,
+          samples: kase.samples,
+          method,
+          correction
+        };
+        const without = testComposition({ ...input, counts: present.counts, typeCount });
+        const out = testComposition({ ...input, counts: withAbsent, typeCount: typeCount + 1 });
+        const label = `${kase.name} ${method} ${correction}`;
+        assert.equal(out.typeTest[0], 'no cells', `${label}: the absent type's test`);
+        for (const lane of ['statistic', 'pValue', 'adjustedP', 'log2Ratio']) {
+          assert.ok(Number.isNaN(out[lane][0]), `${label}: the absent type's ${lane} is NaN`);
+          assert.deepEqual([...out[lane].subarray(1)], [...without[lane]], `${label}: ${lane} of the present types`);
+        }
+        assert.deepEqual(out.typeTest.slice(1), without.typeTest, `${label}: tests of the present types`);
+        assert.deepEqual(out.overall, without.overall, `${label}: overall χ²`);
+      }
+    }
+  }
+});
+
+test('one categorical kernel: the Detailed view and Composition give one answer for one table (NS-5)', async () => {
+  const { runStatisticalTests } = await import('../assets/js/app/analysis/stats/statistical-tests.js');
+  // The audit's table [[30, 70], [45, 55]]: SciPy chi2_contingency 4.181333333333333, p 0.04087153408900611.
+  const page = (pageName, a, b) => ({ pageName, values: [...new Array(a).fill('in'), ...new Array(b).fill('out')] });
+  const detailed = runStatisticalTests([page('P1', 30, 70), page('P2', 45, 55)], 'categorical_obs')[0];
+  const kernel = chiSquaredIndependence([[30, 70], [45, 55]]);
+  close(kernel.statistic, 4.181333333333333, 'Yates χ²', 1e-12);
+  close(kernel.pValue, 0.04087153408900611, 'Yates p', 1e-12);
+  assert.equal(detailed.statistic, kernel.statistic);
+  assert.equal(detailed.pValue, kernel.pValue);
+  close(kernel.pearson, 4.8, 'uncorrected χ²', 1e-12);
+  // Composition, cells as replicates: the same 2 x 2 for a type against the rest.
+  const result = testComposition({
+    counts: Uint32Array.of(30, 45, 70, 55),
+    typeCount: 2,
+    unitCount: 2,
+    conditionOfUnit: Int32Array.of(0, 1),
+    conditionCount: 2,
+    samples: false,
+    method: 'logit',
+    correction: 'bh'
+  });
+  assert.equal(result.statistic[0], kernel.statistic);
+  assert.equal(result.pValue[0], kernel.pValue);
+});
+
+test("Fisher's exact test equals the exact rational two-sided p (R's relative 1e-7 for ties)", () => {
+  // Python fractions: Σ p(x) over p(x) ≤ p(observed)(1 + 1e-7). SciPy agrees
+  // within 1.3e-10 (its 500,000-cell table) and below.
+  for (const [table, exact] of [
+    [[1, 9, 11, 3], 0.0027594561852200836],
+    [[3, 7, 9, 2], 0.029973122852379817],
+    [[10, 10, 10, 10], 1],
+    [[1, 2, 2, 1], 1],
+    [[2, 7, 7, 2], 0.05668449197860963],
+    [[0, 50, 50, 0], 1.9823306042836678e-29],
+    [[5, 1000, 2, 3000], 0.012993989665978494],
+    [[3, 500000, 40, 600000], 4.2470438244025424e-08],
+    [[0, 500, 500, 0], 7.399507995628054e-300]
+  ]) {
+    close(fisherExact2x2(...table).pValue, exact, `Fisher ${table}`, 1e-9);
+  }
+  assert.throws(() => fisherExact2x2(1.5, 2, 3, 4), /whole numbers/);
 });

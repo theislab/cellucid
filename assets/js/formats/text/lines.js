@@ -74,6 +74,24 @@ export async function forEachLine(pieces, onLine) {
 }
 
 const UTF8 = new TextDecoder('utf-8');
+const UTF8_ENCODER = new TextEncoder();
+let ownTextBytes = new Uint8Array(1024);
+
+/**
+ * `text` as a string of its own. A field cut from a line (`splitFields`,
+ * `trim`) is, in V8, a slice that keeps its whole line alive: a field kept
+ * past its line -- a cell's name, a label first seen -- is copied once, or a
+ * 2M-row table of 230-byte lines keeps 0.5 GB of lines through its cell
+ * names alone.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function ownText(text) {
+  if (ownTextBytes.length < text.length * 3) ownTextBytes = new Uint8Array(text.length * 3);
+  const { written } = UTF8_ENCODER.encodeInto(text, ownTextBytes);
+  return UTF8.decode(ownTextBytes.subarray(0, written));
+}
 
 /** One line's text. */
 export function lineText(bytes, start, end) {

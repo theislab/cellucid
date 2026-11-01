@@ -6,7 +6,7 @@ import { DataLayer } from '../assets/js/app/analysis/data/data-layer.js';
 import { AnalysisUIManager } from '../assets/js/app/analysis/ui/analysis-ui-manager.js';
 import { AnalysisWindowManager } from '../assets/js/app/analysis/ui/analysis-window-manager.js';
 import { PlotRenderSlot } from '../assets/js/app/analysis/shared/plot-render-slot.js';
-import { getMemoryMonitor } from '../assets/js/app/analysis/shared/memory-monitor.js';
+import { releaseResidentMemory } from '../assets/js/data/memory-budget.js';
 import { createDataState } from '../assets/js/app/state/index.js';
 import { EventEmitter } from '../assets/js/app/utils/event-emitter.js';
 import { encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
@@ -390,9 +390,9 @@ test(
 );
 
 test(
-  'DataLayer destroy publishes one stable task and drains memory cleanup ownership before clearing',
+  'DataLayer destroy publishes one stable task, stops being counted at once and clears its caches after',
+  { concurrency: false },
   async () => {
-    const unregisterRelease = deferred();
     const events = [];
     const layer = Object.create(DataLayer.prototype);
     layer._destroyPromise = null;
@@ -400,16 +400,8 @@ test(
     layer._datasetGeneration = 4;
     layer._cacheGeneration = 7;
     layer._fieldLoadLifecycle = new AbortController();
-    layer._instanceId = 'data-layer-owned';
-    layer._memoryMonitor = {
-      unregisterCleanupHandler(instanceId) {
-        assert.equal(instanceId, 'data-layer-owned');
-        events.push('memory:unregister');
-        return unregisterRelease.promise.then(() => {
-          events.push('memory:drained');
-        });
-      },
-    };
+    // The memory model stops counting (and trimming) its caches at once.
+    layer._stopCounting = () => events.push('memory:stop');
     layer._dataCache = new Map([['page', {}]]);
     layer._variableCache = new Map([['variable', {}]]);
     layer._pendingRequests = new Map([['request', {}]]);
@@ -425,33 +417,22 @@ test(
     assert.equal(layer._destroyed, true);
     assert.equal(layer._datasetGeneration, 5);
     assert.equal(layer._cacheGeneration, 8);
-    assert.equal(layer._dataCache.size, 1);
-    assert.equal(layer._memoryMonitor === null, false);
+    assert.deepEqual(events, ['memory:stop'], 'the memory model stops counting it synchronously');
+    assert.equal(layer._dataCache.size, 1, 'its caches are cleared by the published task');
 
-    await Promise.resolve();
-    assert.deepEqual(events, ['memory:unregister']);
-    assert.equal(
-      layer._dataCache.size,
-      1,
-      'cache state remains owned while a running memory handler drains',
-    );
-
-    unregisterRelease.resolve();
     await first;
 
-    assert.deepEqual(events, ['memory:unregister', 'memory:drained']);
+    assert.deepEqual(events, ['memory:stop']);
     assert.equal(layer._dataCache.size, 0);
     assert.equal(layer._pendingRequests.size, 0);
-    assert.equal(layer._memoryMonitor, null);
     assert.equal(layer.destroy(), first);
   },
 );
 
 test(
-  'DataLayer destroy synchronously closes prefetch admission while memory ownership drains',
+  'DataLayer destroy synchronously closes prefetch admission',
   { concurrency: false },
   async () => {
-    const unregisterRelease = deferred();
     const events = [];
     const timeoutToken = {};
     const restoreClearTimeout = replaceGlobal(
@@ -467,12 +448,7 @@ test(
     layer._datasetGeneration = 0;
     layer._cacheGeneration = 0;
     layer._fieldLoadLifecycle = new AbortController();
-    layer._instanceId = 'data-layer-prefetch-owner';
-    layer._memoryMonitor = {
-      unregisterCleanupHandler() {
-        return unregisterRelease.promise;
-      },
-    };
+    layer._stopCounting = () => {};
     layer._options = { enablePrefetch: true };
     layer._dataCache = new Map();
     layer._variableCache = new Map();
@@ -498,7 +474,6 @@ test(
       assert.deepEqual(layer._prefetchQueue, []);
       assert.equal(layer._prefetchTimeout, null);
 
-      unregisterRelease.resolve();
       await destruction;
     } finally {
       restoreClearTimeout();
@@ -1132,7 +1107,6 @@ test(
 
     comparison._destroyPromise = null;
     comparison._datasetResetPromise = null;
-    comparison._memoryMonitor = null;
     comparison._analysisWindowManager = null;
     comparison._uiManager = null;
     comparison.dataLayer = null;
@@ -1161,9 +1135,6 @@ test(
     const embeddedDestruction = deferred();
     let dataLayerDestroyed = false;
     const comparison = Object.create(ComparisonModule.prototype);
-    comparison._memoryMonitor = {
-      unregisterCleanupHandler() {},
-    };
     comparison._analysisWindowManager = {
       closeAll() {
         return windowsDestruction.promise;
@@ -1192,59 +1163,6 @@ test(
     assert.equal(dataDestroyedBeforeChildrenSettled, false);
     assert.equal(dataLayerDestroyed, true);
     assert.equal(comparison.dataLayer, null);
-  },
-);
-
-test(
-  'ComparisonModule destroy drains its running memory handler before retiring managers or shared data',
-  async () => {
-    const memoryDrain = deferred();
-    const events = [];
-    const comparison = Object.create(ComparisonModule.prototype);
-    comparison._destroyPromise = null;
-    comparison._datasetResetPromise = null;
-    comparison._memoryMonitor = {
-      unregisterCleanupHandler(componentId) {
-        assert.equal(componentId, 'comparison-module');
-        events.push('memory:unregister');
-        return memoryDrain.promise.then(() => {
-          events.push('memory:drained');
-        });
-      },
-    };
-    comparison._analysisWindowManager = {
-      closeAll() {
-        events.push('windows:destroy');
-      },
-    };
-    comparison._uiManager = {
-      destroy() {
-        events.push('embedded:destroy');
-      },
-    };
-    comparison.dataLayer = {
-      destroy() {
-        events.push('data:destroy');
-      },
-    };
-    comparison._multiVariableAnalysis = {};
-
-    const destroyTask = comparison.destroy();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    assert.deepEqual(events, ['memory:unregister']);
-
-    memoryDrain.resolve();
-    await destroyTask;
-
-    assert.deepEqual(events, [
-      'memory:unregister',
-      'memory:drained',
-      'windows:destroy',
-      'embedded:destroy',
-      'data:destroy',
-    ]);
   },
 );
 
@@ -1314,9 +1232,6 @@ test(
     const comparison = Object.create(ComparisonModule.prototype);
     comparison._destroyPromise = null;
     comparison._datasetResetPromise = null;
-    comparison._memoryMonitor = {
-      unregisterCleanupHandler() {},
-    };
     comparison._analysisWindowManager = {
       closeAll() {},
     };
@@ -1391,7 +1306,6 @@ test(
     const comparison = Object.create(ComparisonModule.prototype);
     comparison._destroyPromise = null;
     comparison._datasetResetPromise = null;
-    comparison._memoryMonitor = null;
     comparison._modeToggleContainer = null;
     comparison._analysisMode = 'detailed';
     comparison._analysisWindowManager = {
@@ -1487,9 +1401,6 @@ test(
     comparison._datasetResetPromise = resetRelease.promise.then(() => {
       events.push('reset:done');
     });
-    comparison._memoryMonitor = {
-      unregisterCleanupHandler() {},
-    };
     comparison._analysisWindowManager = {
       closeAll() {
         events.push('windows:destroy');
@@ -1538,9 +1449,6 @@ test(
     const comparison = Object.create(ComparisonModule.prototype);
     comparison._destroyPromise = null;
     comparison._datasetResetPromise = null;
-    comparison._memoryMonitor = {
-      unregisterCleanupHandler() {},
-    };
     comparison._analysisWindowManager = null;
     comparison._modeToggleContainer = null;
     comparison._analysisMode = 'detailed';
@@ -1625,7 +1533,6 @@ test(
     const comparison = Object.create(ComparisonModule.prototype);
     comparison._destroyPromise = null;
     comparison._datasetResetPromise = null;
-    comparison._memoryMonitor = null;
     comparison._analysisWindowManager = {
       closeAll() {
         return managerDestruction.promise;
@@ -1820,13 +1727,12 @@ test(
     };
     let comparison = null;
     let dataLayer = null;
-    const memoryMonitor = getMemoryMonitor();
-    memoryMonitor.setShowNotifications(false);
     try {
       comparison = new ComparisonModule({ state, container: {}, colorByGene: async () => null });
       dataLayer = comparison.dataLayer;
 
-      await memoryMonitor.performCleanup('critical');
+      // Memory short: every cache gives back what it keeps (`memory-budget.js`).
+      releaseResidentMemory('all', 'refused');
 
       assert.deepEqual(
         directPurges,
@@ -1843,7 +1749,6 @@ test(
       if (dataLayer !== null && dataLayer._destroyed !== true) {
         dataLayer.destroy();
       }
-      memoryMonitor.setShowNotifications(true);
       restoreDocument();
       restoreWindow();
       restoreStorage();

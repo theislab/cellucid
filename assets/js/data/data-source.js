@@ -8,22 +8,29 @@
 
 import {
   getMetadataLoadSignal,
-  throwIfMetadataAborted,
 } from './metadata-load-contract.js';
 import { compareCodePoints } from './data-mapping.js';
 import { parseMappingEmbeddingPath } from './data-mapping-candidates.js';
 import { StateValidator } from '../app/utils/state-validator.js';
 import { getTransferLog } from './transfer-log.js';
 import {
-  RETRY_DELAYS_MS,
+  BYTE_SOURCE_FAILURES,
+  ByteSourceError,
   fetchOnce,
-  isTransientStatus,
+  HOST_FAULTS,
+  hostFaultOfStatus,
+  hostFaultSentence,
+  isTransientAnswer,
+  spreadOf,
   transientStatusError,
   withRetries,
-  worthAskingAgain,
 } from '../formats/io/byte-source.js';
+import { ResponseClock } from '../formats/io/link.js';
+import { retryAfterMilliseconds } from '../formats/io/hosts.js';
 import { isObjectRecord, requireObjectKeys } from '../utils/exact-record.js';
 import { formatCountOf } from '../utils/format-units.js';
+import { publicLink, textWithPublicLinks } from './sources/link-credentials.js';
+import { throwIfAborted } from '../utils/abort.js';
 
 /**
  * @typedef {Object} DatasetStats
@@ -350,7 +357,7 @@ export async function readBoundedBody(response, options) {
   const reader = body.getReader();
   try {
     for (;;) {
-      throwIfMetadataAborted(signal, label);
+      throwIfAborted(signal);
       const { done, value } = await reader.read();
       if (done) break;
       const chunk = value instanceof Uint8Array
@@ -377,7 +384,7 @@ export async function readBoundedBody(response, options) {
       loadedBytes = nextLoadedBytes;
       if (onProgress !== null) onProgress(loadedBytes, totalBytes);
     }
-    throwIfMetadataAborted(signal, label);
+    throwIfAborted(signal);
   } catch (error) {
     // Whatever ended the read (ceiling, abort, a throwing progress callback,
     // or a network error) stops the transfer instead of letting it run on.
@@ -468,38 +475,50 @@ export const CATALOG_FILE_CACHE = 'no-cache';
 /**
  * `fetch` that is never left hanging and rides out a host's transient
  * failures: a request is made again (`withRetries`, the byte reader's
- * schedule) while the host answers that it is busy or failing (HTTP 408,
- * 429, 5xx), while its connection fails (GitHub Pages answers a burst of
- * requests with an occasional 503 that carries no CORS headers, which a page
- * sees only as a failed connection), and when it stalls (no answer and no
- * byte for the link's timeout, `ResponseClock`), unless the failure shows
- * it will stay (`worthAskingAgain`: the same error status twice, or no
- * answer twice), which is reported at once. Each wait is as long as the
- * host's `Retry-After` asks, when the host lets this page read it. The last
- * answer is returned as it is, busy or not, with its body already read; the
- * caller reports it. A connection still failing once the repeats are spent
- * rejects with an error naming the URL.
+ * repeats, their waits grown from the link's retransmission timeout) while
+ * the host answers that it is busy or failing (HTTP 408, 429, 5xx, or a
+ * rate limit it answers with 403), while its connection fails (GitHub Pages
+ * answers a burst of requests with an occasional 503 that carries no CORS
+ * headers, which a page sees only as a failed connection), and when it
+ * stalls (no answer and no byte for the link's timeout, `ResponseClock`),
+ * unless the failure shows it will stay (`worthAskingAgain`: the same error
+ * status twice, or no answer twice), which is reported at once. It is sent
+ * within its host's request budget (`formats/io/hosts.js`), and a wait the
+ * host names (`Retry-After` where the host lets this page read it, a
+ * budget's reset) is waited for exactly, never counted. The last answer is
+ * returned as it is, busy or not, with its body already read; the caller
+ * reports it. A connection still failing once the repeats are spent rejects
+ * with an error naming the URL.
  *
  * @param {string} url
  * @param {RequestInit} [init]
+ * @param {{clock?: import('../formats/io/link.js').ResponseClock}} [options] - `clock`: the
+ *   link the waits grow from and run on (a fresh one of real time; tests give a virtual one)
  * @returns {Promise<Response>}
  */
-export async function fetchWhenNotBusy(url, init = {}) {
+export async function fetchWhenNotBusy(url, init = {}, { clock = new ResponseClock() } = {}) {
   const { signal = null, ...rest } = init;
-  // Busy answers asked again so far; one that is not worth asking again (it
-  // repeats exactly, `worthAskingAgain`) is returned as it is.
-  const busy = [];
-  const { response, bytes } = await withRetries(async attempt => {
-    const answer = await fetchOnce(url, rest, { fetchImpl: globalThis.fetch, signal, wantsBody: () => rest.method !== 'HEAD' });
-    if (isTransientStatus(answer.response.status) && attempt < RETRY_DELAYS_MS.length) {
-      const failure = transientStatusError(answer.response, url);
-      if (worthAskingAgain(failure, busy)) {
-        busy.push(failure);
-        throw failure;
+  // The last busy answer: returned as it is once asking again is over.
+  let busy = null;
+  let answer;
+  try {
+    answer = await withRetries(async () => {
+      const got = await fetchOnce(url, rest, { fetchImpl: globalThis.fetch, signal, clock, wantsBody: () => rest.method !== 'HEAD' });
+      const status = got.response.status;
+      const said = got.bytes !== null && status >= 400 ? new TextDecoder().decode(got.bytes) : got.said;
+      if (isTransientAnswer(got.response, said)) {
+        busy = got;
+        throw transientStatusError(got.response, url, said);
       }
-    }
-    return answer;
-  }, { signal });
+      return got;
+    }, { signal, clock, random: spreadOf(url) });
+  } catch (error) {
+    const answered = error instanceof ByteSourceError &&
+      (error.code === BYTE_SOURCE_FAILURES.RATE_LIMITED || error.code === BYTE_SOURCE_FAILURES.UNAVAILABLE);
+    if (!answered || busy === null || signal?.aborted) throw error;
+    answer = busy;
+  }
+  const { response, bytes } = answer;
   const bodiless = [101, 103, 204, 205, 304].includes(response.status);
   const answered = new Response(bodiless ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
   // The final address after redirects, as `fetch` reports it.
@@ -571,8 +590,23 @@ export const ERROR_MESSAGES = {
   [DataSourceErrorCode.UNSUPPORTED]: 'This operation is not supported.'
 };
 
+/** Error details with the links they name (`input`, `url`) in public form. */
+function publicDetails(details) {
+  if (details === null || typeof details !== 'object') return details;
+  const named = {};
+  for (const key of ['input', 'url']) {
+    if (typeof details[key] === 'string') named[key] = publicLink(details[key]);
+  }
+  return Object.keys(named).length === 0 ? details : { ...details, ...named };
+}
+
 /**
- * Custom error class for data source operations
+ * Custom error class for data source operations.
+ *
+ * A failure names a link by its public form (`textWithPublicLinks`,
+ * `sources/link-credentials.js`) in its message and in `details.input` and
+ * `details.url`: what is shown and logged never holds a link's access key,
+ * whichever site raised it.
  */
 export class DataSourceError extends Error {
   /**
@@ -582,11 +616,11 @@ export class DataSourceError extends Error {
    * @param {Object} [details] - Additional error details
    */
   constructor(message, code, source, details = {}) {
-    super(message);
+    super(textWithPublicLinks(message));
     this.name = 'DataSourceError';
     this.code = code;
     this.source = source;
-    this.details = details;
+    this.details = publicDetails(details);
   }
 
   /**
@@ -613,6 +647,147 @@ export class DataSourceError extends Error {
  */
 export function explainedFailure(message, code, source, details = {}) {
   return new DataSourceError(message, code, source, { ...details, explained: true });
+}
+
+/** The data source code each host fault (`HOST_FAULTS`) is classified by. */
+const HOST_FAULT_CODES = Object.freeze({
+  failing: DataSourceErrorCode.NETWORK_ERROR,
+  limiting: DataSourceErrorCode.NETWORK_ERROR,
+  refusing: DataSourceErrorCode.NETWORK_ERROR,
+  refused: DataSourceErrorCode.PERMISSION_DENIED,
+  missing: DataSourceErrorCode.NOT_FOUND,
+  offline: DataSourceErrorCode.NETWORK_ERROR,
+  connection: DataSourceErrorCode.NETWORK_ERROR,
+});
+
+/** The host faults asking again may cure (the person is offered Try again first). */
+export const PASSING_HOST_FAULTS = Object.freeze(new Set(['failing', 'limiting', 'refusing', 'offline', 'connection']));
+
+/**
+ * A host that did not give what was asked for, said as who is at fault
+ * (`hostFaultSentence`, `HOST_FAULTS`): the host failing or limiting on its
+ * side, refusing this network for now, the link's permissions, nothing at
+ * the address, or this computer offline. A failure written for the person
+ * (`explainedFailure`); the faults that may pass (`PASSING_HOST_FAULTS`) are
+ * never settled (`classifyDataSourceFailure`), so Try again comes first.
+ * `details.hostFault` keeps what built it, so the link source names the
+ * provider the host serves (`LinkDataSource`: "NCBI GEO
+ * (ftp.ncbi.nlm.nih.gov)") and turns a refusal of a provider whose files
+ * are all public into `refusing`.
+ *
+ * @param {{kind?: string, host: string, status?: number|null, what: string,
+ *   service?: string|null, retryAfterMs?: number|null}} fault
+ *   `kind`: from `HOST_FAULTS`, by default the status's (`hostFaultOfStatus`);
+ *   `what`: what was asked for, a noun phrase ("GSE1_x.h5ad", "the file list
+ *   of GSE1"); `service`: the provider the host serves, when known
+ * @param {Object} [details] - `cause`: what it keeps under Details (the
+ *   requests that met it, `hostFaultCause`), or null
+ * @returns {DataSourceError}
+ */
+export function hostFaultFailure({ kind = null, host, status = null, what, service = null, retryAfterMs = null }, { cause = null, ...details } = {}) {
+  const fault = { kind: kind ?? hostFaultOfStatus(status), host, status, what, service, retryAfterMs };
+  if (!HOST_FAULTS.includes(fault.kind)) throw new TypeError(`No host fault for HTTP ${status}.`);
+  return explainedFailure(hostFaultSentence(fault), HOST_FAULT_CODES[fault.kind], 'link', {
+    ...details,
+    ...(cause === null ? {} : { cause }),
+    ...(status === null ? {} : { status }),
+    host,
+    hostFault: fault,
+  });
+}
+
+/**
+ * A provider's answer that is not OK, as its host fault, or null when its
+ * status names none (`hostFaultOfStatus`: a 5xx, 408 or 429): the wait a
+ * limiting host names (`Retry-After`) is said with it.
+ *
+ * @param {Response} response
+ * @param {string} what
+ * @param {Object} [details]
+ * @returns {DataSourceError|null}
+ */
+export function hostFaultOfResponse(response, what, details = {}) {
+  if (hostFaultOfStatus(response.status) === null) return null;
+  const url = response.url || details.url || null;
+  if (url === null || !URL.canParse(url)) return null;
+  return hostFaultFailure({
+    host: new URL(url).host,
+    status: response.status,
+    what,
+    retryAfterMs: retryAfterMilliseconds(response.headers?.get?.('Retry-After') ?? null),
+  }, details);
+}
+
+/**
+ * What a host fault keeps under Details: the requests that met it (the
+ * cause of one said so already, `withRetries`, `hostFaultFailure`), else
+ * the failure itself; null for one said so that carries none. A failure
+ * said again for the person (with the provider's name) takes it as its
+ * cause, never the sentence it replaces.
+ *
+ * @param {unknown} error
+ * @returns {unknown}
+ */
+export function hostFaultCause(error) {
+  if (error?.details?.hostFault === undefined) return error;
+  return error.cause ?? error.details?.cause ?? null;
+}
+
+/**
+ * The host fault (`hostFaultFailure`'s fields, without `what`) a failure
+ * stands for, or null: one said so already (`hostFaultFailure`, or a read
+ * the byte layer gave up on, `withRetries`, also as rebuilt from a reader
+ * worker's answer, `utils/error-wire.js`), or any other failure that
+ * carries a host-side status (`hostFaultOfStatus`) and the host or address
+ * it came from (a catalog's `datasets.json`, `fetchJson`).
+ *
+ * @param {unknown} error
+ * @returns {{kind: string, host: string, status: number|null, service: string|null, retryAfterMs: number|null}|null}
+ */
+export function hostFaultOf(error) {
+  if (error instanceof AggregateError && error.errors.length > 0) return hostFaultOf(error.errors[0]);
+  const details = error?.details;
+  if (details === null || typeof details !== 'object') return null;
+  if (details.hostFault !== undefined && details.hostFault !== null) {
+    const { kind, host, status = null, service = null, retryAfterMs = null } = details.hostFault;
+    return { kind, host, status, service, retryAfterMs };
+  }
+  const status = Number.isInteger(details.status) ? details.status : error?.status;
+  const kind = hostFaultOfStatus(status);
+  if (kind === null) return null;
+  const host = typeof details.host === 'string' && details.host !== ''
+    ? details.host
+    : typeof details.url === 'string' && URL.canParse(details.url) ? new URL(details.url).host : null;
+  return host === null ? null : { kind, host, status, service: null, retryAfterMs: null };
+}
+
+/**
+ * What a failure that a host answered says to the person, by whose problem
+ * it is, wherever it is shown (the sample catalog's notice, a served
+ * source's or a notebook's connection, the startup panel, a notification):
+ * a host fault said already (`hostFaultOf`), or any failure that carries the
+ * host's status and the address it answered for (`details.status`,
+ * `details.url`: a catalog's `datasets.json`, `cellucid serve`, a notebook
+ * kernel's server): 5xx/408 failing, 429 limiting, 401/403 refused, 404/410
+ * missing. Null when the failure names no host's answer (Cellucid's own
+ * refusal of what it read, or a cause it cannot tell).
+ *
+ * @param {unknown} error
+ * @returns {{kind: string, sentence: string}|null}
+ */
+export function describeHostFault(error) {
+  if (error instanceof AggregateError && error.errors.length > 0) return describeHostFault(error.errors[0]);
+  const said = error?.details?.hostFault;
+  if (said !== undefined && said !== null) return { kind: said.kind, sentence: hostFaultSentence(said) };
+  const details = error?.details;
+  const status = Number.isInteger(details?.status) ? details.status : null;
+  if (status === null || typeof details.url !== 'string' || !URL.canParse(details.url, globalThis.location?.href)) return null;
+  const kind = hostFaultOfStatus(status) ??
+    (status === 401 || status === 403 ? 'refused' : status === 404 || status === 410 ? 'missing' : null);
+  if (kind === null) return null;
+  const address = new URL(details.url, globalThis.location?.href);
+  const what = decodeURIComponent(address.pathname.split('/').filter(Boolean).at(-1) ?? address.host);
+  return { kind, sentence: hostFaultSentence({ kind, host: address.host, status, what }) };
 }
 
 /**
@@ -688,14 +863,14 @@ export async function fetchJson(url, sourceType, options = {}) {
   }
   const signal = getMetadataLoadSignal(signalOptions, 'JSON loader');
   try {
-    throwIfMetadataAborted(signal, 'JSON loading');
+    throwIfAborted(signal);
     // Revalidated like every catalog file (CATALOG_FILE_CACHE).
     const response = await fetchCatalogFile(
       url,
       signal === null ? undefined : { signal },
       { askOnce }
     );
-    throwIfMetadataAborted(signal, 'JSON loading');
+    throwIfAborted(signal);
     if (!response.ok) {
       if (response.status === 404) {
         throw new DataSourceError(
@@ -716,10 +891,10 @@ export async function fetchJson(url, sourceType, options = {}) {
       label: `Metadata ${url}`,
       signal,
     });
-    throwIfMetadataAborted(signal, 'JSON loading');
+    throwIfAborted(signal);
     return payload;
   } catch (err) {
-    throwIfMetadataAborted(signal, 'JSON loading');
+    throwIfAborted(signal);
     if (err instanceof DataSourceError) throw err;
     throw new DataSourceError(
       `Network error: ${err.message}`,

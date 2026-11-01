@@ -32,6 +32,7 @@ import {
   validateEmbeddingRef,
 } from './data-mapping.js';
 import { isObjectRecord } from '../utils/exact-record.js';
+import { formatCount, formatSignificant } from '../utils/format-units.js';
 
 /**
  * The clause a mapping-choice refusal gives for a group the open dataset
@@ -95,6 +96,28 @@ function describeExpressionMatrix(value) {
 
 function describeLog1pBase(base) {
   return base === null ? 'base e' : `base ${base}`;
+}
+
+/**
+ * The matrices read as stored although the file records `uns['log1p']`,
+ * their values refuting it (`defaultLog1p`'s `refuted`), said in one short
+ * line (`text`) and why (`detail`, behind it): '' for none.
+ *
+ * @param {ReadonlyArray<{matrix: string, value: number, dtype: string, total: number|null}>} refuted
+ * @returns {{text: string, detail: string}}
+ */
+export function describeLog1pRefuted(refuted) {
+  if (refuted.length === 0) return { text: '', detail: '' };
+  const names = refuted.map(entry => describeExpressionMatrix(entry.matrix));
+  const largest = refuted.reduce((a, b) => (b.value > a.value ? b : a));
+  const shown = largest.value >= 1000 ? formatCount(Math.round(largest.value)) : formatSignificant(largest.value, 4);
+  const total = largest.total === null ? 'more than any number' : `about ${largest.total.toExponential(1)}`;
+  return {
+    text: `Values: as stored — ${names.join(', ')} not log1p (holds ${shown}).`,
+    detail: `The file records uns['log1p'], but the first stored values of ${names.join(', ')} reach ${shown}: ` +
+      `undoing log1p would give one cell a total of ${total}, past what ${largest.dtype} holds, so they were never log1p. ` +
+      'Fold changes use the values as stored; choose log1p under Values to read them as log1p anyway.',
+  };
 }
 
 /**

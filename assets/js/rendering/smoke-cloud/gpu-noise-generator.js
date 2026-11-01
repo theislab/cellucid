@@ -11,7 +11,7 @@
 
 import { glStateOf } from '../gl-state-shadow.js';
 import { contextLostError, requireCleanWebGLState } from '../gl-errors.js';
-import { deleteGlObject, deleteProgramReleasingUse, restorableTexture } from '../gl-utils.js';
+import { deleteGlObject, deleteProgramReleasingUse, fenceHasPassed, restorableTexture } from '../gl-utils.js';
 import {
   MAX_SMOKE_NOISE_RESOLUTION,
   MIN_SMOKE_NOISE_RESOLUTION,
@@ -23,6 +23,7 @@ import {
   BLUE_NOISE_FS
 } from '../shaders/noise-shaders.js';
 import { requireKeys } from '../../utils/exact-record.js';
+import { cancelled } from '../../utils/abort.js';
 
 function asError(value, defaultMessage) {
   return value instanceof Error ? value : new Error(defaultMessage);
@@ -332,13 +333,6 @@ const DEFAULT_NOISE_BATCH_BUDGET_MS = 4;
 const DEFAULT_NOISE_SLICES_PER_BATCH = 16;
 const DEFAULT_NOISE_BATCH_PIXEL_BUDGET =
   DEFAULT_NOISE_SLICES_PER_BATCH * 128 * 128;
-
-class NoiseGenerationCancellationError extends Error {
-  constructor(message = 'GPU cloud-noise generation was cancelled.') {
-    super(message);
-    this.name = 'AbortError';
-  }
-}
 
 class NoiseGenerationRetirementError extends Error {
   constructor(error, skippedCleanupOwner) {
@@ -1074,7 +1068,7 @@ class GPUCloudNoiseGenerationTransaction {
     if (fence === null) return true;
     const gl = this.gl;
     assertContextAvailable(gl, 'GPU cloud-noise batch fence');
-    if (gl.getSyncParameter(fence, gl.SYNC_STATUS) !== gl.SIGNALED) {
+    if (!fenceHasPassed(gl, fence)) {
       this._gpuFencePolls += 1;
       if (this._gpuFencePolls === 2) {
         this._adaptiveSliceCap = Math.max(1, Math.floor(this._adaptiveSliceCap / 2));
@@ -1689,7 +1683,7 @@ class GPUCloudNoiseGenerationTransaction {
     if (!this._settled) {
       this._state = 'cancelled';
       this._settled = true;
-      this._rejectCompletion(new NoiseGenerationCancellationError(message));
+      this._rejectCompletion(cancelled('superseded', message ?? 'GPU cloud-noise generation was cancelled.'));
     } else if (this._state === 'completed') {
       this._state = 'cancelled';
     }
@@ -1722,7 +1716,8 @@ class GPUCloudNoiseGenerationTransaction {
     if (!this._settled) {
       this._state = 'cancelled';
       this._settled = true;
-      this._rejectCompletion(new NoiseGenerationCancellationError(
+      this._rejectCompletion(cancelled(
+        'released',
         'GPU cloud-noise generation was invalidated after context loss.'
       ));
     } else if (this._state === 'completed') {

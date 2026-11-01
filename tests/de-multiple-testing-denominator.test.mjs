@@ -339,6 +339,8 @@ test('a DE run reports the family it corrected over: untested genes are not in i
   analysis.dataLayer = {
     state: { pointCount: 6 },
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    // Genes are read for every open cell (no gene sample).
+    geneCellsOf: async () => null,
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables: () => Object.keys(columns).map(key => ({ key })),
     async readGeneColumn(gene) {
@@ -368,4 +370,19 @@ test('a DE run reports the family it corrected over: untested genes are not in i
   assert.ok(Number.isNaN(untested.pValue));
   assert.equal(untested.adjustedPValue, null);
   assert.deepEqual(result.summary.lowN, ['A', 'B'], 'groups under the minimum of 10 are flagged, not refused');
+});
+
+test('genes tied on p (p = 0 at 10M cells) are ranked by |score|, then |log2FC|, untested last (NS-12)', async () => {
+  const { compareDifferentialResults } = await import('../assets/js/app/analysis/stats/multi-variable-analysis.js');
+  const rows = [
+    { gene: 'first-in-file', pValue: 0, score: 41, log2FoldChange: 0.5 },
+    { gene: 'untested', pValue: NaN, score: NaN, log2FoldChange: NaN },
+    { gene: 'larger-p', pValue: 1e-300, score: 99, log2FoldChange: 9 },
+    { gene: 'strongest', pValue: 0, score: -120, log2FoldChange: -3 },
+    { gene: 'same-score-larger-fc', pValue: 0, score: 41, log2FoldChange: -2 },
+  ];
+  assert.deepEqual(
+    rows.slice().sort(compareDifferentialResults).map(row => row.gene),
+    ['strongest', 'same-score-larger-fc', 'first-in-file', 'larger-p', 'untested']
+  );
 });

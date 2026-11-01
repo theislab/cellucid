@@ -1,8 +1,8 @@
 /**
- * The Zarr codecs on their own: Zstandard decodes whatever a reference
- * encoder writes (Node's zstd, every level, many shapes of data), and every
- * decoder refuses damaged input with a ZarrFormatError instead of returning
- * wrong bytes, reading out of bounds or hanging.
+ * The Zarr codecs on their own: Zstandard (zstd in WebAssembly) decodes
+ * whatever a reference encoder writes (Node's zstd, every level, many shapes
+ * of data), and every decoder refuses damaged input with a ZarrFormatError
+ * instead of returning wrong bytes, reading out of bounds or hanging.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -10,10 +10,10 @@ import { constants, zstdCompressSync } from 'node:zlib';
 
 import { ZarrFormatError } from '../assets/js/formats/zarr/errors.js';
 import { zstdDecompress } from '../assets/js/formats/zarr/codecs/zstd.js';
-import { lz4DecodeBlockInto, numcodecsLz4Decode } from '../assets/js/formats/zarr/codecs/lz4.js';
+import { lz4DecodeBlocks, numcodecsLz4Decode } from '../assets/js/formats/zarr/codecs/lz4.js';
 import { bloscDecode } from '../assets/js/formats/zarr/codecs/blosc.js';
 import { crc32c, crc32cDecode } from '../assets/js/formats/zarr/codecs/crc32c.js';
-import { vlenDecode } from '../assets/js/formats/zarr/codecs/vlen.js';
+import { vlenItems } from '../assets/js/formats/zarr/codecs/vlen.js';
 
 function random(seed) {
   let state = seed >>> 0;
@@ -40,40 +40,61 @@ function samples() {
   return out;
 }
 
-test('Zstandard: every frame Node writes, at every level, decodes exactly', () => {
+test('Zstandard: every frame Node writes, at every level, decodes exactly', async () => {
   let frames = 0;
   for (const data of samples()) {
     for (const level of [-7, 1, 3, 6, 12, 19, 22]) {
       const frame = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_compressionLevel]: level } }));
-      assert.deepEqual(zstdDecompress(frame, data.length), data);
-      assert.deepEqual(zstdDecompress(frame, null), data);
+      assert.deepEqual(await zstdDecompress(frame, data.length), data);
+      assert.deepEqual(await zstdDecompress(frame, null), data);
       frames++;
     }
   }
   assert.equal(frames, 56);
 });
 
-test('Zstandard: frames with checksums, without content size, and several frames in a row', () => {
+test('Zstandard: frames with checksums, without content size, and several frames in a row', async () => {
   const data = new TextEncoder().encode('abcabcabc'.repeat(5000));
   const checked = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_checksumFlag]: 1 } }));
-  assert.deepEqual(zstdDecompress(checked, data.length), data);
+  assert.deepEqual(await zstdDecompress(checked, data.length), data);
   const unsized = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_contentSizeFlag]: 0 } }));
-  assert.deepEqual(zstdDecompress(unsized, null), data);
+  assert.deepEqual(await zstdDecompress(unsized, null), data);
   const two = new Uint8Array([...checked, ...unsized]);
-  const both = zstdDecompress(two, data.length * 2);
+  const both = await zstdDecompress(two, data.length * 2);
   assert.deepEqual(both.subarray(data.length), data);
+  // In a codec list (a variable-length chunk: no size), with a decode task's decoder choices beside it.
+  const { decodeWithCodecs } = await import('../assets/js/formats/zarr/codecs/pipeline.js');
+  assert.deepEqual(await decodeWithCodecs(unsized, [{ id: 'zstd', configuration: {} }], [null], { 'deflate:16': 'fflate' }), data);
   // A skippable frame is skipped.
   const skippable = Uint8Array.of(0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3);
-  assert.deepEqual(zstdDecompress(new Uint8Array([...skippable, ...checked]), data.length), data);
+  assert.deepEqual(await zstdDecompress(new Uint8Array([...skippable, ...checked]), data.length), data);
+  // A content checksum is verified: a frame whose checksum does not match is refused.
+  const wrong = checked.slice();
+  wrong[wrong.length - 1] ^= 0xff;
+  await assert.rejects(zstdDecompress(wrong, data.length), /wrong checksum/);
 });
 
-test('Zstandard: damaged frames are refused, never decoded short, long or out of bounds', () => {
+test('Zstandard: a match more than 2^25 bytes back decodes exactly', async () => {
+  const next = random(5);
+  const block = Uint8Array.from({ length: 1 << 16 }, () => Math.floor(next() * 256));
+  const gap = (1 << 25) + 12_345;
+  const data = new Uint8Array(2 * block.length + gap);
+  data.set(block, 0);
+  data.set(block, block.length + gap);
+  const frame = new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_windowLog]: 27 } }));
+  assert.ok(frame.length < block.length + 4096, `${frame.length} bytes: the repeated block is one match, not literals`);
+  assert.deepEqual(await zstdDecompress(frame, data.length), data);
+});
+
+test('Zstandard: damaged frames are refused, never decoded short, long or out of bounds', async () => {
   const data = new Uint8Array(new Int32Array(Array.from({ length: 20_000 }, (_, i) => (i * 37) % 1000)).buffer);
   const frame = new Uint8Array(zstdCompressSync(data));
-  assert.throws(() => zstdDecompress(frame, data.length + 1), ZarrFormatError);
-  assert.throws(() => zstdDecompress(frame, data.length - 1), ZarrFormatError);
-  assert.throws(() => zstdDecompress(frame.subarray(0, frame.length - 5), data.length), ZarrFormatError);
-  assert.throws(() => zstdDecompress(Uint8Array.of(1, 2, 3, 4, 5), null), /does not start with a Zstandard frame/);
+  await assert.rejects(zstdDecompress(frame, data.length + 1), ZarrFormatError);
+  await assert.rejects(zstdDecompress(frame, data.length - 1), ZarrFormatError);
+  await assert.rejects(zstdDecompress(frame.subarray(0, frame.length - 5), data.length), ZarrFormatError);
+  await assert.rejects(zstdDecompress(Uint8Array.of(1, 2, 3, 4, 5), null), /does not start with a Zstandard frame/);
+  // A size the frame does not state is bounded: more than the bound is refused.
+  await assert.rejects(zstdDecompress(new Uint8Array(zstdCompressSync(data, { params: { [constants.ZSTD_c_contentSizeFlag]: 0 } })), null, { bound: data.length - 1 }), /more than/);
   // Flip bytes all over the frame: each result is an error or, rarely, other
   // bytes of exactly the expected size; never a crash.
   const next = random(3);
@@ -83,7 +104,7 @@ test('Zstandard: damaged frames are refused, never decoded short, long or out of
     const at = 6 + Math.floor(next() * (damaged.length - 6));
     damaged[at] ^= 1 + Math.floor(next() * 255);
     try {
-      const out = zstdDecompress(damaged, data.length);
+      const out = await zstdDecompress(damaged, data.length);
       assert.equal(out.length, data.length);
     } catch (error) {
       assert.ok(error instanceof ZarrFormatError || error.name === 'ZarrUnsupportedError', String(error));
@@ -93,15 +114,20 @@ test('Zstandard: damaged frames are refused, never decoded short, long or out of
   assert.ok(refused > 150, `${refused} of 300 damaged frames refused`);
 });
 
-test('LZ4: a block must end with literals and stay inside its buffers', () => {
-  assert.throws(() => lz4DecodeBlockInto(Uint8Array.of(0x10, 0x41, 0x01, 0x00), new Uint8Array(5)), /final literals/);
-  assert.throws(() => lz4DecodeBlockInto(Uint8Array.of(0x1f, 0x41, 0x05, 0x00, 0x00), new Uint8Array(30)), /before the output/);
-  assert.throws(() => lz4DecodeBlockInto(Uint8Array.of(0x50, 0x41, 0x42), new Uint8Array(5)), /literal run exceeds/);
-  // An overlapping match (a run) followed by final literals.
-  const out = new Uint8Array(9);
-  lz4DecodeBlockInto(Uint8Array.of(0x13, 0x61, 0x01, 0x00, 0x10, 0x62), out);
-  assert.equal(new TextDecoder().decode(out), 'aaaaaaaab');
-  assert.throws(() => numcodecsLz4Decode(Uint8Array.of(100, 0, 0, 0, 0x10, 0x61), 1), /declares 100 bytes/);
+test('LZ4: a block must end with literals and stay inside its buffers', async () => {
+  const one = (block, size) => lz4DecodeBlocks(block, [{ at: 0, stored: block.length, start: 0, size }], size);
+  await assert.rejects(one(Uint8Array.of(0x10, 0x41, 0x01, 0x00), 5), /LZ4 data is corrupt/);
+  await assert.rejects(one(Uint8Array.of(0x1f, 0x41, 0x05, 0x00, 0x00), 30), /LZ4 data is corrupt/);
+  await assert.rejects(one(Uint8Array.of(0x50, 0x41, 0x42), 5), /LZ4 data is corrupt/);
+  // A segment outside its buffers is refused before anything is decoded.
+  await assert.rejects(lz4DecodeBlocks(Uint8Array.of(0x10, 0x62), [{ at: 1, stored: 2, start: 0, size: 1 }], 1), /outside its buffers/);
+  // An overlapping match (a run) followed by the final literals (twelve or
+  // more: LZ4's end-of-block rule, which lz4 enforces).
+  const run = Uint8Array.of(0x13, 0x61, 0x01, 0x00, 0xc0, ...new TextEncoder().encode('b'.repeat(12)));
+  assert.equal(new TextDecoder().decode(await one(run, 20)), `${'a'.repeat(8)}${'b'.repeat(12)}`);
+  // The same with one final literal breaks that rule: refused, as lz4 refuses it.
+  await assert.rejects(one(Uint8Array.of(0x13, 0x61, 0x01, 0x00, 0x10, 0x62), 9), /LZ4 data is corrupt/);
+  await assert.rejects(numcodecsLz4Decode(Uint8Array.of(100, 0, 0, 0, 0x10, 0x61), 1), /declares 100 bytes/);
 });
 
 test('Blosc: headers that contradict the frame are refused', async () => {
@@ -121,6 +147,35 @@ test('Blosc: headers that contradict the frame are refused', async () => {
   await assert.rejects(bloscDecode(header, 8), /decodes to 0 bytes, not the 8/);
   header[0] = 3;
   await assert.rejects(bloscDecode(header, null), error => error.name === 'ZarrUnsupportedError');
+  // The delta filter (flag 0x08, c-blosc2's): undone after the blocks are
+  // decoded, never read as if absent. Two blocks of two 4-byte elements,
+  // stored as is: [1, 2] as [1, 1 ^ 2], then [5, 6] as [5 ^ 1, 6 ^ 2]
+  // (the first block's running XOR; later blocks against the first).
+  const delta = new Uint8Array(16 + 2 * 4 + 2 * (4 + 8));
+  const deltaView = new DataView(delta.buffer);
+  delta.set([2, 1, 0x08 | 0x10 | (1 << 5), 4]);
+  deltaView.setUint32(4, 16, true);
+  deltaView.setUint32(8, 8, true);
+  deltaView.setUint32(12, delta.length, true);
+  deltaView.setUint32(16, 24, true);
+  deltaView.setUint32(20, 36, true);
+  [[24, [1, 3]], [36, [4, 4]]].forEach(([at, words]) => {
+    deltaView.setInt32(at, 8, true);
+    words.forEach((word, i) => deltaView.setUint32(at + 4 + 4 * i, word, true));
+  });
+  assert.deepEqual([...new Uint32Array((await bloscDecode(delta, 16)).buffer)], [1, 2, 5, 6]);
+  // The same frame naming zlib: its streams are stored as they are, so c-blosc
+  // places them, and the delta is undone all the same.
+  delta[2] = 0x08 | 0x10 | (3 << 5);
+  assert.deepEqual([...new Uint32Array((await bloscDecode(delta, 16)).buffer)], [1, 2, 5, 6]);
+  // A plain-copy frame is its bytes, whatever its filters say (c-blosc2 too).
+  const copied = new Uint8Array(16 + 8);
+  copied.set([2, 1, 0x08 | 0x02 | 0x01, 4]);
+  new DataView(copied.buffer).setUint32(4, 8, true);
+  new DataView(copied.buffer).setUint32(8, 8, true);
+  new DataView(copied.buffer).setUint32(12, 24, true);
+  copied.set([9, 8, 7, 6, 5, 4, 3, 2], 16);
+  assert.deepEqual([...await bloscDecode(copied, 8)], [9, 8, 7, 6, 5, 4, 3, 2]);
 });
 
 test('CRC-32C matches its reference value, and a damaged chunk is refused', () => {
@@ -146,11 +201,18 @@ test('variable-length strings must hold exactly the declared items', () => {
     }
     return out;
   };
-  assert.deepEqual(vlenDecode(encode(['a', '', 'üñí', 'x'.repeat(100)]), 4, 'x'), ['a', '', 'üñí', 'x'.repeat(100)]);
-  assert.throws(() => vlenDecode(encode(['a']), 2, 'x'), /holds 1 strings, not the 2/);
-  const bad = encode(['ab']);
-  bad[8] = 0xff;
-  assert.throws(() => vlenDecode(bad, 1, 'x'), /not valid UTF-8/);
+  const items = vlenItems(encode(['a', '', 'üñí', 'x'.repeat(100)]), 4, 'x');
+  assert.deepEqual(items.toArray(), ['a', '', 'üñí', 'x'.repeat(100)]);
+  // Each item decoded when read, by itself.
+  assert.equal(items.at(2), 'üñí');
+  assert.equal(items.length, 4);
+  assert.throws(() => vlenItems(encode(['a']), 2, 'x'), /holds 1 strings, not the 2/);
+  const bad = encode(['ok', 'ab']);
+  bad[14] = 0xff;
+  const badItems = vlenItems(bad, 2, 'x');
+  // An invalid string is refused when it is read; the others read.
+  assert.equal(badItems.at(0), 'ok');
+  assert.throws(() => badItems.at(1), /not valid UTF-8/);
   const truncated = encode(['abc']).subarray(0, 9);
-  assert.throws(() => vlenDecode(truncated, 1, 'x'), /truncated/);
+  assert.throws(() => vlenItems(truncated, 1, 'x'), /truncated/);
 });

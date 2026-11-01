@@ -85,15 +85,34 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
     }
   });
 
-  test(`${format}: the file opens with X named by its index, and refuses a float column`, async t => {
+  test(`${format}: the file opens with raw (more genes than X) named by its index, a symbols column named only when chosen; a float column is refused`, async t => {
     const adapter = await open(t, format);
+    // raw holds more genes than X: the file opens on it, as Scanpy reads
+    // genes (`defaultExpression`), and says why; nothing is guessed.
+    const candidates = adapter.getMappingCandidates();
+    assert.equal(candidates.defaults.expression, 'raw');
+    assert.equal(candidates.expressionReason, 'raw-more-genes');
+    assert.equal(candidates.guessed.includes('expression'), false);
+    // The var index names the genes, whatever it holds: nothing is guessed.
+    assert.equal(candidates.defaults.geneNames, 'index');
+    assert.equal(candidates.guessed.includes('geneNames'), false);
     const own = await adapter.getGeneList();
-    assert.deepEqual(own.fields.map(field => field.key), EXPECTED.genes['X/index'].names);
+    assert.deepEqual(own.fields.map(field => field.key), EXPECTED.genes['raw/index'].names);
+    assert.equal(own.geneNames.source, null);
+    assert.equal(own.geneNames.ids, null);
     assert.equal(
       sha256(await adapter.getGeneValues('var/2')),
-      EXPECTED.genes['X/index'].values[2]
+      EXPECTED.genes['raw/index'].values[2]
     );
-    const columns = adapter.getMappingCandidates().var.columns;
+    // var['gene_symbols'] names them once chosen, each keeping its identifier.
+    const columns = candidates.var.columns;
+    const symbols = columns.findIndex(column => column.key === 'gene_symbols');
+    const symbolsRoute = Object.keys(EXPECTED.genes).find(route => route.startsWith('X/') && route !== 'X/index' &&
+      EXPECTED.genes[route].gene_names.source === 'gene_symbols');
+    const named = await adapter.getGeneList(mappingGeneListPath('X', `column-${symbols}`));
+    assert.deepEqual(named.fields.map(field => field.key), EXPECTED.genes[symbolsRoute].names);
+    assert.deepEqual(named.geneNames.ids, EXPECTED.genes['X/index'].names, 'every gene keeps its identifier');
+    assert.equal(named.geneNames.source, 'gene_symbols');
     const dispersions = columns.findIndex(column => column.key === 'dispersions');
     await assert.rejects(
       adapter.getGeneList(mappingGeneListPath('X', `column-${dispersions}`)),
@@ -101,7 +120,7 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
         && error.key === 'dispersions'
         && error.reason === 'floating-point values cannot name genes'
     );
-    await assert.rejects(adapter.getGeneValues('var/6'), RangeError);
+    await assert.rejects(adapter.getGeneValues(`var/${EXPECTED.genes['raw/index'].names.length}`), RangeError);
     await assert.rejects(
       adapter.getGeneList(mappingGeneListPath('layer-9', 'index')),
       RangeError

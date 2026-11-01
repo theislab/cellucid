@@ -244,18 +244,40 @@ function plural(count, singular, pluralText) {
 }
 
 /**
+ * The namespace of one `obsm` key: a MuData modality's arrays are presented
+ * as `obsm['<modality>:<key>']` (`anndata/views/mudata.js`, and the same in
+ * `prepare()` and `cellucid_prepare()`), each modality's names its own; a
+ * key without `:` is the dataset's own (`prefix` ''). The key rules
+ * (`parseVectorFieldKey`, the default and best-guess embeddings) apply
+ * within one namespace.
+ *
+ * @param {string} key
+ * @returns {{prefix: string, local: string}} `prefix` is `'<modality>:'` or ''
+ */
+export function obsmNamespace(key) {
+  const colon = key.indexOf(':');
+  return colon > 0 && colon < key.length - 1
+    ? { prefix: key.slice(0, colon + 1), local: key.slice(colon + 1) }
+    : { prefix: '', local: key };
+}
+
+/**
  * The vector-field key rule, scVelo's naming convention: an `obsm` key
  * `<field>_<basis>` is the vector field `<field>` on the embedding
  * `X_<basis>` (`velocity_umap` on `X_umap`, `velocity_umap_3d` on
- * `X_umap_3d`, `T_fwd_branches` on `X_branches`).
+ * `X_umap_3d`, `T_fwd_branches` on `X_branches`), within one namespace
+ * (`obsmNamespace`): a modality's `rna:velocity_umap` is the field
+ * `rna:velocity` on `rna:X_umap`, never on the dataset's `X_umap`.
  *
- * - A key that starts with `X_` is never a vector field: AnnData names
- *   representations that way.
- * - Otherwise every split of the key at one `_` into a non-empty `<field>`
- *   and a non-empty `<basis>` is tried, and the split whose `X_<basis>` is an
- *   `obsm` key of the same object wins; when several do, the longest basis
- *   wins (`velocity_umap_3d` is `velocity` on `X_umap_3d` when both `X_umap_3d`
- *   and `X_3d` exist). Matching is exact and case-sensitive.
+ * - A key whose own name (after its namespace) starts with `X_` is never a
+ *   vector field: AnnData names representations that way (`rna:X_umap` is a
+ *   modality's UMAP).
+ * - Otherwise every split of the name at one `_` into a non-empty `<field>`
+ *   and a non-empty `<basis>` is tried, and the split whose `X_<basis>`, in
+ *   the same namespace, is an `obsm` key of the same object wins; when
+ *   several do, the longest basis wins (`velocity_umap_3d` is `velocity` on
+ *   `X_umap_3d` when both `X_umap_3d` and `X_3d` exist). Matching is exact
+ *   and case-sensitive.
  * - A key with no such split is an ordinary `obsm` array.
  *
  * The rule reads names only. Whether the field is drawn is the binding rule
@@ -264,16 +286,19 @@ function plural(count, singular, pluralText) {
  * @param {string} key
  * @param {ReadonlySet<string>} obsmKeys - Every `obsm` key of the object.
  * @returns {{field: string, basis: string, embeddingKey: string}|null}
+ *   `field` keeps the namespace (`rna:velocity`); `basis` is the name's own
  */
 export function parseVectorFieldKey(key, obsmKeys) {
-  if (typeof key !== 'string' || key.startsWith(EMBEDDING_KEY_PREFIX)) return null;
-  for (let split = key.indexOf('_'); split !== -1; split = key.indexOf('_', split + 1)) {
+  if (typeof key !== 'string') return null;
+  const { prefix, local } = obsmNamespace(key);
+  if (local.startsWith(EMBEDDING_KEY_PREFIX)) return null;
+  for (let split = local.indexOf('_'); split !== -1; split = local.indexOf('_', split + 1)) {
     // The first qualifying split from the left has the longest basis.
-    if (split === 0 || split === key.length - 1) continue;
-    const basis = key.slice(split + 1);
-    const embeddingKey = `${EMBEDDING_KEY_PREFIX}${basis}`;
+    if (split === 0 || split === local.length - 1) continue;
+    const basis = local.slice(split + 1);
+    const embeddingKey = `${prefix}${EMBEDDING_KEY_PREFIX}${basis}`;
     if (obsmKeys.has(embeddingKey)) {
-      return { field: key.slice(0, split), basis, embeddingKey };
+      return { field: `${prefix}${local.slice(0, split)}`, basis, embeddingKey };
     }
   }
   return null;
@@ -988,33 +1013,39 @@ function emptySlots() {
  * If any of `X_umap_1d`, `X_umap_2d` or `X_umap_3d` is present, those keys
  * alone fill their slots, reading columns `0 .. d-1`. Otherwise the first of
  * `UMAP_KEYS` (`X_umap`, `X_UMAP`, `X_wnn.umap`, `X_ref.umap`) whose width is
- * 1, 2 or 3 fills the slot of that width. Slots without a default stay null.
- * Presence is all this rule asks: a present key that later fails its
- * load-time check is reported, not skipped.
+ * 1, 2 or 3 fills the slot of that width. A dataset of several modalities
+ * whose own names fill no slot is given the same names in the namespace of
+ * the modality it opens with (`modality`: `rna:X_umap`, `obsmNamespace`).
+ * Slots without a default stay null. Presence is all this rule asks: a
+ * present key that later fails its load-time check is reported, not skipped.
  *
  * @param {Iterable<ObsmEntry>} entries
+ * @param {{modality?: string|null}} [options] - The modality the dataset opens with
  * @returns {EmbeddingSlots}
  */
-export function defaultEmbeddingSlots(entries) {
+export function defaultEmbeddingSlots(entries, { modality = null } = {}) {
   const byKey = new Map();
   for (const entry of entries) byKey.set(entry.key, entry);
-  const slots = emptySlots();
-  const dimensional = DIMENSIONAL_UMAP_KEYS.filter(key => byKey.has(key));
-  if (dimensional.length > 0) {
-    for (const key of dimensional) {
-      const dimension = Number(key['X_umap_'.length]);
-      slots[dimensionSlot(dimension)] = { key, columns: defaultColumns(dimension) };
+  for (const prefix of modality === null ? [''] : ['', `${modality}:`]) {
+    const slots = emptySlots();
+    const dimensional = DIMENSIONAL_UMAP_KEYS.filter(key => byKey.has(`${prefix}${key}`));
+    if (dimensional.length > 0) {
+      for (const key of dimensional) {
+        const dimension = Number(key['X_umap_'.length]);
+        slots[dimensionSlot(dimension)] = { key: `${prefix}${key}`, columns: defaultColumns(dimension) };
+      }
+      return slots;
     }
-    return slots;
+    const single = UMAP_KEYS.map(key => byKey.get(`${prefix}${key}`)).find(entry => entry !== undefined && isDimension(entry.width));
+    if (single !== undefined) {
+      slots[dimensionSlot(single.width)] = {
+        key: single.key,
+        columns: defaultColumns(single.width),
+      };
+      return slots;
+    }
   }
-  const single = UMAP_KEYS.map(key => byKey.get(key)).find(entry => entry !== undefined && isDimension(entry.width));
-  if (single !== undefined) {
-    slots[dimensionSlot(single.width)] = {
-      key: single.key,
-      columns: defaultColumns(single.width),
-    };
-  }
-  return slots;
+  return emptySlots();
 }
 
 /**
@@ -1024,7 +1055,8 @@ export function defaultEmbeddingSlots(entries) {
  * @returns {number}
  */
 export function bestGuessTier(key) {
-  const name = key.toLowerCase();
+  // A modality's key ranks by its own name (`rna:X_umap` is a UMAP).
+  const name = obsmNamespace(key).local.toLowerCase();
   for (const [tier, needles] of BEST_GUESS_TIERS) {
     if (needles.some(needle => name.includes(needle))) return tier;
   }
@@ -1032,14 +1064,23 @@ export function bestGuessTier(key) {
 }
 
 /**
- * Order keys by (tier, key in code-point order).
+ * Order keys by tier, then namespace (`obsmNamespace`: the dataset's own
+ * keys, then the modality it opens with, then the other modalities), then
+ * key in code-point order: a MuData store without a UMAP of its own shows
+ * its gene-expression modality's, not whichever modality sorts first.
  *
  * @param {Iterable<string>} keys
+ * @param {{modality?: string|null}} [options] - The modality the dataset opens with
  * @returns {string[]}
  */
-export function bestGuessOrder(keys) {
-  return Array.from(keys, key => ({ key, tier: bestGuessTier(key) }))
-    .sort((a, b) => a.tier - b.tier || compareCodePoints(a.key, b.key))
+export function bestGuessOrder(keys, { modality = null } = {}) {
+  const namespaceRank = key => {
+    const { prefix } = obsmNamespace(key);
+    if (prefix === '') return 0;
+    return modality !== null && prefix === `${modality}:` ? 1 : 2;
+  };
+  return Array.from(keys, key => ({ key, tier: bestGuessTier(key), namespace: namespaceRank(key) }))
+    .sort((a, b) => a.tier - b.tier || a.namespace - b.namespace || compareCodePoints(a.key, b.key))
     .map(({ key }) => key);
 }
 
@@ -1074,10 +1115,11 @@ export function bestGuessOrder(keys) {
  * deterministic and bounded by the candidate count.
  *
  * @param {Iterable<ObsmEntry>} entries
- * @param {{latentKey: string|null, loadCheck?: LoadCheck|null}} options
+ * @param {{latentKey: string|null, loadCheck?: LoadCheck|null, modality?: string|null}} options
+ *   `modality`: the modality a dataset of several opens with (`bestGuessOrder`)
  * @returns {EmbeddingGuess}
  */
-export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck = null } = {}) {
+export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck = null, modality = null } = {}) {
   const list = Array.from(entries);
   const vectorKeys = vectorFieldKeys(list.map(entry => entry.key));
   const widthByKey = new Map();
@@ -1109,7 +1151,7 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
     [...widthByKey].filter(([, width]) => predicate(width)).map(([key]) => key);
 
   for (const dimension of [3, 2, 1]) {
-    for (const key of bestGuessOrder(keysWhere(width => width === dimension))) {
+    for (const key of bestGuessOrder(keysWhere(width => width === dimension), { modality })) {
       const columns = defaultColumns(dimension);
       if (tryCandidate(key, columns)) {
         slots[dimensionSlot(dimension)] = { key, columns };
@@ -1119,7 +1161,7 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
   }
 
   if (DIMENSION_SLOTS.every(slot => slots[slot] === null)) {
-    for (const key of bestGuessOrder(keysWhere(width => width > 3))) {
+    for (const key of bestGuessOrder(keysWhere(width => width > 3), { modality })) {
       const columns = [0, 1];
       if (tryCandidate(key, columns)) {
         slots['2d'] = { key, columns };
@@ -1143,16 +1185,16 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
  * does `bestGuessEmbeddingSlots` run.
  *
  * @param {Iterable<ObsmEntry>} entries
- * @param {{latentKey: string|null, loadCheck?: LoadCheck|null}} options
+ * @param {{latentKey: string|null, loadCheck?: LoadCheck|null, modality?: string|null}} options
  * @returns {EmbeddingGuess}
  */
-export function resolveEmbeddingSlots(entries, { latentKey = null, loadCheck = null } = {}) {
+export function resolveEmbeddingSlots(entries, { latentKey = null, loadCheck = null, modality = null } = {}) {
   const list = Array.from(entries);
-  const slots = defaultEmbeddingSlots(list);
+  const slots = defaultEmbeddingSlots(list, { modality });
   if (DIMENSION_SLOTS.some(slot => slots[slot] !== null)) {
     return Object.freeze({ slots, guessed: [], rejected: [] });
   }
-  return bestGuessEmbeddingSlots(list, { latentKey, loadCheck });
+  return bestGuessEmbeddingSlots(list, { latentKey, loadCheck, modality });
 }
 
 /**
@@ -1235,6 +1277,40 @@ export function defaultVectorBindings(entries, enabled) {
   return sortVectorBindings(bindings);
 }
 
+/** The neighbour graph AnnData's `sc.pp.neighbors` writes, the default first. */
+export const DEFAULT_GRAPH_KEY = 'connectivities';
+
+/** The suffix Seurat's `FindNeighbors` gives its shared-nearest-neighbour graph (`<assay>_snn`). */
+const SNN_GRAPH_SUFFIX = '_snn';
+
+/** Whether a graph key names a shared-nearest-neighbour graph: `snn`, or `<assay>_snn`, in any case. */
+function isSharedNeighbourGraph(key) {
+  const lowered = key.toLowerCase();
+  return lowered === 'snn' || (lowered.endsWith(SNN_GRAPH_SUFFIX) && key.length > SNN_GRAPH_SUFFIX.length);
+}
+
+/**
+ * The neighbour graph a dataset opens with, of its `obsp` keys: Scanpy's
+ * `connectivities`; else Seurat's shared-nearest-neighbour graph of the
+ * modality (assay) it opens with (`<modality>_snn`), else the first other
+ * shared-nearest-neighbour graph (`<assay>_snn`, or `SNN`, in any case) in
+ * code-point order; else none. Seurat's other graph (`<assay>_nn`,
+ * directed) and Scanpy's `distances` are no undirected neighbour graph and
+ * are never the default. `prepare()` and `cellucid_prepare()` choose the
+ * graph they write by the same rule.
+ *
+ * @param {Iterable<string>} keys - The `obsp` keys
+ * @param {{modality?: string|null}} [options] - The modality (or Seurat's active assay) the dataset opens with
+ * @returns {string|null}
+ */
+export function defaultGraph(keys, { modality = null } = {}) {
+  const list = [...keys];
+  if (list.includes(DEFAULT_GRAPH_KEY)) return DEFAULT_GRAPH_KEY;
+  if (modality !== null && list.includes(`${modality}${SNN_GRAPH_SUFFIX}`)) return `${modality}${SNN_GRAPH_SUFFIX}`;
+  const shared = list.filter(isSharedNeighbourGraph).sort(compareCodePoints);
+  return shared[0] ?? null;
+}
+
 /**
  * The names a gene-expression modality goes by, lower-cased: MuData's `rna`,
  * 10x's `Gene Expression`, Seurat's `RNA` and `SCT`.
@@ -1291,21 +1367,73 @@ export function requireMappingModality(mapping, modalities) {
 }
 
 /**
- * Return the default expression source and whether it was guessed.
+ * The inputs of the default expression rule (`defaultExpression`) a store
+ * gives: whether it has `X` and `raw.X`, whether `raw.X` holds more genes
+ * than `X` (`rawHasMoreGenes`), and whether `X` holds scaled values
+ * (`xScaled`). The one place that rule is read from a store: the web
+ * reader and the datasets publisher both call it, so a published default
+ * opens on the matrix the viewer opens.
  *
- * `X` when it exists. Otherwise `raw`; otherwise the only layer; otherwise
- * the first layer whose name contains `norm` or `log`, then the remaining
- * layers in code-point order, with `counts` and `raw_counts` last. Null when
- * there is nothing to read.
+ * `xScaled` is read only when there is a `raw` to choose (else false): `X`
+ * is a dense float matrix and its first chunk (stored in one piece: its
+ * first row) holds a negative value -- `sc.pp.scale` centres every gene, so
+ * about half of any cell's values are negative, while counts and
+ * normalised values never are, and a sparse matrix is not scaled. One small
+ * read, through `read`.
  *
- * @param {{hasX: boolean, hasRaw: boolean, layers: ReadonlyArray<string>}} options
- * @returns {{expression: string|null, guessed: boolean}}
+ * @param {Object} options
+ * @param {{dense: boolean, floating: boolean, shape: ReadonlyArray<number>, chunks: ReadonlyArray<number>|null}|null} options.X
+ *   `X` as stored (`chunks` null: stored in one piece), null without one
+ * @param {{shape: ReadonlyArray<number>}|null} options.rawX - `raw.X`, null without one
+ * @param {(region: [[number, number], [number, number]]) => Promise<ArrayLike<number>>} options.read -
+ *   The values of `X` in `[[rowStart, rowEnd], [columnStart, columnEnd]]`
+ * @returns {Promise<{hasX: boolean, hasRaw: boolean, rawHasMoreGenes: boolean, xScaled: boolean}>}
  */
-export function defaultExpression({ hasX, hasRaw, layers }) {
-  if (hasX) return { expression: 'X', guessed: false };
-  if (hasRaw) return { expression: 'raw', guessed: true };
-  if (layers.length === 0) return { expression: null, guessed: false };
-  if (layers.length === 1) return { expression: `${LAYER_PREFIX}${layers[0]}`, guessed: true };
+export async function expressionRuleInputs({ X, rawX, read }) {
+  const hasX = X !== null;
+  const hasRaw = rawX !== null;
+  if (!hasX || !hasRaw) return { hasX, hasRaw, rawHasMoreGenes: false, xScaled: false };
+  const rawHasMoreGenes = rawX.shape.length === 2 && X.shape.length === 2 && rawX.shape[1] > X.shape[1];
+  let xScaled = false;
+  if (X.dense && X.floating && X.shape.length === 2 && X.shape[0] > 0 && X.shape[1] > 0) {
+    const [nRows, nColumns] = X.shape;
+    const [rows, columns] = X.chunks ?? [1, nColumns];
+    const values = await read([[0, Math.min(nRows, rows)], [0, Math.min(nColumns, columns)]]);
+    for (let i = 0; i < values.length && !xScaled; i++) xScaled = values[i] < 0;
+  }
+  return { hasX, hasRaw, rawHasMoreGenes, xScaled };
+}
+
+/**
+ * Return the default expression source, whether it was guessed, and why
+ * `raw` was chosen over `X` (`reason`: `raw-more-genes`, raw holds more genes
+ * than X, which kept the highly variable genes; `x-scaled`, X holds scaled
+ * values, negative ones from `sc.pp.scale`; null otherwise).
+ *
+ * Scanpy reads genes from `raw` when it is present (`use_raw=None`), for
+ * the files that convention is for: `adata.raw = adata` saved the
+ * log-normalised matrix of every gene before `X` was cut to the highly
+ * variable genes or scaled. So `raw` is the default when it is present and
+ * either holds more genes than `X` (`rawHasMoreGenes`) or `X` holds scaled
+ * values (`xScaled`: a dense float `X` with negative values in its first
+ * chunk); otherwise `X`. A CELLxGENE file keeps raw counts in `raw` over
+ * the same genes as its normalised `X`, and opens on `X`. `X` is one choice
+ * away in Data mapping either way. Without `X`: `raw` (guessed); otherwise
+ * the only layer; otherwise the first layer whose name contains `norm` or
+ * `log`, then the remaining layers in code-point order, with `counts` and
+ * `raw_counts` last (guessed). Null when there is nothing to read.
+ *
+ * @param {{hasX: boolean, hasRaw: boolean, layers: ReadonlyArray<string>, rawHasMoreGenes?: boolean, xScaled?: boolean}} options
+ * @returns {{expression: string|null, guessed: boolean, reason: string|null}}
+ */
+export function defaultExpression({ hasX, hasRaw, layers, rawHasMoreGenes = false, xScaled = false }) {
+  if (hasRaw && hasX && (rawHasMoreGenes || xScaled)) {
+    return { expression: 'raw', guessed: false, reason: rawHasMoreGenes ? 'raw-more-genes' : 'x-scaled' };
+  }
+  if (hasX) return { expression: 'X', guessed: false, reason: null };
+  if (hasRaw) return { expression: 'raw', guessed: true, reason: null };
+  if (layers.length === 0) return { expression: null, guessed: false, reason: null };
+  if (layers.length === 1) return { expression: `${LAYER_PREFIX}${layers[0]}`, guessed: true, reason: null };
 
   const rank = name => {
     const lowered = name.toLowerCase();
@@ -1322,7 +1450,7 @@ export function defaultExpression({ hasX, hasRaw, layers }) {
       bestRank = nameRank;
     }
   }
-  return { expression: `${LAYER_PREFIX}${best}`, guessed: true };
+  return { expression: `${LAYER_PREFIX}${best}`, guessed: true, reason: null };
 }
 
 /**
@@ -1342,32 +1470,48 @@ function isIntegerDtype(dtype) {
  * `sc.pp.log1p` records itself in `uns['log1p']` (with `base`, None for e),
  * and Scanpy reads that record as saying the data it works on is `log1p`:
  * `rank_genes_groups` undoes it with that base for `X` or any layer it is
- * given. So when the file has `uns['log1p']`, `X` and every layer are `log1p`
- * with its base. `raw` is what `adata.raw = adata` saved, conventionally the
- * log-normalised matrix: it is `log1p` too, unless it is stored as integers
- * (counts). Without `uns['log1p']` every matrix is as stored, as the file
- * states by not recording a transform. The choice is recorded as guessed when
- * the record was read as applying to matrices: it names none of them.
+ * given. So when the file has `uns['log1p']`, `X`, `raw` and every layer are
+ * `log1p` with its base, unless one is stored as integers: counts, which a
+ * `log1p` never writes (`raw` of raw counts, `layers['counts']`). Without
+ * `uns['log1p']` every matrix is as stored, as the file states by not
+ * recording a transform. The choice is recorded as guessed when the record
+ * was read as applying to matrices: it names none of them.
+ *
+ * A record is not taken over values that refute it (`notLog1p`, read from a
+ * matrix's first stored values: undone, the log1p would give a cell a total
+ * past the largest number the matrix's own type holds, so the values were
+ * never log1p): that matrix is as stored, and `refuted` says which and why.
+ * EBI SCEA's E-ANND-5 stores per-million values under an empty
+ * `uns['log1p']`; read as log1p its fold changes were meaningless.
  *
  * @param {{
  *   log1p: {base: number|null}|null,
- *   hasX: boolean,
- *   raw: {dtype: string}|null,
- *   layers: ReadonlyArray<string>
- * }} options - `log1p` is `uns['log1p']` as probed; `layers` the usable
- *   layers' names; `raw` raw.X's dtype, or null without raw.
- * @returns {{log1p: Record<string, {base: number|null}>, guessed: boolean}}
+ *   X: {dtype: string, notLog1p?: Object|null}|null,
+ *   raw: {dtype: string, notLog1p?: Object|null}|null,
+ *   layers: ReadonlyArray<{key: string, dtype: string, notLog1p?: Object|null}>
+ * }} options - `log1p` is `uns['log1p']` as probed; `X` and `raw` X's and
+ *   raw.X's probe (its dtype, and what refutes the record in its values:
+ *   null, or absent before they are read), or null without them; `layers`
+ *   the usable layers' probes.
+ * @returns {{log1p: Record<string, {base: number|null}>, guessed: boolean,
+ *   refuted: Array<{matrix: string, value: number, dtype: string, total: number|null}>}}
  */
-export function defaultLog1p({ log1p, hasX, raw, layers }) {
-  const matrices = [
-    ...(hasX ? ['X'] : []),
-    ...layers.map(name => `${LAYER_PREFIX}${name}`),
-    ...(raw !== null && !isIntegerDtype(raw.dtype) ? ['raw'] : []),
-  ];
-  if (log1p === null) return { log1p: {}, guessed: false };
+export function defaultLog1p({ log1p, X, raw, layers }) {
+  const notCounts = matrix => matrix !== null && !isIntegerDtype(matrix.dtype);
+  const named = [
+    ...(notCounts(X) ? [['X', X]] : []),
+    ...layers.filter(notCounts).map(layer => [`${LAYER_PREFIX}${layer.key}`, layer]),
+    ...(notCounts(raw) ? [['raw', raw]] : []),
+  ].sort(([a], [b]) => compareCodePoints(a, b));
+  if (log1p === null) return { log1p: {}, guessed: false, refuted: [] };
   const result = {};
-  for (const matrix of matrices.sort(compareCodePoints)) result[matrix] = { base: log1p.base };
-  return { log1p: result, guessed: matrices.length > 0 };
+  const refuted = [];
+  for (const [matrix, probe] of named) {
+    const refutation = probe.notLog1p ?? null;
+    if (refutation === null) result[matrix] = { base: log1p.base };
+    else refuted.push({ matrix, value: refutation.value, dtype: refutation.dtype, total: refutation.total });
+  }
+  return { log1p: result, guessed: Object.keys(result).length > 0, refuted };
 }
 
 /**

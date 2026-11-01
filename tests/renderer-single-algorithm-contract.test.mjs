@@ -28,9 +28,10 @@ test('velocity spawn tables are deterministic samples without replacement', () =
     assert.equal(first.length, 128);
     assert.equal(new Set(first).size, first.length);
     assert.notDeepEqual(first, Uint32Array.from({ length: 128 }, (_, index) => index));
+    // The level is a renderer `LodMembership`, nothing else.
     assert.throws(
-      () => overlay._buildSpawnTable(transparency, 512, new Int32Array([0, 1])),
-      /must be a Uint32Array or null/
+      () => overlay._buildSpawnTable(transparency, 512, new Uint32Array([0, 1])),
+      /must be null or one frozen level-of-detail membership/
     );
   } finally {
     Date.now = originalNow;

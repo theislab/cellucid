@@ -27,7 +27,6 @@ import {
   datasetFingerprintMatches,
   describeDataMappingMismatch,
   describeMissingRequiredFields,
-  digestCellOrder,
   getDatasetFingerprint,
   verifySessionFingerprint,
 } from '../assets/js/app/session/session-context.js';
@@ -41,6 +40,7 @@ import {
   validateDataMapping,
 } from '../assets/js/data/data-mapping.js';
 import { installDataMappingMethods } from './helpers/data-mapping-state.mjs';
+import { cellOrderDigest } from '../assets/js/data/cell-order-digest.js';
 
 const CELL_COUNT = 6;
 const VAR_COUNT = 4;
@@ -340,7 +340,7 @@ function makeSerializer(state) {
   });
 }
 
-function fingerprintOf(state) {
+async function fingerprintOf(state) {
   return getDatasetFingerprint({
     dataSourceManager: makeDataSourceManager(),
     state,
@@ -496,7 +496,7 @@ test(
     assert.match(message, /different order/);
     // Row order is one of the two things a coordinate difference can mean,
     // so it is offered, never asserted.
-    assert.match(message, /Either the cells are stored/);
+    assert.match(message, /Either the cells are listed in a different order/);
     assert.strictEqual(destination.highlightPages, untouchedPages);
     assert.deepEqual(restoredSelection(destination), []);
     assert.equal(heldPins(destination), 0);
@@ -527,17 +527,15 @@ test('an unchanged dataset restores the exact selected set', async () => {
     destination.highlightPages[0].highlightedGroups[0].label,
     'CD8 T cells',
   );
-  // The live layout was digested from its resident positions, pinned for the
-  // duration and released.
+  // The live layout (held in memory here) was digested from its resident
+  // positions; nothing was pinned or loaded.
   assert.deepEqual(destination.dimensionLog, [
-    ['pin', 'X_umap_3d'],
     ['getPositions', 'X_umap_3d'],
-    ['release', 'X_umap_3d'],
   ]);
   assert.equal(heldPins(destination), 0);
 });
 
-test('a file without the format-2 signature is refused by its signature, before anything is read', async () => {
+test('a file without the session signature is refused by its signature, before anything is read', async () => {
   const { bundle } = await captureSelectionBundle();
   const bytes = new Uint8Array(await bundle.arrayBuffer());
   // The same framing behind an unversioned signature.
@@ -565,7 +563,7 @@ test('a file without the format-2 signature is refused by its signature, before 
   assert.deepEqual(destination.dimensionLog, []);
 });
 
-test('a fingerprint missing a format-2 field is a schema violation', async () => {
+test('a fingerprint missing a field is a schema violation', async () => {
   const { bundle } = await captureSelectionBundle();
   const withoutName = await rewriteSessionBundle(bundle, manifest => {
     delete manifest.datasetFingerprint.name;
@@ -610,13 +608,12 @@ test(
     });
 
     assert.deepEqual(restoredSelection(destination), [SELECTED_ROWS]);
-    // The 3D layout the session names was pinned, loaded without progress UI,
-    // digested and released; the live view kept showing its 2D layout.
+    // The 3D layout the session names (held in memory here) was loaded
+    // without progress UI and digested; the live view kept showing its 2D
+    // layout.
     assert.deepEqual(destination.dimensionLog, [
-      ['pin', 'X_umap_3d'],
       ['getPositions', 'X_umap_3d'],
       ['load', 'X_umap_3d'],
-      ['release', 'X_umap_3d'],
     ]);
     assert.equal(heldPins(destination), 0);
     assert.equal(destination.dimensionManager.getViewLayout('live'), 'X_umap_2d');
@@ -634,7 +631,7 @@ test(
     assert.deepEqual(manifest.datasetFingerprint.cellOrder, {
       embedding: { key: 'X_tsne_2d', columns: [0, 1] },
       dimension: 2,
-      digest: digestCellOrder(positionsForCellOrder(IDENTITY_ORDER, 2, 3), 2),
+      digest: cellOrderDigest(positionsForCellOrder(IDENTITY_ORDER, 2, 3), 2),
     });
     // The mapping records the enabled set and the defaults, not what one view
     // shows.
@@ -649,10 +646,8 @@ test(
     });
     assert.deepEqual(restoredSelection(destination), [SELECTED_ROWS]);
     assert.deepEqual(destination.dimensionLog.map(entry => entry.slice(0, 2)), [
-      ['pin', 'X_tsne_2d'],
       ['getPositions', 'X_tsne_2d'],
       ['load', 'X_tsne_2d'],
-      ['release', 'X_tsne_2d'],
     ]);
     assert.equal(destination.dimensionManager.getViewLayout('live'), 'X_umap_3d');
 
@@ -889,7 +884,6 @@ test('nothing is applied before verification passes', async () => {
       }
       assert.strictEqual(destination.highlightPages, untouchedPages);
       assert.deepEqual(restoredSelection(destination), []);
-      assert.equal(heldPins(destination), 1);
       destination.pendingLoads.shift()();
       await settle(restore);
     });
@@ -926,7 +920,7 @@ test('nothing is applied before verification passes', async () => {
 
 test('verifySessionFingerprint checks identity, then mapping, then the digest', async () => {
   const source = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
-  const saved = fingerprintOf(source);
+  const saved = await fingerprintOf(source);
   const ctx = state => ({ dataSourceManager: makeDataSourceManager(), state });
 
   const same = makeDatasetState({
@@ -961,19 +955,21 @@ test('verifySessionFingerprint checks identity, then mapping, then the digest', 
   );
   assert.deepEqual(mappingAndRows.dimensionLog, []);
 
+  // Told apart by identity, named by the names they show, never by an
+  // identity id (an internal key: a link's is its encoded address).
   const otherCopy = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
-  assert.match(
-    await verifySessionFingerprint(
-      {
-        dataSourceManager: {
-          getCurrentIdentityId: () => 'pancreas-mirror',
-        },
-        state: otherCopy,
+  const otherCopyRefusal = await verifySessionFingerprint(
+    {
+      dataSourceManager: {
+        getCurrentIdentityId: () => 'pancreas-mirror',
+        getCurrentMetadata: () => ({ name: 'Pancreas mirror' }),
       },
-      saved,
-    ),
-    /saved on a different dataset\. It has the same.*"pancreas" and "pancreas-mirror" is open now/,
+      state: otherCopy,
+    },
+    saved,
   );
+  assert.match(otherCopyRefusal, /saved on a different dataset\. It has the same.*another dataset and "Pancreas mirror" is open now/);
+  assert.doesNotMatch(otherCopyRefusal, /pancreas-mirror|"pancreas"/);
 
   // Validation precedes everything: a malformed record never reaches the
   // dataset.
@@ -986,6 +982,22 @@ test('verifySessionFingerprint checks identity, then mapping, then the digest', 
     }),
     /must contain exactly/,
   );
+});
+
+test('a published starting view applies to any subsample of its dataset; another session names its cells', async () => {
+  const { createCellIdentity } = await import('../assets/js/data/cell-identity.js');
+  const source = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
+  const saved = await fingerprintOf(source);
+  const ctx = state => ({ dataSourceManager: makeDataSourceManager(), state });
+  // Four of the six cells open (fitted to the device, or named in the link).
+  const subsample = makeDatasetState({ cellOrder: [0, 1, 2, 3], pages: emptyPages() });
+  subsample.cellIdentity = createCellIdentity({ nObs: 6, kept: Uint32Array.of(0, 2, 3, 5) });
+  assert.equal(await verifySessionFingerprint(ctx(subsample), saved, { profile: 'published-default' }), null);
+  // A user session saved on every cell is restored on every cell (its cells are opened first).
+  assert.match(await verifySessionFingerprint(ctx(subsample), saved), /6 cells and 4 genes when it was saved, 4 cells/);
+  // A subsample of another dataset (another cell count) is still refused.
+  subsample.cellIdentity = createCellIdentity({ nObs: 7, kept: Uint32Array.of(0, 2, 3, 5) });
+  assert.match(await verifySessionFingerprint(ctx(subsample), saved, { profile: 'published-default' }), /different dataset/);
 });
 
 test(
@@ -1009,7 +1021,7 @@ test(
     // The one thing the digest establishes.
     assert.match(message, /coordinates differ/);
     // Both causes it cannot separate, offered as alternatives.
-    assert.match(message, /Either the cells are stored in a different order/);
+    assert.match(message, /Either the cells are listed in a different order/);
     assert.match(message, /re-computed embedding/);
     // Never the old claim that a re-ordering is what happened.
     assert.doesNotMatch(message, /would mark the wrong cells/);
@@ -1018,12 +1030,12 @@ test(
   },
 );
 
-test('dataset fingerprints are exactly six fields with a cell-order digest over every cell', () => {
+test('dataset fingerprints are exactly six fields with a cell-order digest over every cell', async () => {
   const state = makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
   });
-  const fingerprint = fingerprintOf(state);
+  const fingerprint = await fingerprintOf(state);
   assert.deepEqual(Object.keys(fingerprint).sort(), [
     'cellCount',
     'cellOrder',
@@ -1041,7 +1053,7 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
   assert.match(fingerprint.cellOrder.digest, /^[0-9a-f]{16}$/);
   assert.equal(
     fingerprint.cellOrder.digest,
-    digestCellOrder(positionsForCellOrder(IDENTITY_ORDER, 3), 3),
+    cellOrderDigest(positionsForCellOrder(IDENTITY_ORDER, 3), 3),
   );
   assert.equal(Object.isFrozen(fingerprint.cellOrder), true);
   assert.equal(Object.isFrozen(fingerprint.cellOrder.embedding), true);
@@ -1066,7 +1078,7 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
 
   // Swapping the two last cells is enough to change the digest: the check is
   // not a sample.
-  const swappedFingerprint = fingerprintOf(makeDatasetState({
+  const swappedFingerprint = await fingerprintOf(makeDatasetState({
     cellOrder: [0, 1, 2, 3, 5, 4],
     pages: emptyPages(),
   }));
@@ -1080,7 +1092,7 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
   assert.equal(
     datasetFingerprintMatches(
       fingerprint,
-      fingerprintOf(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() })),
+      await fingerprintOf(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() })),
     ),
     true,
   );
@@ -1088,7 +1100,7 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
   assert.equal(
     datasetFingerprintMatches(
       fingerprint,
-      fingerprintOf(makeDatasetState({
+      await fingerprintOf(makeDatasetState({
         cellOrder: IDENTITY_ORDER,
         pages: emptyPages(),
         mapping: keyedMapping({ geneNames: 'column:symbol' }),
@@ -1100,14 +1112,14 @@ test('dataset fingerprints are exactly six fields with a cell-order digest over 
   // The fingerprint needs the mapping the dataset is shown with.
   const unmapped = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
   unmapped.getDataMapping = () => null;
-  assert.throws(() => fingerprintOf(unmapped), /requires the loaded data mapping/);
+  await assert.rejects(fingerprintOf(unmapped), /requires the loaded data mapping/);
   const noLayoutKey = makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() });
   delete noLayoutKey.getViewLayoutKey;
-  assert.throws(() => fingerprintOf(noLayoutKey), /getViewLayoutKey/);
+  await assert.rejects(fingerprintOf(noLayoutKey), /getViewLayoutKey/);
 });
 
-test('cellOrder.embedding names the live layout by obsm key and columns, whatever its layout key', () => {
-  const keyedFingerprint = fingerprintOf(makeDatasetState({
+test('cellOrder.embedding names the live layout by obsm key and columns, whatever its layout key', async () => {
+  const keyedFingerprint = await fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
     liveLayoutKey: 'X_tsne_2d',
@@ -1115,7 +1127,7 @@ test('cellOrder.embedding names the live layout by obsm key and columns, whateve
   assert.deepEqual(keyedFingerprint.cellOrder.embedding, { key: 'X_tsne_2d', columns: [0, 1] });
   assert.equal(keyedFingerprint.cellOrder.dimension, 2);
 
-  const anndataFingerprint = fingerprintOf(makeDatasetState({
+  const anndataFingerprint = await fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
     kind: 'anndata',
@@ -1147,7 +1159,7 @@ test('cellOrder.embedding names the live layout by obsm key and columns, whateve
     ],
     liveLayoutKey: 'scratch',
   });
-  assert.throws(() => fingerprintOf(unnamed), /no AnnData obsm provenance/);
+  await assert.rejects(fingerprintOf(unnamed), /no AnnData obsm provenance/);
 });
 
 test('an AnnData session is verified on the obsm columns it names', async () => {
@@ -1176,10 +1188,8 @@ test('an AnnData session is verified on the obsm columns it names', async () => 
   });
   assert.deepEqual(restoredSelection(destination), [SELECTED_ROWS]);
   assert.deepEqual(destination.dimensionLog.map(entry => entry.slice(0, 2)), [
-    ['pin', 'pca-view'],
     ['getPositions', 'pca-view'],
     ['load', 'pca-view'],
-    ['release', 'pca-view'],
   ]);
 
   // Other columns of the same array are another embedding.
@@ -1203,12 +1213,12 @@ test('an AnnData session is verified on the obsm columns it names', async () => 
 
 });
 
-test('a fingerprint record must be exact and its data mapping canonical', () => {
-  const keyedFingerprint = fingerprintOf(makeDatasetState({
+test('a fingerprint record must be exact and its data mapping canonical', async () => {
+  const keyedFingerprint = await fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
   }));
-  const anndataFingerprint = fingerprintOf(makeDatasetState({
+  const anndataFingerprint = await fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
     kind: 'anndata',
@@ -1286,17 +1296,17 @@ test('a fingerprint record must be exact and its data mapping canonical', () => 
   assert.doesNotThrow(() => assertDatasetFingerprint({ ...clone(keyedFingerprint), name: null }, 'Saved'));
 });
 
-test('cell-order digests are stable and dataset-wide', () => {
+test('cell-order digests are stable and dataset-wide', async () => {
   const cellOrder = Array.from({ length: 4096 }, (_value, index) => index);
-  const first = fingerprintOf(makeDatasetState({ cellOrder, pages: emptyPages() }));
-  const second = fingerprintOf(makeDatasetState({ cellOrder, pages: emptyPages() }));
+  const first = await fingerprintOf(makeDatasetState({ cellOrder, pages: emptyPages() }));
+  const second = await fingerprintOf(makeDatasetState({ cellOrder, pages: emptyPages() }));
   assert.equal(second.cellOrder.digest, first.cellOrder.digest);
 
   for (const row of [0, 1, 2047, 4094, 4095]) {
     const moved = [...cellOrder];
     const other = row === 0 ? 1 : row - 1;
     [moved[row], moved[other]] = [moved[other], moved[row]];
-    const mutated = fingerprintOf(makeDatasetState({ cellOrder: moved, pages: emptyPages() }));
+    const mutated = await fingerprintOf(makeDatasetState({ cellOrder: moved, pages: emptyPages() }));
     assert.notEqual(
       mutated.cellOrder.digest,
       first.cellOrder.digest,
@@ -1306,7 +1316,7 @@ test('cell-order digests are stable and dataset-wide', () => {
 });
 
 async function verifyRefusals() {
-  const saved = fingerprintOf(makeDatasetState({
+  const saved = await fingerprintOf(makeDatasetState({
     cellOrder: IDENTITY_ORDER,
     pages: emptyPages(),
     liveLayoutKey: 'X_tsne_2d',
@@ -1406,7 +1416,7 @@ test('a session saved with a duplicated gene restores on the reloaded dataset', 
     _userDefinedId: 'user_var_1',
     _fieldSource: 'var',
   });
-  const savedFingerprint = fingerprintOf(source);
+  const savedFingerprint = await fingerprintOf(source);
   assert.equal(savedFingerprint.varCount, VAR_COUNT);
   const bundle = await makeSerializer(source).createSessionBundle();
 
@@ -1431,13 +1441,13 @@ test('the digest of a compact 1D/2D embedding equals the digest of its zero-padd
       }
     }
     assert.equal(
-      digestCellOrder(compact, dimension),
-      digestCellOrder(padded, 3),
+      cellOrderDigest(compact, dimension),
+      cellOrderDigest(padded, 3),
       `${dimension}D digest must not depend on the in-memory layout`,
     );
   }
   assert.throws(
-    () => digestCellOrder(new Float32Array(5), 2),
-    /2 values per cell/,
+    () => cellOrderDigest(new Float32Array(5), 2),
+    /whole cells/,
   );
 });

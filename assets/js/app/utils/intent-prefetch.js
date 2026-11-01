@@ -12,6 +12,8 @@
  * @module utils/intent-prefetch
  */
 
+import { cancelled } from '../../utils/abort.js';
+
 /**
  * How long an option has to stay under the pointer or active before it is
  * prefetched: long enough that sweeping across a list starts nothing, short
@@ -37,7 +39,7 @@ export function createIntentPrefetcher(prefetch, dwellMs = INTENT_PREFETCH_DWELL
   function cancel() {
     if (timer !== null) clearTimeout(timer);
     timer = null;
-    controller?.abort(new DOMException('Prefetch was superseded', 'AbortError'));
+    controller?.abort(cancelled('superseded', 'The prefetch was superseded.'));
     controller = null;
     intended = undefined;
   }

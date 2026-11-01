@@ -31,8 +31,15 @@ async function recordFrame(page) {
     });
     const draws = [];
     const original = gl.drawArrays;
+    const pointPrograms = new Set(Object.values(viewer.getHPRenderer().programs));
     gl.drawArrays = function recordedDraw(mode, first, count) {
+      // A transform-feedback pass draws no fragment: it has no blend state.
+      if (gl.isEnabled(gl.RASTERIZER_DISCARD)) return Reflect.apply(original, this, [mode, first, count]);
       draws.push({
+        // The point pass's own draws (the GPU gather of a tree's draw order,
+        // `high-perf/gpu-permute.js`, draws as many points with another
+        // program, into its own target).
+        pointPass: pointPrograms.has(gl.getParameter(gl.CURRENT_PROGRAM)),
         count,
         coverageMask: gl.isEnabled(gl.SAMPLE_ALPHA_TO_COVERAGE),
         blendSource: gl.getParameter(gl.BLEND_SRC_RGB),
@@ -68,8 +75,8 @@ async function recordFrame(page) {
 }
 
 function expectBaselineAround(result, scatterOpaque) {
-  const scatter = result.draws.filter(draw => draw.count === result.pointCount);
-  const others = result.draws.filter(draw => draw.count !== result.pointCount);
+  const scatter = result.draws.filter(draw => draw.pointPass && draw.count === result.pointCount);
+  const others = result.draws.filter(draw => !scatter.includes(draw));
   expect(scatter.length).toBeGreaterThan(0);
   expect(others.length).toBeGreaterThan(0);
   for (const draw of scatter) {

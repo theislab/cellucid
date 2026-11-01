@@ -17,12 +17,13 @@ import {
 } from './github-reference.js';
 import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { onAbort } from '../../utils/abort.js';
 
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 const CAP_GRAPHQL_URL = 'https://celltype.info/graphql';
-const WORKER_CONTRACT_VERSION = 1;
+const WORKER_CONTRACT_VERSION = 2;
 const GITHUB_API_VERSION = '2026-03-10';
 const GITHUB_PAGE_SIZE = 100;
 const GITHUB_COLLECTION_MAX_ITEMS = 10_000;
@@ -83,6 +84,7 @@ const OAUTH_RANDOM_HEX_256 = /^[0-9a-f]{64}$/;
 
 const APP_AUTH_FLAG_PARAM = 'cellucid_github_auth';
 const APP_AUTH_TOKEN_PARAM = 'cellucid_github_token';
+const APP_AUTH_TOKEN_EXPIRES_PARAM = 'cellucid_github_token_expires_in';
 const APP_AUTH_ERROR_PARAM = 'cellucid_github_error';
 
 const ALLOWED_METHODS = new Set([
@@ -147,12 +149,9 @@ function createWorkerRequestScope(request) {
     firstReason = reason;
     controller.abort(reason);
   };
-  const onCallerAbort = () => {
+  const stopCaller = onAbort(request.signal, () => {
     abort('caller', request.signal.reason);
-  };
-
-  request.signal.addEventListener('abort', onCallerAbort, { once: true });
-  if (request.signal.aborted) onCallerAbort();
+  });
 
   let deadline = null;
   try {
@@ -161,7 +160,7 @@ function createWorkerRequestScope(request) {
       WORKER_REQUEST_DEADLINE_MS
     );
   } catch (cause) {
-    request.signal.removeEventListener('abort', onCallerAbort);
+    stopCaller();
     throw new WorkerHttpError(
       500,
       'Worker request deadline could not be created',
@@ -169,7 +168,7 @@ function createWorkerRequestScope(request) {
     );
   }
 
-  const createAbortError = () => {
+  const stoppedRequestAnswer = () => {
     if (firstCause === 'caller') {
       return new WorkerHttpError(
         499,
@@ -197,14 +196,14 @@ function createWorkerRequestScope(request) {
     if (closed || !closeRequested || deferredCloseCount !== 0) return;
     closed = true;
     clearTimeout(deadline);
-    request.signal.removeEventListener('abort', onCallerAbort);
+    stopCaller();
   };
 
   return {
     signal: controller.signal,
-    createAbortError,
+    stoppedRequestAnswer,
     throwIfAborted() {
-      const error = createAbortError();
+      const error = stoppedRequestAnswer();
       if (error !== null) throw error;
     },
     cancelInternal(reason) {
@@ -238,24 +237,20 @@ function awaitWithinWorkerRequestScope(promise, requestScope) {
   requestScope.throwIfAborted();
   return new Promise((resolve, reject) => {
     let settled = false;
+    let stopWaiting = () => {};
     const settle = (callback, value) => {
       if (settled) return;
       settled = true;
-      requestScope.signal.removeEventListener('abort', onAbort);
+      stopWaiting();
       callback(value);
     };
-    const onAbort = () => {
+    stopWaiting = onAbort(requestScope.signal, () => {
       settle(
         reject,
-        requestScope.createAbortError() ??
+        requestScope.stoppedRequestAnswer() ??
           new WorkerHttpError(502, 'Worker request was interrupted')
       );
-    };
-
-    requestScope.signal.addEventListener('abort', onAbort, { once: true });
-    if (requestScope.signal.aborted) {
-      onAbort();
-    }
+    });
     Promise.resolve(promise).then(
       (value) => settle(resolve, value),
       (error) => settle(reject, error)
@@ -308,7 +303,7 @@ async function readBoundedUtf8Body(
       );
     } catch (cause) {
       if (cause instanceof WorkerHttpError) throw cause;
-      const ownedAbort = requestScope.createAbortError();
+      const ownedAbort = requestScope.stoppedRequestAnswer();
       if (ownedAbort !== null) throw ownedAbort;
       throw new WorkerHttpError(
         readErrorStatus,
@@ -397,7 +392,7 @@ async function readBoundedUtf8Body(
     return textParts.join('');
   } catch (cause) {
     if (cause instanceof WorkerHttpError) throw cause;
-    const ownedAbort = requestScope.createAbortError();
+    const ownedAbort = requestScope.stoppedRequestAnswer();
     if (ownedAbort !== null) throw ownedAbort;
     throw new WorkerHttpError(
       readErrorStatus,
@@ -494,9 +489,10 @@ function streamBoundedGitHubJsonResponse(
   let totalBytes = 0;
   let terminalStarted = false;
   let terminalPromise = null;
+  let stopWaiting = () => {};
 
   const release = () => {
-    requestScope.signal.removeEventListener('abort', onAbort);
+    stopWaiting();
     try {
       reader.releaseLock();
     } catch {
@@ -507,7 +503,7 @@ function streamBoundedGitHubJsonResponse(
   const cancelUpstream = (reason) => {
     if (terminalPromise !== null) return terminalPromise;
     terminalStarted = true;
-    requestScope.signal.removeEventListener('abort', onAbort);
+    stopWaiting();
     let cancellation;
     try {
       cancellation = reader.cancel(reason);
@@ -522,14 +518,14 @@ function streamBoundedGitHubJsonResponse(
   const complete = () => {
     if (terminalStarted) return;
     terminalStarted = true;
-    requestScope.signal.removeEventListener('abort', onAbort);
+    stopWaiting();
     release();
     terminalPromise = Promise.resolve();
   };
-  const onAbort = () => {
+  const abortStream = () => {
     if (terminalStarted) return;
     const error =
-      requestScope.createAbortError() ??
+      requestScope.stoppedRequestAnswer() ??
       new WorkerHttpError(502, 'Worker request was interrupted');
     try {
       downstreamController?.error(error);
@@ -542,8 +538,7 @@ function streamBoundedGitHubJsonResponse(
   const stream = new ReadableStream({
     start(controller) {
       downstreamController = controller;
-      requestScope.signal.addEventListener('abort', onAbort, { once: true });
-      if (requestScope.signal.aborted) onAbort();
+      stopWaiting = onAbort(requestScope.signal, abortStream);
     },
     async pull(controller) {
       if (terminalStarted) {
@@ -607,7 +602,7 @@ function streamBoundedGitHubJsonResponse(
         const error =
           cause instanceof WorkerHttpError
             ? cause
-            : requestScope.createAbortError() ??
+            : requestScope.stoppedRequestAnswer() ??
               new WorkerHttpError(
                 502,
                 `${label} body could not be streamed`,
@@ -708,6 +703,11 @@ export default {
         requestScope = createWorkerRequestScope(request);
         return await handleCallback(request, url, env, requestScope);
       }
+      if (url.pathname === '/auth/revoke') {
+        requireMethod(request, 'POST');
+        requestScope = createWorkerRequestScope(request);
+        return await handleRevoke(request, env, corsHeaders, requestScope);
+      }
       if (url.pathname === '/auth/user') {
         requireMethod(request, 'GET');
         requestScope = createWorkerRequestScope(request);
@@ -750,6 +750,7 @@ export default {
             endpoints: [
               '/auth/login',
               '/auth/callback',
+              '/auth/revoke',
               '/auth/user',
               '/auth/installations',
               '/auth/installation-repos',
@@ -1357,6 +1358,7 @@ function parseOauthOwnerCookie(rawValue, env) {
 const APP_AUTH_FRAGMENT_PARAM_NAMES = new Set([
   APP_AUTH_FLAG_PARAM,
   APP_AUTH_TOKEN_PARAM,
+  APP_AUTH_TOKEN_EXPIRES_PARAM,
   APP_AUTH_ERROR_PARAM,
 ]);
 
@@ -1396,11 +1398,11 @@ function scrubAppAuthFragment(hash, { hasFragment }) {
   };
 }
 
-function redirectToApp(returnTo, { token = null, error = null }, headers) {
-  if ((token === null) === (error === null)) {
+function redirectToApp(returnTo, { token = null, expiresIn = null, error = null }, headers) {
+  if ((token === null) === (error === null) || (token === null) !== (expiresIn === null)) {
     throw new WorkerHttpError(
       500,
-      'OAuth redirect requires exactly one token or error'
+      'OAuth redirect requires exactly one token with its lifetime, or an error'
     );
   }
   const destination = new URL(returnTo);
@@ -1421,6 +1423,7 @@ function redirectToApp(returnTo, { token = null, error = null }, headers) {
       APP_AUTH_TOKEN_PARAM,
       assertExactString(token, 'OAuth token')
     );
+    hashParams.set(APP_AUTH_TOKEN_EXPIRES_PARAM, String(expiresIn));
   }
   if (error !== null) {
     hashParams.set(
@@ -1611,9 +1614,13 @@ async function handleCallback(request, url, env, requestScope) {
       );
       return redirectToApp(returnTo, { error: message }, headers);
     }
+    // An expiring user token (the GitHub App's "Expire user authorization
+    // tokens"): the access token lasts hours, never indefinitely. Its refresh
+    // token is not used: it never leaves the worker, and a sign-in that runs
+    // out is a new sign-in.
     assertExactFields(
       tokenDocument,
-      ['access_token', 'token_type', 'scope'],
+      ['access_token', 'expires_in', 'refresh_token', 'refresh_token_expires_in', 'scope', 'token_type'],
       'GitHub OAuth success response',
       502
     );
@@ -1628,7 +1635,11 @@ async function handleCallback(request, url, env, requestScope) {
       'GitHub OAuth access_token',
       { status: 502 }
     );
-    return redirectToApp(returnTo, { token }, headers);
+    const expiresIn = tokenDocument?.expires_in;
+    if (!Number.isSafeInteger(expiresIn) || expiresIn < 1) {
+      throw new WorkerHttpError(502, 'GitHub OAuth expires_in is not a positive number of seconds');
+    }
+    return redirectToApp(returnTo, { token, expiresIn }, headers);
   } catch (error) {
     if (returnTo !== null) {
       if (!(error instanceof WorkerHttpError)) {
@@ -1668,6 +1679,46 @@ function getBearerToken(request) {
     throw new WorkerHttpError(401, 'Invalid bearer token');
   }
   return match[1];
+}
+
+/**
+ * Revoke the bearer token at GitHub (`DELETE /applications/{client_id}/token`,
+ * which only the app's own credentials may call): Sign out ends the token,
+ * not only the page's copy of it. A token GitHub no longer knows (expired,
+ * revoked already) is revoked too.
+ */
+async function handleRevoke(request, env, corsHeaders, requestScope) {
+  const token = getBearerToken(request);
+  const clientId = requireEnvString(env, 'GITHUB_CLIENT_ID');
+  const clientSecret = requireEnvString(env, 'GITHUB_CLIENT_SECRET');
+  const response = await fetchUpstream(
+    `${GITHUB_API_ORIGIN}/applications/${encodeURIComponent(clientId)}/token`,
+    {
+      method: 'DELETE',
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Cellucid-GitHub-App',
+        'X-GitHub-Api-Version': GITHUB_API_VERSION,
+      },
+      body: JSON.stringify({ access_token: token }),
+    },
+    'GitHub token revocation',
+    requestScope
+  );
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The answer's status is all that is read.
+  }
+  if (response.status !== 204 && response.status !== 404 && response.status !== 422) {
+    throw new WorkerHttpError(502, `GitHub token revocation failed (HTTP ${response.status})`);
+  }
+  return new Response(null, {
+    status: 204,
+    headers: mergeHeaders(corsHeaders, { 'Cache-Control': 'no-store' }),
+  });
 }
 
 async function handleGetUser(request, corsHeaders, requestScope) {
@@ -1899,7 +1950,7 @@ async function cancelCapResponseBodyPreservingOwnerAbort(
   try {
     await awaitWithinWorkerRequestScope(cancellation, requestScope);
   } catch {
-    const ownedAbort = requestScope.createAbortError();
+    const ownedAbort = requestScope.stoppedRequestAnswer();
     if (ownedAbort !== null) throw ownedAbort;
   }
   requestScope.throwIfAborted();
@@ -3355,7 +3406,7 @@ async function fetchUpstream(
     return response;
   } catch (cause) {
     if (cause instanceof WorkerHttpError) throw cause;
-    const ownedAbort = requestScope.createAbortError();
+    const ownedAbort = requestScope.stoppedRequestAnswer();
     if (ownedAbort !== null) throw ownedAbort;
     throw new WorkerHttpError(
       502,

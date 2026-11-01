@@ -16,6 +16,7 @@ import { expect, test } from './helpers/test.mjs';
 import { fulfillFile, zipEntryData } from './helpers/anndata-zarr-zip.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
 
 const fixturesDirectory = path.join(
@@ -66,21 +67,21 @@ const CATALOG_FAILURES = Object.freeze([
     label: 'wrong-address',
     base: `${ORIGIN}/tests/browser/fixtures/no-such-catalog/`,
     status: null,
-    expect: /nothing is published at that address/,
+    expect: /datasets\.json was not found at [^ ]+ \(HTTP 404, not found\): the link or record does not exist/,
     forbid: /Check your network/,
   }),
   Object.freeze({
     label: 'permission-denied',
     base: GOOD_CATALOG,
     status: 403,
-    expect: /the server refused access/,
+    expect: /refused datasets\.json \(HTTP 403, forbidden\): .* the link's permissions/,
     forbid: /Check your network/,
   }),
   Object.freeze({
     label: 'server-error',
     base: GOOD_CATALOG,
     status: 500,
-    expect: /the server reported a problem of its own/,
+    expect: /is not answering \(HTTP 500, a server error\) for datasets\.json: a problem on [^ ]+'s side, not with the link or with Cellucid/,
     forbid: /Check your network/,
   }),
   Object.freeze({
@@ -122,9 +123,9 @@ for (const failure of CATALOG_FAILURES) {
       expect(message).toMatch(/^Sample datasets could not be loaded/);
       expect(message).toMatch(failure.expect);
       expect(message).not.toMatch(failure.forbid);
-      // The notice speaks to a bench scientist, so no URL, status line or
-      // transport term reaches it.
-      expect(message).not.toMatch(/https?:|CORS|gzip|JSON|HTTP/);
+      // The notice speaks to a bench scientist: whose problem it is, with
+      // the host's status (`describeHostFault`), never a URL or a transport term.
+      expect(message).not.toMatch(/https?:|CORS|gzip|JSON/);
 
       // Every failure keeps the persistent retry the notice has always had.
       await expect(page.locator(NOTICE_BUTTON)).toHaveText('Try again');
@@ -154,6 +155,10 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
+  // The first opening is over before the link goes: a read of it still
+  // under way (its gene list, a tree its frames asked for) would fail
+  // offline on its own and say so beside the switch's failure.
+  await waitForPageAtRest(page);
 
   await context.setOffline(true);
   await page.locator('#dataset-select').selectOption(
@@ -169,7 +174,10 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   });
   // It names the dataset that failed, what to do, and what survived.
   expect(message).toContain(`"${OTHER_DATASET.name}" could not be opened`);
-  expect(message).toContain('Try again');
+  // Why, as it is: this computer is offline (not a host refusing this
+  // network, which an offline switch was once said to be), and what to do.
+  expect(message).toContain('This computer is offline');
+  expect(message).toMatch(/try again/i);
   expect(message).toContain(`"${GOOD_DATASET.name}" is still open.`);
   // Nothing a wet-lab user has to decode.
   expect(message).not.toMatch(/Failed to fetch|https?:|gzip/);

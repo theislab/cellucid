@@ -67,6 +67,9 @@ export function clampFloatingPosition({
  * @param {number} box.step - The distance of one step, in pixels.
  * @param {number} box.minHeight - The least height the window may shrink to
  *   (never below one step).
+ * @param {number} box.reach - How far the window takes touches past its
+ *   frame (the outer part of its resize handles: 12 px on a touch screen,
+ *   more than the gap between windows); a header is kept clear of that too.
  * @returns {{x: number, y: number, height: number}}
  */
 export function clearOfOpenHeaders({
@@ -78,19 +81,20 @@ export function clearOfOpenHeaders({
   viewportWidth,
   viewportHeight,
   headers,
-  step
+  step,
+  reach
 }) {
-  if (!Array.isArray(headers) || !(step > 0) || !(minHeight >= 0)) {
+  if (!Array.isArray(headers) || !(step > 0) || !(minHeight >= 0) || !(reach >= 0)) {
     throw new TypeError(
-      'Window placement requires the open headers, a positive step and a minimum height'
+      'Window placement requires the open headers, a positive step, a minimum height and the window\'s reach'
     );
   }
   const clamp = (x, y, h) => clampFloatingPosition({
     left: x, top: y, width, height: h, viewportWidth, viewportHeight
   });
   const covered = ({ x, y }, h) => headers.filter(header =>
-    x < header.right && x + width > header.left
-    && y < header.bottom && y + h > header.top
+    x - reach < header.right && x + width + reach > header.left
+    && y - reach < header.bottom && y + h + reach > header.top
   );
   let position = clamp(left, top, height);
   for (let attempt = 0; attempt < 16 && covered(position, height).length > 0; attempt += 1) {
@@ -100,7 +104,7 @@ export function clearOfOpenHeaders({
   }
   const stillCovered = covered(position, height);
   if (stillCovered.length === 0) return { ...position, height };
-  const below = Math.max(...stillCovered.map(header => header.bottom)) + FLOATING_MARGIN;
+  const below = Math.max(...stillCovered.map(header => header.bottom)) + Math.max(FLOATING_MARGIN, reach);
   const room = viewportHeight - below - FLOATING_MARGIN;
   // Never shorter than one header, whatever the window's own minimum.
   if (room < Math.max(minHeight, step)) return { ...position, height };

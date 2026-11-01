@@ -25,8 +25,20 @@ import {
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
 import { formatBytes, formatDuration, countNoun } from '../utils/format-units.js';
 
-/** Calculations shorter than this finish without a completion notice. */
-const QUICK_CALCULATION_MS = 250;
+/**
+ * The one rule for work in progress: a loading or progress card appears only
+ * once its work has run this long (about the longest wait that still feels
+ * like the flow of using the app), and work that ends before then ends
+ * without a card at all, the change on screen being its answer. A card the
+ * person never saw is not followed by a success card either, unless its
+ * publisher says the outcome is news the person asked for and cannot see
+ * otherwise (`complete(id, message, { announce: true })`: a file saved, a
+ * field created, a session file restored, a dataset opened over another). A
+ * failure is always shown. Every
+ * publisher of progress waits the same (`read-progress-notifications.js`,
+ * `jobs/cancellable-job.js`).
+ */
+export const NOTICE_AFTER_MS = 1000;
 
 // Singleton instance
 let instance = null;
@@ -72,6 +84,7 @@ const DEFAULT_DURATIONS_MS = Object.freeze({
 
 const NOTIFICATION_OPTION_KEYS = new Set([
   'action',
+  'announce',
   'category',
   'details',
   'dismissible',
@@ -151,6 +164,9 @@ function assertNotificationOptions(options, { partial = false } = {}) {
     typeof options.dismissible !== 'boolean'
   ) {
     throw new TypeError('Notification dismissible must be a boolean.');
+  }
+  if (Object.hasOwn(options, 'announce') && typeof options.announce !== 'boolean') {
+    throw new TypeError('Notification announce must be a boolean.');
   }
   if (
     Object.hasOwn(options, 'onCancel') &&
@@ -244,14 +260,26 @@ function describeThrownError(error) {
   return 'the handler threw a non-Error value';
 }
 
+/**
+ * Add `node` to a card's content above its buttons (its action, Cancel),
+ * which stay last under what the card says.
+ *
+ * @param {HTMLElement} content - The card's `.notification-content`
+ * @param {Node} node
+ */
+function appendAboveButtons(content, node) {
+  content.insertBefore(node, content.querySelector(':scope > .notification-action, :scope > [data-role="cancel"]'));
+}
+
 class NotificationCenter {
   constructor() {
     this.container = null;
     this.notifications = new Map();
     this.notificationId = 0;
-    // Cards on screen at once. A card retired early to make room is kept in
-    // `overflowMessages` and listed behind the "earlier messages" control, so
-    // no message is lost to the cap.
+    // Cards on screen at once: five, and two on a phone, where each covers
+    // the foot of the plot (`init`). A card retired early to make room is kept
+    // in `overflowMessages` and listed behind the "earlier messages" control,
+    // so no message is lost to the cap.
     this.maxNotifications = 5;
     /** @type {Array<{ type: string, title: string|null, message: string|null }>} */
     this.overflowMessages = [];
@@ -298,6 +326,17 @@ class NotificationCenter {
 
     document.body.appendChild(this.container);
     this._publishStackBlockSize();
+    // The phone layout (layouts/_responsive.css: the sidebar a full-screen
+    // sheet below 721 px) keeps two cards on screen.
+    const phone = document.defaultView?.matchMedia?.('(max-width: 720px)') ?? null;
+    if (phone !== null) {
+      const fit = () => {
+        this.maxNotifications = phone.matches ? 2 : 5;
+        this._evictNonActiveUntil(this.maxNotifications);
+      };
+      fit();
+      phone.addEventListener?.('change', fit);
+    }
     try {
       this._releaseModalAuxiliary =
         registerModalDocumentAuxiliary(this.container);
@@ -415,16 +454,20 @@ class NotificationCenter {
       html += `<button type="button" class="btn btn-compact notification-action">${escapeHtml(action.label)}</button>`;
     }
 
-    html += '</div>'; // Close notification-content
-
     const cancelable =
       typeof onCancel === 'function' &&
       (type === NotificationType.LOADING || type === NotificationType.PROGRESS);
 
-    // Cancel (for progress/loading only) or dismiss (for others).
+    // Work under way that can be stopped says so in words: its card and the
+    // texts that point at it ("Cancel stops it") name the button Cancel.
     if (cancelable) {
-      html += '<button class="notification-dismiss" data-role="cancel" aria-label="Cancel" title="Cancel">×</button>';
-    } else if (dismissible && type !== NotificationType.LOADING && type !== NotificationType.PROGRESS) {
+      html += '<button type="button" class="btn btn-compact notification-cancel" data-role="cancel">Cancel</button>';
+    }
+
+    html += '</div>'; // Close notification-content
+
+    // A settled card is dismissed (×); work under way never is.
+    if (!cancelable && dismissible && type !== NotificationType.LOADING && type !== NotificationType.PROGRESS) {
       html += '<button class="notification-dismiss" data-role="dismiss" aria-label="Dismiss">×</button>';
     }
 
@@ -438,7 +481,7 @@ class NotificationCenter {
       progressBar.style.width = progressBarWidth;
     }
 
-    const cancelBtn = el.querySelector('.notification-dismiss[data-role="cancel"]');
+    const cancelBtn = el.querySelector('[data-role="cancel"]');
     if (cancelBtn !== null) {
       cancelBtn.addEventListener('click', () => {
         void this._runCancelHandler(cancelBtn, onCancel);
@@ -515,6 +558,9 @@ class NotificationCenter {
       this._updateNotification(id, options);
       return id;
     }
+    if (Object.hasOwn(options, 'announce')) {
+      throw new TypeError('Notification announce names a completion: complete(id, message, { announce }).');
+    }
 
     // Active loading/progress work owns its visible lifecycle. Make room by
     // retiring the oldest non-active item first; if every published item is
@@ -536,16 +582,21 @@ class NotificationCenter {
       element: el,
       options: storedOptions,
       startTime: performance.now(),
-      dismissTimer: null
+      dismissTimer: null,
+      // Work in progress is held back until it has run NOTICE_AFTER_MS.
+      revealTimer: null
     };
     this.notifications.set(id, notification);
 
-    // Trigger enter animation
-    requestAnimationFrame(() => {
-      if (this.notifications.get(id) === notification) {
-        el.classList.add('notification-enter');
-      }
-    });
+    if (ACTIVE_NOTIFICATION_TYPES.has(storedOptions.type)) {
+      el.hidden = true;
+      notification.revealTimer = setTimeout(() => {
+        notification.revealTimer = null;
+        if (this.notifications.get(id) === notification) this._reveal(notification);
+      }, NOTICE_AFTER_MS);
+    } else {
+      this._reveal(notification);
+    }
 
     // Active work owns its own lifecycle; everything else gets the duration its
     // type declares unless the publisher named one. `_scheduleDismiss` treats 0
@@ -559,6 +610,47 @@ class NotificationCenter {
     }
 
     return id;
+  }
+
+  /** Put a held-back card on screen, with its enter animation. @private */
+  _reveal(notification) {
+    if (notification.revealTimer !== null) {
+      clearTimeout(notification.revealTimer);
+      notification.revealTimer = null;
+    }
+    const el = notification.element;
+    el.hidden = false;
+    requestAnimationFrame(() => {
+      if (this.notifications.get(el.id) === notification) {
+        el.classList.add('notification-enter');
+      }
+    });
+  }
+
+  /**
+   * Show a held-back card now: its publisher has already waited
+   * NOTICE_AFTER_MS for its work (a job that publishes its card only then:
+   * `jobs/cancellable-job.js`).
+   *
+   * @param {string} id
+   */
+  reveal(id) {
+    requireNonEmptyString(id, 'Notification id');
+    const notification = this.notifications.get(id);
+    if (notification !== undefined && notification.element.hidden) this._reveal(notification);
+  }
+
+  /**
+   * Whether the card is on screen: a card of work in progress is held back
+   * until its work has run NOTICE_AFTER_MS.
+   *
+   * @param {string} id
+   * @returns {boolean}
+   */
+  isShown(id) {
+    requireNonEmptyString(id, 'Notification id');
+    const notification = this.notifications.get(id);
+    return notification !== undefined && !notification.element.hidden;
   }
 
   /**
@@ -636,6 +728,16 @@ class NotificationCenter {
 
     const { element } = notif;
 
+    // Work that ends before its card was shown: success ends it without a
+    // card (unless announced); anything else is shown now.
+    if (element.hidden && typeChanged) {
+      if (nextType === NotificationType.SUCCESS && options.announce !== true) {
+        this.dismiss(id);
+        return;
+      }
+      this._reveal(notif);
+    }
+
     if (
       Object.hasOwn(options, 'category') &&
       options.category !== notif.options.category
@@ -657,7 +759,7 @@ class NotificationCenter {
         if (content === null) {
           throw new Error(`Notification "${id}" has no content element.`);
         }
-        content.appendChild(msgEl);
+        appendAboveButtons(content, msgEl);
       }
       msgEl.textContent = options.message;
     }
@@ -672,7 +774,7 @@ class NotificationCenter {
         const holder = document.createElement('div');
         holder.innerHTML = notificationDetailsHtml(options.details);
         const message = content.querySelector('.notification-message');
-        if (message === null) content.appendChild(holder.firstElementChild);
+        if (message === null) appendAboveButtons(content, holder.firstElementChild);
         else message.after(holder.firstElementChild);
       }
     }
@@ -744,7 +846,7 @@ class NotificationCenter {
         if (content === null) {
           throw new Error(`Notification "${id}" has no content element.`);
         }
-        content.appendChild(speedEl);
+        appendAboveButtons(content, speedEl);
       }
       speedEl.textContent = formatBytes(options.speed) + '/s';
     }
@@ -763,11 +865,8 @@ class NotificationCenter {
         const progressText = element.querySelector('.notification-progress-text');
         if (progressText) progressText.remove();
 
-        // Replace "cancel" with a standard dismiss button.
-        const existingBtn = element.querySelector('.notification-dismiss');
-        if (existingBtn?.dataset?.role === 'cancel') {
-          existingBtn.remove();
-        }
+        // Replace Cancel with a standard dismiss button.
+        element.querySelector('[data-role="cancel"]')?.remove();
 
         // Add dismiss button if not present (completion/failure is always dismissible).
         if (!element.querySelector('.notification-dismiss')) {
@@ -798,6 +897,7 @@ class NotificationCenter {
 
     // Update stored options
     const nextOptions = { ...notif.options, ...options };
+    delete nextOptions.announce;
     if (retiresActiveTitle) delete nextOptions.title;
     if (TERMINAL_NOTIFICATION_TYPES.has(nextType)) {
       delete nextOptions.progress;
@@ -970,6 +1070,15 @@ class NotificationCenter {
     if (notif.dismissTimer !== null) {
       clearTimeout(notif.dismissTimer);
       notif.dismissTimer = null;
+    }
+    if (notif.revealTimer !== null) {
+      clearTimeout(notif.revealTimer);
+      notif.revealTimer = null;
+    }
+    // A card never shown leaves at once.
+    if (element.hidden) {
+      element.remove();
+      return true;
     }
 
     // Trigger exit animation
@@ -1153,12 +1262,8 @@ class NotificationCenter {
    */
   completeCalculation(id, message, duration = null) {
     requireNonEmptyString(message, 'Calculation completion message');
-    // Work that finished in a blink needs no announcement: the calculation
-    // notice goes away instead of turning into a "ready (0ms)" one.
-    if (duration !== null && Number.isFinite(duration) && duration < QUICK_CALCULATION_MS) {
-      this.dismiss(id);
-      return;
-    }
+    // Work that finished before its card was shown ends without one
+    // (NOTICE_AFTER_MS).
     const finalMessage = duration !== null
       ? `${message} (${formatDuration(duration)})`
       : message;

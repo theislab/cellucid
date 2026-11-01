@@ -606,7 +606,7 @@ export function getColormapByteTable(colormap) {
   if (table !== undefined) return table;
   const buckets = COLORMAP_TABLE_BUCKETS;
   const segments = colormap.colors.length - 1;
-  table = new Uint8Array((buckets + 1) * 4);
+  table = new Uint8Array((COLORMAP_TABLE_BUCKETS + 1) * 4);
   const sample = [0, 0, 0];
   colormap.sampleInto(0, sample);
   let r = Math.round(sample[0] * 255);
@@ -637,11 +637,20 @@ export function getColormapByteTable(colormap) {
   return table;
 }
 
-function buildColormap(id, label, colors) {
+/**
+ * @param {string} id
+ * @param {string} label
+ * @param {number[][]} colors
+ * @param {{diverging?: boolean}} [kind] - `diverging`: its middle is a
+ *   neutral centre, so data spanning 0 is drawn with 0 there
+ *   (`color-manager.js` `computeContinuousDomain`)
+ */
+function buildColormap(id, label, colors, { diverging = false } = {}) {
   const sampleInto = makeColormapSamplerInto(colors);
   return {
     id,
     label,
+    diverging,
     colors,
     cssStops: colors.map(rgbToCss),
     sampleInto,
@@ -659,15 +668,15 @@ export const CONTINUOUS_COLORMAPS = [
   buildColormap('turbo', 'Turbo', TURBO_COLORS),
   buildColormap('twilight', 'Twilight', TWILIGHT_COLORS),
   // Diverging
-  buildColormap('coolwarm', 'Coolwarm', COOLWARM_COLORS),
-  buildColormap('bluered', 'Blue-Red', BLUE_RED_COLORS),
-  buildColormap('spectral', 'Spectral', SPECTRAL_COLORS),
-  buildColormap('rdylbu', 'RdYlBu', RDYLBU_COLORS),
-  buildColormap('rdbu', 'RdBu', RDBU_COLORS),
-  buildColormap('piyg', 'PiYG', PIYG_COLORS),
-  buildColormap('prgn', 'PRGn', PRGN_COLORS),
-  buildColormap('brbg', 'BrBG', BRBG_COLORS),
-  buildColormap('seismic', 'Seismic', SEISMIC_COLORS),
+  buildColormap('coolwarm', 'Coolwarm', COOLWARM_COLORS, { diverging: true }),
+  buildColormap('bluered', 'Blue-Red', BLUE_RED_COLORS, { diverging: true }),
+  buildColormap('spectral', 'Spectral', SPECTRAL_COLORS, { diverging: true }),
+  buildColormap('rdylbu', 'RdYlBu', RDYLBU_COLORS, { diverging: true }),
+  buildColormap('rdbu', 'RdBu', RDBU_COLORS, { diverging: true }),
+  buildColormap('piyg', 'PiYG', PIYG_COLORS, { diverging: true }),
+  buildColormap('prgn', 'PRGn', PRGN_COLORS, { diverging: true }),
+  buildColormap('brbg', 'BrBG', BRBG_COLORS, { diverging: true }),
+  buildColormap('seismic', 'Seismic', SEISMIC_COLORS, { diverging: true }),
   // Sequential (multi-hue)
   buildColormap('ylgnbu', 'YlGnBu', YLGNBU_COLORS),
   buildColormap('ylorrd', 'YlOrRd', YLORRD_COLORS),
@@ -884,6 +893,30 @@ export function scanpyCategoryPalette(stored, categoryCount) {
 }
 
 /**
+ * The colours of a categorical's categories when it is coded by the ones its
+ * open cells hold (`AnnDataReader._readPresentCategorical`): `stored` the
+ * stored position of each, `colors` the file's colours of them
+ * (`uns['<key>_colors']` at those positions, or null). Each category takes
+ * the colour it has with every category open -- the file's, when each of
+ * the categories found has a hex colour (`scanpyCategoryPalette`), else
+ * Cellucid's at its stored position (`getCategoryColor`) -- so a share of
+ * the cells, or more of them opened later, shows each category in the same
+ * colour. A fresh array the caller owns.
+ *
+ * @param {ReadonlyArray<string>|null} colors
+ * @param {ArrayLike<number>} stored
+ * @returns {Array<[number, number, number]>}
+ */
+export function presentCategoryPalette(colors, stored) {
+  const file = scanpyCategoryPalette(colors, stored.length);
+  if (file !== null) return file;
+  return Array.from(stored, position => {
+    const color = getCategoryColor(position);
+    return [color[0], color[1], color[2]];
+  });
+}
+
+/**
  * The colour category `idx` of a categorical field opens with: its file's
  * palette (`field.palette`, `scanpyCategoryPalette`) while that still has one
  * colour per category, else Cellucid's own (`getCategoryColor`). Merging
@@ -901,6 +934,16 @@ export function defaultCategoryColor(field, idx) {
     ? palette[idx]
     : getCategoryColor(idx);
   return [color[0], color[1], color[2]];
+}
+
+/**
+ * How many colours of the category sequence (`getCategoryColor`) are the
+ * designed palettes, before the sequence fans out around the colour wheel.
+ *
+ * @returns {number}
+ */
+export function getCategoryColorSeedCount() {
+  return EXTENDED_CATEGORY_SEEDS.length;
 }
 
 // Returns a distinct-looking color for the provided category index. Uses the base
