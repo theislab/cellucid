@@ -1,0 +1,30 @@
+{
+  "examples": [
+    {
+      "name": "Page 1",
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "page",
+      "name"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.page.rename",
+  "version": 1
+}

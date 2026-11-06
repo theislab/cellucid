@@ -1,0 +1,44 @@
+{
+  "examples": [
+    {
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "visible": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "visible": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "field",
+      "visible"
+    ],
+    "type": "object"
+  },
+  "type": "filter.category.all",
+  "version": 1
+}

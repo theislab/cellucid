@@ -19,8 +19,8 @@ import {
   assertExactLinkedInHandle,
   assertExactOptionalProfileText,
   assertExactOrcidId,
-  isExactOrcidId,
 } from '../../../community-annotations/profile-identifiers.js';
+import { isExactOrcidId } from '../../../community-annotations/wire-contract.js';
 import {
   fetchOrcidExpandedSearch,
   fetchOrcidPerson,
@@ -46,8 +46,6 @@ export const ORCID_SEARCH_DEBOUNCE_MS = 250;
  * suggestion's pointerdown can cancel the hide before its click selects it.
  */
 export const ORCID_SUGGESTION_HIDE_DELAY_MS = 150;
-/** Deadline for one ORCID registry request before it is aborted. */
-export const ORCID_REQUEST_TIMEOUT_MS = 6500;
 
 /**
  * Build the identity modal opener for one community annotation controls
@@ -263,7 +261,6 @@ export function createIdentityProfileModal({
             let profileModalClosed = false;
             let searchTimer = null;
             let activeSearch = null;
-            let activeSearchTimeout = null;
             let hideTimer = null;
             let positionFrame = null;
             let positionTimer = null;
@@ -350,10 +347,6 @@ export function createIdentityProfileModal({
                 );
               }
               activeSearch = null;
-              if (activeSearchTimeout !== null) {
-                clearTimeout(activeSearchTimeout);
-                activeSearchTimeout = null;
-              }
               request.abort();
               return true;
             };
@@ -425,8 +418,7 @@ export function createIdentityProfileModal({
                     ? ''
                     : assertExactOptionalProfileText(
                         item?.name,
-                        'ORCID result name',
-                        240
+                        'ORCID result name'
                       );
                 const label = name ? `${name} — ${orcid}` : orcid;
                 const row = el('button', {
@@ -466,7 +458,7 @@ export function createIdentityProfileModal({
             };
 
             async function searchOrcid(query, { signal } = {}) {
-              const q = assertExactOptionalProfileText(query, 'ORCID search query', 240);
+              const q = assertExactOptionalProfileText(query, 'ORCID search query');
               if (!q) return [];
 
               // Small in-memory cache for snappy UX (per modal open).
@@ -537,14 +529,8 @@ export function createIdentityProfileModal({
                 const ctrl = new AbortController();
                 activeSearch = ctrl;
                 renderSuggestions([], { loading: true });
-                const timeout = setTimeout(() => {
-                  const error = new Error(
-                    `ORCID request timed out after ${ORCID_REQUEST_TIMEOUT_MS / 1000} seconds`
-                  );
-                  error.name = 'TimeoutError';
-                  ctrl.abort(error);
-                }, ORCID_REQUEST_TIMEOUT_MS);
-                activeSearchTimeout = timeout;
+                // No deadline of its own: the request is given up only when
+                // nothing arrives for the link's stall timeout (orcid-client.js).
                 try {
                   const items = await searchOrcid(q, { signal: ctrl.signal });
                   if (
@@ -579,10 +565,6 @@ export function createIdentityProfileModal({
                         : 'ORCID lookup failed';
                   }
                 } finally {
-                  clearTimeout(timeout);
-                  if (activeSearchTimeout === timeout) {
-                    activeSearchTimeout = null;
-                  }
                   if (activeSearch === ctrl) {
                     activeSearch = null;
                   }
@@ -720,18 +702,6 @@ export function createIdentityProfileModal({
                     }
                 ],
                 [
-                  'ORCID request timeout',
-                  activeSearchTimeout === null
-                    ? null
-                    : () => {
-                      const timer = activeSearchTimeout;
-                      clearTimeout(timer);
-                      if (activeSearchTimeout === timer) {
-                        activeSearchTimeout = null;
-                      }
-                    }
-                ],
-                [
                   'ORCID suggestion hide timer',
                   hideTimer === null
                     ? null
@@ -824,13 +794,11 @@ export function createIdentityProfileModal({
                 login,
                 displayName: assertExactOptionalProfileText(
                   nameInput.value,
-                  'Name',
-                  120
+                  'Name'
                 ),
                 title: assertExactOptionalProfileText(
                   titleInput.value,
-                  'Affiliation / role',
-                  120
+                  'Affiliation / role'
                 ),
                 orcid: assertExactOrcidId(orcidInput.value, {
                   allowEmpty: true,

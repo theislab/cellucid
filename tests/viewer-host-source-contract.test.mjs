@@ -30,11 +30,13 @@ import {
 } from '../assets/js/data/data-source-manager.js';
 import {
   createViewerHostPointerDelivery,
-} from '../assets/js/app/viewer-host-pointer-delivery.js';
+} from '../assets/js/app/viewer-host/pointer-delivery.js';
 import {
   VIEWER_BINARY_EVENT_HEADER_FIELDS,
   VIEWER_EVENT_FIELDS,
-  encodeViewerBinaryCommand,
+  VIEWER_HOST_RUNTIMES,
+  encodeViewerAction,
+  encodeViewerLoadSession,
   encodeViewerCells,
   viewerProtocolDocument,
 } from '../assets/js/data/viewer-protocol.js';
@@ -91,9 +93,11 @@ Object.defineProperty(globalThis, 'fetch', {
   },
 });
 
-/** The binary frame of a host's highlight of `cells`, in red. */
-function highlightFrame(cells) {
-  return encodeViewerBinaryCommand({ type: 'highlight', color: '#ff0000', label: null }, Uint32Array.from(cells));
+/** A host's `action` command sent on `socket`: text, or binary when its parameters hold typed arrays. */
+function sendAction(socket, requestId, action, params, turn = null, turnLabel = null) {
+  const frame = encodeViewerAction({ requestId, action, params, turn, turnLabel });
+  if (typeof frame === 'string') socket.hostSend(frame);
+  else socket.hostSendBinary(frame);
 }
 
 function cellsOf(body) {
@@ -732,16 +736,22 @@ test('Viewer host pointer hooks use per-view pick records without changing wire 
 test('Viewer host command failure names the command for the person watching', () => {
   assert.deepEqual(
     describeViewerHostCommandFailure(
-      'setColorBy',
-      new Error('Viewer host set-color-by command requires exactly one field "CD8A"'),
+      'action',
+      new Error('There is no field "CD8A" in obs; did you mean CD8B?'),
+      'color.by',
     ),
     {
       title: 'Notebook command failed',
       message:
-        'The notebook "setColorBy" command did not run: Viewer host set-color-by ' +
-        'command requires exactly one field "CD8A". The viewer is unchanged; ' +
-        'correct the notebook cell and run it again.',
+        'The notebook\'s "color.by" action did not run: There is no field "CD8A" in obs; ' +
+        'did you mean CD8B?. The viewer is unchanged; correct the notebook cell and run it again.',
     },
+  );
+  // An action named by text that is not a dotted type is not echoed.
+  assert.equal(
+    describeViewerHostCommandFailure('action', new Error('boom'), '<img src=x>').message,
+    'The notebook "action" command did not run: boom. The viewer is unchanged; ' +
+    'correct the notebook cell and run it again.',
   );
 
   assert.equal(
@@ -754,8 +764,8 @@ test('Viewer host command failure names the command for the person watching', ()
   // reader can act on rather than an empty or "undefined" notification.
   for (const thrown of [new Error(''), 'plain string', null, undefined, { a: 1 }]) {
     assert.equal(
-      describeViewerHostCommandFailure('highlight', thrown).message,
-      'The notebook "highlight" command did not run: the viewer reported no ' +
+      describeViewerHostCommandFailure('freeze', thrown).message,
+      'The notebook "freeze" command did not run: the viewer reported no ' +
       'reason. The viewer is unchanged; correct the notebook cell and run it ' +
       'again.',
     );
@@ -765,19 +775,19 @@ test('Viewer host command failure names the command for the person watching', ()
   // truncated so one failure cannot fill the notification surface.
   assert.equal(
     describeViewerHostCommandFailure(
-      'highlight',
+      'freeze',
       new Error('first line\n  second line\tthird'),
     ).message.startsWith(
-      'The notebook "highlight" command did not run: first line second line third.',
+      'The notebook "freeze" command did not run: first line second line third.',
     ),
     true,
   );
   const truncated = describeViewerHostCommandFailure(
-    'highlight',
+    'freeze',
     new Error('x'.repeat(4000)),
   ).message;
-  assert.equal(truncated.includes(`${'x'.repeat(239)}…`), true);
-  assert.equal(truncated.includes('x'.repeat(241)), false);
+  assert.equal(truncated.includes(`${'x'.repeat(999)}…`), true);
+  assert.equal(truncated.includes('x'.repeat(1001)), false);
 
   // Only recognised command types may be named.
   assert.throws(
@@ -787,31 +797,24 @@ test('Viewer host command failure names the command for the person watching', ()
 });
 
 test('Viewer host command labels are drawn from the exact command set', () => {
-  for (const type of [
-    'ping',
-    'debug_snapshot',
-    'highlight',
-    'setColorBy',
-    'setVisibility',
-    'clearHighlights',
-    'resetCamera',
-    'freeze',
-    'requestSessionBundle',
-    'setDataMapping',
-  ]) {
+  for (const type of ['ping', 'debug_snapshot', 'freeze', 'requestSessionBundle', 'action']) {
     assert.equal(describeViewerHostCommandType({ type }), type);
   }
   for (const data of [
+    // Schema 2's state commands are actions now.
+    { type: 'highlight' },
+    { type: 'setColorBy' },
+    { type: 'setField' },
     { type: 'javascript:alert(1)' },
     { type: '__proto__' },
     { type: 'constructor' },
     { type: '' },
     { type: 7 },
-    { type: ['highlight'] },
+    { type: ['action'] },
     {},
     null,
-    'highlight',
-    ['highlight'],
+    'action',
+    ['action'],
   ]) {
     assert.equal(describeViewerHostCommandType(data), null);
   }
@@ -963,16 +966,19 @@ test(
 test('commands that arrive before the app is ready run, in order, once it accepts them', async () => {
   const { source, socket } = await connectedSource();
   const seen = [];
-  socket.hostSend({ type: 'setColorBy', field: 'leiden' });
-  socket.hostSendBinary(highlightFrame([1, 2]));
-  socket.hostSend({ type: 'resetCamera' });
+  sendAction(socket, 'r1', 'color.by', { field: { source: 'obs', key: 'leiden' } });
+  sendAction(socket, 'r2', 'highlight.cells', { cells: Uint32Array.of(1, 2) });
+  socket.hostSend({ type: 'freeze' });
   source.onMessage(message => seen.push(message.type));
-  source.onHighlight(cells => seen.push(`highlight:${cells === null ? 'clear' : cells.join(',')}`));
+  source.onAction(async ({ action, params }) => {
+    seen.push(params.cells instanceof Uint32Array ? `${action}:${params.cells.join(',')}` : action);
+    return { outcome: null, step: null };
+  });
   assert.deepEqual(seen, []);
   source.acceptCommands();
-  assert.deepEqual(seen, ['setColorBy', 'highlight:1,2', 'resetCamera']);
-  socket.hostSend({ type: 'clearHighlights' });
-  assert.deepEqual(seen.at(-1), 'highlight:clear');
+  assert.deepEqual(seen, ['color.by', 'highlight.cells:1,2', 'freeze']);
+  sendAction(socket, 'r3', 'highlight.clear-all', {});
+  assert.deepEqual(seen.at(-1), 'highlight.clear-all');
   source.acceptCommands();
   assert.equal(seen.length, 4, 'accepting twice replays nothing');
   source.disconnect();
@@ -982,59 +988,83 @@ test('host commands are checked against their exact keys before any handler', as
   const raised = silenceNotifications(t);
   const { source, socket } = await connectedSource();
   source.acceptCommands();
-  let highlightCalls = 0;
-  const visibility = [];
-  source.onHighlight(() => {
-    highlightCalls += 1;
+  const actions = [];
+  source.onAction(async action => {
+    actions.push(action);
+    return { outcome: null, step: null };
   });
-  source.onMessage(message => visibility.push(message));
   // A frame of the right shape whose values are wrong reaches no handler,
   // and the host is told; the channel stays open.
-  socket.hostSendBinary(encodeViewerBinaryCommand({ type: 'highlight', color: 'red', label: null }, Uint32Array.of(1)));
-  assert.equal(highlightCalls, 0);
-  assert.equal(raised.length, 1);
-  socket.hostSendBinary(highlightFrame([1, 2]));
-  assert.equal(highlightCalls, 1);
-  socket.hostSendBinary(encodeViewerBinaryCommand({ type: 'setVisibility', visible: false, all: false }, Uint32Array.of(0, 4)));
-  socket.hostSendBinary(encodeViewerBinaryCommand({ type: 'setVisibility', visible: true, all: true }, null));
-  assert.deepEqual(visibility, [
-    { type: 'setVisibility', visible: false, cells: Uint32Array.of(0, 4) },
-    { type: 'setVisibility', visible: true, cells: null },
+  for (const command of [
+    { type: 'action', requestId: 'r1', action: 'color.by', params: {}, turn: null, turnLabel: null, extra: 1 },
+    { type: 'action', requestId: 'r2', action: 'Color by', params: {}, turn: null, turnLabel: null },
+    { type: 'action', requestId: 'r3', action: 'color.by', params: [], turn: null, turnLabel: null },
+    { type: 'action', requestId: '', action: 'color.by', params: {}, turn: null, turnLabel: null },
+    { type: 'action', action: 'color.by', params: {}, turn: null, turnLabel: null },
+    // An action names its turn and the turn's label together, or neither.
+    { type: 'action', requestId: 'r4', action: 'color.by', params: {}, turn: 'python-turn-1', turnLabel: null },
+    { type: 'action', requestId: 'r5', action: 'color.by', params: {} },
+  ]) {
+    socket.hostSend(command);
+  }
+  assert.equal(actions.length, 0);
+  assert.equal(raised.length, 7);
+  const errors = (await decodeFrames(socket.frames)).filter(frame => frame.type === 'command_error');
+  assert.deepEqual(errors.map(error => [error.command, error.requestId]), [
+    ['action', 'r1'], ['action', 'r2'], ['action', 'r3'], ['action', null], ['action', null], ['action', 'r4'], ['action', 'r5'],
   ]);
-  assert.throws(() => source.onHighlight(null), /callback.*function/i);
+  sendAction(socket, 'r6', 'highlight.cells', { label: 'Cycling', cells: Uint32Array.of(0, 4) });
+  sendAction(socket, 'r7', 'cells.visibility.set', { cells: null, visible: true });
+  sendAction(socket, 'r8', 'color.by', { field: { source: 'obs', key: 'leiden' } }, 'python-turn-1', 'Cluster');
+  assert.deepEqual(actions, [
+    { action: 'highlight.cells', params: { label: 'Cycling', cells: Uint32Array.of(0, 4) }, turn: null, turnLabel: null },
+    { action: 'cells.visibility.set', params: { cells: null, visible: true }, turn: null, turnLabel: null },
+    { action: 'color.by', params: { field: { source: 'obs', key: 'leiden' } }, turn: 'python-turn-1', turnLabel: 'Cluster' },
+  ]);
+  assert.throws(() => source.onAction(null), /handler must be a function/);
+  assert.throws(() => source.onAction(async () => null), /already have a handler/);
+  assert.equal('onHighlight' in source, false);
   assert.equal('onSelectionSync' in source, false);
   source.disconnect();
 });
 
-test('a command that names cells is a binary frame, checked as exactly as the hosts check events', async t => {
+test('a binary command is checked as exactly as the hosts check events', async t => {
   silenceNotifications(t);
-  const header = text => new TextEncoder().encode(text);
-  const frame = (headerText, cells = [1, 2], prefix = null) => {
-    const headerBytes = header(headerText);
-    const bytes = new Uint8Array(4 + headerBytes.length + cells.length * 4);
-    const view = new DataView(bytes.buffer);
-    view.setUint32(0, prefix ?? headerBytes.length, true);
+  const frame = (header, body = new Uint8Array(0), prefix = null) => {
+    const headerBytes = new TextEncoder().encode(typeof header === 'string' ? header : JSON.stringify(header));
+    const bytes = new Uint8Array(4 + headerBytes.length + body.length);
+    new DataView(bytes.buffer).setUint32(0, prefix ?? headerBytes.length, true);
     bytes.set(headerBytes, 4);
-    cells.forEach((cell, index) => view.setUint32(4 + headerBytes.length + index * 4, cell, true));
+    bytes.set(body, 4 + headerBytes.length);
     return bytes;
   };
+  const cells = new Uint8Array(Uint32Array.of(1, 2).buffer);
+  const header = {
+    type: 'action', requestId: 'r1', action: 'highlight.cells', params: {}, turn: null, turnLabel: null,
+    arrays: [{ path: ['cells'], type: 'uint32', length: 2 }],
+  };
   const refusals = [
-    // The old text form of a command that names cells.
-    { text: { type: 'highlight', cells: [1, 2], color: '#ff0000' } },
-    { text: { type: 'setVisibility', cells: null, visible: true } },
+    // A session pushed in: exactly its keys, a name without a folder, a file.
+    frame({ type: 'load_session', requestId: 'r2', name: 'a.cellucid-session', extra: 1 }, cells),
+    frame({ type: 'load_session', requestId: 'r2', name: 'dir/a.cellucid-session' }, cells),
+    frame({ type: 'load_session', requestId: 'r2', name: 'a.cellucid-session' }),
+    // Schema 2's binary commands.
+    frame({ type: 'highlight', color: '#ff0000', label: null }, cells),
+    frame({ type: 'setVisibility', visible: true, all: true }),
     // Commands carry no credentials: the channel is the viewer's.
-    { binary: frame('{"type":"highlight","color":"#ff0000","label":null,"viewerId":"viewer-1","viewerToken":"secret-1"}') },
-    { binary: frame('{"type":"highlight"}') },
-    { binary: frame('{"type":"setColorBy","field":"x"}') },
-    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', [2, 1]) },
-    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', [3, 3]) },
-    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', []) },
-    { binary: Uint8Array.of(...frame('{"type":"highlight","color":"#ff0000","label":null}', [1]), 0) },
-    { binary: frame('{"type":"highlight","color":"#ff0000","label":null}', [1], 400) },
-    { binary: frame('{"type":"setVisibility","visible":true,"all":true}', [1]) },
-    { binary: frame('{"type":"setVisibility","visible":"yes","all":false}', [1]) },
-    { binary: Uint8Array.of(2, 0, 0, 0, 0xff, 0xfe) },
-    { binary: Uint8Array.of(1, 0) },
+    frame({ ...header, viewerId: 'viewer-1', viewerToken: 'secret-1' }, cells),
+    frame({ ...header, arrays: undefined }, cells),
+    frame({ ...header, arrays: [] }),
+    frame({ ...header, arrays: [{ path: ['cells'], type: 'uint32' }] }, cells),
+    frame({ ...header, arrays: [{ path: [], type: 'uint32', length: 2 }] }, cells),
+    frame({ ...header, arrays: [{ path: ['cells'], type: 'int32', length: 2 }] }, cells),
+    frame({ ...header, params: { cells: [1] } }, cells),
+    frame({ ...header, action: 'highlight' }, cells),
+    frame(header, Uint8Array.of(...cells, 0)),
+    frame(header, cells.subarray(0, 4)),
+    frame(header, cells, 400),
+    Uint8Array.of(2, 0, 0, 0, 0xff, 0xfe),
+    Uint8Array.of(1, 0),
   ];
   for (const refusal of refusals) {
     const { source, socket } = await connectedSource();
@@ -1042,18 +1072,189 @@ test('a command that names cells is a binary frame, checked as exactly as the ho
     const ends = [];
     let handled = 0;
     source.onChannelEnd(end => ends.push(end));
-    source.onHighlight(() => {
+    source.onAction(async () => {
       handled += 1;
+      return { outcome: null, step: null };
     });
     source.onMessage(() => {
       handled += 1;
     });
-    if (refusal.text) socket.hostSend(refusal.text);
-    else socket.hostSendBinary(refusal.binary);
-    assert.deepEqual(ends.map(end => end.kind), ['protocol'], JSON.stringify(refusal.text ?? [...refusal.binary]));
+    socket.hostSendBinary(refusal);
+    assert.deepEqual(ends.map(end => end.kind), ['protocol'], JSON.stringify([...refusal]));
     assert.equal(socket.closedByViewer.code, 1008);
     assert.equal(handled, 0);
   }
+});
+
+test('a session file a host pushes is loaded by the app\'s handler and answered with the tracker shown', async t => {
+  const raised = silenceNotifications(t);
+  const { source, socket } = await connectedSource();
+  source.acceptCommands();
+  const loads = [];
+  source.onLoadSession(async ({ name, file }) => {
+    loads.push({ name, text: new TextDecoder().decode(file) });
+    if (name === 'other.cellucid-session') throw new Error('This session was saved on another dataset.');
+    return { tracker: { id: 't-1', name: 'T cell analysis' }, head: 's9' };
+  });
+  const file = new TextEncoder().encode('CELLUCID_SESSION/4\n');
+  socket.hostSendBinary(encodeViewerLoadSession({ requestId: 'r1', name: 'shared.cellucid-session', file }));
+  socket.hostSendBinary(encodeViewerLoadSession({ requestId: 'r2', name: 'other.cellucid-session', file }));
+  await waitFor(() => socket.frames.length >= 2, 'two answers');
+  const frames = await decodeFrames(socket.frames);
+  assert.deepEqual(frames.filter(frame => frame.type === 'session_loaded'), [
+    { type: 'session_loaded', requestId: 'r1', tracker: { id: 't-1', name: 'T cell analysis' }, head: 's9' },
+  ]);
+  const errors = frames.filter(frame => frame.type === 'command_error');
+  assert.deepEqual(errors.map(error => [error.command, error.requestId, error.reason]), [
+    ['load_session', 'r2', 'This session was saved on another dataset.'],
+  ]);
+  assert.deepEqual(loads, [
+    { name: 'shared.cellucid-session', text: 'CELLUCID_SESSION/4\n' },
+    { name: 'other.cellucid-session', text: 'CELLUCID_SESSION/4\n' },
+  ]);
+  assert.match(raised[0].message, /^The notebook "load_session" command did not run/);
+  assert.throws(() => source.onLoadSession(null), /handler must be a function/);
+  assert.throws(() => source.onLoadSession(async () => null), /already have a handler/);
+  source.disconnect();
+});
+
+test('a history change reaches the host while its dataset is shown, and only then', async () => {
+  const { source, socket } = await connectedSource();
+  let shown = 'example';
+  source.setShownDatasetProvider(() => shown);
+  const change = { kind: 'step', tracker: 't-1', head: 's3', step: 's3', branch: 'b0' };
+  assert.equal(source.notifyHistoryChanged(change), true);
+  shown = null;
+  assert.equal(source.notifyHistoryChanged({ ...change, kind: 'moved', step: null }), false);
+  shown = 'example';
+  assert.equal(source.notifyHistoryChanged({ ...change, kind: 'moved', head: 's2', step: null, branch: null }), true);
+  const frames = (await decodeFrames(socket.frames)).filter(frame => frame.type === 'history_changed');
+  assert.deepEqual(frames, [
+    { type: 'history_changed', kind: 'step', tracker: 't-1', head: 's3', step: 's3', branch: 'b0' },
+    { type: 'history_changed', kind: 'moved', tracker: 't-1', head: 's2', step: null, branch: null },
+  ]);
+  assert.throws(() => source.notifyHistoryChanged({ ...change, kind: 'renamed' }), /kind is one of/);
+  assert.throws(() => source.notifyHistoryChanged({ ...change, extra: 1 }), /history change/);
+  source.disconnect();
+});
+
+test('an action is answered with its outcome and step, or with the command error of its request', async t => {
+  const raised = silenceNotifications(t);
+  const { source, socket } = await connectedSource();
+  source.acceptCommands();
+  source.onAction(async ({ action, params }) => {
+    if (action === 'color.by') return { outcome: null, step: { id: 's3', label: `Coloured by ${params.field.key}` } };
+    if (action === 'history.get') return { outcome: { head: 's3', note: 'Ünïcode' }, step: null };
+    if (action === 'view.picture') return { outcome: { png: new Uint8Array(1) }, step: null };
+    throw new RangeError(`There is no action "${action}"`);
+  });
+  sendAction(socket, 'r1', 'color.by', { field: { source: 'obs', key: 'leiden' } });
+  sendAction(socket, 'r2', 'history.get', {});
+  sendAction(socket, 'r3', 'nothing.here', {});
+  sendAction(socket, 'r4', 'view.picture', {});
+  await waitFor(() => socket.frames.length >= 4, 'four answers');
+  const frames = await decodeFrames(socket.frames);
+  const results = frames.filter(frame => frame.header?.type === 'action_result');
+  assert.deepEqual(results.map(frame => frame.header), [
+    { type: 'action_result', requestId: 'r1', step: { id: 's3', label: 'Coloured by leiden' } },
+    { type: 'action_result', requestId: 'r2', step: null },
+  ]);
+  assert.deepEqual(results.map(frame => JSON.parse(new TextDecoder().decode(frame.body))), [
+    null, { head: 's3', note: 'Ünïcode' },
+  ]);
+  const errors = frames.filter(frame => frame.type === 'command_error');
+  assert.deepEqual(errors.map(error => [error.command, error.requestId]), [['action', 'r3'], ['action', 'r4']]);
+  assert.match(errors[0].reason, /There is no action "nothing.here"/);
+  assert.match(errors[1].reason, /outcome/);
+  assert.match(raised[0].message, /^The notebook's "nothing.here" action did not run/);
+  source.disconnect();
+});
+
+test('an agent app\'s commands through the host run through the agent handler and are answered by agent events', async t => {
+  const raised = silenceNotifications(t);
+  const { source, socket } = await connectedSource();
+  source.acceptCommands();
+  const seen = [];
+  source.onAgent({
+    list: connection => {
+      seen.push(['list', connection]);
+      return [{ name: 'color_by', title: 'Colour by a field', description: 'Colour.', inputSchema: { type: 'object' }, annotations: {} }];
+    },
+    call: call => {
+      seen.push(['call', call]);
+      source.sendAgentAsking(call.id, { message: 'Claude Code (local) asks to colour by a field.', detail: null });
+      source.sendAgentAnswered(call.id, true);
+      source.sendAgentResult(call.id, { content: [{ type: 'text', text: 'Ünïcode done' }], isError: false });
+    },
+    cancel: id => seen.push(['cancel', id]),
+    answer: (id, allowed) => seen.push(['answer', id, allowed]),
+  });
+  const connection = { id: 'local-1', client: 'claude-code' };
+  socket.hostSend({ type: 'agent_list', requestId: 'a1', connection });
+  socket.hostSend({ type: 'agent_call', requestId: 'a2', tool: 'color_by', args: { field: { source: 'obs', key: 'leiden' } }, agent: 'Claude Code', connection });
+  socket.hostSend({ type: 'agent_cancel', requestId: 'a2' });
+  socket.hostSend({ type: 'agent_answer', requestId: 'a3', allowed: false });
+  // Not read: a connection id that is no id, arguments that are no object, an extra key.
+  socket.hostSend({ type: 'agent_list', requestId: 'a4', connection: { id: 'has space', client: null } });
+  socket.hostSend({ type: 'agent_call', requestId: 'a5', tool: 'color_by', args: [], agent: 'Claude Code', connection });
+  socket.hostSend({ type: 'agent_cancel', requestId: 'a6', extra: true });
+  source.notifyAgentToolsChanged();
+  await waitFor(() => socket.frames.length >= 8, 'the agent events and three command errors');
+  assert.deepEqual(seen, [
+    ['list', connection],
+    ['call', { id: 'a2', tool: 'color_by', args: { field: { source: 'obs', key: 'leiden' } }, agent: 'Claude Code', connection }],
+    ['cancel', 'a2'],
+    ['answer', 'a3', false],
+  ]);
+  const frames = await decodeFrames(socket.frames);
+  const binary = frames.filter(frame => frame.header !== undefined);
+  assert.deepEqual(binary.map(frame => frame.header), [{ type: 'agent_tools', requestId: 'a1' }, { type: 'agent_result', requestId: 'a2' }]);
+  assert.equal(JSON.parse(new TextDecoder().decode(binary[0].body))[0].name, 'color_by');
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(binary[1].body)), { content: [{ type: 'text', text: 'Ünïcode done' }], isError: false });
+  const text = frames.filter(frame => frame.header === undefined);
+  assert.deepEqual(text.filter(frame => frame.type.startsWith('agent_')), [
+    { type: 'agent_asking', requestId: 'a2', message: 'Claude Code (local) asks to colour by a field.', detail: null },
+    { type: 'agent_answered', requestId: 'a2', allowed: true },
+    { type: 'agent_tools_changed' },
+  ]);
+  const errors = text.filter(frame => frame.type === 'command_error');
+  assert.deepEqual(errors.map(error => [error.command, error.requestId]), [['agent_list', 'a4'], ['agent_call', 'a5'], ['agent_cancel', 'a6']]);
+  assert.ok(raised.length >= 3);
+  assert.throws(() => source.onAgent({ list: () => [] }), /needs call\(\)/);
+  assert.throws(() => source.onAgent({ list() {}, call() {}, cancel() {}, answer() {} }), /already have a handler/);
+  source.disconnect();
+});
+
+test('a viewer without an agent handler refuses an agent command as a command error', async t => {
+  silenceNotifications(t);
+  const { source, socket } = await connectedSource();
+  source.acceptCommands();
+  socket.hostSend({ type: 'agent_list', requestId: 'a1', connection: { id: 'local-1', client: null } });
+  await waitFor(() => socket.frames.length >= 1, 'the command error');
+  const [error] = await decodeFrames(socket.frames);
+  assert.equal(error.type, 'command_error');
+  assert.match(error.reason, /cannot take agent calls yet/);
+  source.disconnect();
+});
+
+test('a host that does not take action results is answered with nothing', async t => {
+  silenceNotifications(t);
+  protocolFixture.document = { ...CURRENT_PROTOCOL, events: CURRENT_PROTOCOL.events.filter(type => type !== 'action_result') };
+  t.after(() => {
+    protocolFixture.document = CURRENT_PROTOCOL;
+  });
+  const { source, socket } = await connectedSource();
+  source.acceptCommands();
+  let applied = 0;
+  source.onAction(async () => {
+    applied += 1;
+    return { outcome: null, step: null };
+  });
+  sendAction(socket, 'r1', 'highlight.clear-all', {});
+  await nextTask();
+  assert.equal(applied, 1);
+  assert.deepEqual(socket.frames, []);
+  source.disconnect();
 });
 
 test('a frame the viewer cannot read ends the channel as a protocol violation', async t => {
@@ -1149,6 +1350,7 @@ test('a session request while another dataset is shown is answered with a comman
   const frames = await decodeFrames(socket.frames);
   const error = frames.map(frame => frame.header ?? frame).find(frame => frame.type === 'command_error');
   assert.equal(error?.command, 'requestSessionBundle');
+  assert.equal(error.requestId, 'r-1', 'the error answers the request it names');
   assert.match(error.reason, /another dataset/);
   source.disconnect();
 });
@@ -1212,8 +1414,13 @@ test('main wires the channel: session bundles on it, commands accepted after eve
   assert.match(mainSource, /createViewerHostBridgeDataSource\(viewerHostConfig\)/);
   assert.match(mainSource, /viewerHostSource\.sendSessionBundle\(message\.requestId, bundle\)/);
   assert.match(mainSource, /viewerHostSource\.onChannelEnd\(/);
+  // The host's actions are the page's actions, dispatched as the host's.
+  assert.match(mainSource, /viewerHostSource\.onAction\(viewerHostCommandHandlers\.handleAction\)/);
+  // An agent app's calls through the host run as a local connection's (`agent-calls.js`).
+  assert.match(mainSource, /createAgentCalls\(\{[^}]*kind: 'local'/s);
+  assert.ok(mainSource.indexOf('viewerHostSource.acceptCommands();') > mainSource.indexOf('viewerHostSource.onAgent('));
   const accept = mainSource.indexOf('viewerHostSource.acceptCommands();');
-  assert.ok(accept > mainSource.indexOf('viewerHostCommandHandlers.handleMessage'));
+  assert.ok(accept > mainSource.indexOf('viewerHostSource.onAction('));
   assert.ok(accept > mainSource.indexOf('viewerHostSource.sendSessionBundle('));
   // No polling: the host closing the channel is how the viewer learns it stopped.
   assert.doesNotMatch(mainSource, /HealthMonitor|checkHealth\(/);
@@ -1319,18 +1526,16 @@ test('a failed notebook command is announced in the viewer and reported to the h
     source.disconnect();
   });
 
-  source.onMessage(message => {
-    if (message.type === 'setColorBy') {
-      throw new Error('Viewer host set-color-by command requires exactly one field "CD8A"');
-    }
+  source.onAction(async () => {
+    throw new Error('There is no field "CD8A" in obs');
   });
-  socket.hostSend({ type: 'setColorBy', field: 'CD8A' });
+  sendAction(socket, 'r1', 'color.by', { field: { source: 'obs', key: 'CD8A' } });
+  await nextTask();
   assert.equal(raised.length, 1);
   assert.equal(
     raised[0].message,
-    'The notebook "setColorBy" command did not run: Viewer host set-color-by ' +
-    'command requires exactly one field "CD8A". The viewer is unchanged; ' +
-    'correct the notebook cell and run it again.',
+    'The notebook\'s "color.by" action did not run: There is no field "CD8A" in obs. ' +
+    'The viewer is unchanged; correct the notebook cell and run it again.',
   );
   assert.deepEqual(raised[0].options, {
     category: 'connectivity',
@@ -1338,20 +1543,22 @@ test('a failed notebook command is announced in the viewer and reported to the h
     duration: 0,
   });
   assert.equal(logged.length, 1);
-  assert.match(logged[0][0], /^\[ViewerHost\] The notebook "setColorBy"/);
+  assert.match(logged[0][0], /^\[ViewerHost\] The notebook's "color.by" action/);
   assert.deepEqual(await decodeFrames(socket.frames), [{
     type: 'command_error',
-    command: 'setColorBy',
-    reason: 'Viewer host set-color-by command requires exactly one field "CD8A"',
+    command: 'action',
+    requestId: 'r1',
+    reason: 'There is no field "CD8A" in obs',
   }]);
 
-  // An asynchronous rejection reaches the same surface.
+  // A command that fails in its handler at once reaches the same surface.
   raised.length = 0;
-  source.onHighlight(() => Promise.reject(new Error('highlight page missing')));
-  socket.hostSendBinary(highlightFrame([1, 2, 3]));
-  await nextTask();
+  source.onMessage(() => {
+    throw new Error('freeze failed');
+  });
+  socket.hostSend({ type: 'freeze' });
   assert.equal(raised.length, 1);
-  assert.match(raised[0].message, /^The notebook "highlight" command did not run: highlight page missing\./);
+  assert.match(raised[0].message, /^The notebook "freeze" command did not run: freeze failed\./);
 
   // An unknown command type is never echoed into the notification, and the
   // host is not told of a command it cannot have sent.
@@ -1373,7 +1580,7 @@ test('a failed notebook command is announced in the viewer and reported to the h
   notifications.error = () => {
     throw new Error('notification surface unavailable');
   };
-  socket.hostSend({ type: 'setColorBy', field: 'CD8A' });
+  socket.hostSend({ type: 'freeze' });
   assert.equal(logged.length, 2);
   assert.match(logged[1][0], /^\[ViewerHost\] Notebook command failure notice failed:/);
 });
@@ -1417,20 +1624,16 @@ test('initialization reads the host protocol and gates events on it', async t =>
   assert.equal(source.getHostLabel(), 'Python');
   assert.equal(source.acceptsEvent('data_mapping'), false);
   assert.equal(
-    await source.notifyDataMapping({ origin: 'user', requestId: null, mapping: REPORTED_MAPPING }),
+    await source.notifyDataMapping({ origin: 'notebook', mapping: REPORTED_MAPPING }),
     false,
   );
   assert.deepEqual(socket.frames, []);
   await assert.rejects(
-    source.notifyDataMapping({ origin: 'notebook', requestId: null, mapping: REPORTED_MAPPING }),
-    /requestId/,
+    source.notifyDataMapping({ origin: 'user', requestId: null, mapping: REPORTED_MAPPING }),
+    /exactly/,
   );
   await assert.rejects(
-    source.notifyDataMapping({ origin: 'user', requestId: 'req-1', mapping: REPORTED_MAPPING }),
-    /requestId must be null/,
-  );
-  await assert.rejects(
-    source.notifyDataMapping({ origin: 'url', requestId: null, mapping: REPORTED_MAPPING }),
+    source.notifyDataMapping({ origin: 'url', mapping: REPORTED_MAPPING }),
     /origin must be one of/,
   );
   source.disconnect();
@@ -1448,7 +1651,7 @@ test('a host without the viewer channel is told to upgrade, and a malformed prot
     () => new Response(JSON.stringify({ events: ['ready'], commands: ['ping'] }), { status: 200 }),
     // From before binary commands: its highlights are JSON text.
     () => new Response(JSON.stringify({
-      channel: '_cellucid/ws', events: ['ready'], commands: ['highlight', 'ping'],
+      channel: '_cellucid/ws', events: ['ready'], commands: ['action', 'ping'],
     }), { status: 200 }),
   ]) {
     globalThis.fetch = protocolServer(response);
@@ -1462,9 +1665,9 @@ test('a host without the viewer channel is told to upgrade, and a malformed prot
     { channel: '_cellucid/ws', events: ['ready'], commands: [7], binaryCommands: [] },
     { channel: '_cellucid/ws', events: 'ready', commands: [], binaryCommands: [] },
     { channel: '_cellucid/ws', events: [], commands: [], binaryCommands: [], version: '1' },
-    { channel: '_cellucid/ws', events: [], commands: ['ping'], binaryCommands: 'highlight' },
+    { channel: '_cellucid/ws', events: [], commands: ['ping'], binaryCommands: 'action' },
     // A binary command must be one of the host's commands.
-    { channel: '_cellucid/ws', events: [], commands: ['ping'], binaryCommands: ['highlight'] },
+    { channel: '_cellucid/ws', events: [], commands: ['ping'], binaryCommands: ['action'] },
     { channel: 'elsewhere', events: [], commands: [], binaryCommands: [] },
   ]) {
     globalThis.fetch = protocolServer(() => new Response(JSON.stringify(body), { status: 200 }));
@@ -1474,8 +1677,8 @@ test('a host without the viewer channel is told to upgrade, and a malformed prot
   }
   // A command this viewer reads in one form, which the host sends in the other.
   for (const body of [
-    { channel: '_cellucid/ws', events: [], commands: ['highlight', 'ping'], binaryCommands: [] },
-    { channel: '_cellucid/ws', events: [], commands: ['highlight', 'ping'], binaryCommands: ['highlight', 'ping'] },
+    { channel: '_cellucid/ws', events: [], commands: ['action', 'ping'], binaryCommands: [] },
+    { channel: '_cellucid/ws', events: [], commands: ['action', 'ping'], binaryCommands: ['action', 'ping'] },
   ]) {
     globalThis.fetch = protocolServer(() => new Response(JSON.stringify(body), { status: 200 }));
     const source = new ViewerHostDataSource(getViewerHostConfig());
@@ -1485,7 +1688,7 @@ test('a host without the viewer channel is told to upgrade, and a malformed prot
   // A newer host's command this viewer does not know yet is not refused here.
   assert.equal(
     requireViewerHostProtocolPayload({
-      channel: '_cellucid/ws', events: [], commands: ['highlight', 'later'], binaryCommands: ['highlight', 'later'],
+      channel: '_cellucid/ws', events: [], commands: ['action', 'later'], binaryCommands: ['action', 'later'],
     }).binaryCommands.has('later'),
     true,
   );
@@ -1502,12 +1705,17 @@ test('the host is named from its server info, and an unknown runtime is refused'
     protocolFixture.passthrough = false;
   });
   const protocol = () => new Response(JSON.stringify(CURRENT_PROTOCOL), { status: 200 });
-  for (const [runtime, label] of [['r', 'R'], ['jupyter', 'Jupyter'], ['python', 'Python']]) {
+  // Its steps are labelled with its language: Jupyter is Python's notebook viewer.
+  const named = [['r', 'R', 'r'], ['jupyter', 'Jupyter', 'python'], ['python', 'Python', 'python']];
+  assert.deepEqual(named.map(([runtime]) => runtime).sort(), Object.keys(VIEWER_HOST_RUNTIMES).sort(), 'every runtime has a language');
+  for (const [runtime, label, language] of named) {
     globalThis.fetch = protocolServer(protocol, runtime);
     const source = new ViewerHostDataSource(getViewerHostConfig());
     assert.equal(source.getHostLabel(), null);
+    assert.equal(source.getHostLanguage(), null);
     assert.equal(await source.initialize(), true);
     assert.equal(source.getHostLabel(), label);
+    assert.equal(source.getHostLanguage(), language);
     source.disconnect();
   }
   globalThis.fetch = protocolServer(protocol, 'perl');
@@ -1518,31 +1726,4 @@ test('the host is named from its server info, and an unknown runtime is refused'
     () => requireViewerHostInfoPayload({ ...hostInfo(health, 'r'), n_cells: 4 }, health),
     /same server and dataset/
   );
-});
-
-test('setDataMapping is validated before delivery, and a failure reaches the host', async t => {
-  silenceNotifications(t);
-  const { source, socket } = await connectedSource();
-  source.acceptCommands();
-  const delivered = [];
-  source.onMessage(message => {
-    delivered.push(message);
-    if (message.type === 'setDataMapping') {
-      throw new RangeError("obsp['distances'] is not symmetric — choose a connectivities matrix");
-    }
-  });
-  socket.hostSend({ type: 'setDataMapping', requestId: 'req-1', mapping: { kind: 'anndata' } });
-  assert.equal(delivered.length, 0);
-  socket.hostSend({ type: 'setDataMapping', requestId: 'req-2', mapping: REPORTED_MAPPING, extra: 1 });
-  assert.equal(delivered.length, 0);
-  socket.hostSend({ type: 'setDataMapping', requestId: 'req-3', mapping: REPORTED_MAPPING });
-  assert.equal(delivered.length, 1);
-  const frames = await decodeFrames(socket.frames);
-  assert.deepEqual(frames.map(event => [event.type, event.command]), [
-    ['command_error', 'setDataMapping'],
-    ['command_error', 'setDataMapping'],
-    ['command_error', 'setDataMapping'],
-  ]);
-  assert.match(frames[2].reason, /not symmetric/);
-  source.disconnect();
 });

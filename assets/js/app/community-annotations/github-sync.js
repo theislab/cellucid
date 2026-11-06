@@ -1,14 +1,47 @@
 /**
- * Community Annotation - GitHub sync (GitHub App OAuth).
+ * Community Annotation - GitHub sync through the community-annotation Worker.
  *
- * Static-site friendly GitHub sync using the REST API "contents" endpoints,
- * proxied through a Cloudflare Worker to avoid exposing client secrets.
- * - Pull: list & fetch `annotations/users/ghid_*.json`, merge into local session
- * - Push: write only `annotations/users/ghid_<id>.json`
+ * Every request goes through `worker-request.js` (the app's one transport:
+ * stall timeouts, request budgets from GitHub's headers, retries per request).
  *
- * Security:
- * - Never logs tokens.
- * - Avoids DOM usage (UI layer is separate).
+ * **Pull** (`openSnapshot`, `validateAndLoadConfig`, `pullFiles`) reads one
+ * commit, then only what changed under it:
+ *
+ * 1. Repository metadata, asked with `If-None-Match` (its last ETag and body
+ *    are kept for the page: an unchanged answer is a `304`).
+ * 2. `POST /graphql/snapshot` at the resolved branch: the commit and every
+ *    entry of `annotations/` and `annotations/moderation/` with its blob id
+ *    and size. Everything after is read by object id from this one commit,
+ *    never at the branch name, so one Pull never mixes two commits. When the
+ *    `annotations` tree id equals the last completed Pull's (`file-cache.js`
+ *    marker), nothing changed: the Pull stops there.
+ * 3. The three schemas are checked by blob id against
+ *    `ANNOTATION_SCHEMA_BLOB_OIDS` (no download).
+ * 4. The users tree is listed by its id (`GET git/trees/{oid}`, skipped when
+ *    it is the last completed Pull's); a tree GitHub truncated is an explicit
+ *    error.
+ * 5. Changed files (user files, the merges file, the config) are read through
+ *    `POST /graphql/blobs`, packed into batches by their sizes in the tree
+ *    (an adaptive batch: doubled after a batch succeeds, halved when GitHub
+ *    or the Worker refuses one for its size or time); a blob whose text GitHub
+ *    truncated is read alone through the REST blob route.
+ * 6. Each file is validated and projected onto the open dataset as its batch
+ *    arrives, and kept in the file cache with the batch: an interrupted Pull
+ *    resumes from there. A file that fails is excluded on its own (kept as
+ *    excluded, with its reason, by blob id, so it is not read again until it
+ *    changes) and reported; a path under `annotations/users/` that is not a
+ *    user file, and a case variant of an annotation path, is ignored and
+ *    listed. A Pull never stops for one file.
+ * 7. Files gone from the repository are pruned, then the Pull is marked
+ *    complete.
+ *
+ * **Publish** writes only the contributor's own `annotations/users/ghid_<id>.json`
+ * (and, for authors, `annotations/config.json` and the merges file), directly
+ * or, without write access, through one pull request per contributor and
+ * base branch from their fork (`publishUserFileViaFork`; the contributor
+ * makes the fork on GitHub, Cellucid only finds it).
+ *
+ * Never logs tokens; no DOM.
  */
 
 import { getGitHubAuthSession, getGitHubWorkerOrigin } from './github-auth.js';
@@ -19,11 +52,10 @@ import {
 } from './repo-store.js';
 import {
   ANNOTATION_FILE_MAX_UTF8_BYTES,
+  ANNOTATION_SCHEMA_BLOB_OIDS,
   AnnotationFileTooLargeError,
   assertConfigDocument,
   assertMergesDocument,
-  assertSchemaIdentity,
-  assertUserDocument,
   assertUserFile,
   composeMergesFile,
   composeUserFile,
@@ -39,52 +71,60 @@ import {
   isCanonicalGitHubRepositoryName,
   parseCanonicalGitHubRepositoryReference,
 } from './github-reference.js';
+import {
+  assertWorkerTransport,
+  defaultWorkerTransport,
+  namedWaitMsOf,
+  requestWorker,
+  WORKER_RESPONSE_CUT,
+} from './worker-request.js';
+import { ANNOTATION_MERGES_PATH } from './file-cache.js';
+import { OPERATION_ID_HEADER, OPERATION_OUTCOME_HEADER } from './worker-contract.js';
+import { isLimitAnswer } from '../../formats/io/byte-source.js';
 import { requireExactObjectKeys } from '../../utils/exact-record.js';
-import { isCancellation, cancelled, onAbort } from '../../utils/abort.js';
+import { cancelled } from '../../utils/abort.js';
 
-const GITHUB_DEFAULT_TIMEOUT_MS = 20_000;
-const GITHUB_FORK_READINESS_ATTEMPTS = 5;
-const GITHUB_FORK_READINESS_REQUEST_TIMEOUT_MS = 3_000;
-const GITHUB_RENAMED_FORK_LOOKUP_MAX_PAGES = 10;
-const GITHUB_RENAMED_FORK_LOOKUP_MAX_ITEMS =
-  GITHUB_RENAMED_FORK_LOOKUP_MAX_PAGES * 100;
-const GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS = 10_000;
-const DEFAULT_USER_PULL_CONCURRENCY = 8;
-const MAX_TREE_ITEMS = 100_000;
-/**
- * Changed user files are fetched and handed on in batches of about this many
- * decoded bytes, so a Pull holds one batch at a time however many files the
- * repository has. A scheduling size, not a limit: a larger file is its own
- * batch.
- */
-export const COMMUNITY_ANNOTATION_PULL_BATCH_BYTES = 32 * 1024 * 1024;
-const GITHUB_SHA = /^[0-9a-f]{40}$/;
-const ANNOTATION_USERS_DIRECTORY_PATH = 'annotations/users';
-const ANNOTATION_USERS_PATH_PREFIX =
-  `${ANNOTATION_USERS_DIRECTORY_PATH}/`;
-const EMPTY_ANNOTATION_USERS_SENTINEL = Object.freeze({
-  path: `${ANNOTATION_USERS_PATH_PREFIX}.gitkeep`,
-  sha: '8b137891791fe96927ad78e64b0aad7bded08bdc',
-  size: 1,
-});
+const GIT_OID = /^[0-9a-f]{40}$/;
+const USER_FILE_NAME = /^ghid_([1-9][0-9]*)\.json$/;
+const ANNOTATION_CONFIG_PATH = 'annotations/config.json';
+const ANNOTATION_TEMPLATE_URL = 'https://github.com/theislab/cellucid-annotation';
 const PUBLICATION_MODES = new Set(['direct', 'fork-pull-request']);
-const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
-const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
 const OPERATION_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const OPERATION_OUTCOMES = new Set([
-  'applied',
-  'not-applied',
-  'unknown',
-]);
+const OPERATION_OUTCOMES = new Set(['applied', 'not-applied', 'unknown']);
 
-function assertExactNonblankString(value, label, { max = 2048 } = {}) {
-  if (
-    typeof value !== 'string' ||
-    !value ||
-    /^\s|\s$/.test(value) ||
-    Array.from(value).length > max
-  ) {
+/**
+ * The first `/graphql/blobs` batch carries files of about this many bytes
+ * (their sizes in the tree, plus `BLOB_RECORD_OVERHEAD_BYTES` each); every
+ * batch that succeeds doubles it, and one GitHub or the Worker refuses for
+ * its size or time (HTTP 413, 502, 504, a GraphQL resource or timeout error)
+ * halves it. A scheduling size, not a limit: a larger file is a batch of its
+ * own, and no file is left unread. 256 KiB is about 250 typical user files
+ * of a large repository (about 1 KB each), so the batches of a first Pull of
+ * 5,000 users grow 256 KiB, 512 KiB, 1 MiB, 2 MiB: about six requests.
+ */
+const BLOB_BATCH_START_BYTES = 256 * 1024;
+
+/**
+ * What one blob adds to a batch beyond its bytes: its id in the request
+ * (`"<40 hex>",`) and its record in the answer (`"b123":{"oid":...,
+ * "byteSize":...,"isBinary":false,"isTruncated":false,"text":""}`), so a
+ * repository of many tiny files is packed by request size too. Measured from
+ * the shapes, a scheduling size.
+ */
+const BLOB_RECORD_OVERHEAD_BYTES = 160;
+
+/** The statuses a blob batch is halved on instead of asked again as it is (module doc, step 5). */
+const BLOB_BATCH_RESIZE_STATUSES = new Set([413, 502, 504]);
+/** GraphQL error types that say a query asked too much at once (GitHub's resource limits). */
+const GRAPHQL_RESOURCE_ERRORS = new Set(['MAX_NODE_LIMIT_EXCEEDED', 'RESOURCE_LIMITS_EXCEEDED']);
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertExactNonblankString(value, label) {
+  if (typeof value !== 'string' || !value || /^\s|\s$/.test(value)) {
     throw new Error(`${label} must be an exact nonblank string`);
   }
   return value;
@@ -112,7 +152,7 @@ function assertExactHttpOrigin(value, label) {
 }
 
 function assertGitHubBranch(value, label = 'GitHub branch') {
-  const branch = assertExactNonblankString(value, label, { max: 1024 });
+  const branch = assertExactNonblankString(value, label);
   if (!isCanonicalGitHubBranch(branch)) {
     throw new Error(`${label} is not a canonical GitHub branch`);
   }
@@ -120,27 +160,15 @@ function assertGitHubBranch(value, label = 'GitHub branch') {
 }
 
 function assertGitHubSha(value, label) {
-  const sha = assertExactNonblankString(value, label, { max: 40 });
-  if (!GITHUB_SHA.test(sha)) {
+  if (typeof value !== 'string' || !GIT_OID.test(value)) {
     throw new Error(`${label} must be a lowercase 40-character Git SHA`);
   }
-  return sha;
+  return value;
 }
 
 function assertOptionalToken(value) {
   if (value === null) return null;
-  return assertExactNonblankString(value, 'GitHub token', { max: 4096 });
-}
-
-function assertTimeoutMs(timeoutMs) {
-  if (
-    typeof timeoutMs !== 'number' ||
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 0
-  ) {
-    throw new Error('GitHub request timeoutMs must be a nonnegative safe integer');
-  }
-  return timeoutMs;
+  return assertExactNonblankString(value, 'GitHub token');
 }
 
 function assertAbortSignalOrNull(value, label = 'GitHub request signal') {
@@ -158,38 +186,11 @@ function assertAbortSignalOrNull(value, label = 'GitHub request signal') {
   return value;
 }
 
-function createRequestAbortScope(signal, timeoutMs) {
-  const ownerSignal = assertAbortSignalOrNull(signal);
-  const ms = assertTimeoutMs(timeoutMs);
-  if (typeof AbortController === 'undefined') {
-    throw new Error('AbortController is required for GitHub annotation requests');
+function assertSafeCount(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a nonnegative safe integer`);
   }
-  const controller = new AbortController();
-  let abortCause = null;
-  const abortWithCause = (cause) => {
-    if (abortCause === null) abortCause = cause;
-    controller.abort();
-  };
-  const stopOwner = onAbort(ownerSignal, () => abortWithCause('owner'));
-
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  let timeout = null;
-  if (ms > 0) {
-    timeout = setTimeout(() => {
-      abortWithCause('timeout');
-    }, ms);
-  }
-
-  return {
-    abortCause: () => abortCause,
-    controller,
-    ownerSignal,
-    timeoutMs: ms,
-    cleanup() {
-      if (timeout !== null) clearTimeout(timeout);
-      stopOwner();
-    },
-  };
+  return value;
 }
 
 /** The caller stopped a GitHub request: a cancellation naming what it was. */
@@ -197,73 +198,15 @@ function ownedRequestCancelled(label, cause = undefined) {
   return cancelled('user', `${label} was cancelled.`, cause);
 }
 
-function throwIfRequestAborted(scope, label, cause = undefined) {
-  const abortCause = scope.abortCause();
-  if (abortCause === 'owner') {
-    throw ownedRequestCancelled(
-      label,
-      scope.ownerSignal.reason ?? cause
-    );
-  }
-  if (abortCause === 'timeout') {
-    const error = new Error(
-      `${label} timed out after ${Math.max(
-        1,
-        Math.round(scope.timeoutMs / 1000)
-      )}s`
-    );
-    error.code = 'TIMEOUT';
-    if (cause !== undefined) error.cause = cause;
-    throw error;
-  }
-}
-
-function attachRetryAfterHeader(error, response) {
-  if (
-    !error ||
-    typeof error !== 'object' ||
-    !response ||
-    typeof response !== 'object' ||
-    !response.headers ||
-    typeof response.headers.get !== 'function'
-  ) {
-    return error;
-  }
-  const retryAfter = response.headers.get('retry-after');
-  if (retryAfter !== null) {
-    if (
-      typeof retryAfter === 'string' &&
-      retryAfter.length > 0 &&
-      retryAfter === retryAfter.trim()
-    ) {
-      error.retryAfter = retryAfter;
-    }
-    return error;
-  }
-  const rawReset = response.headers.get('x-ratelimit-reset');
-  if (
-    typeof rawReset === 'string' &&
-    /^(?:0|[1-9][0-9]*)$/.test(rawReset)
-  ) {
-    const reset = Number(rawReset);
-    if (Number.isSafeInteger(reset)) {
-      error.rateLimitResetEpochSeconds = reset;
-    }
-  }
-  return error;
-}
-
 function assertPublicationMode(value) {
   if (!PUBLICATION_MODES.has(value)) {
-    throw new Error(
-      'publicationMode must equal "direct" or "fork-pull-request"'
-    );
+    throw new Error('publicationMode must equal "direct" or "fork-pull-request"');
   }
   return value;
 }
 
 function assertGitHubLogin(value, label = 'GitHub login') {
-  const login = assertExactNonblankString(value, label, { max: 64 });
+  const login = assertExactNonblankString(value, label);
   if (!isCanonicalGitHubAccount(login)) {
     throw new Error(`${label} is not a canonical GitHub account`);
   }
@@ -271,7 +214,7 @@ function assertGitHubLogin(value, label = 'GitHub login') {
 }
 
 function assertGitHubRepositoryFullName(value, label) {
-  const fullName = assertExactNonblankString(value, label, { max: 256 });
+  const fullName = assertExactNonblankString(value, label);
   if (!isCanonicalGitHubRepositoryFullName(fullName)) {
     throw new Error(`${label} must equal an exact owner/repository name`);
   }
@@ -281,23 +224,11 @@ function assertGitHubRepositoryFullName(value, label) {
 function assertRepositoryPublicationInfo(repoInfo) {
   requireExactObjectKeys(
     repoInfo,
-    [
-      'full_name',
-      'default_branch',
-      'private',
-      'allow_forking',
-      'permissions',
-    ],
+    ['full_name', 'default_branch', 'private', 'allow_forking', 'permissions'],
     'GitHub repository metadata'
   );
-  assertGitHubRepositoryFullName(
-    repoInfo.full_name,
-    'GitHub repository full_name'
-  );
-  assertGitHubBranch(
-    repoInfo.default_branch,
-    'GitHub repository default_branch'
-  );
+  assertGitHubRepositoryFullName(repoInfo.full_name, 'GitHub repository full_name');
+  assertGitHubBranch(repoInfo.default_branch, 'GitHub repository default_branch');
   if (typeof repoInfo.private !== 'boolean') {
     throw new Error('GitHub repository private must be boolean');
   }
@@ -318,8 +249,7 @@ function assertRepositoryPublicationInfo(repoInfo) {
   return {
     private: repoInfo.private,
     allowForking: repoInfo.allow_forking,
-    canDirectPush:
-      permissions.push || permissions.maintain || permissions.admin,
+    canDirectPush: permissions.push || permissions.maintain || permissions.admin,
     canManage: permissions.maintain || permissions.admin,
   };
 }
@@ -339,18 +269,10 @@ export function buildUpdatedAnnotationConfig({
   annotatableSettings,
   closedFields,
 } = {}) {
-  assertConfigDocument(currentConfig, {
-    path: 'annotations/config.json',
-  });
-  const did = assertExactNonblankString(
-    datasetId,
-    'datasetId',
-    { max: 256 }
-  );
+  assertConfigDocument(currentConfig, { path: ANNOTATION_CONFIG_PATH });
+  const did = assertExactNonblankString(datasetId, 'datasetId');
   const existing =
-    currentConfig.supportedDatasets.find(
-      entry => entry.datasetId === did
-    ) ?? null;
+    currentConfig.supportedDatasets.find(entry => entry.datasetId === did) ?? null;
   const replacement = {
     datasetId: did,
     name: datasetName === undefined ? existing?.name : datasetName,
@@ -366,17 +288,13 @@ export function buildUpdatedAnnotationConfig({
       )
       : [...currentConfig.supportedDatasets, replacement],
   };
-  assertConfigDocument(config, {
-    path: 'annotations/config.json publish payload',
-  });
+  assertConfigDocument(config, { path: 'annotations/config.json publish payload' });
   return { config, replacement };
 }
 
 function assertAuthUserResponse(value) {
   if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
+    !isPlainObject(value) ||
     Object.keys(value).length !== 2 ||
     !Object.hasOwn(value, 'id') ||
     !Object.hasOwn(value, 'login')
@@ -392,76 +310,51 @@ function assertAuthUserResponse(value) {
   };
 }
 
+// ---------------------------------------------------------------- mutations
+
 function deriveGitHubMutationKind(method, path) {
   if (method === 'GET') return null;
-  if (
-    method === 'PUT' &&
-    /^\/repos\/[^/]+\/[^/]+\/contents\/.+$/.test(path)
-  ) {
+  if (method === 'PUT' && /^\/repos\/[^/]+\/[^/]+\/contents\/.+$/.test(path)) {
     return 'contents-put';
   }
-  if (
-    method === 'POST' &&
-    /^\/repos\/[^/]+\/[^/]+\/git\/refs$/.test(path)
-  ) {
+  if (method === 'POST' && /^\/repos\/[^/]+\/[^/]+\/git\/refs$/.test(path)) {
     return 'git-refs-post';
   }
-  if (
-    method === 'POST' &&
-    /^\/repos\/[^/]+\/[^/]+\/forks$/.test(path)
-  ) {
-    return 'forks-post';
+  if (method === 'PATCH' && /^\/repos\/[^/]+\/[^/]+\/git\/refs\/heads\/.+$/.test(path)) {
+    return 'git-ref-patch';
   }
-  if (
-    method === 'POST' &&
-    /^\/repos\/[^/]+\/[^/]+\/pulls$/.test(path)
-  ) {
+  if (method === 'POST' && /^\/repos\/[^/]+\/[^/]+\/pulls$/.test(path)) {
     return 'pulls-post';
   }
-  throw new Error(
-    `GitHub ${method} ${path} has no exact mutation operation contract`
-  );
+  throw new Error(`GitHub ${method} ${path} has no exact mutation operation contract`);
 }
 
 function createGitHubMutationOperation(method, path) {
   const kind = deriveGitHubMutationKind(method, path);
   if (kind === null) return null;
   if (typeof globalThis.crypto?.randomUUID !== 'function') {
-    throw new Error(
-      'crypto.randomUUID is required for GitHub mutation ownership'
-    );
+    throw new Error('crypto.randomUUID is required for GitHub mutation ownership');
   }
   const id = globalThis.crypto.randomUUID();
   if (typeof id !== 'string' || !OPERATION_ID.test(id)) {
-    throw new Error(
-      'crypto.randomUUID returned a non-canonical operation identity'
-    );
+    throw new Error('crypto.randomUUID returned a non-canonical operation identity');
   }
   return Object.freeze({ id, kind });
 }
 
 function mutationOperationRecord(operation, outcome) {
   if (
-    !operation ||
-    typeof operation !== 'object' ||
+    !isPlainObject(operation) ||
     !OPERATION_ID.test(operation.id) ||
     typeof operation.kind !== 'string' ||
     !OPERATION_OUTCOMES.has(outcome)
   ) {
     throw new Error('Invalid GitHub mutation outcome record');
   }
-  return Object.freeze({
-    id: operation.id,
-    kind: operation.kind,
-    outcome,
-  });
+  return Object.freeze({ id: operation.id, kind: operation.kind, outcome });
 }
 
-function createUnknownMutationOutcomeError(
-  message,
-  operation,
-  cause = undefined
-) {
+function createUnknownMutationOutcomeError(message, operation, cause = undefined) {
   const error = new Error(message);
   error.code = 'GITHUB_MUTATION_OUTCOME_UNKNOWN';
   error.operation = mutationOperationRecord(operation, 'unknown');
@@ -470,8 +363,7 @@ function createUnknownMutationOutcomeError(
 }
 
 function readWorkerMutationOutcome(response, operation) {
-  const responseOperationId = response.headers.get(OPERATION_ID_HEADER);
-  if (responseOperationId !== operation.id) {
+  if (response.headers.get(OPERATION_ID_HEADER) !== operation.id) {
     throw createUnknownMutationOutcomeError(
       'GitHub mutation operation identity mismatch after dispatch',
       operation
@@ -484,10 +376,7 @@ function readWorkerMutationOutcome(response, operation) {
       operation
     );
   }
-  if (
-    (response.ok && outcome !== 'applied') ||
-    (!response.ok && outcome === 'applied')
-  ) {
+  if ((response.ok && outcome !== 'applied') || (!response.ok && outcome === 'applied')) {
     throw createUnknownMutationOutcomeError(
       'GitHub mutation operation outcome contradicts its HTTP status',
       operation
@@ -497,23 +386,12 @@ function readWorkerMutationOutcome(response, operation) {
 }
 
 function attachMutationOutcome(error, operation, outcome) {
-  if (!error || typeof error !== 'object') {
-    return createUnknownMutationOutcomeError(
-      'GitHub mutation failed after dispatch',
-      operation,
-      error
-    );
-  }
   error.operation = mutationOperationRecord(operation, outcome);
   return error;
 }
 
 function attachMutationOutcomeToDocument(document, operation, outcome) {
-  if (
-    document === null ||
-    typeof document !== 'object' ||
-    Array.isArray(document)
-  ) {
+  if (!isPlainObject(document)) {
     throw createUnknownMutationOutcomeError(
       'GitHub mutation returned an invalid success document after dispatch',
       operation
@@ -530,48 +408,36 @@ function attachMutationOutcomeToDocument(document, operation, outcome) {
 
 function attachDocumentMutationOutcome(error, document) {
   if (
-    error &&
-    typeof error === 'object' &&
-    !error.operation &&
-    document &&
-    typeof document === 'object' &&
-    !Array.isArray(document) &&
-    document.operation
+    isPlainObject(error) || error instanceof Error
   ) {
-    error.operation = document.operation;
+    if (!error.operation && isPlainObject(document) && document.operation) {
+      error.operation = document.operation;
+    }
   }
   return error;
 }
 
-function observeResponseBodyCancellation(response) {
-  if (typeof response?.body?.cancel !== 'function') return;
-  try {
-    Promise.resolve(response.body.cancel()).catch(() => {});
-  } catch {
-    // The primary protocol error owns the public outcome.
-  }
-}
-
-function parseHttpJson(text, label) {
-  if (typeof text !== 'string' || text === '') {
-    throw new Error(`${label} returned an empty response body`);
-  }
-  return parseExactJson(text, { path: label });
-}
-
-function assertWorkerErrorDocument(value, label) {
+function shouldReconcileMutation(error, kind) {
+  const operation = error?.operation;
   if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.keys(value).length !== 1 ||
-    !Object.hasOwn(value, 'error')
+    operation &&
+    operation.kind === kind &&
+    (operation.outcome === 'unknown' || operation.outcome === 'applied')
   ) {
-    throw new Error(`${label} must contain exactly error`);
+    return true;
   }
-  return assertExactNonblankString(value.error, `${label} error`, {
-    max: 4096,
-  });
+  return (
+    (error?.status === 409 || error?.status === 422) &&
+    (!operation || (operation.kind === kind && operation.outcome === 'not-applied'))
+  );
+}
+
+function inheritMutationErrorContext(error, cause) {
+  error.cause = cause;
+  if (Number.isSafeInteger(cause?.status)) error.status = cause.status;
+  if (cause?.operation) error.operation = cause.operation;
+  if (cause?.github) error.github = cause.github;
+  return error;
 }
 
 function stableStringifyJson(value) {
@@ -580,9 +446,7 @@ function stableStringifyJson(value) {
     if (v === null) return null;
     if (typeof v === 'string' || typeof v === 'boolean') return v;
     if (typeof v === 'number' && Number.isFinite(v)) return v;
-    if (typeof v !== 'object') {
-      throw new Error('Cannot compare a non-JSON value');
-    }
+    if (typeof v !== 'object') throw new Error('Cannot compare a non-JSON value');
     if (ancestors.has(v)) throw new Error('Cannot compare cyclic JSON');
     ancestors.add(v);
     if (Array.isArray(v)) {
@@ -591,30 +455,21 @@ function stableStringifyJson(value) {
       return array;
     }
     const out = Object.create(null);
-    for (const k of Object.keys(v).sort()) {
-      out[k] = walk(v[k]);
-    }
+    for (const k of Object.keys(v).sort()) out[k] = walk(v[k]);
     ancestors.delete(v);
     return out;
   };
   return JSON.stringify(walk(value));
 }
 
+// ------------------------------------------------------------------- base64
+
 function encodeBase64Bytes(bytes) {
-  if (!(bytes instanceof Uint8Array)) {
-    throw new Error('Base64 input must be a Uint8Array');
-  }
+  if (!(bytes instanceof Uint8Array)) throw new Error('Base64 input must be a Uint8Array');
   const chunks = [];
   const chunkSize = 32_768;
   for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
-    chunks.push(
-      String.fromCharCode(
-        ...bytes.subarray(
-          offset,
-          Math.min(bytes.byteLength, offset + chunkSize)
-        )
-      )
-    );
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkSize))));
   }
   return btoa(chunks.join(''));
 }
@@ -630,33 +485,22 @@ function base64AlphabetValue(code) {
 
 function scanFoldedBase64Payload(
   value,
-  {
-    compareCanonical = null,
-    path = 'GitHub annotation content',
-    phase = 'remote-read',
-  } = {}
+  { compareCanonical = null, path = 'GitHub annotation content', phase = 'remote-read' } = {}
 ) {
-  if (typeof value !== 'string') {
-    throw new Error('GitHub annotation content must be a base64 string');
-  }
+  if (typeof value !== 'string') throw new Error('GitHub annotation content must be a base64 string');
   if (compareCanonical !== null && typeof compareCanonical !== 'string') {
     throw new Error('Canonical base64 comparison input must be a string');
   }
-
+  const invalid = () => new Error('GitHub annotation content must be valid base64 with optional line folding');
   let payloadLength = 0;
   let padding = 0;
   let hasFolding = false;
   let equalsCanonical = compareCanonical === null ? null : true;
   let lastAlphabetValue = -1;
-
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
     if (code === 13) {
-      if (value.charCodeAt(index + 1) !== 10) {
-        throw new Error(
-          'GitHub annotation content must be valid base64 with optional line folding'
-        );
-      }
+      if (value.charCodeAt(index + 1) !== 10) throw invalid();
       hasFolding = true;
       index += 1;
       continue;
@@ -665,1010 +509,778 @@ function scanFoldedBase64Payload(
       hasFolding = true;
       continue;
     }
-
     if (code === 61) {
       padding += 1;
-      if (padding > 2) {
-        throw new Error(
-          'GitHub annotation content must be valid base64 with optional line folding'
-        );
-      }
+      if (padding > 2) throw invalid();
     } else {
       const alphabetValue = base64AlphabetValue(code);
-      if (alphabetValue < 0 || padding !== 0) {
-        throw new Error(
-          'GitHub annotation content must be valid base64 with optional line folding'
-        );
-      }
+      if (alphabetValue < 0 || padding !== 0) throw invalid();
       lastAlphabetValue = alphabetValue;
     }
-
     if (
       compareCanonical !== null &&
-      (
-        payloadLength >= compareCanonical.length ||
-        code !== compareCanonical.charCodeAt(payloadLength)
-      )
+      (payloadLength >= compareCanonical.length || code !== compareCanonical.charCodeAt(payloadLength))
     ) {
       equalsCanonical = false;
     }
     payloadLength += 1;
   }
-
-  if (payloadLength === 0 || payloadLength % 4 !== 0) {
-    throw new Error(
-      'GitHub annotation content must be valid base64 with optional line folding'
-    );
-  }
+  if (payloadLength === 0 || payloadLength % 4 !== 0) throw invalid();
   if (
     (padding === 1 && (lastAlphabetValue & 0b11) !== 0) ||
     (padding === 2 && (lastAlphabetValue & 0b1111) !== 0)
   ) {
-    throw new Error(
-      'GitHub annotation content must be canonical base64 with zero padding bits'
-    );
+    throw new Error('GitHub annotation content must be canonical base64 with zero padding bits');
   }
-  if (
-    compareCanonical !== null &&
-    payloadLength !== compareCanonical.length
-  ) {
+  if (compareCanonical !== null && payloadLength !== compareCanonical.length) {
     equalsCanonical = false;
   }
-  const decodedByteLength =
-    (payloadLength / 4) * 3 - padding;
+  const decodedByteLength = (payloadLength / 4) * 3 - padding;
   if (decodedByteLength > ANNOTATION_FILE_MAX_UTF8_BYTES) {
-    throw new AnnotationFileTooLargeError(
-      path,
-      decodedByteLength,
-      { phase }
-    );
+    throw new AnnotationFileTooLargeError(path, decodedByteLength, { phase });
   }
-  return {
-    decodedByteLength,
-    equalsCanonical,
-    hasFolding,
-    payloadLength,
-  };
+  return { decodedByteLength, equalsCanonical, hasFolding, payloadLength };
 }
 
 function base64PayloadEqualsCanonical(value, canonical, path) {
-  const canonicalInfo = scanFoldedBase64Payload(canonical, {
-    path,
-    phase: 'publication-preflight',
-  });
-  if (canonicalInfo.hasFolding) {
-    throw new Error('Canonical base64 comparison input must not be folded');
-  }
-  return scanFoldedBase64Payload(value, {
-    compareCanonical: canonical,
-    path,
-  }).equalsCanonical === true;
+  const canonicalInfo = scanFoldedBase64Payload(canonical, { path, phase: 'publication-preflight' });
+  if (canonicalInfo.hasFolding) throw new Error('Canonical base64 comparison input must not be folded');
+  return scanFoldedBase64Payload(value, { compareCanonical: canonical, path }).equalsCanonical === true;
 }
 
+/** Decode base64 text (optionally folded) to exact UTF-8; a UTF-8 BOM is kept, so exact JSON refuses it. */
 function decodeBase64Utf8(b64, path) {
-  const {
-    decodedByteLength,
-    hasFolding,
-  } = scanFoldedBase64Payload(b64, { path });
-  const base64 = hasFolding
-    ? b64.replaceAll('\r\n', '').replaceAll('\n', '')
-    : b64;
+  const { decodedByteLength, hasFolding } = scanFoldedBase64Payload(b64, { path });
+  const base64 = hasFolding ? b64.replaceAll('\r\n', '').replaceAll('\n', '') : b64;
   const bin = atob(base64);
-  if (typeof TextDecoder === 'undefined') {
-    throw new Error('TextDecoder is required for GitHub annotation sync');
-  }
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  // Preserve a UTF-8 BOM so the exact JSON parser rejects it, matching the
-  // repository validator instead of silently discarding it.
   return {
-    decoded: new TextDecoder(
-      'utf-8',
-      { fatal: true, ignoreBOM: true }
-    ).decode(bytes),
+    decoded: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes),
     decodedByteLength,
   };
 }
 
-async function getGitTreeRecursive({
-  workerOrigin,
-  owner,
-  repo,
-  token = null,
-  ref,
-  signal = null,
-}) {
-  const treeish = assertGitHubBranch(ref, 'Git tree ref');
-  const res = await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeish)}`,
-    { token, query: { recursive: 1 }, signal }
-  );
-  const list = Array.isArray(res?.tree) ? res.tree : null;
-  if (!list) throw new Error('Expected git tree listing');
-  if (typeof res?.truncated !== 'boolean') {
-    throw new Error('GitHub git tree response truncated must be boolean');
+const utf8Encoder = new TextEncoder();
+
+// ---------------------------------------------------------------- transport
+
+/**
+ * What one sync talks to the Worker with: its origin, the token, the
+ * transport (`worker-request.js`) and who hears a wait the host names.
+ *
+ * @typedef {{workerOrigin: string, token: string|null, transport: object,
+ *   onWait: ((wait: object|null) => void)|null}} WorkerContext
+ */
+
+function workerUrl(workerOrigin, scope, path, query) {
+  const origin = assertExactHttpOrigin(workerOrigin, 'GitHub worker origin');
+  if (typeof path !== 'string' || !path.startsWith('/')) {
+    throw new Error('Worker path must start with "/"');
   }
-  if (res.truncated) {
-    throw new Error('GitHub returned a truncated git tree; annotation Pull is incomplete');
-  }
-  if (list.length > MAX_TREE_ITEMS) {
-    throw new Error(`Git tree contains more than ${MAX_TREE_ITEMS} entries`);
-  }
-  return list.map((rawEntry, index) => {
-    if (
-      rawEntry === null ||
-      typeof rawEntry !== 'object' ||
-      Array.isArray(rawEntry)
-    ) {
-      throw new Error(`Git tree entry ${index} must be an object`);
-    }
-    if (
-      rawEntry.type !== 'blob' &&
-      rawEntry.type !== 'tree' &&
-      rawEntry.type !== 'commit'
-    ) {
-      throw new Error(
-        `Git tree entry ${index} type must equal blob, tree, or commit`
-      );
-    }
-    const path = assertExactNonblankString(
-      rawEntry.path,
-      `Git tree entry ${index} path`,
-      { max: 4096 }
-    );
-    if (
-      path.startsWith('/') ||
-      path.endsWith('/') ||
-      path.split('/').some((segment) => !segment)
-    ) {
-      throw new Error(`Git tree entry ${index} path is not canonical`);
-    }
-    let size = null;
-    if (rawEntry.type === 'blob') {
-      if (
-        !Number.isSafeInteger(rawEntry.size) ||
-        rawEntry.size < 0
-      ) {
-        throw new Error(
-          `Git tree blob entry ${index} size must be a nonnegative safe integer`
-        );
+  const url = new URL(`${origin}${scope === 'api' ? '/api' : ''}${path}`);
+  if (query !== null) {
+    if (!isPlainObject(query)) throw new Error('GitHub query must be a JSON object or null');
+    for (const [key, value] of Object.entries(query)) {
+      if (typeof value === 'string') {
+        url.searchParams.set(assertExactNonblankString(key, 'GitHub query key'), assertExactNonblankString(value, `GitHub query ${key}`));
+      } else if (Number.isSafeInteger(value) && value >= 0) {
+        url.searchParams.set(key, `${value}`);
+      } else {
+        throw new Error(`GitHub query ${key} must be an exact string or nonnegative safe integer`);
       }
-      size = rawEntry.size;
     }
-    return {
-      type: rawEntry.type,
-      path,
-      sha: assertGitHubSha(
-        rawEntry.sha,
-        `Git tree entry ${index} SHA`
-      ),
-      size,
-    };
-  });
+  }
+  return url;
 }
 
-async function getGitBlobJson({
-  workerOrigin,
-  owner,
-  repo,
-  token = null,
-  sha,
-  path,
-  signal = null,
-}) {
-  const s = assertGitHubSha(sha, 'Git blob SHA');
-  const res = await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(s)}`,
-    { token, signal }
-  );
-  if (res?.encoding !== 'base64') {
-    throw new Error(`GitHub blob ${JSON.stringify(path)} must use base64 encoding`);
-  }
-  if (typeof res?.content !== 'string' || !res.content) {
-    throw new Error(`GitHub blob ${JSON.stringify(path)} has empty content`);
-  }
-  const { decoded, decodedByteLength } =
-    decodeBase64Utf8(res.content, path);
-  return {
-    decodedByteLength,
-    json: parseExactJson(decoded, { path }),
-  };
-}
-
-async function mapWithConcurrency(
-  items,
-  concurrency,
-  fn,
-  { signal = null } = {}
-) {
-  if (!Array.isArray(items)) {
-    throw new Error('Concurrent map items must be an array');
-  }
-  if (
-    !Number.isSafeInteger(concurrency) ||
-    concurrency < 1
-  ) {
-    throw new Error('Concurrent map limit must be a positive safe integer');
-  }
-  if (typeof fn !== 'function') {
-    throw new Error('Concurrent map callback must be a function');
-  }
-  const ownerSignal = assertAbortSignalOrNull(
-    signal,
-    'Concurrent GitHub request signal'
-  );
-  const list = items;
-  const limit = concurrency;
-  const results = new Array(list.length);
-  if (!list.length) return results;
-
-  const abortScope = createRequestAbortScope(ownerSignal, 0);
-  let nextIndex = 0;
-  let firstError;
-  let hasError = false;
+/** The Worker's own error words (`{"error": "..."}`), or the status. */
+function workerErrorMessage(text, label, status) {
   try {
-    const workers = new Array(Math.min(limit, list.length))
-      .fill(null)
-      .map(async () => {
-        while (!hasError && !abortScope.controller.signal.aborted) {
-          const idx = nextIndex;
-          nextIndex += 1;
-          if (idx >= list.length) return;
-          try {
-            results[idx] = await fn(
-              list[idx],
-              idx,
-              abortScope.controller.signal
-            );
-          } catch (error) {
-            if (!hasError) {
-              hasError = true;
-              firstError = error;
-              abortScope.controller.abort();
-            }
-            return;
-          }
-        }
-      });
-    await Promise.all(workers);
-    if (hasError) throw firstError;
-    throwIfRequestAborted(
-      abortScope,
-      'Concurrent GitHub requests'
-    );
-    return results;
-  } finally {
-    abortScope.cleanup();
+    const document = JSON.parse(text);
+    if (
+      isPlainObject(document) &&
+      Object.keys(document).length === 1 &&
+      typeof document.error === 'string' &&
+      document.error.trim() !== ''
+    ) {
+      return document.error;
+    }
+  } catch {
+    // Not the Worker's error document: said by its status.
   }
+  return `${label} failed with HTTP ${status}`;
 }
 
-export function parseOwnerRepo(input) {
-  return parseCanonicalGitHubRepositoryReference(input);
-}
-
-function sanitizeUserKeyForPath(userKey) {
-  if (typeof userKey !== 'string') return null;
-  const m = userKey.match(/^ghid_([1-9][0-9]*)$/);
-  if (!m) return null;
-  const id = Number(m[1]);
-  if (!Number.isSafeInteger(id) || id < 1) return null;
-  return userKey;
-}
-
-function fnv1aHash32(input) {
-  const str = assertExactNonblankString(input, 'Hash input', { max: 8192 });
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
-function encodeGitRefPath(ref) {
-  const raw = assertGitHubBranch(ref, 'GitHub ref path');
-  return raw.split('/').map((p) => encodeURIComponent(p)).join('/');
-}
-
-function toDeterministicPrBranch({ datasetId, baseBranch, fileUser }) {
-  const didRaw = assertExactNonblankString(
-    datasetId,
-    'Pull-request dataset id',
-    { max: 256 }
-  );
-  const baseRaw = assertGitHubBranch(baseBranch, 'Pull-request base branch');
-  const userRaw = sanitizeUserKeyForPath(fileUser);
-  if (userRaw === null) {
-    throw new Error('Pull-request file user must be an exact ghid identity');
-  }
-  const fingerprint = fnv1aHash32(
-    `${didRaw}\u0000${baseRaw}\u0000${userRaw}`
-  ).toString(36);
-  return `cellucid-annotations/${userRaw}/${fingerprint}`;
-}
-
-function toWorkerApiUrl(workerOrigin, githubPath) {
-  const origin = assertExactHttpOrigin(workerOrigin, 'GitHub worker origin');
-  const p = assertExactNonblankString(githubPath, 'GitHub API path');
-  if (!p.startsWith('/')) throw new Error('GitHub API path must start with "/"');
-  return new URL(`${origin}/api${p}`);
-}
-
-function toWorkerAuthUrl(workerOrigin, workerPath) {
-  const origin = assertExactHttpOrigin(workerOrigin, 'GitHub worker origin');
-  const p = assertExactNonblankString(workerPath, 'GitHub worker path');
-  if (!p.startsWith('/')) throw new Error('Worker path must start with "/"');
-  return new URL(`${origin}${p}`);
-}
-
-async function githubRequest(workerOrigin, path, {
-  token = null,
+/**
+ * One request to the Worker: `scope` 'api' is the GitHub proxy
+ * (`/api/repos/...`; a mutation carries an operation id and its outcome is
+ * read), 'service' the Worker's own routes (`/auth/user`, `/graphql/*`).
+ * Answers `{status, document, etag, response}`: the JSON body of a success,
+ * or `status: 304` and no document for an unchanged conditional GET. Every
+ * other answer throws an error carrying `status`, where it was asked
+ * (`github` / `worker`: `{path, method}`), whether it was a rate limit
+ * (`rateLimited`, `retryAfterMs`) and a mutation's outcome (`operation`).
+ *
+ * @param {WorkerContext} ctx
+ */
+async function callWorker(ctx, {
+  scope,
+  path,
   method = 'GET',
   query = null,
   body = null,
-  timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS,
+  ifNoneMatch = null,
   signal = null,
-} = {}) {
-  const url = toWorkerApiUrl(workerOrigin, path);
-  if (
-    query !== null &&
-    (
-      typeof query !== 'object' ||
-      Array.isArray(query)
-    )
-  ) {
-    throw new Error('GitHub query must be a JSON object or null');
+  answersAsIs = null,
+}) {
+  if (scope !== 'api' && scope !== 'service') throw new Error('Worker request scope must equal api or service');
+  if (!['GET', 'POST', 'PUT', 'PATCH'].includes(method)) {
+    throw new Error('GitHub request method must equal GET, POST, PUT, or PATCH');
   }
-  if (query !== null) {
-    for (const [k, v] of Object.entries(query)) {
-      const key = assertExactNonblankString(k, 'GitHub query key', {
-        max: 128,
-      });
-      let encodedValue;
-      if (typeof v === 'string') {
-        encodedValue = assertExactNonblankString(
-          v,
-          `GitHub query ${key}`,
-          { max: 2048 }
-        );
-      } else if (Number.isSafeInteger(v) && v >= 0) {
-        encodedValue = `${v}`;
-      } else {
-        throw new Error(
-          `GitHub query ${key} must be an exact string or nonnegative safe integer`
-        );
-      }
-      url.searchParams.set(key, encodedValue);
-    }
-  }
-  if (method !== 'GET' && method !== 'POST' && method !== 'PUT') {
-    throw new Error('GitHub request method must equal GET, POST, or PUT');
-  }
-
-  const headers = {
-    Accept: 'application/vnd.github+json',
+  const url = workerUrl(ctx.workerOrigin, scope, path, query);
+  const ownerSignal = assertAbortSignalOrNull(signal);
+  const where = scope === 'api' ? { github: { path, method } } : { worker: { path, method } };
+  const decorate = (error) => {
+    if (error && typeof error === 'object' && !error.github && !error.worker) Object.assign(error, where);
+    return error;
   };
-  const mutationOperation = createGitHubMutationOperation(method, path);
-  const exactToken = assertOptionalToken(token);
-  if (exactToken !== null) headers.Authorization = `Bearer ${exactToken}`;
-  if (body != null) headers['Content-Type'] = 'application/json';
-  if (mutationOperation !== null) {
-    headers[OPERATION_ID_HEADER] = mutationOperation.id;
-  }
+  const operation = scope === 'api' ? createGitHubMutationOperation(method, path) : null;
+  const headers = { Accept: scope === 'api' ? 'application/vnd.github+json' : 'application/json' };
+  const token = assertOptionalToken(ctx.token);
+  if (token !== null) headers.Authorization = `Bearer ${token}`;
+  if (body !== null) headers['Content-Type'] = 'application/json';
+  if (ifNoneMatch !== null) headers['If-None-Match'] = ifNoneMatch;
+  if (operation !== null) headers[OPERATION_ID_HEADER] = operation.id;
+  const label = `GitHub ${method} ${scope === 'api' ? '' : 'worker '}${path}`;
 
-  const abortScope = createRequestAbortScope(signal, timeoutMs);
   let dispatched = false;
-
+  let answer;
   try {
-    throwIfRequestAborted(abortScope, 'GitHub request');
-    dispatched = true;
-    const res = await fetch(url.toString(), {
+    if (ownerSignal?.aborted) throw ownedRequestCancelled(label, ownerSignal.reason);
+    answer = await requestWorker(ctx.transport, url.toString(), {
       method,
       headers,
-      body: body !== null ? stableStringifyJson(body) : undefined,
-      signal: abortScope.controller.signal
+      body: body === null ? undefined : stableStringifyJson(body),
+    }, {
+      signal: ownerSignal,
+      label,
+      origin: ctx.workerOrigin,
+      mutation: operation !== null,
+      onWait: ctx.onWait,
+      answersAsIs,
+      onDispatch: () => {
+        dispatched = true;
+      },
     });
-    throwIfRequestAborted(abortScope, 'GitHub request');
-
-    let mutationOutcome = null;
-    if (mutationOperation !== null) {
-      try {
-        mutationOutcome = readWorkerMutationOutcome(
-          res,
-          mutationOperation
-        );
-      } catch (error) {
-        observeResponseBodyCancellation(res);
-        throw error;
-      }
-    }
-
-    const text = await res.text();
-    throwIfRequestAborted(abortScope, 'GitHub request');
-    let responseJson;
-    try {
-      responseJson = parseHttpJson(
-        text,
-        `GitHub ${method} ${path} response`
-      );
-    } catch (cause) {
-      const error = new Error(
-        `GitHub ${method} ${path} returned invalid JSON: ${cause?.message || cause}`
-      );
-      error.status = res.status;
-      error.github = { path, method };
-      error.cause = cause;
-      const exactError = attachRetryAfterHeader(error, res);
-      if (mutationOperation !== null) {
-        throw createUnknownMutationOutcomeError(
-          exactError.message,
-          mutationOperation,
-          exactError
-        );
-      }
-      throw exactError;
-    }
-
-    if (!res.ok) {
-      const msg = assertWorkerErrorDocument(
-        responseJson,
-        `GitHub ${method} ${path} error response`
-      );
-      const err = new Error(msg);
-      // attach minimal context (no token)
-      err.status = res.status;
-      err.github = { path, method };
-      const exactError = attachRetryAfterHeader(err, res);
-      if (mutationOperation !== null) {
-        throw attachMutationOutcome(
-          exactError,
-          mutationOperation,
-          mutationOutcome
-        );
-      }
-      throw exactError;
-    }
-
-    return mutationOperation === null
-      ? responseJson
-      : attachMutationOutcomeToDocument(
-          responseJson,
-          mutationOperation,
-          mutationOutcome
-        );
-  } catch (err) {
-    try {
-      throwIfRequestAborted(
-        abortScope,
-        'GitHub request',
-        err
-      );
-    } catch (ownedError) {
-      ownedError.github = { path, method };
-      if (mutationOperation !== null && dispatched) {
-        const unknown = createUnknownMutationOutcomeError(
+  } catch (error) {
+    if (ownerSignal?.aborted) {
+      const stop = ownedRequestCancelled(label, ownerSignal.reason ?? error);
+      if (operation !== null && dispatched) {
+        throw decorate(createUnknownMutationOutcomeError(
           'GitHub mutation outcome is unknown after request cancellation',
-          mutationOperation,
-          ownedError
-        );
-        unknown.github = { path, method };
-        throw unknown;
+          operation,
+          stop
+        ));
       }
-      throw ownedError;
+      throw decorate(stop);
     }
-    if (
-      mutationOperation !== null &&
-      dispatched &&
-      !err?.operation
-    ) {
-      const unknown = createUnknownMutationOutcomeError(
+    if (operation !== null && dispatched) {
+      throw decorate(createUnknownMutationOutcomeError(
         'GitHub mutation outcome is unknown after a transport failure',
-        mutationOperation,
-        err
-      );
-      unknown.github = { path, method };
-      throw unknown;
+        operation,
+        error
+      ));
     }
-    if (
-      mutationOperation !== null &&
-      err?.operation &&
-      !err.github
-    ) {
-      err.github = { path, method };
-    }
-    if (isCancellation(err) && mutationOperation === null) {
-      const error = new Error(
-        'GitHub request transport was interrupted independently'
-      );
-      error.code = 'GITHUB_TRANSPORT_FAILED';
-      error.github = { path, method };
-      error.cause = err;
-      throw error;
-    }
-    if (err && typeof err === 'object' && !err.github) err.github = { path, method };
-    throw err;
-  } finally {
-    abortScope.cleanup();
-  }
-}
-
-async function workerAuthRequest(workerOrigin, path, {
-  token = null,
-  method = 'GET',
-  body = null,
-  timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS,
-  signal = null,
-} = {}) {
-  const url = toWorkerAuthUrl(workerOrigin, path);
-  const headers = {};
-  const exactToken = assertOptionalToken(token);
-  if (exactToken !== null) headers.Authorization = `Bearer ${exactToken}`;
-  if (body != null) headers['Content-Type'] = 'application/json';
-  if (method !== 'GET' && method !== 'POST') {
-    throw new Error('GitHub worker request method must equal GET or POST');
+    throw decorate(error);
   }
 
-  const abortScope = createRequestAbortScope(signal, timeoutMs);
-
-  try {
-    throwIfRequestAborted(abortScope, 'GitHub auth request');
-    const res = await fetch(url.toString(), {
-      method,
-      headers,
-      body: body !== null ? stableStringifyJson(body) : undefined,
-      signal: abortScope.controller.signal
-    });
-    throwIfRequestAborted(abortScope, 'GitHub auth request');
-
-    const text = await res.text();
-    throwIfRequestAborted(abortScope, 'GitHub auth request');
-    let responseJson;
+  const { response, text } = answer;
+  let outcome = null;
+  if (operation !== null) {
     try {
-      responseJson = parseHttpJson(
-        text,
-        `GitHub worker ${method} ${path} response`
-      );
-    } catch (cause) {
-      const error = new Error(
-        `GitHub worker ${method} ${path} returned invalid JSON: ${cause?.message || cause}`
-      );
-      error.status = res.status;
-      error.worker = { path, method };
-      error.cause = cause;
-      throw attachRetryAfterHeader(error, res);
+      outcome = readWorkerMutationOutcome(response, operation);
+    } catch (error) {
+      throw decorate(error);
     }
-    if (!res.ok) {
-      const msg = assertWorkerErrorDocument(
-        responseJson,
-        `GitHub worker ${method} ${path} error response`
-      );
-      const err = new Error(msg);
-      err.status = res.status;
-      err.worker = { path, method };
-      throw attachRetryAfterHeader(err, res);
+  }
+  if (response.status === 304 && ifNoneMatch !== null) {
+    return { status: 304, document: null, etag: response.headers.get('ETag'), response };
+  }
+  if (answersAsIs?.(response) === true) {
+    return { status: response.status, document: null, etag: null, response, text };
+  }
+  if (!response.ok) {
+    const error = new Error(workerErrorMessage(text, label, response.status));
+    error.status = response.status;
+    if (isLimitAnswer(response, text)) {
+      error.rateLimited = true;
+      error.retryAfterMs = namedWaitMsOf(ctx.transport, url.toString(), response);
     }
-    return responseJson;
-  } catch (err) {
-    try {
-      throwIfRequestAborted(
-        abortScope,
-        'GitHub auth request',
-        err
-      );
-    } catch (ownedError) {
-      ownedError.worker = { path, method };
-      throw ownedError;
-    }
-    if (isCancellation(err)) {
-      const error = new Error(
-        'GitHub auth request transport was interrupted independently'
-      );
-      error.code = 'GITHUB_TRANSPORT_FAILED';
-      error.worker = { path, method };
-      error.cause = err;
-      throw error;
-    }
-    if (err && typeof err === 'object' && !err.worker) err.worker = { path, method };
-    throw err;
-  } finally {
-    abortScope.cleanup();
-  }
-}
-
-async function getRepoInfo({
-  workerOrigin,
-  owner,
-  repo,
-  token = null,
-  signal = null,
-}) {
-  return githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
-    { token, signal }
-  );
-}
-
-function assertForkRepositoryIdentity(value) {
-  requireExactObjectKeys(
-    value,
-    ['full_name', 'fork', 'parent'],
-    'GitHub fork identity'
-  );
-  const fullName = assertGitHubRepositoryFullName(
-    value.full_name,
-    'GitHub fork identity full_name'
-  );
-  if (typeof value.fork !== 'boolean') {
-    throw new Error('GitHub fork identity fork must be boolean');
-  }
-  if (value.fork === false) {
-    if (value.parent !== null) {
-      throw new Error(
-        'GitHub non-fork identity parent must equal exact null'
-      );
-    }
-    return { fork: false, fullName, parentFullName: null };
-  }
-  requireExactObjectKeys(
-    value.parent,
-    ['full_name'],
-    'GitHub fork identity parent'
-  );
-  return {
-    fork: true,
-    fullName,
-    parentFullName: assertGitHubRepositoryFullName(
-      value.parent.full_name,
-      'GitHub fork identity parent full_name'
-    ),
-  };
-}
-
-async function getForkRepositoryIdentity({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  signal = null,
-}) {
-  return assertForkRepositoryIdentity(
-    await githubRequest(
-      workerOrigin,
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
-      {
-        token,
-        query: { fork_identity: 1 },
-        signal,
-      }
-    )
-  );
-}
-
-async function getContent({
-  workerOrigin,
-  owner,
-  repo,
-  token = null,
-  path,
-  ref = null,
-  signal = null,
-}) {
-  const p = assertExactNonblankString(path, 'GitHub content path');
-  if (p.startsWith('/') || p.split('/').some((segment) => !segment)) {
-    throw new Error('GitHub content path must be a canonical relative path');
-  }
-  const query =
-    ref === null ? null : { ref: assertGitHubBranch(ref, 'GitHub content ref') };
-  return githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`,
-    { token, query, signal }
-  );
-}
-
-function assertContentFileRecord(content, path) {
-  if (!content || content.type !== 'file') {
-    throw new Error(`Expected file at ${path}`);
-  }
-  if (content.encoding !== 'base64') {
-    throw new Error(`GitHub file ${JSON.stringify(path)} must use base64 encoding`);
-  }
-  const sha = assertGitHubSha(content.sha, `GitHub file ${JSON.stringify(path)} SHA`);
-  scanFoldedBase64Payload(content.content, { path });
-  return {
-    contentBase64: content.content,
-    sha,
-  };
-}
-
-function shouldReconcileMutation(error, kind) {
-  const operation = error?.operation;
-  if (
-    operation &&
-    operation.kind === kind &&
-    (
-      operation.outcome === 'unknown' ||
-      operation.outcome === 'applied'
-    )
-  ) {
-    return true;
-  }
-  return (
-    (error?.status === 409 || error?.status === 422) &&
-    (
-      !operation ||
-      (
-        operation.kind === kind &&
-        operation.outcome === 'not-applied'
-      )
-    )
-  );
-}
-
-async function putContent({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  path,
-  branch,
-  message,
-  contentBase64,
-  sha = null,
-  signal = null,
-}) {
-  const exactToken = assertExactNonblankString(
-    token,
-    'GitHub token',
-    { max: 4096 }
-  );
-  const p = assertExactNonblankString(path, 'GitHub content path');
-  if (p.startsWith('/') || p.split('/').some((segment) => !segment)) {
-    throw new Error('GitHub content path must be a canonical relative path');
-  }
-  const exactMessage = assertExactNonblankString(
-    message,
-    'GitHub commit message',
-    { max: 256 }
-  );
-  if (
-    typeof contentBase64 !== 'string' ||
-    !contentBase64 ||
-    /^\s|\s$/.test(contentBase64)
-  ) {
-    throw new Error('GitHub base64 content must be an exact nonblank string');
-  }
-  const exactContent = contentBase64;
-  if (
-    scanFoldedBase64Payload(exactContent, {
-      path: p,
-      phase: 'publication-preflight',
-    }).hasFolding
-  ) {
-    throw new Error('GitHub base64 content must be canonical and unfolded');
-  }
-  const payload = {
-    message: exactMessage,
-    content: exactContent,
-    branch: assertGitHubBranch(branch),
-  };
-  if (sha !== null) payload.sha = assertGitHubSha(sha, 'Existing content SHA');
-  const requestPath =
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
-  let response = null;
-  try {
-    response = await githubRequest(
-      workerOrigin,
-      requestPath,
-      {
-        token: exactToken,
-        method: 'PUT',
-        body: payload,
-        signal,
-      }
-    );
-    assertGitHubSha(
-      response?.content?.sha,
-      'Published GitHub content SHA'
-    );
-    return response;
-  } catch (caughtError) {
-    const error = attachDocumentMutationOutcome(caughtError, response);
-    if (
-      !shouldReconcileMutation(error, 'contents-put') ||
-      signal?.aborted === true
-    ) {
-      throw error;
-    }
-    try {
-      const remote = await getContent({
-        workerOrigin,
-        owner,
-        repo,
-        token: exactToken,
-        path: p,
-        ref: payload.branch,
-        signal,
-      });
-      const remoteFile = assertContentFileRecord(remote, p);
-      if (
-        base64PayloadEqualsCanonical(
-          remoteFile.contentBase64,
-          exactContent,
-          p
-        )
-      ) {
-        return { content: { sha: remoteFile.sha } };
-      }
-    } catch {
-      // The original mutation outcome remains authoritative when one bounded
-      // desired-state read cannot prove convergence.
-    }
+    decorate(error);
+    if (operation !== null) throw attachMutationOutcome(error, operation, outcome);
     throw error;
   }
-}
-
-function isContentConflictError(error) {
-  return (
-    error?.status === 409 &&
-    (
-      !error?.operation ||
-      error.operation.outcome === 'not-applied'
-    )
-  );
-}
-
-function inheritMutationErrorContext(error, cause) {
-  error.cause = cause;
-  if (Number.isSafeInteger(cause?.status)) {
-    error.status = cause.status;
+  let document;
+  try {
+    if (text === '') throw new Error('empty body');
+    document = JSON.parse(text);
+  } catch (cause) {
+    const cut = new Error(
+      `${label} answered HTTP ${response.status} with an incomplete or invalid JSON body; try again`
+    );
+    cut.code = WORKER_RESPONSE_CUT;
+    cut.transient = true;
+    cut.status = response.status;
+    cut.cause = cause;
+    decorate(cut);
+    if (operation !== null) {
+      throw decorate(createUnknownMutationOutcomeError(cut.message, operation, cut));
+    }
+    throw cut;
   }
-  if (cause?.operation) {
-    error.operation = cause.operation;
+  if (operation !== null) {
+    try {
+      attachMutationOutcomeToDocument(document, operation, outcome);
+    } catch (error) {
+      throw decorate(error);
+    }
   }
-  if (cause?.github) {
-    error.github = cause.github;
-  }
-  return error;
+  return { status: response.status, document, etag: response.headers.get('ETag'), response };
 }
 
-function decodeJsonContentFile(content, path) {
-  const file = assertContentFileRecord(content, path);
-  const { decoded } = decodeBase64Utf8(file.contentBase64, path);
-  return {
-    json: parseExactJson(decoded, { path }),
-    sha: file.sha,
-    contentBase64: file.contentBase64,
-  };
+/** A GET through the GitHub proxy: its JSON document. */
+async function githubGet(ctx, path, { query = null, signal = null } = {}) {
+  return (await callWorker(ctx, { scope: 'api', path, query, signal })).document;
 }
 
-async function readJsonFile({
-  workerOrigin,
-  owner,
-  repo,
-  token = null,
-  path,
-  ref = null,
-  signal = null,
-}) {
-  const content = await getContent({
-    workerOrigin,
-    owner,
-    repo,
-    token,
-    path,
-    ref,
-    signal,
-  });
-  return decodeJsonContentFile(content, path);
+function repoPath(owner, repo, rest = '') {
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${rest}`;
+}
+
+function contentPath(owner, repo, path) {
+  const p = assertExactNonblankString(path, 'GitHub content path');
+  if (p.startsWith('/') || p.split('/').some((segment) => !segment)) {
+    throw new Error('GitHub content path must be a canonical relative path');
+  }
+  return repoPath(owner, repo, `/contents/${p.split('/').map(encodeURIComponent).join('/')}`);
+}
+
+function encodeGitRefPath(ref) {
+  return assertGitHubBranch(ref, 'GitHub ref path').split('/').map((p) => encodeURIComponent(p)).join('/');
 }
 
 function isNotFoundError(err) {
   return err?.status === 404;
 }
 
-async function readJsonFileOrNull({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  path,
-  ref,
-  signal = null,
-}) {
-  try {
-    return await readJsonFile({
-      workerOrigin,
-      owner,
-      repo,
-      token,
-      path,
-      ref,
-      signal,
-    });
-  } catch (err) {
-    if (isNotFoundError(err)) {
-      return { json: null, sha: null, contentBase64: null };
+function layoutInvalid(message) {
+  const error = new Error(message);
+  error.code = 'COMMUNITY_ANNOTATION_REPOSITORY_LAYOUT_INVALID';
+  return error;
+}
+
+function protocolError(message) {
+  const error = new Error(message);
+  error.code = 'GITHUB_WORKER_RESPONSE_INVALID';
+  return error;
+}
+
+// -------------------------------------------------------------- GraphQL
+
+/** A GraphQL answer's `{data, errors}`, checked for shape. */
+function graphqlEnvelope(document, label) {
+  if (!isPlainObject(document)) throw protocolError(`${label} must be a JSON object`);
+  for (const key of Object.keys(document)) {
+    if (key !== 'data' && key !== 'errors' && key !== 'extensions') {
+      throw protocolError(`${label} has an unexpected member ${JSON.stringify(key)}`);
     }
-    throw err;
+  }
+  const errors = document.errors === undefined ? [] : document.errors;
+  if (!Array.isArray(errors) || errors.some((error) => !isPlainObject(error) || typeof error.message !== 'string')) {
+    throw protocolError(`${label} errors must be an array of objects with a message`);
+  }
+  const data = document.data === undefined ? null : document.data;
+  if (data !== null && !isPlainObject(data)) throw protocolError(`${label} data must be an object or null`);
+  return { data, errors };
+}
+
+function graphqlFailure(errors, label) {
+  const error = new Error(`${label} failed: ${errors.map((entry) => entry.message).join('; ')}`);
+  error.graphqlErrors = errors.map((entry) => ({ type: typeof entry.type === 'string' ? entry.type : null, message: entry.message }));
+  return error;
+}
+
+/**
+ * One `/graphql/*` request. GitHub answers a spent GraphQL budget with HTTP
+ * 200 and a `RATE_LIMITED` error; its headers tell the book of hosts the
+ * budget's reset, which holds the next request until then, so it is asked
+ * again (while the book holds the Worker; never in a loop of refusals).
+ */
+async function callGraphql(ctx, path, body, { signal = null, answersAsIs = null } = {}) {
+  const label = `GitHub worker POST ${path}`;
+  for (;;) {
+    const result = await callWorker(ctx, { scope: 'service', path, method: 'POST', body, signal, answersAsIs });
+    if (result.document === null) return { ...result, data: null, errors: [] };
+    const { data, errors } = graphqlEnvelope(result.document, label);
+    if (errors.some((error) => error.type === 'RATE_LIMITED')) {
+      const url = workerUrl(ctx.workerOrigin, 'service', path, null).toString();
+      if ((ctx.transport.hosts.heldForMs?.(url) ?? 0) > 0) continue;
+      const limited = graphqlFailure(errors, label);
+      limited.status = 403;
+      limited.rateLimited = true;
+      limited.retryAfterMs = null;
+      limited.worker = { path, method: 'POST' };
+      throw limited;
+    }
+    return { ...result, data, errors };
   }
 }
 
-function assertForkRecord(
-  value,
-  index,
-  upstreamFullName,
-  { requireParent = false } = {}
-) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`GitHub fork ${index} must be an object`);
+/** The entries of a GraphQL tree object: `[{name, type, oid, byteSize}]` (`byteSize` null for a tree or submodule). */
+function graphqlTreeEntries(object, label) {
+  if (!isPlainObject(object) || !Array.isArray(object.entries)) {
+    throw protocolError(`${label} must be a tree with entries`);
   }
-  const fullName = assertGitHubRepositoryFullName(
-    value.full_name,
-    `GitHub fork ${index} full_name`
-  );
-  if (!value.owner || typeof value.owner !== 'object' || Array.isArray(value.owner)) {
-    throw new Error(`GitHub fork ${index} owner must be an object`);
+  const seen = new Set();
+  return object.entries.map((entry, index) => {
+    const at = `${label} entry ${index}`;
+    if (!isPlainObject(entry)) throw protocolError(`${at} must be an object`);
+    if (typeof entry.name !== 'string' || entry.name === '' || entry.name.includes('/')) {
+      throw protocolError(`${at} name must be one nonempty path segment`);
+    }
+    if (seen.has(entry.name)) throw protocolError(`${label} repeats ${JSON.stringify(entry.name)}`);
+    seen.add(entry.name);
+    if (entry.type !== 'blob' && entry.type !== 'tree' && entry.type !== 'commit') {
+      throw protocolError(`${at} type must equal blob, tree, or commit`);
+    }
+    assertGitHubSha(entry.oid, `${at} oid`);
+    let byteSize = null;
+    if (entry.type === 'blob') {
+      if (!isPlainObject(entry.object)) throw protocolError(`${at} blob must state its byteSize`);
+      byteSize = assertSafeCount(entry.object.byteSize, `${at} byteSize`);
+    }
+    return { name: entry.name, type: entry.type, oid: entry.oid, byteSize };
+  });
+}
+
+/** The entry of a GraphQL `file(path:)` lookup: `{oid, type, object}` or null. */
+function graphqlFileEntry(value, label) {
+  if (value === null || value === undefined) return null;
+  if (!isPlainObject(value)) throw protocolError(`${label} must be an object or null`);
+  assertGitHubSha(value.oid, `${label} oid`);
+  return value;
+}
+
+/**
+ * Names under `annotations/` (and its moderation folder) that Cellucid reads,
+ * by their exact lowercase spelling: an entry spelled otherwise (`Users`,
+ * `Config.json`) is a case variant, ignored and listed (a case-insensitive
+ * checkout would merge it with the real one).
+ */
+const ANNOTATION_NAMES = Object.freeze(['users', 'config.json', 'schema.json', 'config.schema.json', 'moderation']);
+const MODERATION_NAMES = Object.freeze(['merges.json', 'merges.schema.json']);
+
+function caseVariantsOf(entries, names, prefix) {
+  return entries
+    .filter((entry) => !names.includes(entry.name) && names.includes(entry.name.toLowerCase()))
+    .map((entry) => ({
+      path: `${prefix}${entry.name}`,
+      reason: `a case variant of ${prefix}${entry.name.toLowerCase()}; Cellucid reads only the exact lowercase path`,
+    }));
+}
+
+function requireSchemaBlob(entries, name, expectedOid, path) {
+  const entry = entries.find((candidate) => candidate.name === name) ?? null;
+  if (entry === null || entry.type !== 'blob') {
+    throw layoutInvalid(
+      `${path} is missing. Copy it from ${ANNOTATION_TEMPLATE_URL} (the annotation template), then Pull again.`
+    );
   }
-  const owner = assertGitHubLogin(
-    value.owner.login,
-    `GitHub fork ${index} owner login`
-  );
-  const name = assertExactNonblankString(
-    value.name,
-    `GitHub fork ${index} name`,
-    { max: 100 }
-  );
-  if (!isCanonicalGitHubRepositoryName(name)) {
-    throw new Error(`GitHub fork ${index} name is not canonical`);
+  if (entry.oid !== expectedOid) {
+    throw layoutInvalid(
+      `${path} is not the schema this Cellucid reads (Git blob ${entry.oid}, expected ${expectedOid}). ` +
+      `Copy the current ${path} from ${ANNOTATION_TEMPLATE_URL}, then Pull again.`
+    );
   }
+}
+
+/**
+ * The repository at one commit, as a Pull reads it (module doc, steps 2–3).
+ *
+ * @typedef {{repoInfo: object, branch: string, commitOid: string, annotationsOid: string,
+ *   usersOid: string, config: {oid: string, byteSize: number},
+ *   merges: {oid: string, byteSize: number}|null, ignored: Array<{path: string, reason: string}>}} RepositorySnapshot
+ */
+function parseSnapshot(data, { owner, repo, branch, repoInfo }) {
+  const where = `${owner}/${repo}@${branch}`;
+  if (data === null || !isPlainObject(data)) throw protocolError('GitHub snapshot answered no data');
+  const repository = data.repository;
+  if (repository === null || repository === undefined) {
+    const error = new Error(`GitHub repository ${owner}/${repo} is not accessible`);
+    error.status = 404;
+    throw error;
+  }
+  if (!isPlainObject(repository)) throw protocolError('GitHub snapshot repository must be an object');
+  if (repository.ref === null || repository.ref === undefined) {
+    throw layoutInvalid(`Branch "${branch}" does not exist in ${owner}/${repo}.`);
+  }
+  const target = repository.ref?.target;
+  if (!isPlainObject(target)) throw protocolError('GitHub snapshot ref target must be an object');
+  const commitOid = assertGitHubSha(target.oid, 'GitHub snapshot commit oid');
+  const annotations = graphqlFileEntry(target.annotations, 'GitHub snapshot annotations');
+  if (annotations === null || annotations.type !== 'tree') {
+    throw layoutInvalid(
+      `${where} has no annotations/ folder. Set the repository up from ${ANNOTATION_TEMPLATE_URL}, then Pull again.`
+    );
+  }
+  const entries = graphqlTreeEntries(annotations.object, 'GitHub snapshot annotations/');
+  const moderation = graphqlFileEntry(target.moderation, 'GitHub snapshot annotations/moderation');
+  const moderationEntries = moderation !== null && moderation.type === 'tree'
+    ? graphqlTreeEntries(moderation.object, 'GitHub snapshot annotations/moderation/')
+    : [];
+
+  requireSchemaBlob(entries, 'schema.json', ANNOTATION_SCHEMA_BLOB_OIDS.user, 'annotations/schema.json');
+  requireSchemaBlob(entries, 'config.schema.json', ANNOTATION_SCHEMA_BLOB_OIDS.config, 'annotations/config.schema.json');
+  requireSchemaBlob(
+    moderationEntries,
+    'merges.schema.json',
+    ANNOTATION_SCHEMA_BLOB_OIDS.merges,
+    'annotations/moderation/merges.schema.json'
+  );
+  const users = entries.find((entry) => entry.name === 'users') ?? null;
+  if (users === null || users.type !== 'tree') {
+    throw layoutInvalid(
+      `${where} has no annotations/users/ folder. Set the repository up from ${ANNOTATION_TEMPLATE_URL}, then Pull again.`
+    );
+  }
+  const config = entries.find((entry) => entry.name === 'config.json') ?? null;
+  if (config === null || config.type !== 'blob') {
+    throw layoutInvalid(
+      `${where} has no annotations/config.json. Set the repository up from ${ANNOTATION_TEMPLATE_URL}, then Pull again.`
+    );
+  }
+  const ignored = [
+    ...caseVariantsOf(entries, ANNOTATION_NAMES, 'annotations/'),
+    ...caseVariantsOf(moderationEntries, MODERATION_NAMES, 'annotations/moderation/'),
+  ];
+  const mergesEntry = moderationEntries.find((entry) => entry.name === 'merges.json') ?? null;
+  let merges = null;
+  if (mergesEntry !== null) {
+    if (mergesEntry.type === 'blob') {
+      merges = { oid: mergesEntry.oid, byteSize: mergesEntry.byteSize };
+    } else {
+      ignored.push({ path: ANNOTATION_MERGES_PATH, reason: `a ${mergesEntry.type === 'tree' ? 'folder' : 'submodule'}, not a file` });
+    }
+  }
+  return Object.freeze({
+    repoInfo,
+    branch,
+    commitOid,
+    annotationsOid: annotations.oid,
+    usersOid: users.oid,
+    config: { oid: config.oid, byteSize: config.byteSize },
+    merges,
+    ignored,
+  });
+}
+
+// ------------------------------------------------------- what the page keeps
+
+/**
+ * Repository metadata as last answered, by Worker origin and repository:
+ * its ETag and body, so the next Pull asks `If-None-Match` and an unchanged
+ * answer (`304`) costs no transfer. A `304` names the same body for whoever
+ * asks (the ETag is the body's), so it is kept per repository, not per user.
+ */
+const repositoryMetadataByKey = new Map();
+/** Validated config documents by blob id (content addressed). */
+const configByOid = new Map();
+
+function repositoryKey(workerOrigin, owner, repo) {
+  return `${workerOrigin}|${owner.toLowerCase()}/${repo.toLowerCase()}`;
+}
+
+/** Read one blob through the REST blob route (a blob GitHub's GraphQL truncated): `{text, byteSize}`. */
+async function readBlobRest(ctx, owner, repo, oid, path, { signal = null } = {}) {
+  const document = await githubGet(ctx, repoPath(owner, repo, `/git/blobs/${oid}`), { signal });
+  if (!isPlainObject(document) || document.sha !== oid || document.encoding !== 'base64' || typeof document.content !== 'string') {
+    throw protocolError(`GitHub blob ${oid} (${path}) must answer its sha and base64 content`);
+  }
+  const byteSize = assertSafeCount(document.size, `GitHub blob ${oid} size`);
+  const { decoded, decodedByteLength } = decodeBase64Utf8(document.content, path);
+  if (decodedByteLength !== byteSize) throw protocolError(`GitHub blob ${oid} (${path}) content does not match its size`);
+  return { text: decoded, byteSize };
+}
+
+/**
+ * Read blobs by id, `/graphql/blobs` in one request: per oid in request
+ * order `{oid, byteSize, isBinary, text}` (a blob whose text GitHub
+ * truncated is read through the REST route), or `{resize: true}` when the
+ * batch was refused for its size or time.
+ */
+async function readBlobBatch(ctx, owner, repo, items, { signal = null } = {}) {
+  const label = 'GitHub worker POST /graphql/blobs';
+  const result = await callGraphql(ctx, '/graphql/blobs', { owner, repo, oids: items.map((item) => item.oid) }, {
+    signal,
+    answersAsIs: (response) => BLOB_BATCH_RESIZE_STATUSES.has(response.status),
+  });
+  if (result.document === null && BLOB_BATCH_RESIZE_STATUSES.has(result.status)) return { resize: true };
+  const { data, errors } = result;
+  if (errors.length > 0) {
+    const resize = errors.every((error) =>
+      GRAPHQL_RESOURCE_ERRORS.has(error.type) || /\btim(?:e|ed)\s?out\b/i.test(error.message)
+    );
+    if (resize) return { resize: true };
+    throw graphqlFailure(errors, label);
+  }
+  const repository = data?.repository;
+  if (!isPlainObject(repository)) {
+    const error = new Error(`GitHub repository ${owner}/${repo} is not accessible`);
+    error.status = 404;
+    throw error;
+  }
+  const blobs = [];
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    const blob = repository[`b${index}`];
+    if (blob === null || blob === undefined) {
+      throw protocolError(
+        `GitHub did not answer blob ${item.oid} (${item.path}) of the commit this Pull reads; start a new Pull`
+      );
+    }
+    if (!isPlainObject(blob) || blob.oid !== item.oid) {
+      throw protocolError(`GitHub answered another object for blob ${item.oid} (${item.path})`);
+    }
+    const byteSize = assertSafeCount(blob.byteSize, `GitHub blob ${item.oid} byteSize`);
+    if (typeof blob.isBinary !== 'boolean' || typeof blob.isTruncated !== 'boolean') {
+      throw protocolError(`GitHub blob ${item.oid} must state isBinary and isTruncated`);
+    }
+    if (blob.isBinary) {
+      blobs.push({ oid: item.oid, byteSize, isBinary: true, text: null });
+    } else if (blob.isTruncated) {
+      const rest = await readBlobRest(ctx, owner, repo, item.oid, item.path, { signal });
+      blobs.push({ oid: item.oid, byteSize: rest.byteSize, isBinary: false, text: rest.text });
+    } else {
+      if (typeof blob.text !== 'string') throw protocolError(`GitHub blob ${item.oid} must state its text`);
+      blobs.push({ oid: item.oid, byteSize, isBinary: false, text: blob.text });
+    }
+  }
+  return { blobs };
+}
+
+/** Read one blob by id (batch of one, REST when a batch of one is refused). */
+async function readOneBlob(ctx, owner, repo, item, { signal = null } = {}) {
+  const outcome = await readBlobBatch(ctx, owner, repo, [item], { signal });
+  if (outcome.resize) {
+    const rest = await readBlobRest(ctx, owner, repo, item.oid, item.path, { signal });
+    return { oid: item.oid, byteSize: rest.byteSize, isBinary: false, text: rest.text };
+  }
+  return outcome.blobs[0];
+}
+
+/**
+ * What one file is, read: `{view}` its projection onto the open dataset, or
+ * `{rejection: {code, message}}` why it is excluded. Never throws for the
+ * file's content: a Pull never stops for one file.
+ */
+function verdictOf(path, blob, datasetId) {
+  const reject = (code, message) => ({ rejection: { code, message } });
+  if (blob.isBinary) {
+    return reject('COMMUNITY_ANNOTATION_FILE_NOT_TEXT', `${path} is binary, not JSON text`);
+  }
+  if (utf8Encoder.encode(blob.text).length !== blob.byteSize) {
+    return reject('COMMUNITY_ANNOTATION_FILE_NOT_TEXT', `${path} is not valid UTF-8 text`);
+  }
+  try {
+    const json = parseExactJson(blob.text, { path });
+    if (path === ANNOTATION_MERGES_PATH) return { view: projectMergesFile(json, datasetId, { path }) };
+    return { view: projectUserFile(json, datasetId, { path, filename: path.slice('annotations/users/'.length) }) };
+  } catch (error) {
+    return reject(
+      typeof error?.code === 'string' && error.code ? error.code : 'COMMUNITY_ANNOTATION_CONTRACT_INVALID',
+      typeof error?.message === 'string' && error.message ? error.message : `${path} is not a valid annotation file`
+    );
+  }
+}
+
+/** A user-file path's entry in the users tree, or why the entry is ignored. */
+function classifyUsersEntry(entry) {
+  const path = `annotations/users/${entry.name}`;
+  if (entry.name === '.gitkeep') return { skip: true };
+  const match = USER_FILE_NAME.exec(entry.name);
+  if (match === null || !Number.isSafeInteger(Number(match[1]))) {
+    return { ignored: { path, reason: 'not a user file (annotations/users/ holds only ghid_<GitHub user id>.json)' } };
+  }
+  if (entry.type !== 'blob') {
+    return { ignored: { path, reason: `a ${entry.type === 'tree' ? 'folder' : 'submodule'}, not a user file` } };
+  }
+  return { file: { path, sha: entry.sha, size: entry.size } };
+}
+
+/** The users tree, listed by its id: user files and ignored paths (module doc, step 4). */
+async function listUsersTree(ctx, owner, repo, usersOid, { signal = null } = {}) {
+  const document = await githubGet(ctx, repoPath(owner, repo, `/git/trees/${usersOid}`), { signal });
+  if (!isPlainObject(document) || document.sha !== usersOid || !Array.isArray(document.tree)) {
+    throw protocolError(`GitHub tree ${usersOid} must answer its sha and entries`);
+  }
+  if (typeof document.truncated !== 'boolean') throw protocolError('GitHub tree truncated must be boolean');
+  if (document.truncated) {
+    throw layoutInvalid(
+      `GitHub truncated the listing of annotations/users/ (GitHub lists at most 100,000 entries or 7 MB of a tree: ` +
+      'https://docs.github.com/en/rest/git/trees#get-a-tree), so this Pull cannot see every user file.'
+    );
+  }
+  const files = [];
+  const ignored = [];
+  const seen = new Set();
+  document.tree.forEach((raw, index) => {
+    if (!isPlainObject(raw) || typeof raw.path !== 'string' || raw.path === '' || raw.path.includes('/')) {
+      throw protocolError(`GitHub tree ${usersOid} entry ${index} must name one path segment`);
+    }
+    if (seen.has(raw.path)) throw protocolError(`GitHub tree ${usersOid} repeats ${JSON.stringify(raw.path)}`);
+    seen.add(raw.path);
+    if (raw.type !== 'blob' && raw.type !== 'tree' && raw.type !== 'commit') {
+      throw protocolError(`GitHub tree ${usersOid} entry ${index} type must equal blob, tree, or commit`);
+    }
+    const sha = assertGitHubSha(raw.sha, `GitHub tree ${usersOid} entry ${index} sha`);
+    const size = raw.type === 'blob' ? assertSafeCount(raw.size, `GitHub tree ${usersOid} entry ${index} size`) : null;
+    const verdict = classifyUsersEntry({ name: raw.path, type: raw.type, sha, size });
+    if (verdict.file) files.push(verdict.file);
+    else if (verdict.ignored) ignored.push(verdict.ignored);
+  });
+  return { files, ignored };
+}
+
+/** Code-unit order (never locale-dependent). */
+function byCodeUnits(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+// ---------------------------------------------------- publication (Contents)
+
+function assertContentFileRecord(content, path) {
+  if (!isPlainObject(content) || content.type !== 'file') throw new Error(`Expected file at ${path}`);
+  if (content.encoding !== 'base64') {
+    throw new Error(`GitHub file ${JSON.stringify(path)} must use base64 encoding`);
+  }
+  const sha = assertGitHubSha(content.sha, `GitHub file ${JSON.stringify(path)} SHA`);
+  scanFoldedBase64Payload(content.content, { path });
+  return { contentBase64: content.content, sha };
+}
+
+/** A file at a branch through the Contents API (publication reads it for its SHA): `{json, sha, contentBase64}`, or null. */
+async function readContentFile(ctx, owner, repo, path, ref, { signal = null } = {}) {
+  let content;
+  try {
+    content = await githubGet(ctx, contentPath(owner, repo, path), {
+      query: { ref: assertGitHubBranch(ref, 'GitHub content ref') },
+      signal,
+    });
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  const file = assertContentFileRecord(content, path);
+  const { decoded } = decodeBase64Utf8(file.contentBase64, path);
+  return { json: parseExactJson(decoded, { path }), sha: file.sha, contentBase64: file.contentBase64 };
+}
+
+function conflictError(path, message, cause = undefined) {
+  const error = new Error(message);
+  error.code = 'COMMUNITY_ANNOTATION_CONFLICT';
+  error.path = path;
+  if (cause !== undefined) inheritMutationErrorContext(error, cause);
+  return error;
+}
+
+/**
+ * Write one file with the Contents API, `sha` naming the version it
+ * replaces (null: a new file). A write GitHub refuses because the file
+ * changed meanwhile -- `409`, or `422` when it was created after it was read
+ * as missing (another device publishing at the same moment) -- or whose
+ * outcome is unknown, is settled by reading the file again: the bytes this
+ * write sent are success; any other version than `sha` is
+ * `COMMUNITY_ANNOTATION_CONFLICT`.
+ */
+async function putContent(ctx, { owner, repo, path, branch, message, contentBase64, sha = null, signal = null }) {
+  if (assertOptionalToken(ctx.token) === null) throw new Error('GitHub token required to publish');
+  const exactMessage = assertExactNonblankString(message, 'GitHub commit message');
+  if (typeof contentBase64 !== 'string' || !contentBase64 || /^\s|\s$/.test(contentBase64)) {
+    throw new Error('GitHub base64 content must be an exact nonblank string');
+  }
+  if (scanFoldedBase64Payload(contentBase64, { path, phase: 'publication-preflight' }).hasFolding) {
+    throw new Error('GitHub base64 content must be canonical and unfolded');
+  }
+  const payload = { message: exactMessage, content: contentBase64, branch: assertGitHubBranch(branch) };
+  if (sha !== null) payload.sha = assertGitHubSha(sha, 'Existing content SHA');
+  let response = null;
+  try {
+    response = (await callWorker(ctx, {
+      scope: 'api',
+      path: contentPath(owner, repo, path),
+      method: 'PUT',
+      body: payload,
+      signal,
+    })).document;
+    assertGitHubSha(response?.content?.sha, 'Published GitHub content SHA');
+    return response;
+  } catch (caughtError) {
+    const error = attachDocumentMutationOutcome(caughtError, response);
+    if (!shouldReconcileMutation(error, 'contents-put') || signal?.aborted === true) throw error;
+    let remote;
+    try {
+      remote = await readContentFile(ctx, owner, repo, path, payload.branch, { signal });
+    } catch {
+      // The original outcome stands when the file cannot be read again.
+      throw error;
+    }
+    if (remote !== null && base64PayloadEqualsCanonical(remote.contentBase64, contentBase64, path)) {
+      return { content: { sha: remote.sha } };
+    }
+    if ((remote?.sha ?? null) !== sha) {
+      throw conflictError(
+        path,
+        `${path} changed on GitHub while publishing.\nPull first to merge the latest version, then Publish again.`,
+        error
+      );
+    }
+    throw error;
+  }
+}
+
+// ------------------------------------------------------------------ fork
+
+function assertForkRecord(value, index) {
+  if (!isPlainObject(value)) throw new Error(`GitHub fork ${index} must be an object`);
+  const fullName = assertGitHubRepositoryFullName(value.full_name, `GitHub fork ${index} full_name`);
+  if (!isPlainObject(value.owner)) throw new Error(`GitHub fork ${index} owner must be an object`);
+  const owner = assertGitHubLogin(value.owner.login, `GitHub fork ${index} owner login`);
+  const name = assertExactNonblankString(value.name, `GitHub fork ${index} name`);
+  if (!isCanonicalGitHubRepositoryName(name)) throw new Error(`GitHub fork ${index} name is not canonical`);
   if (fullName.toLowerCase() !== `${owner}/${name}`.toLowerCase()) {
     throw new Error(`GitHub fork ${index} identity fields disagree`);
-  }
-  if (requireParent && value.parent === undefined) {
-    throw new Error(`GitHub fork ${index} is missing its parent repository`);
-  }
-  if (value.parent !== undefined) {
-    if (
-      !value.parent ||
-      typeof value.parent !== 'object' ||
-      Array.isArray(value.parent) ||
-      assertGitHubRepositoryFullName(
-        value.parent.full_name,
-        `GitHub fork ${index} parent full_name`
-      ).toLowerCase() !== upstreamFullName.toLowerCase()
-    ) {
-      throw new Error(`GitHub fork ${index} has a different parent repository`);
-    }
   }
   return { owner, name, fullName };
 }
 
-function createForkLookupLimitError({
-  forkOwner,
-  upstreamFullName,
-  cause = undefined,
-}) {
-  const error = new Error(
-    `Cellucid could not safely locate a renamed fork of ` +
-    `${upstreamFullName} owned by ${forkOwner} within the newest ` +
-    `${GITHUB_RENAMED_FORK_LOOKUP_MAX_ITEMS.toLocaleString('en-US')} forks ` +
-    `or ${Math.round(GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS / 1000)}s. ` +
-    `Rename the fork to the upstream repository name on GitHub, then publish again.`
-  );
-  error.code = 'GITHUB_FORK_LOOKUP_LIMIT';
-  if (cause !== undefined) error.cause = cause;
-  return error;
+function assertForkRepositoryIdentity(value) {
+  requireExactObjectKeys(value, ['full_name', 'fork', 'parent'], 'GitHub fork identity');
+  const fullName = assertGitHubRepositoryFullName(value.full_name, 'GitHub fork identity full_name');
+  if (typeof value.fork !== 'boolean') throw new Error('GitHub fork identity fork must be boolean');
+  if (value.fork === false) {
+    if (value.parent !== null) throw new Error('GitHub non-fork identity parent must equal exact null');
+    return { fork: false, fullName, parentFullName: null };
+  }
+  requireExactObjectKeys(value.parent, ['full_name'], 'GitHub fork identity parent');
+  return {
+    fork: true,
+    fullName,
+    parentFullName: assertGitHubRepositoryFullName(value.parent.full_name, 'GitHub fork identity parent full_name'),
+  };
 }
 
-function createForkNameConflictError({
-  forkOwner,
-  upstreamFullName,
-  canonicalFullName,
-}) {
+function createForkNameConflictError({ forkOwner, upstreamFullName, canonicalFullName }) {
   const error = new Error(
     `GitHub repository ${canonicalFullName} exists, but it is not a fork of ` +
     `${upstreamFullName}. Rename that repository or rename the existing ` +
@@ -1678,25 +1290,15 @@ function createForkNameConflictError({
   return error;
 }
 
-async function probeCanonicalOwnedFork({
-  workerOrigin,
-  upstreamRepo,
-  upstreamFullName,
-  token,
-  forkOwner,
-  signal = null,
-}) {
-  const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
-  const expectedFullName = `${exactForkOwner}/${upstreamRepo}`;
+/** `{login}/{upstream name}`: the caller's fork (`{collision: false, name}`), another repository (`{collision: true}`), or null. */
+async function probeCanonicalOwnedFork(ctx, { upstreamRepo, upstreamFullName, forkOwner, signal = null }) {
+  const expectedFullName = `${forkOwner}/${upstreamRepo}`;
   let identity;
   try {
-    identity = await getForkRepositoryIdentity({
-      workerOrigin,
-      owner: exactForkOwner,
-      repo: upstreamRepo,
-      token,
+    identity = assertForkRepositoryIdentity(await githubGet(ctx, repoPath(forkOwner, upstreamRepo), {
+      query: { fork_identity: 1 },
       signal,
-    });
+    }));
   } catch (error) {
     if (isNotFoundError(error)) return null;
     throw error;
@@ -1705,510 +1307,164 @@ async function probeCanonicalOwnedFork({
   const actualOwner = identity.fullName.slice(0, separator);
   const actualName = identity.fullName.slice(separator + 1);
   if (
-    actualOwner.toLowerCase() === exactForkOwner.toLowerCase() &&
+    actualOwner.toLowerCase() === forkOwner.toLowerCase() &&
     identity.fork &&
     identity.parentFullName.toLowerCase() === upstreamFullName.toLowerCase()
   ) {
-    return {
-      collision: false,
-      name: actualName,
-    };
+    return { collision: false, name: actualName };
   }
   return {
     collision: true,
-    canonicalFullName:
-      actualOwner.toLowerCase() === exactForkOwner.toLowerCase()
-        ? identity.fullName
-        : expectedFullName,
+    canonicalFullName: actualOwner.toLowerCase() === forkOwner.toLowerCase() ? identity.fullName : expectedFullName,
   };
 }
 
-async function findOwnedForkRepo({
-  workerOrigin,
-  upstreamOwner,
-  upstreamRepo,
-  upstreamFullName,
-  token,
-  forkOwner,
-  signal = null,
-}) {
-  const exactUpstreamFullName = assertGitHubRepositoryFullName(
-    upstreamFullName,
-    'Fork source repository'
-  );
-  const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
+/**
+ * The caller's fork under another name (renamed): the upstream's forks,
+ * newest first, a page of 100 at a time until GitHub has no more (a page
+ * shorter than 100), each request under the transport's stall timeout.
+ */
+async function findOwnedForkRepo(ctx, { upstreamOwner, upstreamRepo, forkOwner, signal = null }) {
   const seen = new Set();
-  const abortScope = createRequestAbortScope(
-    signal,
-    GITHUB_RENAMED_FORK_LOOKUP_TIMEOUT_MS
-  );
-  try {
-    for (
-      let page = 1;
-      page <= GITHUB_RENAMED_FORK_LOOKUP_MAX_PAGES;
-      page += 1
-    ) {
-      throwIfRequestAborted(abortScope, 'GitHub renamed fork lookup');
-      const document = await githubRequest(
-        workerOrigin,
-        `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
-        {
-          token,
-          query: { sort: 'newest', per_page: 100, page },
-          signal: abortScope.controller.signal,
-          timeoutMs: 0,
-        }
-      );
-      if (!Array.isArray(document)) {
-        throw new Error('GitHub forks response must be an array');
-      }
-      if (document.length > 100) {
-        throw new Error('GitHub forks response page exceeds 100 entries');
-      }
-      let matchingName = null;
-      document.forEach((raw, index) => {
-        const fork = assertForkRecord(
-          raw,
-          (page - 1) * 100 + index,
-          exactUpstreamFullName
-        );
-        const key = fork.fullName.toLowerCase();
-        if (seen.has(key)) {
-          throw new Error(`GitHub forks response repeats ${fork.fullName}`);
-        }
-        seen.add(key);
-        if (fork.owner.toLowerCase() === exactForkOwner.toLowerCase()) {
-          if (matchingName !== null) {
-            throw new Error(
-              `GitHub returned multiple forks owned by ${exactForkOwner}`
-            );
-          }
-          matchingName = fork.name;
-        }
-      });
-      if (matchingName !== null) return matchingName;
-      if (document.length < 100) return null;
-    }
-    throw createForkLookupLimitError({
-      forkOwner: exactForkOwner,
-      upstreamFullName: exactUpstreamFullName,
-    });
-  } catch (error) {
-    try {
-      throwIfRequestAborted(
-        abortScope,
-        'GitHub renamed fork lookup',
-        error
-      );
-    } catch (ownedError) {
-      if (abortScope.abortCause() === 'timeout') {
-        throw createForkLookupLimitError({
-          forkOwner: exactForkOwner,
-          upstreamFullName: exactUpstreamFullName,
-          cause: ownedError,
-        });
-      }
-      throw ownedError;
-    }
-    if (error?.code === 'TIMEOUT') {
-      throw createForkLookupLimitError({
-        forkOwner: exactForkOwner,
-        upstreamFullName: exactUpstreamFullName,
-        cause: error,
-      });
-    }
-    throw error;
-  } finally {
-    abortScope.cleanup();
-  }
-}
-
-async function selectOrCreateForkRepo({
-  workerOrigin,
-  upstreamOwner,
-  upstreamRepo,
-  upstreamFullName,
-  token,
-  forkOwner,
-  signal = null,
-}) {
-  const exactUpstreamFullName = assertGitHubRepositoryFullName(
-    upstreamFullName,
-    'Fork source repository'
-  );
-  const exactForkOwner = assertGitHubLogin(forkOwner, 'Fork owner');
-  const canonical = await probeCanonicalOwnedFork({
-    workerOrigin,
-    upstreamRepo,
-    upstreamFullName: exactUpstreamFullName,
-    token,
-    forkOwner: exactForkOwner,
-    signal,
-  });
-  if (canonical !== null && !canonical.collision) {
-    return { name: canonical.name, requiresReadiness: false };
-  }
-  if (canonical?.collision) {
-    const renamed = await findOwnedForkRepo({
-      workerOrigin,
-      upstreamOwner,
-      upstreamRepo,
-      upstreamFullName: exactUpstreamFullName,
-      token,
-      forkOwner: exactForkOwner,
+  for (let page = 1; ; page += 1) {
+    const document = await githubGet(ctx, repoPath(upstreamOwner, upstreamRepo, '/forks'), {
+      query: { sort: 'newest', per_page: 100, page },
       signal,
     });
-    if (renamed !== null) {
-      return { name: renamed, requiresReadiness: false };
-    }
-    throw createForkNameConflictError({
-      forkOwner: exactForkOwner,
-      upstreamFullName: exactUpstreamFullName,
-      canonicalFullName: canonical.canonicalFullName,
+    if (!Array.isArray(document)) throw new Error('GitHub forks response must be an array');
+    if (document.length > 100) throw new Error('GitHub forks response page exceeds the 100 entries asked for');
+    let matchingName = null;
+    document.forEach((raw, index) => {
+      const fork = assertForkRecord(raw, (page - 1) * 100 + index);
+      const key = fork.fullName.toLowerCase();
+      if (seen.has(key)) throw new Error(`GitHub forks response repeats ${fork.fullName}`);
+      seen.add(key);
+      if (fork.owner.toLowerCase() === forkOwner.toLowerCase()) {
+        if (matchingName !== null) throw new Error(`GitHub returned multiple forks owned by ${forkOwner}`);
+        matchingName = fork.name;
+      }
     });
-  }
-
-  let created = null;
-  try {
-    created = await githubRequest(
-      workerOrigin,
-      `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/forks`,
-      { token, method: 'POST', body: {}, signal }
-    );
-    const fork = assertForkRecord(
-      created,
-      'created',
-      exactUpstreamFullName,
-      { requireParent: true }
-    );
-    if (fork.owner.toLowerCase() !== exactForkOwner.toLowerCase()) {
-      throw new Error(
-        `GitHub created the fork for ${fork.owner}, expected ${exactForkOwner}`
-      );
-    }
-    return { name: fork.name, requiresReadiness: true };
-  } catch (caughtError) {
-    const error = attachDocumentMutationOutcome(caughtError, created);
-    if (
-      !shouldReconcileMutation(error, 'forks-post') ||
-      signal?.aborted === true
-    ) {
-      throw error;
-    }
-    try {
-      const reconciledCanonical = await probeCanonicalOwnedFork({
-        workerOrigin,
-        upstreamRepo,
-        upstreamFullName: exactUpstreamFullName,
-        token,
-        forkOwner: exactForkOwner,
-        signal,
-      });
-      if (
-        reconciledCanonical !== null &&
-        !reconciledCanonical.collision
-      ) {
-        return {
-          name: reconciledCanonical.name,
-          requiresReadiness: true,
-        };
-      }
-      const reconciled = await findOwnedForkRepo({
-        workerOrigin,
-        upstreamOwner,
-        upstreamRepo,
-        upstreamFullName: exactUpstreamFullName,
-        token,
-        forkOwner: exactForkOwner,
-        signal,
-      });
-      if (reconciled !== null) {
-        return { name: reconciled, requiresReadiness: true };
-      }
-      if (reconciledCanonical?.collision) {
-        throw createForkNameConflictError({
-          forkOwner: exactForkOwner,
-          upstreamFullName: exactUpstreamFullName,
-          canonicalFullName:
-            reconciledCanonical.canonicalFullName,
-        });
-      }
-    } catch (reconciliationError) {
-      if (
-        error?.operation?.outcome === 'unknown' ||
-        error?.operation?.outcome === 'applied'
-      ) {
-        throw error;
-      }
-      if (
-        reconciliationError?.code === 'GITHUB_FORK_LOOKUP_LIMIT' ||
-        reconciliationError?.code === 'GITHUB_FORK_NAME_CONFLICT' ||
-        isCancellation(reconciliationError)
-      ) {
-        throw reconciliationError;
-      }
-      // Preserve the original mutation outcome when the bounded read cannot
-      // prove that the exact fork now exists.
-    }
-    throw error;
+    if (matchingName !== null) return matchingName;
+    if (document.length < 100) return null;
   }
 }
 
-function waitForForkReadinessDelay(delayMs, signal) {
-  if (!Number.isSafeInteger(delayMs) || delayMs < 1) {
-    throw new Error('GitHub fork readiness delay must be a positive integer');
+/**
+ * The repository a contributor publishes from: their fork of the source, as
+ * the source's name under their account, else (renamed) among the source's
+ * forks. Cellucid never creates one (that needs the GitHub App's
+ * Administration permission, which it does not ask for): without a fork,
+ * Publish stops and says where to make it.
+ */
+async function findForkRepo(ctx, { upstreamOwner, upstreamRepo, upstreamFullName, forkOwner, signal = null }) {
+  const lookup = { upstreamOwner, upstreamRepo, upstreamFullName, forkOwner, signal };
+  const canonical = await probeCanonicalOwnedFork(ctx, lookup);
+  if (canonical !== null && !canonical.collision) return canonical.name;
+  const renamed = await findOwnedForkRepo(ctx, lookup);
+  if (renamed !== null) return renamed;
+  if (canonical?.collision) {
+    throw createForkNameConflictError({ forkOwner, upstreamFullName, canonicalFullName: canonical.canonicalFullName });
   }
-  if (signal?.aborted === true) {
-    throw ownedRequestCancelled(
-      'GitHub fork readiness',
-      signal.reason
-    );
-  }
-  // Not aborted (checked above): the abort callback never runs before the
-  // timer and its remover exist.
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const settle = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      stopWaiting();
-      callback(value);
-    };
-    const timer = setTimeout(() => settle(resolve), delayMs);
-    const stopWaiting = onAbort(signal, () => {
-      settle(
-        reject,
-        ownedRequestCancelled(
-          'GitHub fork readiness',
-          signal.reason
-        )
-      );
-    });
-  });
+  throw forkMissingError(upstreamFullName);
 }
 
-async function waitForForkBaseRef({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  branch,
-  signal = null,
-}) {
-  const exactOwner = assertGitHubLogin(owner, 'Fork readiness owner');
-  const exactRepo = assertExactNonblankString(
-    repo,
-    'Fork readiness repository',
-    { max: 100 }
-  );
-  if (!isCanonicalGitHubRepositoryName(exactRepo)) {
-    throw new Error('Fork readiness repository is not canonical');
-  }
-  const exactBranch = assertGitHubBranch(
-    branch,
-    'Fork readiness base branch'
-  );
-  let lastNotFound = null;
-  for (
-    let attempt = 1;
-    attempt <= GITHUB_FORK_READINESS_ATTEMPTS;
-    attempt += 1
-  ) {
-    try {
-      await getBranchTipSha({
-        workerOrigin,
-        owner: exactOwner,
-        repo: exactRepo,
-        token,
-        branch: exactBranch,
-        signal,
-        timeoutMs: GITHUB_FORK_READINESS_REQUEST_TIMEOUT_MS,
-      });
-      return;
-    } catch (error) {
-      if (error?.status !== 404) throw error;
-      lastNotFound = error;
-    }
-    if (attempt < GITHUB_FORK_READINESS_ATTEMPTS) {
-      await waitForForkReadinessDelay(
-        Math.min(1_000, 100 * (2 ** (attempt - 1))),
-        signal
-      );
-    }
-  }
+/**
+ * A contributor's user token writes to their fork only when Cellucid's GitHub
+ * App is installed on their account with access to that fork: a user token
+ * reaches only "resources in an account where it [the app] is installed"
+ * (https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user),
+ * and an installation reaches all repositories or the ones selected.
+ */
+const FORK_INSTALLATION_SENTENCE =
+  "Cellucid's GitHub App must be installed on your GitHub account with access to your fork " +
+  '(All repositories, or Only select repositories with the fork selected).';
+
+function forkMissingError(upstreamFullName) {
+  const forkUrl = `https://github.com/${upstreamFullName}/fork`;
   const error = new Error(
-    `GitHub fork ${exactOwner}/${exactRepo} did not expose base branch ` +
-    `${exactBranch} after ${GITHUB_FORK_READINESS_ATTEMPTS} readiness probes. ` +
-    'Wait for GitHub to finish creating the fork, then try again.'
+    `You have no fork of ${upstreamFullName} yet: fork it on GitHub, then Publish again.\n` +
+    `Fork it at ${forkUrl}. ${FORK_INSTALLATION_SENTENCE}`
   );
-  error.code = 'GITHUB_FORK_NOT_READY';
-  error.cause = lastNotFound;
-  throw error;
+  error.code = 'GITHUB_FORK_MISSING';
+  error.forkUrl = forkUrl;
+  return error;
+}
+
+function forkNotWritableError(forkFullName, cause) {
+  const error = new Error(
+    `Cellucid cannot write to your fork ${forkFullName}: install Cellucid's GitHub App on your account ` +
+    'with access to it, then Publish again.\n' +
+    `${FORK_INSTALLATION_SENTENCE}\nGitHub said: ${cause?.message ?? cause}`
+  );
+  error.code = 'GITHUB_FORK_NOT_WRITABLE';
+  error.cause = cause;
+  return error;
 }
 
 function requireBranchTipSha(document, label) {
-  if (
-    !document ||
-    typeof document !== 'object' ||
-    Array.isArray(document) ||
-    !document.object ||
-    typeof document.object !== 'object' ||
-    Array.isArray(document.object)
-  ) {
+  if (!isPlainObject(document) || !isPlainObject(document.object)) {
     throw new Error(`${label} must contain an object SHA`);
   }
   return assertGitHubSha(document.object.sha, `${label} object SHA`);
 }
 
-async function getBranchTipSha({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  branch,
-  signal = null,
-  timeoutMs = GITHUB_DEFAULT_TIMEOUT_MS,
-}) {
-  const exactBranch = assertGitHubBranch(branch);
-  const ref = await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(exactBranch)}`,
-    { token, signal, timeoutMs }
-  );
-  return requireBranchTipSha(ref, 'GitHub branch response');
-}
-
-async function ensureBranchExists({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  branch,
-  baseSha,
-  signal = null,
-}) {
-  const b = assertGitHubBranch(branch, 'Pull Request branch');
-  const sha = assertGitHubSha(baseSha, 'Pull Request base SHA');
+/** The commit a branch points at, or null when it does not exist. */
+async function getBranchTipSha(ctx, owner, repo, branch, { signal = null } = {}) {
   try {
-    const existing = await githubRequest(
-      workerOrigin,
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeGitRefPath(b)}`,
-      { token, signal }
-    );
-    requireBranchTipSha(existing, 'Existing Pull Request branch response');
-    return;
-  } catch (err) {
-    if (err?.status !== 404) throw err;
-  }
-  try {
-    await githubRequest(
-      workerOrigin,
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
-      {
-        token,
-        method: 'POST',
-        body: { ref: `refs/heads/${b}`, sha },
-        signal,
-      }
+    return requireBranchTipSha(
+      await githubGet(ctx, repoPath(owner, repo, `/git/ref/heads/${encodeGitRefPath(branch)}`), { signal }),
+      'GitHub branch response'
     );
   } catch (error) {
-    if (
-      !shouldReconcileMutation(error, 'git-refs-post') ||
-      signal?.aborted === true
-    ) {
-      throw error;
-    }
-    try {
-      const currentSha = await getBranchTipSha({
-        workerOrigin,
-        owner,
-        repo,
-        token,
-        branch: b,
-        signal,
-      });
-      if (currentSha === sha) return;
-    } catch {
-      // The original mutation outcome remains authoritative when the exact
-      // requested branch tip cannot be proved by one read.
-    }
+    if (isNotFoundError(error)) return null;
     throw error;
   }
 }
 
-async function upsertFileOnBranch({
-  workerOrigin,
-  owner,
-  repo,
-  token,
-  branch,
-  path,
-  message,
-  contentBase64,
-  signal = null,
-}) {
-  const b = assertGitHubBranch(branch, 'Pull Request branch');
-  const p = assertExactNonblankString(path, 'Pull Request file path');
+/**
+ * GitHub copies a new fork asynchronously; until it has, the fork's Git
+ * objects cannot be read (https://docs.github.com/en/rest/repos/forks#create-a-fork).
+ * A copied fork has the source's base branch, or (forked with its default
+ * branch only) at least the source's default branch; with neither, Publish
+ * stops and asks to try again rather than waiting a fixed time.
+ */
+async function assertForkCopied(ctx, { owner, repo, baseBranch, defaultBranch, signal = null }) {
+  if ((await getBranchTipSha(ctx, owner, repo, baseBranch, { signal })) !== null) return;
+  if (defaultBranch !== baseBranch && (await getBranchTipSha(ctx, owner, repo, defaultBranch, { signal })) !== null) return;
+  const error = new Error(`GitHub is still copying your fork ${owner}/${repo}; Publish again in a minute.`);
+  error.code = 'GITHUB_FORK_NOT_READY';
+  throw error;
+}
 
-  let sha = null;
-  try {
-    const existing = await getContent({
-      workerOrigin,
-      owner,
-      repo,
-      token,
-      path: p,
-      ref: b,
-      signal,
-    });
-    if (!existing || existing.type !== 'file') {
-      throw new Error(`Expected file at ${p}`);
-    }
-    const existingFile = assertContentFileRecord(existing, p);
-    sha = existingFile.sha;
-    if (
-      base64PayloadEqualsCanonical(
-        existingFile.contentBase64,
-        contentBase64,
-        p
-      )
-    ) {
-      return;
-    }
-  } catch (err) {
-    if (err?.status !== 404) throw err;
+function fnv1aHash32(input) {
+  const str = assertExactNonblankString(input, 'Hash input');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
   }
+  return hash >>> 0;
+}
 
-  await putContent({
-    workerOrigin,
-    owner,
-    repo,
-    token,
-    path: p,
-    branch: b,
-    message,
-    contentBase64,
-    sha,
-    signal,
-  });
+/**
+ * The one head branch of a contributor's pull requests against one base
+ * branch: `cellucid-annotations/ghid_<id>/<fnv(base)>`. One user file holds
+ * every dataset of the contributor, so every dataset they publish goes into
+ * the same pull request.
+ */
+export function toAnnotationHeadBranch({ baseBranch, fileUser }) {
+  const base = assertGitHubBranch(baseBranch, 'Pull-request base branch');
+  if (typeof fileUser !== 'string' || !/^ghid_[1-9][0-9]*$/.test(fileUser) || !Number.isSafeInteger(Number(fileUser.slice(5)))) {
+    throw new Error('Pull-request file user must be an exact ghid identity');
+  }
+  return `cellucid-annotations/${fileUser}/${fnv1aHash32(base).toString(36)}`;
 }
 
 function assertPullRequestRecord(value, label) {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    !Number.isSafeInteger(value.number) ||
-    value.number < 1
-  ) {
+  if (!isPlainObject(value) || !Number.isSafeInteger(value.number) || value.number < 1) {
     throw new Error(`${label} has an invalid number`);
   }
-  const htmlUrl = assertExactNonblankString(
-    value.html_url,
-    `${label} html_url`,
-    { max: 2048 }
-  );
+  const htmlUrl = assertExactNonblankString(value.html_url, `${label} html_url`);
   let parsed;
   try {
     parsed = new URL(htmlUrl);
@@ -2220,361 +1476,232 @@ function assertPullRequestRecord(value, label) {
   if (parsed.protocol !== 'https:' || parsed.toString() !== htmlUrl) {
     throw new Error(`${label} html_url must be an exact HTTPS URL`);
   }
-  return {
-    number: value.number,
-    html_url: htmlUrl,
-  };
+  return { number: value.number, html_url: htmlUrl };
 }
 
-async function findOpenPullRequest({
-  workerOrigin,
-  token,
-  upstreamOwner,
-  upstreamRepo,
-  baseBranch,
-  headOwner,
-  headBranch,
-  signal = null,
-}) {
-  const headQuery = `${headOwner}:${headBranch}`;
-  const existing = await githubRequest(
-    workerOrigin,
-    `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
-    {
-      token,
-      query: {
-        state: 'open',
-        head: headQuery,
-        base: baseBranch,
-        per_page: 100,
-      },
-      signal,
-    }
-  );
-  if (!Array.isArray(existing)) {
-    throw new Error('GitHub Pull Request lookup must return an array');
-  }
-  if (existing.length > 1) {
-    throw new Error('GitHub returned multiple open Pull Requests for one head');
-  }
-  return existing.length === 0
-    ? null
-    : assertPullRequestRecord(
-        existing[0],
-        'Existing GitHub Pull Request'
-      );
-}
-
-async function openOrReusePullRequest({
-  workerOrigin,
-  token,
-  upstreamOwner,
-  upstreamRepo,
-  baseBranch,
-  headOwner,
-  headRepo,
-  headBranch,
-  title,
-  body,
-  signal = null,
-}) {
-  const exactHeadOwner = assertGitHubLogin(headOwner, 'Pull Request head owner');
-  const exactHeadBranch = assertGitHubBranch(
-    headBranch,
-    'Pull Request head branch'
-  );
-  const exactBaseBranch = assertGitHubBranch(
-    baseBranch,
-    'Pull Request base branch'
-  );
-  const exactTitle = assertExactNonblankString(
-    title,
-    'Pull Request title',
-    { max: 256 }
-  );
-  const exactBody = assertExactNonblankString(
-    body,
-    'Pull Request body',
-    { max: 65_536 }
-  );
-  const headQuery = `${exactHeadOwner}:${exactHeadBranch}`;
-
-  const existing = await findOpenPullRequest({
-    workerOrigin,
-    token,
-    upstreamOwner,
-    upstreamRepo,
-    baseBranch: exactBaseBranch,
-    headOwner: exactHeadOwner,
-    headBranch: exactHeadBranch,
+async function findOpenPullRequest(ctx, { upstreamOwner, upstreamRepo, baseBranch, headOwner, headBranch, signal = null }) {
+  const existing = await githubGet(ctx, repoPath(upstreamOwner, upstreamRepo, '/pulls'), {
+    query: { state: 'open', head: `${headOwner}:${headBranch}`, base: baseBranch, per_page: 100 },
     signal,
   });
-  if (existing !== null) return { pr: existing, reused: true };
+  if (!Array.isArray(existing)) throw new Error('GitHub Pull Request lookup must return an array');
+  if (existing.length > 1) throw new Error('GitHub returned multiple open Pull Requests for one head');
+  return existing.length === 0 ? null : assertPullRequestRecord(existing[0], 'Existing GitHub Pull Request');
+}
 
+async function createPullRequest(ctx, { upstreamOwner, upstreamRepo, baseBranch, headOwner, headBranch, title, body, signal = null }) {
   let created = null;
   try {
-    created = await githubRequest(
-      workerOrigin,
-      `/repos/${encodeURIComponent(upstreamOwner)}/${encodeURIComponent(upstreamRepo)}/pulls`,
-      {
-        token,
-        method: 'POST',
-        body: {
-          title: exactTitle,
-          head: headQuery,
-          base: exactBaseBranch,
-          body: exactBody,
-          maintainer_can_modify: true
-        },
-        signal,
+    created = (await callWorker(ctx, {
+      scope: 'api',
+      path: repoPath(upstreamOwner, upstreamRepo, '/pulls'),
+      method: 'POST',
+      body: {
+        title: assertExactNonblankString(title, 'Pull Request title'),
+        head: `${headOwner}:${headBranch}`,
+        base: baseBranch,
+        body: assertExactNonblankString(body, 'Pull Request body'),
+        maintainer_can_modify: true,
       },
-    );
-    return {
-      pr: assertPullRequestRecord(
-        created,
-        'Created GitHub Pull Request'
-      ),
-      reused: false,
-    };
+      signal,
+    })).document;
+    return { pr: assertPullRequestRecord(created, 'Created GitHub Pull Request'), reused: false };
   } catch (caughtError) {
     const error = attachDocumentMutationOutcome(caughtError, created);
-    if (
-      !shouldReconcileMutation(error, 'pulls-post') ||
-      signal?.aborted === true
-    ) {
+    if (!shouldReconcileMutation(error, 'pulls-post') || signal?.aborted === true) throw error;
+    let reconciled = null;
+    try {
+      reconciled = await findOpenPullRequest(ctx, { upstreamOwner, upstreamRepo, baseBranch, headOwner, headBranch, signal });
+    } catch {
+      // Never create a second pull request when the first one's outcome cannot be read.
+    }
+    if (reconciled !== null) return { pr: reconciled, reused: true };
+    throw error;
+  }
+}
+
+/**
+ * Point the contributor's head branch at `sha` (the upstream tip): created
+ * when missing, else moved with a forced update (the Worker allows that only
+ * on the caller's own `cellucid-annotations/ghid_<id>/` branch of the
+ * caller's own fork). A write whose outcome is unknown, or refused because
+ * the branch appeared or moved meanwhile, is settled by reading it again.
+ */
+async function resetHeadBranch(ctx, { owner, repo, branch, sha, signal = null }) {
+  const current = await getBranchTipSha(ctx, owner, repo, branch, { signal });
+  if (current === sha) return;
+  const kind = current === null ? 'git-refs-post' : 'git-ref-patch';
+  try {
+    await callWorker(ctx, current === null
+      ? { scope: 'api', path: repoPath(owner, repo, '/git/refs'), method: 'POST', body: { ref: `refs/heads/${branch}`, sha }, signal }
+      : {
+          scope: 'api',
+          path: repoPath(owner, repo, `/git/refs/heads/${encodeGitRefPath(branch)}`),
+          method: 'PATCH',
+          body: { sha, force: true },
+          signal,
+        });
+  } catch (error) {
+    if (!shouldReconcileMutation(error, kind) || signal?.aborted === true) throw error;
+    let now = null;
+    try {
+      now = await getBranchTipSha(ctx, owner, repo, branch, { signal });
+    } catch {
       throw error;
     }
-    try {
-      const reconciled = await findOpenPullRequest({
-        workerOrigin,
-        token,
-        upstreamOwner,
-        upstreamRepo,
-        baseBranch: exactBaseBranch,
-        headOwner: exactHeadOwner,
-        headBranch: exactHeadBranch,
-        signal,
-      });
-      if (reconciled !== null) {
-        return { pr: reconciled, reused: true };
-      }
-    } catch {
-      // Do not create a second Pull Request when one bounded lookup cannot
-      // prove the outcome of the dispatched creation.
+    if (now === sha) return;
+    // Created by another of the contributor's devices meanwhile: moved now.
+    if (current === null && now !== null) {
+      await resetHeadBranch(ctx, { owner, repo, branch, sha, signal });
+      return;
     }
     throw error;
   }
 }
 
-async function publishFileViaPullRequest({
-  workerOrigin,
-  token,
-  upstreamOwner,
-  upstreamRepo,
-  baseBranch,
-  headOwner,
-  headRepo,
-  headBranch,
-  path,
-  title,
-  body,
-  contentBase64,
-  signal = null,
-}) {
-  const upstreamSha = await getBranchTipSha({
-    workerOrigin,
-    owner: upstreamOwner,
-    repo: upstreamRepo,
-    token,
-    branch: baseBranch,
-    signal,
-  });
+function userFileOf(userDoc) {
+  const id = userDoc?.githubUserId;
+  if (!Number.isSafeInteger(id) || id < 1) throw new Error('User doc githubUserId must be a positive safe integer');
+  const fileUser = `ghid_${id}`;
+  return { id, fileUser, path: `annotations/users/${fileUser}.json`, filename: `${fileUser}.json` };
+}
 
-  await ensureBranchExists({
-    workerOrigin,
-    owner: headOwner,
-    repo: headRepo,
-    token,
-    branch: headBranch,
-    baseSha: upstreamSha,
-    signal,
-  });
-  await upsertFileOnBranch({
-    workerOrigin,
-    owner: headOwner,
-    repo: headRepo,
-    token,
-    branch: headBranch,
-    path,
-    message: title,
-    contentBase64,
-    signal,
-  });
-
-  const { pr, reused } = await openOrReusePullRequest({
-    workerOrigin,
-    token,
-    upstreamOwner,
-    upstreamRepo,
-    baseBranch,
-    headOwner,
-    headRepo,
-    headBranch,
-    title,
-    body,
-    signal,
-  });
-
-  if (
-    !pr ||
-    typeof pr !== 'object' ||
-    Array.isArray(pr) ||
-    !Number.isSafeInteger(pr.number) ||
-    pr.number < 1
-  ) {
-    throw new Error('GitHub Pull Request response has an invalid number');
-  }
-  const prUrl = assertExactNonblankString(
-    pr.html_url,
-    'GitHub Pull Request html_url',
-    { max: 2048 }
-  );
-  let parsedPrUrl;
+/**
+ * The contributor's own published file, which a Publish composes onto. One
+ * that does not meet the contract is never overwritten silently: the
+ * Publish stops and says so.
+ */
+function assertOwnPublishedFile(json, path, filename, where) {
   try {
-    parsedPrUrl = new URL(prUrl);
+    return assertUserFile(json, { path, filename });
   } catch (cause) {
-    const error = new Error('GitHub Pull Request html_url must be an HTTPS URL');
+    const error = new Error(
+      `Your published file ${path}${where} is not a valid annotation file (${cause?.message ?? cause}). ` +
+      'Cellucid will not overwrite it: fix or remove it on GitHub, then Pull and Publish again.'
+    );
+    error.code = 'COMMUNITY_ANNOTATION_OWN_FILE_INVALID';
+    error.path = path;
     error.cause = cause;
     throw error;
   }
-  if (parsedPrUrl.protocol !== 'https:' || parsedPrUrl.toString() !== prUrl) {
-    throw new Error('GitHub Pull Request html_url must be an exact HTTPS URL');
-  }
-  return { prUrl, prNumber: pr.number, reused };
 }
 
-async function publishAnnotationFile({
-  publicationMode,
+/**
+ * Publish a contributor's file through a pull request from their fork
+ * (design: one head branch per contributor and base branch):
+ *
+ * 1. The file to compose onto is the open pull request's head file (it
+ *    carries the sections of other datasets not merged yet), else the
+ *    upstream tip's file.
+ * 2. Unchanged against what the pull request (or, without one, upstream)
+ *    already holds: nothing is written.
+ * 3. The head branch is reset to the upstream tip (created, or moved with a
+ *    forced update) and the composed file is written on it, so the pull
+ *    request's diff is the user file alone and a squash-merged earlier pull
+ *    request never makes it conflict.
+ * 4. The open pull request is reused, else one is opened.
+ */
+async function publishUserFileViaFork(ctx, {
   repoInfo,
-  workerOrigin,
-  token,
-  upstreamOwner,
-  upstreamRepo,
+  source,
   baseBranch,
   datasetId,
-  fileUser,
-  path,
+  file,
+  viewOver,
+  upstream,
+  authUser,
   title,
   body,
-  contentBase64,
-  sourceSha,
   signal = null,
 }) {
-  const mode = assertPublicationMode(publicationMode);
   const capability = assertRepositoryPublicationInfo(repoInfo);
-  assertGitHubLogin(upstreamOwner, 'Connected repository owner');
-  if (!isCanonicalGitHubRepositoryName(upstreamRepo)) {
-    throw new Error('Connected repository name is not canonical');
+  if (!capability.allowForking) throw new Error('Fork Pull Request publication is disabled for this repository');
+  const { fileUser, path, filename } = file;
+  if (`ghid_${authUser.id}` !== fileUser) {
+    throw new Error(`Pull Request file identity must equal authenticated user ghid_${authUser.id}`);
   }
-  const resolvedSource = parseCanonicalGitHubRepositoryReference(
-    repoInfo.full_name
-  );
-  if (resolvedSource === null || resolvedSource.ref !== null) {
-    throw new Error(
-      'GitHub repository metadata did not resolve an exact source repository'
-    );
-  }
-  if (mode === 'direct') {
-    if (!capability.canDirectPush) {
-      throw new Error(
-        'Direct annotation publication requires GitHub write permission'
-      );
-    }
-    const response = await putContent({
-      workerOrigin,
-      owner: resolvedSource.owner,
-      repo: resolvedSource.repo,
-      token,
-      path,
-      branch: baseBranch,
-      message: title,
-      contentBase64,
-      sha: sourceSha,
+  const upstreamFullName = repoInfo.full_name;
+  const fork = {
+    name: await findForkRepo(ctx, {
+      upstreamOwner: source.owner,
+      upstreamRepo: source.repo,
+      upstreamFullName,
+      forkOwner: authUser.login,
       signal,
-    });
-    const rawSha = response?.content?.sha;
-    return {
-      mode,
-      sha: assertGitHubSha(rawSha, 'Published GitHub content SHA'),
-    };
+    }),
+  };
+  await assertForkCopied(ctx, {
+    owner: authUser.login,
+    repo: fork.name,
+    baseBranch,
+    defaultBranch: repoInfo.default_branch,
+    signal,
+  });
+  const headBranch = toAnnotationHeadBranch({ baseBranch, fileUser });
+  const pull = { upstreamOwner: source.owner, upstreamRepo: source.repo, baseBranch, headOwner: authUser.login, headBranch, signal };
+  const openPr = await findOpenPullRequest(ctx, pull);
+
+  const headFile = openPr === null
+    ? null
+    : await readContentFile(ctx, authUser.login, fork.name, path, headBranch, { signal });
+  const base = headFile ?? upstream;
+  const prior = base === null
+    ? null
+    : assertOwnPublishedFile(base.json, path, filename, headFile !== null ? ` (pull request #${openPr.number})` : '');
+  // A composed change goes on top of the file the pull request already
+  // proposes (its other unmerged changes stay in it), else on top of upstream.
+  const view = viewOver(prior);
+  const contentBase64 = encodeBase64Bytes(
+    toAnnotationPublicationBytes(composeUserFile(prior, datasetId, view, { path, filename }), { path })
+  );
+  if (base !== null && base64PayloadEqualsCanonical(base.contentBase64, contentBase64, path)) {
+    if (openPr !== null) {
+      return { mode: 'fork-pull-request', prUrl: openPr.html_url, prNumber: openPr.number, reused: true, changed: false, view };
+    }
+    return { mode: 'none', sha: upstream.sha, changed: false, view };
   }
 
-  if (!capability.allowForking) {
-    throw new Error(
-      'Fork Pull Request publication is disabled for this repository'
-    );
-  }
-  const authUser = assertAuthUserResponse(
-    await workerAuthRequest(workerOrigin, '/auth/user', {
-      token,
-      signal,
-    })
-  );
-  const expectedFileUser = `ghid_${authUser.id}`;
-  if (fileUser !== null && fileUser !== expectedFileUser) {
-    throw new Error(
-      `Pull Request file identity must equal authenticated user ${expectedFileUser}`
-    );
-  }
-  const fork = await selectOrCreateForkRepo({
-    workerOrigin,
-    upstreamOwner: resolvedSource.owner,
-    upstreamRepo: resolvedSource.repo,
-    upstreamFullName: repoInfo.full_name,
-    token,
-    forkOwner: authUser.login,
-    signal,
-  });
-  if (fork.requiresReadiness) {
-    await waitForForkBaseRef({
-      workerOrigin,
+  const upstreamTip = await getBranchTipSha(ctx, source.owner, source.repo, baseBranch, { signal });
+  if (upstreamTip === null) throw layoutInvalid(`Branch "${baseBranch}" does not exist in ${upstreamFullName}.`);
+  try {
+    await resetHeadBranch(ctx, { owner: authUser.login, repo: fork.name, branch: headBranch, sha: upstreamTip, signal });
+    // The file at the upstream tip, which the write replaces (read again: the
+    // tip may be newer than the file read above).
+    const atTip = await readContentFile(ctx, authUser.login, fork.name, path, headBranch, { signal });
+    await putContent(ctx, {
       owner: authUser.login,
       repo: fork.name,
-      token,
-      branch: baseBranch,
+      path,
+      branch: headBranch,
+      message: title,
+      contentBase64,
+      sha: atTip?.sha ?? null,
       signal,
     });
+  } catch (error) {
+    // GitHub refuses a user token's write to a repository its app is not
+    // installed on (403 "Resource not accessible by integration", or 404).
+    if ((error?.status === 403 && error?.rateLimited !== true) || error?.status === 404) {
+      throw forkNotWritableError(`${authUser.login}/${fork.name}`, error);
+    }
+    throw error;
   }
-  const headBranch = toDeterministicPrBranch({
-    datasetId,
-    baseBranch,
-    fileUser: expectedFileUser,
-  });
-  const result = await publishFileViaPullRequest({
-    workerOrigin,
-    token,
-    upstreamOwner: resolvedSource.owner,
-    upstreamRepo: resolvedSource.repo,
-    baseBranch,
-    headOwner: authUser.login,
-    headRepo: fork.name,
-    headBranch,
-    path,
-    title,
-    body,
-    contentBase64,
-    signal,
-  });
-  return { mode, ...result };
+  const { pr, reused } = openPr !== null
+    ? { pr: openPr, reused: true }
+    : await createPullRequest(ctx, { ...pull, title, body });
+  return { mode: 'fork-pull-request', prUrl: pr.html_url, prNumber: pr.number, reused, changed: true, view };
 }
 
 export class CommunityAnnotationGitHubSync {
-  constructor({ datasetId, owner, repo, token = null, branch = null, workerOrigin = null } = {}) {
-    this.datasetId = assertExactNonblankString(
-      datasetId,
-      'Annotation sync datasetId',
-      { max: 256 }
-    );
+  /**
+   * @param {{datasetId: string, owner: string, repo: string, token?: string|null, branch?: string|null,
+   *   workerOrigin?: string|null, transport?: object|null, onWait?: ((wait: object|null) => void)|null}} options
+   *   `transport`: what requests go through (`worker-request.js`; the page's
+   *   by default, tests give a virtual clock); `onWait`: told when a request
+   *   waits for a wait the host named (a rate limit's reset), and null after
+   */
+  constructor({ datasetId, owner, repo, token = null, branch = null, workerOrigin = null, transport = null, onWait = null } = {}) {
+    this.datasetId = assertExactNonblankString(datasetId, 'Annotation sync datasetId');
     if (
       typeof owner !== 'string' ||
       typeof repo !== 'string' ||
@@ -2587,120 +1714,273 @@ export class CommunityAnnotationGitHubSync {
     this.repo = repo;
     this.token = assertOptionalToken(token);
     this.branch = branch === null ? null : assertGitHubBranch(branch);
-    const configuredOrigin = workerOrigin === null
-      ? getGitHubWorkerOrigin()
-      : workerOrigin;
     this.workerOrigin = assertExactHttpOrigin(
-      configuredOrigin,
+      workerOrigin === null ? getGitHubWorkerOrigin() : workerOrigin,
       'GitHub worker origin'
     );
-
-    this._schemaCheckedRef = null;
-    this._repoInfo = null;
+    this.transport = transport === null ? defaultWorkerTransport(this.workerOrigin) : assertWorkerTransport(transport);
+    if (onWait !== null && typeof onWait !== 'function') throw new TypeError('Annotation sync onWait must be a function or null');
+    this.onWait = onWait;
+    /** @type {RepositorySnapshot|null} */
+    this._snapshot = null;
   }
 
   get ownerRepo() {
     return `${this.owner}/${this.repo}`;
   }
 
-  async validateAndLoadConfig({ datasetId, signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation config request signal'
-    );
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-    const workerOrigin = this.workerOrigin;
-    const repoInfo = await getRepoInfo({
-      workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      signal: requestSignal,
-    });
-    assertRepositoryPublicationInfo(repoInfo);
-    this._repoInfo = repoInfo;
-    const branch = this.branch === null
-      ? assertGitHubBranch(
-        repoInfo.default_branch,
-        'GitHub repository default_branch'
-      )
-      : this.branch;
-
-    this.branch = branch;
-
-    // Validate the complete, exact contract published by the repository.
-    if (this._schemaCheckedRef !== branch) {
-      const schemaSpecs = [
-        ['user', 'annotations/schema.json'],
-        ['config', 'annotations/config.schema.json'],
-        ['merges', 'annotations/moderation/merges.schema.json'],
-      ];
-      const schemas = await Promise.all(
-        schemaSpecs.map(async ([kind, path]) => {
-          const { json } = await readJsonFile({
-            workerOrigin,
-            owner: this.owner,
-            repo: this.repo,
-            token,
-            path,
-            ref: branch,
-            signal: requestSignal,
-          });
-          return { kind, path, json };
-        })
-      );
-      schemas.forEach(({ kind, path, json }) => {
-        assertSchemaIdentity(json, kind, { path });
-      });
-      this._schemaCheckedRef = branch;
-    }
-
-    const { json: config, sha: configSha } = await readJsonFile({
-      workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/config.json',
-      ref: branch,
-      signal: requestSignal,
-    });
-    assertConfigDocument(config, { path: 'annotations/config.json' });
-
-    const targetDatasetId = datasetId === undefined
-      ? this.datasetId
-      : assertExactNonblankString(
-        datasetId,
-        'Annotation config datasetId',
-        { max: 256 }
-      );
-    const supported = config.supportedDatasets;
-    const match =
-      supported.find((entry) => entry.datasetId === targetDatasetId) ?? null;
-
-    return { repoInfo, branch, config, configSha: configSha || null, datasetId: targetDatasetId, datasetConfig: match };
+  _ctx() {
+    if (!this.token) throw new Error('GitHub sign-in required');
+    return { workerOrigin: this.workerOrigin, token: this.token, transport: this.transport, onWait: this.onWait };
   }
 
-  async readRepoConfigJson({ signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
+  /** Repository metadata, asked with the last ETag of this repository (module doc, step 1). */
+  async _repositoryMetadata(signal) {
+    const key = repositoryKey(this.workerOrigin, this.owner, this.repo);
+    const known = repositoryMetadataByKey.get(key) ?? null;
+    const result = await callWorker(this._ctx(), {
+      scope: 'api',
+      path: repoPath(this.owner, this.repo),
+      ifNoneMatch: known?.etag ?? null,
       signal,
-      'Annotation config read signal'
-    );
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-    const branch = assertGitHubBranch(
-      this.branch,
-      'Resolved annotation repository branch'
-    );
-    return readJsonFile({
-      workerOrigin: this.workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/config.json',
-      ref: branch,
-      signal: requestSignal,
     });
+    const repoInfo = result.status === 304 ? known.repoInfo : result.document;
+    assertRepositoryPublicationInfo(repoInfo);
+    if (result.status !== 304) {
+      if (typeof result.etag === 'string' && result.etag !== '') {
+        repositoryMetadataByKey.set(key, { etag: result.etag, repoInfo });
+      } else {
+        repositoryMetadataByKey.delete(key);
+      }
+    }
+    return repoInfo;
+  }
+
+  /** The repository resolved from its metadata: `{owner, repo}` as GitHub names it now (renames followed). */
+  _source(repoInfo) {
+    const source = parseCanonicalGitHubRepositoryReference(repoInfo.full_name);
+    if (source === null || source.ref !== null) {
+      throw new Error('GitHub repository metadata did not resolve an exact source repository');
+    }
+    return source;
+  }
+
+  /**
+   * The repository at the branch's current commit (module doc, steps 1–3):
+   * metadata, the snapshot, the schemas checked by blob id.
+   *
+   * @returns {Promise<RepositorySnapshot>}
+   */
+  async openSnapshot({ signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation snapshot signal');
+    const repoInfo = await this._repositoryMetadata(requestSignal);
+    const branch = this.branch === null
+      ? assertGitHubBranch(repoInfo.default_branch, 'GitHub repository default_branch')
+      : this.branch;
+    this.branch = branch;
+    const source = this._source(repoInfo);
+    const { data, errors } = await callGraphql(this._ctx(), '/graphql/snapshot', {
+      owner: source.owner,
+      repo: source.repo,
+      branch,
+    }, { signal: requestSignal });
+    if (errors.length > 0 && (data === null || data.repository === undefined)) {
+      throw graphqlFailure(errors, 'GitHub snapshot');
+    }
+    this._snapshot = parseSnapshot(data, { owner: source.owner, repo: source.repo, branch, repoInfo });
+    return this._snapshot;
+  }
+
+  /** The config of a snapshot, read by its blob id (kept for the page by id). */
+  async _readConfig(snapshot, signal) {
+    const { oid, byteSize } = snapshot.config;
+    const known = configByOid.get(oid);
+    if (known !== undefined) return known;
+    if (byteSize > ANNOTATION_FILE_MAX_UTF8_BYTES) {
+      throw new AnnotationFileTooLargeError(ANNOTATION_CONFIG_PATH, byteSize, { phase: 'remote-tree-preflight' });
+    }
+    const source = this._source(snapshot.repoInfo);
+    const blob = await readOneBlob(this._ctx(), source.owner, source.repo, { oid, path: ANNOTATION_CONFIG_PATH }, { signal });
+    if (blob.isBinary || utf8Encoder.encode(blob.text).length !== blob.byteSize) {
+      throw layoutInvalid(`${ANNOTATION_CONFIG_PATH} is not UTF-8 JSON text`);
+    }
+    const config = parseExactJson(blob.text, { path: ANNOTATION_CONFIG_PATH });
+    assertConfigDocument(config, { path: ANNOTATION_CONFIG_PATH });
+    configByOid.set(oid, config);
+    return config;
+  }
+
+  /**
+   * Open the repository and read its config: `{repoInfo, branch, config,
+   * configSha, datasetId, datasetConfig, snapshot}`. `configSha` is the
+   * config's blob id, which is the SHA the Contents API names it by.
+   */
+  async validateAndLoadConfig({ datasetId, signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation config request signal');
+    const snapshot = await this.openSnapshot({ signal: requestSignal });
+    const config = await this._readConfig(snapshot, requestSignal);
+    const targetDatasetId = datasetId === undefined
+      ? this.datasetId
+      : assertExactNonblankString(datasetId, 'Annotation config datasetId');
+    const datasetConfig = config.supportedDatasets.find((entry) => entry.datasetId === targetDatasetId) ?? null;
+    return {
+      repoInfo: snapshot.repoInfo,
+      branch: snapshot.branch,
+      config,
+      configSha: snapshot.config.oid,
+      datasetId: targetDatasetId,
+      datasetConfig,
+      snapshot,
+    };
+  }
+
+  /**
+   * Read every changed file of a snapshot into the file cache (module doc,
+   * steps 2 and 4–7). Answers what the cache now holds of it:
+   * `{unchanged, userCount, fetchedCount, ignored, ownSha, mergesSha}` --
+   * `unchanged` when the `annotations` tree is the last completed Pull's
+   * (nothing was read); `ignored` the paths that are no annotation file,
+   * with why; `ownSha` the blob id of the caller's own user file (null when
+   * they have none). Excluded files are in the cache, with their reasons.
+   *
+   * @param {{snapshot: RepositorySnapshot, fileCache: import('./file-cache.js').CommunityAnnotationFileCache,
+   *   cacheScope: {datasetId: string, repoRef: string, userId: number}, ownUserKey?: string|null,
+   *   signal?: AbortSignal|null, onProgress?: ((progress: {done: number, total: number}) => void)|null}} options
+   */
+  async pullFiles({ snapshot, fileCache, cacheScope, ownUserKey = null, signal = null, onProgress = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation files pull signal');
+    if (snapshot === null || typeof snapshot !== 'object' || !GIT_OID.test(snapshot.annotationsOid ?? '')) {
+      throw new TypeError('Annotation files pull requires a repository snapshot');
+    }
+    if (ownUserKey !== null && !/^ghid_[1-9][0-9]*$/.test(ownUserKey)) {
+      throw new Error('Annotation files pull own user key must be an exact ghid identity');
+    }
+    const ownPath = ownUserKey === null ? null : `annotations/users/${ownUserKey}.json`;
+    const mergesSha = snapshot.merges?.oid ?? null;
+    const marker = await fileCache.getPullMarker(cacheScope);
+    if (marker !== null && marker.annotationsOid === snapshot.annotationsOid) {
+      const own = ownPath === null ? null : await fileCache.getRecord(cacheScope, ownPath);
+      return {
+        unchanged: true,
+        userCount: null,
+        fetchedCount: 0,
+        ignored: [...snapshot.ignored, ...marker.ignored],
+        ownSha: own?.sha ?? null,
+        mergesSha,
+      };
+    }
+
+    // From here records change: the marker no longer describes them.
+    await fileCache.deletePullMarker(cacheScope, { signal: requestSignal });
+    const ctx = this._ctx();
+    const source = this._source(snapshot.repoInfo);
+    const known = await fileCache.getKnownShas(cacheScope);
+    let files;
+    let usersIgnored;
+    if (marker !== null && marker.usersOid === snapshot.usersOid) {
+      // The last completed Pull listed this very tree, and the cache holds
+      // exactly its files.
+      files = [...known].filter(([path]) => path !== ANNOTATION_MERGES_PATH).map(([path, sha]) => ({ path, sha, size: null }));
+      usersIgnored = marker.ignored;
+    } else {
+      ({ files, ignored: usersIgnored } = await listUsersTree(ctx, source.owner, source.repo, snapshot.usersOid, { signal: requestSignal }));
+    }
+
+    const tooLarge = [];
+    const pending = [];
+    const consider = (path, oid, size) => {
+      if (known.get(path) === oid) return;
+      if (size > ANNOTATION_FILE_MAX_UTF8_BYTES) {
+        tooLarge.push({
+          path,
+          sha: oid,
+          rejection: {
+            code: 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE',
+            message: new AnnotationFileTooLargeError(path, size, { phase: 'remote-tree-preflight' }).message,
+          },
+        });
+      } else {
+        pending.push({ path, oid, size });
+      }
+    };
+    for (const file of files) consider(file.path, file.sha, file.size);
+    if (snapshot.merges !== null) consider(ANNOTATION_MERGES_PATH, snapshot.merges.oid, snapshot.merges.byteSize);
+    if (tooLarge.length > 0) await fileCache.putRecords(cacheScope, tooLarge, { signal: requestSignal });
+    pending.sort((left, right) => byCodeUnits(left.path, right.path));
+
+    const total = pending.length;
+    let done = 0;
+    onProgress?.({ done, total });
+    let budget = BLOB_BATCH_START_BYTES;
+    // The smallest batch refused for its size in this Pull: batches grow up
+    // to just under it, so one refusal is not met again and again.
+    let refusedAt = Infinity;
+    for (let start = 0; start < pending.length;) {
+      let end = start;
+      let cost = 0;
+      do {
+        cost += pending[end].size + BLOB_RECORD_OVERHEAD_BYTES;
+        end += 1;
+      } while (end < pending.length && cost + pending[end].size + BLOB_RECORD_OVERHEAD_BYTES <= budget);
+      const batch = pending.slice(start, end);
+      let blobs;
+      const outcome = await readBlobBatch(ctx, source.owner, source.repo, batch, { signal: requestSignal });
+      if (outcome.resize) {
+        refusedAt = Math.min(refusedAt, cost);
+        if (batch.length > 1) {
+          budget = Math.max(1, Math.floor(cost / 2));
+          continue;
+        }
+        const rest = await readBlobRest(ctx, source.owner, source.repo, batch[0].oid, batch[0].path, { signal: requestSignal });
+        blobs = [{ oid: batch[0].oid, byteSize: rest.byteSize, isBinary: false, text: rest.text }];
+      } else {
+        blobs = outcome.blobs;
+        budget = Math.max(budget, Math.min(budget * 2, refusedAt - 1));
+      }
+      const records = batch.map((item, index) => {
+        if (blobs[index].byteSize !== item.size) {
+          throw protocolError(`GitHub blob ${item.oid} (${item.path}) does not have the size its tree states`);
+        }
+        return { path: item.path, sha: item.oid, ...verdictOf(item.path, blobs[index], this.datasetId) };
+      });
+      await fileCache.putRecords(cacheScope, records, { signal: requestSignal });
+      done += batch.length;
+      onProgress?.({ done, total });
+      start = end;
+    }
+
+    const keep = new Set(files.map((file) => file.path));
+    if (snapshot.merges !== null) keep.add(ANNOTATION_MERGES_PATH);
+    await fileCache.pruneToPaths(cacheScope, keep, { signal: requestSignal });
+    await fileCache.setPullMarker(cacheScope, {
+      commitOid: snapshot.commitOid,
+      annotationsOid: snapshot.annotationsOid,
+      usersOid: snapshot.usersOid,
+      ignored: usersIgnored,
+    }, { signal: requestSignal });
+    return {
+      unchanged: false,
+      userCount: files.length,
+      fetchedCount: total + tooLarge.length,
+      ignored: [...snapshot.ignored, ...usersIgnored],
+      ownSha: ownPath === null ? null : files.find((file) => file.path === ownPath)?.sha ?? null,
+      mergesSha,
+    };
+  }
+
+  /** Metadata and branch of this sync's repository: from the snapshot already opened, else opened now. */
+  async _resolved(signal) {
+    const snapshot = this._snapshot ?? await this.openSnapshot({ signal });
+    return { repoInfo: snapshot.repoInfo, branch: snapshot.branch, source: this._source(snapshot.repoInfo) };
+  }
+
+  /** Authors write the config and merges directly: maintain and admin access include write access. */
+  _requireAuthorDirect(repoInfo, mode, what) {
+    const capability = assertRepositoryPublicationInfo(repoInfo);
+    if (!capability.canManage) throw new Error(`Maintain/admin access required to publish ${what}`);
+    if (mode !== 'direct' || !capability.canDirectPush) {
+      throw new Error(`${what} is published directly: maintain/admin access includes write access`);
+    }
   }
 
   async updateDatasetFieldsToAnnotate({
@@ -2714,227 +1994,69 @@ export class CommunityAnnotationGitHubSync {
     publicationMode,
     signal = null,
   } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation config publication signal'
-    );
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation config publication signal');
     const mode = assertPublicationMode(publicationMode);
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-
-    const { repoInfo, branch } = await this.validateAndLoadConfig({
-      datasetId,
-      signal: requestSignal,
-    });
-    const capability = assertRepositoryPublicationInfo(repoInfo);
-    if (!capability.canManage) {
-      throw new Error(
-        'Maintain/admin access required to update annotations/config.json'
-      );
-    }
-
-    const did = datasetId === undefined
-      ? this.datasetId
-      : assertExactNonblankString(datasetId, 'datasetId', { max: 256 });
-
+    const ctx = this._ctx();
+    const { repoInfo, branch, source } = await this._resolved(requestSignal);
+    this._requireAuthorDirect(repoInfo, mode, 'annotations/config.json');
+    const did = datasetId === undefined ? this.datasetId : assertExactNonblankString(datasetId, 'datasetId');
     const msg = commitMessage === null
       ? `Update annotatable fields for ${did}`
-      : assertExactNonblankString(
-        commitMessage,
-        'Annotation config commit message',
-        { max: 256 }
-      );
+      : assertExactNonblankString(commitMessage, 'Annotation config commit message');
     const expectedSha = conflictIfRemoteShaNotEqual === null
       ? null
-      : assertGitHubSha(
-        conflictIfRemoteShaNotEqual,
-        'Expected annotation config SHA'
-      );
-    const {
-      json: current,
-      sha,
-      contentBase64: remoteContentBase64,
-    } = await readJsonFile({
-      workerOrigin: this.workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/config.json',
-      ref: branch,
-      signal: requestSignal,
-    });
-    assertConfigDocument(current, { path: 'annotations/config.json' });
-
-    const {
-      config: nextConfig,
-      replacement,
-    } = buildUpdatedAnnotationConfig({
-      currentConfig: current,
+      : assertGitHubSha(conflictIfRemoteShaNotEqual, 'Expected annotation config SHA');
+    const current = await readContentFile(ctx, source.owner, source.repo, ANNOTATION_CONFIG_PATH, branch, { signal: requestSignal });
+    if (current === null) throw layoutInvalid(`${repoInfo.full_name}@${branch} has no annotations/config.json.`);
+    assertConfigDocument(current.json, { path: ANNOTATION_CONFIG_PATH });
+    const { config: nextConfig, replacement } = buildUpdatedAnnotationConfig({
+      currentConfig: current.json,
       datasetId: did,
       datasetName,
       fieldsToAnnotate,
       annotatableSettings,
       closedFields,
     });
-    const contentBase64 = encodeBase64Bytes(
-      toAnnotationPublicationBytes(nextConfig, {
-        path: 'annotations/config.json',
-      })
-    );
-
-    if (
-      base64PayloadEqualsCanonical(
-        remoteContentBase64,
-        contentBase64,
-        'annotations/config.json'
-      )
-    ) {
-      return {
-        mode: 'none',
-        branch,
-        path: 'annotations/config.json',
-        sha: sha || null,
-        ...replacement,
-        changed: false
-      };
-    }
-
-    if (!expectedSha) {
-      const err = new Error(
-        'Missing baseline version for annotations/config.json.\n' +
-        'Pull first to load the latest config, then Publish again.'
+    const contentBase64 = encodeBase64Bytes(toAnnotationPublicationBytes(nextConfig, { path: ANNOTATION_CONFIG_PATH }));
+    const unchanged = { mode: 'none', branch, path: ANNOTATION_CONFIG_PATH, sha: current.sha, ...replacement, changed: false };
+    if (base64PayloadEqualsCanonical(current.contentBase64, contentBase64, ANNOTATION_CONFIG_PATH)) return unchanged;
+    if (expectedSha === null) {
+      const err = conflictError(
+        ANNOTATION_CONFIG_PATH,
+        'Missing baseline version for annotations/config.json.\nPull first to load the latest config, then Publish again.'
       );
-      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-      err.path = 'annotations/config.json';
-      err.remoteSha = sha || null;
+      err.remoteSha = current.sha;
       err.expectedSha = null;
       throw err;
     }
-    if (sha !== expectedSha) {
-      const err = new Error(
-        'annotations/config.json changed since your last Pull.\n' +
-        'Pull first to review the latest settings, then Publish again.'
+    if (current.sha !== expectedSha) {
+      const err = conflictError(
+        ANNOTATION_CONFIG_PATH,
+        'annotations/config.json changed since your last Pull.\nPull first to review the latest settings, then Publish again.'
       );
-      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-      err.path = 'annotations/config.json';
-      err.remoteSha = sha || null;
+      err.remoteSha = current.sha;
       err.expectedSha = expectedSha;
       throw err;
     }
-
-    // Avoid no-op commits: compare semantic JSON ignoring key order.
-    const changed = stableStringifyJson(current) !== stableStringifyJson(nextConfig);
-    if (!changed) {
-      return {
-        mode: 'none',
-        branch,
-        path: 'annotations/config.json',
-        sha: sha || null,
-        ...replacement,
-        changed: false
-      };
-    }
-
-    try {
-      const result = await publishAnnotationFile({
-        publicationMode: mode,
-        repoInfo,
-        workerOrigin: this.workerOrigin,
-        token,
-        upstreamOwner: this.owner,
-        upstreamRepo: this.repo,
-        baseBranch: branch,
-        datasetId: did,
-        fileUser: null,
-        path: 'annotations/config.json',
-        title: msg,
-        body: [
-          'Community annotation configuration update from Cellucid.',
-          '',
-          'File: `annotations/config.json`',
-        ].join('\n'),
-        contentBase64,
-        sourceSha: sha,
-        signal: requestSignal,
-      });
-      return {
-        ...result,
-        branch,
-        path: 'annotations/config.json',
-        ...replacement,
-        changed: true
-      };
-    } catch (err) {
-      if (isContentConflictError(err)) {
-        const conflict = new Error(
-          'annotations/config.json changed while publishing.\n' +
-          'Pull first to review/merge the latest settings, then Publish again.'
-        );
-        conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        conflict.path = 'annotations/config.json';
-        throw inheritMutationErrorContext(conflict, err);
-      }
-      throw err;
-    }
-  }
-
-  async pullModerationMerges({
-    knownShas = null,
-    signal = null,
-  } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation moderation pull signal'
-    );
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-    const branch = assertGitHubBranch(
-      this.branch,
-      'Resolved annotation repository branch'
-    );
-    const workerOrigin = this.workerOrigin;
-    const path = 'annotations/moderation/merges.json';
-    if (
-      knownShas !== null &&
-      (
-        typeof knownShas !== 'object' ||
-        Array.isArray(knownShas)
-      )
-    ) {
-      throw new Error('Known annotation SHAs must be a JSON object or null');
-    }
-    const previousSha =
-      knownShas !== null && Object.hasOwn(knownShas, path)
-        ? assertGitHubSha(knownShas[path], `Known SHA for ${path}`)
-        : null;
-    try {
-      const content = await getContent({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        path,
-        ref: branch,
-        signal: requestSignal,
-      });
-      if (!content || content.type !== 'file') {
-        throw new Error(`Expected file at ${path}`);
-      }
-      const sha = assertGitHubSha(content.sha, `${path} SHA`);
-      if (previousSha === sha) {
-        return { doc: null, sha, path, fetched: false };
-      }
-      const { json } = decodeJsonContentFile(content, path);
-      return {
-        doc: projectMergesFile(json, this.datasetId, { path }),
-        sha,
-        path,
-        fetched: true,
-      };
-    } catch (err) {
-      if (isNotFoundError(err)) return { doc: null, sha: null, path, fetched: false };
-      throw err;
-    }
+    if (stableStringifyJson(current.json) === stableStringifyJson(nextConfig)) return unchanged;
+    const response = await putContent(ctx, {
+      owner: source.owner,
+      repo: source.repo,
+      path: ANNOTATION_CONFIG_PATH,
+      branch,
+      message: msg,
+      contentBase64,
+      sha: current.sha,
+      signal: requestSignal,
+    });
+    return {
+      mode: 'direct',
+      sha: assertGitHubSha(response?.content?.sha, 'Published GitHub content SHA'),
+      branch,
+      path: ANNOTATION_CONFIG_PATH,
+      ...replacement,
+      changed: true,
+    };
   }
 
   async pushModerationMerges({
@@ -2944,616 +2066,169 @@ export class CommunityAnnotationGitHubSync {
     publicationMode,
     signal = null,
   } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation moderation publication signal'
-    );
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation moderation publication signal');
     const mode = assertPublicationMode(publicationMode);
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-
-    const repoInfo =
-      this._repoInfo === null
-        ? await getRepoInfo({
-            workerOrigin: this.workerOrigin,
-            owner: this.owner,
-            repo: this.repo,
-            token,
-            signal: requestSignal,
-          })
-        : this._repoInfo;
-    const capability = assertRepositoryPublicationInfo(repoInfo);
-    this._repoInfo = repoInfo;
-    if (!capability.canManage) {
-      throw new Error(
-        'Maintain/admin access required to publish moderation merges'
-      );
-    }
-
-    const branch = this.branch === null
-      ? assertGitHubBranch(
-        repoInfo?.default_branch,
-        'GitHub repository default_branch'
-      )
-      : assertGitHubBranch(this.branch);
-    this.branch = branch;
-
+    const ctx = this._ctx();
+    const { repoInfo, branch, source } = await this._resolved(requestSignal);
+    this._requireAuthorDirect(repoInfo, mode, ANNOTATION_MERGES_PATH);
     const msg = commitMessage === null
       ? 'Update annotation moderation merges'
-      : assertExactNonblankString(
-        commitMessage,
-        'Moderation merges commit message',
-        { max: 256 }
-      );
-    assertMergesDocument(mergesDoc, {
-      path: 'annotations/moderation/merges.json publish payload',
-    });
-
+      : assertExactNonblankString(commitMessage, 'Moderation merges commit message');
+    assertMergesDocument(mergesDoc, { path: 'annotations/moderation/merges.json publish payload' });
     const expectedSha = conflictIfRemoteShaNotEqual === null
       ? null
-      : assertGitHubSha(
-        conflictIfRemoteShaNotEqual,
-        'Expected moderation merges SHA'
-      );
-
-    const {
-      json: current,
-      sha,
-      contentBase64: remoteContentBase64,
-    } = await readJsonFileOrNull({
-      workerOrigin: this.workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      path: 'annotations/moderation/merges.json',
-      ref: branch,
-      signal: requestSignal,
-    });
-
+      : assertGitHubSha(conflictIfRemoteShaNotEqual, 'Expected moderation merges SHA');
+    const current = await readContentFile(ctx, source.owner, source.repo, ANNOTATION_MERGES_PATH, branch, { signal: requestSignal });
     // The open dataset's merges replace that dataset's part of the file;
     // every other dataset's merges stay as published.
-    const incoming = composeMergesFile(current, this.datasetId, mergesDoc, {
-      path: 'annotations/moderation/merges.json',
-    });
-    const currentComparable = current
-      ? { version: current.version, merges: current.merges }
-      : null;
-    const nextComparable = { version: incoming.version, merges: incoming.merges };
-    const contentBase64 = encodeBase64Bytes(
-      toAnnotationPublicationBytes(incoming, {
-        path: 'annotations/moderation/merges.json',
-      })
-    );
-
-    if (
-      remoteContentBase64 !== null &&
-      base64PayloadEqualsCanonical(
-        remoteContentBase64,
-        contentBase64,
-        'annotations/moderation/merges.json'
-      )
-    ) {
-      return {
-        mode: 'none',
-        branch,
-        path: 'annotations/moderation/merges.json',
-        sha: sha || null,
-        changed: false,
-      };
+    const incoming = composeMergesFile(current?.json ?? null, this.datasetId, mergesDoc, { path: ANNOTATION_MERGES_PATH });
+    const contentBase64 = encodeBase64Bytes(toAnnotationPublicationBytes(incoming, { path: ANNOTATION_MERGES_PATH }));
+    const unchanged = { mode: 'none', branch, path: ANNOTATION_MERGES_PATH, sha: current?.sha ?? null, changed: false };
+    if (current !== null && base64PayloadEqualsCanonical(current.contentBase64, contentBase64, ANNOTATION_MERGES_PATH)) {
+      return unchanged;
     }
-
-    // If the remote file exists, require a baseline SHA from the last Pull.
-    if (!expectedSha && sha) {
-      const err = new Error(
-        'Missing baseline version for annotations/moderation/merges.json.\n' +
-        'Pull first to load the latest merges, then Publish again.'
+    if (expectedSha === null && current !== null) {
+      const err = conflictError(
+        ANNOTATION_MERGES_PATH,
+        'Missing baseline version for annotations/moderation/merges.json.\nPull first to load the latest merges, then Publish again.'
       );
-      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-      err.path = 'annotations/moderation/merges.json';
-      err.remoteSha = sha || null;
+      err.remoteSha = current.sha;
       err.expectedSha = null;
       throw err;
     }
-    if (expectedSha && sha !== expectedSha) {
-      const err = new Error(
-        'annotations/moderation/merges.json changed since your last Pull.\n' +
-        'Pull first to review the latest merges, then Publish again.'
+    if (expectedSha !== null && current?.sha !== expectedSha) {
+      const err = conflictError(
+        ANNOTATION_MERGES_PATH,
+        'annotations/moderation/merges.json changed since your last Pull.\nPull first to review the latest merges, then Publish again.'
       );
-      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-      err.path = 'annotations/moderation/merges.json';
-      err.remoteSha = sha || null;
+      err.remoteSha = current?.sha ?? null;
       err.expectedSha = expectedSha;
       throw err;
     }
-
-    const changed = stableStringifyJson(currentComparable) !== stableStringifyJson(nextComparable);
-    if (!changed) {
-      return {
-        mode: 'none',
-        branch,
-        path: 'annotations/moderation/merges.json',
-        sha: sha || null,
-        changed: false,
-      };
+    const currentComparable = current === null ? null : { version: current.json.version, merges: current.json.merges };
+    if (stableStringifyJson(currentComparable) === stableStringifyJson({ version: incoming.version, merges: incoming.merges })) {
+      return unchanged;
     }
-
-    try {
-      const result = await publishAnnotationFile({
-        publicationMode: mode,
-        repoInfo,
-        workerOrigin: this.workerOrigin,
-        token,
-        upstreamOwner: this.owner,
-        upstreamRepo: this.repo,
-        baseBranch: branch,
-        datasetId: this.datasetId,
-        fileUser: null,
-        path: 'annotations/moderation/merges.json',
-        title: msg,
-        body: [
-          'Community annotation moderation update from Cellucid.',
-          '',
-          'File: `annotations/moderation/merges.json`',
-        ].join('\n'),
-        contentBase64,
-        sourceSha: sha,
-        signal: requestSignal,
-      });
-      return {
-        ...result,
-        branch,
-        path: 'annotations/moderation/merges.json',
-        changed: true,
-      };
-    } catch (err) {
-      if (isContentConflictError(err)) {
-        const conflict = new Error(
-          'annotations/moderation/merges.json changed while publishing.\n' +
-          'Pull first to review the latest merges, then Publish again.'
-        );
-        conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        conflict.path = 'annotations/moderation/merges.json';
-        throw inheritMutationErrorContext(conflict, err);
-      }
-      throw err;
-    }
+    const response = await putContent(ctx, {
+      owner: source.owner,
+      repo: source.repo,
+      path: ANNOTATION_MERGES_PATH,
+      branch,
+      message: msg,
+      contentBase64,
+      sha: current?.sha ?? null,
+      signal: requestSignal,
+    });
+    return {
+      mode: 'direct',
+      sha: assertGitHubSha(response?.content?.sha, 'Published GitHub content SHA'),
+      branch,
+      path: ANNOTATION_MERGES_PATH,
+      changed: true,
+    };
   }
 
-  async getAuthenticatedUser({ signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Authenticated GitHub user request signal'
-    );
-    const token = this.token;
-    if (!token) return null;
-    return assertAuthUserResponse(
-      await workerAuthRequest(this.workerOrigin, '/auth/user', {
-        token,
-        signal: requestSignal,
-      })
-    );
+  /** The caller's own user file at the branch (a profile load, not a Pull): `{doc, sha, path}` or null. */
+  async pullUserFile({ userKey = null, signal = null } = {}) {
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation user-file pull signal');
+    if (typeof userKey !== 'string' || !/^ghid_[1-9][0-9]*$/.test(userKey)) throw new Error('userKey required');
+    const { branch, source } = await this._resolved(requestSignal);
+    const path = `annotations/users/${userKey}.json`;
+    const file = await readContentFile(this._ctx(), source.owner, source.repo, path, branch, { signal: requestSignal });
+    if (file === null) return null;
+    return { doc: projectUserFile(file.json, this.datasetId, { path, filename: `${userKey}.json` }), sha: file.sha, path };
   }
 
   /**
-   * Fetch every user file whose SHA changed, a batch at a time: each batch of
-   * validated `{ path, sha, doc }` records goes to `onRecords` (which caches
-   * it) before the next batch is fetched, so no Pull holds more than one batch
-   * of raw files.
-   *
-   * @param {object} options
-   * @param {Record<string, string>|null} [options.knownShas]
-   * @param {(records: Array<{path: string, sha: string, doc: object}>) => Promise<void>} options.onRecords
-   * @param {AbortSignal|null} [options.signal]
-   * @returns {Promise<{ shas: Record<string, string>, fetchedCount: number, totalCount: number, concurrency: number }>}
+   * Publish the person's own file: `userDoc` is the open dataset's view to
+   * publish, or a function that makes it from the view published now (null
+   * when none is) — a single change (an agent's vote or suggestion) is
+   * published on top of what is on GitHub (in fork mode, on top of the open
+   * pull request's file), never with the rest of the person's unpublished
+   * changes. A composed view names its owner in `githubUserId`. Answers the
+   * route taken with the view written (`view`).
    */
-  async pullAllUsers({ knownShas = null, onRecords, signal = null } = {}) {
-    if (typeof onRecords !== 'function') {
-      throw new TypeError('Annotation users pull requires an onRecords sink');
-    }
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation users pull signal'
-    );
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-    const branch = assertGitHubBranch(
-      this.branch,
-      'Resolved annotation repository branch'
-    );
-    const workerOrigin = this.workerOrigin;
-
-    const tree = await getGitTreeRecursive({
-      workerOrigin,
-      owner: this.owner,
-      repo: this.repo,
-      token,
-      ref: branch,
-      signal: requestSignal,
-    });
-    if (!Array.isArray(tree)) {
-      throw new Error('Git tree response must contain an array');
-    }
-    const userBlobs = [];
-    let hasUsersInventory = false;
-    for (const entry of tree) {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-        throw new Error('Git tree entries must be objects');
-      }
-      const path = entry.path;
-      if (
-        typeof path !== 'string' ||
-        !path ||
-        /^\s|\s$/.test(path)
-      ) {
-        throw new Error('Git tree entry path must be an exact nonblank string');
-      }
-
-      if (path === ANNOTATION_USERS_DIRECTORY_PATH) {
-        if (entry.type !== 'tree') {
-          throw new Error(
-            `${ANNOTATION_USERS_DIRECTORY_PATH} must be a Git tree`
-          );
-        }
-        hasUsersInventory = true;
-        continue;
-      }
-
-      if (path === EMPTY_ANNOTATION_USERS_SENTINEL.path) {
-        if (
-          entry.type !== 'blob' ||
-          entry.sha !== EMPTY_ANNOTATION_USERS_SENTINEL.sha ||
-          entry.size !== EMPTY_ANNOTATION_USERS_SENTINEL.size
-        ) {
-          throw new Error(
-            `${EMPTY_ANNOTATION_USERS_SENTINEL.path} must be the exact ` +
-            'one-byte pristine template sentinel'
-          );
-        }
-        hasUsersInventory = true;
-        continue;
-      }
-
-      if (!path.startsWith(ANNOTATION_USERS_PATH_PREFIX)) {
-        const lowerPath = path.toLowerCase();
-        if (
-          lowerPath === ANNOTATION_USERS_DIRECTORY_PATH ||
-          lowerPath.startsWith(ANNOTATION_USERS_PATH_PREFIX)
-        ) {
-          throw new Error(
-            `Invalid annotation users inventory path ${JSON.stringify(path)}; ` +
-            `expected exact lowercase ${ANNOTATION_USERS_DIRECTORY_PATH}`
-          );
-        }
-        continue;
-      }
-      if (
-        entry.type !== 'blob' ||
-        !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(path)
-      ) {
-        throw new Error(
-          `Invalid annotation user-file path ${JSON.stringify(path)}; ` +
-          'expected annotations/users/ghid_<positive-github-id>.json'
-        );
-      }
-      hasUsersInventory = true;
-      userBlobs.push(entry);
-    }
-    if (!hasUsersInventory) {
-      throw new Error(
-        `Git tree does not contain the required ${ANNOTATION_USERS_DIRECTORY_PATH} inventory`
-      );
-    }
-    /** @type {Record<string, string>} */
-    const nextShas = {};
-    const userBlobSizes = new Map();
-    for (const f of userBlobs) {
-      const path = f.path;
-      if (!Number.isSafeInteger(f.size) || f.size < 0) {
-        throw new Error(
-          `Git tree is missing the decoded byte size for ${JSON.stringify(path)}`
-        );
-      }
-      if (f.size > ANNOTATION_FILE_MAX_UTF8_BYTES) {
-        throw new AnnotationFileTooLargeError(
-          path,
-          f.size,
-          { phase: 'remote-tree-preflight' }
-        );
-      }
-      const sha = assertGitHubSha(
-        f.sha,
-        `Git tree SHA for ${JSON.stringify(path)}`
-      );
-      if (Object.hasOwn(nextShas, path)) {
-        throw new Error(`Git tree contains duplicate path ${JSON.stringify(path)}`);
-      }
-      nextShas[path] = sha;
-      userBlobSizes.set(path, f.size);
-    }
-    if (
-      knownShas !== null &&
-      (
-        typeof knownShas !== 'object' ||
-        Array.isArray(knownShas)
-      )
-    ) {
-      throw new Error('Known annotation SHAs must be a JSON object or null');
-    }
-    if (knownShas !== null) {
-      for (const [path, sha] of Object.entries(knownShas)) {
-        if (
-          path !== 'annotations/config.json' &&
-          path !== 'annotations/moderation/merges.json' &&
-          !/^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(path)
-        ) {
-          throw new Error(
-            `Known annotation SHA path is invalid: ${JSON.stringify(path)}`
-          );
-        }
-        assertGitHubSha(sha, `Known SHA for ${path}`);
-      }
-    }
-    const needsFetch = (path, sha) => {
-      if (knownShas === null || !Object.hasOwn(knownShas, path)) return true;
-      return knownShas[path] !== sha;
-    };
-
-    const allPaths = Object.keys(nextShas).sort((a, b) => a.localeCompare(b));
-    const toFetch = allPaths.filter((path) => needsFetch(path, nextShas[path]));
-
-    const concurrency = DEFAULT_USER_PULL_CONCURRENCY;
-    const fetchRecord = async (path, _index, batchSignal) => {
-      const sha = nextShas[path] || null;
-      const filename = path.split('/').pop();
-      const { decodedByteLength, json } = await getGitBlobJson({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        sha,
-        path,
-        signal: batchSignal,
-      });
-      const expectedDecodedByteLength =
-        userBlobSizes.get(path) ?? null;
-      if (decodedByteLength !== expectedDecodedByteLength) {
-        throw new Error(
-          `Git blob ${JSON.stringify(path)} decoded byte length changed ` +
-          'from the recursive tree; start a new Pull'
-        );
-      }
-      return {
-        path,
-        sha,
-        doc: projectUserFile(json, this.datasetId, { path, filename }),
-      };
-    };
-    for (let start = 0; start < toFetch.length;) {
-      let end = start;
-      let batchBytes = 0;
-      do {
-        batchBytes += userBlobSizes.get(toFetch[end]);
-        end += 1;
-      } while (
-        end < toFetch.length
-        && batchBytes + userBlobSizes.get(toFetch[end]) <= COMMUNITY_ANNOTATION_PULL_BATCH_BYTES
-      );
-      const records = await mapWithConcurrency(
-        toFetch.slice(start, end),
-        concurrency,
-        fetchRecord,
-        { signal: requestSignal }
-      );
-      await onRecords(records);
-      start = end;
-    }
-
-    return {
-      shas: nextShas,
-      fetchedCount: toFetch.length,
-      totalCount: allPaths.length,
-      concurrency
-    };
-  }
-
-  async pullUserFile({ userKey = null, signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation user-file pull signal'
-    );
-    const token = this.token;
-    if (!token) throw new Error('GitHub sign-in required');
-    const branch = assertGitHubBranch(
-      this.branch,
-      'Resolved annotation repository branch'
-    );
-    const workerOrigin = this.workerOrigin;
-
-    const key = sanitizeUserKeyForPath(userKey);
-    if (!key) throw new Error('userKey required');
-
-    try {
-      const path = `annotations/users/${key}.json`;
-      const { json, sha } = await readJsonFile({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        path,
-        ref: branch,
-        signal: requestSignal,
-      });
-      return {
-        doc: projectUserFile(json, this.datasetId, { path, filename: `${key}.json` }),
-        sha: sha || null,
-        path,
-      };
-    } catch (err) {
-      if (err?.status === 404) return null;
-      throw err;
-    }
-  }
-
   async pushMyUserFile({
     userDoc,
+    githubUserId = null,
     commitMessage = null,
     conflictIfRemoteShaNotEqual = null,
     publicationMode,
     signal = null,
   } = {}) {
-    const requestSignal = assertAbortSignalOrNull(
-      signal,
-      'Annotation user-file publication signal'
-    );
+    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation user-file publication signal');
     const mode = assertPublicationMode(publicationMode);
-    const token = this.token;
-    if (!token) throw new Error('GitHub token required to push');
-    const branch = assertGitHubBranch(
-      this.branch,
-      'Resolved annotation repository branch'
-    );
-    const workerOrigin = this.workerOrigin;
-
-    const id = userDoc?.githubUserId;
-    if (!Number.isSafeInteger(id) || id < 1) {
-      throw new Error('User doc githubUserId must be a positive safe integer');
+    const ctx = this._ctx();
+    const composeView = typeof userDoc === 'function' ? userDoc : null;
+    if (composeView !== null && (!Number.isSafeInteger(githubUserId) || githubUserId < 1)) {
+      throw new Error('A composed user file names its githubUserId');
     }
-    const fileUser = `ghid_${id}`;
-    const path = `annotations/users/${fileUser}.json`;
-    // The open dataset's section alone must fit the file limit; checked
-    // before any request, because the published file can only be larger.
-    toAnnotationPublicationBytes(
-      composeUserFile(null, this.datasetId, userDoc, {
-        path,
-        filename: `${fileUser}.json`,
-      }),
-      { path }
-    );
+    const { id, fileUser, path, filename } = userFileOf(composeView === null ? userDoc : { githubUserId });
+    if (composeView === null) {
+      // The open dataset's section alone must fit the file limit; checked
+      // before any request, because the published file can only be larger.
+      toAnnotationPublicationBytes(composeUserFile(null, this.datasetId, userDoc, { path, filename }), { path });
+    }
+    // The view to publish over a published file (null: none).
+    const viewOver = (file) => (composeView === null
+      ? userDoc
+      : composeView(file === null ? null : projectUserFile(file, this.datasetId, { path, filename })));
     const authenticatedUser = assertAuthUserResponse(
-      await workerAuthRequest(workerOrigin, '/auth/user', {
-        token,
-        signal: requestSignal,
-      })
+      (await callWorker(ctx, { scope: 'service', path: '/auth/user', signal: requestSignal })).document
     );
     if (authenticatedUser.id !== id) {
       throw new Error(
         `User document identity ${fileUser} does not match authenticated GitHub user ghid_${authenticatedUser.id}`
       );
     }
+    const { repoInfo, branch, source } = await this._resolved(requestSignal);
+    assertRepositoryPublicationInfo(repoInfo);
+    const upstream = await readContentFile(ctx, source.owner, source.repo, path, branch, { signal: requestSignal });
+    const published = upstream === null ? null : assertOwnPublishedFile(upstream.json, path, filename, '');
+    const remoteUpdatedAt = published?.updatedAt ?? null;
+    const msg = commitMessage === null
+      ? `Update annotations for @${authenticatedUser.login}`
+      : assertExactNonblankString(commitMessage, 'Annotation user-file commit message');
 
-    let sha = null;
-    let published = null;
-    let remoteUpdatedAt = null;
-    let remoteContentBase64 = null;
-    try {
-      const existing = await getContent({
-        workerOrigin,
-        owner: this.owner,
-        repo: this.repo,
-        token,
-        path,
-        ref: branch,
-        signal: requestSignal,
-      });
-      const {
-        json: parsed,
-        sha: existingSha,
-        contentBase64: existingContentBase64,
-      } = decodeJsonContentFile(existing, path);
-      sha = existingSha;
-      published = assertUserFile(parsed, { path, filename: `${fileUser}.json` });
-      remoteUpdatedAt = parsed.updatedAt;
-      remoteContentBase64 = existingContentBase64;
-    } catch (err) {
-      if (err?.status !== 404) throw err;
-    }
-    // The open dataset's view replaces that dataset's section of the file;
-    // the contributor's other datasets stay as published.
-    const content = encodeBase64Bytes(
-      toAnnotationPublicationBytes(
-        composeUserFile(published, this.datasetId, userDoc, {
-          path,
-          filename: `${fileUser}.json`,
-        }),
-        { path }
+    // Direct: the open dataset's view replaces that dataset's section of the
+    // file; the contributor's other datasets stay as published.
+    const view = mode === 'direct' ? viewOver(published) : null;
+    const content = mode === 'direct'
+      ? encodeBase64Bytes(
+        toAnnotationPublicationBytes(composeUserFile(published, this.datasetId, view, { path, filename }), { path })
       )
-    );
-
-    if (
-      remoteContentBase64 !== null &&
-      base64PayloadEqualsCanonical(remoteContentBase64, content, path)
-    ) {
-      return {
-        mode: 'none',
-        branch,
-        path,
-        sha,
-        remoteUpdatedAt,
-      };
+      : null;
+    if (mode === 'direct' && upstream !== null && base64PayloadEqualsCanonical(upstream.contentBase64, content, path)) {
+      return { mode: 'none', branch, path, sha: upstream.sha, remoteUpdatedAt, view };
     }
-
     const expectedSha = conflictIfRemoteShaNotEqual === null
       ? null
-      : assertGitHubSha(
-        conflictIfRemoteShaNotEqual,
-        'Expected remote user-file SHA'
-      );
+      : assertGitHubSha(conflictIfRemoteShaNotEqual, 'Expected remote user-file SHA');
+    const sha = upstream?.sha ?? null;
     if (!expectedSha && sha) {
-      const err = new Error(
-        'Missing baseline version for your remote user file.\n' +
-        'Pull first to merge any existing votes/suggestions, then Publish again.'
+      const err = conflictError(
+        path,
+        'Missing baseline version for your remote user file.\nPull first to merge any existing votes/suggestions, then Publish again.'
       );
-      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-      err.remoteUpdatedAt = remoteUpdatedAt;
-      err.remoteSha = sha;
-      err.expectedSha = null;
-      err.path = path;
+      Object.assign(err, { remoteUpdatedAt, remoteSha: sha, expectedSha: null });
       throw err;
     }
     if (expectedSha && sha !== expectedSha) {
-      const err = new Error(
-        'Remote user file changed since your last Pull.\n' +
-        'Pull first to merge changes before publishing.'
-      );
-      err.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-      err.remoteUpdatedAt = remoteUpdatedAt;
-      err.remoteSha = sha;
-      err.expectedSha = expectedSha;
-      err.path = path;
+      const err = conflictError(path, 'Remote user file changed since your last Pull.\nPull first to merge changes before publishing.');
+      Object.assign(err, { remoteUpdatedAt, remoteSha: sha, expectedSha });
       throw err;
     }
 
-    const repoInfo =
-      this._repoInfo === null
-        ? await getRepoInfo({
-            workerOrigin,
-            owner: this.owner,
-            repo: this.repo,
-            token,
-            signal: requestSignal,
-          })
-        : this._repoInfo;
-    assertRepositoryPublicationInfo(repoInfo);
-    this._repoInfo = repoInfo;
-    const msg = commitMessage === null
-      ? `Update annotations for @${authenticatedUser.login}`
-      : assertExactNonblankString(
-        commitMessage,
-        'Annotation user-file commit message',
-        { max: 256 }
-      );
-    try {
-      const result = await publishAnnotationFile({
-        publicationMode: mode,
+    if (mode === 'fork-pull-request') {
+      const result = await publishUserFileViaFork(ctx, {
         repoInfo,
-        workerOrigin,
-        upstreamOwner: this.owner,
-        upstreamRepo: this.repo,
-        token,
+        source,
         baseBranch: branch,
         datasetId: this.datasetId,
-        fileUser,
-        path,
+        file: { fileUser, path, filename },
+        viewOver,
+        upstream,
+        authUser: authenticatedUser,
         title: msg,
         body: [
           'Community annotation update from Cellucid.',
@@ -3561,25 +2236,72 @@ export class CommunityAnnotationGitHubSync {
           `User: @${authenticatedUser.login}`,
           `File: \`${path}\``,
         ].join('\n'),
-        contentBase64: content,
-        sourceSha: sha,
         signal: requestSignal,
       });
-      return { ...result, path, remoteUpdatedAt };
+      return { ...result, branch, path, remoteUpdatedAt };
+    }
+
+    if (!assertRepositoryPublicationInfo(repoInfo).canDirectPush) {
+      throw new Error('Direct annotation publication requires GitHub write permission');
+    }
+    try {
+      const response = await putContent(ctx, {
+        owner: source.owner,
+        repo: source.repo,
+        path,
+        branch,
+        message: msg,
+        contentBase64: content,
+        sha,
+        signal: requestSignal,
+      });
+      return {
+        mode: 'direct',
+        sha: assertGitHubSha(response?.content?.sha, 'Published GitHub content SHA'),
+        branch,
+        path,
+        remoteUpdatedAt,
+        view,
+      };
     } catch (err) {
-      if (isContentConflictError(err)) {
-        const conflict = new Error(
-          'Remote user file changed while publishing.\n' +
-          'Pull first to merge changes before publishing.'
-        );
-        conflict.code = 'COMMUNITY_ANNOTATION_CONFLICT';
-        conflict.remoteUpdatedAt = remoteUpdatedAt;
-        conflict.path = path;
-        throw inheritMutationErrorContext(conflict, err);
-      }
+      if (err?.code === 'COMMUNITY_ANNOTATION_CONFLICT') err.remoteUpdatedAt = remoteUpdatedAt;
       throw err;
     }
   }
+}
+
+/**
+ * Fold a Pull's cached files into `remoteUserFiles` (the session's
+ * `createRemoteUserFiles()`), one record at a time from the file cache: a
+ * file excluded when it was read stays out, and one the session refuses when
+ * it is folded (`COMMUNITY_ANNOTATION_FILE_REJECTED`: an id another
+ * contributor owns, a second file of one identity) is left out on its own.
+ * Answers `{excluded: [{path, sha, reason}], moderationDocument}`.
+ */
+export async function foldCachedFiles({ fileCache, cacheScope, remoteUserFiles }) {
+  const excluded = [];
+  let moderationDocument = null;
+  await fileCache.forEachRecord(cacheScope, (record) => {
+    if (record.rejection !== null) {
+      excluded.push({ path: record.path, sha: record.sha, reason: record.rejection.message });
+      return;
+    }
+    if (record.path === ANNOTATION_MERGES_PATH) {
+      moderationDocument = record.view;
+      return;
+    }
+    try {
+      remoteUserFiles.add(record.view);
+    } catch (error) {
+      if (error?.code !== 'COMMUNITY_ANNOTATION_FILE_REJECTED') throw error;
+      excluded.push({ path: record.path, sha: record.sha, reason: String(error.message) });
+    }
+  });
+  return { excluded, moderationDocument };
+}
+
+export function parseOwnerRepo(input) {
+  return parseCanonicalGitHubRepositoryReference(input);
 }
 
 export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOverride = null } = {}) {
@@ -3594,69 +2316,40 @@ export function getGitHubSyncForDataset({ datasetId, username = 'local', tokenOv
   if (meta.branchMode === 'explicit' && parsed.ref === null) {
     throw new Error('Explicit annotation repository connection is missing its branch');
   }
-  const branchMode = meta.branchMode;
-  const token = tokenOverride === null
-    ? getGitHubAuthSession().getToken()
-    : assertOptionalToken(tokenOverride);
+  const token = tokenOverride === null ? getGitHubAuthSession().getToken() : assertOptionalToken(tokenOverride);
   return new CommunityAnnotationGitHubSync({
     datasetId,
     owner: parsed.owner,
     repo: parsed.repo,
     token,
-    branch: branchMode === 'explicit' ? (parsed.ref || null) : null,
-    workerOrigin: getGitHubWorkerOrigin()
+    branch: meta.branchMode === 'explicit' ? (parsed.ref || null) : null,
+    workerOrigin: getGitHubWorkerOrigin(),
   });
 }
 
 export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue, username = 'local' }) {
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed || parsed.ref === null) return false;
-  return setAnnotationRepoForDataset(
-    datasetId,
-    parsed.ownerRepoRef,
-    username,
-    { branchMode: 'explicit' }
-  );
+  return setAnnotationRepoForDataset(datasetId, parsed.ownerRepoRef, username, { branchMode: 'explicit' });
 }
 
-export async function resolveAnnotationRepositoryFromUrlParam({
-  urlParamValue,
-  tokenOverride = null,
-  signal = null,
-} = {}) {
-  const requestSignal = assertAbortSignalOrNull(
-    signal,
-    'Annotation repository resolution signal'
-  );
+export async function resolveAnnotationRepositoryFromUrlParam({ urlParamValue, tokenOverride = null, signal = null } = {}) {
+  const requestSignal = assertAbortSignalOrNull(signal, 'Annotation repository resolution signal');
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed) return null;
-
   // Default-branch ownership is resolved once, before the repository reference
   // becomes persistent state.
   if (!parsed.ref) {
-    const token = tokenOverride === null
-      ? getGitHubAuthSession().getToken()
-      : assertOptionalToken(tokenOverride);
+    const token = tokenOverride === null ? getGitHubAuthSession().getToken() : assertOptionalToken(tokenOverride);
     if (!token) return false;
-    const repoInfo = await getRepoInfo({
-      workerOrigin: getGitHubWorkerOrigin(),
-      owner: parsed.owner,
-      repo: parsed.repo,
-      token,
-      signal: requestSignal,
-    });
-    const head = assertGitHubBranch(
-      repoInfo?.default_branch,
-      'GitHub repository default_branch'
+    const workerOrigin = getGitHubWorkerOrigin();
+    const repoInfo = await githubGet(
+      { workerOrigin, token, transport: defaultWorkerTransport(workerOrigin), onWait: null },
+      repoPath(parsed.owner, parsed.repo),
+      { signal: requestSignal }
     );
-    return {
-      repoRef: `${parsed.ownerRepo}@${head}`,
-      branchMode: 'default',
-    };
+    const head = assertGitHubBranch(repoInfo?.default_branch, 'GitHub repository default_branch');
+    return { repoRef: `${parsed.ownerRepo}@${head}`, branchMode: 'default' };
   }
-
-  return {
-    repoRef: parsed.ownerRepoRef,
-    branchMode: 'explicit',
-  };
+  return { repoRef: parsed.ownerRepoRef, branchMode: 'explicit' };
 }

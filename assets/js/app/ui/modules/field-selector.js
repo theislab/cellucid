@@ -22,6 +22,8 @@ import {
   isAnnotationRepoConnected
 } from '../../community-annotations/access-store.js';
 import { syncCommunityAnnotationCacheContext } from '../../community-annotations/runtime-context.js';
+import { annotationFieldKey } from '../../community-annotations/field-names.js';
+import { quoteName } from '../../actions/targets/names.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
 import {
   createFieldInteractionOwner,
@@ -30,6 +32,9 @@ import {
 } from './field-interaction-owner.js';
 import { useOpenCells } from '../../../data/open-cells-work.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { getActions } from '../../actions/index.js';
+import { requireNewName, resolveField } from '../../actions/targets/fields.js';
+import { dispatchFromControl, isQuietFailure, reportActionFailure } from '../../actions/control-dispatch.js';
 
 const NONE_FIELD_VALUE = '-1';
 const INIT_KEYS = new Set(['state', 'dom', 'dataSourceManager', 'callbacks']);
@@ -57,14 +62,12 @@ const DOM_TYPES = new Map([
 ]);
 const REQUIRED_STATE_METHODS = [
   'clearActiveField',
-  'deleteField',
   'duplicateField',
   'ensureFieldLoaded',
   'getDatasetGeneration',
   'getFields',
   'getVarFields',
   'getVisibleFields',
-  'renameField',
   'setActiveField'
 ];
 
@@ -420,29 +423,6 @@ export function initFieldSelector(options) {
     }
   }
 
-  function reportTaskFailure(task, prefix, category) {
-    if (
-      task === null
-      || typeof task !== 'object'
-      || typeof task.then !== 'function'
-      || typeof task.catch !== 'function'
-    ) {
-      throw new TypeError('Field selector UI task must be a Promise');
-    }
-    interactionOwner.track(task);
-    task.catch((error) => {
-      if (isCancellation(error)) {
-        return;
-      }
-      const exactError = requireError(error, 'Field selector UI task');
-      console.error(exactError);
-      getNotificationCenter().error(
-        `${prefix}: ${exactError.message}`,
-        { category }
-      );
-    });
-  }
-
   function readDatasetGeneration() {
     const generation = state.getDatasetGeneration();
     if (!Number.isSafeInteger(generation) || generation < 0) {
@@ -600,7 +580,7 @@ export function initFieldSelector(options) {
       if (isCommunityAnnotationUiEnabled()) {
         catVotingLocked = readAnnotationFlag(
           'isFieldAnnotated',
-          field.key
+          annotationFieldKey(field)
         );
       }
     }
@@ -653,7 +633,7 @@ export function initFieldSelector(options) {
       isCommunityAnnotationUiEnabled()
       && source === FieldSource.OBS
       && field.kind === FieldKind.CATEGORY
-      && readAnnotationFlag('isFieldAnnotated', field.key)
+      && readAnnotationFlag('isFieldAnnotated', annotationFieldKey(field))
     ) {
       getNotificationCenter().error(
         'Rename is disabled while voting is enabled for this field',
@@ -676,21 +656,17 @@ export function initFieldSelector(options) {
         ) {
           return;
         }
-        const renamed = requireBoolean(
-          state.renameField(source, index, newName),
-          'Field rename result'
-        );
-        if (!renamed) {
-          getNotificationCenter().error(
-            'Failed to rename field',
-            { category: 'filter' }
+        void dispatchFromControl(
+          'field.rename',
+          { field: { source, key: field.key }, name: newName },
+          { failure: 'Failed to rename field', category: 'filter' }
+        ).then(done => {
+          if (done?.outcome == null) return;
+          getNotificationCenter().success(
+            `Renamed to "${newName}"`,
+            { category: 'filter', duration: 2000 }
           );
-          return;
-        }
-        getNotificationCenter().success(
-          `Renamed to "${newName}"`,
-          { category: 'filter', duration: 2000 }
-        );
+        });
       },
       onCancel: () => {
         releaseTransient();
@@ -728,7 +704,7 @@ export function initFieldSelector(options) {
       isCommunityAnnotationUiEnabled()
       && source === FieldSource.OBS
       && field.kind === FieldKind.CATEGORY
-      && readAnnotationFlag('isFieldAnnotated', field.key)
+      && readAnnotationFlag('isFieldAnnotated', annotationFieldKey(field))
     ) {
       getNotificationCenter().error(
         'Delete is disabled while voting is enabled for this field',
@@ -754,21 +730,17 @@ export function initFieldSelector(options) {
         ) {
           return;
         }
-        const deleted = requireBoolean(
-          state.deleteField(source, index),
-          'Field deletion result'
-        );
-        if (!deleted) {
-          getNotificationCenter().error(
-            'Failed to delete field',
-            { category: 'filter' }
+        void dispatchFromControl(
+          'field.delete',
+          { field: { source, key: field.key } },
+          { failure: 'Failed to delete field', category: 'filter' }
+        ).then(done => {
+          if (done === null) return;
+          getNotificationCenter().success(
+            `Deleted "${field.key}"`,
+            { category: 'filter', duration: 2500 }
           );
-          return;
-        }
-        getNotificationCenter().success(
-          `Deleted "${field.key}"`,
-          { category: 'filter', duration: 2500 }
-        );
+        });
       },
       onCancel: () => {
         releaseTransient();
@@ -892,9 +864,9 @@ export function initFieldSelector(options) {
         if (
           annotationUiEnabled
           && select === categoricalSelect
-          && readAnnotationFlag('isFieldAnnotated', field.key)
+          && readAnnotationFlag('isFieldAnnotated', annotationFieldKey(field))
         ) {
-          annotationBadge = readAnnotationFlag('isFieldClosed', field.key)
+          annotationBadge = readAnnotationFlag('isFieldClosed', annotationFieldKey(field))
             ? '🗳️🏁 '
             : '🗳️ ';
         }
@@ -933,8 +905,14 @@ export function initFieldSelector(options) {
    * no change commits under it. Whatever keeps it from being shown is said
    * (`describeUnshownField`), except a newer choice, Cancel, or another
    * dataset.
+   *
+   * It is the implementation of the action `color.by` (`colorByAction`):
+   * the controls dispatch the action, and `signal` is the action's.
+   *
+   * @param {number} idx
+   * @param {{signal?: AbortSignal|null}} [options]
    */
-  function activateField(idx) {
+  function activateField(idx, { signal = null } = {}) {
     assertAlive();
     const index = requireSelectableIndex(idx, 'Field activation index');
     if (interactionOwner.isSuspended()) {
@@ -953,7 +931,7 @@ export function initFieldSelector(options) {
     return interactionOwner.run(token => useOpenCells(
       () => activateFieldOnOpenCells(index, token),
       token.signal
-    ));
+    ), { signal });
   }
 
   async function activateFieldOnOpenCells(index, token) {
@@ -1052,68 +1030,124 @@ export function initFieldSelector(options) {
     }
   }
 
-  async function duplicateSelectedField(select, expectedKind) {
-    const index = parseSelectorIndex(
-      select.value,
-      `${expectedKind} duplicate selection`
-    );
-    if (index === -1) return;
-    const { field } = getFieldForSource(FieldSource.OBS, index);
-    if (field.kind !== expectedKind) {
-      throw new Error(
-        `${expectedKind} duplicate action references the wrong field kind`
-      );
-    }
-    const intent = interactionOwner.beginIntent();
-
+  /**
+   * Duplicate a field and colour by the copy (the toolbars' copy button),
+   * as a step: the action `field.duplicate`, said while it runs.
+   *
+   * @param {'obs'|'var'} source
+   * @param {number} index
+   */
+  function duplicateFieldAt(source, index) {
+    assertAlive();
+    const { field } = getFieldForSource(source, index);
     const notifications = getNotificationCenter();
     const notificationId = notifications.loading(
       `Duplicating "${field.key}"…`,
       { category: 'filter' }
     );
-    try {
-      const result = requireDuplicateResult(
-        await state.duplicateField(FieldSource.OBS, index),
-        FieldSource.OBS,
-        state
-      );
-      interactionOwner.assertIntentCurrent(intent);
-      if (expectedKind === FieldKind.CATEGORY) {
-        categoricalSelect.value = String(result.newFieldIndex);
-        continuousSelect.value = NONE_FIELD_VALUE;
-      } else {
-        continuousSelect.value = String(result.newFieldIndex);
-        categoricalSelect.value = NONE_FIELD_VALUE;
-      }
-      await activateField(result.newFieldIndex);
-      if (expectedKind === FieldKind.CATEGORY) {
-        const updated = requireBoolean(
-          annotationSession.setFieldAnnotated(result.newKey, false),
-          'Duplicated field annotation reset'
-        );
-        if (!updated) {
-          throw new Error(
-            'Duplicated field annotation reset did not complete'
-          );
+    void getActions().dispatch('field.duplicate', { field: { source, key: field.key } }).then(
+      ({ outcome }) => {
+        notifications.complete(notificationId, `Created "${outcome.name}"`, { announce: true });
+      },
+      error => {
+        if (isQuietFailure(error)) {
+          notifications.dismiss(notificationId);
+          return;
         }
-      }
-      notifications.complete(
-        notificationId,
-        `Created "${result.newKey}"`,
-        { announce: true }
-      );
-    } catch (error) {
-      if (isCancellation(error)) {
         notifications.dismiss(notificationId);
-        return;
+        reportActionFailure(error, { failure: 'Duplicate failed', category: 'filter' });
       }
-      const exactError = requireError(error, 'Field duplication');
-      console.error(exactError);
-      notifications.fail(
-        notificationId,
-        `Duplicate failed: ${exactError.message}`
-      );
+    );
+  }
+
+  /** Colour the view in focus by `field` (`{source, key}`), or by nothing (null), as a step. */
+  function dispatchColorBy(field) {
+    void dispatchFromControl(
+      'color.by',
+      { field },
+      field === null
+        ? { failure: 'Failed to clear field', category: 'filter' }
+        : { failure: 'Failed to load field', category: 'data' }
+    );
+  }
+
+  /**
+   * The action `color.by`: colour by a field of the cells or a gene (named),
+   * or by nothing (null), through this selector's own choice, so the selects
+   * and the gene search name what is shown whoever chose it.
+   */
+  async function colorByAction({ field }, { signal }) {
+    assertAlive();
+    if (field === null) {
+      const cleared = await activateField(-1, { signal });
+      return cleared === null ? null : { field: null };
     }
+    const target = resolveField(state, field);
+    const info = target.source === FieldSource.OBS
+      ? await activateField(target.index, { signal })
+      : await geneSelector.selectGene(target.index, { signal });
+    if (info === null) return null;
+    return { field: target.field.key, source: target.source, kind: target.field.kind };
+  }
+
+  /**
+   * The action `field.duplicate`: copy a field (named) and colour by the
+   * copy; a categorical copy starts without community annotation voting.
+   */
+  async function duplicateAction({ field: ref, name }, { signal }) {
+    assertAlive();
+    const target = resolveField(state, ref);
+    if (name !== undefined) requireNewName(state, target.source, name);
+    // The copy is the latest choice: one under way ends, and a session or
+    // another dataset taking over meanwhile leaves the copy unshown.
+    const intent = interactionOwner.beginIntent();
+    const result = requireDuplicateResult(
+      await state.duplicateField(target.source, target.index, name === undefined ? {} : { newKey: name }),
+      target.source,
+      state
+    );
+    interactionOwner.assertIntentCurrent(intent);
+    if (target.source === FieldSource.VAR) {
+      geneSelector.initGeneExpressionDropdown();
+      await geneSelector.selectGene(result.newFieldIndex, { signal });
+      return { name: result.newKey };
+    }
+    renderFieldSelects();
+    await activateField(result.newFieldIndex, { signal });
+    if (target.field.kind === FieldKind.CATEGORY) {
+      const updated = requireBoolean(
+        annotationSession.setFieldAnnotated(result.newKey, false),
+        'Duplicated field annotation reset'
+      );
+      if (!updated) {
+        throw new Error(
+          'Duplicated field annotation reset did not complete'
+        );
+      }
+    }
+    return { name: result.newKey };
+  }
+
+  /**
+   * Why a field's name and categories cannot be edited now (community
+   * annotation voting on it), or null: the field and category actions refuse
+   * then, as the toolbar and the legend do.
+   *
+   * @param {'obs'|'var'} source
+   * @param {object} field
+   * @returns {string|null}
+   */
+  function fieldLock(source, field) {
+    if (destroyed) return null;
+    if (
+      source === FieldSource.OBS
+      && field.kind === FieldKind.CATEGORY
+      && isCommunityAnnotationUiEnabled()
+      && readAnnotationFlag('isFieldAnnotated', annotationFieldKey(field))
+    ) {
+      return `${quoteName(field.key)} cannot be edited while community annotation voting is enabled for it.`;
+    }
+    return null;
   }
 
   geneSelector = initGeneExpressionSelector({
@@ -1146,7 +1180,9 @@ export function initFieldSelector(options) {
       },
       onActivateField: idx => activateField(idx),
       onAdoptDatasetGeneration: adoptDatasetGeneration,
-      onChooseGeneNames: callbacks.onChooseGeneNames
+      onChooseGeneNames: callbacks.onChooseGeneNames,
+      onDuplicateField: duplicateFieldAt,
+      onClearColoring: () => dispatchColorBy(null)
     }
   });
   requireExactKeys(
@@ -1198,7 +1234,7 @@ export function initFieldSelector(options) {
       );
     }
     const datasetGeneration = readDatasetGeneration();
-    const enabled = readAnnotationFlag('isFieldAnnotated', field.key);
+    const enabled = readAnnotationFlag('isFieldAnnotated', annotationFieldKey(field));
     let releaseTransient = () => {};
     const closeDialog = showConfirmDialog({
       title: enabled
@@ -1222,7 +1258,7 @@ export function initFieldSelector(options) {
           return;
         }
         const updated = requireBoolean(
-          annotationSession.setFieldAnnotated(field.key, !enabled),
+          annotationSession.setFieldAnnotated(annotationFieldKey(field), !enabled),
           'Community annotation field update'
         );
         if (!updated) {
@@ -1250,17 +1286,9 @@ export function initFieldSelector(options) {
     );
     if (index >= 0) {
       continuousSelect.value = NONE_FIELD_VALUE;
-      reportTaskFailure(
-        activateField(index),
-        'Failed to load field',
-        'data'
-      );
+      dispatchColorBy({ source: FieldSource.OBS, key: getFieldForSource(FieldSource.OBS, index).field.key });
     } else if (continuousSelect.value === NONE_FIELD_VALUE) {
-      reportTaskFailure(
-        activateField(-1),
-        'Failed to clear field',
-        'filter'
-      );
+      dispatchColorBy(null);
     }
   }, { signal: lifecycle.signal });
 
@@ -1271,26 +1299,15 @@ export function initFieldSelector(options) {
     );
     if (index >= 0) {
       categoricalSelect.value = NONE_FIELD_VALUE;
-      reportTaskFailure(
-        activateField(index),
-        'Failed to load field',
-        'data'
-      );
+      dispatchColorBy({ source: FieldSource.OBS, key: getFieldForSource(FieldSource.OBS, index).field.key });
     } else if (categoricalSelect.value === NONE_FIELD_VALUE) {
-      reportTaskFailure(
-        activateField(-1),
-        'Failed to clear field',
-        'filter'
-      );
+      dispatchColorBy(null);
     }
   }, { signal: lifecycle.signal });
 
   categoricalCopyBtn.addEventListener('click', () => {
-    reportTaskFailure(
-      duplicateSelectedField(categoricalSelect, FieldKind.CATEGORY),
-      'Categorical duplicate action failed',
-      'filter'
-    );
+    const index = parseSelectorIndex(categoricalSelect.value, 'Categorical duplicate selection');
+    if (index >= 0) duplicateFieldAt(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
   categoricalRenameBtn.addEventListener('click', () => {
     const index = parseSelectorIndex(
@@ -1309,19 +1326,12 @@ export function initFieldSelector(options) {
     if (index >= 0) startFieldDelete(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
   categoricalClearBtn.addEventListener('click', () => {
-    reportTaskFailure(
-      activateField(-1),
-      'Failed to clear field',
-      'filter'
-    );
+    dispatchColorBy(null);
   }, { signal: lifecycle.signal });
 
   continuousCopyBtn.addEventListener('click', () => {
-    reportTaskFailure(
-      duplicateSelectedField(continuousSelect, FieldKind.CONTINUOUS),
-      'Continuous duplicate action failed',
-      'filter'
-    );
+    const index = parseSelectorIndex(continuousSelect.value, 'Continuous duplicate selection');
+    if (index >= 0) duplicateFieldAt(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
   continuousRenameBtn.addEventListener('click', () => {
     const index = parseSelectorIndex(
@@ -1340,11 +1350,7 @@ export function initFieldSelector(options) {
     if (index >= 0) startFieldDelete(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
   continuousClearBtn.addEventListener('click', () => {
-    reportTaskFailure(
-      activateField(-1),
-      'Failed to clear field',
-      'filter'
-    );
+    dispatchColorBy(null);
   }, { signal: lifecycle.signal });
 
   const rerenderForExternalState = () => renderFieldSelects();
@@ -1390,6 +1396,13 @@ export function initFieldSelector(options) {
   }
   categoryBuilderContainer.dataset.catBuilderInitialized = 'true';
 
+  // The orchestration above is the implementation of colouring and
+  // duplicating, whoever asks: a control here, an agent, a notebook, a replay.
+  const unprovideActions = [
+    getActions().provide('color.by', colorByAction),
+    getActions().provide('field.duplicate', duplicateAction),
+  ];
+
   function destroy() {
     if (destroyPromise !== null) return destroyPromise;
     destroyed = true;
@@ -1402,6 +1415,7 @@ export function initFieldSelector(options) {
     const interactionDestruction = interactionOwner.destroy();
     const errors = [];
     const cleanups = [
+      ...unprovideActions,
       () => closeTransientInteractions(),
       () => lifecycle.abort(),
       () => dataSourceManager.offDatasetChange(rerenderForExternalState),
@@ -1550,6 +1564,7 @@ export function initFieldSelector(options) {
       return deletedFieldsPanel.renderDeletedFieldsSection();
     },
     clearGeneSelection,
+    fieldLock,
     updateFieldSelectDisabledStates
   };
 }

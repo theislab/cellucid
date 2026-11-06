@@ -175,8 +175,12 @@ export const viewContextCoreMethods = {
   _cloneFieldState(field) {
     if (!field) return null;
     const clone = { ...field };
-    // Category colours and visibility are shared: neither array is ever
-    // written, a change makes a new one (`category-state.js`).
+    // Shared, because none is ever written in place (a change makes a new
+    // one): category colours and visibility (`category-state.js`), the
+    // category list and its originals (`renameCategory`, `_applyCategoryOverlay`)
+    // and the centroid tables and their records (`_syncCentroidCategoryLabels`).
+    // Codes and values are replaced, not written. What is written in place
+    // below is copied.
     if (field._continuousStats) clone._continuousStats = { ...field._continuousStats };
     if (field._continuousFilter) clone._continuousFilter = { ...field._continuousFilter };
     if (field._continuousColorRange) clone._continuousColorRange = { ...field._continuousColorRange };
@@ -397,7 +401,8 @@ export const viewContextCoreMethods = {
    * naming the field by its old key (and saved it so), and lacked the
    * original key/categories a later revert needs. The rename-owned
    * properties are copied from the renamed field onto the same field in every
-   * other view, and those views' centroid labels follow a category rename.
+   * other view, and those views' centroid tables and labels follow a
+   * category rename.
    *
    * @param {'obs'|'var'} source
    * @param {object} renamed - The focused view's renamed field.
@@ -423,7 +428,14 @@ export const viewContextCoreMethods = {
       }
       if (Array.isArray(renamed.categories)) {
         if (target.categories !== renamed.categories) {
-          target.categories = [...renamed.categories];
+          // Lists and centroid tables are never written in place, so the
+          // view's copy shares the renamed list and relabels its own tables
+          // from its own previous list (it may share them with a third view).
+          const previous = target.categories;
+          target.categories = renamed.categories;
+          if (Array.isArray(previous) && previous.length === renamed.categories.length) {
+            this._syncCentroidCategoryLabels(target, previous);
+          }
         }
         if (Array.isArray(renamed._originalCategories)) {
           target._originalCategories = [...renamed._originalCategories];

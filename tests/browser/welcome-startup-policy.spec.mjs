@@ -191,6 +191,7 @@ test('a failed exact remote-server intent keeps onboarding hidden and says why',
 
   const remoteUrl = new URL('/', APP_ORIGIN);
   remoteUrl.searchParams.set('remote', APP_ORIGIN);
+  remoteUrl.searchParams.set('sampleCatalog', SAMPLE_CATALOG_URL);
   await page.goto(remoteUrl.toString(), { waitUntil: 'domcontentloaded' });
 
   // A server that does not answer is data that did not open: Cellucid

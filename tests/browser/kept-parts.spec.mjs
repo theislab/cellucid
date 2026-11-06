@@ -153,8 +153,8 @@ async function readsKept(page) {
  * lock, a kept file whose directory goes meanwhile fails in WebKit, which
  * says so on the page's console ("Failed to load resource: ...
  * WebKitBlobResource error 1", measured on macOS WebKit: a `File` read after
- * its file or directory was removed; one appended to, cut or rewritten reads
- * without a word).
+ * its file or directory was removed, and now and then one rewritten while it
+ * is read: 5 of 2,645 reads; `space.js` `filesOf` holds both under one lock).
  */
 async function keptPartBytes(page) {
   return page.evaluate(async () => {
@@ -257,7 +257,13 @@ test('a visit cut short at once keeps what it read: the page closed the moment i
   test.skip(!keeps, 'this browser gives the reader worker no storage it can write');
   await readsEnded(page);
   const first = { ...counter };
-  // The tab is closed the moment its reads ended: no linger, no hidden page;
+  // A read does not wait for the disk: what it fetched is written in the worker's next
+  // turns, and a page closed before that fetches the last range again (1 GET in 12 on
+  // Firefox under load; a harmless cost of reads that never wait to be kept). What is
+  // held here is that nothing more is needed once it is written: the journal open, no
+  // quiet time gone by, nothing flushed, no page event.
+  await expect.poll(() => keptPartBytes(page), { timeout: 60_000 }).toBeGreaterThanOrEqual(first.bytes);
+  // The tab is closed the moment that is so: no linger, no hidden page;
   // the application is torn down first, which ends its reader workers from
   // outside (nothing they were asked to keep is waited for).
   const context = page.context();

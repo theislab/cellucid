@@ -1,0 +1,22 @@
+{
+  "examples": [
+    {
+      "step": "s3"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "step": {
+        "pattern": "^s(0|[1-9][0-9]*)$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "step"
+    ],
+    "type": "object"
+  },
+  "type": "history.step.revert",
+  "version": 1
+}

@@ -1,3 +1,4 @@
+import { takeSplitClicksOn } from './split-clicks.mjs';
 import { expect } from './test.mjs';
 
 /**
@@ -22,16 +23,34 @@ export const SESSION_SECTION_TOGGLES = Object.freeze({
 
 /**
  * Opens one Session section, as a person does with a click on its header,
- * and returns once it is open. A click before the page bound the header
- * does nothing, so it is clicked until the header says it is open.
+ * and returns once it is open.
+ *
+ * The header is bound with the rest of the interface (`initUI`, after which
+ * the page keeps `window._cellucidUi`): a click before that reaches nothing,
+ * so the helper waits for it. From then on a click toggles the section, and
+ * the header is clicked until it says it is open, for two things can happen
+ * between the look and the click that a person would answer the same way,
+ * by clicking again:
+ * - the page opens the section itself when it has something to show there
+ *   (`expandSessionSection`: genes read for a sample of the open cells),
+ *   and a click that lands just after closes it again;
+ * - the header sits under the Dataset box, which fills in while the start
+ *   dataset opens and moves it: a click whose press and release fell on
+ *   either side of such a move is no click (`split-clicks.mjs`). It is
+ *   reported as one, and taken here as answered.
  *
  * @param {import('@playwright/test').Page} page
  * @param {keyof typeof SESSION_SECTION_TOGGLES} name
  */
 export async function openSessionSection(page, name) {
-  const toggle = page.locator(`#${SESSION_SECTION_TOGGLES[name]}`);
+  const id = SESSION_SECTION_TOGGLES[name];
+  const toggle = page.locator(`#${id}`);
+  await page.waitForFunction(() => window._cellucidUi !== undefined, null, { timeout: 0 });
   await expect.poll(async () => {
-    if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
+    if (await toggle.getAttribute('aria-expanded') !== 'true') {
+      await toggle.click();
+      await takeSplitClicksOn(page, id);
+    }
     return toggle.getAttribute('aria-expanded');
   }).toBe('true');
 }

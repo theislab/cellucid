@@ -18,6 +18,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // No `dataset` parameter: the app opens on the catalog default sample.
 const APP_URL =
@@ -65,7 +66,7 @@ async function openSections(page) {
 
 async function saveSession(page, testInfo) {
   const download = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('sample.cellucid-session');
   await (await download).saveAs(sessionPath);
   return sessionPath;
@@ -167,16 +168,16 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
     'title',
     'Load a dataset to export a figure',
   );
-  const saveButton = page.locator('#save-state-btn');
-  await expect(saveButton).toBeDisabled();
-  await expect(saveButton).toHaveAttribute(
+  const shareButton = page.locator('#history-share-btn');
+  await expect(shareButton).toBeDisabled();
+  await expect(shareButton).toHaveAttribute(
     'title',
-    'Load a dataset to save a session',
+    'Load a dataset to share a session',
   );
 
   // Load stays available and names the dataset the session needs.
   const chooser = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooser).setFiles(sessionPath);
   const refusal = page.locator('.notification-error', {
     hasText: 'No dataset is open.',
@@ -249,7 +250,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   await expect(page.locator('#dataset-name')).toHaveText(SAMPLE_NAME);
   await expect(keepView).toBeEnabled();
   await expect(exportButton).toBeEnabled();
-  await expect(saveButton).toBeEnabled();
+  await expect(shareButton).toBeEnabled();
   await expect(
     annotation.locator('[data-community-annotation-action="github-connection"]'),
   ).toBeEnabled();
@@ -264,12 +265,14 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   ).toHaveCount(1);
   await keepView.click();
   await expect(page.locator('.split-badge')).toHaveCount(2);
-  await saveSession(page, testInfo);
-  await expect(
+  // Share… › Save file says the file it wrote, for a few seconds: watched from before the save.
+  const saidSaved = expect(
     page.locator('.notification-success', {
-      hasText: 'Session saved successfully',
+      hasText: /Saved .+\.cellucid-session\./,
     }),
   ).not.toHaveCount(0);
+  await saveSession(page, testInfo);
+  await saidSaved;
 
   expect(pageErrors).toEqual([]);
   // The refused session load is the one error the app reports, by design.

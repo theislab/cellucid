@@ -13,26 +13,50 @@
  *   `unauthorized`. Nothing else is sent before `welcome`, and the socket is
  *   that one viewer's from then on, so no later frame carries credentials;
  * - **commands** (host → viewer): text frames, one JSON object each, keys
- *   exactly as `VIEWER_COMMAND_FIELDS` names them; a command that names
- *   cells or carries a column (a highlight, a visibility change, a field) is
- *   a **binary frame** (`VIEWER_BINARY_COMMAND_HEADER_FIELDS`,
- *   `decodeViewerBinaryCommand`);
+ *   exactly as `VIEWER_COMMAND_FIELDS` names them; an `action` whose
+ *   parameters hold typed arrays (cells, a column's values) is a **binary
+ *   frame** (`VIEWER_BINARY_COMMAND_HEADER_FIELDS`, `decodeViewerBinaryCommand`);
  * - **events** (viewer → host): text frames, keys exactly as
- *   `VIEWER_EVENT_FIELDS` names them; a selection, a result and a session
- *   bundle are **binary frames** (`VIEWER_BINARY_EVENT_HEADER_FIELDS`).
+ *   `VIEWER_EVENT_FIELDS` names them; a selection, a result, an action's
+ *   answer and a session bundle are **binary frames**
+ *   (`VIEWER_BINARY_EVENT_HEADER_FIELDS`).
+ *
+ * **Actions.** Everything a host changes or reads in the viewer is an action
+ * of the catalogue (`app/actions/`; the catalogue document both packages
+ * generate their methods from is `tests/fixtures/action-catalog.json`): one
+ * `action` command names it (`action`, its dotted type) with its parameters,
+ * and the viewer answers it with one `action_result` (its outcome, a read's
+ * result, and the history step it made, or null) or one `command_error`
+ * carrying the same `requestId`. A host action takes the path a person's
+ * control takes: one step of the history, labelled as the host's, undone like
+ * any other. Undo, redo and jumps are actions of the catalogue too, and so is
+ * every other history action (`history.*`).
+ *
+ * **The history.** An action may belong to a host's **turn** (`turn`, its id,
+ * and `turnLabel`, what it was asked to do; both null otherwise): every step
+ * of one turn is undone together in the State panel, as an agent's turn is.
+ * Whenever the history changes (a step, a move, an edit, a tracker, a loaded
+ * session) the viewer sends `history_changed`, saying what kind of change it
+ * was and where the history now stands, so a host keeps a current account of
+ * it without asking; a host reads the history itself with the history's read
+ * actions. A host pushes a session file into the viewer with `load_session`
+ * (a binary frame, the file as its body), answered by `session_loaded` (the
+ * tracker shown and its head) or a `command_error`; the file's trackers are
+ * added beside the person's own.
  *
  * A binary frame, either way, is a little-endian uint32 header length, that
  * many bytes of UTF-8 JSON header, then the body (`encodeViewerBinaryFrame`).
- * A body of cells is little-endian uint32 cell indices, strictly ascending:
- * a million cells are 4 MB read in place, where the same cells as JSON text
- * were 7 MB to build and parse.
+ * A body of cells is little-endian uint32 cell indices: a million cells are
+ * 4 MB read in place, where the same cells as JSON text were 7 MB to build
+ * and parse. A binary `action`'s header lists each typed array of its
+ * parameters (`arrays`: where it goes in `params`, its type and length) and
+ * its body holds them in that order (`encodeViewerAction`).
  *
  * **Cells are original positions.** Every cell either side names -- in a
- * selection, a hover, a click, a result, a highlight or visibility command, a
- * pushed field -- is its row in the dataset's `obs` (0-based), whether the
- * viewer opened every cell or a subsample of them (`data/cell-identity.js`).
- * `nObs` in a result or a field is the dataset's whole cell count, so each
- * side checks it names the same dataset.
+ * selection, a hover, a click, a result, an action's parameters -- is its
+ * row in the dataset's `obs` (0-based), whether the viewer opened every cell
+ * or a subsample of them (`data/cell-identity.js`). `nObs` in a result is the
+ * dataset's whole cell count, so each side checks it names the same dataset.
  *
  * **Results** are what a person made in the viewer and a host pulls back
  * into its AnnData, Seurat or SingleCellExperiment object: highlight groups
@@ -69,7 +93,27 @@
  * count; none when it is null), then `values` of the header's `values` type,
  * one per named cell, or one per cell of the dataset when `cells` is null.
  * Category codes take the type's largest value for "no category"; float
- * values take NaN for "no value". A `setField` command's body is the same.
+ * values take NaN for "no value".
+ *
+ * **Agents.** A host may carry an agent's tool calls to the viewer: an agent
+ * app on the same computer (Claude Code, Claude Desktop, Cursor) driving the
+ * viewer through the host package's local MCP server (`cellucid mcp`). The
+ * viewer runs them exactly as it runs a connector agent's calls
+ * (`app/agent/bridge/agent-calls.js`): as the agent (`agent`, the app's name)
+ * through a connection of kind `local` (`connection`: `{id, client}`, the
+ * MCP session and the app's own name), so the person's permissions decide,
+ * a question is asked in the viewer's confirm card, the steps are one turn
+ * the person can Stop and undo. `agent_list` asks for the tools as that
+ * connection may use them, answered by `agent_tools` (binary: the MCP tools
+ * as UTF-8 JSON); `agent_call` runs one, answered by exactly one
+ * `agent_result` (binary: the MCP tool result as UTF-8 JSON, an error
+ * included); while the person is asked about a call the viewer sends
+ * `agent_asking` (the card's question in one sentence, `message`, and what
+ * makes it cost, `detail`) and then `agent_answered`; `agent_answer`
+ * answers that question from the agent's app (the person answered an MCP
+ * elicitation there); `agent_cancel` stops a call the app gave up on.
+ * `agent_tools_changed` says the person's settings changed what a tool list
+ * says (ask it again).
  *
  * `GET /_cellucid/protocol` names the channel and lists every command the
  * host may send, which of them it sends as binary frames, and every event
@@ -89,7 +133,7 @@ import { formatCountOf } from '../utils/format-units.js';
 import { allocateTypedArray } from './sparse-column-index.js';
 
 /** The document's version: a reader of `viewer-protocol.json` checks it. */
-export const VIEWER_PROTOCOL_SCHEMA = 2;
+export const VIEWER_PROTOCOL_SCHEMA = 5;
 
 /** Where the channel is, relative to the server's base address. */
 export const VIEWER_CHANNEL_PATH = '_cellucid/ws';
@@ -133,42 +177,67 @@ export const VIEWER_CLOSE_CODES = Object.freeze({
 
 /**
  * Every command a host sends as a text frame, with the exact keys it carries.
- * `setGeneSet`: add the gene set `name`, or replace the one of that name
- * (answered by its `result`, carrying this `requestId`).
+ * `action`: apply (or read) the catalogue's action `action` (its dotted type,
+ * `color.by`) with `params`, a JSON object the action's parameter schema
+ * checks, as part of the host's turn `turn` (its id) labelled `turnLabel`, or
+ * of none (both null); answered by an `action_result` or a `command_error`
+ * with the same `requestId`. `requestSessionBundle`: the history as a
+ * `.cellucid-session` file (format 4), answered by a `session_bundle` or a
+ * `command_error`. `freeze`: the host stopped; keep the last complete view.
  */
 export const VIEWER_COMMAND_FIELDS = Object.freeze({
   ping: Object.freeze(['type', 'requestId']),
   debug_snapshot: Object.freeze(['type', 'requestId']),
   requestSessionBundle: Object.freeze(['type', 'requestId']),
-  clearHighlights: Object.freeze(['type']),
-  setColorBy: Object.freeze(['type', 'field']),
-  resetCamera: Object.freeze(['type']),
   freeze: Object.freeze(['type']),
-  setDataMapping: Object.freeze(['type', 'requestId', 'mapping']),
-  setGeneSet: Object.freeze(['type', 'requestId', 'name', 'description', 'genes']),
+  action: Object.freeze(['type', 'requestId', 'action', 'params', 'turn', 'turnLabel']),
+  agent_list: Object.freeze(['type', 'requestId', 'connection']),
+  agent_call: Object.freeze(['type', 'requestId', 'tool', 'args', 'agent', 'connection']),
+  agent_cancel: Object.freeze(['type', 'requestId']),
+  agent_answer: Object.freeze(['type', 'requestId', 'allowed']),
 });
 
 /**
+ * The keys of an agent command's `connection`: `id`, the local connection
+ * (one MCP session of one app: letters, digits, `_` and `-`, at most 64),
+ * which the person's "allow for this connection" keys on; `client`, the
+ * app's own name (`clientInfo.name`), or null.
+ */
+export const VIEWER_AGENT_CONNECTION_FIELDS = Object.freeze(['id', 'client']);
+export const VIEWER_AGENT_CONNECTION_ID_PATTERN = '^[A-Za-z0-9_-]{1,64}$';
+const AGENT_CONNECTION_ID = new RegExp(VIEWER_AGENT_CONNECTION_ID_PATTERN);
+
+/**
  * Every command a host sends as a binary frame, with the exact keys of its
- * header. `highlight`: the cells to highlight, at least one, in the
- * `#rrggbb` `color`, as one group named `label` (null: the viewer names it).
- * `setVisibility`: the cells to show or hide (`visible`), at least one; or,
- * with `all: true`, every cell, and an empty body. `setField`: a column as a
- * user-defined field `key` (added, or replacing the field of that key the
- * notebook pushed before), `categorical` with its `categories` or
- * `continuous` (`categories` null); its body is a result body (cells and
- * values) of a dataset of `nObs` cells. Answered by the field's `result`.
+ * header. `action`: an action whose parameters hold typed arrays (an
+ * `x-cells` list of original positions as uint32, an `x-values` column as
+ * any value type); `params` is the JSON rest of its parameters and `arrays`
+ * lists each array in body order: `{path, type, length}`, `path` the keys
+ * (and list indices) leading to it in `params`, its last key one `params`
+ * does not hold (the array fills it). The body is each array's elements,
+ * little-endian, one after another. `load_session`: a `.cellucid-session`
+ * file (format 4) to load into the viewer's history, beside the person's own
+ * trackers; `name` is the file's name (a loaded tracker names the file it came
+ * from) and the body is the file, answered by a `session_loaded` or a
+ * `command_error` with the same `requestId`.
  */
 export const VIEWER_BINARY_COMMAND_HEADER_FIELDS = Object.freeze({
-  highlight: Object.freeze(['type', 'color', 'label']),
-  setVisibility: Object.freeze(['type', 'visible', 'all']),
-  setField: Object.freeze(['type', 'requestId', 'key', 'kind', 'categories', 'nObs', 'cells', 'values']),
+  action: Object.freeze(['type', 'requestId', 'action', 'params', 'turn', 'turnLabel', 'arrays']),
+  load_session: Object.freeze(['type', 'requestId', 'name']),
 });
+
+/** The keys of one entry of a binary `action`'s `arrays`. */
+export const VIEWER_ACTION_ARRAY_FIELDS = Object.freeze(['path', 'type', 'length']);
 
 /**
  * Every event the viewer sends as a text frame, with its exact keys.
  * `ready`: the cells open (`n_cells`) and in the dataset (`n_obs`; more when
- * a subsample is open). `color_by`: the field the viewer colours by now
+ * a subsample is open). `command_error`: a command the viewer did not carry
+ * out, the `requestId` it named (null for one that names none) and why
+ * (`reason`, one sentence a person can act on). `data_mapping`: the data
+ * mapping the viewer shows, sent when a dataset opens and whenever it
+ * changes, and why it is what it is (`origin`; `notebook` for a host's
+ * `mapping.set`). `color_by`: the field the viewer colours by now
  * (`field` null: none), from `obs` or `var` (a gene, by its identifier: the
  * var index), and, for a gene whose shown name differs from its identifier
  * (the data mapping names the genes by a var column), that name (`symbol`;
@@ -180,7 +249,14 @@ export const VIEWER_BINARY_COMMAND_HEADER_FIELDS = Object.freeze({
  * result of `epoch` is gone. `results`: every result the viewer holds in
  * `epoch` at `revision`, each `{kind, id, revision}`, sent after every result
  * of a snapshot, and the host dataset they describe (`dataset`; null: the
- * viewer shows another dataset, and `items` is empty).
+ * viewer shows another dataset, and `items` is empty). `history_changed`: the
+ * history changed (`kind`, one of `VIEWER_HISTORY_CHANGE_KINDS`), and where it
+ * stands now: the tracker in use (`tracker`, its id), the step shown
+ * (`head`), the step the change made or concerns (`step`; null when none),
+ * and the active branch (`branch`, its id; null while the history names
+ * none). `session_loaded`: the session file of `load_session` `requestId` is
+ * loaded: the tracker now shown (`tracker`, `{id, name}`) and its step shown
+ * (`head`).
  */
 export const VIEWER_EVENT_FIELDS = Object.freeze({
   hover: Object.freeze(['type', 'cell', 'position']),
@@ -190,26 +266,54 @@ export const VIEWER_EVENT_FIELDS = Object.freeze({
   debug_snapshot: Object.freeze([
     'type', 'requestId', 'ts', 'locationHref', 'origin', 'serverUrl', 'connected', 'userAgent',
   ]),
-  command_error: Object.freeze(['type', 'command', 'reason']),
-  data_mapping: Object.freeze(['type', 'requestId', 'origin', 'mapping']),
+  command_error: Object.freeze(['type', 'command', 'requestId', 'reason']),
+  data_mapping: Object.freeze(['type', 'origin', 'mapping']),
   color_by: Object.freeze(['type', 'field', 'source', 'symbol', 'cells_read']),
   result_removed: Object.freeze(['type', 'epoch', 'revision', 'kind', 'id']),
   results: Object.freeze(['type', 'epoch', 'dataset', 'revision', 'nObs', 'items']),
+  history_changed: Object.freeze(['type', 'kind', 'tracker', 'head', 'step', 'branch']),
+  session_loaded: Object.freeze(['type', 'requestId', 'tracker', 'head']),
+  agent_asking: Object.freeze(['type', 'requestId', 'message', 'detail']),
+  agent_answered: Object.freeze(['type', 'requestId', 'allowed']),
+  agent_tools_changed: Object.freeze(['type']),
 });
+
+/**
+ * What a `history_changed` says changed: a step was recorded (`step`), the
+ * step shown moved (`moved`: undo, redo, a jump, another branch), the
+ * history's structure was edited (`edited`: a rename, a note, a bookmark, a
+ * delete, a restore, …), a tracker was started, used, renamed or removed
+ * (`tracker`), or a session file was loaded (`loaded`).
+ */
+export const VIEWER_HISTORY_CHANGE_KINDS = Object.freeze(['step', 'moved', 'edited', 'tracker', 'loaded']);
+
+/** The keys of a `session_loaded`'s `tracker`. */
+export const VIEWER_SESSION_LOADED_TRACKER_FIELDS = Object.freeze(['id', 'name']);
 
 /**
  * Every event the viewer sends as a binary frame, with the exact keys of its
  * header. `selection`: the body is the selected cells (original positions),
  * little-endian uint32, strictly ascending, at least one. `session_bundle`:
  * the body is the `.cellucid-session` file the host asked for with
- * `requestSessionBundle`. `result`: one result (`encodeViewerResult`);
- * `requestId` is the `setField` or `setGeneSet` it answers, or null.
+ * `requestSessionBundle`. `result`: one result (`encodeViewerResult`).
+ * `action_result`: the answer to the `action` command of `requestId`: the
+ * body is its outcome as UTF-8 JSON (`null` when the action did nothing to
+ * report; a read's result otherwise), and `step` the history step it made,
+ * `{id, label}`, or null (a read, or a change that changed nothing). The
+ * outcome travels in a body because a read's result (a picture of a view, the
+ * values of many cells) is as large as it asks for.
  */
 export const VIEWER_BINARY_EVENT_HEADER_FIELDS = Object.freeze({
   selection: Object.freeze(['type', 'source']),
   session_bundle: Object.freeze(['type', 'requestId']),
-  result: Object.freeze(['type', 'requestId', 'epoch', 'revision', 'kind', 'id', 'nObs', 'meta', 'cells', 'values']),
+  result: Object.freeze(['type', 'epoch', 'revision', 'kind', 'id', 'nObs', 'meta', 'cells', 'values']),
+  action_result: Object.freeze(['type', 'requestId', 'step']),
+  agent_tools: Object.freeze(['type', 'requestId']),
+  agent_result: Object.freeze(['type', 'requestId']),
 });
+
+/** The keys of an `action_result`'s `step`. */
+export const VIEWER_ACTION_STEP_FIELDS = Object.freeze(['id', 'label']);
 
 /** An epoch: 16 lowercase hexadecimal characters (64 random bits). */
 export const VIEWER_RESULT_EPOCH_PATTERN = '^[0-9a-f]{16}$';
@@ -257,12 +361,10 @@ export const VIEWER_HIGHLIGHT_TOOLS = Object.freeze([
 /**
  * Who made a field or gene set: the person (`user`), an analysis
  * (`analysis`: a gene signature's scores and sets), a marker genes result
- * (`markers`), or a host (`notebook`: pushed with `setField`/`setGeneSet`).
+ * (`markers`), or a host (`notebook`: pushed with its `field.push` or
+ * `gene-set.save` action).
  */
 export const VIEWER_RESULT_ORIGINS = Object.freeze(['analysis', 'markers', 'notebook', 'user']);
-
-/** The kinds of field a host pushes with `setField`. */
-export const VIEWER_FIELD_KINDS = Object.freeze(['categorical', 'continuous']);
 
 /** Each value type of a body, and its size in bytes (little-endian). */
 export const VIEWER_VALUE_TYPES = Object.freeze({
@@ -293,17 +395,21 @@ export const VIEWER_DATA_MAPPING_ORIGINS = Object.freeze([
   'notebook',
 ]);
 
-/** Longest `command_error` reason the viewer sends. */
-export const VIEWER_COMMAND_ERROR_REASON_LIMIT = 240;
+/**
+ * Longest `command_error` reason the viewer sends: room for an action's
+ * refusal that names what it expected ("There is no category … in …; its
+ * categories are …").
+ */
+export const VIEWER_COMMAND_ERROR_REASON_LIMIT = 1000;
 
 /** Every event type, text and binary, sorted. */
 export function viewerEventTypes() {
   return [...Object.keys(VIEWER_EVENT_FIELDS), ...Object.keys(VIEWER_BINARY_EVENT_HEADER_FIELDS)].sort();
 }
 
-/** Every command type, text and binary, sorted. */
+/** Every command type, text and binary (an `action` is either), sorted. */
 export function viewerCommandTypes() {
-  return [...Object.keys(VIEWER_COMMAND_FIELDS), ...Object.keys(VIEWER_BINARY_COMMAND_HEADER_FIELDS)].sort();
+  return [...new Set([...Object.keys(VIEWER_COMMAND_FIELDS), ...Object.keys(VIEWER_BINARY_COMMAND_HEADER_FIELDS)])].sort();
 }
 
 /** Every command type a host sends as a binary frame, sorted. */
@@ -364,8 +470,11 @@ function encodeFrame(header, body, aligned = false) {
       throw new TypeError('A binary viewer frame body must be bytes');
     }
   }
-  const text = JSON.stringify(header);
-  const headerBytes = new TextEncoder().encode(aligned ? text.padEnd(text.length + ((4 - (text.length % 4)) % 4)) : text);
+  const text = new TextEncoder().encode(JSON.stringify(header));
+  // Padding counts bytes, not characters: a header with non-ASCII text is
+  // longer in UTF-8 than in characters.
+  const pad = aligned ? (4 - (text.length % 4)) % 4 : 0;
+  const headerBytes = pad === 0 ? text : Uint8Array.from([...text, ...new Array(pad).fill(0x20)]);
   const length = parts.reduce((sum, part) => sum + part.length, 0);
   const frame = allocateTypedArray(Uint8Array, 4 + headerBytes.length + length, 'Viewer frame');
   new DataView(frame.buffer).setUint32(0, headerBytes.length, true);
@@ -512,8 +621,7 @@ export function requireViewerResultHeader(header) {
   if (!hasExactKeys(header, VIEWER_BINARY_EVENT_HEADER_FIELDS.result) || header.type !== 'result') {
     throw new TypeError(`A result header must carry exactly ${VIEWER_BINARY_EVENT_HEADER_FIELDS.result.join(', ')}`);
   }
-  const { requestId, epoch, revision, kind, id, nObs, meta, cells, values } = header;
-  if (requestId !== null && !isExactText(requestId)) throw new TypeError('A result requestId must be exact text or null');
+  const { epoch, revision, kind, id, nObs, meta, cells, values } = header;
   if (!isViewerResultEpoch(epoch)) throw new TypeError('A result epoch must be 16 lowercase hexadecimal characters');
   if (!Number.isSafeInteger(revision) || revision < 1) throw new TypeError('A result revision must be a positive integer');
   const metaFields = VIEWER_RESULT_META_FIELDS[kind];
@@ -589,20 +697,19 @@ export function requireViewerResultHeader(header) {
  * `cells` and `values` read from the arrays given) and the body's parts in
  * order, views of the arrays on a little-endian host.
  *
- * @param {{requestId: string|null, epoch: string, revision: number, kind: string, id: string,
+ * @param {{epoch: string, revision: number, kind: string, id: string,
  *   nObs: number, meta: Object, cells: Uint32Array|null,
  *   values: Uint8Array|Uint16Array|Uint32Array|Float32Array|Float64Array|null}} result
  *   `cells`: original positions, ascending; null for every cell of the dataset
  * @returns {{header: Object, body: Uint8Array[]}}
  */
 export function encodeViewerResult(result) {
-  const { requestId, epoch, revision, kind, id, nObs, meta, cells, values } = result;
+  const { epoch, revision, kind, id, nObs, meta, cells, values } = result;
   if (cells !== null && !(cells instanceof Uint32Array)) {
     throw new TypeError('Result cells must be a Uint32Array of original positions or null');
   }
   const header = {
     type: 'result',
-    requestId,
     epoch,
     revision,
     kind,
@@ -711,148 +818,312 @@ export function decodeViewerResult(frame) {
   return { header, ...sections };
 }
 
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
+
+/** A dotted action type, as the catalogue names one (`app/actions/catalog.js`). */
+const ACTION_TYPE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$/;
+
+/** Whether `value` is a dotted action type (`color.by`); its text is safe to show. */
+export function isViewerActionType(value) {
+  return typeof value === 'string' && ACTION_TYPE_PATTERN.test(value);
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && !ArrayBuffer.isView(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+/** A JSON value with finite numbers, plain objects and lists only. */
+function requireJsonValue(value, label, ancestors = new Set()) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`${label} holds a number JSON cannot carry`);
+    return;
+  }
+  if (typeof value !== 'object' || ancestors.has(value) || (!Array.isArray(value) && !isPlainObject(value))) {
+    throw new TypeError(`${label} must be JSON`);
+  }
+  ancestors.add(value);
+  for (const entry of Array.isArray(value) ? value : Object.values(value)) requireJsonValue(entry, label, ancestors);
+  ancestors.delete(value);
+}
+
 /**
- * Check one `setField` header: a key, a kind, the categories of a
- * categorical (null for a continuous), the dataset's cell count, and the
- * body's shape (codes for a categorical, floats for a continuous).
+ * Check an `action` command's own fields (its parameters are the action's
+ * schema's to check): a request id, a dotted action type, parameters that
+ * are one JSON object (typed arrays already placed in it), and its turn:
+ * `turn` (the turn's id, exact text) and `turnLabel` (what the turn was asked
+ * to do, text), both set or both null.
+ *
+ * @param {{requestId: unknown, action: unknown, params: unknown, turn: unknown, turnLabel: unknown}} command
  */
-function requireSetFieldHeader(header) {
-  const { requestId, key, kind, categories, nObs, cells, values } = header;
-  if (!isExactText(requestId)) throw new TypeError('A setField command requestId must be exact text');
-  if (!isExactText(key, { whitespace: true })) throw new TypeError('A setField command key must be exact text');
-  if (!VIEWER_FIELD_KINDS.includes(kind)) throw new TypeError('A setField command kind must be categorical or continuous');
-  if (!Number.isSafeInteger(nObs) || nObs < 1 || nObs > 0xffffffff) throw new TypeError('A setField command nObs must be a cell count');
-  if (cells !== null && (!isCount(cells) || cells < 1)) throw new TypeError('A setField command cells must be a count of at least one, or null');
-  if (kind === 'categorical') {
-    requireStringList(categories, 'A setField command\'s categories', { allowEmpty: false });
-    if (!CODE_TYPES.includes(values)) throw new TypeError('A categorical setField command carries uint8, uint16 or uint32 codes');
-  } else {
-    if (categories !== null) throw new TypeError('A continuous setField command has no categories');
-    if (!FLOAT_TYPES.includes(values)) throw new TypeError('A continuous setField command carries float32 or float64 values');
+export function requireViewerActionCommand(command) {
+  if (!isExactText(command?.requestId)) throw new TypeError('An action command requestId must be exact text');
+  if (!isViewerActionType(command.action)) {
+    throw new TypeError('An action command names its action by its dotted type, such as "color.by"');
+  }
+  if (!isPlainObject(command.params)) throw new TypeError('An action command params must be one object');
+  if ((command.turn === null) !== (command.turnLabel === null)) {
+    throw new TypeError('An action command names its turn and the turn\'s label together, or neither');
+  }
+  if (command.turn !== null && !isExactText(command.turn)) throw new TypeError('An action command turn must be exact text or null');
+  if (command.turnLabel !== null && !isExactText(command.turnLabel, { whitespace: true })) {
+    throw new TypeError('An action command turnLabel must be text or null');
+  }
+  return command;
+}
+
+function requireAgentConnection(connection, label) {
+  if (!hasExactKeys(connection, VIEWER_AGENT_CONNECTION_FIELDS)) {
+    throw new TypeError(`${label} connection must be {id, client}`);
+  }
+  if (typeof connection.id !== 'string' || !AGENT_CONNECTION_ID.test(connection.id)) {
+    throw new TypeError(`${label} connection id must be 1 to 64 letters, digits, "_" or "-"`);
+  }
+  if (connection.client !== null && !isExactText(connection.client, { whitespace: true })) {
+    throw new TypeError(`${label} connection client must be the app's name, or null`);
+  }
+  return connection;
+}
+
+/**
+ * Check an agent command (`agent_list`, `agent_call`, `agent_cancel`,
+ * `agent_answer`) beyond its keys: its `requestId`, and the fields of its
+ * type -- a connection `{id, client}`, a tool name, arguments that are one
+ * JSON object, the agent's name, whether the person allowed it.
+ *
+ * @param {{type: string}} command
+ */
+export function requireViewerAgentCommand(command) {
+  const label = `An ${command?.type} command`;
+  if (!isExactText(command?.requestId)) throw new TypeError(`${label} requestId must be exact text`);
+  switch (command.type) {
+    case 'agent_list':
+      requireAgentConnection(command.connection, label);
+      return command;
+    case 'agent_call':
+      if (typeof command.tool !== 'string' || !/^[a-z][a-z0-9_]*$/.test(command.tool)) {
+        throw new TypeError(`${label} names its tool as the tool list does, such as "color_by"`);
+      }
+      if (!isPlainObject(command.args)) throw new TypeError(`${label} args must be one object`);
+      requireJsonValue(command.args, `${label} args`);
+      if (!isExactText(command.agent, { whitespace: true })) {
+        throw new TypeError(`${label} names its agent, exact text`);
+      }
+      requireAgentConnection(command.connection, label);
+      return command;
+    case 'agent_cancel':
+      return command;
+    case 'agent_answer':
+      if (typeof command.allowed !== 'boolean') throw new TypeError(`${label} allowed must be true or false`);
+      return command;
+    default:
+      throw new TypeError(`"${command.type}" is no agent command`);
   }
 }
 
 /**
- * Build one binary command frame, as a host does: the header (exactly its
- * type's keys) and the cells, or `null` for a `setVisibility` of every cell
- * (`all: true`), and for a `setField` its values. The viewer never sends one;
- * the protocol's examples and tests are built with it.
+ * The typed arrays of an action's parameters taken out: the JSON rest, and
+ * each array with the path to it, in the order met. An array goes under an
+ * object's key (a parameter, or a key of an object inside one), never
+ * directly in a list.
  *
- * @param {Object} header
- * @param {Uint32Array|null} cells
- * @param {ArrayBufferView|null} [values] - A `setField`'s values
+ * @param {object} params
+ * @returns {{params: object, arrays: Array<{path: Array<string|number>, type: string, array: ArrayBufferView}>}}
+ */
+function splitActionParams(params) {
+  const arrays = [];
+  const visit = (node, path, inList) => {
+    if (ArrayBuffer.isView(node)) {
+      if (inList) throw new TypeError(`An action parameter list holds a typed array at ${path.join('.')}; put it under a key`);
+      arrays.push({ path, type: valueTypeOfArray(node), array: node });
+      return undefined;
+    }
+    if (Array.isArray(node)) return node.map((item, index) => visit(item, [...path, index], true));
+    if (isPlainObject(node)) {
+      const out = {};
+      for (const [key, child] of Object.entries(node)) {
+        const kept = visit(child, [...path, key], false);
+        if (kept !== undefined) Object.defineProperty(out, key, { value: kept, enumerable: true, writable: true, configurable: true });
+      }
+      return out;
+    }
+    return node;
+  };
+  const rest = visit(params, [], false);
+  requireJsonValue(rest, 'An action command params');
+  return { params: rest, arrays };
+}
+
+/**
+ * One `action` command as a host sends it: a JSON text frame when its
+ * parameters hold no typed array, else a binary frame whose header lists the
+ * arrays (`VIEWER_BINARY_COMMAND_HEADER_FIELDS.action`) and whose body holds
+ * them, the header padded to a multiple of 4 bytes. The viewer never sends
+ * one; the protocol's examples and tests are built with it, and the packages'
+ * encoders must make the same bytes.
+ *
+ * @param {{requestId: string, action: string, params: object, turn?: string|null, turnLabel?: string|null}} command
+ * @returns {string|Uint8Array}
+ */
+export function encodeViewerAction({ requestId, action, params, turn = null, turnLabel = null }) {
+  requireViewerActionCommand({ requestId, action, params, turn, turnLabel });
+  const split = splitActionParams(params);
+  if (split.arrays.length === 0) {
+    return JSON.stringify({ type: 'action', requestId, action, params: split.params, turn, turnLabel });
+  }
+  const header = {
+    type: 'action',
+    requestId,
+    action,
+    params: split.params,
+    turn,
+    turnLabel,
+    arrays: split.arrays.map(({ path, type, array }) => ({ path, type, length: array.length })),
+  };
+  return encodeFrame(header, split.arrays.map(({ array }) => littleEndianBytes(array)), true);
+}
+
+/**
+ * One `load_session` command as a host sends it: a binary frame whose header
+ * names the request and the file, padded to a multiple of 4 bytes, and whose
+ * body is the `.cellucid-session` file. The viewer never sends one; the
+ * protocol's examples and tests are built with it, and the packages' encoders
+ * must make the same bytes.
+ *
+ * @param {{requestId: string, name: string, file: Uint8Array}} command
  * @returns {Uint8Array}
  */
-export function encodeViewerBinaryCommand(header, cells, values = null) {
-  if (!hasExactKeys(header, VIEWER_BINARY_COMMAND_HEADER_FIELDS[header?.type] ?? [null])) {
-    throw new TypeError('A binary viewer command header must carry exactly the keys of its type');
-  }
-  if (header.type === 'setField') {
-    requireSetFieldHeader(header);
-    if ((cells === null) !== (header.cells === null) || (cells !== null && cells.length !== header.cells)) {
-      throw new TypeError('A setField header counts the cells it names');
-    }
-    if (values === null || valueTypeOfArray(values) !== header.values) {
-      throw new TypeError('A setField header names its values\' type');
-    }
-    requireSections({
-      nObs: header.nObs,
-      cells,
-      values,
-      categoryCount: header.kind === 'categorical' ? header.categories.length : null,
-      label: `The setField command "${header.key}"`,
-    });
-    const body = [];
-    if (cells !== null) body.push(littleEndianBytes(cells));
-    body.push(littleEndianBytes(values));
-    return encodeFrame(header, body, true);
-  }
-  if (values !== null) throw new TypeError('Only a setField command carries values');
-  const every = header.type === 'setVisibility' && header.all === true;
-  if (every !== (cells === null)) {
-    throw new TypeError('A command names its cells, or (setVisibility with all) none');
-  }
-  return encodeFrame(header, every ? new Uint8Array(0) : encodeViewerCells(cells, `${header.type} cells`), true);
+export function encodeViewerLoadSession({ requestId, name, file }) {
+  requireViewerLoadSession({ requestId, name, file });
+  return encodeFrame({ type: 'load_session', requestId, name }, file, true);
 }
 
-const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
+/**
+ * Check a `load_session` command: a request id, the file's name (text, no
+ * path), and a body that is a non-empty file.
+ *
+ * @param {{requestId: unknown, name: unknown, file: unknown}} command
+ */
+export function requireViewerLoadSession(command) {
+  if (!isExactText(command?.requestId)) throw new TypeError('A load_session command requestId must be exact text');
+  if (!isExactText(command.name, { whitespace: true }) || /[\\/]/.test(command.name)) {
+    throw new TypeError('A load_session command names the file by its name (text without a folder)');
+  }
+  if (!(command.file instanceof Uint8Array) || command.file.byteLength === 0) {
+    throw new TypeError('A load_session command carries the session file as its body');
+  }
+  return command;
+}
+
+/**
+ * Check a `history_changed` event before the viewer sends it.
+ *
+ * @param {{type: string, kind: unknown, tracker: unknown, head: unknown, step: unknown, branch: unknown}} event
+ */
+export function requireViewerHistoryChanged(event) {
+  if (!hasExactKeys(event, VIEWER_EVENT_FIELDS.history_changed) || event.type !== 'history_changed') {
+    throw new TypeError(`A history_changed event carries exactly ${VIEWER_EVENT_FIELDS.history_changed.join(', ')}`);
+  }
+  if (!VIEWER_HISTORY_CHANGE_KINDS.includes(event.kind)) {
+    throw new TypeError(`A history_changed kind is one of ${VIEWER_HISTORY_CHANGE_KINDS.join(', ')}`);
+  }
+  for (const key of ['tracker', 'head']) {
+    if (!isExactText(event[key])) throw new TypeError(`A history_changed ${key} is an id`);
+  }
+  for (const key of ['step', 'branch']) {
+    if (event[key] !== null && !isExactText(event[key])) throw new TypeError(`A history_changed ${key} is an id or null`);
+  }
+  return event;
+}
+
+function requireArrayPath(path, label) {
+  if (!Array.isArray(path) || path.length === 0) throw new TypeError(`${label} path must name where it goes`);
+  path.forEach((key, index) => {
+    const last = index === path.length - 1;
+    if (typeof key === 'string' ? key.length === 0 : !(Number.isSafeInteger(key) && key >= 0 && !last)) {
+      throw new TypeError(`${label} path must be keys and list indices ending in a key`);
+    }
+  });
+}
+
+/** Put `array` at `path` of `params`: every step but the last exists, the last key does not. */
+function placeArray(params, path, array, label) {
+  let node = params;
+  for (const key of path.slice(0, -1)) {
+    const next = typeof key === 'number'
+      ? (Array.isArray(node) && key < node.length ? node[key] : undefined)
+      : (isPlainObject(node) && Object.hasOwn(node, key) ? node[key] : undefined);
+    if (next === undefined || next === null || typeof next !== 'object') {
+      throw new TypeError(`${label} path ${JSON.stringify(path)} leads nowhere in params`);
+    }
+    node = next;
+  }
+  const key = path[path.length - 1];
+  if (!isPlainObject(node) || Object.hasOwn(node, key)) {
+    throw new TypeError(`${label} path ${JSON.stringify(path)} must name a key params does not hold`);
+  }
+  Object.defineProperty(node, key, { value: array, enumerable: true, writable: true, configurable: true });
+}
 
 /**
  * Read one binary command frame from the host, checked as strictly as the
  * hosts check the viewer's binary events: the header length inside the
- * frame, the header exactly its type's keys with values of their types, and
- * the body whole little-endian uint32 cell indices, strictly ascending, at
- * least one (none, and nothing else, for `setVisibility` with `all: true`),
- * or for a `setField` its cells and values. The cells are a view of the
- * frame on a little-endian host when the body starts on a 4-byte boundary
- * (hosts pad the header so it does), else one copy. Whether every cell is one
- * of the dataset's is the command's to check, against the dataset it applies
- * to.
+ * frame, the header exactly its type's keys, every array's path, type and
+ * length, and a body of exactly those arrays. Each array is a view of the
+ * frame on a little-endian host when it starts on a boundary of its element
+ * size, else one copy, and goes into `params` at its path. Whether the
+ * parameters fit the action is the action's schema to say (`x-cells` takes a
+ * Uint32Array, `x-values` any numeric array), and whether its cells are the
+ * dataset's is the action's to check.
  *
  * @param {ArrayBuffer|Uint8Array} frame
- * @returns {{type: 'highlight', color: string, label: string|null, cells: Uint32Array}
- *   |{type: 'setVisibility', visible: boolean, cells: Uint32Array|null}
- *   |{type: 'setField', requestId: string, key: string, kind: string, categories: string[]|null,
- *     nObs: number, cells: Uint32Array|null, values: ArrayBufferView}}
+ * @returns {{type: 'action', requestId: string, action: string, params: object}}
  */
 export function decodeViewerBinaryCommand(frame) {
   const { bytes, header, start } = readFrameHeader(frame, 'command');
-  const fields = VIEWER_BINARY_COMMAND_HEADER_FIELDS[header?.type];
-  if (fields === undefined || !Object.hasOwn(VIEWER_BINARY_COMMAND_HEADER_FIELDS, header.type)) {
-    throw new TypeError('A binary command must be one this viewer reads as binary');
-  }
+  const fields = isPlainObject(header) && Object.hasOwn(VIEWER_BINARY_COMMAND_HEADER_FIELDS, header.type)
+    ? VIEWER_BINARY_COMMAND_HEADER_FIELDS[header.type]
+    : undefined;
+  if (fields === undefined) throw new TypeError('A binary command must be one this viewer reads as binary');
   if (!hasExactKeys(header, fields)) {
     throw new TypeError(`A ${header.type} command header must carry exactly ${fields.join(', ')}`);
   }
-  const bodyLength = bytes.byteLength - start;
-  if (header.type === 'setField') {
-    requireSetFieldHeader(header);
-    const label = `The setField command "${header.key}"`;
-    const { cells, values } = readSections(bytes, start, header, label);
-    requireSections({
-      nObs: header.nObs,
-      cells,
-      values,
-      categoryCount: header.kind === 'categorical' ? header.categories.length : null,
-      label,
-    });
-    const { type, requestId, key, kind, categories, nObs } = header;
-    return { type, requestId, key, kind, categories, nObs, cells, values };
+  if (header.type === 'load_session') {
+    const command = { type: 'load_session', requestId: header.requestId, name: header.name, file: bytes.subarray(start) };
+    requireViewerLoadSession(command);
+    return command;
   }
-  let every = false;
-  if (header.type === 'highlight') {
-    if (typeof header.color !== 'string') {
-      throw new TypeError('A highlight command color must be text');
-    }
-    if (header.label !== null && !isExactText(header.label, { whitespace: true })) {
-      throw new TypeError('A highlight command label must be exact text or null');
-    }
-  } else {
-    if (typeof header.visible !== 'boolean' || typeof header.all !== 'boolean') {
-      throw new TypeError('A setVisibility command visible and all must be true or false');
-    }
-    every = header.all;
+  requireViewerActionCommand(header);
+  requireJsonValue(header.params, 'An action command params');
+  if (!Array.isArray(header.arrays) || header.arrays.length === 0) {
+    throw new TypeError('A binary action command lists the arrays its body holds');
   }
-  if (every) {
-    if (bodyLength !== 0) {
-      throw new TypeError('A setVisibility command of every cell carries no cells');
+  let expected = 0;
+  header.arrays.forEach((entry, index) => {
+    const label = `The action command's array ${index}`;
+    if (!hasExactKeys(entry, VIEWER_ACTION_ARRAY_FIELDS)) {
+      throw new TypeError(`${label} must carry exactly ${VIEWER_ACTION_ARRAY_FIELDS.join(', ')}`);
     }
-    return { type: header.type, visible: header.visible, cells: null };
-  }
-  if (bodyLength === 0 || bodyLength % 4 !== 0) {
-    throw new TypeError(
-      `A ${header.type} command body must be one or more little-endian uint32 cell indices`
-    );
-  }
-  const cells = readSection(bytes, start, bodyLength / 4, 'uint32');
-  for (let index = 1; index < cells.length; index++) {
-    if (cells[index] <= cells[index - 1]) {
-      throw new TypeError(`A ${header.type} command must list its cells strictly ascending, each once`);
+    requireArrayPath(entry.path, label);
+    if (!Object.hasOwn(VIEWER_VALUE_TYPES, entry.type)) {
+      throw new TypeError(`${label} type must be one of ${Object.keys(VIEWER_VALUE_TYPES).join(', ')}`);
     }
+    if (!isCount(entry.length)) throw new TypeError(`${label} length must be a count`);
+    expected += entry.length * VIEWER_VALUE_TYPES[entry.type];
+  });
+  if (bytes.byteLength - start !== expected) {
+    throw new TypeError(`A binary action command body must be ${formatCountOf(expected, 'byte')} for its arrays, not ${bytes.byteLength - start}`);
   }
-  return header.type === 'highlight'
-    ? { type: 'highlight', color: header.color, label: header.label, cells }
-    : { type: 'setVisibility', visible: header.visible, cells };
+  const params = header.params;
+  let at = start;
+  header.arrays.forEach((entry, index) => {
+    placeArray(params, entry.path, readSection(bytes, at, entry.length, entry.type), `The action command's array ${index}`);
+    at += entry.length * VIEWER_VALUE_TYPES[entry.type];
+  });
+  return {
+    type: 'action', requestId: header.requestId, action: header.action, params, turn: header.turn, turnLabel: header.turnLabel,
+  };
 }
 
 /** The mapping the examples set and report. */
@@ -875,18 +1146,41 @@ function hex(bytes) {
   return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** One binary command example: its header, its cells (none for every cell), its values, its bytes. */
-function binaryCommand(header, cells, values = null) {
-  const frame = header.type === 'setField'
-    ? encodeViewerBinaryCommand(
-      header,
-      cells === null ? null : Uint32Array.from(cells),
-      VALUE_ARRAY_TYPES[header.values].from(values)
-    )
-    : encodeViewerBinaryCommand(header, cells === null ? null : Uint32Array.from(cells));
-  return header.type === 'setField'
-    ? { header, cells, values, hex: hex(frame) }
-    : { header, cells: cells ?? [], hex: hex(frame) };
+/**
+ * One binary `action` example: its header (with the arrays it lists), each
+ * array's elements, and its bytes. `arrays` gives `[path, type, elements]`.
+ */
+function binaryAction(requestId, action, params, arrays, turn = null, turnLabel = null) {
+  const full = structuredClone(params);
+  for (const [path, type, elements] of arrays) {
+    let node = full;
+    for (const key of path.slice(0, -1)) node = node[key];
+    node[path[path.length - 1]] = VALUE_ARRAY_TYPES[type].from(elements);
+  }
+  const frame = encodeViewerAction({ requestId, action, params: full, turn, turnLabel });
+  const header = {
+    type: 'action', requestId, action, params, turn, turnLabel,
+    arrays: arrays.map(([path, type, elements]) => ({ path, type, length: elements.length })),
+  };
+  return { header, arrays: arrays.map(([path, type, elements]) => ({ path, type, elements })), hex: hex(frame) };
+}
+
+/** One `load_session` example: its header, its body as text, and its bytes. */
+function loadSessionCommand(requestId, name, bodyText) {
+  const file = new TextEncoder().encode(bodyText);
+  return { header: { type: 'load_session', requestId, name }, bodyText, hex: hex(encodeViewerLoadSession({ requestId, name, file })) };
+}
+
+/** One `action_result` example: its header, its outcome, and its bytes. */
+function actionResultEvent(requestId, outcome, step) {
+  const header = { type: 'action_result', requestId, step };
+  return { header, outcome, hex: hex(encodeViewerBinaryFrame(header, new TextEncoder().encode(JSON.stringify(outcome)))) };
+}
+
+/** One binary agent event example (`agent_tools`, `agent_result`): its header, its JSON body, and its bytes. */
+function agentJsonEvent(type, requestId, body) {
+  const header = { type, requestId };
+  return { header, body, hex: hex(encodeViewerBinaryFrame(header, new TextEncoder().encode(JSON.stringify(body)))) };
 }
 
 /** One result example: its header, cells (null: every cell), values (null: none), and bytes. */
@@ -928,39 +1222,45 @@ function examples() {
       { type: 'ping', requestId: 'r1' },
       { type: 'debug_snapshot', requestId: 'r2' },
       { type: 'requestSessionBundle', requestId: 'r3' },
-      { type: 'clearHighlights' },
-      { type: 'setColorBy', field: 'cell_type' },
-      { type: 'resetCamera' },
       { type: 'freeze' },
-      {
-        type: 'setDataMapping',
-        requestId: 'r4',
-        mapping: EXAMPLE_MAPPING,
-      },
-      {
-        type: 'setGeneSet',
-        requestId: 'r6',
-        name: 'T cell markers',
-        description: 'From the notebook',
-        genes: ['CD3E', 'CD3D', 'IL7R'],
-      },
+      { type: 'action', requestId: 'r4', action: 'color.by', params: { field: { source: 'obs', key: 'cell_type' } }, turn: null, turnLabel: null },
+      // A read: answered by its result, and no step.
+      { type: 'action', requestId: 'r5', action: 'history.get', params: {}, turn: null, turnLabel: null },
+      // Part of a notebook turn (`with viewer.turn("QC")`): its steps undo together.
+      { type: 'action', requestId: 'r6', action: 'gene-set.save', params: { name: 'T cell markers', description: 'From the notebook', genes: ['CD3E', 'CD3D', 'IL7R'] }, turn: 'python-turn-1', turnLabel: 'Marker genes' },
+      // Cells as a JSON list: a few cells need no binary frame.
+      { type: 'action', requestId: 'r7', action: 'cells.visibility.set', params: { cells: null, visible: true }, turn: null, turnLabel: null },
+      // A history action, by its type, as every other.
+      { type: 'action', requestId: 'r14', action: 'history.undo', params: {}, turn: null, turnLabel: null },
+      // An agent app on this computer, through `cellucid mcp`: its tools, a call, a stop, an answer it got from the person.
+      { type: 'agent_list', requestId: 'a1', connection: { id: 'local-3f9c2a7d', client: 'claude-code' } },
+      { type: 'agent_call', requestId: 'a2', tool: 'color_by', args: { field: { source: 'obs', key: 'cell_type' } }, agent: 'Claude Code', connection: { id: 'local-3f9c2a7d', client: 'claude-code' } },
+      { type: 'agent_call', requestId: 'a3', tool: 'history_get', args: {}, agent: 'Cursor', connection: { id: 'local-77e0b1c4', client: null } },
+      { type: 'agent_cancel', requestId: 'a3' },
+      { type: 'agent_answer', requestId: 'a4', allowed: false },
     ],
     binaryCommands: [
-      binaryCommand({ type: 'highlight', color: '#e41a1c', label: null }, [0, 2, 7]),
-      // Past 2^31: a cell index is a uint32, every bit of it.
-      binaryCommand({ type: 'highlight', color: '#00FF7f', label: 'Cycling cells' }, [5, 2147483648, 4294967295]),
-      binaryCommand({ type: 'setVisibility', visible: false, all: false }, [1, 3]),
-      binaryCommand({ type: 'setVisibility', visible: true, all: true }, null),
-      // A categorical column of every cell: code 255 is "no category".
-      binaryCommand({
-        type: 'setField', requestId: 'r7', key: 'leiden', kind: 'categorical', categories: ['0', '1', '2'],
-        nObs: 5, cells: null, values: 'uint8',
-      }, null, [0, 2, 1, 255, 0]),
-      // A continuous column of two cells of ten.
-      binaryCommand({
-        type: 'setField', requestId: 'r8', key: 'score', kind: 'continuous', categories: null,
-        nObs: 10, cells: 2, values: 'float32',
-      }, [3, 8], [0.5, -1.25]),
+      binaryAction('r8', 'highlight.cells', { color: '#e41a1c' }, [[['cells'], 'uint32', [0, 2, 7]]]),
+      // Past 2^31: a cell index is a uint32, every bit of it; any order.
+      binaryAction('r9', 'highlight.cells', { label: 'Cycling cells', page: 'Notebook' }, [[['cells'], 'uint32', [4294967295, 5, 2147483648]]]),
+      binaryAction('r10', 'cells.visibility.set', { visible: false }, [[['cells'], 'uint32', [1, 3]]], 'python-turn-1', 'Hide the doublets'),
+      // A categorical column of every cell (cells null): code 255 is "no category".
+      binaryAction('r11', 'field.push', { key: 'leiden', kind: 'categorical', categories: ['0', '1', '2'], n_obs: 5, cells: null }, [
+        [['values'], 'uint8', [0, 2, 1, 255, 0]],
+      ]),
+      // A continuous column of two cells of ten: cells, then values.
+      binaryAction('r12', 'field.push', { key: 'score', kind: 'continuous', categories: null, n_obs: 10 }, [
+        [['cells'], 'uint32', [3, 8]],
+        [['values'], 'float32', [0.5, -1.25]],
+      ]),
+      // An array inside an object of the parameters (the path names it), and an empty one.
+      binaryAction('r13', 'example.nested', { groups: [{ name: 'a' }, { name: 'b' }] }, [
+        [['groups', 0, 'cells'], 'uint32', [1, 2]],
+        [['groups', 1, 'cells'], 'uint32', []],
+        [['weights'], 'float64', [0.25]],
+      ]),
+      // A session file pushed into the viewer (the body here stands for one).
+      loadSessionCommand('r15', 'T cell analysis.cellucid-session', 'CELLUCID_SESSION/4\n'),
     ],
     events: [
       { type: 'hover', cell: 3, position: { x: 0.5, y: -1, z: 0 } },
@@ -978,8 +1278,10 @@ function examples() {
         connected: true,
         userAgent: null,
       },
-      { type: 'command_error', command: 'setColorBy', reason: 'no field named cell_type' },
-      { type: 'data_mapping', requestId: 'r4', origin: 'notebook', mapping: EXAMPLE_MAPPING },
+      { type: 'command_error', command: 'action', requestId: 'r4', reason: 'There is no field "cell_typ" in obs; did you mean cell_type?' },
+      // A command that names no request (or a frame read no further than its type).
+      { type: 'command_error', command: 'freeze', requestId: null, reason: 'The viewer has no dataset open.' },
+      { type: 'data_mapping', origin: 'notebook', mapping: EXAMPLE_MAPPING },
       { type: 'color_by', field: 'cell_type', source: 'obs', symbol: null, cells_read: null },
       { type: 'color_by', field: 'CD3E', source: 'var', symbol: null, cells_read: null },
       { type: 'color_by', field: 'ENSG00000198851', source: 'var', symbol: 'CD3E', cells_read: null },
@@ -1005,28 +1307,52 @@ function examples() {
       // The person opened another dataset in the viewer: a new epoch that
       // describes none of the host's.
       { type: 'results', epoch: 'fedcba9876543210', dataset: null, revision: 0, nObs: 2700, items: [] },
+      // The history: a step recorded, a move, an edit, another tracker, a loaded session.
+      { type: 'history_changed', kind: 'step', tracker: 't-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10', head: 's4', step: 's4', branch: 'b0' },
+      { type: 'history_changed', kind: 'moved', tracker: 't-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10', head: 's2', step: null, branch: 'b0' },
+      { type: 'history_changed', kind: 'edited', tracker: 't-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10', head: 's2', step: null, branch: 'b1' },
+      { type: 'history_changed', kind: 'tracker', tracker: 't-5d0e1c2b-7a4f-4e8b-9c3d-2f1a0b9c8d7e', head: 's0', step: null, branch: null },
+      { type: 'history_changed', kind: 'loaded', tracker: 't-5d0e1c2b-7a4f-4e8b-9c3d-2f1a0b9c8d7e', head: 's9', step: null, branch: 'b2' },
+      { type: 'session_loaded', requestId: 'r15', tracker: { id: 't-5d0e1c2b-7a4f-4e8b-9c3d-2f1a0b9c8d7e', name: 'T cell analysis' }, head: 's9' },
+      // The person is asked about an agent's call in the viewer (and answers there, or in the agent's app).
+      { type: 'agent_asking', requestId: 'a4', message: 'Claude Code (local) asks to save a copy as a file. It writes a file on this computer.', detail: null },
+      { type: 'agent_answered', requestId: 'a4', allowed: false },
+      { type: 'agent_tools_changed' },
     ],
     binaryEvents: [
       { header: { type: 'selection', source: 'lasso' }, cells: [0, 2, 7], hex: hex(selection) },
       { header: { type: 'session_bundle', requestId: 'r3' }, bodyText: 'CELLUCID_SESSION\n', hex: hex(bundle) },
+      // A change: its outcome, and the step of the history it made.
+      actionResultEvent('r4', null, { id: 's3', label: 'Coloured by cell_type' }),
+      actionResultEvent('r11', { name: 'leiden', kind: 'categorical', id: 'user_cat_1' }, { id: 's4', label: 'Added the categorical column leiden' }),
+      // A read: its result, and no step.
+      actionResultEvent('r5', { head: 's4', steps: [{ id: 's0', label: 'Opened Example' }], note: 'Ünïcode — kept as UTF-8' }, null),
+      // An agent's tools (the MCP tools, as its connection may use them), and a call's MCP result.
+      agentJsonEvent('agent_tools', 'a1', [{
+        name: 'color_by', title: 'Colour by a field', description: 'Colour the cells by a field.',
+        inputSchema: { type: 'object', properties: {} },
+        annotations: { title: 'Colour by a field', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      }]),
+      agentJsonEvent('agent_result', 'a2', { content: [{ type: 'text', text: '{"step":{"id":"s5","label":"Coloured by cell_type"}}' }], isError: false }),
+      agentJsonEvent('agent_result', 'a4', { content: [{ type: 'text', text: 'The person declined: save a copy.' }], isError: true }),
       resultEvent({
-        requestId: null, revision: 1, kind: 'highlight', id: 'highlight_1', nObs: 10,
+        revision: 1, kind: 'highlight', id: 'highlight_1', nObs: 10,
         meta: { label: 'Lasso selection (3 cells)', tool: 'lasso', pageId: 'page_1', pageName: 'Page 1', color: '#e41a1c', enabled: true },
         cells: [0, 2, 7], values: null,
       }),
       // A categorical over the open cells of a subsample: code 255 is "no category".
       resultEvent({
-        requestId: null, revision: 2, kind: 'categorical', id: 'user_cat_1', nObs: 10,
+        revision: 2, kind: 'categorical', id: 'user_cat_1', nObs: 10,
         meta: { key: 'annotation', categories: ['B cell', 'T cell'], origin: 'user' },
         cells: [0, 3, 4, 9], values: [1, 0, 255, 1], valueType: 'uint8',
       }),
       resultEvent({
-        requestId: null, revision: 3, kind: 'continuous', id: 'user_obs_value_1', nObs: 3,
+        revision: 3, kind: 'continuous', id: 'user_obs_value_1', nObs: 3,
         meta: { key: 'T cell markers score', origin: 'analysis' },
         cells: null, values: [0.25, -1, 3.5], valueType: 'float32',
       }),
       resultEvent({
-        requestId: 'r6', revision: 4, kind: 'geneSet', id: 'gene_set_1', nObs: 10,
+        revision: 4, kind: 'geneSet', id: 'gene_set_1', nObs: 10,
         // Genes by identifier (the var index), with the names shown when a
         // var column names the genes (here a CELLxGENE file's feature_name).
         meta: {
@@ -1037,16 +1363,16 @@ function examples() {
         cells: [], values: null,
       }),
       resultEvent({
-        requestId: null, revision: 5, kind: 'visibility', id: 'visible', nObs: 10,
+        revision: 5, kind: 'visibility', id: 'visible', nObs: 10,
         meta: {}, cells: [1, 2, 3], values: null,
       }),
       resultEvent({
-        requestId: null, revision: 6, kind: 'subset', id: 'open', nObs: 10,
+        revision: 6, kind: 'subset', id: 'open', nObs: 10,
         meta: { digest: '0123456789abcdef' }, cells: [0, 3, 4, 9], values: null,
       }),
       // Genes named by the var index: no symbols beside them.
       resultEvent({
-        requestId: null, revision: 7, kind: 'geneSet', id: 'markers_1', nObs: 10,
+        revision: 7, kind: 'geneSet', id: 'markers_1', nObs: 10,
         meta: { name: 'B cell', description: 'Marker genes', genes: ['MS4A1', 'CD79A'], symbols: null, origin: 'markers' },
         cells: [], values: null,
       }),
@@ -1072,6 +1398,27 @@ export function viewerProtocolDocumentFixture() {
     binaryCommands: Object.fromEntries(
       Object.entries(VIEWER_BINARY_COMMAND_HEADER_FIELDS).map(([type, keys]) => [type, [...keys]])
     ),
+    action: {
+      typePattern: ACTION_TYPE_PATTERN.source,
+      arrayFields: [...VIEWER_ACTION_ARRAY_FIELDS],
+      stepFields: [...VIEWER_ACTION_STEP_FIELDS],
+      body: 'binary action: each of header.arrays in order, length elements of its type, little-endian, '
+        + 'placed in params at its path (keys and list indices ending in a key params does not hold); '
+        + 'action_result: the outcome as UTF-8 JSON',
+      turn: 'turn and turnLabel: both exact text (the turn\'s id; what it was asked to do), or both null',
+    },
+    agent: {
+      connectionFields: [...VIEWER_AGENT_CONNECTION_FIELDS],
+      connectionIdPattern: VIEWER_AGENT_CONNECTION_ID_PATTERN,
+      body: 'agent_tools: the MCP tools (a JSON array) as UTF-8 JSON; agent_result: the MCP tool result '
+        + '({content, isError, ...}) as UTF-8 JSON; every agent_call is answered by exactly one agent_result',
+    },
+    history: {
+      changeKinds: [...VIEWER_HISTORY_CHANGE_KINDS],
+      sessionLoadedTrackerFields: [...VIEWER_SESSION_LOADED_TRACKER_FIELDS],
+      loadSession: 'binary load_session: the header padded to a multiple of 4 bytes, then the .cellucid-session file; '
+        + 'name is the file\'s name without a folder',
+    },
     events: Object.fromEntries(Object.entries(VIEWER_EVENT_FIELDS).map(([type, keys]) => [type, [...keys]])),
     binaryEvents: Object.fromEntries(
       Object.entries(VIEWER_BINARY_EVENT_HEADER_FIELDS).map(([type, keys]) => [type, [...keys]])
@@ -1080,7 +1427,6 @@ export function viewerProtocolDocumentFixture() {
       kinds: Object.fromEntries(Object.entries(VIEWER_RESULT_META_FIELDS).map(([kind, keys]) => [kind, [...keys]])),
       highlightTools: [...VIEWER_HIGHLIGHT_TOOLS],
       origins: [...VIEWER_RESULT_ORIGINS],
-      fieldKinds: [...VIEWER_FIELD_KINDS],
       valueTypes: { ...VIEWER_VALUE_TYPES },
       epochPattern: VIEWER_RESULT_EPOCH_PATTERN,
       body: 'cells: header.cells little-endian uint32 original positions, strictly ascending (none when null); ' +

@@ -35,47 +35,8 @@ function createButton() {
   };
 }
 
-test('Save follows the runtime cells while Load stays available', () => {
-  const saveBtn = createButton();
-  const loadBtn = createButton();
-  const controls = initSessionControls({
-    dom: { saveBtn, loadBtn },
-    datasetChanges: {
-      recordAction: () => 1,
-      settled: true,
-      whenSettled: async () => {},
-    },
-    currentDatasetIdentityId: () => null,
-    localFiles: { kept: async () => null, reopen: async () => false },
-    currentCellIdentity: () => null,
-    reopenDataset: async () => ({ shown: false, inPlace: false }),
-    openDatasetSource: async () => false,
-    sessionSerializer: {
-      downloadSession() {},
-      loadSessionFromFile() {}
-    }
-  });
-  try {
-    assert.equal(saveBtn.disabled, true, 'nothing is published yet');
-    assert.equal(saveBtn.title, 'Load a dataset to save a session');
-    assert.equal(loadBtn.disabled, undefined);
-    controls.setCellsPresent(true);
-    assert.equal(saveBtn.disabled, false);
-    assert.equal(saveBtn.title, '');
-    controls.setCellsPresent(false);
-    assert.equal(saveBtn.disabled, true);
-    assert.equal(saveBtn.title, 'Load a dataset to save a session');
-    assert.throws(() => controls.setCellsPresent('yes'), TypeError);
-    assert.equal(loadBtn.disabled, undefined);
-  } finally {
-    void controls.destroy();
-  }
-});
-
 test('session-control destroy fences late publication and drains active work', async () => {
-  const save = deferred();
   const load = deferred();
-  const saveBtn = createButton();
   const loadBtn = createButton();
   const serializerCalls = [];
   const notifications = getNotificationCenter();
@@ -88,7 +49,7 @@ test('session-control destroy fences late publication and drains active work', a
   try {
     let afterLoads = 0;
     const controls = initSessionControls({
-      dom: { saveBtn, loadBtn },
+      dom: { loadBtn },
       // No dataset change is in flight, so a chosen session restores at once.
       datasetChanges: {
         recordAction: () => 1,
@@ -100,11 +61,7 @@ test('session-control destroy fences late publication and drains active work', a
       currentCellIdentity: () => null,
       reopenDataset: async () => ({ shown: false, inPlace: false }),
       openDatasetSource: async () => false,
-      sessionSerializer: {
-        downloadSession(filename) {
-          serializerCalls.push(['save', filename]);
-          return save.promise;
-        },
+        sessionSerializer: {
         loadSessionFromFile() {
           serializerCalls.push(['load']);
           return load.promise;
@@ -114,14 +71,11 @@ test('session-control destroy fences late publication and drains active work', a
         afterLoads += 1;
       }
     });
-    const retainedSaveListener = saveBtn.listeners()[0];
     const retainedLoadListener = loadBtn.listeners()[0];
-    const saving = saveBtn.click();
     const loading = loadBtn.click();
 
     const destruction = controls.destroy();
     assert.equal(controls.destroy(), destruction);
-    assert.equal(saveBtn.listeners().length, 0);
     assert.equal(loadBtn.listeners().length, 0);
 
     let destroySettled = false;
@@ -131,22 +85,17 @@ test('session-control destroy fences late publication and drains active work', a
     await Promise.resolve();
     assert.equal(destroySettled, false);
 
-    save.resolve();
-    await saving;
-    await Promise.resolve();
-    assert.equal(destroySettled, false);
     load.resolve(true);
     await Promise.all([loading, destruction]);
 
     assert.equal(afterLoads, 0);
     assert.deepEqual(notificationCalls, []);
     assert.equal(destroySettled, true);
-    assert.equal(serializerCalls.length, 2);
+    assert.equal(serializerCalls.length, 1);
 
-    assert.equal(retainedSaveListener(), undefined);
     assert.equal(retainedLoadListener(), undefined);
     controls.showSessionStatus('retained status');
-    assert.equal(serializerCalls.length, 2);
+    assert.equal(serializerCalls.length, 1);
     assert.deepEqual(notificationCalls, []);
   } finally {
     notifications.success = originalSuccess;

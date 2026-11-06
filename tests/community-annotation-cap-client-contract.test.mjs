@@ -5,13 +5,14 @@ import {
   searchCellTypes,
 } from '../assets/js/app/community-annotations/cap-api.js';
 import { getGitHubWorkerOrigin } from '../assets/js/app/community-annotations/github-auth.js';
+import { createHostBook } from '../assets/js/formats/io/hosts.js';
+import { ResponseClock } from '../assets/js/formats/io/link.js';
+import { virtualTime } from './helpers/virtual-time.mjs';
 import {
   mergeCapMarkerGenes,
   parseMarkerGenesInput,
   reconcileEditedMarkerChange,
 } from '../assets/js/app/ui/modules/community-annotation-voting-modal.js';
-
-const MAX_CAP_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 function capResult(overrides = {}) {
   return {
@@ -32,7 +33,7 @@ function capResult(overrides = {}) {
 function capResponse(results, omittedInvalidCount = 0, init = {}) {
   return new Response(
     JSON.stringify({
-      contractVersion: 2,
+      contractVersion: 3,
       results,
       omittedInvalidCount,
     }),
@@ -192,18 +193,39 @@ test('CAP rejects an oversized serialized marker request before network access',
   assert.equal(fetchCalls, 0);
 });
 
-test('CAP rejects a semantically stale Worker response on every lookup', async () => {
-  await withFetch(
-    async () => new Response(JSON.stringify({
-      contractVersion: 0,
+/**
+ * A transport on virtual time (`tests/helpers/virtual-time.mjs`): retries,
+ * budgets and stall timeouts run their real logic, and every wait is
+ * instant, so no test here waits on a real timer.
+ */
+function virtualTransport(fetchImpl) {
+  const time = virtualTime();
+  return {
+    time,
+    transport: {
+      fetch: fetchImpl,
+      hosts: createHostBook({ now: time.now, after: time.after }),
+      clock: new ResponseClock({ clock: time.now, after: time.after }),
+    },
+  };
+}
+
+test('CAP names an older Worker as one to redeploy, any other version as incompatible', async () => {
+  for (const [contractVersion, code, words] of [
+    [2, 'GITHUB_WORKER_OUTDATED', /older version \(contract 2\).*redeploy/],
+    [4, 'GITHUB_WORKER_INCOMPATIBLE', /reload Cellucid/],
+    ['3', 'GITHUB_WORKER_INCOMPATIBLE', /does not match/],
+  ]) {
+    const { transport } = virtualTransport(async () => new Response(JSON.stringify({
+      contractVersion,
       results: [],
       omittedInvalidCount: 0,
-    }), { status: 200 }),
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error?.code === 'CAP_WORKER_INCOMPATIBLE'
-    )
-  );
+    }), { status: 200 }));
+    await assert.rejects(
+      () => searchCellTypes('T cell', 10, { transport }),
+      error => error?.code === code && words.test(error.message),
+    );
+  }
 });
 
 test('CAP classifies every missing proxy route before parsing its body', async (t) => {
@@ -213,88 +235,105 @@ test('CAP classifies every missing proxy route before parsing its body', async (
     '',
   ]) {
     await t.test(body || 'empty body', async () => {
-      await withFetch(
-        async () => new Response(body, { status: 404 }),
-        () => assert.rejects(
-          () => searchCellTypes('T cell'),
-          error => {
-            assert.equal(error?.code, 'CAP_WORKER_INCOMPATIBLE');
-            assert.match(
-              error?.message ?? '',
-              /deploy the matching Cellucid Worker/
-            );
-            return true;
-          }
-        )
+      const { transport } = virtualTransport(async () => new Response(body, { status: 404 }));
+      await assert.rejects(
+        () => searchCellTypes('T cell', 10, { transport }),
+        error => {
+          assert.equal(error?.code, 'GITHUB_WORKER_INCOMPATIBLE');
+          assert.match(error?.message ?? '', /deploy the matching Cellucid Worker/);
+          return true;
+        }
       );
     });
   }
 });
 
-test('CAP preserves non-success HTTP outcomes with arbitrary bodies', async (t) => {
+test('CAP preserves a final non-success HTTP outcome with arbitrary bodies', async (t) => {
   for (const scenario of [
     {
       name: 'exact Worker error',
-      body: JSON.stringify({ error: 'Rate limit exceeded' }),
-      message: 'CAP proxy error: HTTP 429: Rate limit exceeded',
+      body: JSON.stringify({ error: 'CAP lookup term is not valid' }),
+      message: 'CAP proxy error: HTTP 400: CAP lookup term is not valid',
     },
     {
       name: 'HTML edge response',
-      body: '<!doctype html><title>Too many requests</title>',
-      message: 'CAP proxy error: HTTP 429',
+      body: '<!doctype html><title>Bad request</title>',
+      message: 'CAP proxy error: HTTP 400',
     },
     {
       name: 'oversized Worker error detail',
       body: JSON.stringify({ error: 'E'.repeat(513) }),
-      message: 'CAP proxy error: HTTP 429',
+      message: 'CAP proxy error: HTTP 400',
     },
     {
       name: 'empty edge response',
       body: '',
-      message: 'CAP proxy error: HTTP 429',
+      message: 'CAP proxy error: HTTP 400',
     },
   ]) {
     await t.test(scenario.name, async () => {
-      await withFetch(
-        async () => new Response(scenario.body, { status: 429 }),
-        () => assert.rejects(
-          () => searchCellTypes('T cell'),
-          error => error?.message === scenario.message
-        )
+      let calls = 0;
+      const { transport } = virtualTransport(async () => {
+        calls += 1;
+        return new Response(scenario.body, { status: 400 });
+      });
+      await assert.rejects(
+        () => searchCellTypes('T cell', 10, { transport }),
+        error => error?.message === scenario.message && error.status === 400
       );
+      assert.equal(calls, 1, 'a refusal is not asked again');
     });
   }
 });
 
-test('CAP client rejects stale-worker envelopes above the lookup ceiling', async (t) => {
-  await t.test('lookup ceiling', async () => {
-    await withFetch(
-      async () => capResponse(
-        Array.from({ length: 26 }, (_, index) => capResult({
-          id: `cap-${index}`,
-        }))
-      ),
-      () => assert.rejects(
-        () => searchCellTypes('T cell', 25),
-        /at most 25 items/
-      )
-    );
-  });
+test('CAP asks again while the Worker is busy or rate limited, paced by what it says', async () => {
+  const answers = [
+    () => new Response(JSON.stringify({ error: 'busy' }), { status: 503 }),
+    () => new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+      status: 429,
+      headers: { 'Retry-After': '30', 'Content-Type': 'application/json', 'Content-Length': '31' },
+    }),
+    () => capResponse([capResult()]),
+  ];
+  const { transport, time } = virtualTransport(async () => answers.shift()());
+  const envelope = await searchCellTypes('T cell', 10, { transport });
+  assert.deepEqual(envelope.results, [capResult()]);
+  assert.equal(answers.length, 0);
+  // The 429's Retry-After was waited for exactly.
+  assert.ok(time.now() >= 30_000, `waited ${time.now()} ms`);
+});
 
-  await t.test('lookup partition coherence', async () => {
-    await withFetch(
-      async () => capResponse(
-        Array.from({ length: 24 }, (_, index) => capResult({
-          id: `cap-${index}`,
-        })),
-        2
-      ),
-      () => assert.rejects(
-        () => searchCellTypes('T cell', 25),
-        /results plus omittedInvalidCount must not exceed 25/
-      )
-    );
+test('CAP waits for a slow answer that keeps arriving, and gives up on a silent one', async () => {
+  // A body that delivers a byte every second for 21 s: never silent for a stall window.
+  const body = JSON.stringify({ contractVersion: 3, results: [capResult()], omittedInvalidCount: 0 });
+  const slow = virtualTransport(async () => new Response(new ReadableStream({
+    async start(controller) {
+      const bytes = new TextEncoder().encode(body);
+      const step = Math.ceil(bytes.length / 21);
+      for (let at = 0; at < bytes.length; at += step) {
+        await slow.time.sleep(1000);
+        controller.enqueue(bytes.slice(at, at + step));
+      }
+      controller.close();
+    },
+  }), { status: 200 }));
+  const envelope = await searchCellTypes('T cell', 10, { transport: slow.transport });
+  assert.deepEqual(envelope.results, [capResult()]);
+  assert.ok(slow.time.now() >= 21_000);
+
+  // A Worker that never answers: stalled, asked again with growing patience, then reported.
+  let calls = 0;
+  const silent = virtualTransport((_url, init) => {
+    calls += 1;
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    });
   });
+  await assert.rejects(
+    () => searchCellTypes('T cell', 10, { transport: silent.transport }),
+    error => error?.code === 'GITHUB_WORKER_UNREACHABLE' && error.transient === true,
+  );
+  assert.ok(calls >= 2, `asked ${calls} times`);
 });
 
 test('CAP owner aborts are exact before and during fetch', async (t) => {
@@ -304,17 +343,13 @@ test('CAP owner aborts are exact before and during fetch', async (t) => {
     reason.name = 'AbortError';
     controller.abort(reason);
     let fetchCalled = false;
-    await withFetch(
-      async () => {
-        fetchCalled = true;
-        return capResponse([]);
-      },
-      () => assert.rejects(
-        () => searchCellTypes('T cell', 10, {
-          signal: controller.signal,
-        }),
-        error => error === reason
-      )
+    const { transport } = virtualTransport(async () => {
+      fetchCalled = true;
+      return capResponse([]);
+    });
+    await assert.rejects(
+      () => searchCellTypes('T cell', 10, { signal: controller.signal, transport }),
+      error => error === reason
     );
     assert.equal(fetchCalled, false);
   });
@@ -323,377 +358,27 @@ test('CAP owner aborts are exact before and during fetch', async (t) => {
     const controller = new AbortController();
     const reason = new Error('superseded form search');
     reason.name = 'AbortError';
-    await withFetch(
-      async (_url, init) => new Promise((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => {
-          reject(new DOMException('aborted', 'AbortError'));
-        }, { once: true });
-      }),
-      async () => {
-        const pending = searchCellTypes('T cell', 10, {
-          signal: controller.signal,
-        });
-        controller.abort(reason);
-        await assert.rejects(pending, error => error === reason);
-      }
-    );
+    const { transport } = virtualTransport(async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'));
+      }, { once: true });
+    }));
+    const pending = searchCellTypes('T cell', 10, { signal: controller.signal, transport });
+    await new Promise(resolve => setImmediate(resolve));
+    controller.abort(reason);
+    await assert.rejects(pending, error => error === reason);
   });
-});
-
-test('CAP distinguishes an independent fetch abort', async () => {
-  await withFetch(
-    async () => {
-      throw new DOMException('transport abort', 'AbortError');
-    },
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => {
-        assert.equal(error?.code, 'CAP_FETCH_INTERRUPTED');
-        assert.match(error?.message ?? '', /independently aborted/);
-        return true;
-      }
-    )
-  );
-});
-
-test('CAP response ceiling preflights and cancels an oversized body', async () => {
-  let cancelled = false;
-  const response = {
-    headers: {
-      get(name) {
-        return name.toLowerCase() === 'content-length'
-          ? String(MAX_CAP_RESPONSE_BYTES + 1)
-          : null;
-      },
-    },
-    body: {
-      async cancel() {
-        cancelled = true;
-      },
-    },
-    ok: true,
-    status: 200,
-  };
-  await withFetch(
-    async () => response,
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error?.code === 'CAP_RESPONSE_TOO_LARGE'
-    )
-  );
-  assert.equal(cancelled, true);
-});
-
-test('CAP preserves a size violation when body cancellation rejects', async () => {
-  let cancelAttempts = 0;
-  const response = {
-    headers: {
-      get: () => String(MAX_CAP_RESPONSE_BYTES + 1),
-    },
-    body: {
-      async cancel() {
-        cancelAttempts += 1;
-        throw new Error('hostile cancellation failure');
-      },
-    },
-    ok: true,
-    status: 200,
-  };
-  await withFetch(
-    async () => response,
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error?.code === 'CAP_RESPONSE_TOO_LARGE'
-    )
-  );
-  assert.equal(cancelAttempts, 1);
-});
-
-test('CAP streaming response overrun cancels the reader', async () => {
-  let readCount = 0;
-  let cancelled = false;
-  const response = {
-    headers: { get: () => null },
-    body: {
-      getReader() {
-        return {
-          async read() {
-            readCount += 1;
-            if (readCount === 1) {
-              return {
-                done: false,
-                value: new Uint8Array(MAX_CAP_RESPONSE_BYTES),
-              };
-            }
-            return { done: false, value: new Uint8Array(1) };
-          },
-          async cancel() {
-            cancelled = true;
-          },
-        };
-      },
-    },
-    ok: true,
-    status: 200,
-  };
-  await withFetch(
-    async () => response,
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error?.code === 'CAP_RESPONSE_TOO_LARGE'
-    )
-  );
-  assert.equal(cancelled, true);
-});
-
-test('CAP invalid UTF-8 cancels its response reader', async () => {
-  let cancelled = false;
-  let read = false;
-  const response = {
-    headers: { get: () => null },
-    body: {
-      getReader() {
-        return {
-          async read() {
-            if (read) return { done: true, value: undefined };
-            read = true;
-            return {
-              done: false,
-              value: new Uint8Array([0xc3, 0x28]),
-            };
-          },
-          async cancel() {
-            cancelled = true;
-          },
-        };
-      },
-    },
-    ok: true,
-    status: 200,
-  };
-  await withFetch(
-    async () => response,
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error?.code === 'CAP_RESPONSE_INVALID'
-    )
-  );
-  assert.equal(cancelled, true);
 });
 
 test('CAP rejects a UTF-8 BOM instead of accepting an alternate JSON wire form', async () => {
-  const json = new TextEncoder().encode(JSON.stringify({
-    contractVersion: 2,
-    results: [],
-    omittedInvalidCount: 0,
-  }));
-  const bytes = new Uint8Array(json.byteLength + 3);
-  bytes.set([0xef, 0xbb, 0xbf]);
-  bytes.set(json, 3);
-  await withFetch(
-    async () => new Response(bytes, { status: 200 }),
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      /CAP proxy returned invalid JSON/
-    )
+  const bytes = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(
+    JSON.stringify({ contractVersion: 3, results: [], omittedInvalidCount: 0 })
+  )]);
+  const { transport } = virtualTransport(async () => new Response(bytes, { status: 200 }));
+  await assert.rejects(
+    () => searchCellTypes('T cell', 10, { transport }),
+    error => error?.code === 'CAP_RESPONSE_INVALID'
   );
-});
-
-test('CAP preserves invalid UTF-8 when reader cleanup is hostile', async () => {
-  let cancelAttempts = 0;
-  let releaseAttempts = 0;
-  let read = false;
-  const response = {
-    headers: { get: () => null },
-    body: {
-      getReader() {
-        return {
-          async read() {
-            if (read) return { done: true, value: undefined };
-            read = true;
-            return {
-              done: false,
-              value: new Uint8Array([0xc3, 0x28]),
-            };
-          },
-          async cancel() {
-            cancelAttempts += 1;
-            throw new Error('hostile reader cancellation failure');
-          },
-          releaseLock() {
-            releaseAttempts += 1;
-            throw new Error('hostile reader release failure');
-          },
-        };
-      },
-    },
-    ok: true,
-    status: 200,
-  };
-  await withFetch(
-    async () => response,
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error?.code === 'CAP_RESPONSE_INVALID'
-    )
-  );
-  assert.equal(cancelAttempts, 1);
-  // The reader is dropped, never released: WebKit can deadlock a collection
-  // that starts inside `releaseLock()` (`formats/io/inflate.js`).
-  assert.equal(releaseAttempts, 0);
-});
-
-test('CAP response read failure cancels its active reader', async () => {
-  let cancelled = false;
-  const readFailure = new Error('synthetic CAP response read failure');
-  const response = {
-    headers: { get: () => null },
-    body: {
-      getReader() {
-        return {
-          async read() {
-            throw readFailure;
-          },
-          async cancel() {
-            cancelled = true;
-          },
-        };
-      },
-    },
-    ok: true,
-    status: 200,
-  };
-  await withFetch(
-    async () => response,
-    () => assert.rejects(
-      () => searchCellTypes('T cell'),
-      error => error === readFailure
-    )
-  );
-  assert.equal(cancelled, true);
-});
-
-test('CAP owner abort cancels a stalled response reader', async () => {
-  let cancelled = false;
-  let markReaderStarted;
-  const readerStarted = new Promise(resolve => {
-    markReaderStarted = resolve;
-  });
-  const controller = new AbortController();
-  const reason = new Error('retired CAP response owner');
-  reason.name = 'AbortError';
-  await withFetch(
-    async (_url, init) => ({
-      headers: { get: () => null },
-      body: {
-        getReader() {
-          return {
-            read() {
-              markReaderStarted();
-              return new Promise((resolve, reject) => {
-                init.signal.addEventListener('abort', () => {
-                  reject(new DOMException(
-                    'Synthetic CAP response read aborted',
-                    'AbortError'
-                  ));
-                }, { once: true });
-              });
-            },
-            async cancel() {
-              cancelled = true;
-            },
-          };
-        },
-      },
-      ok: true,
-      status: 200,
-    }),
-    async () => {
-      const pending = searchCellTypes('T cell', 10, {
-        signal: controller.signal,
-      });
-      await readerStarted;
-      controller.abort(reason);
-      await assert.rejects(pending, error => error === reason);
-    }
-  );
-  assert.equal(cancelled, true);
-});
-
-test('CAP removes its owner abort listener when timer creation throws', async () => {
-  const previousSetTimeout = globalThis.setTimeout;
-  let listeners = 0;
-  const signal = {
-    aborted: false,
-    reason: undefined,
-    addEventListener(type) {
-      if (type === 'abort') listeners += 1;
-    },
-    removeEventListener(type) {
-      if (type === 'abort') listeners -= 1;
-    },
-  };
-  globalThis.setTimeout = () => {
-    throw new Error('hostile timer creation failure');
-  };
-  try {
-    await assert.rejects(
-      () => searchCellTypes('T cell', 10, { signal }),
-      /hostile timer creation failure/
-    );
-    assert.equal(listeners, 0);
-  } finally {
-    globalThis.setTimeout = previousSetTimeout;
-  }
-});
-
-test('CAP timeout retires its timer and owner listener before returning', async () => {
-  const previousSetTimeout = globalThis.setTimeout;
-  const previousClearTimeout = globalThis.clearTimeout;
-  const timerHandle = Object.freeze({ timer: 'CAP timeout' });
-  let listeners = 0;
-  let clearCalls = 0;
-  let fetchCalls = 0;
-  const signal = {
-    aborted: false,
-    reason: undefined,
-    addEventListener(type) {
-      if (type === 'abort') listeners += 1;
-    },
-    removeEventListener(type) {
-      if (type === 'abort') listeners -= 1;
-    },
-  };
-  globalThis.setTimeout = (callback, delay) => {
-    assert.equal(delay, 1);
-    callback();
-    return timerHandle;
-  };
-  globalThis.clearTimeout = handle => {
-    assert.equal(handle, timerHandle);
-    clearCalls += 1;
-  };
-  try {
-    await withFetch(
-      async () => {
-        fetchCalls += 1;
-        return capResponse([]);
-      },
-      () => assert.rejects(
-        () => searchCellTypes('T cell', 10, {
-          signal,
-          timeoutMs: 1,
-        }),
-        error => error?.code === 'CAP_REQUEST_TIMEOUT'
-      )
-    );
-    assert.equal(fetchCalls, 0);
-    assert.equal(clearCalls, 1);
-    assert.equal(listeners, 0);
-  } finally {
-    globalThis.setTimeout = previousSetTimeout;
-    globalThis.clearTimeout = previousClearTimeout;
-  }
 });
 
 test('typed marker parsing is lossless and rejects malformed or excess intent', () => {

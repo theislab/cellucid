@@ -75,6 +75,7 @@ import { fmix32 } from '../cell-identity.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
 import { decodePoolStats } from '../../formats/io/decode-pool.js';
 import { loadedRoundTripMs } from '../../formats/io/link.js';
+import { measureOf } from '../../utils/machine.js';
 import { geneSampleRequestOf } from '../cell-subset-policy.js';
 
 /** The `obsm` array a first view draws when the file names none: an embedding of 2 or 3 columns, UMAP first. */
@@ -149,7 +150,7 @@ export async function firstViewCost(root, nObs, fileRows, target, readOptions = 
       // The store cannot say: every stored byte.
     }
   }
-  if (measureDecode && decodePoolStats().decodedBytesPerMs === null) {
+  if (measureDecode && decodingRate() === null) {
     // How fast chunks decode here, measured on the chunk the first open
     // cell lies in (the first view reads it whatever its size): read now.
     const first = Math.floor((fileRows === null ? 0 : fileRows[0]) / chunkRows) * chunkRows;
@@ -382,11 +383,17 @@ function readTime(link, decoding, bytesFor, showMs, storedFor = bytesFor) {
 /**
  * Decoded bytes a millisecond here, every decoder together: the rate one
  * chunk is measured to decode at (`decodePoolStats`), times the chunks
- * decoded at once; null before any chunk is decoded.
+ * decoded at once; null before any chunk is decoded. The machine's
+ * `decodeBytesPerMs` (`utils/machine.js`): held, it is the held rate, and
+ * nothing is read to measure it (`firstViewCost` `measureDecode`) -- the
+ * measured rate follows how busy the machine is, and carries over from
+ * every chunk the realm decoded before.
  */
 export function decodingRate() {
-  const { decodedBytesPerMs, size } = decodePoolStats();
-  return decodedBytesPerMs > 0 ? decodedBytesPerMs * Math.max(1, size) : null;
+  return measureOf('decodeBytesPerMs', () => {
+    const { decodedBytesPerMs, size } = decodePoolStats();
+    return decodedBytesPerMs > 0 ? decodedBytesPerMs * Math.max(1, size) : null;
+  });
 }
 
 /**

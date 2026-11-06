@@ -22,6 +22,15 @@ const PER_CELL = 1200;
 const LATENCY_MS = 40;
 const BYTES_PER_MS = 400;
 
+// The link is this spec's subject, and it is measured (`helpers/device.mjs`
+// holds it for every other spec): the answers below are held back so the
+// reader measures a slow link, and what it then plans is asserted only as
+// far as any slow link gives it (genes for a sample of at least 2 cells and
+// fewer than all; a runner that answers later measures a slower link and
+// reads them for fewer, never for none or for all). The decoding rate, the
+// order time and the opening cost stay held.
+test.use({ device: { link: 'measured' } });
+
 function atlas() {
   const data = new Float32Array(CELLS * PER_CELL);
   const indices = new Int32Array(CELLS * PER_CELL);
@@ -91,7 +100,7 @@ test('a CSR atlas over a slow link opens every cell, reads a gene for a stated s
 
   // Every cell on the map; genes for a sample of them.
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(CELLS);
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getGeneSample()?.cells ?? null), { timeout: 30_000 }).not.toBeNull();
+  await expect.poll(() => page.evaluate(() => window._cellucidState.getGeneSample()?.cells ?? null)).not.toBeNull();
   const sample = await page.evaluate(() => window._cellucidState.getGeneSample());
   expect(sample.of).toBe(CELLS);
   expect(sample.cells).toBeGreaterThan(1);
@@ -144,7 +153,7 @@ test('a CSR atlas over a slow link opens every cell, reads a gene for a stated s
   // 100 %, the top of the slider: its cost said before it is read.
   await page.keyboard.press('End');
   await expect(page.locator('#gene-read-percent')).toHaveValue('100');
-  await expect(page.locator('#gene-read-status')).toHaveText(/^2\.4K of 2\.4K cells · \d[\d.,]* (KB|MB)(, ~\d.*)?$/, { timeout: 30_000 });
+  await expect(page.locator('#gene-read-status')).toHaveText(/^2\.4K of 2\.4K cells · \d[\d.,]* (KB|MB)(, ~\d.*)?$/);
   await expect(page.locator('#gene-read-action')).toHaveText('Read');
 
   // Read: the gene then has a value on every cell, and the lines go.

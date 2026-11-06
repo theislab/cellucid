@@ -53,6 +53,8 @@ function createState() {
     updateFilteredCount() {},
     _pushActiveViewLabelToViewer() {},
     _notifyVisibilityChange() {},
+    // A DataState is an event emitter: a recolour says so (`colors:changed`).
+    emit() {},
   };
   for (const prototype of [
     DataStateFilterMethods.prototype,

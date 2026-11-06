@@ -77,6 +77,7 @@ test('a field whose categories could not be read says so, once, until the field 
     _fieldGroups: new Map(),
     _fieldGroupFailures: new Map(),
     _pendingFields: new Set(),
+    _fieldReads: new Set(),
     _resolvedGroups: null,
     _replicateBlocker: null,
     _highlightRevision: 0,

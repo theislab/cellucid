@@ -1,0 +1,21 @@
+{
+  "examples": [
+    {
+      "shown": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "shown": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "shown"
+    ],
+    "type": "object"
+  },
+  "type": "layout.sidebar.show",
+  "version": 1
+}

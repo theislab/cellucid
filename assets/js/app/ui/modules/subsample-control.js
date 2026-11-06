@@ -5,7 +5,10 @@
  * method, its seed and what the method needs (a field to stratify by, an
  * embedding) appear, with Apply.
  *
- * Apply reads the open dataset again in place with the chosen cells
+ * Apply and Open all cells dispatch the action `cells.open` (a step of the
+ * history, undone by reading the cells before again: the `cells` state
+ * domain, `app/state/domains/cells.js`), whose implementation is here:
+ * it reads the open dataset again in place with the chosen cells
  * (`dataset-controls.js`, `reopenOpenDataset`), carrying highlights and
  * labels across by original cell position (`cell-subset-carry.js`), and
  * makes the choice this tab's for datasets opened next
@@ -41,7 +44,11 @@ import { cellShareReadShare } from '../../../data/anndata/subsample-plan.js';
 import { renderFactList } from '../components/controls.js';
 import { readDataSourceUrlParameters } from '../../url-state.js';
 import { SUBSAMPLE_URL_PARAMETERS, subsampleLink } from '../../subsample-url.js';
-import { onAbort } from '../../../utils/abort.js';
+import { onAbort, throwIfAborted } from '../../../utils/abort.js';
+import { getActions } from '../../actions/index.js';
+import { shownMsPerCell } from '../../../data/opening-cost.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
+import { dispatchFromControl } from '../../actions/control-dispatch.js';
 
 const DOM_KEYS = Object.freeze([
   'root', 'slider', 'percent', 'count', 'settings', 'method', 'seed',
@@ -305,13 +312,28 @@ export function geneCostFacts(plan) {
  *   costs now, as Details rows (`geneCostFacts`), asked once per opening
  *   when Details is first opened (working it out may read the matrix's row
  *   pointers, which the first gene reads anyway)
- * @returns {{refresh: () => void, showGrowth: (progress: {cells: number, target: number}|null) => void, showOpenCells: () => void, destroy: () => void}}
+ * @returns {{refresh: () => void, showGrowth: (progress: {cells: number, target: number}|null) => void, showOpenCells: () => void,
+ *   reopenKeeping: (cellSubset: Object) => Promise<{restoring: Promise<void>}>, destroy: () => void}}
  */
 export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify = () => {}, representation = async () => null, geneCost = async () => null, viewCarry = null }) {
   for (const key of DOM_KEYS) {
     if (!dom?.[key]) throw new TypeError(`The cells-to-open control needs its ${key}.`);
   }
+  // Opening a share of the cells, whoever asks, is this control's reading
+  // again (`openCellsAction`); provided first, so a second control on the
+  // page fails before it starts anything.
+  const unprovide = getActions().provide('cells.open', (params, context) => openCellsAction(params, context));
+  // What opening the cells again would take, from what openings of this page measured per cell (the agent presence's heavy work).
+  const unestimate = getActions().provideEstimate('cells.open', params => {
+    const subset = getCellSubset();
+    const msPerCell = shownMsPerCell();
+    if (subset === null || msPerCell === null) return null;
+    const cells = params.mode === 'all' || params.count === undefined || params.count >= subset.nObs ? subset.nObs : params.count;
+    return { ms: msPerCell * cells, bytes: null, what: `Opens ${formatCountOf(cells, 'cell')} again` };
+  });
   const lifecycle = new AbortController();
+  onAbort(lifecycle.signal, unprovide);
+  onAbort(lifecycle.signal, unestimate);
   const on = (element, event, handler) => element.addEventListener(event, handler, { signal: lifecycle.signal });
   let busy = false;
   // A progressive opening growing in place: `{cells, target}`, or null.
@@ -571,10 +593,10 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
   /**
    * Read the open dataset again with the cells `cellSubset` asks for,
    * keeping what the person made and where they were: highlights and labels
-   * by original cell position (`cell-subset-carry.js`), and the views
-   * (cameras, layout), each view's active field and filters, the sidebar
-   * controls and the analysis windows (`viewCarry`, the session's records of
-   * them). The cells newly open then join what is derived from the file (a
+   * by original cell position (`cell-subset-carry.js`), and every other
+   * state domain but the cells themselves (`viewCarry`: the views and their
+   * cameras, colours and filters, the settings, the analyses, through each
+   * domain's owner). The cells newly open then join what is derived from the file (a
    * label made from a column, a category or range group), as growing in
    * place gives the cells added (`takeInNewCells`).
    *
@@ -588,7 +610,7 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
    */
   async function reopenKeeping(cellSubset) {
     const carried = captureCarried(state);
-    const view = viewCarry === null ? null : viewCarry.capture();
+    const view = viewCarry === null ? null : await viewCarry.capture();
     const { shown, inPlace } = await reopen(cellSubset);
     // Cells grown or cut in place kept everything shown
     // (`app/open-cells-resize.js`); a new reading gets it back.
@@ -607,31 +629,95 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
     return { restoring };
   }
 
-  async function apply(request) {
+  /** The parameters of `cells.open` the control's choice stands for. */
+  function actionParamsOf(request, nObs) {
+    if (request.mode === 'all') return { mode: 'all' };
+    return {
+      mode: 'subsample',
+      count: request.k ?? shareCount(Number(request.percent), nObs),
+      method: request.method ?? null,
+      seed: request.seed ?? null,
+      ...(request.field === undefined ? {} : { field: request.field }),
+      ...(request.allocation === undefined ? {} : { allocation: request.allocation }),
+      ...(request.embedding === undefined ? {} : { embedding: request.embedding }),
+    };
+  }
+
+  /**
+   * Apply: the action `cells.open`, a step. Datasets opened next in this tab
+   * take the share shown (the control's choice, not the dataset's state).
+   */
+  function apply(request) {
     if (busy) return;
     const subset = getCellSubset();
     if (subset === null) return;
+    setTabCellSubsetRequest(request.mode === 'subsample' ? { ...request, k: undefined, percent: String(percentShown()) } : { mode: 'all' });
+    void dispatchFromControl('cells.open', actionParamsOf(request, subset.nObs), {
+      failure: 'The cells could not be opened',
+      category: 'data',
+    });
+  }
+
+  /**
+   * The action `cells.open`: read the open dataset again with every cell or
+   * with exactly `count` cells chosen by `method` (the file's own when
+   * null), keeping what was made (`reopenKeeping`). Resolves once what was
+   * shown is back, or, when a newer `cells.open` replaces it meanwhile, once
+   * the cells are open: the control is the person's again as soon as they
+   * are (a share chosen by mistake is changed at once), and the newer
+   * reading supersedes the restoring, whose notes are then not said.
+   */
+  async function openCellsAction(params, { signal }) {
+    const subset = getCellSubset();
+    if (subset === null) {
+      throw new ActionRefused('The dataset shown cannot be read again with other cells.', { code: 'unavailable' });
+    }
+    if (busy) throw new ActionRefused('The cells are being read again; wait until that ends.', { code: 'busy' });
+    const nObs = subset.nObs;
+    let exact;
+    if (params.mode === 'all' || params.count >= nObs) {
+      exact = { mode: 'all' };
+    } else {
+      if (params.count === undefined) throw new ActionRefused('A subsample names how many cells to open (count).', { code: 'bad-params' });
+      if (params.count < FEWEST_OPEN_CELLS) {
+        throw new ActionRefused(`Open at least ${formatCountOf(FEWEST_OPEN_CELLS, 'cell')}: ${FEWEST_OPEN_CELLS_REASON}.`, { code: 'bad-params' });
+      }
+      const method = params.method;
+      if (method === 'stratified' && params.field === undefined) {
+        throw new ActionRefused('A stratified subsample names the categorical column it is stratified by (field).', { code: 'bad-params' });
+      }
+      const request = {
+        mode: 'subsample',
+        ...(method === null ? {} : { method }),
+        ...(params.seed === null ? {} : { seed: params.seed }),
+        ...(method === 'stratified' ? { field: params.field, allocation: params.allocation } : {}),
+        ...(method === 'spatial' ? { ...(params.embedding === undefined ? {} : { embedding: params.embedding }), gridSize: DEFAULT_GRID_SIZE } : {}),
+      };
+      // The open dataset is read with exactly this many cells.
+      exact = { ...request, k: params.count, strict: true };
+    }
+    throwIfAborted(signal);
     busy = true;
     render();
     try {
-      // The open dataset is read with exactly this many cells; datasets
-      // opened next take the same share.
-      const exact = request.mode === 'subsample'
-        ? { ...request, k: request.k ?? shareCount(Number(request.percent), subset.nObs), percent: undefined, strict: true }
-        : request;
-      // Datasets opened next take the share shown.
-      const tab = request.mode === 'subsample' ? { ...request, k: undefined, percent: String(percentShown()) } : request;
-      if (request.mode !== 'kept') setTabCellSubsetRequest(request.mode === 'all' ? { mode: 'all' } : tab);
       const { restoring } = await reopenKeeping(exact);
       busy = false;
       refresh();
-      await restoring;
+      let removeStop = () => {};
+      const replaced = new Promise(resolve => { removeStop = onAbort(signal, resolve); });
+      try {
+        await Promise.race([restoring, replaced]);
+      } finally {
+        removeStop();
+      }
     } finally {
       if (busy) {
         busy = false;
         refresh();
       }
     }
+    const now = getCellSubset();
+    return { cells: now?.kept == null ? (now?.nObs ?? nObs) : now.kept.length, of: nObs };
   }
 
   on(dom.slider, 'input', () => {
@@ -666,22 +752,8 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
   on(dom.copyLink, 'click', () => { void copyLink(); });
   on(dom.openAll, 'click', () => {
     // Every cell of this dataset; the tab keeps fitting datasets opened next.
-    void (async () => {
-      if (busy) return;
-      busy = true;
-      render();
-      try {
-        const { restoring } = await reopenKeeping({ mode: 'all' });
-        busy = false;
-        refresh();
-        await restoring;
-      } finally {
-        if (busy) {
-          busy = false;
-          refresh();
-        }
-      }
-    })();
+    if (busy || getCellSubset() === null) return;
+    void dispatchFromControl('cells.open', { mode: 'all' }, { failure: 'The cells could not be opened', category: 'data' });
   });
   /**
    * The open cells changed in place (a growth step, an Apply): the count
@@ -703,6 +775,7 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
   refresh();
   return {
     refresh,
+    reopenKeeping,
     /**
      * Say how far a progressive opening has grown (`{cells, target}`), or
      * that it is done (null): the control shows the cells open so far.

@@ -11,9 +11,22 @@
 
 import { formatPercent } from '../../components/display-format.js';
 
-export function clampInt(value, min, max) {
-  const n = Number.isFinite(value) ? Math.floor(value) : min;
-  return Math.max(min, Math.min(max, n));
+/**
+ * The minimum-annotator count an input field holds: a non-negative whole
+ * number of voters. The contract bounds it only by what JSON numbers carry
+ * exactly (a safe integer, `config.schema.json` `maximum`); anything else the
+ * field holds (empty, negative, fractional, too large) keeps `previous`, so a
+ * stray keystroke never rewrites a published setting.
+ *
+ * @param {string} raw - The input's value
+ * @param {number} previous - The count in force
+ * @returns {number}
+ */
+export function minAnnotatorsFromInput(raw, previous) {
+  const text = String(raw ?? '').trim();
+  if (!/^[0-9]+$/.test(text)) return previous;
+  const n = Number(text);
+  return Number.isSafeInteger(n) ? n : previous;
 }
 
 export function formatPctSigned11(value) {

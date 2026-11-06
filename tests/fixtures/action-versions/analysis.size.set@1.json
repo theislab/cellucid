@@ -1,0 +1,72 @@
+{
+  "examples": [
+    {
+      "analysis": "markers",
+      "expanded": {
+        "footerHeight": 1,
+        "height": 1,
+        "optionsWidth": 1,
+        "statsWidth": 1,
+        "width": 1
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "analysis": {
+        "enum": [
+          "markers",
+          "differential",
+          "dotplot",
+          "signature",
+          "composition",
+          "quick",
+          "detailed",
+          "correlation"
+        ],
+        "type": "string"
+      },
+      "expanded": {
+        "additionalProperties": false,
+        "properties": {
+          "footerHeight": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "height": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "optionsWidth": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "statsWidth": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "width": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "optionsWidth",
+          "footerHeight",
+          "statsWidth"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "analysis",
+      "expanded"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.size.set",
+  "version": 1
+}

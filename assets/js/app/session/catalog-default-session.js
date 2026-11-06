@@ -2,7 +2,10 @@
  * @fileoverview The default view a dataset catalog names for a dataset: its
  * `session` (`datasets.json`, `data/sources/anndata-catalog.js`), a
  * `.cellucid-session` file pinned by its exact byte length and SHA-256,
- * applied when the dataset is opened from the catalog.
+ * applied when the dataset is opened from the catalog. It is a starting view
+ * (`published-default.js`: a format-4 session of one tracker of one root),
+ * put back before the dataset's history starts, so the history starts from
+ * it (`SessionSerializer.restorePublishedDefaultState`).
  *
  * Only a dataset of a catalog (the sample catalog, or a linked one) that
  * names a session owns one; every other dataset performs no request.

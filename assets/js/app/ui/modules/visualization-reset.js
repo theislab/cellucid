@@ -5,6 +5,9 @@
  * owner is present. Resetting restores that exact state; missing controls,
  * missing methods, malformed values, and unsupported enum values are errors.
  *
+ * The Reset camera button is the `display.reset` action, implemented here;
+ * the R key is `camera.reset` of the focused view (`camera-controls.js`).
+ *
  * @module ui/modules/visualization-reset
  */
 
@@ -16,6 +19,10 @@ import {
   POINT_SIZE_SLIDER_MINIMUM,
 } from '../../../rendering/point-size-scale.js';
 import { requireObjectRecord } from '../../../utils/exact-record.js';
+import { getActions } from '../../actions/index.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
+import { dispatchFromControl } from '../../actions/control-dispatch.js';
+import { viewNameOf } from '../../actions/targets/views.js';
 
 const EXACT_OPTION_KEYS = Object.freeze([
   'cameraControls',
@@ -583,19 +590,34 @@ export function initVisualizationReset(options) {
 
   captureInitialState();
 
-  listen(resetCameraBtn, 'click', resetVisualizationToDefaults);
+  listen(resetCameraBtn, 'click', () => {
+    void dispatchFromControl('display.reset', {}, { failure: 'Reset failed', category: 'render' });
+  });
   listen(document, 'keydown', (event) => {
     if (isTextEntryTarget(event.target)) {
       return;
     }
+    // A chord (⌘R reloads) and a held key's repeats are not the shortcut.
+    if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
     if (event.key === 'r' || event.key === 'R') {
-      viewer.resetCamera();
+      void dispatchFromControl(
+        'camera.reset',
+        { view: viewNameOf(viewer, viewer.getFocusedViewId()) },
+        { failure: 'Camera reset failed', category: 'render' }
+      );
     }
+  });
+
+  const withdrawDisplayReset = getActions().provide('display.reset', () => {
+    if (destroyed) throw new ActionRefused('The display controls are closed.', { code: 'unavailable' });
+    resetVisualizationToDefaults();
+    return null;
   });
 
   function destroy() {
     if (destroyed) return;
     destroyed = true;
+    withdrawDisplayReset();
     lifecycleController.abort();
   }
 

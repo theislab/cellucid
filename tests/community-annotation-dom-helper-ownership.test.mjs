@@ -42,10 +42,7 @@ function annotationUiSources() {
 
 test('community-annotation/dom.js owns its helpers for the whole annotation UI', () => {
   const owned = ownedHelperNames();
-  assert.ok(
-    owned.includes('el') && owned.includes('toCleanString'),
-    'dom.js must still export the shared element and string helpers'
-  );
+  assert.ok(owned.includes('el'), 'dom.js must still export the shared element helper');
 
   const sources = annotationUiSources();
   assert.ok(
@@ -90,10 +87,19 @@ test('the voting modal builds its DOM through the shared owner', () => {
     .split(',')
     .map((name) => name.trim())
     .filter(Boolean);
-  for (const name of ['el', 'toCleanString']) {
-    assert.ok(
-      imported.includes(name),
-      `the voting modal must import ${name} rather than define its own`
-    );
-  }
+  assert.ok(imported.includes('el'), 'the voting modal must import el rather than define its own');
+});
+
+test('community annotation has one toCleanString (utils/clean-string.js)', () => {
+  const owner = fileURLToPath(new URL('../assets/js/utils/clean-string.js', import.meta.url));
+  assert.match(read(owner), /^export function toCleanString\(/m);
+  const sources = [
+    ...annotationUiSources(),
+    DOM_MODULE,
+    ...readdirSync(fileURLToPath(new URL('../assets/js/app/community-annotations/', import.meta.url)))
+      .filter(name => name.endsWith('.js'))
+      .map(name => fileURLToPath(new URL(`../assets/js/app/community-annotations/${name}`, import.meta.url))),
+  ];
+  const offenders = sources.filter(file => /^(?:export )?function toCleanString\s*\(|^(?:const|let|var) toCleanString\s*=/m.test(read(file)));
+  assert.deepEqual(offenders.map(file => path.relative(MODULES_DIR, file)), [], 'import toCleanString from utils/clean-string.js');
 });

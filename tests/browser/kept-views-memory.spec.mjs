@@ -32,8 +32,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
     select.dispatchEvent(new Event('change', { bubbles: true }));
   }, mode);
   const settled = () => expect.poll(
-    () => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().settled),
-    { timeout: 30_000 },
+    () => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().settled)
   ).toBe(true);
   // What the canvas shows, kept in the page, and where two captures differ:
   // pane by pane, how many pixels, by how much, and the first few, so a
@@ -138,8 +137,8 @@ test('six kept views draw in a grid, and views released under memory pressure co
         gl.readPixels(0, 0, plan.width, plan.rows, gl.RED, gl.UNSIGNED_BYTE, alpha);
         const geometry = renderer._snapshotGeometryPools?.get(snapshot.geometryGeneration) ?? null;
         const expectedOrder = geometry === null || snapshot.geometryGeneration === renderer._liveGeometryGeneration
-          ? (renderer._liveOrder?.drawOrder ?? null)
-          : (geometry.order?.drawOrder ?? null);
+          ? (renderer._liveOrder ?? null)
+          : (geometry.order ?? null);
         out[snapshot.id] = {
           colorBytes: colors.length,
           colorHash: hash(colors),
@@ -174,6 +173,11 @@ test('six kept views draw in a grid, and views released under memory pressure co
   // while the shown view republishes the same colours and visibility (a
   // store replacement, which allocates).
   await setLayout('single');
+  // The layout is changed by an action: a kept view is dormant once a frame
+  // has presented the one view alone. Settled before that frame is the grid
+  // still (WebKit, 1 run in 7: nothing was dormant, so the refused
+  // allocation had nothing to release and was thrown).
+  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPresentedLayout().panes.length)).toBe(1);
   await settled();
   await page.evaluate(() => {
     // The first store sized reports OUT_OF_MEMORY when its allocation is

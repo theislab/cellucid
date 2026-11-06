@@ -1,3 +1,10 @@
+/**
+ * Per-view state is captured view by view, by position (the live view
+ * first, then each kept view): whichever view is focused, the live view's
+ * value is the live view's, and the focused view's value is read from the
+ * state it is being edited in (DataState's top level), not from its parked
+ * view context (`app/state/domains/view-list.js` `viewOwner`).
+ */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -6,18 +13,10 @@ import {
   createInMemoryAnnDataDimensionManager,
   inMemoryAnnDataMapping,
 } from './helpers/in-memory-anndata.mjs';
-import {
-  capture as captureCoreState
-} from '../assets/js/app/session/contributors/core-state.js';
+import { createActiveFieldDomain } from '../assets/js/app/state/domains/active-field.js';
+import { createFiltersDomain } from '../assets/js/app/state/domains/filters.js';
+import { createViewsDomain } from '../assets/js/app/state/domains/views.js';
 import { visibleOf } from './helpers/category-state.mjs';
-
-function cameraState() {
-  return {
-    navigationMode: 'orbit',
-    orbit: { radius: 3, targetRadius: 3, theta: 0.5, phi: 1, target: [0, 0, 0] },
-    freefly: { position: [1, 2, 3], yaw: 0.25, pitch: -0.1 }
-  };
-}
 
 const permissiveViewer = new Proxy({}, {
   get: (_target, property) => (
@@ -65,49 +64,29 @@ function twoViewState() {
   return state;
 }
 
-function captureWith(state, activeId) {
-  const previousDocument = globalThis.document;
-  globalThis.document = { getElementById: () => null };
-  try {
-    const [chunk] = captureCoreState({
-      state,
-      viewer: {
-        getCamerasLocked: () => true,
-        getCameraState: () => cameraState(),
-        getViewLayout: () => ({ mode: 'grid', activeId, liveViewHidden: false }),
-        getSnapshotViews: () => [{
-          id: 'snap_1',
-          label: 'sample',
-          fieldKey: 'sample',
-          fieldKind: 'category',
-          meta: { filtersText: [] }
-        }],
-        getViewCameraState: () => cameraState(),
-        getCentroidFlags: () => ({ points: false, labels: false })
-      },
-      sidebar: { querySelectorAll: () => [] }
-    });
-    return chunk.payload;
-  } finally {
-    if (previousDocument === undefined) delete globalThis.document;
-    else globalThis.document = previousDocument;
-  }
+/** The viewer as the domains read it: the live view and one kept view, `activeId` focused. */
+function viewerWith(activeId) {
+  return {
+    getSnapshotViews: () => [{ id: 'snap_1' }],
+    getViewLayout: () => ({ mode: 'grid', activeId, liveViewHidden: false }),
+    getCamerasLocked: () => true,
+    getCentroidFlags: () => ({ points: false, labels: false }),
+  };
 }
 
-const LIVE_FIELD_STATE = {
-  activeFields: { activeFieldKey: 'leiden', activeFieldSource: 'obs' },
-  filters: {
-    'obs:leiden': {
-      kind: 'category',
-      filterEnabled: null,
-      visibility: [{ categoryName: 'a', visible: false }],
-      colors: [],
-      colormapId: null,
-      outlierFilterEnabled: null,
-      outlierThreshold: null
-    }
-  }
-};
+function captureWith(state, activeId) {
+  const viewer = viewerWith(activeId);
+  const refreshUi = () => {};
+  return {
+    activeField: createActiveFieldDomain({ state, viewer, refreshUi }).capture(),
+    filters: createFiltersDomain({ state, viewer, refreshUi }).capture(),
+    views: createViewsDomain({ state, viewer, refreshUi }).capture(),
+  };
+}
+
+const LEIDEN = { source: 'obs', key: 'leiden' };
+const SAMPLE = { source: 'obs', key: 'sample' };
+const LIVE_FILTERS = [{ field: LEIDEN, hidden: ['a'] }];
 
 test('saving while a kept view is selected records the live view as the live view', () => {
   const liveSelected = captureWith(twoViewState(), 'live');
@@ -115,19 +94,15 @@ test('saving while a kept view is selected records the live view as the live vie
   state.setActiveView('snap_1');
   const snapshotSelected = captureWith(state, 'snap_1');
 
-  for (const payload of [liveSelected, snapshotSelected]) {
-    assert.deepEqual(
-      { activeFields: payload.activeFields, filters: payload.filters },
-      LIVE_FIELD_STATE
-    );
-    assert.deepEqual(payload.multiview.snapshots[0].activeFields, {
-      activeFieldKey: 'sample',
-      activeFieldSource: 'obs'
-    });
-    assert.deepEqual(payload.multiview.snapshots[0].filters, {});
+  for (const [values, focus] of [[liveSelected, 0], [snapshotSelected, 1]]) {
+    assert.deepEqual(values.activeField, { views: [LEIDEN, SAMPLE] });
+    assert.deepEqual(values.filters, { views: [LIVE_FILTERS, []] });
+    assert.equal(values.views.focus, focus);
     // Each view records the representation it shows.
-    assert.deepEqual(payload.liveEmbedding, { key: 'X_umap', columns: [0, 1, 2] });
-    assert.deepEqual(payload.multiview.snapshots[0].embedding, { key: 'X_umap', columns: [0, 1, 2] });
+    assert.deepEqual(
+      values.views.views.map(view => view.embedding),
+      [{ key: 'X_umap', columns: [0, 1, 2] }, { key: 'X_umap', columns: [0, 1, 2] }]
+    );
   }
 });
 
@@ -136,17 +111,7 @@ test('the selected kept view is captured from the state it is being edited in', 
   state.setActiveView('snap_1');
   // An edit on the selected kept view lives in DataState until focus moves.
   state.obsData.fields[1]._categoryVisible = visibleOf([true, false]);
-  const payload = captureWith(state, 'snap_1');
-  assert.deepEqual(payload.multiview.snapshots[0].filters, {
-    'obs:sample': {
-      kind: 'category',
-      filterEnabled: null,
-      visibility: [{ categoryName: 'y', visible: false }],
-      colors: [],
-      colormapId: null,
-      outlierFilterEnabled: null,
-      outlierThreshold: null
-    }
-  });
-  assert.deepEqual(payload.filters, LIVE_FIELD_STATE.filters);
+  const { filters } = captureWith(state, 'snap_1');
+  assert.deepEqual(filters.views[1], [{ field: SAMPLE, hidden: ['y'] }]);
+  assert.deepEqual(filters.views[0], LIVE_FILTERS);
 });

@@ -1,7 +1,8 @@
 /**
  * @fileoverview Session bundle writer.
  *
- * Writes a single-file `.cellucid-session` bundle containing:
+ * Writes a single-file bundle (a `.cellucid-session`, or another file kind of
+ * the framing, such as a `.cellucid-library`, by its `signature`) containing:
  * - A small JSON manifest (gzip'd or plain, chosen by orchestrator per-chunk)
  * - Length-prefixed chunk payloads in manifest order
  *
@@ -12,7 +13,7 @@
  */
 
 import {
-  SESSION_BUNDLE_MAGIC_BYTES,
+  SESSION_SIGNATURE,
   u32ToBytesLE
 } from './format.js';
 import {
@@ -25,6 +26,8 @@ import { requirePlainRecord } from '../../../utils/exact-record.js';
  * @typedef {object} BundleWriteInput
  * @property {any} manifest - JSON-serializable manifest object.
  * @property {Uint8Array[]} chunks - Stored chunk bytes in manifest order.
+ * @property {import('./format.js').BundleSignature} [signature] - The file kind
+ *   written (`SESSION_SIGNATURE` by default).
  */
 
 /**
@@ -33,7 +36,7 @@ import { requirePlainRecord } from '../../../utils/exact-record.js';
  * @param {BundleWriteInput} input
  * @returns {Blob}
  */
-export function writeBundle({ manifest, chunks }) {
+export function writeBundle({ manifest, chunks, signature = SESSION_SIGNATURE }) {
   requirePlainRecord(manifest, 'Bundle manifest');
   assertArray(manifest.chunks, 'Bundle manifest chunks');
   assertArray(chunks, 'Bundle stored chunks');
@@ -67,7 +70,7 @@ export function writeBundle({ manifest, chunks }) {
 
   /** @type {BlobPart[]} */
   const parts = [];
-  parts.push(SESSION_BUNDLE_MAGIC_BYTES);
+  parts.push(signature.bytes);
   parts.push(u32ToBytesLE(manifestBytes.byteLength));
   parts.push(manifestBytes);
 

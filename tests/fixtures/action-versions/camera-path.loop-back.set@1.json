@@ -1,0 +1,21 @@
+{
+  "examples": [
+    {
+      "enabled": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "enabled"
+    ],
+    "type": "object"
+  },
+  "type": "camera-path.loop-back.set",
+  "version": 1
+}

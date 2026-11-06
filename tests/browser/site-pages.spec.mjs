@@ -72,6 +72,11 @@ test('the footer keeps its links to one quiet line and opens each page in a new 
   const footer = page.locator('#copyright');
   const links = footer.locator('p').nth(1).locator('a');
   await expect(links).toHaveText(['Docs', 'Cite', 'GitHub', 'Privacy', 'Terms']);
+  // Contact writes to the project's address (SECURITY.md's contact, the reading
+  // pages'), beside who made it: the links line has no room for it at 260px.
+  const credit = footer.locator('p').nth(0).locator('a');
+  await expect(credit).toHaveText(['Kemal Inecik', 'Theis Lab', 'Contact']);
+  await expect(footer.getByRole('link', { name: 'Contact', exact: true })).toHaveAttribute('href', 'mailto:hello@cellucid.com');
   // One line at the sidebar's default width: every link starts on the same row.
   const rows = await links.evaluateAll(anchors => anchors.map(anchor => {
     const box = anchor.getBoundingClientRect();
@@ -79,6 +84,14 @@ test('the footer keeps its links to one quiet line and opens each page in a new 
   }));
   expect(rows).not.toContain(null);
   expect(new Set(rows).size).toBe(1);
+  // Every line of links stays one line at the narrowest sidebar a desktop has
+  // (260px, a window 900px wide or less).
+  await page.setViewportSize({ width: 880, height: 800 });
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width').trim())).toBe('260px');
+  for (const line of [0, 1, 2]) {
+    const tops = await footer.locator('p').nth(line).locator('a').evaluateAll(anchors => anchors.map(anchor => Math.round(anchor.getBoundingClientRect().top)));
+    expect(new Set(tops).size, `footer line ${line + 1}`).toBe(1);
+  }
   // The accessibility statement sits beside the licence, on its line.
   const license = footer.locator('p').nth(2).locator('a');
   await expect(license).toHaveText(['BSD 3-Clause license', 'Accessibility']);

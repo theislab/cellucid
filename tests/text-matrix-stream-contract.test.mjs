@@ -8,6 +8,8 @@
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 import zlib from 'node:zlib';
 
 import { openDatasetStore, openTranscodedStore } from '../assets/js/data/anndata/open.js';

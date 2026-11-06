@@ -155,8 +155,8 @@ const AMBIENT_FRAME_CAUSE = 'highlight';
  *   lookup). `withBorrowedViewData` lends a view's arrays to a reader (the
  *   figure-export preview, on every build).
  * - Registrations: `set…Callback` / `set…Handler`, and the listeners that
- *   need no frame (`onPresentedViewStateChanged` does: its baseline is the
- *   next frame drawn).
+ *   need no frame (`onPresentedViewStateChanged` needs one to read its
+ *   baseline from, and asks for it itself without redrawing a pane).
  * - Work that changes nothing on screen when called: `prepareCellPicking`
  *   builds, in a worker, the index those lookups read (the store adopts its
  *   draw order once it lands, which asks for its own frames:
@@ -209,6 +209,8 @@ function isFrameReaderMethodName(methodName) {
  * pointer move, mostly with the cells it already shows.
  */
 const SELF_INVALIDATING_VIEWER_METHODS = new Set([
+  'measureFullDetailFrameCost',
+  'onPresentedViewStateChanged',
   'setLiveViewLabel',
   'updateHighlight',
   'updateSnapshotAttributes'
@@ -1222,6 +1224,9 @@ export function createViewer({
 	  let presentedViewStateGeneration = 0;
 	  const presentedCameraSettlement =
 	    new PresentedCameraSettlementTracker();
+	  // The view the pending camera burst moves (the focused view when it
+	  // began), or null while none is pending.
+	  let presentedBurstViewId = null;
 	  const presentedFrameState = {
 	    initialized: false,
 	    canvasHeight: 0,
@@ -1289,11 +1294,27 @@ export function createViewer({
 	    }
 	    // Any explicit semantic publication becomes the new frame baseline;
 	    // camera tracking will initialize from it instead of delivering a
-	    // duplicate trailing event for the same change.
+	    // duplicate trailing event for the same change. A camera still
+	    // settling then (a glide after a key or a drag, a zoom easing) settles
+	    // here first, on the view it moved: retiring its burst silently left
+	    // the motion up to this moment unobserved, so the history met it as a
+	    // change made outside an action. Motion that goes on afterwards is a
+	    // burst of its own, from the new baseline.
 	    if (resetFrameBaseline) {
+	      const unsettledViewId = presentedCameraSettlement.isPending()
+	        ? presentedBurstViewId
+	        : null;
 	      presentedFrameState.initialized = false;
 	      presentedCameraSettlement.reset();
+	      presentedBurstViewId = null;
+	      if (unsettledViewId !== null && viewExists(unsettledViewId)) {
+	        deliverPresentedViewStateEvent('camera-settled', unsettledViewId);
+	      }
 	    }
+	    deliverPresentedViewStateEvent(reason, exactViewId);
+	  }
+
+	  function deliverPresentedViewStateEvent(reason, exactViewId) {
 	    if (presentedViewStateListeners.size === 0) return;
 	    presentedViewStateGeneration =
 	      presentedViewStateGeneration === Number.MAX_SAFE_INTEGER
@@ -1325,6 +1346,7 @@ export function createViewer({
 	    if (presentedViewStateListeners.size === 0) {
 	      presentedFrameState.initialized = false;
 	      presentedCameraSettlement.reset();
+	      presentedBurstViewId = null;
 	      return;
 	    }
 	    const state = presentedFrameState;
@@ -1368,6 +1390,7 @@ export function createViewer({
 	        wasInitialized
 	      );
 	      if (transition === 'camera-changing') {
+	        presentedBurstViewId = focusedViewId;
 	        publishPresentedViewStateChange(
 	          transition,
 	          focusedViewId,
@@ -1382,6 +1405,7 @@ export function createViewer({
 	      true
 	    );
 	    if (transition === 'camera-settled') {
+	      presentedBurstViewId = null;
 	      publishPresentedViewStateChange(
 	        transition,
 	        focusedViewId
@@ -9720,9 +9744,15 @@ export function createViewer({
       // allocating and dispatching an event for every interpolated frame.
     },
 
+    /**
+     * Stop the camera where the last frame shows it: the glide a drag or a
+     * key leaves, and a zoom still easing toward its target. A key held, or
+     * a drag in progress, moves it again on the next frame.
+     */
     stopInertia() {
       velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
       vec3.set(freeflyVelocity, 0, 0, 0);
+      targetRadius = radius;
     },
 
     /**
@@ -11115,6 +11145,18 @@ export function createViewer({
      * choice was measured no faster.
      */
     measureFullDetailFrameCost() {
+      // Nothing the page could turn on would draw fewer cells of this framing
+      // (`sampleFullDetailFrameCost`, from the cameras the panes were last
+      // drawn with): nothing to measure, so no frame of every pane. Measuring
+      // redrew all of them at each settling of a camera, most of all on a GPU
+      // so slow that a drag settles between two moves of the pointer.
+      if (presentedAtFullDetail()) {
+        const fewer = presentedDrawsFewer();
+        if (!fewer.lod && !fewer.culling) {
+          reportFullDetailFrameCost({ kind: 'nothing-fewer' });
+          return;
+        }
+      }
       armFullDetailFrameCost();
     },
     /**
@@ -11197,6 +11239,9 @@ export function createViewer({
       // emitted because subscribers already build their initial state.
       presentedFrameState.initialized = false;
       presentedFrameState.pending = false;
+      // A frame to read that baseline from, not a change of what is drawn:
+      // every pane that did not move keeps its pixels.
+      invalidateCameraFrame();
       let subscribed = true;
       return () => {
         if (!subscribed) return;

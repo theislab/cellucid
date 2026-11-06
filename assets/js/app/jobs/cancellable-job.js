@@ -23,8 +23,9 @@
  *   (bytes read, how fast, how long is left), in one line (`describe`).
  * - **One notification.** A job running longer than a moment shows one
  *   progress notification, with Cancel, updated as it goes and closed with
- *   the outcome. Its reads carry a read kind of `JOB_READ_KINDS`, which the
- *   generic read notifications skip (`app/read-progress-notifications.js`),
+ *   the outcome. Its reads carry a read kind of `JOB_READ_KINDS` (or name
+ *   the job as their `owner`: a copy of the dataset's `cells` reads), which
+ *   the generic read notifications skip (`app/read-progress-notifications.js`),
  *   so a job never shows twice.
  *
  * @module app/jobs/cancellable-job
@@ -44,12 +45,23 @@ import { cancel, isCancellation } from '../../utils/abort.js';
 export const JOB_READ_KINDS = Object.freeze(new Set(['analysis', 'outliers']));
 
 /**
+ * Read kinds a job may follow by owner besides its own: `cells`, the reads
+ * made once of every cell (a copy of the dataset, `writeAnnDataCopy`, whose
+ * reads name the job as their `owner`). Other reads of the kind (an
+ * export's) stay the generic notifications'.
+ */
+const OWNED_READ_KINDS = Object.freeze(new Set(['cells']));
+
+/** The ids of the jobs running now: a read one of them owns is shown by it. */
+const runningJobs = new Set();
+
+/**
  * Whether a read activity belongs to a job, which shows it itself: a read of
- * a job's kind, or one a job adopted by joining the load it reads for
- * (`data/read-activity-log.js`, `adopt`).
+ * a job's kind, one a running job owns, or one a job adopted by joining the
+ * load it reads for (`data/read-activity-log.js`, `adopt`).
  */
 export function isJobRead(activity) {
-  return JOB_READ_KINDS.has(activity?.kind) || (activity?.adoptedBy?.length ?? 0) > 0;
+  return JOB_READ_KINDS.has(activity?.kind) || runningJobs.has(activity?.owner) || (activity?.adoptedBy?.length ?? 0) > 0;
 }
 
 /** Notification and view updates are coalesced to at most this often. */
@@ -98,7 +110,7 @@ export class CancellableJob {
    * @param {string|null} [options.plan=null] - What the job costs, when known
    *   before it starts (`20,000 genes × 45,000 cells`)
    * @param {string|null} [options.readKind=null] - The read kind of its reads
-   *   (one of `JOB_READ_KINDS`), followed in the read activity log
+   *   (one of `JOB_READ_KINDS`, or `cells` for reads it owns), followed in the read activity log
    * @param {((activity: Object, job: CancellableJob) => boolean)|null} [options.ownsRead]
    *   Which reads of `readKind` are this job's; by default those whose
    *   `owner` is the job's `id` (pass `job.id` as the reads' owner)
@@ -112,6 +124,9 @@ export class CancellableJob {
    * @param {boolean} [options.failureNotice=true] - Whether a failure before
    *   the progress notification appeared gets an error notification of its
    *   own (false where the feature's own view always says why)
+   * @param {boolean} [options.successNotice=false] - Whether success before
+   *   the progress notification appeared gets a notification of its own
+   *   (true where nothing else tells the outcome: a file saved)
    * @param {Object} [options.notifications] - Notification center
    * @param {Object} [options.log] - Read activity log
    */
@@ -124,15 +139,17 @@ export class CancellableJob {
     onCancel = () => {},
     notifyAfterMs = NOTICE_AFTER_MS,
     failureNotice = true,
+    successNotice = false,
     notifications = getNotificationCenter(),
     log = getReadActivityLog(),
   }) {
     if (typeof title !== 'string' || title.length === 0) throw new TypeError('A job needs a title.');
-    if (readKind !== null && !JOB_READ_KINDS.has(readKind)) {
+    if (readKind !== null && !JOB_READ_KINDS.has(readKind) && !OWNED_READ_KINDS.has(readKind)) {
       throw new RangeError(`Unknown job read kind '${String(readKind)}'.`);
     }
     /** Unique id: the `owner` of the job's reads. */
     this.id = `job-${nextJobId++}`;
+    runningJobs.add(this.id);
     this.title = title;
     this.category = category;
     this._controller = new AbortController();
@@ -149,6 +166,7 @@ export class CancellableJob {
     this._itemsStartedAt = null;
     this._onCancel = onCancel;
     this._failureNotice = failureNotice;
+    this._successNotice = successNotice;
     this._notifications = notifications;
     this._notificationId = null;
     this._listeners = new Set();
@@ -292,13 +310,20 @@ export class CancellableJob {
     return true;
   }
 
-  /** The job finished; `message` closes its notification. */
-  succeed(message = `${this.title} done (${formatDuration(performance.now() - this.startedAt)})`) {
+  /**
+   * The job finished; `message` closes its notification (or, with
+   * `successNotice`, is one of its own), `details` what it adds on demand.
+   */
+  succeed(message = `${this.title} done (${formatDuration(performance.now() - this.startedAt)})`, { details = '' } = {}) {
     if (!this.running) return;
     this.message = message;
     this._end('done');
+    // Details stay until the person closes them (they are read on demand).
+    const more = details === '' ? {} : { details, duration: 0 };
     if (this._notificationId !== null) {
-      this._closeNotification(id => this._notifications.complete(id, message));
+      this._closeNotification(id => this._notifications.complete(id, message, more));
+    } else if (this._successNotice) {
+      this._notifications.success(message, { category: this.category, ...more });
     }
   }
 
@@ -348,6 +373,7 @@ export class CancellableJob {
   /** @private */
   _end(state) {
     this.state = state;
+    runningJobs.delete(this.id);
     this.endedAt = performance.now();
     this._ended();
     clearTimeout(this._notifyTimer);

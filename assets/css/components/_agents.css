@@ -1,0 +1,884 @@
+/* components/_agents.css
+   Agents (app/agent/): the Connect panel (connect/: the status line, the
+   approval dialog with who asks, where the answer goes, the warnings and
+   the code to compare, and Manage…'s rows with Remove and Forget this
+   browser), then the dock at the foot of the plot with the presence (the
+   permission cards, the activity lines, the permission settings) and the
+   chat bar (presence/, chat/). */
+
+/* ------------------------------------------------------------------------
+   The panel
+   --------------------------------------------------------------------- */
+
+/* One line: the short words fit the sidebar; the whole sentence is its title. */
+.agent-connect-status {
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------------
+   The approval
+   --------------------------------------------------------------------- */
+
+.agent-approval-dialog {
+  width: min(440px, calc(100vw - 2 * var(--space-4)));
+}
+
+.agent-approval-who {
+  margin: 0 0 var(--space-2);
+  font-size: var(--type-body);
+  line-height: var(--leading-normal);
+  color: var(--color-text-primary);
+}
+
+.agent-approval-warnings {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-4);
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-warning-text);
+}
+
+.agent-approval-warnings[hidden] {
+  display: none;
+}
+
+.agent-approval-code-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+}
+
+/* The code as the page that asked shows it: compared at a glance. */
+.agent-approval-code {
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+
+/* ------------------------------------------------------------------------
+   Manage…
+   --------------------------------------------------------------------- */
+
+.agent-connections-dialog {
+  width: min(480px, calc(100vw - 2 * var(--space-4)));
+}
+
+.agent-connections-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+  max-height: min(50dvh, 420px);
+  overflow-y: auto;
+}
+
+.agent-connections-list[hidden] {
+  display: none;
+}
+
+.agent-connection-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+}
+
+.agent-connection-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.agent-connection-title,
+.agent-connection-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-connection-title {
+  font-size: var(--type-body);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.agent-connection-meta {
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.agent-forget {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1-5);
+  padding-top: var(--space-3);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.agent-forget .field-help {
+  margin: 0;
+}
+
+.agent-forget-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+}
+
+.agent-forget-confirm[hidden],
+.agent-forget > .btn[hidden] {
+  display: none;
+}
+
+.agent-forget-question {
+  font-size: var(--type-hint);
+  color: var(--color-text-primary);
+}
+
+/* ========================================================================
+   Agents' dock – the presence and the chat bar (#agent-dock in index.html;
+   assets/js/app/agent/)
+   ===================================================================== */
+
+/* A track along the bottom of the part of the plot the sidebar does not
+   cover (the viewer's presented area, published by app/agent/dock.js), above
+   the selection bar and, on a phone, above the panel's bar. The track takes
+   no pointer; only its cards do. */
+.agent-dock {
+  --agent-dock-gutter: var(--space-4);
+  position: fixed;
+  left: var(--agent-dock-left, 0px);
+  width: var(--agent-dock-width, 100%);
+  box-sizing: border-box;
+  bottom: max(
+    calc(var(--space-4) + var(--phone-bar-space, 0px) + env(safe-area-inset-bottom, 0px)),
+    calc(var(--select-bar-block-size, 0px) + var(--space-2))
+  );
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1-5);
+  padding: 0 var(--agent-dock-gutter);
+  pointer-events: none;
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+}
+
+.agent-dock > * {
+  pointer-events: auto;
+}
+
+/* The selection bar's rule: while the sidebar fills a phone's screen, the
+   dock would float over the menu. */
+@media (max-width: 720px) {
+  body:has(#sidebar:not(.hidden)) .agent-dock {
+    display: none;
+  }
+}
+
+/* One width for every card of the dock. */
+.agent-presence,
+.agent-chat-panel {
+  box-sizing: border-box;
+  width: min(100%, 40rem);
+}
+
+/* ------------------------------------------------------------- Presence */
+
+.agent-presence {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.agent-notices,
+.agent-confirms,
+.agent-activities {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.agent-notices:empty,
+.agent-confirms:empty,
+.agent-activities:empty {
+  display: none;
+}
+
+/* A question: drawn with the emphasised edge, since the agent waits for it. */
+.agent-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  border: var(--border-strong);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+.agent-confirm-title {
+  margin: 0;
+  font-size: var(--type-heading);
+  font-weight: var(--font-weight-semibold);
+}
+
+.agent-confirm-why {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.agent-confirm-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+}
+
+/* Deny on its own; Allow's three scopes after their one label. */
+.agent-confirm-deny {
+  margin-right: auto;
+}
+
+.agent-confirm-allow-label {
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+/* The permission settings (dialog body drawn by the presence). */
+.agent-permissions-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-group-gap);
+}
+
+.agent-permission-modes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.agent-permission-kinds {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: var(--control-row-gap) var(--space-3);
+  margin: 0;
+  font-size: var(--type-control);
+}
+
+.agent-permission-kinds dd {
+  margin: 0;
+}
+
+.agent-permission-grants {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+/* The permission settings in one line (the chat settings, the Agents panel): the mode, Change…. */
+.agent-permissions-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: var(--type-control);
+}
+
+textarea.obs-select.agent-chat-instructions {
+  min-height: calc(2 * var(--space-6));
+}
+
+/* One line per agent turn: which agent, what it does, Stop / Undo turn. */
+.agent-activity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--control-height) + var(--space-2));
+  padding: 0 var(--space-1) 0 var(--space-2-5);
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--type-control);
+}
+
+.agent-activity-dot {
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-text-tertiary);
+}
+
+.agent-activity[data-state="acting"] .agent-activity-dot {
+  background: var(--color-accent);
+  animation: agent-pulse var(--duration-slow) ease-in-out infinite alternate;
+}
+
+.agent-activity[data-state="stopped"] .agent-activity-dot {
+  background: var(--color-warning);
+}
+
+@keyframes agent-pulse {
+  from { opacity: 1; }
+  to { opacity: var(--opacity-35); }
+}
+
+/* One line whatever it says (the select bar's rule): cut, its whole text is its title. */
+.agent-activity-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------- Chat bar */
+
+.agent-chat-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-height: var(--control-height);
+  padding: var(--control-button-padding-y) var(--space-3);
+  border: var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+  color: var(--color-text-primary);
+  font-family: inherit;
+  font-size: var(--type-button);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.agent-chat-toggle:hover {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.agent-chat-toggle-mark {
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-accent);
+}
+
+.agent-chat-toggle[data-busy="true"] .agent-chat-toggle-mark {
+  animation: agent-pulse var(--duration-slow) ease-in-out infinite alternate;
+}
+
+.agent-dock[data-chat-open="true"] .agent-chat-toggle {
+  display: none;
+}
+
+.agent-chat-panel {
+  display: flex;
+  flex-direction: column;
+  /* Never taller than the screen above the selection bar (a phone on its
+     side): the log gives up its height first. */
+  max-height: calc(100dvh - var(--select-bar-block-size, 0px) - var(--phone-bar-space, 0px) - var(--space-8));
+  overflow: hidden;
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-lg);
+}
+
+.agent-chat-panel[hidden] {
+  display: none;
+}
+
+.agent-chat-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2-5);
+  border-bottom: var(--border-light);
+}
+
+.agent-chat-title {
+  margin: 0;
+  flex: none;
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-semibold);
+}
+
+/* The chat's one status line: cut, the whole text is its title. */
+.agent-chat-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-chat-settings {
+  margin: var(--space-2) var(--space-2-5) 0;
+}
+
+.agent-chat-settings[hidden] {
+  display: none;
+}
+
+.agent-chat-key-link {
+  margin-left: auto;
+  font-size: var(--type-hint);
+  color: var(--color-text-link);
+}
+
+.agent-chat-key-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.agent-chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: min(48vh, 30rem);
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-2-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2-5);
+  font-size: var(--type-body);
+  overscroll-behavior: contain;
+}
+
+.agent-chat-log:empty {
+  display: none;
+}
+
+.agent-chat-empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.agent-chat-empty .empty-state {
+  margin: 0;
+}
+
+.agent-chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+}
+
+.agent-msg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  min-width: 0;
+}
+
+/* Who said it, and the message's own actions (Edit, Copy), shown on hover or focus. */
+.agent-msg-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.agent-msg-head .btn {
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--easing-standard);
+}
+
+.agent-msg:hover .agent-msg-head .btn,
+.agent-msg-head .btn:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .agent-msg-head .btn {
+    opacity: 1;
+  }
+}
+
+.agent-msg-user[data-flash="true"] .agent-msg-text {
+  animation: agent-flash var(--duration-slow) ease-in-out 2;
+}
+
+@keyframes agent-flash {
+  50% { background: var(--color-accent-soft); }
+}
+
+.agent-msg-who {
+  margin: 0;
+  font-size: var(--type-label);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.agent-msg-user .agent-msg-text {
+  margin: 0;
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  background: var(--color-surface-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-msg-body {
+  overflow-wrap: anywhere;
+  line-height: var(--leading-normal);
+}
+
+.agent-msg-body > :first-child {
+  margin-top: 0;
+}
+
+.agent-msg-body > :last-child {
+  margin-bottom: 0;
+}
+
+.agent-msg-body p,
+.agent-msg-body ul,
+.agent-msg-body ol,
+.agent-msg-body blockquote {
+  margin: 0 0 var(--space-1-5);
+}
+
+.agent-msg-body ul,
+.agent-msg-body ol {
+  padding-left: var(--space-5);
+}
+
+.agent-msg-body .agent-md-nested {
+  margin-left: var(--space-4);
+}
+
+.agent-msg-body .agent-md-heading {
+  font-weight: var(--font-weight-semibold);
+}
+
+.agent-msg-body blockquote {
+  padding-left: var(--space-2);
+  border-left: var(--border-strong);
+  color: var(--color-text-secondary);
+}
+
+.agent-msg-body code,
+.agent-tool-body pre,
+.agent-md-code {
+  font-size: var(--type-hint);
+}
+
+/* Nothing in the log scrolls on its own: the log is the one scroller. (A
+   scroller with a background nested in the log, inside the fixed dock, was
+   painted a second time over the plot by Chromium.) Long lines wrap. */
+.agent-md-code,
+.agent-tool-body pre {
+  margin: 0 0 var(--space-1-5);
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  background: var(--color-surface-sunken);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-md-table {
+  margin: 0 0 var(--space-1-5);
+}
+
+.agent-md-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--type-control);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.agent-md-table th,
+.agent-md-table td {
+  padding: var(--space-0-5) var(--space-2);
+  border: var(--border-light);
+  text-align: left;
+  vertical-align: top;
+}
+
+.agent-md-table th {
+  font-weight: var(--font-weight-semibold);
+  background: var(--color-surface-secondary);
+}
+
+/* Tool calls: one compact row each, opening to what was asked and answered. */
+.agent-tools {
+  display: flex;
+  flex-direction: column;
+}
+
+.agent-tool-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.agent-tool .agent-tool-head {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--space-1-5);
+}
+
+.agent-tool-mark {
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  border: var(--border-control);
+  box-sizing: border-box;
+}
+
+.agent-tool[data-state="step"] .agent-tool-mark {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+}
+
+.agent-tool[data-state="refused"] .agent-tool-mark {
+  border-color: var(--color-danger);
+  background: var(--color-danger);
+}
+
+.agent-tool[data-state="stopped"] .agent-tool-mark,
+.agent-tool[data-state="interrupted"] .agent-tool-mark {
+  border-color: var(--color-warning);
+}
+
+.agent-tool[data-state="running"] .agent-tool-mark {
+  border-color: var(--color-accent);
+  animation: agent-pulse var(--duration-slow) ease-in-out infinite alternate;
+}
+
+.agent-tool-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-tool-body {
+  padding: var(--space-1) 0 0 var(--space-3-5);
+}
+
+.agent-msg-note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.agent-msg-note p {
+  margin: 0;
+}
+
+.agent-msg-note[data-kind="error"],
+.agent-msg-note[data-kind="refusal"] {
+  color: var(--color-danger-text);
+}
+
+.agent-turn-foot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-turn-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1-5);
+}
+
+.agent-turn-sent-line {
+  margin: 0;
+  text-align: right;
+}
+
+.agent-chat-working {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.agent-chat-working[data-phase="waiting"] {
+  color: var(--color-warning-text);
+}
+
+.agent-chat-composer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-1-5);
+  margin: 0;
+  padding: var(--space-1-5) var(--space-2-5) var(--space-2);
+  border-top: var(--border-light);
+}
+
+/* One line to start (a field box, not the three lines of a textarea); it
+   grows with what is typed (chat/index.js) up to a few lines, then scrolls. */
+textarea.obs-select.agent-chat-input {
+  /* Basis 0: beside its buttons on one line, under the tray (the composer wraps only for the tray). */
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: max(var(--control-height), var(--control-target-min));
+  max-height: 10rem;
+  resize: none;
+  overflow-y: auto;
+}
+
+/* Above the message field (chat/index.js): a question's choices, the selection attached. */
+.agent-chat-tray {
+  display: flex;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.agent-chat-choices {
+  display: flex;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+}
+
+/* A choice is the person's answer in a few words: it wraps rather than leaving the panel. */
+.btn.agent-chat-choice {
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.agent-chat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0-5);
+  max-width: 100%;
+  min-height: var(--control-height);
+  padding: 0 0 0 var(--space-2);
+  border: var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--color-accent-soft);
+  font-size: var(--type-hint);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-chat-chip-text {
+  white-space: nowrap;
+}
+
+.icon-btn.agent-chat-chip-remove {
+  flex: none;
+  border-radius: var(--radius-full);
+}
+
+/* What a message attached, under it. */
+.agent-msg-attached {
+  align-self: flex-start;
+  margin: 0;
+  padding: 0 var(--space-2);
+  border: var(--border-light);
+  border-radius: var(--radius-full);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A question the agent asked, with its choices as words (their buttons are above the field). */
+.agent-ask {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--color-accent);
+}
+
+.agent-ask-question {
+  margin: 0;
+  font-weight: var(--font-weight-medium);
+}
+
+.agent-ask-choices {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* Said once per dataset: what agents read is sent to their provider (presence). */
+.agent-notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+.agent-notice-title {
+  margin: 0;
+  font-size: var(--type-control);
+  font-weight: var(--font-weight-semibold);
+}
+
+.agent-notice-text {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.agent-notice-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--type-control);
+}
+
+/* The dataset shown: names and summaries only (permission settings). */
+.agent-permission-data {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--type-control);
+}
+
+.agent-permission-data .field-help {
+  margin: 0;
+}

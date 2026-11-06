@@ -47,7 +47,9 @@
 import { isContinuousValues } from '../../../data/continuous-values.js';
 import { columnFormOf, noteColumnForm, resizedForm } from '../../../data/column-forms.js';
 import { createNeutralColors, createShownCellVisibilityMask, isAllShownCellVisibilityMask } from './per-cell-array-ownership.js';
-import { recordUnfilteredVisibility } from './filter-manager.js';
+import { hasCategoryFilter, recordUnfilteredVisibility } from './filter-manager.js';
+import { withCategoriesVisible } from '../../utils/category-state.js';
+import { withoutCategoryCellLimits } from './category-cell-sample.js';
 import { categoricalStorageForCodes } from '../../../data/categorical-storage-contract.js';
 import { growFieldCategories } from './field/category-growth.js';
 import { carryCategoryCodesProof } from './category-codes.js';
@@ -141,9 +143,8 @@ function cellRange(from, to) {
  * once. A group made on the cells now open (a category clicked while the
  * cells read again were restoring) already holds the newly open cells its
  * category takes in (`takeInNewCells` runs after it); taken twice, a cell
- * was listed twice and a highlight's cells were no cell set (its draft could
- * not be written, `highlight-draft.js`). `a` itself when `b` adds no cell,
- * so the group is not changed (an analysis of its page running meanwhile
+ * was listed twice and a highlight's cells were no cell set. `a` itself
+ * when `b` adds no cell, so the group is not changed (an analysis of its page running meanwhile
  * goes on: changing it ended that run without a word).
  */
 function mergedCells(a, b) {
@@ -255,7 +256,7 @@ export class DataStateOpenCellsMethods {
    *   loaded fields by cache key (growing only), a text or boolean column's
    *   with its grown categories and their colours when its added cells
    *   hold labels it had not shown (`category-growth.js`).
-   * @returns {{from: number, to: number, released: string[], extended: string[], droppedGroups: string[], resetRanges: string[], resumeActive: {source: 'obs'|'var', index: number}|null}}
+   * @returns {{from: number, to: number, released: string[], extended: string[], droppedGroups: string[], resetRanges: string[], resetFilters: string[], resumeActive: {source: 'obs'|'var', index: number}|null}}
    *   What could not stay as it was, or changed, for the caller to say
    *   (`extended`: the fields whose added cells hold categories they had
    *   not shown, now shown beside the others); `resumeActive`: the field
@@ -277,7 +278,7 @@ export class DataStateOpenCellsMethods {
       throw new TypeError(`The shown layout's positions hold ${formatCountOf(this.positionsDimension, 'value')} for each of the ${formatCountOf(n, 'open cell')}.`);
     }
     const grown = n > from;
-    const outcome = { from, to: n, released: [], extended: [], droppedGroups: [], resetRanges: [], resumeActive: null };
+    const outcome = { from, to: n, released: [], extended: [], droppedGroups: [], resetRanges: [], resetFilters: [], resumeActive: null };
 
     // Loads under way read the earlier cells: they are superseded.
     this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
@@ -377,7 +378,7 @@ export class DataStateOpenCellsMethods {
    *   priority: {seed: number|null, originals: Uint32Array|null},
    *   positions: Float32Array, order: Uint32Array}} change - `positions`: the
    *   shown layout's, reordered first (`DimensionManager.reorderCells`)
-   * @returns {{from: number, to: number, released: string[], extended: string[], droppedGroups: string[], resetRanges: string[], resumeActive: null}}
+   * @returns {{from: number, to: number, released: string[], extended: string[], droppedGroups: string[], resetRanges: string[], resetFilters: string[], resumeActive: null}}
    */
   reorderOpenCells({ identity, priority, positions, order }) {
     const n = this.pointCount;
@@ -392,7 +393,7 @@ export class DataStateOpenCellsMethods {
     }
     const positionOf = new Uint32Array(n);
     for (let j = 0; j < n; j++) positionOf[order[j]] = j;
-    const outcome = { from: n, to: n, released: [], extended: [], droppedGroups: [], resetRanges: [], resumeActive: null };
+    const outcome = { from: n, to: n, released: [], extended: [], droppedGroups: [], resetRanges: [], resetFilters: [], resumeActive: null };
 
     this._datasetGeneration = (this._datasetGeneration ?? 0) + 1;
     this.retireOutlierJobs();
@@ -685,6 +686,14 @@ export class DataStateOpenCellsMethods {
         }
         delete field._continuousStats;
         delete field._positiveStats;
+      }
+      // A category filter reads the codes this field no longer has: reset,
+      // and said, never left to refuse every later visibility pass.
+      if (field.kind === 'category' && hasCategoryFilter(field)) {
+        withCategoriesVisible(field, true);
+        withoutCategoryCellLimits(field);
+        field._missingVisible = true;
+        outcome.resetFilters.push(field.key);
       }
     };
     const grown = n > from;

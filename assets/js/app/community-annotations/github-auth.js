@@ -31,46 +31,29 @@ import {
   isCanonicalGitHubRepositoryFullName,
 } from './github-reference.js';
 import { requireExactObjectKeys } from '../../utils/exact-record.js';
-import { formatCountOf } from '../../utils/format-units.js';
 import { isCancellation, cancelled, onAbort } from '../../utils/abort.js';
+import {
+  AUTH_ERROR_PARAM,
+  AUTH_FLAG_PARAM,
+  AUTH_TOKEN_EXPIRES_PARAM,
+  AUTH_TOKEN_PARAM,
+  WORKER_CONTRACT_VERSION,
+  WORKER_ENDPOINTS,
+  WORKER_SERVICE,
+  scrubAuthFragment,
+} from './worker-contract.js';
+import {
+  WORKER_RESPONSE_CUT,
+  WORKER_UNREACHABLE,
+  defaultWorkerTransport,
+  requestWorker,
+} from './worker-request.js';
 
-const DEFAULT_WORKER_ORIGIN = 'https://cellucid-github-auth.benkemalim.workers.dev';
+/** The deployed Worker (`wrangler.community-annotations.jsonc`), on its custom domain. */
+const DEFAULT_WORKER_ORIGIN = 'https://api.cellucid.com';
 
 /** The sign-in's name in the shared store: `cellucid:github-app-auth:session`. */
 const SIGN_IN_NAME = 'github-app';
-
-const AUTH_FLAG_PARAM = 'cellucid_github_auth';
-const AUTH_TOKEN_PARAM = 'cellucid_github_token';
-const AUTH_TOKEN_EXPIRES_PARAM = 'cellucid_github_token_expires_in';
-const AUTH_ERROR_PARAM = 'cellucid_github_error';
-
-const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
-const DEFAULT_AUTH_RESPONSE_MAX_BYTES = 5_000_000;
-const GITHUB_COLLECTION_MAX_ITEMS = 10_000;
-const WORKER_CAPABILITY_MAX_BYTES = 16_384;
-const WORKER_SERVICE = 'Cellucid GitHub Auth';
-const WORKER_CONTRACT_VERSION = 2;
-const WORKER_ENDPOINTS = Object.freeze([
-  '/auth/login',
-  '/auth/callback',
-  '/auth/revoke',
-  '/auth/user',
-  '/auth/installations',
-  '/auth/installation-repos',
-  '/cap/lookup-cells',
-  '/api/repos/*',
-]);
-
-function assertTimeoutMs(timeoutMs) {
-  if (
-    typeof timeoutMs !== 'number' ||
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 1
-  ) {
-    throw new Error('GitHub request timeout must be a positive safe integer');
-  }
-  return timeoutMs;
-}
 
 function assertAbortSignalOrNull(signal) {
   if (
@@ -89,73 +72,11 @@ function assertAbortSignalOrNull(signal) {
   return signal;
 }
 
-function createRequestAbortScope(signal, timeoutMs) {
-  const ownerSignal = assertAbortSignalOrNull(signal);
-  const ms = assertTimeoutMs(timeoutMs);
-  if (typeof AbortController !== 'function') {
-    throw new Error('AbortController is required for GitHub annotation requests');
-  }
-  const controller = new AbortController();
-  let abortCause = null;
-  const abortWithCause = (cause) => {
-    if (abortCause === null) abortCause = cause;
-    controller.abort();
-  };
-  const stopOwner = onAbort(ownerSignal, () => abortWithCause('owner'));
-
-  let timeout;
-  try {
-    timeout = setTimeout(() => {
-      abortWithCause('timeout');
-    }, ms);
-  } catch (error) {
-    stopOwner();
-    throw error;
-  }
-
-  return {
-    abortCause: () => abortCause,
-    controller,
-    ownerSignal,
-    timeoutMs: ms,
-    cleanup() {
-      try {
-        clearTimeout(timeout);
-      } catch {
-        // Cleanup cannot replace the authoritative request outcome.
-      }
-      stopOwner();
-    },
-  };
-}
-
 /** The caller stopped a GitHub authentication request: a cancellation naming its address. */
 function requestCancelled(url, cause = undefined) {
   const error = cancelled('user', 'GitHub authentication request was cancelled.', cause);
   if (url !== null) error.url = url;
   return error;
-}
-
-function throwIfRequestAborted(scope, url, cause = undefined) {
-  const abortCause = scope.abortCause();
-  if (abortCause === 'owner') {
-    throw requestCancelled(
-      url,
-      cause ?? scope.ownerSignal.reason
-    );
-  }
-  if (abortCause === 'timeout') {
-    const error = new Error(
-      `Request timed out after ${Math.max(
-        1,
-        Math.round(scope.timeoutMs / 1000)
-      )}s`
-    );
-    error.code = 'TIMEOUT';
-    error.url = url;
-    if (cause !== undefined) error.cause = cause;
-    throw error;
-  }
 }
 
 function createAuthSupersededError(cause = undefined) {
@@ -251,31 +172,66 @@ function assertWorkerErrorDocument(value, label) {
   return value.error;
 }
 
-function assertWorkerCompatibilityDocument(value) {
-  requireExactObjectKeys(
-    value,
-    ['status', 'service', 'contractVersion', 'endpoints'],
-    'GitHub worker capability response'
-  );
+/**
+ * The Worker's root document, checked against this client: the service
+ * and contract version first, so a Worker of another version is named as
+ * such (`GITHUB_WORKER_OUTDATED` for an older one, which its owner must
+ * redeploy; a newer one asks for a reload of Cellucid), then the exact
+ * route inventory of contract `WORKER_CONTRACT_VERSION`.
+ */
+function assertWorkerCompatibilityDocument(value, origin) {
   if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
     value.status !== 'ok' ||
     value.service !== WORKER_SERVICE ||
-    value.contractVersion !== WORKER_CONTRACT_VERSION
+    !Number.isSafeInteger(value.contractVersion)
   ) {
-    throw new Error(
-      'GitHub worker capability status, service, or contract version is stale'
+    throw createWorkerIncompatibleError(
+      origin,
+      new Error('The service at the Worker origin does not identify as the Cellucid GitHub Worker')
     );
   }
-  if (
-    !Array.isArray(value.endpoints) ||
-    value.endpoints.length !== WORKER_ENDPOINTS.length ||
-    value.endpoints.some(
-      (endpoint, index) => endpoint !== WORKER_ENDPOINTS[index]
-    )
-  ) {
-    throw new Error(
-      'GitHub worker endpoint inventory does not match this Cellucid client'
+  if (value.contractVersion < WORKER_CONTRACT_VERSION) {
+    const error = new Error(
+      `The community-annotation service at ${origin} runs an older version ` +
+      `(contract ${value.contractVersion}) than this Cellucid ` +
+      `(contract ${WORKER_CONTRACT_VERSION}); its owner must redeploy the Worker. ` +
+      'No GitHub token was sent.'
     );
+    error.code = 'GITHUB_WORKER_OUTDATED';
+    error.origin = origin;
+    error.workerContractVersion = value.contractVersion;
+    throw error;
+  }
+  if (value.contractVersion > WORKER_CONTRACT_VERSION) {
+    const error = new Error(
+      `The community-annotation service at ${origin} runs a newer version ` +
+      `(contract ${value.contractVersion}) than this page of Cellucid ` +
+      `(contract ${WORKER_CONTRACT_VERSION}). Reload Cellucid to use it. ` +
+      'No GitHub token was sent.'
+    );
+    error.code = 'GITHUB_WORKER_INCOMPATIBLE';
+    error.origin = origin;
+    error.workerContractVersion = value.contractVersion;
+    throw error;
+  }
+  try {
+    requireExactObjectKeys(
+      value,
+      ['status', 'service', 'contractVersion', 'endpoints'],
+      'GitHub worker capability response'
+    );
+    if (
+      !Array.isArray(value.endpoints) ||
+      value.endpoints.length !== WORKER_ENDPOINTS.length ||
+      value.endpoints.some((endpoint, index) => endpoint !== WORKER_ENDPOINTS[index])
+    ) {
+      throw new Error('GitHub worker endpoint inventory does not match this Cellucid client');
+    }
+  } catch (cause) {
+    throw createWorkerIncompatibleError(origin, cause);
   }
   return value;
 }
@@ -356,186 +312,74 @@ function removeSessionItem() {
   }
 }
 
-function authResponseTooLarge(url, maxResponseBytes) {
-  const error = new Error(
-    `GitHub authentication response exceeds ${formatCountOf(maxResponseBytes, 'byte')}`
-  );
-  error.code = 'GITHUB_AUTH_RESPONSE_TOO_LARGE';
-  error.url = url;
-  return error;
-}
-
-async function cancelAuthResponseBody(response) {
-  if (typeof response?.body?.cancel !== 'function') return;
-  try {
-    await response.body.cancel();
-  } catch {
-    // The response-validation failure remains authoritative.
-  }
-}
-
-function knownAuthResponseByteLength(response) {
-  const raw = response?.headers?.get?.('content-length') ?? null;
-  if (raw === null || raw === '' || !/^[0-9]+$/.test(raw)) return null;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) ? value : Number.POSITIVE_INFINITY;
-}
-
+/**
+ * One JSON request to the Worker through the app's one transport
+ * (`worker-request.js`: stall timeouts from the measured link, never a total
+ * deadline; the request budget the Worker relays; retries of transient
+ * answers). A non-2xx answer throws the Worker's `{error}` sentence with its
+ * `status`; a request the caller stopped throws a cancellation.
+ *
+ * @param {string} url
+ * @param {{method?: string, headers?: Record<string, string>|null, body?: unknown,
+ *   signal?: AbortSignal|null, transport?: object|null}} [options]
+ *   `transport`: the Worker transport (tests give a virtual clock); the
+ *   origin's own by default
+ */
 async function fetchJson(url, {
   method = 'GET',
   headers = null,
   body = null,
-  timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   signal = null,
-  maxResponseBytes = DEFAULT_AUTH_RESPONSE_MAX_BYTES,
+  transport = null,
 } = {}) {
-  if (
-    !Number.isSafeInteger(maxResponseBytes) ||
-    maxResponseBytes < 1
-  ) {
-    throw new TypeError(
-      'GitHub authentication response limit must be a positive safe integer'
-    );
-  }
-  const scope = createRequestAbortScope(signal, timeoutMs);
-
+  const origin = new URL(url).origin;
+  let answer;
   try {
-    const res = await fetch(url, {
-      method,
-      headers: headers || undefined,
-      body: body != null ? JSON.stringify(body) : undefined,
-      signal: scope.controller.signal,
-    });
-    throwIfRequestAborted(scope, url);
-
-    const knownByteLength = knownAuthResponseByteLength(res);
-    if (
-      knownByteLength !== null &&
-      knownByteLength > maxResponseBytes
-    ) {
-      const primary = authResponseTooLarge(url, maxResponseBytes);
-      await cancelAuthResponseBody(res);
-      throw primary;
-    }
-
-    const decodedChunks = [];
-    let byteLength = 0;
-    if (res.body !== null) {
-      if (typeof res.body.getReader !== 'function') {
-        await cancelAuthResponseBody(res);
-        throw new TypeError(
-          'GitHub authentication response body must expose a stream reader'
-        );
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder(
-        'utf-8',
-        { fatal: true, ignoreBOM: true }
-      );
-      let streamDone = false;
-      let readerCancelled = false;
-      const cancelLiveReader = async () => {
-        if (streamDone || readerCancelled) return;
-        readerCancelled = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // The response-validation failure remains authoritative.
-        }
-      };
-      try {
-        while (true) {
-          const part = await reader.read();
-          throwIfRequestAborted(scope, url);
-          if (part.done) {
-            streamDone = true;
-            try {
-              decodedChunks.push(decoder.decode());
-            } catch (cause) {
-              const error = new Error(
-                'GitHub authentication response is not valid UTF-8'
-              );
-              error.code = 'GITHUB_AUTH_RESPONSE_INVALID';
-              error.url = url;
-              error.cause = cause;
-              throw error;
-            }
-            break;
-          }
-          if (!(part.value instanceof Uint8Array)) {
-            const error = new TypeError(
-              'GitHub authentication response chunks must be Uint8Array values'
-            );
-            await cancelLiveReader();
-            throw error;
-          }
-          byteLength += part.value.byteLength;
-          if (byteLength > maxResponseBytes) {
-            const primary = authResponseTooLarge(url, maxResponseBytes);
-            await cancelLiveReader();
-            throw primary;
-          }
-          try {
-            decodedChunks.push(decoder.decode(part.value, { stream: true }));
-          } catch (cause) {
-            const error = new Error(
-              'GitHub authentication response is not valid UTF-8'
-            );
-            error.code = 'GITHUB_AUTH_RESPONSE_INVALID';
-            error.url = url;
-            error.cause = cause;
-            await cancelLiveReader();
-            throw error;
-          }
-        }
-      } catch (error) {
-        let primary = error;
-        try {
-          throwIfRequestAborted(scope, url, error);
-        } catch (abortError) {
-          primary = abortError;
-        }
-        await cancelLiveReader();
-        throw primary;
-      }
-    }
-    const text = decodedChunks.join('');
-    throwIfRequestAborted(scope, url);
-    let responseJson;
-    try {
-      if (!text) throw new Error('empty response body');
-      responseJson = parseExactJson(text, {
-        path: `GitHub annotation endpoint ${url}`,
-      });
-    } catch (cause) {
-      const error = new Error(
-        `GitHub annotation endpoint returned invalid JSON: ${cause?.message || cause}`
-      );
-      error.status = res.status;
-      error.url = url;
-      error.cause = cause;
-      throw error;
-    }
-    if (!res.ok) {
-      const msg = assertWorkerErrorDocument(
-        responseJson,
-        `GitHub annotation endpoint ${url} error response`
-      );
-      const err = new Error(msg);
-      err.status = res.status;
-      err.url = url;
-      throw err;
-    }
-    return responseJson;
+    answer = await requestWorker(
+      transport ?? defaultWorkerTransport(origin),
+      url,
+      {
+        method,
+        headers: headers || undefined,
+        body: body != null ? JSON.stringify(body) : undefined,
+        cache: 'no-store',
+        credentials: 'omit',
+      },
+      { signal, label: `${method} ${new URL(url).pathname}`, origin }
+    );
   } catch (err) {
-    if (isCancellation(err) || scope.controller.signal.aborted) {
-      throwIfRequestAborted(scope, url, err);
-      throw requestCancelled(url, err);
-    }
+    if (isCancellation(err) || signal?.aborted) throw requestCancelled(url, err);
+    if (err !== null && typeof err === 'object' && err.url === undefined) err.url = url;
     throw err;
-  } finally {
-    scope.cleanup();
   }
+  const { response: res, text } = answer;
+  let responseJson;
+  try {
+    if (!text) throw new Error('empty response body');
+    responseJson = parseExactJson(text, {
+      path: `GitHub annotation endpoint ${url}`,
+    });
+  } catch (cause) {
+    const error = new Error(
+      `GitHub annotation endpoint returned invalid JSON: ${cause?.message || cause}`
+    );
+    error.code = 'GITHUB_AUTH_RESPONSE_INVALID';
+    error.status = res.status;
+    error.url = url;
+    error.cause = cause;
+    throw error;
+  }
+  if (!res.ok) {
+    const msg = assertWorkerErrorDocument(
+      responseJson,
+      `GitHub annotation endpoint ${url} error response`
+    );
+    const err = new Error(msg);
+    err.status = res.status;
+    err.url = url;
+    throw err;
+  }
+  return responseJson;
 }
 
 function getGitHubLoginUrl(workerOrigin = null) {
@@ -588,52 +432,53 @@ function assertGitHubLogin(login, label) {
   return login;
 }
 
-function assertInstallationsResponse(document) {
+/**
+ * One page of a Worker collection: `{items, nextPage}`, `nextPage` the page
+ * after this one or null on the last (the Worker answers one GitHub page per
+ * request: Cloudflare Free allows 50 subrequests per request). Items are
+ * checked by `projectItem` and must not repeat within the page.
+ */
+function assertCollectionPage(document, page, label, projectItem, identityOf) {
+  requireExactObjectKeys(document, ['items', 'nextPage'], label);
+  if (!Array.isArray(document.items)) {
+    throw new Error(`${label} items must be an array`);
+  }
+  if (document.nextPage !== null && document.nextPage !== page + 1) {
+    throw new Error(`${label} nextPage must be ${page + 1} or null`);
+  }
+  const seen = new Set();
+  const items = document.items.map((item, index) => {
+    const projected = projectItem(item, index);
+    for (const key of identityOf(projected)) {
+      if (seen.has(key)) throw new Error(`${label} contains duplicate entries`);
+      seen.add(key);
+    }
+    return projected;
+  });
+  return { items, nextPage: document.nextPage };
+}
+
+function projectInstallation(installation, index) {
   requireExactObjectKeys(
-    document,
-    ['installations'],
-    'GitHub installations endpoint'
+    installation,
+    ['id', 'account'],
+    `GitHub installation ${index}`
   );
-  if (
-    !Array.isArray(document.installations) ||
-    document.installations.length > GITHUB_COLLECTION_MAX_ITEMS
-  ) {
+  if (!Number.isSafeInteger(installation.id) || installation.id < 1) {
     throw new Error(
-      `GitHub installations endpoint installations must be an array of at ` +
-      `most ${GITHUB_COLLECTION_MAX_ITEMS} items`
+      `GitHub installation ${index} id must be a positive safe integer`
     );
   }
-  const seenIds = new Set();
-  const seenAccounts = new Set();
-  const installations = document.installations.map((installation, index) => {
-    requireExactObjectKeys(
-      installation,
-      ['id', 'account'],
-      `GitHub installation ${index}`
-    );
-    if (!Number.isSafeInteger(installation.id) || installation.id < 1) {
-      throw new Error(
-        `GitHub installation ${index} id must be a positive safe integer`
-      );
-    }
-    requireExactObjectKeys(
-      installation.account,
-      ['login'],
-      `GitHub installation ${index} account`
-    );
-    const login = assertGitHubLogin(
-      installation.account.login,
-      `GitHub installation ${index} account login`
-    );
-    const accountKey = login.toLowerCase();
-    if (seenIds.has(installation.id) || seenAccounts.has(accountKey)) {
-      throw new Error('GitHub installations endpoint contains duplicate entries');
-    }
-    seenIds.add(installation.id);
-    seenAccounts.add(accountKey);
-    return { id: installation.id, account: { login } };
-  });
-  return { installations };
+  requireExactObjectKeys(
+    installation.account,
+    ['login'],
+    `GitHub installation ${index} account`
+  );
+  const login = assertGitHubLogin(
+    installation.account.login,
+    `GitHub installation ${index} account login`
+  );
+  return { id: installation.id, account: { login } };
 }
 
 function assertRepositoryFullName(fullName, label) {
@@ -643,104 +488,27 @@ function assertRepositoryFullName(fullName, label) {
   return fullName;
 }
 
-function assertInstallationRepositoriesResponse(document) {
+function projectRepository(repository, index) {
   requireExactObjectKeys(
-    document,
-    ['repositories'],
-    'GitHub installation repositories endpoint'
+    repository,
+    ['id', 'full_name', 'private'],
+    `GitHub installation repository ${index}`
   );
-  if (
-    !Array.isArray(document.repositories) ||
-    document.repositories.length > GITHUB_COLLECTION_MAX_ITEMS
-  ) {
+  if (!Number.isSafeInteger(repository.id) || repository.id < 1) {
     throw new Error(
-      `GitHub installation repositories endpoint repositories must be an ` +
-      `array of at most ${GITHUB_COLLECTION_MAX_ITEMS} items`
+      `GitHub installation repository ${index} id must be a positive safe integer`
     );
   }
-  const seenIds = new Set();
-  const seenNames = new Set();
-  const repositories = document.repositories.map((repository, index) => {
-    requireExactObjectKeys(
-      repository,
-      ['id', 'full_name', 'private'],
-      `GitHub installation repository ${index}`
+  const fullName = assertRepositoryFullName(
+    repository.full_name,
+    `GitHub installation repository ${index} full_name`
+  );
+  if (typeof repository.private !== 'boolean') {
+    throw new Error(
+      `GitHub installation repository ${index} private must be boolean`
     );
-    if (!Number.isSafeInteger(repository.id) || repository.id < 1) {
-      throw new Error(
-        `GitHub installation repository ${index} id must be a positive safe integer`
-      );
-    }
-    const fullName = assertRepositoryFullName(
-      repository.full_name,
-      `GitHub installation repository ${index} full_name`
-    );
-    if (typeof repository.private !== 'boolean') {
-      throw new Error(
-        `GitHub installation repository ${index} private must be boolean`
-      );
-    }
-    const nameKey = fullName.toLowerCase();
-    if (seenIds.has(repository.id) || seenNames.has(nameKey)) {
-      throw new Error(
-        'GitHub installation repositories endpoint contains duplicate entries'
-      );
-    }
-    seenIds.add(repository.id);
-    seenNames.add(nameKey);
-    return {
-      id: repository.id,
-      full_name: fullName,
-      private: repository.private,
-    };
-  });
-  return { repositories };
-}
-
-const AUTH_FRAGMENT_PARAM_NAMES = new Set([
-  AUTH_FLAG_PARAM,
-  AUTH_TOKEN_PARAM,
-  AUTH_TOKEN_EXPIRES_PARAM,
-  AUTH_ERROR_PARAM,
-]);
-
-function readFragmentParamName(segment, index) {
-  // Decode only the field name. Retaining the raw segment prevents unrelated
-  // fragment bytes and separators from being normalized during auth cleanup.
-  let candidate = segment;
-  if (index === 0 && candidate.startsWith('?')) {
-    candidate = candidate.slice(1);
   }
-  if (!candidate) return null;
-  const separatorIndex = candidate.indexOf('=');
-  const rawName =
-    separatorIndex === -1
-      ? candidate
-      : candidate.slice(0, separatorIndex);
-  const probe = new URLSearchParams(`__cellucid_probe__=&${rawName}=`);
-  const names = probe.keys();
-  names.next();
-  return names.next().value ?? null;
-}
-
-function scrubAuthFragment(hash) {
-  const segments = hash.split('&');
-  let ownsFragment = false;
-  const retained = [];
-  for (let index = 0; index < segments.length; index += 1) {
-    const segment = segments[index];
-    const name = readFragmentParamName(segment, index);
-    if (name !== null && AUTH_FRAGMENT_PARAM_NAMES.has(name)) {
-      ownsFragment = true;
-      continue;
-    }
-    retained.push(segment);
-  }
-  return {
-    ownsFragment,
-    cleanedHash: retained.join('&'),
-    hasRetainedSegments: retained.length > 0,
-  };
+  return { id: repository.id, full_name: fullName, private: repository.private };
 }
 
 function validateAuthFragment(params) {
@@ -825,8 +593,14 @@ function readAuthResultFromUrl(urlString) {
 }
 
 export class GitHubAuthSession extends EventEmitter {
-  constructor() {
+  /**
+   * @param {{transport?: object|null}} [options] - `transport`: the Worker
+   *   transport every request uses (`worker-request.js`; tests give one on
+   *   virtual time); the Worker origin's own by default
+   */
+  constructor({ transport = null } = {}) {
     super();
+    this._transport = transport;
     if (typeof AbortController !== 'function') {
       throw new Error('AbortController is required for GitHub annotation requests');
     }
@@ -902,7 +676,6 @@ export class GitHubAuthSession extends EventEmitter {
   }
 
   _assertRequestOwnerCurrent(owner, cause = undefined) {
-    if (cause?.code === 'TIMEOUT') return;
     const abortCause = owner.getAbortCause();
     if (
       abortCause === 'caller' ||
@@ -1049,6 +822,7 @@ export class GitHubAuthSession extends EventEmitter {
     let userResponse;
     try {
       userResponse = await fetchJson(url, {
+        transport: this._transport,
         method: 'GET',
         headers: { Authorization: `Bearer ${owner.token}` },
         signal: owner.signal,
@@ -1072,22 +846,27 @@ export class GitHubAuthSession extends EventEmitter {
     let response;
     try {
       response = await fetchJson(`${workerOrigin}/`, {
+        transport: this._transport,
         method: 'GET',
         signal: owner.signal,
-        maxResponseBytes: WORKER_CAPABILITY_MAX_BYTES,
       });
-      this._assertRequestOwnerCurrent(owner);
-      assertWorkerCompatibilityDocument(response);
     } catch (error) {
       this._assertRequestOwnerCurrent(owner, error);
+      // Not reached, cut off or failing (a 5xx) is what it is; an answer
+      // that is not the Worker's root document is an incompatible service.
       if (
         isCancellation(error) ||
-        error?.code === 'GITHUB_AUTH_SUPERSEDED'
+        error?.code === 'GITHUB_AUTH_SUPERSEDED' ||
+        error?.code === WORKER_UNREACHABLE ||
+        error?.code === WORKER_RESPONSE_CUT ||
+        error?.status >= 500
       ) {
         throw error;
       }
       throw createWorkerIncompatibleError(workerOrigin, error);
     }
+    this._assertRequestOwnerCurrent(owner);
+    assertWorkerCompatibilityDocument(response, workerOrigin);
     this._assertRequestOwnerCurrent(owner);
     this._verifiedWorkerOrigin = workerOrigin;
     return true;
@@ -1285,6 +1064,14 @@ export class GitHubAuthSession extends EventEmitter {
     return token === null ? Promise.resolve(true) : this._revoke(token);
   }
 
+  /**
+   * Forget a sign-in GitHub refused (it expired or was revoked): nothing is
+   * left to revoke, so nothing is asked of GitHub.
+   */
+  forgetRefused() {
+    this._forget();
+  }
+
   /** Forget the sign-in in this tab (sign-out, or a token that expired). @private */
   _forget() {
     const hadAuthenticatedState = this.isAuthenticated();
@@ -1321,64 +1108,78 @@ export class GitHubAuthSession extends EventEmitter {
     }
   }
 
-  async listInstallations({ signal = null } = {}) {
+  /**
+   * Every page of one Worker collection, in order, merged by item id (a
+   * listing read page by page can shift while it is read: an item seen on
+   * two pages is kept once, as the later page has it).
+   */
+  async _listCollection({ path, method, body = null, signal, label, projectItem, identityOf }) {
     const token = this._token;
     if (!token) throw new Error('Not signed in');
     const owner = this._createRequestOwner(signal);
     const workerOrigin = this.getWorkerOrigin();
-    const url = `${workerOrigin}/auth/installations`;
     try {
       if (this._verifiedWorkerOrigin !== workerOrigin) {
         await this._verifyWorkerForOwner(owner);
       }
-      let response;
-      try {
-        response = await fetchJson(url, {
-          method: 'GET',
-          headers: { Authorization: `Bearer ${token}` },
-          signal: owner.signal,
-        });
-      } catch (error) {
-        this._assertRequestOwnerCurrent(owner, error);
-        throw error;
+      const byId = new Map();
+      for (let page = 1; page !== null;) {
+        let response;
+        try {
+          response = await fetchJson(`${workerOrigin}${path}?page=${page}`, {
+            transport: this._transport,
+            method,
+            headers: body === null
+              ? { Authorization: `Bearer ${token}` }
+              : { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body,
+            signal: owner.signal,
+          });
+        } catch (error) {
+          this._assertRequestOwnerCurrent(owner, error);
+          throw error;
+        }
+        this._assertRequestOwnerCurrent(owner);
+        const result = assertCollectionPage(response, page, `${label} page ${page}`, projectItem, identityOf);
+        for (const item of result.items) {
+          byId.delete(item.id);
+          byId.set(item.id, item);
+        }
+        page = result.nextPage;
       }
-      this._assertRequestOwnerCurrent(owner);
-      return assertInstallationsResponse(response);
+      return [...byId.values()];
     } finally {
       owner.cleanup();
     }
   }
 
+  async listInstallations({ signal = null } = {}) {
+    const installations = await this._listCollection({
+      path: '/auth/installations',
+      method: 'GET',
+      signal,
+      label: 'GitHub installations endpoint',
+      projectItem: projectInstallation,
+      identityOf: (item) => [`id:${item.id}`, `account:${item.account.login.toLowerCase()}`],
+    });
+    return { installations };
+  }
+
   async listInstallationRepos(installationId, { signal = null } = {}) {
-    const token = this._token;
-    if (!token) throw new Error('Not signed in');
+    if (!this._token) throw new Error('Not signed in');
     if (!Number.isSafeInteger(installationId) || installationId < 1) {
       throw new Error('Invalid installation_id');
     }
-    const owner = this._createRequestOwner(signal);
-    const workerOrigin = this.getWorkerOrigin();
-    const url = `${workerOrigin}/auth/installation-repos`;
-    try {
-      if (this._verifiedWorkerOrigin !== workerOrigin) {
-        await this._verifyWorkerForOwner(owner);
-      }
-      let response;
-      try {
-        response = await fetchJson(url, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: { installation_id: installationId },
-          signal: owner.signal,
-        });
-      } catch (error) {
-        this._assertRequestOwnerCurrent(owner, error);
-        throw error;
-      }
-      this._assertRequestOwnerCurrent(owner);
-      return assertInstallationRepositoriesResponse(response);
-    } finally {
-      owner.cleanup();
-    }
+    const repositories = await this._listCollection({
+      path: '/auth/installation-repos',
+      method: 'POST',
+      body: { installation_id: installationId },
+      signal,
+      label: 'GitHub installation repositories endpoint',
+      projectItem: projectRepository,
+      identityOf: (item) => [`id:${item.id}`, `name:${item.full_name.toLowerCase()}`],
+    });
+    return { repositories };
   }
 }
 

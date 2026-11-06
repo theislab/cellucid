@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 
 // The sample server answers single-range requests with 206 and allows any
 // origin, as a bucket or a repository's file host does. A link to one of its
@@ -85,6 +86,10 @@ test('the address bar refuses text it does not recognise before connecting', asy
   await page.goto(`/?${PINNED}data=` + encodeURIComponent(FIXTURE), { waitUntil: 'domcontentloaded' });
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+  // The Dataset box fills in after its name and moves the controls under it:
+  // a click made meanwhile is pressed on one thing and released on another
+  // (`helpers/split-clicks.mjs`; Firefox, 1 run in 5).
+  await waitForPageAtRest(page);
   await page.locator('#data-link-disconnect-btn').click();
   await page.locator('#data-address').fill('not a link');
   await page.locator('#data-address-open-btn').click();
@@ -106,6 +111,7 @@ test('a folder link without datasets.json says so, whichever host serves it', as
   await page.goto(`/?${PINNED}data=` + encodeURIComponent(FIXTURE), { waitUntil: 'domcontentloaded' });
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('current-ui-smoke');
+  await waitForPageAtRest(page);
   for (const folder of [`${SAMPLE_ORIGIN}/tests/browser/fixtures/`, 'https://example.org/atlas/']) {
     await page.locator('#data-address').fill(folder);
     await page.locator('#data-address-open-btn').click();

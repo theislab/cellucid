@@ -146,6 +146,10 @@ export function compositionPlotData(composition, display) {
   };
 }
 
+
+/** A finite number, or null (JSON has no NaN). */
+const finiteOrNull = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
 export class CompositionUI extends FormBasedAnalysisUI {
   static getRequirements() {
     return {
@@ -492,7 +496,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
     counts.className = 'analysis-link-btn';
     counts.textContent = 'Counts CSV';
     counts.title = 'Cells per cell type and sample, for other tools';
-    counts.addEventListener('click', () => this._downloadCounts());
+    counts.addEventListener('click', () => this._trackInteractiveTask(this._downloadCounts(), 'CSV export'));
     container.appendChild(counts);
   }
 
@@ -530,8 +534,8 @@ export class CompositionUI extends FormBasedAnalysisUI {
   }
 
   /** The counts, one row per cell type and one column per sample (or condition). */
-  _downloadCounts() {
-    if (this._refuseStaleExport('CSV')) return;
+  async _downloadCounts() {
+    if (await this._refuseStaleExport('CSV')) return;
     const composition = this._lastResult?.composition;
     if (!composition) return;
     const { types, units, counts } = composition;
@@ -552,10 +556,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
     const composition = this._lastResult?.composition;
     if (!composition) return;
     const { types, conditions, test } = composition;
-    if (test === null) {
-      this._downloadCounts();
-      return;
-    }
+    if (test === null) return this._downloadCounts();
     const header = ['cell_type', ...conditions.map(name => `mean_proportion_${name}`), 'log2_ratio', 'test', 'statistic', 'pvalue', 'pvalue_adjusted', ...conditions.map(name => `n_samples_${name}`)];
     const rows = [header.map(csvCell).join(',')];
     types.forEach((type, index) => {
@@ -574,6 +575,31 @@ export class CompositionUI extends FormBasedAnalysisUI {
   }
 
   // ---------------------------------------------------------------- Sessions
+
+  /**
+   * Each cell type's mean proportion per condition and, when tested, its
+   * ratio and p values, the most significant first (top `top`), as an agent
+   * reads the result (`describeResult`).
+   * @override
+   */
+  _resultTable(result, top) {
+    const composition = result?.composition;
+    if (!composition) return { columns: [], rows: [], total: 0 };
+    const { types, conditions, test } = composition;
+    const columns = ['cell_type', ...conditions.map(name => `mean_proportion_${name}`)];
+    if (test !== null) columns.push('log2_ratio', 'p_value', 'p_adjusted');
+    const order = types.map((_, index) => index);
+    if (test !== null) {
+      const p = index => (Number.isFinite(test.adjustedP[index]) ? test.adjustedP[index] : Infinity);
+      order.sort((a, b) => p(a) - p(b));
+    }
+    const rows = order.slice(0, top).map(index => [
+      String(types[index]),
+      ...conditions.map((_, condition) => (test === null ? null : finiteOrNull(test.meanProportion[index * conditions.length + condition]))),
+      ...(test === null ? [] : [finiteOrNull(test.log2Ratio[index]), finiteOrNull(test.pValue[index]), finiteOrNull(test.adjustedP[index])])
+    ]);
+    return { columns, rows, total: types.length };
+  }
 
   _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
@@ -601,7 +627,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
         throw new Error(`The composition result names the field "${key}", which this dataset lacks`);
       }
     }
-    await this._restoreAnalysisResult(result);
+    await this._restoreAnalysisResult(result, envelope.provenance);
   }
 }
 

@@ -15,6 +15,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openPhoneSheet } from './helpers/panels.mjs';
+import { armSelection } from './helpers/selection-gesture.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -176,26 +177,6 @@ const selectModeOf = page => page.evaluate(
   () => window._cellucidViewer.getSelectMode(),
 );
 
-// How long a gesture that did land may take to arm its tool before it counts
-// as dropped; see highlight-selection-feedback.spec.mjs.
-const GESTURE_LANDING_TIMEOUT_MS = 3_000;
-
-async function armSelection(page, tool, gesture) {
-  const controls = page.locator(`#${tool}-step-controls`);
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await gesture();
-    const armed = await controls.waitFor({
-      state: 'attached',
-      timeout: GESTURE_LANDING_TIMEOUT_MS,
-    }).then(() => true, error => {
-      if (error?.name !== 'TimeoutError') throw error;
-      return false;
-    });
-    if (armed) return;
-  }
-  await expect(controls).toBeAttached();
-}
-
 async function turnOnSelectMode(page) {
   await page.locator('#highlight-select-mode').tap();
   await expect(page.locator('#highlight-select-mode'))
@@ -266,7 +247,7 @@ test.describe('on a phone', () => {
     await expect(combine.getByRole('button', { name: 'Intersect' }))
       .toHaveAttribute('aria-pressed', 'true');
     await combine.getByRole('button', { name: 'Add' }).tap();
-    expect(await selectModeOf(page)).toEqual({ enabled: true, combine: 'union' });
+    await expect.poll(() => selectModeOf(page)).toEqual({ enabled: true, combine: 'union' });
     await combine.getByRole('button', { name: 'Intersect' }).tap();
 
     // On a phone the full-screen sidebar is closed to reach the plot; the

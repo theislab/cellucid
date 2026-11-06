@@ -25,6 +25,7 @@ function place(name, where) {
 export const PLACES = Object.freeze({
   // Panels.
   session: place('Session', { panel: 'session-section' }),
+  state: place('State', { panel: 'state-section' }),
   visualization: place('Visualization', { panel: 'visualization-section' }),
   navigation: place('Navigation', { panel: 'navigation-section' }),
   compareViews: place('Compare views', { panel: 'compare-views-section' }),
@@ -35,10 +36,16 @@ export const PLACES = Object.freeze({
   // Blocks of the Session panel.
   dataset: place('Dataset', { heading: 'dataset-facts-title' }),
   openData: place('Open data', { heading: 'open-data-title' }),
+  myDatasets: place('My datasets', { heading: 'my-datasets-title' }),
   stored: place('Stored', { heading: 'kept-stores-title' }),
   subsampling: place('Subsampling', { heading: 'reading-title' }),
   dataMapping: place('Data mapping', { heading: 'data-mapping-title' }),
-  sessionFile: place('Session file', { heading: 'session-state-title' }),
+  // Blocks of the State panel.
+  sessionFile: place('Session', { heading: 'session-state-title' }),
+  history: place('History', { heading: 'history-title' }),
+  // The Agents panel and its block.
+  agents: place('Agents', { panel: 'agents-section' }),
+  agentConnect: place('Claude and ChatGPT', { heading: 'agent-connect-title' }),
   // Blocks of the Visualization panel.
   performance: place('Performance', { heading: 'renderer-settings-title' }),
   vectorField: place('Vector field', { heading: 'vector-field-title' }),

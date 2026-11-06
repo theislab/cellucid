@@ -9,8 +9,9 @@
  * dimension the default. Views then show any representation that is on (see
  * the Compare views picker). Choices are staged until Apply, so editing
  * columns does not load an array once per axis; turning a representation on
- * loads nothing until a view shows it. Apply runs `DataState.applyDataMapping`
- * as one transaction; Revert drops the staged choices. The other groups the
+ * loads nothing until a view shows it. Apply dispatches the action
+ * `mapping.set` naming the groups it changes (`DataState.applyDataMapping`,
+ * one transaction, an undoable step); Revert drops the staged choices. The other groups the
  * dataset can change -- genes, neighbour graph, latent space, vector fields
  * -- follow as their own disclosures (`data-mapping/groups.js`), staged with
  * the embeddings and applied in the same transaction.
@@ -61,6 +62,8 @@ import {
 } from './data-mapping/groups.js';
 import { sameJson } from '../../utils/same-json.js';
 import { PLACES, placePath } from '../place-names.js';
+import { getActions } from '../../actions/index.js';
+import { mappingParamsOf } from '../../actions/definitions/mapping.js';
 
 /** Why genes are read from `raw` (`defaultExpression`'s reason), as the genes line says it. */
 const RAW_REASON_TEXT = Object.freeze({
@@ -69,7 +72,6 @@ const RAW_REASON_TEXT = Object.freeze({
 });
 
 const REQUIRED_STATE_METHODS = Object.freeze([
-  'applyDataMapping',
   'canChangeMappingGroup',
   'canMapAnyEmbedding',
   'describeDataMappingRefusal',
@@ -855,7 +857,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     panel.status.set('Loading…', 'muted');
     render();
     try {
-      await state.applyDataMapping(next, { origin: 'user' });
+      await getActions().dispatch('mapping.set', mappingParamsOf(mapping, next));
       if (superseded()) return;
       unstage();
       stagedGroups.clear();

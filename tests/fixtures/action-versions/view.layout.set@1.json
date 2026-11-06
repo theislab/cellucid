@@ -1,0 +1,24 @@
+{
+  "examples": [
+    {
+      "layout": "grid"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "layout": {
+        "enum": [
+          "grid",
+          "single"
+        ]
+      }
+    },
+    "required": [
+      "layout"
+    ],
+    "type": "object"
+  },
+  "type": "view.layout.set",
+  "version": 1
+}

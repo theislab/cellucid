@@ -7,9 +7,10 @@
  *   draws, with NO outlier filtering
  * - Persist soft-deletes so derived columns are restorable
  *
- * Session bundles persist:
- * - field *definitions* eagerly via `toSessionMeta()/fromSessionMeta()`
- * - large categorical codes arrays separately as binary chunks
+ * The history and session files keep these fields through the
+ * `field-overlays` state domain (`app/state/domains/field-overlays.js`): each
+ * field's definition with its codes or values as columns by original cell
+ * position, put back as the registry's inventory with `adoptFields`.
  */
 
 import { StateValidator } from '../utils/state-validator.js';
@@ -315,9 +316,9 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
 
   /**
    * Register a user-defined continuous field that holds its own values: a
-   * column a notebook pushed (`setField`). Unlike a continuous alias, nothing
-   * can derive these values again, so the template keeps them and a session
-   * stores them (`user-defined/values/<id>`).
+   * column a notebook pushed (the `field.push` action). Unlike a continuous
+   * alias, nothing can derive these values again, so the template keeps them
+   * and a session stores them (`user-defined/values/<id>`).
    *
    * @param {object} options
    * @param {string} options.key
@@ -775,21 +776,16 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       // every update that moves either operand. A rename moves neither -- it
       // swaps a label for a label of the same inventory size against the same
       // array -- so re-reading every code cannot change the verdict, and at
-      // dataset scale that read is the entire cost of the edit. It also used to
-      // reject a rename outright while a restored field waited for its lazy
-      // codes chunk, because an unloaded field has no codes to walk.
+      // dataset scale that read is the entire cost of the edit.
       const inventoryResized = nextCategories.length !== field.categories.length;
       if (nextCodes !== field.codes || inventoryResized) {
-        const expectedLength = isCategoricalCodes(field.codes)
-          ? field.codes.length
-          : field._codesLengthHint;
-        if (!Number.isSafeInteger(expectedLength) || expectedLength < 1) {
+        if (!isCategoricalCodes(field.codes)) {
           throw new TypeError(`User-defined field "${id}" requires an exact code length`);
         }
         requireCategoryCodes(
           nextCodes,
           nextCategories,
-          expectedLength,
+          field.codes.length,
           `User-defined field "${id}"`
         );
       }
@@ -848,353 +844,30 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     return true;
   }
 
-  // ---------------------------------------------------------------------------
-  // Serialization
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Session-bundle metadata export (NO heavy codes payloads).
-   *
-   * The session bundle stores user-defined field definitions in an eager JSON
-   * chunk (key/categories/source refs), while the large categorical `codes`
-   * arrays are stored separately as binary chunks and loaded lazily.
-   *
-   * Centroids are not part of the record: they are derived from the codes
-   * and each layout's positions, and recomputed when the codes are restored.
-   *
-   * @returns {any[]}
-   */
-  toSessionMeta() {
-    const result = [];
-    for (const [id, field] of this._fields) {
-      requireNonEmptyTrimmedString(id, 'User-defined field id');
-      if (!field || typeof field !== 'object' || Array.isArray(field)) {
-        throw new TypeError(`User-defined field "${id}" must be an object`);
-      }
-      const source = field._fieldSource;
-      if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
-        throw new TypeError(`User-defined field "${id}" has invalid source`);
-      }
-      const kind = field.kind;
-      if (kind !== FieldKind.CONTINUOUS && kind !== FieldKind.CATEGORY) {
-        throw new TypeError(`User-defined field "${id}" has invalid kind`);
-      }
-      StateValidator.validateFieldKey(field.key);
-      if (typeof field._isDeleted !== 'boolean' || typeof field._isPurged !== 'boolean') {
-        throw new TypeError(`User-defined field "${id}" requires exact lifecycle state`);
-      }
-      if (field._isPurged && !field._isDeleted) {
-        throw new TypeError(`Purged user-defined field "${id}" must also be deleted`);
-      }
-      requireNullableRecord(field._sourceField, `User-defined field "${id}" source metadata`);
-      requireNullableRecord(field._operation, `User-defined field "${id}" operation metadata`);
-      if (!Number.isFinite(field._createdAt)) {
-        throw new TypeError(`User-defined field "${id}" requires a finite creation time`);
-      }
-
-      if (field._isPurged) {
-        // A purge is irreversible, so nothing here can ever be shown or
-        // restored again. Only the identity survives, and only so the id
-        // stays taken. Describing the released arrays would be describing
-        // data that no longer exists, and writing them would add megabytes
-        // to every bundle for a column the user permanently discarded.
-        result.push({
-          id,
-          source,
-          kind,
-          key: field.key,
-          isDeleted: true,
-          isPurged: true,
-          sourceField: field._sourceField,
-          operation: field._operation,
-          createdAt: field._createdAt
-        });
-        continue;
-      }
-
-      if (kind === FieldKind.CONTINUOUS) {
-        // A continuous alias is metadata only: its values are copied from its
-        // source field. A stored field (no source) names the length and type
-        // of the values its own chunk holds (`user-defined/values/<id>`).
-        const record = {
-          id,
-          source,
-          kind,
-          key: field.key,
-          isDeleted: field._isDeleted,
-          isPurged: field._isPurged,
-          sourceField: field._sourceField,
-          operation: field._operation,
-          createdAt: field._createdAt
-        };
-        if (field._sourceField === null) {
-          if (!(field.values instanceof Float32Array)) {
-            throw new TypeError(`User-defined field "${id}" must hold its values before session capture`);
-          }
-          record.valuesLength = field.values.length;
-          record.valuesType = 'Float32Array';
-        }
-        result.push(record);
-        continue;
-      }
-
-      // Categorical user-defined fields: store definition (no codes array).
-      requireCategoryInventory(
-        field.categories,
-        `User-defined field "${id}"`
-      );
-      if (!isCategoricalCodes(field.codes)) {
-        throw new TypeError(`User-defined field "${id}" requires exact typed codes`);
-      }
-      if (field.loaded !== true) {
-        throw new TypeError(
-          `User-defined field "${id}" must be loaded before session capture`
-        );
-      }
-      requireCategoryCodes(
-        field.codes,
-        field.categories,
-        field.codes.length,
-        `User-defined field "${id}"`
-      );
-      const codesType = field.codes.constructor.name;
-      const codesLength = field.codes.length;
-      if (
-        !(field.centroidsByLayout instanceof Map)
-        || !(field._normalizedLayouts instanceof Set)
-        || !Array.isArray(field._sourcePages)
-        || !Object.values(OverlapStrategy).includes(field._overlapStrategy)
-      ) {
-        throw new TypeError(`User-defined field "${id}" has invalid categorical metadata`);
-      }
-      if (field._overlapLabel !== null) {
-        requireNonEmptyTrimmedString(field._overlapLabel, `User-defined field "${id}" overlap label`);
-      }
-      requireNullableRecord(
-        field._intersectionLabels,
-        `User-defined field "${id}" intersection labels`
-      );
-      if (field._uncoveredLabel !== null) {
-        requireNonEmptyTrimmedString(field._uncoveredLabel, `User-defined field "${id}" uncovered label`);
-      }
-
-      result.push({
-        id,
-        source,
-        kind,
-        key: field.key,
-        categories: [...field.categories],
-        isDeleted: field._isDeleted,
-        isPurged: field._isPurged,
-        codesLength,
-        codesType,
-        sourceField: field._sourceField,
-        operation: field._operation,
-        sourcePages: field._sourcePages,
-        overlapStrategy: field._overlapStrategy,
-        overlapLabel: field._overlapLabel,
-        intersectionLabels: field._intersectionLabels,
-        uncoveredLabel: field._uncoveredLabel,
-        createdAt: field._createdAt
-      });
-    }
-    return result;
-  }
-
-  /**
-   * Restore user-defined field definitions from session-bundle metadata.
-   *
-   * Note: categorical `codes` arrays are intentionally NOT restored here.
-   * They are attached later by the session-bundle lazy `user-defined/codes/*` chunks.
-   *
-   * @param {any[]} data
-   */
-  fromSessionMeta(data) {
-    if (!Array.isArray(data)) {
-      throw new TypeError('User-defined session metadata must be an array');
-    }
-    const restored = new Map();
-    for (let itemIndex = 0; itemIndex < data.length; itemIndex++) {
-      const item = data[itemIndex];
-      if (!item || typeof item !== 'object' || Array.isArray(item)) {
-        throw new TypeError(`User-defined session item ${itemIndex} must be an object`);
-      }
-      const kind = item.kind;
-      const source = item.source;
-      if (kind !== FieldKind.CONTINUOUS && kind !== FieldKind.CATEGORY) {
-        throw new TypeError(`User-defined session item ${itemIndex} has invalid kind`);
-      }
-      if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
-        throw new TypeError(`User-defined session item ${itemIndex} has invalid source`);
-      }
-      requireNonEmptyTrimmedString(item.id, `User-defined session item ${itemIndex} id`);
-      StateValidator.validateFieldKey(item.key);
-      if (restored.has(item.id)) {
-        throw new TypeError(`User-defined session id "${item.id}" is duplicated`);
-      }
-      if (typeof item.isDeleted !== 'boolean' || typeof item.isPurged !== 'boolean') {
-        throw new TypeError(`User-defined session item ${itemIndex} requires exact lifecycle state`);
-      }
-      if (item.isPurged && !item.isDeleted) {
-        throw new TypeError(`Purged user-defined session item ${itemIndex} must also be deleted`);
-      }
-      requireNullableRecord(item.sourceField, `User-defined session item ${itemIndex} source metadata`);
-      requireNullableRecord(item.operation, `User-defined session item ${itemIndex} operation metadata`);
-      if (!Number.isFinite(item.createdAt)) {
-        throw new TypeError(`User-defined session item ${itemIndex} requires a finite creation time`);
-      }
-
-      if (item.isPurged) {
-        // The tombstone written by `toSessionMeta`. It carries no codes and
-        // no categories because the purge released them, so restoring it can
-        // only re-establish that the id is taken.
-        restored.set(item.id, {
-          key: item.key,
-          kind,
-          values: null,
-          codes: null,
-          categories: [],
-          centroidsByLayout: new Map(),
-          loaded: false,
-          _loadingPromise: null,
-
-          _isUserDefined: true,
-          _isDeleted: true,
-          _isPurged: true,
-          _userDefinedId: item.id,
-          _fieldSource: source,
-          _normalizedLayouts: new Set(),
-          _sourceField: item.sourceField,
-          _operation: item.operation,
-          _sourcePages: [],
-          _overlapStrategy: OverlapStrategy.FIRST,
-          _overlapLabel: null,
-          _intersectionLabels: null,
-          _uncoveredLabel: null,
-          _createdAt: item.createdAt
-        });
-        continue;
-      }
-
-      if (kind === FieldKind.CONTINUOUS) {
-        const stored = Object.hasOwn(item, 'valuesType');
-        if (stored) {
-          if (item.sourceField !== null || item.valuesType !== 'Float32Array') {
-            throw new TypeError(`User-defined session item ${itemIndex} stores Float32Array values and has no source`);
-          }
-          if (!Number.isSafeInteger(item.valuesLength) || item.valuesLength < 1) {
-            throw new TypeError(`User-defined session item ${itemIndex} has invalid valuesLength`);
-          }
-        } else if (item.sourceField === null) {
-          throw new TypeError(`User-defined session item ${itemIndex} is a continuous alias without a source`);
-        }
-        const field = {
-          key: item.key,
-          kind: FieldKind.CONTINUOUS,
-          values: null,
-          loaded: false,
-          _loadingPromise: null,
-          // A stored field's values arrive with its `user-defined/values`
-          // chunk, which is checked against this length.
-          ...(stored ? { _valuesLengthHint: item.valuesLength } : {}),
-
-          _isUserDefined: true,
-          _isDeleted: item.isDeleted,
-          _isPurged: item.isPurged,
-          _userDefinedId: item.id,
-          _fieldSource: source,
-          _sourceField: item.sourceField,
-          _operation: item.operation,
-          _createdAt: item.createdAt
-        };
-
-        restored.set(item.id, field);
-        continue;
-      }
-
-      // Categorical metadata is incomplete until its exact binary codes chunk
-      // is restored. Never publish an empty array as usable scientific data.
-      if (
-        item.codesType !== 'Uint8Array'
-        && item.codesType !== 'Uint16Array'
-        && item.codesType !== 'Uint32Array'
-      ) {
-        throw new TypeError(`User-defined session item ${itemIndex} has invalid codesType`);
-      }
-      if (!Number.isSafeInteger(item.codesLength) || item.codesLength < 1) {
-        throw new TypeError(`User-defined session item ${itemIndex} has invalid codesLength`);
-      }
-      if (
-        !Array.isArray(item.categories)
-        || item.categories.length === 0
-        || !Array.isArray(item.sourcePages)
-        || !Object.values(OverlapStrategy).includes(item.overlapStrategy)
-      ) {
-        throw new TypeError(`User-defined session item ${itemIndex} has invalid categorical metadata`);
-      }
-      requireCategoryInventory(
-        item.categories,
-        `User-defined session item ${itemIndex}`
-      );
-      if (item.overlapLabel !== null) {
-        requireNonEmptyTrimmedString(
-          item.overlapLabel,
-          `User-defined session item ${itemIndex} overlap label`
-        );
-      }
-      requireNullableRecord(
-        item.intersectionLabels,
-        `User-defined session item ${itemIndex} intersection labels`
-      );
-      if (item.uncoveredLabel !== null) {
-        requireNonEmptyTrimmedString(
-          item.uncoveredLabel,
-          `User-defined session item ${itemIndex} uncovered label`
-        );
-      }
-      // Centroids are not stored: they are derived from the codes and the
-      // positions of each layout, and computed once the codes are restored.
-      const centroidsByLayout = new Map();
-      const normalizedLayouts = new Set();
-      const field = {
-        key: item.key,
-        kind: FieldKind.CATEGORY,
-        categories: [...item.categories],
-        codes: null,
-        centroidsByLayout,
-        loaded: false,
-        _loadingPromise: null,
-
-        _isUserDefined: true,
-        _isDeleted: item.isDeleted,
-        _isPurged: item.isPurged,
-        _userDefinedId: item.id,
-        _fieldSource: source,
-        _sourceField: item.sourceField,
-        _operation: item.operation,
-        _sourcePages: item.sourcePages,
-        _overlapStrategy: item.overlapStrategy,
-        _overlapLabel: item.overlapLabel,
-        _intersectionLabels: item.intersectionLabels,
-        _uncoveredLabel: item.uncoveredLabel,
-        _createdAt: item.createdAt,
-        _normalizedLayouts: normalizedLayouts,
-
-        // Hints used by session restore to validate incoming code payloads.
-        _codesLengthHint: item.codesLength,
-        _codesTypeHint: item.codesType
-      };
-
-      restored.set(item.id, field);
-    }
-
-    this._fields.clear();
-    for (const [id, field] of restored) {
-      this._fields.set(id, field);
-    }
-  }
-
   clear() {
     this._fields.clear();
+  }
+
+  /**
+   * Replace the inventory with `fields`, in this order: the state a history
+   * step restores (`app/state/domains/field-overlays.js`). A field object
+   * that is already registered under its id stays the same object, so every
+   * view's copy of it keeps referring to its template.
+   *
+   * @param {object[]} fields - Templates, each with its `_userDefinedId`
+   */
+  adoptFields(fields) {
+    if (!Array.isArray(fields)) throw new TypeError('User-defined fields must be a list');
+    const next = new Map();
+    for (const field of fields) {
+      if (!field || typeof field !== 'object' || field._isUserDefined !== true) {
+        throw new TypeError('A user-defined field template must be a user-defined field');
+      }
+      const id = requireNonEmptyTrimmedString(field._userDefinedId, 'User-defined field id');
+      if (next.has(id)) throw new TypeError(`User-defined field id "${id}" is duplicated`);
+      next.set(id, field);
+    }
+    this._fields.clear();
+    for (const [id, field] of next) this._fields.set(id, field);
   }
 }

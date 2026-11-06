@@ -122,6 +122,8 @@ test('form-based analysis requires concrete result rendering and propagates exec
   ui._activeAnalysisRequestId = null;
   ui._analysisInvalidationOwner = null;
   ui._getTitle = () => 'Manual';
+  // A run records what it is computed on: the settings its schema names.
+  ui._getOptionsSchema = () => ({ keys: [] });
   ui._options = {};
   ui._selectedPages = [];
   ui._runRow = null;

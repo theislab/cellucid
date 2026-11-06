@@ -247,6 +247,10 @@ export class BaseAnalysisUI {
 
     // Selected pages - UNIFIED across all analysis types
     this._selectedPages = [];
+    // Whether the pages are the analysis's own (a person's, an action's, a
+    // restored value's, even none): a redraw then shows exactly them. Until
+    // then a page selector shows its default (`_pageSelectionToShow`).
+    this._pagesChosen = false;
 
     // Current analysis configuration (pages mirrored from _selectedPages).
     this._currentConfig = {
@@ -553,6 +557,20 @@ export class BaseAnalysisUI {
     }
   }
 
+  /**
+   * Restore the record of a result left out of a shared session
+   * (`shared/analysis-result-session.js` `leftOutResultOf`). An analysis
+   * that keeps no result in a session never had one left out.
+   * @param {{kind: string, leftOut: true, provenance: Object|null}} _record
+   * @returns {Promise<void>}
+   */
+  async importLeftOutResult(_record) {
+    throw new TypeError(
+      `${this.constructor.name} recomputes its result from its settings; ` +
+      'a session cannot leave a result of it out'
+    );
+  }
+
   // ===========================================================================
   // Page/Highlight Change Handlers
   // ===========================================================================
@@ -562,14 +580,55 @@ export class BaseAnalysisUI {
    * All analysis UIs should use this method for page change notifications.
    * This is the primary method called by AnalysisUIManager.
    * @param {string[]} pageIds - Selected page IDs
+   * @param {{given?: boolean}} [options] - `given: false`: no pages were
+   *   chosen (an empty shared selection only seeded, `AnalysisUIManager`); a
+   *   page selector then shows its default.
    */
-  onPageSelectionChange(pageIds) {
+  onPageSelectionChange(pageIds, { given = true } = {}) {
     requirePageIds(pageIds, 'Analysis selectedPages');
     this._requireAvailableSelectedPages(pageIds, 'Analysis selectedPages');
-    this._selectedPages = [...pageIds];
-    this._currentConfig.pages = this._selectedPages;
+    this._assignPages(pageIds, { given });
     this._renderControls();
     this._scheduleUpdate();
+  }
+
+  /**
+   * The pages this analysis compares, given (by a person, an action, a
+   * restored value, even none): its one record of them (`_selectedPages`,
+   * mirrored in `_currentConfig.pages`), shown exactly by every redraw.
+   * With `given: false` (no pages chosen) a redraw shows the selector's
+   * default instead, which the analysis takes (`_adoptSelectorDefault`).
+   * @param {string[]} pageIds
+   * @param {{given?: boolean}} [options]
+   * @protected
+   */
+  _assignPages(pageIds, { given = true } = {}) {
+    this._selectedPages = [...pageIds];
+    this._currentConfig.pages = this._selectedPages;
+    this._pagesChosen = given;
+  }
+
+  /**
+   * What a page selector made by a redraw shows: the pages given, exactly
+   * (none included), or, for an analysis never given pages, undefined (the
+   * selector's default, which the analysis then takes as its pages).
+   * @returns {string[]|undefined}
+   * @protected
+   */
+  _pageSelectionToShow() {
+    return this._pagesChosen ? [...this._selectedPages] : undefined;
+  }
+
+  /**
+   * After a redraw made a page selector: an analysis never given pages takes
+   * the selector's default; one given pages keeps them (a redraw changes no
+   * state).
+   * @protected
+   */
+  _adoptSelectorDefault() {
+    if (this._pagesChosen || this._pageSelector === null || this._pageSelector === undefined) return;
+    this._selectedPages = this._pageSelector.getSelectedPages();
+    this._currentConfig.pages = [...this._selectedPages];
   }
 
   /**
@@ -672,6 +731,70 @@ export class BaseAnalysisUI {
     return this._isLoading;
   }
 
+  /** Whether a run of this analysis is under way (its job). */
+  isRunning() {
+    return this._shownJob?.running === true;
+  }
+
+  /**
+   * Stop the run under way, as its Cancel does; whether one was running.
+   * @returns {boolean}
+   */
+  cancelRun() {
+    const job = this._shownJob ?? null;
+    if (job === null || !job.running) return false;
+    job.cancel();
+    return true;
+  }
+
+  /**
+   * A change the person made in this analysis (its pages, its options, a
+   * run, `kind`): the comparison module records it as the matching action's
+   * step (`analysis/actions.js`). A change an action made is recorded by the
+   * dispatcher instead, so the action paths never call this.
+   *
+   * @param {'pages'|'set'|'run'|'view'} kind - 'view': how it is shown (`analysis.view.set`)
+   * @param {Object} detail
+   * @protected
+   */
+  _recordPersonChange(kind, detail) {
+    // Observed now, recorded once what the change set off has settled (a
+    // display option redraws the shown result, a choice runs the analysis
+    // after its delay), so one step holds all of it and nothing changes
+    // after it; the history knows it is under way meanwhile.
+    this.comparisonModule?.recordAnalysisChange?.(this, kind, detail, { after: this.whenSettled() });
+  }
+
+  /**
+   * Whether this analysis is laid out where a person sees it: its plots can
+   * draw (a plot waits for a laid-out place, `shared/plot-render-slot.js`).
+   * Not when its row, its section or the sidebar is closed, or its window
+   * folded.
+   * @returns {boolean}
+   */
+  isShown() {
+    const root = this._container;
+    return root != null && root.isConnected === true && root.getClientRects().length > 0 && root.clientWidth > 0;
+  }
+
+  /**
+   * Resolves once this analysis's interactive work has settled (a display
+   * redraw, a re-cluster: `_trackInteractiveTask`), work started meanwhile
+   * included. Work started in the same turn as the call is waited for too.
+   * @returns {Promise<void>}
+   */
+  async whenSettled() {
+    await Promise.resolve();
+    // Each task once: a destroyed analysis keeps a failed task for its owner.
+    const awaited = new Set();
+    for (;;) {
+      const pending = [...(this._interactiveTasks ?? [])].filter(task => !awaited.has(task));
+      if (pending.length === 0) return;
+      for (const task of pending) awaited.add(task);
+      await Promise.allSettled(pending);
+    }
+  }
+
   /**
    * Update the page selector's cell counts in place. A UI without a page
    * selector component has no counts to update.
@@ -706,13 +829,27 @@ export class BaseAnalysisUI {
     if (this._updateTimer) {
       clearTimeout(this._updateTimer);
     }
+    // The update waiting for its delay is this analysis's work already, so
+    // `whenSettled` (a step, an agent's action) waits for it, not only for
+    // the update once it starts: what it changes belongs to the change that
+    // scheduled it. A newer schedule replaces it (one pending at a time).
+    this._settleScheduledUpdate?.();
+    let settle;
+    const scheduled = new Promise(resolve => { settle = resolve; });
+    this._settleScheduledUpdate = settle;
+    this._trackInteractiveTask(scheduled, 'Scheduled analysis update');
     this._updateTimer = setTimeout(() => {
       this._updateTimer = null;
-      if (!this._isCurrentAnalysisIntent(requestId)) return;
-      this._trackInteractiveTask(
+      if (this._settleScheduledUpdate === settle) this._settleScheduledUpdate = null;
+      if (!this._isCurrentAnalysisIntent(requestId)) {
+        settle();
+        return;
+      }
+      const update = this._trackInteractiveTask(
         this._runAnalysisIfValid(requestId),
         'Scheduled analysis update'
       );
+      update.then(settle, settle);
     }, delay);
   }
 
@@ -1493,6 +1630,9 @@ export class BaseAnalysisUI {
       }
       this._updateTimer = null;
     }
+    // The update that will not run now is settled, so nothing waits for it.
+    this._settleScheduledUpdate?.();
+    this._settleScheduledUpdate = null;
 
     void Promise.resolve().then(async () => {
       const interactiveOutcomes = await Promise.allSettled([

@@ -138,3 +138,30 @@ test('no plot type pins a pixel layout height', async () => {
     );
   }
 });
+
+test('a marker result with no gene passing the filters draws the heatmap\'s empty state on every path', async () => {
+  // The expanded view, a redraw after a plot option and an update all call
+  // the definition, so the definition owns the empty case: none of them may
+  // read a matrix that is not there.
+  const { default: heatmap } = await import('../assets/js/app/analysis/plots/types/gene-heatmap.js');
+  const made = [];
+  const container = {
+    children: [],
+    ownerDocument: { createElement: tag => { const element = { tag, className: '', textContent: '' }; made.push(element); return element; } },
+    replaceChildren(...nodes) { this.children = nodes; },
+  };
+  for (const draw of [
+    () => heatmap.render({ matrix: null }, {}, container, null),
+    () => heatmap.update(container, { matrix: null }, {}, null),
+  ]) {
+    container.children = [];
+    assert.equal(await draw(), null);
+    assert.equal(container.children.length, 1);
+    assert.equal(container.children[0].className, 'empty-state');
+    assert.equal(container.children[0].textContent, 'No genes pass the filters.');
+  }
+  const csv = heatmap.exportCSV({ matrix: null }, {});
+  assert.deepEqual(csv.rows, []);
+  assert.deepEqual(csv.columns, ['gene']);
+  assert.equal(csv.metadata.geneCount, 0);
+});

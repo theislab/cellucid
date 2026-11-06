@@ -11,9 +11,10 @@
  *   place by the browser's reader (`served-anndata.js`, `getAnnDataSource()`);
  * - holds the viewer channel (`viewer-channel.js`, rules in
  *   `viewer-protocol.js`): one WebSocket to the host, authenticated with the
- *   viewer id and token, carrying the host's commands (highlight, colour by,
- *   visibility, data mapping, session capture, …) to the viewer and the
- *   viewer's events (selection, hover, click, ready, data mapping, …) back.
+ *   viewer id and token, carrying the host's commands (an action of the
+ *   catalogue -- colour by, highlight, push a column, read the history, … --,
+ *   session capture) to the viewer and the viewer's events (an action's
+ *   answer, selection, hover, click, ready, data mapping, results, …) back.
  *   The page reaches the host at the address it was loaded from, so a
  *   notebook proxy that carries the page carries the channel too.
  *
@@ -53,7 +54,15 @@ import {
   VIEWER_COMMAND_ERROR_REASON_LIMIT,
   VIEWER_DATA_MAPPING_ORIGINS,
   VIEWER_RESULT_META_FIELDS,
+  VIEWER_ACTION_STEP_FIELDS,
+  VIEWER_COMMAND_FIELDS,
+  VIEWER_SESSION_LOADED_TRACKER_FIELDS,
+  isViewerActionType,
   isViewerResultEpoch,
+  requireViewerActionCommand,
+  requireViewerAgentCommand,
+  requireViewerHistoryChanged,
+  requireViewerLoadSession,
   encodeViewerCells,
   encodeViewerResult,
   viewerBinaryCommandTypes,
@@ -274,19 +283,6 @@ function requireExactJsonValue(value, label, ancestors = new Set()) {
 function requireNonNegativeInteger(value, label) {
   if (!Number.isInteger(value) || value < 0) {
     throw new TypeError(`${label} must be a non-negative integer`);
-  }
-  return value;
-}
-
-/**
- * The cells of a host command: the Uint32Array its binary frame carried,
- * strictly ascending and at least one (`decodeViewerBinaryCommand` checked
- * both). The state that applies them checks every index against the dataset
- * (`requireCellList` for a highlight, `setCellVisibility` for visibility).
- */
-function requireCommandCells(value, label) {
-  if (!(value instanceof Uint32Array) || value.length === 0) {
-    throw new TypeError(`${label} must be the cells of a binary command frame`);
   }
   return value;
 }
@@ -590,6 +586,12 @@ function deliverCallbacks(callbacks, args) {
  */
 const VIEWER_HOST_COMMAND_TYPES = Object.freeze(viewerCommandTypes());
 
+/**
+ * The language of each runtime a host names (`VIEWER_HOST_RUNTIMES`):
+ * `jupyter` is Python's notebook viewer (R's says `r` in a notebook too).
+ */
+const VIEWER_HOST_LANGUAGES = Object.freeze({ python: 'python', jupyter: 'python', r: 'r' });
+
 
 /**
  * Name the host command that one failed viewer-channel frame was carrying.
@@ -619,22 +621,37 @@ function describeViewerHostFailureReason(error) {
 }
 
 /**
+ * The request id one failed viewer-channel frame named, when it named one as
+ * exact text; null otherwise (`freeze`, or a frame read no further).
+ *
+ * @param {unknown} data - The frame's parsed JSON object.
+ * @returns {string|null}
+ */
+export function describeViewerHostRequestId(data) {
+  const requestId = isPlainRecord(data) ? data.requestId : undefined;
+  try {
+    return requireExactText(requestId, 'Viewer host requestId');
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Build the exact user-facing text for one failed notebook command.
  *
- * The state-changing commands -- `highlight`, `setColorBy`, `setVisibility`,
- * `clearHighlights`, `resetCamera` and `freeze` -- carry no `requestId`, so
- * `viewer.set_color_by(...)` returns whether the viewer applied it or threw.
- * Announcing the failure here is what separates "the command failed" from
- * "the command matched nothing". The bridge also reports it to the notebook as
- * a `command_error` event, but only when the notebook's `cellucid` lists that
- * event in `/_cellucid/protocol` (see `requestViewerHostProtocol`); a host closes
- * the channel on an event type it does not declare.
+ * The person watching sees why a notebook's command did nothing (a console
+ * entry inside an embedded iframe is no user surface); the notebook learns it
+ * from the `command_error` event that names the command's `requestId`, which
+ * fails the notebook's request for it. A failed `action` is named by its
+ * dotted type (`color.by`), which is safe to show: only a type of the
+ * catalogue's form is named, any other text is not echoed.
  *
  * @param {string|null} commandType - A value from {@link describeViewerHostCommandType}.
  * @param {unknown} error
+ * @param {string|null} [action] - The failed action's type, for an `action`
  * @returns {{title: string, message: string}}
  */
-export function describeViewerHostCommandFailure(commandType, error) {
+export function describeViewerHostCommandFailure(commandType, error, action = null) {
   if (commandType !== null && !VIEWER_HOST_COMMAND_TYPES.includes(commandType)) {
     throw new TypeError(
       'Viewer host command failure type must be one recognised command or null'
@@ -642,7 +659,9 @@ export function describeViewerHostCommandFailure(commandType, error) {
   }
   const subject = commandType === null
     ? 'A notebook command'
-    : `The notebook "${commandType}" command`;
+    : commandType === 'action' && isViewerActionType(action)
+      ? `The notebook's "${action}" action`
+      : `The notebook "${commandType}" command`;
   return {
     title: 'Notebook command failed',
     message:
@@ -735,8 +754,14 @@ export class ViewerHostDataSource {
     /** @type {Set<Function>} */
     this._messageCallbacks = new Set();
 
-    /** @type {Set<Function>} */
-    this._highlightCallbacks = new Set();
+    /**
+     * What runs a host's action (`onAction`): resolves to its outcome and
+     * the history step it made.
+     * @type {((action: {action: string, params: object}) => Promise<{outcome: unknown, step: {id: string, label: string}|null}>)|null}
+     */
+    this._actionHandler = null;
+    this._loadSessionHandler = null;
+    this._agentHandler = null;
 
     this._lifecycleRevision = 0;
     this._catalogRevision = 0;
@@ -826,6 +851,17 @@ export class ViewerHostDataSource {
     return this._runtime === null ? null : VIEWER_HOST_RUNTIMES[this._runtime];
   }
 
+  /**
+   * The language of the program serving the viewer, which a step it takes is
+   * labelled with: `python` (a script, or Jupyter -- the runtime of Python's
+   * notebook viewers) or `r`; null before it answered.
+   *
+   * @returns {'python'|'r'|null}
+   */
+  getHostLanguage() {
+    return this._runtime === null ? null : VIEWER_HOST_LANGUAGES[this._runtime];
+  }
+
   _assertAlive() {
     if (this._destroyed) {
       throw new Error('Viewer host source has been destroyed.');
@@ -841,11 +877,13 @@ export class ViewerHostDataSource {
    * guarded: none may turn the channel's message handler or a promise
    * rejection handler into a thrown failure.
    *
-   * @param {string|null} commandType
+   * @param {unknown} command - The command's parsed frame (anything)
    * @param {unknown} error
    */
-  _reportMessageFailure(commandType, error) {
-    const failure = describeViewerHostCommandFailure(commandType, error);
+  _reportMessageFailure(command, error) {
+    const commandType = describeViewerHostCommandType(command);
+    const action = commandType === 'action' && isViewerActionType(command.action) ? command.action : null;
+    const failure = describeViewerHostCommandFailure(commandType, error, action);
     try {
       console.error(`[ViewerHost] ${failure.message}`, error);
     } catch {
@@ -861,6 +899,7 @@ export class ViewerHostDataSource {
         this._sendEvent({
           type: 'command_error',
           command: commandType,
+          requestId: describeViewerHostRequestId(command),
           reason: describeViewerHostFailureReason(error)
         });
       } catch (deliveryError) {
@@ -903,12 +942,11 @@ export class ViewerHostDataSource {
       this._heldCommands.push(command);
       return;
     }
-    const commandType = describeViewerHostCommandType(command);
     let result;
     try {
       result = this._handleCommand(command);
     } catch (error) {
-      this._reportMessageFailure(commandType, error);
+      this._reportMessageFailure(command, error);
       return;
     }
     if (
@@ -920,14 +958,14 @@ export class ViewerHostDataSource {
       typeof result.then === 'function'
     ) {
       void Promise.resolve(result).catch(error => {
-        this._reportMessageFailure(commandType, error);
+        this._reportMessageFailure(command, error);
       });
     }
   }
 
   /**
    * Start running the host's commands: the app calls this once every handler
-   * it registers with `onHighlight`/`onMessage` is in place. Commands that
+   * it registers with `onAction`/`onMessage` is in place. Commands that
    * arrived before run now, in order.
    */
   acceptCommands() {
@@ -1336,30 +1374,30 @@ export class ViewerHostDataSource {
           userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : null
         });
 
-      case 'highlight':
-        return this._handleHighlight(data);
+      case 'action':
+        // A text frame as it came, or a binary one with its arrays in place
+        // in its parameters (`decodeViewerBinaryCommand`).
+        requireExactKeys(data, VIEWER_COMMAND_FIELDS.action, 'Viewer host action');
+        requireViewerActionCommand(data);
+        return this._runAction(data);
 
-      case 'setColorBy':
-        return this._handleSetColorBy(data);
+      case 'agent_list':
+      case 'agent_call':
+      case 'agent_cancel':
+      case 'agent_answer':
+        // An agent app's call through the host's `cellucid mcp`: run as the
+        // agent through a local connection (`onAgent`), answered by its own
+        // events, never a `command_error` once it is read.
+        requireExactKeys(data, VIEWER_COMMAND_FIELDS[data.type], `Viewer host ${data.type}`);
+        requireViewerAgentCommand(data);
+        return this._runAgentCommand(data);
 
-      case 'setVisibility':
-        return this._handleSetVisibility(data);
-
-      case 'clearHighlights':
-        requireExactKeys(
-          data,
-          ['type'],
-          'Viewer host clear-highlights message'
-        );
-        return this._handleClearHighlights();
-
-      case 'resetCamera':
-        requireExactKeys(
-          data,
-          ['type'],
-          'Viewer host reset-camera message'
-        );
-        return this._handleResetCamera(data);
+      case 'load_session':
+        // Only ever a binary frame (`decodeViewerBinaryCommand`): the file as
+        // its body.
+        requireExactKeys(data, ['type', 'requestId', 'name', 'file'], 'Viewer host session load');
+        requireViewerLoadSession(data);
+        return this._runLoadSession(data);
 
       case 'freeze':
         requireExactKeys(
@@ -1367,21 +1405,6 @@ export class ViewerHostDataSource {
           ['type'],
           'Viewer host freeze message'
         );
-        return deliverCallbacks(this._messageCallbacks, [data]);
-
-      case 'setDataMapping':
-        requireExactKeys(
-          data,
-          ['type', 'requestId', 'mapping'],
-          'Viewer host set-data-mapping message'
-        );
-        requireExactText(
-          data.requestId,
-          'Viewer host set-data-mapping requestId'
-        );
-        validateDataMapping(data.mapping, {
-          label: 'Viewer host set-data-mapping mapping'
-        });
         return deliverCallbacks(this._messageCallbacks, [data]);
 
       case 'requestSessionBundle':
@@ -1397,34 +1420,6 @@ export class ViewerHostDataSource {
         this._requireHostDatasetShown();
         return deliverCallbacks(this._messageCallbacks, [data]);
 
-      case 'setGeneSet': {
-        requireExactKeys(
-          data,
-          ['type', 'requestId', 'name', 'description', 'genes'],
-          'Viewer host set-gene-set message'
-        );
-        requireExactText(data.requestId, 'Viewer host set-gene-set requestId');
-        requireExactText(data.name, 'Viewer host gene set name', { allowWhitespace: true });
-        if (typeof data.description !== 'string') {
-          throw new TypeError('Viewer host gene set description must be text');
-        }
-        if (!Array.isArray(data.genes)) {
-          throw new TypeError('Viewer host gene set genes must be a list');
-        }
-        data.genes.forEach((gene, index) => requireExactText(gene, `Viewer host gene set gene ${index}`));
-        return deliverCallbacks(this._messageCallbacks, [data]);
-      }
-
-      case 'setField':
-        // Decoded and checked by the channel (`decodeViewerBinaryCommand`):
-        // the header, the cells and the values.
-        requireExactKeys(
-          data,
-          ['type', 'requestId', 'key', 'kind', 'categories', 'nObs', 'cells', 'values'],
-          'Viewer host set-field message'
-        );
-        return deliverCallbacks(this._messageCallbacks, [data]);
-
       default:
         // The type is not echoed: it is the host's text, and this message
         // reaches the person watching.
@@ -1435,89 +1430,122 @@ export class ViewerHostDataSource {
   }
 
   /**
-   * Handle highlight command from Python
-   * @param {Object} data
+   * Run one host action through the app's handler (`onAction`) and answer it
+   * with its `action_result`: its outcome (a read's result) as JSON in the
+   * frame's body, and the history step it made. A failure reaches the host
+   * as the `command_error` of its `requestId` (`_observeCommand`).
+   *
+   * @param {{requestId: string, action: string, params: object}} command
    * @private
    */
-  _handleHighlight(data) {
-    requireExactKeys(
-      data,
-      ['type', 'cells', 'color', 'label'],
-      'Viewer host highlight message'
-    );
-    const { cells, color, label } = data;
-    if (label !== null) {
-      requireExactText(label, 'Viewer host highlight label', { allowWhitespace: true });
+  async _runAction(command) {
+    if (this._actionHandler === null) {
+      throw new Error('This viewer cannot carry out actions yet; reload the page.');
     }
-    requireCommandCells(cells, 'Viewer host highlight cells');
-    if (
-      typeof color !== 'string' ||
-      !/^#[0-9a-fA-F]{6}$/.test(color)
-    ) {
-      throw new TypeError(
-        'Viewer host highlight color must be an exact six-digit hex color'
-      );
-    }
-    return deliverCallbacks(this._highlightCallbacks, [cells, color, label]);
+    const answer = await this._actionHandler({
+      action: command.action, params: command.params, turn: command.turn, turnLabel: command.turnLabel,
+    });
+    requireExactKeys(answer, ['outcome', 'step'], 'Viewer host action answer');
+    this._sendActionResult(command.requestId, answer.outcome, answer.step);
   }
 
   /**
-   * Handle color by command
-   * @param {Object} data
+   * One agent command through the app's agent handler (`onAgent`): the tool
+   * list (`agent_tools`), a call (its `agent_result`, whatever happens), a
+   * stop, or the person's answer given in the agent's app.
+   *
+   * @param {object} command - an agent command, its keys checked (`requireViewerAgentCommand`)
    * @private
    */
-  _handleSetColorBy(data) {
-    requireExactKeys(
-      data,
-      ['type', 'field'],
-      'Viewer host set-color-by message'
-    );
-    const { field } = data;
-    requireExactText(
-      field,
-      'Viewer host set-color-by field',
-      { allowWhitespace: true }
-    );
-    return deliverCallbacks(this._messageCallbacks, [data]);
-  }
-
-  /**
-   * Handle visibility command
-   * @param {Object} data
-   * @private
-   */
-  _handleSetVisibility(data) {
-    requireExactKeys(
-      data,
-      ['type', 'cells', 'visible'],
-      'Viewer host set-visibility message'
-    );
-    const { cells, visible } = data;
-    if (cells !== null) {
-      requireCommandCells(cells, 'Viewer host set-visibility cells');
+  _runAgentCommand(command) {
+    if (this._agentHandler === null) {
+      throw new Error('This viewer cannot take agent calls yet; reload the page.');
     }
-    if (typeof visible !== 'boolean') {
-      throw new TypeError(
-        'Viewer host set-visibility visible must be a boolean'
-      );
+    switch (command.type) {
+      case 'agent_list':
+        return this._sendAgentJson('agent_tools', command.requestId, this._agentHandler.list(command.connection));
+      case 'agent_call':
+        return this._agentHandler.call({
+          id: command.requestId, tool: command.tool, args: command.args, agent: command.agent, connection: command.connection,
+        });
+      case 'agent_cancel':
+        return this._agentHandler.cancel(command.requestId);
+      default:
+        return this._agentHandler.answer(command.requestId, command.allowed);
     }
-    return deliverCallbacks(this._messageCallbacks, [data]);
   }
 
   /**
-   * Handle clear highlights command
+   * Send a binary agent event whose body is JSON (`agent_tools`,
+   * `agent_result`), when the host accepts it.
+   *
+   * @param {'agent_tools'|'agent_result'} type
+   * @param {string} requestId
+   * @param {unknown} body - JSON
+   * @returns {boolean} Whether it was sent
    * @private
    */
-  _handleClearHighlights() {
-    return deliverCallbacks(this._highlightCallbacks, [null, null, null]);
+  _sendAgentJson(type, requestId, body) {
+    this._captureConnection(`Viewer host ${type}`);
+    requireExactText(requestId, `Viewer host ${type} requestId`);
+    requireExactJsonValue(body, `Viewer host ${type} body`);
+    if (!this._protocol.events.has(type)) return false;
+    this._channel.sendBinary({ type, requestId }, new Blob([JSON.stringify(body)]));
+    return true;
   }
 
   /**
-   * Handle reset camera command
+   * Load the session file a host pushed (`load_session`) through the app's
+   * handler (`onLoadSession`) and answer it with `session_loaded`: the
+   * tracker shown and its step shown. A failure reaches the host as the
+   * `command_error` of its `requestId` (`_observeCommand`).
+   *
+   * @param {{requestId: string, name: string, file: Uint8Array}} command
    * @private
    */
-  _handleResetCamera(data) {
-    return deliverCallbacks(this._messageCallbacks, [data]);
+  async _runLoadSession(command) {
+    if (this._loadSessionHandler === null) {
+      throw new Error('This viewer cannot load a session yet; reload the page.');
+    }
+    const answer = await this._loadSessionHandler({ name: command.name, file: command.file });
+    requireExactKeys(answer, ['tracker', 'head'], 'Viewer host session load answer');
+    requireExactKeys(answer.tracker, VIEWER_SESSION_LOADED_TRACKER_FIELDS, 'Viewer host session load tracker');
+    requireExactText(answer.tracker.id, 'Viewer host session load tracker id');
+    requireExactText(answer.tracker.name, 'Viewer host session load tracker name', { allowWhitespace: true });
+    requireExactText(answer.head, 'Viewer host session load head');
+    this._sendEvent({
+      type: 'session_loaded',
+      requestId: command.requestId,
+      tracker: { id: answer.tracker.id, name: answer.tracker.name },
+      head: answer.head
+    });
+  }
+
+  /**
+   * Send an action's answer, when the host accepts it.
+   *
+   * @param {string} requestId
+   * @param {unknown} outcome - JSON (null: nothing to report)
+   * @param {{id: string, label: string}|null} step
+   * @returns {boolean} Whether it was sent
+   * @private
+   */
+  _sendActionResult(requestId, outcome, step) {
+    this._captureConnection('Viewer host action answer');
+    requireExactText(requestId, 'Viewer host action requestId');
+    if (step !== null) {
+      requireExactKeys(step, VIEWER_ACTION_STEP_FIELDS, 'Viewer host action step');
+      requireExactText(step.id, 'Viewer host action step id');
+      requireExactText(step.label, 'Viewer host action step label', { allowWhitespace: true });
+    }
+    requireExactJsonValue(outcome, 'The action\'s outcome');
+    if (!this._protocol.events.has('action_result')) return false;
+    this._channel.sendBinary({
+      type: 'action_result',
+      requestId,
+      step
+    }, new Blob([JSON.stringify(outcome)]));
+    return true;
   }
 
   /**
@@ -1708,9 +1736,8 @@ export class ViewerHostDataSource {
    * Tell Python which data mapping the viewer shows, when the notebook's
    * `cellucid` accepts the `data_mapping` event.
    *
-   * @param {{origin: string, requestId: string|null, mapping: Object}} report
-   *   `requestId` names the `setDataMapping` command this answers; it is set
-   *   exactly when `origin` is `notebook`.
+   * @param {{origin: string, mapping: Object}} report - `origin` is why the
+   *   mapping is what it is (`notebook`: the host's own `mapping.set`)
    * @returns {Promise<boolean>} Whether the event was sent.
    */
   async notifyDataMapping(report) {
@@ -1719,7 +1746,7 @@ export class ViewerHostDataSource {
     }
     requireExactKeys(
       report,
-      ['origin', 'requestId', 'mapping'],
+      ['origin', 'mapping'],
       'Viewer host data-mapping report'
     );
     if (!VIEWER_HOST_DATA_MAPPING_ORIGINS.includes(report.origin)) {
@@ -1727,19 +1754,11 @@ export class ViewerHostDataSource {
         `Viewer host data-mapping origin must be one of ${VIEWER_HOST_DATA_MAPPING_ORIGINS.join(', ')}`
       );
     }
-    if (report.origin === 'notebook') {
-      requireExactText(report.requestId, 'Viewer host data-mapping requestId');
-    } else if (report.requestId !== null) {
-      throw new TypeError(
-        'Viewer host data-mapping requestId must be null unless it answers the notebook'
-      );
-    }
     const mapping = validateDataMapping(report.mapping, {
       label: 'Viewer host data-mapping report'
     });
     return this._sendEvent({
       type: 'data_mapping',
-      requestId: report.requestId,
       origin: report.origin,
       mapping
     });
@@ -1782,7 +1801,7 @@ export class ViewerHostDataSource {
   /**
    * Send one result (`encodeViewerResult`), when the host accepts results.
    * Its cells are already original positions: the results publisher
-   * (`app/viewer-host-results.js`) names them.
+   * (`app/viewer-host/results.js`) names them.
    *
    * @param {Parameters<typeof encodeViewerResult>[0]} result
    * @returns {boolean} Whether it was sent
@@ -1892,28 +1911,132 @@ export class ViewerHostDataSource {
   // =========================================================================
 
   /**
-   * Register callback for highlight commands from the host
-   * @param {Function} callback - Called with (cells, color, label): the
-   *   ascending Uint32Array of a highlight's original positions, its colour
-   *   and its label (null: the viewer names it), or (null, null, null) to
-   *   clear every highlight
+   * Register what carries out the host's actions: `handler({action, params})`
+   * applies (or reads) the catalogue's action `action` -- its parameters
+   * checked by the action's schema, its typed arrays in place -- and resolves
+   * to `{outcome, step}`: the action's outcome (JSON; a read's result) and
+   * the history step it made as `{id, label}`, or null. A rejection is the
+   * host's `command_error`. One handler: each action is answered once.
+   *
+   * @param {(action: {action: string, params: object}) => Promise<{outcome: unknown, step: {id: string, label: string}|null}>} handler
    */
-  onHighlight(callback) {
-    if (typeof callback !== 'function') {
-      throw new TypeError('Viewer host highlight callback must be a function');
+  onAction(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('Viewer host action handler must be a function');
     }
-    this._highlightCallbacks.add(callback);
+    if (this._actionHandler !== null) {
+      throw new Error('Viewer host actions already have a handler');
+    }
+    this._actionHandler = handler;
   }
 
   /**
-   * Remove highlight callback
-   * @param {Function} callback
+   * Register what runs an agent app's calls that come through the host
+   * (`cellucid mcp`): `list(connection)` returns the MCP tools as that
+   * connection may use them; `call({id, tool, args, agent, connection})`
+   * runs one and answers it later with `sendAgentResult(id, result)`;
+   * `cancel(id)` stops it; `answer(id, allowed)` answers the person's
+   * question about it from the agent's app. One handler
+   * (`app/agent/bridge/agent-calls.js` behind it).
+   *
+   * @param {{list: Function, call: Function, cancel: Function, answer: Function}} handler
    */
-  offHighlight(callback) {
-    if (typeof callback !== 'function') {
-      throw new TypeError('Viewer host highlight callback must be a function');
+  onAgent(handler) {
+    for (const name of ['list', 'call', 'cancel', 'answer']) {
+      if (typeof handler?.[name] !== 'function') throw new TypeError(`Viewer host agent handler needs ${name}()`);
     }
-    this._highlightCallbacks.delete(callback);
+    if (this._agentHandler !== null) {
+      throw new Error('Viewer host agent calls already have a handler');
+    }
+    this._agentHandler = handler;
+  }
+
+  /**
+   * Answer an agent call (`agent_result`): its MCP tool result.
+   * @param {string} requestId
+   * @param {{content: object[], isError: boolean}} result
+   * @returns {boolean} Whether it was sent
+   */
+  sendAgentResult(requestId, result) {
+    if (!this._connected) return false;
+    return this._sendAgentJson('agent_result', requestId, result);
+  }
+
+  /**
+   * The person is asked about agent call `requestId` (`agent_asking`):
+   * the card's question in one sentence, and what makes it cost (or null).
+   * @param {string} requestId
+   * @param {{message: string, detail: string|null}} question
+   */
+  sendAgentAsking(requestId, { message, detail = null }) {
+    if (!this._connected) return false;
+    requireExactText(requestId, 'Viewer host agent_asking requestId');
+    return this._sendEvent({
+      type: 'agent_asking',
+      requestId,
+      message: String(message),
+      detail: detail === null ? null : String(detail)
+    });
+  }
+
+  /** The person answered the question about agent call `requestId` (`agent_answered`). */
+  sendAgentAnswered(requestId, allowed) {
+    if (!this._connected) return false;
+    requireExactText(requestId, 'Viewer host agent_answered requestId');
+    return this._sendEvent({
+      type: 'agent_answered',
+      requestId,
+      allowed: allowed === true
+    });
+  }
+
+  /** The person's settings changed what a tool list says (`agent_tools_changed`). */
+  notifyAgentToolsChanged() {
+    if (!this._connected) return false;
+    return this._sendEvent({
+      type: 'agent_tools_changed'
+    });
+  }
+
+  /**
+   * Register what loads a session file the host pushed: `handler({name,
+   * file})` loads the `.cellucid-session` bytes `file` (named `name`) into
+   * the open dataset's history and resolves to `{tracker: {id, name}, head}`,
+   * the tracker shown and its step shown. A rejection is the host's
+   * `command_error`. One handler.
+   *
+   * @param {(load: {name: string, file: Uint8Array}) => Promise<{tracker: {id: string, name: string}, head: string}>} handler
+   */
+  onLoadSession(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('Viewer host session-load handler must be a function');
+    }
+    if (this._loadSessionHandler !== null) {
+      throw new Error('Viewer host session loads already have a handler');
+    }
+    this._loadSessionHandler = handler;
+  }
+
+  /**
+   * Tell the host the history changed (`history_changed`), when it accepts
+   * that event and the viewer shows the host's dataset: a history of another
+   * dataset is not the host's.
+   *
+   * @param {{kind: string, tracker: string, head: string, step: string|null, branch: string|null}} change
+   * @returns {boolean} Whether it was sent
+   */
+  notifyHistoryChanged(change) {
+    requireExactKeys(change, ['kind', 'tracker', 'head', 'step', 'branch'], 'Viewer host history change');
+    const event = requireViewerHistoryChanged({
+      type: 'history_changed',
+      kind: change.kind,
+      tracker: change.tracker,
+      head: change.head,
+      step: change.step,
+      branch: change.branch
+    });
+    if (this.getShownHostDataset() === null) return false;
+    return this._sendEvent(event);
   }
 
   /**
@@ -2223,7 +2346,9 @@ export class ViewerHostDataSource {
     this._datasetEntries.clear();
     this._releaseAnnData();
     this._messageCallbacks.clear();
-    this._highlightCallbacks.clear();
+    this._actionHandler = null;
+    this._loadSessionHandler = null;
+    this._agentHandler = null;
     this._endCallbacks.clear();
   }
 

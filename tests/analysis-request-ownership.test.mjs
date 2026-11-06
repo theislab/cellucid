@@ -155,13 +155,18 @@ test('a newer run never captures an older Running label', async () => {
 test('a highlight change marks a shown result stale; it neither discards nor re-runs it', async () => {
   const run = deferred();
   const { ui } = createHarness([run]);
+  // The result's page: a change of its cells is a change of the result's input.
+  const page = { id: 'page_1', name: 'Page 1', highlightedGroups: [{ id: 'g', enabled: true, cellIndices: Uint32Array.of(0, 1) }] };
+  ui.dataLayer = { state: { getHighlightPages: () => [page], getHighlightedCellCountForPage: () => 2 } };
+  ui._selectedPages = ['page_1'];
   ui._updatePageSelectorCounts = () => {};
   run.resolve({ data: { owner: 'shown' } });
   await ui._runAnalysis();
-  assert.equal(ui._isResultStale(), false);
+  assert.deepEqual(await ui.getStaleReasons(), []);
+  page.highlightedGroups = [{ id: 'g', enabled: true, cellIndices: Uint32Array.of(0, 1, 2) }];
   ui.onHighlightChanged();
   assert.equal(ui.getLastResult().data.owner, 'shown');
-  assert.equal(ui._isResultStale(), true);
+  assert.deepEqual(await ui.getStaleReasons(), ['The cells of Page 1 changed since this result.']);
   assert.deepEqual(ui.renders, ['shown']);
 });
 

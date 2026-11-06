@@ -149,6 +149,8 @@
  * @module formats/io/link
  */
 
+import { measureOf } from '../../utils/machine.js';
+
 /**
  * The rate, in stored bytes per millisecond, at which the reader builds a
  * gene index from a compressed row-major matrix: measured on an Apple M1 Pro
@@ -1217,4 +1219,39 @@ export class LinkMeter {
       busyMs: this.busyMs,
     };
   }
+}
+
+/**
+ * The link the reader plans on (`AnnDataReader`): `meter` itself, or, while
+ * the machine's link is held (`utils/machine.js` `link`: `{latencyMs,
+ * bytesPerMs}`), `meter` with what it measures replaced by the held link at
+ * rest -- its round trip (the shortest, on a connection already made and
+ * under load alike), its rate, known as a link that kept full is, and
+ * nothing a request costs past its round trip. Everything a plan derives
+ * from those (`mergeGapBytes`, `roundTripBytes`, `maxRequestBytes`,
+ * `readsAhead`, `snapshot`) is derived as ever, by `meter`'s own rules, and
+ * what `meter` knows without timing anything stays (its prior, its
+ * protocol and concurrency, the host's request budget).
+ *
+ * Only the reader's plans read it. The requests themselves are still
+ * measured by `meter` and shaped by what it measured: how long a stalled
+ * request is waited for must follow the link as it is, on a slow machine
+ * above all (`ResponseClock`), and a plan must not.
+ *
+ * @param {LinkMeter|null} meter
+ * @returns {LinkMeter|null}
+ */
+export function plannedLink(meter) {
+  const held = measureOf('link', () => null);
+  if (meter === null || meter === undefined || held === null) return meter ?? null;
+  const at = value => ({ get: () => value, enumerable: true });
+  return Object.create(meter, {
+    latencyMs: at(held.latencyMs),
+    warmLatencyMs: at(held.latencyMs),
+    loadedLatencyMs: at(held.latencyMs),
+    bytesPerMs: at(held.bytesPerMs),
+    bandwidthMeasured: at(true),
+    connectionBytesPerMs: at(0),
+    loadedRequestMs: at(0),
+  });
 }

@@ -1,0 +1,12 @@
+{
+  "examples": [
+    {}
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "type": "view.clear",
+  "version": 1
+}

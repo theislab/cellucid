@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import { initHighlightPagesUI } from '../assets/js/app/ui/modules/highlight/highlight-pages-ui.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { provideHighlightActions } from '../assets/js/app/ui/modules/highlight/highlight-actions.js';
+import { settleActions } from './helpers/highlight-state-pages.mjs';
 
 class FakeClassList {
   constructor(element) {
@@ -351,16 +353,6 @@ function createState() {
       this.onChange();
       return page;
     },
-    highlightPageRecord(pageId) {
-      const index = this.pages.findIndex(page => page.id === pageId);
-      return index < 0 ? null : { page: this.pages[index], index, active: this.activePageId === pageId, cells: null };
-    },
-    restoreHighlightPage(record) {
-      operations.push(['restore', record.page.id]);
-      this.pages.splice(record.index, 0, record.page);
-      this.onChange();
-      return true;
-    },
     deleteHighlightPage(pageId) {
       operations.push(['delete', pageId]);
       this.pages = this.pages.filter(page => page.id !== pageId);
@@ -425,6 +417,9 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     document.body.appendChild(tabs);
     document.body.appendChild(addButton);
     const { operations, state } = createState();
+    // Every page control dispatches a highlight action, applied here to the
+    // fake state; each interaction settles before its result is read.
+    const removeActions = provideHighlightActions({ state });
     const pagesUi = initHighlightPagesUI({
       state,
       dom: {
@@ -454,6 +449,7 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
 
     tabControls[0].focus();
     tabControls[0].dispatch('keydown', { key: 'ArrowRight' });
+    await settleActions();
     tabControls = tabs.querySelectorAll('.highlight-page-tab-activate');
     assert.equal(state.activePageId, 'page_2');
     assert.equal(document.activeElement, tabControls[1]);
@@ -468,7 +464,9 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     assert.equal(document.activeElement, renameInput);
     renameInput.value = 'Activated cells';
     renameInput.dispatch('keydown', { key: 'Enter' });
+    await settleActions();
     assert.equal(state.pages[1].name, 'Activated cells');
+    assert.deepEqual(operations.at(-1), ['rename', 'page_2', 'Activated cells']);
     assert.equal(tabs.querySelector('.highlight-page-tab-input'), null);
     const renamedTab = tabs.querySelectorAll(
       '.highlight-page-tab-activate'
@@ -513,6 +511,7 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     combineButton.dispatch('click');
     combineMenu = document.getElementById('page-combine-menu');
     combineMenu.querySelector('.page-combine-option').dispatch('click');
+    await settleActions();
     assert.equal(state.pages.length, 3);
     assert.equal(state.activePageId, 'page_3');
     assert.deepEqual(
@@ -524,25 +523,22 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     ).find(control => control.getAttribute('aria-selected') === 'true');
     assert.equal(document.activeElement, activeTab);
 
-    // Deleting offers Undo (audit F-9); taking it puts the very page back.
+    // Deleting is at once and is one history step: the history undoes it,
+    // so no notification offers a second Undo.
     const notifications = getNotificationCenter();
     const shown = [];
     const show = notifications.show;
     notifications.show = notice => shown.push(notice);
     try {
       activeTab.dispatch('keydown', { key: 'Delete' });
+      await settleActions();
     } finally {
       notifications.show = show;
     }
     assert.equal(state.pages.length, 2);
     assert.equal(state.activePageId, 'page_1');
-    assert.equal(shown.length, 1);
-    assert.equal(shown[0].action.label, 'Undo');
-    const deleted = operations.at(-1)[1];
-    shown[0].action.run();
-    assert.deepEqual(operations.at(-1), ['restore', deleted]);
-    assert.ok(state.pages.some(page => page.id === deleted));
-    state.deleteHighlightPage(deleted);
+    assert.deepEqual(operations.at(-1), ['delete', 'page_3']);
+    assert.deepEqual(shown, []);
     activeTab = tabs.querySelectorAll(
       '.highlight-page-tab-activate'
     ).find(control => control.getAttribute('aria-selected') === 'true');
@@ -551,6 +547,7 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
 
     addButton.focus();
     addButton.dispatch('click');
+    await settleActions();
     assert.equal(state.pages.length, 3);
     assert.equal(state.activePageId, 'page_4');
     activeTab = tabs.querySelectorAll(
@@ -558,6 +555,8 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     ).find(control => control.getAttribute('aria-selected') === 'true');
     assert.equal(document.activeElement, activeTab);
     assert.equal(activeTab.getAttribute('role'), 'tab');
+    pagesUi.destroy();
+    removeActions();
   });
 });
 
@@ -576,6 +575,7 @@ test('a page colour drag publishes once per frame, and its final colour on chang
       document.body.appendChild(tabs);
       document.body.appendChild(addButton);
       const { operations, state } = createState();
+      const removeActions = provideHighlightActions({ state });
       const pagesUi = initHighlightPagesUI({ state, dom: { addPageBtn: addButton, pagesTabsEl: tabs } });
       state.onChange = pagesUi.renderHighlightPages;
       const input = tabs.querySelector('.color-swatch-input');
@@ -583,18 +583,22 @@ test('a page colour drag publishes once per frame, and its final colour on chang
         input.value = color;
         input.dispatch('input', {});
       }
+      await settleActions();
       assert.deepEqual(operations.filter(([kind]) => kind === 'color'), [], 'nothing before the frame');
       for (const frame of frames.splice(0)) frame?.();
+      await settleActions();
       assert.deepEqual(operations.filter(([kind]) => kind === 'color'), [['color', 'page_1', '#333333']]);
       input.value = '#444444';
       input.dispatch('input', {});
       input.dispatch('change', {});
+      await settleActions();
       assert.deepEqual(
         operations.filter(([kind]) => kind === 'color').at(-1),
         ['color', 'page_1', '#444444'],
         'the final colour is published at once on change'
       );
       pagesUi.destroy?.();
+      removeActions();
     });
   } finally {
     globalThis.requestAnimationFrame = previous.requestAnimationFrame;

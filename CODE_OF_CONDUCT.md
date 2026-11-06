@@ -51,7 +51,7 @@ an individual is officially representing the community in public spaces.
 If you experience or witness unacceptable behavior, please report it by:
 
 - Opening an issue (for non-sensitive reports), or
-- Emailing the maintainer at `k.inecik@gmail.com`.
+- Emailing the project at `hello@cellucid.com`.
 
 All reports will be reviewed and investigated promptly and fairly.
 

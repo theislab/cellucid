@@ -20,12 +20,12 @@
 import { readFile } from 'node:fs/promises';
 import { expect, test } from './helpers/test.mjs';
 
-import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
-import { gzipDecompress } from '../../assets/js/app/session/codecs/gzip.js';
+import { shownDomainValue } from './helpers/session-files.mjs';
 import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const ROOT = appUrl('/tests/browser/fixtures/generated-user-defined-centroids/');
 const DATASET_ID = 'user-defined-centroids';
@@ -225,28 +225,16 @@ async function saveSession(page, errors, sessionPath) {
   // The first error the save raises ends the wait (the download's own
   // timeout bounds it otherwise).
   const failure = errors.next().then(() => null);
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await Promise.race([downloadPromise, failure]);
   expect(download, `saving the session failed: ${errors.slice(errorCount).join('\n')}`)
     .not.toBe(null);
   await download.saveAs(sessionPath);
 }
 
+/** The `field-overlays` value the saved session shows. */
 async function readFieldOverlays(sessionPath) {
-  const bytes = await readFile(sessionPath);
-  const { chunkStream } = await readBundle(
-    new Blob([bytes]),
-    { signal: null, onProgress: null },
-  );
-  for await (const chunk of chunkStream) {
-    if (chunk.meta.id !== 'core/field-overlays') continue;
-    const raw = await gzipDecompress(chunk.bytes, {
-      maxOutputBytes: chunk.meta.uncompressedBytes,
-      signal: null,
-    });
-    return JSON.parse(new TextDecoder().decode(raw));
-  }
-  throw new Error('The session has no field-overlays chunk.');
+  return shownDomainValue(await readFile(sessionPath), 'field-overlays');
 }
 
 test('a categorical from a selection keeps exact labels across dimensions and sessions', async (
@@ -301,24 +289,23 @@ test('a categorical from a selection keeps exact labels across dimensions and se
   await saveSession(page, errors, sessionPath);
 
   const overlays = await readFieldOverlays(sessionPath);
-  expect(overlays.userDefinedFields).toHaveLength(1);
+  expect(overlays.userFields).toHaveLength(1);
   // A session stores the field's codes, never its centroids: the record is
   // the definition alone, and centroids are recomputed from the codes on
   // restore.
-  expect(Object.keys(overlays.userDefinedFields[0]).sort()).toEqual([
+  expect(Object.keys(overlays.userFields[0]).sort()).toEqual([
     'categories',
-    'codesLength',
-    'codesType',
+    'codes',
     'createdAt',
+    'deleted',
     'id',
     'intersectionLabels',
-    'isDeleted',
-    'isPurged',
     'key',
     'kind',
     'operation',
     'overlapLabel',
     'overlapStrategy',
+    'purged',
     'source',
     'sourceField',
     'sourcePages',
@@ -330,7 +317,7 @@ test('a categorical from a selection keeps exact labels across dimensions and se
   // default 3D here.
   await openDataset(page);
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
   await expect.poll(async () => (

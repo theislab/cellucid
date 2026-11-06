@@ -171,6 +171,26 @@ test('the browser-test server survives every abort a spec can cause', async t =>
   );
 });
 
+test('every asset of the inventory is served whole, an empty one too', async t => {
+  const server = await startServer();
+  t.after(() => {
+    server.child.kill('SIGKILL');
+  });
+  // The inventory is what a Python or R host downloads from a web source; one
+  // empty asset (a `.gitkeep`) once dropped the connection unanswered.
+  const inventory = await (await fetch(`http://${HOST}:${server.port}/cellucid-web-assets.json`)).json();
+  const empty = inventory.assets.filter(asset => asset.bytes === 0);
+  assert.ok(empty.length > 0, 'the inventory lists an empty asset to serve');
+  for (const asset of empty) {
+    const response = await fetch(`http://${HOST}:${server.port}/${asset.path}`, { cache: 'no-store' });
+    assert.equal(response.status, 200, asset.path);
+    assert.equal(response.headers.get('content-length'), '0', asset.path);
+    assert.equal((await response.arrayBuffer()).byteLength, 0, asset.path);
+  }
+  assert.equal(server.child.exitCode, null, `the server exited: ${server.stderr.join('')}`);
+  assert.deepEqual(server.stderr.filter(line => /request failed/.test(line)), []);
+});
+
 test('the server still refuses to start on an address it cannot take', async t => {
   const server = await startServer();
   t.after(() => {

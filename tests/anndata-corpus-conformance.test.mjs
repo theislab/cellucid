@@ -21,6 +21,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 
 import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';

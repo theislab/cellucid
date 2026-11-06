@@ -17,7 +17,8 @@ const CAP_LOOKUP_APQ_HASH =
   '7669f4698d1243244b365018dc60a69b61969791659814e0b4ad1b65385ddaab';
 const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
 const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
-const WORKER_DEADLINE_MS = 15_000;
+// GitHub's own 10 s request timeout plus a 3 s connection set-up (the Worker cites both).
+const WORKER_STALL_TIMEOUT_MS = 13_000;
 const encoder = new TextEncoder();
 
 function deferred() {
@@ -203,7 +204,8 @@ test('CAP namespace requires an exact allowed Origin and exact CORS preflight', 
       preflight.headers.get('Access-Control-Allow-Credentials'),
       null
     );
-    assert.equal(preflight.headers.get('Access-Control-Max-Age'), '600');
+    // Chromium keeps a preflight 2 hours at most; every Worker route asks for that.
+    assert.equal(preflight.headers.get('Access-Control-Max-Age'), '7200');
     assert.equal(preflight.headers.get('Vary'), 'Origin');
 
     for (const headers of [
@@ -306,7 +308,7 @@ test('lookup route maps every search kind to the exact official APQ fields', asy
       );
       assert.equal(response.status, 200);
       assert.deepEqual(await responseDocument(response), {
-        contractVersion: 2,
+        contractVersion: 3,
         results: [projectedLookupItem(upstreamItem)],
         omittedInvalidCount: 0,
       });
@@ -366,14 +368,6 @@ test('CAP request schemas reject coercion, query material, and credentials befor
       name: 'lookup unknown field',
       path: '/cap/lookup-cells',
       body: '{"kind":"name","term":"T cell","limit":1,"query":"query X"}',
-      status: 400,
-    },
-    {
-      name: 'lookup duplicate decoded key',
-      path: '/cap/lookup-cells',
-      body:
-        '{"kind":"name","\\u006bind":"marker",' +
-        '"term":"T cell","limit":1}',
       status: 400,
     },
     {
@@ -623,7 +617,7 @@ test('lookup projection omits and counts invalid rows without clipping valid bou
       );
       assert.equal(response.status, 200);
       const document = await responseDocument(response);
-      assert.equal(document.contractVersion, 2);
+      assert.equal(document.contractVersion, 3);
       assert.equal(document.omittedInvalidCount, invalid.length);
       assert.equal(document.results.length, 2);
       assert.deepEqual(document.results[0], projectedLookupItem(valid));
@@ -686,14 +680,6 @@ test('CAP malformed envelopes and all upstream failures fail closed without APQ 
             lookupCells: [validLookupItem(), validLookupItem({ id: '43' })],
           },
         }),
-    },
-    {
-      name: 'duplicate JSON keys',
-      fetch: async () =>
-        new Response(
-          '{"data":{"lookupCells":[]},"\\u0064ata":{"lookupCells":[]}}',
-          { status: 200 }
-        ),
     },
     {
       name: 'invalid JSON',
@@ -937,7 +923,27 @@ test('CAP cancels an upstream streamed byte overrun', async () => {
   );
 });
 
-test('CAP request cancellation and deadline own the exact upstream signal', async () => {
+test('CAP request JSON is parsed natively: a repeated key keeps its last value, which is what is checked and sent', async () => {
+  const forwarded = [];
+  await withMockedFetch(async (_url, options = {}) => {
+    forwarded.push(parseExactJson(options.body));
+    return jsonResponse({ data: { lookupCells: [] } });
+  }, async () => {
+    const response = await worker.fetch(
+      capRequest('/cap/lookup-cells', {
+        body: '{"kind":"name","\\u006bind":"marker","term":"CD3D","limit":1}',
+      }),
+      ENV
+    );
+    assert.equal(response.status, 200);
+  });
+  assert.deepEqual(forwarded[0].variables.search, {
+    name: 'CD3D',
+    fields: ['markerGenes', 'canonicalMarkerGenes'],
+  });
+});
+
+test('CAP request cancellation and the stall clock own the exact upstream signal', async () => {
   const preAborted = new AbortController();
   preAborted.abort(new DOMException('caller secret', 'AbortError'));
   let upstreamCalls = 0;
@@ -997,13 +1003,15 @@ test('CAP request cancellation and deadline own the exact upstream signal', asyn
         ENV
       );
       const upstreamSignal = await deadlineFetchStarted.promise;
-      assert.equal(timers.records.length, 1);
-      assert.equal(timers.records[0].delay, WORKER_DEADLINE_MS);
-      timers.fire(timers.records[0]);
+      // Reading the request body was progress; the answer is awaited now.
+      const live = () => timers.records.filter(record => !record.cleared && !record.fired);
+      assert.equal(live().length, 1);
+      assert.equal(live()[0].delay, WORKER_STALL_TIMEOUT_MS);
+      timers.fire(live()[0]);
       assert.equal(upstreamSignal.aborted, true);
       const response = await deadlineWorkerPromise;
       assert.equal(response.status, 504);
-      assert.equal(timers.records[0].cleared, true);
+      assert.deepEqual(live(), []);
     });
   } finally {
     if (deadlineWorkerPromise !== null) await deadlineWorkerPromise;

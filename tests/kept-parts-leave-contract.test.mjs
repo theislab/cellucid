@@ -2,7 +2,7 @@
  * What a reader fetched of a remote file is kept as it arrives
  * (`formats/io/kept-parts.js`, a journal: `space.js` `openKeptJournal`),
  * whatever the visit's length: a tab closed at once, a worker ended or a
- * browser that crashes right after a read loses none of it, and a later
+ * browser that crashes once it is written loses none of it, and a later
  * visit fetches none of it again; nothing waits for the reads to go quiet
  * or for a page event (`flushKeptParts` only asks the disk to hold what is
  * written). A file whose reads name no version (Google Drive's public
@@ -116,6 +116,14 @@ async function journalBytes(disk, atLeast) {
 }
 
 /** Whether no journal is being written: each holds its writing lock until it is closed (`space.js` `openKeptJournal`). */
+/**
+ * A link whose reads go quiet only when a test says: a journal closes, and a
+ * provider is asked to confirm, once the reads have fetched nothing for the
+ * link's timeout (`KeptParts.measuredBy`), and a real second can pass between
+ * any two lines of a test on a loaded machine.
+ */
+const NEVER_QUIET = Object.freeze({ timeoutMs: 3_600_000 });
+
 const noneWritten = disk => ![...disk.environment.navigator.locks.held.keys()].some(name => name.endsWith('#writing'));
 
 test('what a reader fetched is kept as it arrives: after a visit cut short at once (a tab closed, a crash) a later visit fetches none of it again', async t => {
@@ -153,7 +161,10 @@ test('a journal still being written by another reader is left alone; once its re
   const asked = countingHost(t);
   const file = remoteFile('census:1');
   const writing = keptPartsOf(file, { environment: disk.environment, tab: 'tab' });
-  await createByteReader(withKeptParts(httpByteSource(file), writing)).read(0, 2000);
+  const link = { timeoutMs: NEVER_QUIET.timeoutMs };
+  writing.measuredBy(link);
+  const reader = createByteReader(withKeptParts(httpByteSource(file), writing));
+  await reader.read(0, 2000);
   await journalBytes(disk, 2000);
   // Another tab opens the file while the first still writes: it does not read a journal that still grows.
   const other = keptPartsOf(file, { environment: disk.environment, tab: 'tab' });
@@ -161,10 +172,11 @@ test('a journal still being written by another reader is left alone; once its re
   assert.equal(other.keptBytes(), 0, 'left to the next opening');
   assert.ok(manifests(disk).some(manifest => manifest?.kind === 'parts'), 'and never removed');
   await other.close();
-  // The writer's reads go quiet for its link's timeout (unmeasured: a
-  // second): its journal is closed (its writing lock let go), never
-  // appended to again, and read by whoever opens the file next, while the
-  // writer still lives.
+  // The writer's reads go quiet for its link's timeout: its journal is closed
+  // (its writing lock let go), never appended to again, and read by whoever
+  // opens the file next, while the writer still lives.
+  link.timeoutMs = 1;
+  await reader.read(3000, 100);
   await until(() => noneWritten(disk), 'the quiet writer\'s journal closed');
   const before = asked.length;
   const later = keptPartsOf(file, { environment: disk.environment, tab: 'tab' });
@@ -187,7 +199,8 @@ test('a file whose reads name no version (Google Drive\'s public reads) is used 
   let changed = 0;
   const file = remoteFile('md5:aa:4096');
   const confirm = async () => holds;
-  const parts = keptPartsOf(file, { environment: disk.environment, tab: 'tab', confirm, onChanged: () => changed++ });
+  const parts = keptPartsOf(file, { environment: disk.environment, tab: 'tab', confirm });
+  parts.measuredBy(NEVER_QUIET);
   const reader = createByteReader(withKeptParts(httpByteSource(file), parts));
   await reader.read(0, 1000);
   // Hidden: the provider confirms what was read so far.
@@ -198,6 +211,7 @@ test('a file whose reads name no version (Google Drive\'s public reads) is used 
   disk.environment.navigator.locks = createLocks();
   const before = asked.length;
   const later = keptPartsOf(file, { environment: disk.environment, tab: 'tab', confirm });
+  later.measuredBy(NEVER_QUIET);
   const again = createByteReader(withKeptParts(httpByteSource(file), later));
   await again.read(0, 1000);
   assert.deepEqual(asked.slice(before), [], 'the confirmed bytes are kept');
@@ -206,6 +220,7 @@ test('a file whose reads name no version (Google Drive\'s public reads) is used 
   // Replaced on Drive by a file of the same size: its checksum moved.
   holds = false;
   const watched = keptPartsOf(file, { environment: disk.environment, tab: 'tab', confirm, onChanged: () => changed++ });
+  watched.measuredBy(NEVER_QUIET);
   await createByteReader(withKeptParts(httpByteSource(file), watched)).read(2000, 1000);
   await watched.flush();
   assert.equal(changed, 1, 'a version that no longer holds is a changed file');

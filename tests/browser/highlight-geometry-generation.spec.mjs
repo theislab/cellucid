@@ -5,10 +5,11 @@ import { dismissWelcome } from './helpers/welcome.mjs';
 
 /**
  * What each engine calls a request the page cancelled: Chromium
- * `net::ERR_ABORTED`, WebKit `cancelled` (hosted macOS WebKit reported five
- * of the reader's module requests so).
+ * `net::ERR_ABORTED`, WebKit `cancelled` on macOS (hosted macOS WebKit reported
+ * five of the reader's module requests so) and `Load request cancelled` on Linux
+ * (`app/utils/sha256.js`, nightly run 41382954122).
  */
-const CANCELLED_BY_THE_PAGE = new Set(['net::ERR_ABORTED', 'cancelled']);
+const CANCELLED_BY_THE_PAGE = new Set(['net::ERR_ABORTED', 'cancelled', 'Load request cancelled']);
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=highlight-geometry-generation-ci`;
@@ -179,14 +180,12 @@ test('highlight upload follows exact same-reference geometry generations', async
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
     };
+    // Frame by frame until the uploads are made, however slow a frame is
+    // (120 frames were two seconds).
     const waitForUploadCount = async expectedCount => {
-      for (let frame = 0; frame < 120; frame++) {
-        if (audit.snapshot().length >= expectedCount) return;
+      while (audit.snapshot().length < expectedCount) {
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
-      throw new Error(
-        `Timed out waiting for ${expectedCount} exact highlight uploads.`,
-      );
     };
     const legacySparsePositionFingerprints = positions => {
       const len = positions.length;
@@ -440,14 +439,12 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
     };
+    // Frame by frame until the uploads are made, however slow a frame is
+    // (120 frames were two seconds).
     const waitForUploadCount = async expectedCount => {
-      for (let frame = 0; frame < 120; frame++) {
-        if (audit.snapshot().length >= expectedCount) return;
+      while (audit.snapshot().length < expectedCount) {
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
-      throw new Error(
-        `Timed out waiting for ${expectedCount} highlight upload attempts.`,
-      );
     };
 
     viewer.pause();

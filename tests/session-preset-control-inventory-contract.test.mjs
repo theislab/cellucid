@@ -1,12 +1,15 @@
 /**
- * The published sample presets (`anndata/<id>.cellucid-session`) record the *complete* UI
- * control inventory, so adding one identified input to the sidebar invalidates
- * every preset that was saved before it existed (CEL-0224). The loader refuses
- * the whole document with `Session UI state is missing current control
- * "<id>"`, and the visible result is that the advertised camera never applies
- * and no field is coloured. Removing a control is equally fatal in the other
- * direction: the preset then carries a key the interface no longer has, and the
- * loader refuses with `... does not exist in the current interface`.
+ * The published sample presets (`anndata/<id>.cellucid-session`, session
+ * format 4 starting views: one tracker of one root, `published-default.js`)
+ * record the *complete* settings control inventory in their root's `settings`
+ * value (`app/state/domains/settings.js`), so adding one identified input to
+ * the sidebar invalidates every preset that was saved before it existed
+ * (CEL-0224). The settings domain refuses the value with `Session UI state is
+ * missing current control "<id>"`, the starting view fails as a whole, and the
+ * visible result is that the advertised camera never applies and no field is
+ * coloured. Removing a control is equally fatal in the other direction: the
+ * preset then carries a key the interface no longer has, and the domain
+ * refuses with `... does not exist in the current interface`.
  *
  * Nothing guarded this. The advertised-default browser spec builds its session
  * bundle at runtime from the page it just loaded, so its bundle and its markup
@@ -17,21 +20,24 @@
  *
  * The current control inventory is derived from `index.html` by running the
  * application's own `collectUIControls()` against a parsed copy of that
- * markup. Nothing here restates which controls are serialized. The three
- * filters that define the inventory — `data-state-serializer-skip` ancestors,
- * `DOMAIN_OWNED_IDS`, and `SERIALIZABLE_INPUT_TYPES` — all live in
- * `assets/js/app/state-serializer/ui-controls.js` and are applied by that
- * module here exactly as they are in the browser. A fourth *filter* added there
- * is honoured by this file the day it lands, with no edit. That is the whole
- * point: a restated list would be the same defect one level up.
+ * markup, over the part of the inventory the `settings` domain holds
+ * (`createUiControlSerializer({sidebar, domains: ['settings']})`: the
+ * accordion sections and the theme are the `layout` domain's, which a
+ * starting view does not hold, and the centroid toggles the `views`
+ * domain's). Nothing here restates which controls are serialized. The filters
+ * that define the inventory — `data-state-serializer-skip` ancestors,
+ * `DOMAIN_OWNED_IDS`, `SERIALIZABLE_INPUT_TYPES` and the one map that splits it
+ * between domains (`controlDomainOf`) — all live in the control serializer
+ * (`createUiControlSerializer`) and are applied by that module here exactly as
+ * they are in the browser. A further *filter* added there is honoured by this
+ * file the day it lands, with no edit. That is the whole point: a restated
+ * list would be the same defect one level up.
  *
  * A new *selector* is the one thing that does need an edit here, and
  * deliberately so: the parsed-markup shim below throws on a query it does not
  * implement rather than returning an empty list, because an unimplemented
  * selector answered with `[]` would silently shrink the inventory and make
- * every stale preset look current. `[data-state-serializer-pressed-group]` and
- * `button[id]` were added to the shim when the highlight toolbelt joined the
- * inventory (CEL-0249).
+ * every stale preset look current.
  *
  * The comparison is the **inventory**: the set of keys and the control type
  * each key declares. Both are decided by the markup alone, and both are what
@@ -58,16 +64,22 @@
  * ## Recovering when this fails
  *
  * The presets are not regenerated from markup — they are real saves. When a
- * control is added or removed, each published preset has to be re-saved and
- * republished in `cellucid-datasets`:
+ * control is added or removed, each published preset has to be captured again
+ * and republished in `cellucid-datasets`:
  *
- *  1. open the app on the dataset, restore its current preset, and save state;
- *  2. run `node scripts/publish_session_preset.mjs --dataset <id> --from <save>`
- *     there: it trims the save to the published profile, rebinds it to the
- *     store's identity, writes `anndata/<id>.cellucid-session`, and repins that
- *     entry's `session.bytes` and `session.sha256` in `anndata/datasets.json`;
+ *  1. run `node scripts/capture_session_preset.mjs --dataset <id> --out <save>`
+ *     there: it opens the sample with its current starting view applied and
+ *     saves it with the viewer's own Save;
+ *  2. run `node scripts/publish_session_preset.mjs --dataset <id> --from <save>`:
+ *     it makes the save's head the starting view's one root
+ *     (`trimToPublishedDefault`), rebinds it to the store's identity, writes
+ *     `anndata/<id>.cellucid-session`, and repins that entry's
+ *     `session.bytes` and `session.sha256` in `anndata/datasets.json`;
  *  3. review and repin what that repository's own preset tests pin
  *     (`tests/session-presets-contract.test.mjs`).
+ *
+ * The presets are read from the `cellucid-datasets` checkout beside this
+ * repository, or from the one `CELLUCID_DATASETS_ROOT` names.
  *
  * Every preset carries the same inventory, so a control change always
  * invalidates all of them, never one.
@@ -76,17 +88,30 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
 import test from 'node:test';
-import { gunzipSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
 
-import { SESSION_BUNDLE_MAGIC_BYTES } from '../assets/js/app/session/bundle/format.js';
-
+import { openHistoryFile } from '../assets/js/app/session/history-file.js';
+import {
+  assertPublishedDefaultProfile,
+  assertPublishedDefaultRoot,
+} from '../assets/js/app/session/published-default.js';
 import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
 import { createDomId } from '../assets/js/app/ui/components/dom-id.js';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
-const PRESET_REPOSITORY_URL = new URL('../../cellucid-datasets/', import.meta.url);
+/**
+ * The `cellucid-datasets` checkout the presets are read from: the one
+ * `CELLUCID_DATASETS_ROOT` names, else the one beside this repository.
+ */
+const NAMED_PRESET_REPOSITORY = process.env.CELLUCID_DATASETS_ROOT ?? null;
+const PRESET_REPOSITORY_URL = NAMED_PRESET_REPOSITORY === null
+  ? new URL('../../cellucid-datasets/', import.meta.url)
+  : pathToFileURL(`${path.resolve(NAMED_PRESET_REPOSITORY)}${path.sep}`);
 const PRESET_CATALOG_URL = new URL('anndata/datasets.json', PRESET_REPOSITORY_URL);
+/** The part of the control inventory a starting view holds. */
+const PRESET_CONTROL_DOMAINS = Object.freeze(['settings']);
 
 const indexHtml = await readFile(INDEX_URL, 'utf8');
 
@@ -229,9 +254,6 @@ class ParsedElement {
         node => node.tagName === 'details'
           && node.classNames.includes('accordion-section'),
       );
-    }
-    if (selector === 'button[id]') {
-      return all.filter(node => node.tagName === 'button' && node.id.length > 0);
     }
     const attributeSelector = /^\[([a-z][a-z-]*)\]$/.exec(selector);
     if (attributeSelector !== null) {
@@ -380,8 +402,8 @@ function withParsedDocument(documentRoot, run) {
 }
 
 /**
- * The control inventory the given markup would produce, as the application
- * itself computes it.
+ * The settings control inventory the given markup would produce, as the
+ * application itself computes it.
  *
  * @param {string} html
  * @returns {{
@@ -401,7 +423,7 @@ function deriveInventory(html) {
   );
   const controls = withParsedDocument(
     documentRoot,
-    () => createUiControlSerializer({ sidebar }).collectUIControls(),
+    () => createUiControlSerializer({ sidebar, domains: PRESET_CONTROL_DOMAINS }).collectUIControls(),
   );
   return { documentRoot, sidebar, controls };
 }
@@ -410,8 +432,24 @@ const currentMarkup = deriveInventory(indexHtml);
 const currentInventory = currentMarkup.controls;
 const currentInventoryKeys = Object.keys(currentInventory).sort();
 
+test('every sidebar section\'s open state is the layout\'s, a section whose controls stay out included', () => {
+  // `data-state-serializer-skip` on a section keeps its controls out of the
+  // settings, never the section itself: opening the State, Camera path,
+  // Figure export, Community annotation or Benchmark section is a layout
+  // step like any other.
+  const sections = [...indexHtml.matchAll(/<details class="accordion-section"[^>]*\bid="([^"]+)"/g)].map(match => match[1]);
+  assert.ok(sections.includes('state-section') && sections.includes('cinematic-camera-section'), 'the markup names its sections');
+  const layout = withParsedDocument(
+    currentMarkup.documentRoot,
+    () => createUiControlSerializer({ sidebar: currentMarkup.sidebar, domains: ['layout'] }).collectUIControls(),
+  );
+  const accordions = Object.keys(layout).filter(key => key.startsWith('accordion:')).map(key => key.slice('accordion:'.length));
+  assert.deepEqual(accordions.sort(), [...sections].sort());
+});
+
 /**
- * The refusal the loader raises for this candidate against this markup.
+ * The refusal the settings domain raises for this candidate against this
+ * markup (its restore validates the controls first, `restoreUIControls`).
  *
  * `validateCompleteControls()` compares the two key sets in full before it
  * inspects a single record, so a candidate whose keys disagree always fails on
@@ -422,7 +460,7 @@ function loaderRefusalFor(markup, candidateControls) {
   try {
     withParsedDocument(
       markup.documentRoot,
-      () => createUiControlSerializer({ sidebar: markup.sidebar })
+      () => createUiControlSerializer({ sidebar: markup.sidebar, domains: PRESET_CONTROL_DOMAINS })
         .validateUIControls(candidateControls),
     );
   } catch (error) {
@@ -432,51 +470,43 @@ function loaderRefusalFor(markup, candidateControls) {
 }
 
 /* ------------------------------------------------------------------ *
- * Reading the published presets out of the sibling repository.
+ * Reading the published presets out of the cellucid-datasets repository.
  * ------------------------------------------------------------------ */
 
-function decodeCoreStateControls(bytes, label) {
-  const magicLength = SESSION_BUNDLE_MAGIC_BYTES.byteLength;
-  assert.deepEqual(
-    [...bytes.subarray(0, magicLength)],
-    [...SESSION_BUNDLE_MAGIC_BYTES],
-    `${label} must open with the current session format signature`,
-  );
-  let offset = magicLength;
-  const manifestLength = bytes.readUInt32LE(offset);
-  offset += 4;
-  const manifest = JSON.parse(
-    bytes.subarray(offset, offset + manifestLength).toString('utf8'),
-  );
-  offset += manifestLength;
-
-  const payloads = [];
-  while (offset < bytes.length) {
-    const chunkLength = bytes.readUInt32LE(offset);
-    offset += 4;
-    payloads.push(bytes.subarray(offset, offset + chunkLength));
-    offset += chunkLength;
+/**
+ * The settings controls a published starting view puts back: its root's
+ * `settings` value, read as the application reads a starting view (the
+ * format-4 reader, the starting-view profile and its one root).
+ */
+async function readPresetControls(bytes, label) {
+  const file = await openHistoryFile(new Blob([bytes]), { signal: null, onProgress: null });
+  let eager;
+  try {
+    assertPublishedDefaultProfile(file.manifest);
+    eager = await file.readEager();
+    await file.readRest();
+  } catch (error) {
+    await file.cancel(error);
+    throw new Error(`${label} is not a starting view this version of Cellucid reads: ${error.message}`, { cause: error });
   }
-
-  const index = manifest.chunks.findIndex(chunk => chunk.id === 'core/state');
+  const [root] = eager.history.trackers[0].steps;
+  assertPublishedDefaultRoot(root);
   assert.ok(
-    index >= 0,
-    `${label} must carry a core/state chunk: it is the chunk that holds the `
-      + 'recorded control inventory',
+    Object.hasOwn(root.after, 'settings'),
+    `${label} must hold a settings value: it is the value that records the control inventory`,
   );
-  const chunk = manifest.chunks[index];
-  assert.equal(chunk.codec, 'gzip', `${label} core/state must be gzip`);
-  const coreState = JSON.parse(gunzipSync(payloads[index]).toString('utf8'));
+  const settings = eager.values.get(root.after.settings);
   assert.ok(
-    coreState.uiControls !== null && typeof coreState.uiControls === 'object',
-    `${label} core/state must carry a uiControls record`,
+    settings?.controls !== null && typeof settings?.controls === 'object',
+    `${label} settings must carry a controls record`,
   );
-  return coreState.uiControls;
+  return settings.controls;
 }
 
 /**
- * The presets the catalog advertises, or `null` when the sibling repository is
- * not checked out.
+ * The presets the catalog advertises, or `null` when the `cellucid-datasets`
+ * repository is not checked out beside this one (and none is named by
+ * `CELLUCID_DATASETS_ROOT`).
  *
  * Read the way the viewer reads them: through `anndata/datasets.json`, each
  * `session` at its catalog path, held to the declared byte length and SHA-256.
@@ -488,9 +518,17 @@ async function readPublishedPresets() {
   try {
     repositoryRoot = await stat(PRESET_REPOSITORY_URL);
   } catch {
+    repositoryRoot = null;
+  }
+  if (repositoryRoot === null || !repositoryRoot.isDirectory()) {
+    // A repository named on purpose that is not there is a mistake, not a skip.
+    assert.equal(
+      NAMED_PRESET_REPOSITORY,
+      null,
+      `CELLUCID_DATASETS_ROOT names ${NAMED_PRESET_REPOSITORY}, which is not a cellucid-datasets checkout`,
+    );
     return null;
   }
-  if (!repositoryRoot.isDirectory()) return null;
 
   const catalog = JSON.parse(await readFile(PRESET_CATALOG_URL, 'utf8'));
   assert.equal(catalog.schema, 2, 'the sample catalog must be schema 2');
@@ -508,7 +546,7 @@ async function readPublishedPresets() {
     presets.push({
       datasetId: entry.id,
       label,
-      controls: decodeCoreStateControls(bytes, label),
+      controls: await readPresetControls(bytes, label),
     });
   }
   return presets.sort((left, right) =>
@@ -620,27 +658,6 @@ test('the parsed markup accounts for every control element in the file', () => {
     );
   }
 
-  // Pressed-button groups are found by attribute rather than by tag, so the
-  // walk is cross-checked the same way: an independent scan for the marker.
-  const walkedGroups = currentMarkup.documentRoot
-    .querySelectorAll('[data-state-serializer-pressed-group]')
-    .map(element => element.id)
-    .sort();
-  const scannedGroups = scanTags('div')
-    .filter(tag => /\bdata-state-serializer-pressed-group\b/.test(tag))
-    .map(identifierOf)
-    .sort();
-  assert.deepEqual(
-    walkedGroups,
-    scannedGroups,
-    'the parsed pressed-button groups must be exactly the ones an independent '
-      + 'scan of index.html finds',
-  );
-  assert.ok(
-    walkedGroups.every(id => id.length > 0),
-    'every pressed-button group needs a stable id, which is its session key',
-  );
-
   assert.ok(
     currentInventoryKeys.length > 0,
     'the derived inventory must not be empty, or every comparison below is '
@@ -648,53 +665,21 @@ test('the parsed markup accounts for every control element in the file', () => {
   );
 });
 
-test('a pressed-button group added to the markup fails the guard and is named', () => {
-  // The toolbelt derivation has to participate in the guard, or a second
-  // toolbelt could be added and every preset would silently go stale again.
+test('a group of pressed buttons is never a control: the selection tool is an input mode, not state', () => {
+  // A toolbelt (one pressed button of several) decides what the next gesture
+  // does, as a held key does: page chrome, no setting and no step (History
+  // v2 §3.3.8). The real one, and one added beside it, stay out.
   const probeGroupId = `${PROBE_ID}-group`;
+  assert.equal(Object.hasOwn(currentInventory, 'highlight-mode'), false);
   const added = deriveInventory(insertAfterTagOf(
     indexHtml,
     anchorInput.id,
-    `<div id="${probeGroupId}" data-state-serializer-pressed-group>`
+    `<div id="${probeGroupId}" role="group">`
       + `<button id="${probeGroupId}-on" aria-pressed="true">On</button>`
       + `<button id="${probeGroupId}-off" aria-pressed="false">Off</button>`
       + '</div>',
   ));
-
-  assert.deepEqual(
-    added.controls[probeGroupId],
-    { type: 'pressed-group', pressedId: `${probeGroupId}-on` },
-    'a marked group must enter the inventory as one control, or this edit '
-      + 'proves nothing',
-  );
-  assert.deepEqual(
-    Object.keys(added.controls).filter(
-      key => !Object.hasOwn(currentInventory, key),
-    ),
-    [probeGroupId],
-    'exactly the added group must be new',
-  );
-  assert.equal(
-    loaderRefusalFor(added, currentInventory),
-    `Session UI state is missing current control "${probeGroupId}".`,
-    'the loader must name the toolbelt a preset saved before it existed lacks',
-  );
-
-  // The identical markup without the marker is not a control. That is what
-  // proves the inclusion above is the marker and not the buttons.
-  const unmarked = deriveInventory(insertAfterTagOf(
-    indexHtml,
-    anchorInput.id,
-    `<div id="${probeGroupId}">`
-      + `<button id="${probeGroupId}-on" aria-pressed="true">On</button>`
-      + '</div>',
-  ));
-  assert.deepEqual(
-    Object.keys(unmarked.controls).sort(),
-    currentInventoryKeys,
-    'an unmarked button group is not serialized, so the field-action toolbars '
-      + 'and every other button in the sidebar stay out of the inventory',
-  );
+  assert.deepEqual(Object.keys(added.controls).sort(), currentInventoryKeys);
 });
 
 test('every published preset records the current control inventory', async (t) => {
@@ -774,7 +759,8 @@ test('every published preset records each preference the loader accepts', async 
     );
     return;
   }
-  // Accordion records are keyed `accordion:<id>`; none holds a preference.
+  // Every key of the settings inventory is a control's id (accordion
+  // sections, keyed `accordion:<id>`, are the layout's).
   const preferenceElements = currentInventoryKeys
     .map(id => findById(currentMarkup.documentRoot, id))
     .filter(element => element?.dataset.sessionPreference !== undefined);

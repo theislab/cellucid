@@ -9,6 +9,7 @@ import {
   ENCODED_SAMPLE_CATALOG_URL,
 } from './helpers/origins.mjs';
 import { sceneQuietness } from './helpers/frame-scheduling.mjs';
+import { expectWelcomeShown } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
   `${APP_ORIGIN}/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=reduced-motion-camera-path-ci`;
@@ -68,7 +69,7 @@ async function waitForViewerPaint(page) {
  */
 async function preparePath(page) {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('#welcome-modal')).toBeVisible();
+  await expectWelcomeShown(page);
   await page.keyboard.press('Escape');
   await expect(page.locator('#welcome-modal')).toBeHidden();
   await expect(page.locator('#dataset-name')).toHaveText(
@@ -181,7 +182,7 @@ async function playAndMeasure(page, reducedMotion) {
   }
 
   await expect
-    .poll(() => playButton.getAttribute('title'), { timeout: 30_000 })
+    .poll(() => playButton.getAttribute('title'))
     .toBe('Play');
   // Both paths publish the exact endpoint synchronously before the stop that
   // flips the title. Let the viewer consume it on real frames, so any residual

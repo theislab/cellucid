@@ -20,10 +20,15 @@
  *   in memory, found again by its identity, and removed once a store made
  *   from it is kept;
  * - the revision is raised whenever the transcoders change
- *   (`KEPT_STORE_REVISION`, pinned below with a digest of their sources).
+ *   (`KEPT_STORE_REVISION`, pinned below with a digest of their sources),
+ *   and whenever what they write changes (pinned with the digests of four
+ *   corpus stores they write, through the writers they share with the copy
+ *   of a dataset: `data/anndata/write/element-writer.js`,
+ *   `formats/zarr/writer.js`).
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -35,6 +40,7 @@ import {
   TRANSCODED_DIRECTORY,
   identityDigest,
   findKeptDownload,
+  findKeptStores,
   holdTranscodedStore,
   keepDownload,
   keptAbout,
@@ -225,6 +231,48 @@ async function keptStore(disk, identity, bytes) {
 }
 
 const identityOf = name => Object.freeze({ kind: 'file', name, size: 1, lastModified: 1 });
+
+test('a kept directory\'s last-used time is written while no read of its files runs: under the lock the Stored listing reads them under', async t => {
+  // WebKit refuses a page's read of a file a worker rewrites meanwhile, and
+  // logs it as a failed load: the listing read the last-used time of a
+  // dataset a later visit's reader was opening (`space.js` `filesOf`).
+  const disk = opfsOnDisk();
+  t.after(disk.cleanup);
+  const requested = [];
+  const record = () => {
+    const base = disk.environment.navigator.locks;
+    disk.environment.navigator.locks = {
+      ...base,
+      request: (name, options, callback) => {
+        requested.push({ name, mode: options.mode });
+        return base.request(name, options, callback);
+      },
+      query: () => base.query(),
+    };
+  };
+  const rewrites = directory => requested.filter(item => item.name === `${TRANSCODED_DIRECTORY}/${directory}#files` && item.mode === 'exclusive').length;
+  const usedAt = directory => Number(readFileSync(path.join(parentOf(disk.root), directory, 'used'), 'utf8'));
+  // Kept: its first time is written under the lock.
+  record();
+  const directory = await keptStore(disk, identityOf('a.rds'), 1000);
+  assert.equal(rewrites(directory), 1, 'written under the files lock when the store is kept');
+  const first = usedAt(directory);
+  assert.ok(first > 0);
+  // A later visit opening it: found, and its time written again under the same lock.
+  newVisit(disk);
+  requested.length = 0;
+  record();
+  const found = await findKeptStores(identityOf('a.rds'), disk.environment);
+  assert.deepEqual(found.map(store => store.directory), [directory], 'the later visit finds the kept store');
+  assert.equal(rewrites(directory), 1, 'written under the files lock when a later visit opens it');
+  assert.ok(usedAt(directory) >= first);
+  // The listing reads it under the same lock, shared.
+  requested.length = 0;
+  const [item] = await listKeptStores(disk.environment);
+  assert.ok(item.used >= first);
+  assert.ok(requested.some(entry => entry.name === `${TRANSCODED_DIRECTORY}/${directory}#files` && entry.mode === 'shared'));
+  for (const store of found) store.release();
+});
 
 test('a kept store that is not what its manifest says is removed and the file is read again', async t => {
   const disk = opfsOnDisk();
@@ -587,6 +635,19 @@ const REVISIONS = [
   { revision: 3, digest: '89692a8819268704acdc6e5ef0b0392f73838461fd12b40e9e66e259168d7911' },
   { revision: 4, digest: '54d7583008248184c8ab983f92beb2c5efe2708e399506727b0f4d9fe0c84b8a' },
   { revision: 5, digest: '19907022c3eedef29080d83435d35106e7c5b8ea3d95a3149cfe2e14d37b59c3' },
+  { revision: 6, digest: '712d0a9f9ccc4eeec73d78b41dbfb59e20fecbae96d65d44a5bc03c1502e8b85' },
+  { revision: 7, digest: 'c2766488713bce8e541aaeedef7ea5a84dac2a9874f1e69eff78b324887ae379' },
+  // The input-format registry names Cellucid's own files (`CELLUCID_FILES`); nothing a transcoder writes changed.
+  { revision: 8, digest: '19bb651ee18b4c2bcfc791a666b57aebc1987599fb13b1e7a42d02d9beed5fde' },
+  // The State panel's place names (`ui/place-names.js`, which the registry's messages name); nothing a transcoder writes changed.
+  { revision: 9, digest: 'b95b17638cadd871f4b7ed90262f2222821fa93630486cce13921cb905f1bfd7' },
+  // The registry's session-file sentence names Load… › Open a session file…; nothing a transcoder writes changed.
+  { revision: 10, digest: 'f4f5a3cd44efca77b406e6ce972083194212000b9d07bd5cd32ecc9baadfc853' },
+  // A 403 that names Retry-After is a rate limit (`byte-source.js` `isLimitAnswer`: GitHub's secondary limits); nothing a transcoder writes changed.
+  { revision: 11, digest: '7fd1caf0692685a564cafa2c9bd9b2a3e8f934b761a6b4a150fd8ac50a0fe347' },
+  { revision: 12, digest: '41a3728f589d43152158fd09b89f7a18a925a4bcb81455043f2197b5edfed8fa' },
+  // The rates a plan weighs are read through `utils/machine.js` (the link the reader plans on, the decoding rate, the cores); nothing a transcoder writes changed.
+  { revision: 13, digest: 'a1dc761510f5d62359b15d945f846249d1aa9be2d9e2370a1dd53cb3daebc89c' },
 ];
 
 test('the kept-store revision is raised whenever the transcoders change', () => {
@@ -613,5 +674,160 @@ test('the kept-store revision is raised whenever the transcoders change', () => 
   for (const [, revision, recorded] of committed?.matchAll(/\{ revision: (\d+), digest: '([0-9a-f]{64})' \}/g) ?? []) {
     const row = REVISIONS.find(item => item.revision === Number(revision));
     assert.equal(row?.digest, recorded, `revision ${revision}'s committed digest is kept as it was: a change takes the next revision`);
+  }
+});
+
+/**
+ * What the transcoders write, pinned to the revision that keeps it: the
+ * stores of a Seurat `.rds`, a SingleCellExperiment `.rds`, a Seurat `.rda`
+ * and a Cell Ranger 3 MatrixMarket folder of the R and MatrixMarket corpus
+ * (`fixtures/rds/corpus.zip`), transcoded in memory, each key and its bytes
+ * in key order. The guard above follows the transcoders' source; this one
+ * their output, written through code they share with other writers (the
+ * element layer `data/anndata/write/element-writer.js` and the Zarr writer
+ * `formats/zarr/writer.js`, which the copy of a dataset writes with too): a
+ * change there that changes a byte of a kept store fails here until
+ * `KEPT_STORE_REVISION` is raised and a row added. A row is never edited; a
+ * revision raised for its source alone takes a row of the same digests.
+ */
+const OUTPUT_REVISIONS = [
+  {
+    revision: 6,
+    digests: {
+      'rds/seurat5_gzip.rds': '60fe503b67c82555a80737c25155567673315c552645b8e1eb484939a7c914a5',
+      'rds/sce.rds': '1c36136e4e6d23728e97705156bc52658bf3d0bf75527eab630be6561a0e3715',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'ca8ec3b60aa69bf6411bed075fa17a2a80ae63b0a8577c34c3f0173f05aaf667',
+      'mtx/cellranger3': '6cc777b233fe0ba2d8581eeb065da82fc5451861f60d44efbe547f879cf808dc',
+    },
+  },
+  {
+    // Integer uns scalars <i8, a MuData's obsmap a dict (as mudata writes it).
+    revision: 7,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },  {
+    // Raised for the registry's source alone (`CELLUCID_FILES`): the same stores.
+    revision: 8,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for the place names the registry's messages name alone: the same stores.
+    revision: 9,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for the registry's session-file sentence alone: the same stores.
+    revision: 10,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for GitHub's 403-with-Retry-After counted as a rate limit alone: the same stores.
+    revision: 11,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for a store's validators answered by the bytes read: the same stores.
+    revision: 12,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for the rates a plan weighs read through `utils/machine.js`: the same stores.
+    revision: 13,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+];
+
+/** A transcoded store's every key and its bytes, in key order, as one SHA-256. */
+async function storeDigest(store) {
+  const hash = createHash('sha256');
+  for (const key of store.list().sort()) {
+    const bytes = await store.get(key);
+    hash.update(`${key}\0${bytes.length}\0`);
+    hash.update(bytes);
+  }
+  return hash.digest('hex');
+}
+
+test('the kept-store revision is raised whenever what the transcoders write changes', async () => {
+  const corpus = archive;
+  const bytesOf = async entry => (await corpus.entry(entry).read()).slice();
+  const byteReaderOf = file => createByteReader(blobByteSource(file));
+  const digests = {};
+  for (const name of Object.keys(OUTPUT_REVISIONS.at(-1).digests)) {
+    let transcoded;
+    if (name.startsWith('mtx/')) {
+      const prefix = `${name}/`;
+      const folder = name.slice('mtx/'.length);
+      const files = new Map();
+      for (const entry of corpus.entries) {
+        if (entry.path.startsWith(prefix) && !entry.path.endsWith('/')) {
+          files.set(`${folder}/${entry.path.slice(prefix.length)}`, new File([await bytesOf(entry.path)], entry.path.split('/').at(-1)));
+        }
+      }
+      transcoded = await TRANSCODERS.mtx.transcode({ files, rootName: folder }, { byteReaderOf, memory: true });
+    } else {
+      const file = new File([await bytesOf(name)], name.split('/').at(-1), { lastModified: 1 });
+      transcoded = await TRANSCODERS[name.endsWith('.rda') ? 'rda' : 'rds'].transcode({ file }, { byteReaderOf, memory: true });
+    }
+    // A matrix read after its map: every row of it, as a kept store holds it once whole.
+    const store = transcoded.matrixStream ? (await transcoded.matrixStream.ensure(transcoded.matrixStream.nObs)).store : transcoded.store;
+    digests[name] = await storeDigest(store);
+  }
+  OUTPUT_REVISIONS.forEach((row, index) => {
+    if (index > 0) assert.ok(row.revision > OUTPUT_REVISIONS[index - 1].revision, 'rows by revision, in order');
+  });
+  const last = OUTPUT_REVISIONS.at(-1);
+  assert.deepEqual({ revision: KEPT_STORE_REVISION, digests }, last,
+    'What the transcoders write changed (or the revision did): raise KEPT_STORE_REVISION in ' +
+    'assets/js/data/anndata/transcode/space.js (stores kept by the earlier revision are then removed, not read), ' +
+    'and add a row with the new revision and these digests to OUTPUT_REVISIONS.');
+  // A row is never edited: against the committed test, a new output comes with a new revision.
+  let committed = null;
+  try {
+    committed = execFileSync('git', ['show', 'HEAD:tests/transcode-cache-contract.test.mjs'], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    committed = null;
+  }
+  const table = committed?.match(/const OUTPUT_REVISIONS = \[([\s\S]*?)\n\];/)?.[1] ?? '';
+  for (const [, revision, body] of table.matchAll(/revision: (\d+),\s*digests: \{([^}]*)\}/g)) {
+    const recorded = Object.fromEntries([...body.matchAll(/'([^']+)': '([0-9a-f]{64})'/g)].map(([, key, digest]) => [key, digest]));
+    assert.deepEqual(OUTPUT_REVISIONS.find(item => item.revision === Number(revision))?.digests, recorded,
+      `revision ${revision}'s committed output digests are kept as they were: a change takes the next revision`);
   }
 });

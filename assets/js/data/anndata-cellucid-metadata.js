@@ -15,11 +15,15 @@
  * | `source` | `{name, url}`: where the data comes from (`url` optional) |
  * | `defaults` | the launch defaults the dataset opens with (`requireAnnDataLaunchDefaults`) |
  * | `outlierQuantiles` | `{latentKey, minPoints, fields}`: every categorical obs field's outlier quantiles in that latent space, one float32 array per field (`data/latent-outliers.js`) |
- * | `session` | the record of a session applied to the file in Python; never read |
+ * | `history_applied` | the record of each saved history the Python or R package applied to the data (`apply_cellucid_session_to_anndata`, `cellucid_apply_session()`): JSON text; never read |
+ * | `gene_sets` | the gene sets a package pulled from the viewer or wrote from an applied history, by name; never read |
+ * | `pulled` | what each column a package's pull wrote came from, by column; never read |
  * | `priority` | `{seed, specVersion, nObs, levels}`: the file stores its cells in priority order (`anndata/priority-layout.js`): the subsampling specification's `uniform` rank under `seed`, `specVersion` that specification's version, `nObs` the cell count it was written with, `levels` the ascending prefix sizes `varm['cellucid_prefix_counts']` counts at |
  *
  * Every key is optional, and a file without `uns['cellucid']` opens exactly as
- * any AnnData file does. A key that is present must be exactly right, and a key
+ * any AnnData file does. The packages keep their own records under the last
+ * three keys on the AnnData a person works with, so that object opens again in
+ * the viewer as it is (`show_anndata(adata)` after a pull or an apply). A key that is present must be exactly right, and a key
  * not in the table refuses the file, so a misspelt default never passes
  * unnoticed -- except `priority`, which is never checked here: the reader
  * verifies it against the file's cells, and a record that does not describe
@@ -39,7 +43,11 @@ import { isObjectRecord, requireObjectKeys } from '../utils/exact-record.js';
 /** The one schema this viewer reads. */
 export const CELLUCID_UNS_SCHEMA = 1;
 
-const KEYS = Object.freeze(['schema', 'id', 'name', 'description', 'citation', 'source', 'defaults', 'outlierQuantiles', 'session', 'priority']);
+/** The keys `uns['cellucid']` may hold (a copy's changes are checked against them, `anndata/write/copy.js`). */
+export const CELLUCID_UNS_KEYS = Object.freeze([
+  'schema', 'id', 'name', 'description', 'citation', 'source', 'defaults', 'outlierQuantiles', 'priority',
+  'history_applied', 'gene_sets', 'pulled',
+]);
 const OUTLIER_KEYS = Object.freeze(['latentKey', 'minPoints', 'fields']);
 const CITATION_KEYS = Object.freeze(['text', 'url']);
 const SOURCE_KEYS = Object.freeze(['name', 'url']);
@@ -208,7 +216,7 @@ function storedOutlierQuantilesOf(value, sourceType) {
 export function requireCellucidFileMetadata(value, sourceType) {
   const empty = { id: null, name: null, description: null, citation: null, source: null, defaults: {}, outlierQuantiles: null };
   if (value === null) return Object.freeze(empty);
-  requireMetadataKeys(value, KEYS, "uns['cellucid']", sourceType);
+  requireMetadataKeys(value, CELLUCID_UNS_KEYS, "uns['cellucid']", sourceType);
   if (Object.hasOwn(value, 'schema')) {
     const schema = single(value.schema);
     if (schema !== CELLUCID_UNS_SCHEMA) {

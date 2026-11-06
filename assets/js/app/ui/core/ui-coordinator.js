@@ -33,6 +33,9 @@ import { initDatasetControls } from '../modules/dataset-controls.js';
 import { initDatasetCard } from '../modules/dataset-card.js';
 import { initKeptStoresLine } from '../modules/kept-stores-line.js';
 import { initKeptStoresDialog } from '../modules/kept-stores-dialog.js';
+import { initMyDatasets } from '../modules/my-datasets/index.js';
+import { installDatasetOpenActions } from '../modules/dataset-open-action.js';
+import { initAgentConnect } from '../../agent/connect/index.js';
 import { geneCostFacts, initSubsampleControl } from '../modules/subsample-control.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { initSessionControls } from '../modules/session-controls.js';
@@ -45,6 +48,10 @@ import { initCommunityAnnotationControls } from '../modules/community-annotation
 import { initVisualizationReset } from '../modules/visualization-reset.js';
 import { initFigureExport } from '../modules/figure-export/index.js';
 import { initCinematicCamera } from '../modules/cinematic-camera/index.js';
+import { initStateSection } from '../modules/state/index.js';
+import { initAgents } from '../../agent/index.js';
+import { createBranchComparison } from '../modules/state/compare.js';
+import { datasetFactsOf } from '../modules/state/dataset-facts.js';
 import { initInfoPopovers } from '../components/info-popovers.js';
 import { bindDisclosure } from '../components/controls.js';
 import {
@@ -53,6 +60,9 @@ import {
   retireSnapshotView,
 } from '../../view-snapshot-publication.js';
 import { debug } from '../../../utils/debug.js';
+import { installFieldActions } from '../../state/actions/field-actions.js';
+import { getActions } from '../../actions/index.js';
+import { openCellsKey } from '../../state/domains/cells.js';
 
 /**
  * Build one terminal cleanup owner whose Promise identity is stable even when
@@ -226,6 +236,10 @@ function publishDataSourceReadiness(documentOwner) {
  *   dataset change begins its transaction with
  *   (`createLatestDatasetReloadCoordinator`).
  * @param {object|null} [options.sessionSerializer]
+ * @param {object|null} [options.datasetHistories] The history of the dataset
+ *   shown and the saved states (`app/history/dataset-history.js`)
+ * @param {{capture: Function, restore: Function}|null} [options.viewCarry] What a
+ *   re-read of the open cells keeps (`app/session/view-carry.js`)
  * @param {any|null} [options.viewerHostSource]
  */
 export function initUI({
@@ -238,6 +252,8 @@ export function initUI({
   resizeOpenCells,
   datasetChanges,
   sessionSerializer = null,
+  datasetHistories = null,
+  viewCarry = null,
   viewerHostSource = null
 }) {
   debug.log('[UI] initUI');
@@ -322,11 +338,13 @@ export function initUI({
     state,
     dom: dom.communityAnnotation,
     dataSourceManager,
-    infoPopovers
+    infoPopovers,
+    actions: getActions(),
   });
 
   const representationControls = initRepresentationControls({
     state,
+    viewer,
     dom: dom.representation,
     callbacks: {
       viewLabel: viewId => viewControls?.describeViewPosition?.(viewId) ?? null,
@@ -442,6 +460,8 @@ export function initUI({
     legend.render?.(info.field);
     legend.handleOutlierUI?.(info.field);
     communityAnnotationControls.render?.();
+    // The field actions' Export follows the field the selectors now show.
+    cellExports.refresh();
   }
 
   /**
@@ -467,6 +487,15 @@ export function initUI({
     renderControls.markSmokeDirty?.();
   }
 
+  // Before the field selector: its first activation refreshes the exports' buttons.
+  const cellExports = initCellExportsUi({
+    state,
+    dom: dom.cellExports,
+    getAnnDataSource: activeAnnDataSource,
+    notifications: getNotificationCenter(),
+    // The buttons' exports as actions (`cells.export`, `field.export`).
+    actions: getActions(),
+  });
   const fieldSelector = initFieldSelector({
     state,
     dom: dom.fieldSelector,
@@ -476,12 +505,6 @@ export function initUI({
       // A gene search that finds nothing offers the gene names column (Data mapping).
       onChooseGeneNames: () => dataMappingControls?.reveal({ openSidebar: true, focusGroup: 'geneNames' })
     }
-  });
-  const cellExports = initCellExportsUi({
-    state,
-    dom: dom.cellExports,
-    getAnnDataSource: activeAnnDataSource,
-    notifications: getNotificationCenter()
   });
   if (sessionSerializer !== null) {
     if (
@@ -551,6 +574,18 @@ export function initUI({
     syncNavigationUiForView(state.getActiveViewId());
   }
 
+  // Agents (app/agent/): the presence every agent acting here goes through
+  // (the confirm card, the activity line), the chat bar, and whether a saved
+  // session carries the conversations.
+  const agents = initAgents({
+    dom: dom.agent,
+    viewer,
+    actions: getActions(),
+    // The chat attaches the highlighted cells as a reference (agent/chat/selection.js).
+    state,
+    notify: sentence => getNotificationCenter().info(sentence, { category: 'session' }),
+  });
+
   const sessionControls = initSessionControls({
     dom: dom.session,
     sessionSerializer,
@@ -566,6 +601,10 @@ export function initUI({
     currentCellIdentity: () => (dataSourceManager?.getCurrentDatasetId?.() == null ? null : state.cellIdentity),
     reopenDataset: cellSubset => datasetControls.reopenOpenDataset(cellSubset),
     restoreGeneSample: genes => restoreSessionGeneSample(genes),
+    // Saved states (the autosave, named saves) open like a session file: their dataset first.
+    savedStates: datasetHistories === null
+      ? null
+      : { read: id => datasetHistories.savedStates.read(id), load: source => datasetHistories.loadSaved(source) },
     onAfterLoad: refreshUiAfterStateLoad
   });
 
@@ -664,9 +703,30 @@ export function initUI({
       };
     }
   });
+  // My datasets (Open data): the datasets opened in this browser, each opened
+  // again in one click; its openers are the dataset and session controls'.
+  const myDatasets = dataSourceManager === null || dom.myDatasets.menu.root === null
+    ? null
+    : initMyDatasets(dom.myDatasets, {
+        currentId: () => dataSourceManager.getCurrentIdentityId(),
+        onDatasetChange: listener => {
+          dataSourceManager.onDatasetChange(listener);
+          return () => dataSourceManager.offDatasetChange(listener);
+        },
+        openDatasetSource: record => datasetControls.openDatasetSource(record),
+        reopenLocalFile: datasetId => datasetControls.reopenLocalFile(datasetId),
+        openSavedState: id => sessionControls.openSavedState(id),
+        // Forgetting a dataset by name (`my-datasets.forget`): the row's Forget.
+        actions: getActions(),
+      });
   // What is kept in this browser (Open data › Stored), and the dialog that lists and removes it.
   const keptStoresLine = initKeptStoresLine(dom.keptStores, { onManage: opener => void keptStoresDialog.open(opener) });
-  const keptStoresDialog = initKeptStoresDialog(dom.keptStoresDialog, { onRemoved: () => void keptStoresLine.refresh() });
+  const keptStoresDialog = initKeptStoresDialog(dom.keptStoresDialog, {
+    onRemoved: () => void keptStoresLine.refresh(),
+    onShowLibrary: myDatasets === null ? null : opener => myDatasets.openAll(opener),
+    // Its rows and their removal as actions (`stored.list`, `stored.remove`).
+    actions: getActions(),
+  });
   const datasetControls = initDatasetControls({
     dom: dom.dataset,
     datasetCard,
@@ -691,10 +751,22 @@ export function initUI({
     }
   });
   const { refreshDatasetUI: refreshDatasetControls } = datasetControls;
+  // Opening a dataset by name (`dataset.open`, `datasets.list`): the Open data controls' own paths.
+  const uninstallDatasetOpenActions = dataSourceManager === null
+    ? () => {}
+    : installDatasetOpenActions({ actions: getActions(), dataSourceManager, state, datasetControls });
+  // Agents › Claude and ChatGPT: this page's connection to the Cellucid relay, and its approvals.
+  const agentConnect = dom.agentConnect.section === null
+    ? null
+    : initAgentConnect(dom.agentConnect, {
+      actions: getActions(), dataSourceManager, notifications: getNotificationCenter(),
+      // Each connection's tool list says what the person's permission settings make of each kind.
+      permissionFor: question => agents.presence.permissionFor(question),
+    });
   const citeDialog = initCiteDialog({ ownerDocument: document });
   const shareDialog = dataSourceManager === null
     ? null
-    : initShareDialog({ ownerDocument: document, dataSourceManager });
+    : initShareDialog({ ownerDocument: document, dataSourceManager, actions: getActions() });
   // How much of a dataset is read, and how (Open data, Cells to open).
   const subsampleControl = initSubsampleControl({
     dom: dom.subsample,
@@ -711,20 +783,39 @@ export function initUI({
       return geneCostFacts(await loader.readPlan(gene));
     },
     // Cameras, fields, filters and analysis windows stay across a re-read.
-    viewCarry: sessionSerializer === null
+    viewCarry: viewCarry === null
       ? null
       : {
-          capture: () => sessionSerializer.captureViewCarry(),
+          capture: () => viewCarry.capture(),
           // The dataset read again lists its genes after its first view: a
           // view coloured by a gene is given back once they are listed.
           restore: async carry => {
             await state.whenGenesListed();
-            return sessionSerializer.restoreViewCarry(carry);
+            return viewCarry.restore(carry);
           },
         },
   });
   // Genes read for, below Cells to open: the one place the gene sample changes.
-  const geneReadControl = initGeneReadControl({ dom: dom.geneRead, state });
+  const geneReadControl = initGeneReadControl({
+    dom: dom.geneRead,
+    state,
+    openCellsKey: () => openCellsKey(activeAnnDataSource()?.getCellSubset?.() ?? null),
+  });
+  // What the `cells` state domain reads and puts back (`state/domains/cells.js`):
+  // the cells open, the genes asked for on them, a reading of the dataset
+  // again on other cells that keeps what was made, and genes read for more cells.
+  const openCells = Object.freeze({
+    subset: () => activeAnnDataSource()?.getCellSubset?.() ?? null,
+    geneSample: () => state.getGeneSample?.() ?? null,
+    genesAsked: () => geneReadControl.genesAsked(),
+    setGenesAsked: cells => geneReadControl.setGenesAsked(cells),
+    reopen: request => subsampleControl.reopenKeeping(request),
+    readGenes: cells => readGenesForMoreCellsSaid(state, cells, null, 'the cells of the step shown'),
+  });
+  // The field, label, colour, filter and mapping actions the state alone
+  // implements (`state/actions/field-actions.js`), refused while community
+  // annotation voting locks a field.
+  const uninstallFieldActions = installFieldActions({ state, fieldLock: fieldSelector.fieldLock });
   // Subsampling's header, collapsed: the cells open and the share genes are read for.
   function refreshSubsamplingSummary() {
     if (destroyed) return;
@@ -781,6 +872,32 @@ export function initUI({
     cameraDom: dom.camera,
     renderControls,
     cameraControls
+  });
+
+  // The State panel: the session file (above, sessionControls) and the
+  // history of the dataset shown (ui/modules/state/). Branches are compared
+  // in kept views through the owned publication below. The report draws no
+  // pictures until the figure export can return one without downloading.
+  const stateSection = initStateSection({
+    dom: dom.state,
+    dispatch: (type, params, meta) => getActions().dispatch(type, params, meta),
+    // The tour and the report as actions (`history.tour.start`, `history.tour.stop`, `history.report`).
+    provide: (type, handler) => getActions().provide(type, handler),
+    datasetFacts: datasetFactsOf({ state, dataSourceManager }),
+    compareBranches: createBranchComparison({ dispatch: (type, params) => getActions().dispatch(type, params) }),
+    camera: viewer,
+    // The report's pictures are the agent's: the figure export's drawing of the selected view.
+    pictures: async () => (await getActions().dispatch('view.picture', { width: 720, height: 540, legend: true })).outcome,
+    // A session file of any dataset replayed on the one shown: read and checked as a file, its steps by name.
+    replaySessionFile: sessionSerializer === null || datasetHistories === null ? null : {
+      pick: () => sessionSerializer.pickSessionFile(),
+      replay: (file, options) => datasetHistories.replay(() => sessionSerializer.openSessionFile(file, options), { ...options, choice: { file: file.name } }),
+    },
+    // A replay's names mapped (its report's "Replay again with these names"): from the same source, in a new tracker.
+    replayAgain: datasetHistories === null ? null : {
+      can: trackerId => datasetHistories.replaySource(trackerId) !== null,
+      replay: (trackerId, mapping, options) => datasetHistories.replayAgain(trackerId, mapping, options),
+    }
   });
 
   // State change wiring
@@ -984,6 +1101,8 @@ export function initUI({
       () => highlightControls.destroy(),
       () => cellExports.destroy(),
       () => sessionControls.destroy(),
+      () => stateSection.destroy(),
+      () => agents.destroy(),
       () => visualizationReset.destroy(),
       () => {
         if (viewerNeedsUiRetirement(viewer)) {
@@ -1019,6 +1138,10 @@ export function initUI({
       () => datasetCard.destroy(),
       () => keptStoresLine.destroy(),
       () => keptStoresDialog.destroy(),
+      () => myDatasets?.destroy(),
+      () => uninstallFieldActions(),
+      () => uninstallDatasetOpenActions(),
+      () => agentConnect?.destroy(),
       () => subsampleControl.destroy(),
       () => geneReadControl.destroy(),
       () => stopSubsamplingSummary(),
@@ -1052,7 +1175,6 @@ export function initUI({
     // A retired UI has no controls left to gate.
     if (destroyed) return;
     viewControls.setCellsPresent(present);
-    sessionControls.setCellsPresent(present);
     figureExportControls.setCellsPresent?.(present);
   }
 
@@ -1096,6 +1218,8 @@ export function initUI({
     publishCellPresence,
     refreshUiAfterStateLoad,
     showSessionStatus,
+    // A saved state from the lists or the Continue offer: its dataset, then its history.
+    openSavedState: sessionControls.openSavedState,
     refreshDatasetUI,
     refreshOpenCells,
     showLoadedConnectivityEdges: datasetControls.showLoadedConnectivityEdges,
@@ -1104,9 +1228,11 @@ export function initUI({
     settleFieldInteractions: fieldSelector.settleAllInteractions,
     cinematicCamera,
     figureExport: figureExportControls,
+    openCells,
     publishSnapshotView: publishOwnedSnapshot,
     retireSnapshotView: retireOwnedSnapshot,
     clearSnapshotViews: clearOwnedSnapshots,
+    agents,
     destroy,
   };
 }

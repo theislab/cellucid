@@ -6,9 +6,8 @@
  * reload, Load. The restore says "Session fully restored." -- a restored
  * result in a closed row is drawn when the row opens, the restore never
  * waits for that -- the colour controls are usable afterwards, and a gene
- * picked then is shown. The highlights saved in (and loaded from) the
- * session are never offered back as unsaved after a reload
- * (`app/highlight-draft.js`).
+ * picked then is shown. The loaded history is kept in this browser as it is
+ * (`app/history/autosave.js`), and a reload offers to continue it.
  *
  * Fixture: a synthetic CSR `.zarr.zip` served over one slow shared link, so
  * genes are read for a stated sample of the cells (`gene-sample.spec.mjs`).
@@ -20,6 +19,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { anndataZarrZip } from './helpers/anndata-zarr-zip.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -32,6 +32,15 @@ const GENES = 1500;
 const PER_CELL = 1200;
 const LATENCY_MS = 40;
 const BYTES_PER_MS = 400;
+
+// The link is this spec's subject, and it is measured (`helpers/device.mjs`
+// holds it for every other spec): the answers below are held back so the
+// reader measures a slow link, and what it then plans is asserted only as
+// far as any slow link gives it (genes for a sample of at least 2 cells and
+// fewer than all; a runner that answers later measures a slower link and
+// reads them for fewer, never for none or for all). The decoding rate, the
+// order time and the opening cost stay held.
+test.use({ device: { link: 'measured' } });
 const RESTORED = 'Session fully restored.';
 const MODES = ['differential', 'genesPanel', 'signature', 'dotplot'];
 
@@ -132,7 +141,7 @@ async function applyShare(page, percent, cells) {
   await page.locator('#subsample-apply').click();
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(cells);
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.startupPhase), { timeout: 120_000 }).toBe('ready');
-  await expect(page.locator('#dataset-read')).not.toHaveText(/^Reading…/, { timeout: 30_000 });
+  await expect(page.locator('#dataset-read')).not.toHaveText(/^Reading…/);
   const tops = await page.evaluate(() => {
     const seen = [...new Set(window.__applyTops)];
     window.__applyTops = null;
@@ -167,7 +176,7 @@ test('a session saved on a gene sample after a share round trip restores to the 
   await page.route(url, serveSlowly(atlas()));
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(url)}`, { waitUntil: 'domcontentloaded' });
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(CELLS);
-  await expect.poll(() => page.evaluate(() => window._cellucidState.getGeneSample()?.cells ?? null), { timeout: 30_000 }).not.toBeNull();
+  await expect.poll(() => page.evaluate(() => window._cellucidState.getGeneSample()?.cells ?? null)).not.toBeNull();
   await openCollapsedPanels(page);
 
   // A gene on the sample, topped up.
@@ -203,14 +212,11 @@ test('a session saved on a gene sample after a share round trip restores to the 
 
   // Save.
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath('gene-sample.cellucid-session');
   await download.saveAs(sessionPath);
   const bytes = await readFile(sessionPath);
-  // The saved file holds the highlights: their draft goes once it is written
-  // (`downloadSession` awaits the removal after the download starts).
-  await expect.poll(() => page.evaluate(async () => (await import('/assets/js/app/highlight-draft.js')).listHighlightDrafts()), { timeout: 30_000 }).toEqual([]);
 
   // Reload, Load.
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -218,16 +224,13 @@ test('a session saved on a gene sample after a share round trip restores to the 
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.startupPhase), { timeout: 120_000 }).toBe('ready');
   await openCollapsedPanels(page);
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles({ name: 'gene-sample.cellucid-session', mimeType: 'application/octet-stream', buffer: bytes });
   await expect.poll(() => messages(page), { timeout: 120_000 }).toContain(RESTORED);
   expect(await page.evaluate(() => ({ field: window._cellucidState.getActiveField()?.key ?? null, highlighted: window._cellucidState.getTotalHighlightedCellCount() }))).toEqual(saved);
   // Every analysis has its result back, the ones in closed rows (nothing
   // drawn there yet) as well as the open one.
   expect(await page.evaluate(ids => ids.filter(id => window._comparisonModule.getUI(id)._lastResult == null), MODES)).toEqual([]);
-  // The highlights were saved in the session, and loaded from it: they are
-  // never offered back as unsaved.
-  expect((await messages(page)).filter(text => /not saved in a session/.test(text))).toEqual([]);
 
   // The controls are usable: a gene picked now is shown.
   await expect(page.locator('#categorical-field')).toBeEnabled();
@@ -238,15 +241,13 @@ test('a session saved on a gene sample after a share round trip restores to the 
   await page.locator('#analysis-header-differential').click();
   await expect(page.locator('#analysis-panel-differential .analysis-result-line')).toBeVisible();
 
-  // A reload after the restore offers nothing back either.
+  // The loaded history (with the gene picked since) is kept in this browser,
+  // and a reload offers to continue it: reloaded once that is written (a
+  // change is written moments after it is made, `app/history/autosave.js`).
+  await page.evaluate(() => window._cellucidHistories.flush());
   await page.reload({ waitUntil: 'domcontentloaded' });
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(CELLS);
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.startupPhase), { timeout: 120_000 }).toBe('ready');
-  // What decides the offer is the draft this browser keeps of the dataset
-  // (`highlight-draft.js`: offered only when one is stored): the restore
-  // removed it, and nothing has been highlighted since, so there is none to
-  // offer, whenever the opened dataset asks.
-  expect(await page.evaluate(async () => (await import('/assets/js/app/highlight-draft.js')).listHighlightDrafts())).toEqual([]);
-  expect((await messages(page)).filter(text => /not saved in a session/.test(text))).toEqual([]);
+  await expect.poll(() => messages(page)).toContainEqual(expect.stringMatching(/^Continue where you left off\?/));
   expect(errors).toEqual([]);
 });

@@ -28,6 +28,7 @@ import {
 import { isCategoricalCodes, missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 import { abortReason } from '../../../../utils/abort.js';
 import { hiddenCategoryBytes, hiddenCategoryCount } from '../../../utils/category-state.js';
+import { cellSampleFilterOf } from '../category-cell-sample.js';
 
 /**
  * Resolve the filters that can hide a cell once per count: every category,
@@ -73,13 +74,16 @@ function resolveCellFilters(owner, skip) {
       if (field._categoryFilterEnabled === false) continue;
       const shown = field._categoryVisible;
       const missingHidden = field._missingVisible === false;
-      if (missingHidden || hiddenCategoryCount(shown) > 0) {
+      // Categories that keep only some of their cells (`category-cell-sample.js`).
+      const sample = isCategoricalCodes(field.codes) ? cellSampleFilterOf(field, owner.cellIdentity) : null;
+      if (missingHidden || hiddenCategoryCount(shown) > 0 || sample !== null) {
         categories.push({
           codes: field.codes || [],
           // One byte per category, 1 where hidden (made once per visibility).
           hidden: hiddenCategoryBytes(shown),
           missingCode: isCategoricalCodes(field.codes) ? missingCategoryCode(field.codes) : -1,
           missingHidden,
+          sample,
         });
       }
     } else if (field.kind === 'continuous') {
@@ -105,6 +109,15 @@ function cellPassesFilters(categories, ranges, outliers, cell) {
     const filter = categories[index];
     const code = filter.codes[cell];
     if (code === filter.missingCode ? filter.missingHidden : filter.hidden[code] === 1) return false;
+    const sample = filter.sample;
+    if (
+      sample !== null
+      && code < sample.limited.length
+      && sample.limited[code] === 1
+      && (sample.bits[cell >>> 3] & (1 << (cell & 7))) === 0
+    ) {
+      return false;
+    }
   }
   for (let index = 0; index < ranges.length; index++) {
     const filter = ranges[index];
@@ -142,7 +155,14 @@ function sameResolvedFilters(left, right) {
   for (let index = 0; index < left.categories.length; index++) {
     const a = left.categories[index];
     const b = right.categories[index];
-    if (a.codes !== b.codes || a.missingHidden !== b.missingHidden || a.hidden.length !== b.hidden.length) return false;
+    if (
+      a.codes !== b.codes
+      || a.missingHidden !== b.missingHidden
+      || a.hidden.length !== b.hidden.length
+      || a.sample !== b.sample
+    ) {
+      return false;
+    }
     // One visibility array gives one table (`hiddenCategoryBytes`).
     if (a.hidden === b.hidden) continue;
     for (let code = 0; code < a.hidden.length; code++) {
@@ -289,6 +309,8 @@ function visibleFromTotals(codes, alpha, total, categoryCount) {
     || inputs.continuousFilters.length !== 0
     || inputs.outlierFilters.length !== 0
     || inputs.categoryFilters.length > 1
+    // A category keeping some of its cells shows only part of them.
+    || inputs.sampleFilters.length !== 0
   ) {
     return null;
   }

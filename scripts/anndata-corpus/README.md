@@ -105,9 +105,9 @@ a clear message naming the feature, never a wrong value.
 | anndata-0.8.0 | 26 | 17 | 0 | 0 |
 | anndata-0.7.8 | 31 | 15 | 0 | 4 |
 | anndata-0.6.22.post1 | 30 | 13 | 0 | 7 |
-| emulated | 8 | 0 | 0 | 0 |
+| emulated | 10 | 0 | 0 | 0 |
 
-573 fixtures, 21.4 MB unpacked, kept as 8 writer archives and index.json.
+575 fixtures, 21.4 MB unpacked, kept as 8 writer archives and index.json.
 
 | Variant | What it holds | 0.12.19 | 0.11.4 | 0.10.9 | 0.9.2 | 0.8.0 | 0.7.8 | 0.6.22.post1 | Reader must |
 |---|---|---|---|---|---|---|---|---|---|
@@ -269,6 +269,8 @@ Emulated layouts (`emulated/`, made from real writer output by `postprocess.py`)
 | `obsm_compound_06.h5ad` | anndata 0.6.22 file with obsm rewritten as one compound dataset (one member per embedding), the layout of anndata before 0.6.20. | read exactly |
 | `seuratdisk_partial_column_order.h5ad` | anndata 0.7.8 file whose obs column-order lists only 'cell_type' and 'n_counts' while the group holds more columns, as SeuratDisk's Convert() leaves it. anndata reads only the listed columns. | read exactly |
 | `track_order_scanpy_like.h5ad` | anndata 0.12.19 Scanpy-like file re-created with track_order=True on the file and every group (creation-order indexed links). | read exactly |
+| `uns_csr_matrix_07.h5ad` | anndata 0.7.8 file with a 3 x 4 csr_matrix (encoding-type csr_matrix) in uns['graph']. | read exactly |
+| `uns_h5sparse_06.h5ad` | anndata 0.6.22 file with a 3 x 4 h5sparse CSR group (h5sparse_format='csr') in uns['graph']. | read exactly |
 
 <!-- variant-matrix:end -->
 

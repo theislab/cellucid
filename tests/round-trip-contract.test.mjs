@@ -1,6 +1,6 @@
 /**
  * The round trip on the viewer's side: what a person made, published to the
- * host as viewer-protocol results (`app/viewer-host-results.js`), and the
+ * host as viewer-protocol results (`app/viewer-host/results.js`), and the
  * files the web app exports with no notebook (`app/exports/cell-exports.js`,
  * `formats/hdf5/writer.js`): an obs-name CSV, an obs-column CSV, a GMT file
  * and an `.h5ad` subset that Cellucid's own reader and Python's anndata read
@@ -17,7 +17,8 @@ import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { DataState } from '../assets/js/app/state/core/data-state.js';
-import { createViewerHostResults } from '../assets/js/app/viewer-host-results.js';
+import { createFieldOverlaysDomain } from '../assets/js/app/state/domains/field-overlays.js';
+import { createViewerHostResults } from '../assets/js/app/viewer-host/results.js';
 import { DerivedResultsRegistry } from '../assets/js/app/registries/derived-results.js';
 import { formatGmt, parseGmt } from '../assets/js/app/analysis/shared/gene-sets.js';
 import {
@@ -125,7 +126,7 @@ test('every result reaches the host once, in original positions, and only what c
   await results.resync();
   const again = source.sent.filter(item => item.header);
   assert.equal(again.length, 4);
-  assert.ok(again.every(item => item.header.requestId === null));
+  assert.ok(again.every(item => !Object.hasOwn(item.header, 'requestId')), 'a result names no request (an action is answered by action_result)');
   assert.equal(source.sent.at(-1).inventory.items.length, again.length);
 
   // A field a session restore left unread is read in the background, then sent.
@@ -232,7 +233,6 @@ test('each dataset a page opens is a new epoch; another dataset publishes nothin
   state.addHighlightDirect({ type: 'lasso', label: 'Elsewhere', cellIndices: Uint32Array.of(1) });
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.deepEqual(source.sent, []);
-  assert.throws(() => results.answer('r1', 'highlight', 'highlight_3'), /another dataset/);
 
   // The host's dataset again: a third epoch, every result again from revision 1.
   source.shown.dataset = 'example';
@@ -651,9 +651,11 @@ test('the HDF5 writer writes strings past one heap collection and refuses what i
 });
 
 test('a pushed column is a field holding its own values: replaced in place, saved and restored with the session', async () => {
-  const { capture, restore } = await import('../assets/js/app/session/contributors/user-defined-values.js');
-  const state = new DataState({}, null);
+  // The views a state domain covers: the live view alone.
+  const viewer = { getSnapshotViews: () => [] };
+  const state = new DataState(viewer, null);
   state.pointCount = 4;
+  state.cellIdentity = createCellIdentity({ nObs: 4 });
   state.obsData = { fields: [] };
   state.varData = { fields: [] };
   state.colorsArray = new Uint8Array(16);
@@ -671,29 +673,32 @@ test('a pushed column is a field holding its own values: replaced in place, save
     /exists already/
   );
 
-  const meta = state.getUserDefinedFieldsRegistry().toSessionMeta();
+  // The field-overlays state (what the history and a session file keep)
+  // holds the field with its own values, by original position.
+  const value = createFieldOverlaysDomain({ state, viewer, refreshUi: () => {} }).capture();
+  const [item] = value.userFields;
   assert.deepEqual(
-    Object.keys(meta[0]).sort(),
-    ['createdAt', 'id', 'isDeleted', 'isPurged', 'key', 'kind', 'operation', 'source', 'sourceField', 'valuesLength', 'valuesType']
+    Object.keys(item).sort(),
+    ['createdAt', 'deleted', 'id', 'key', 'kind', 'operation', 'purged', 'source', 'sourceField', 'values']
   );
-  const [chunk] = capture({ state });
-  assert.equal(chunk.id, `user-defined/values/${made.fieldId}`);
-  assert.equal(chunk.label, 'User-defined values: score');
+  assert.deepEqual([item.id, item.key, item.kind, item.sourceField, item.operation], [made.fieldId, 'score', 'continuous', null, operation]);
+  assert.equal(item.values.cells, null);
+  assert.deepEqual([...item.values.values], [4, 5, 6, 7]);
 
-  const restored = new DataState({}, null);
+  const restored = new DataState(viewer, null);
   restored.pointCount = 4;
-  restored.getUserDefinedFieldsRegistry().fromSessionMeta(meta);
-  const template = restored.getUserDefinedFieldsRegistry().getField(made.fieldId);
-  restored.obsData = { fields: [{ ...template }] };
+  restored.cellIdentity = createCellIdentity({ nObs: 4 });
+  restored.obsData = { fields: [] };
   restored.varData = { fields: [] };
-  const { payload, ...chunkMeta } = chunk;
-  restore({ state: restored }, { ...chunkMeta, storedBytes: payload.length, uncompressedBytes: payload.length }, payload);
+  restored._resetViewContexts();
+  const overlays = createFieldOverlaysDomain({ state: restored, viewer, refreshUi: () => {} });
+  await overlays.restore(structuredClone(value));
   assert.deepEqual([...restored.getFields()[0].values], [4, 5, 6, 7]);
   assert.equal(restored.getFields()[0].loaded, true);
-  // A chunk of the wrong length is refused.
-  restored.getUserDefinedFieldsRegistry().getField(made.fieldId)._valuesLengthHint = 4;
-  assert.throws(
-    () => restore({ state: restored }, { ...chunkMeta, storedBytes: 8, uncompressedBytes: 8 }, new Uint8Array(8)),
-    /8 bytes for 4 float32 values/
-  );
+  assert.equal(restored.getFields()[0]._userDefinedId, made.fieldId);
+  // A column of the wrong length is refused, and the field keeps its values.
+  const wrong = structuredClone(value);
+  wrong.userFields[0].values = { cells: null, values: new Float32Array(8) };
+  await assert.rejects(overlays.restore(wrong), /A column of 8 values does not fit the 4 cells of this dataset/);
+  assert.deepEqual([...restored.getFields()[0].values], [4, 5, 6, 7]);
 });

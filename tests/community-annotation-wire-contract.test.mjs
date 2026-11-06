@@ -13,19 +13,26 @@ import {
   getGitHubWorkerOrigin,
   toGitHubUserKey,
 } from '../assets/js/app/community-annotations/github-auth.js';
+import * as wireContract from '../assets/js/app/community-annotations/wire-contract.js';
 import {
-  ANNOTATION_CONTRACT_IDS,
+  ANNOTATION_MERGES_FILE_VERSION,
+  ANNOTATION_SCHEMA_BLOB_OIDS,
+  ANNOTATION_USER_FILE_VERSION,
+  annotationSuggestionIdOwner,
   assertConfigDocument,
   assertMergesDocument,
-  assertSchemaIdentity,
+  assertMergesFile,
   assertUserDocument,
-  parseExactJson,
+  assertUserFile,
+  composeMergesFile,
   composeUserFile,
+  isAnnotationExactNonblank,
+  parseExactJson,
+  projectMergesFile,
   projectUserFile,
 } from '../assets/js/app/community-annotations/wire-contract.js';
 import {
   toCacheScopeKey,
-  toFileShaIndexKey,
   toSessionStorageKey,
 } from '../assets/js/app/community-annotations/cache-scope.js';
 import {
@@ -73,7 +80,7 @@ function validRemoteUser(overrides = {}) {
     suggestions: {
       'cell_type:Alpha': [
         {
-          id: 'suggestion-remote',
+          id: 'ghid_7_suggestion-remote',
           label: 'T cell',
           ontologyId: null,
           evidence: null,
@@ -118,8 +125,8 @@ function validMerges(overrides = {}) {
     merges: [
       {
         bucket: 'cell_type:Alpha',
-        fromSuggestionId: 'from',
-        intoSuggestionId: 'into',
+        fromSuggestionId: 'ghid_7_from',
+        intoSuggestionId: 'ghid_8_into',
         by: 'ghid_42',
         at: '2026-07-25T01:02:03.456Z',
       },
@@ -214,11 +221,18 @@ test('community annotation state preserves every legal prototype-named field and
   }
 });
 
-test('votes, comments, and user-file export preserve every legal prototype-named suggestion id', () => {
+test('votes, comments, and user-file export preserve every suggestion id whose rest is a prototype name', () => {
+  // A bare prototype name is no suggestion id (an id names its owner first);
+  // as the rest of one it is ordinary text.
+  for (const name of PROTOTYPE_IDENTITIES) {
+    assert.equal(annotationSuggestionIdOwner(name), null);
+  }
+  const REMOTE_IDS = PROTOTYPE_IDENTITIES.map(name => `ghid_7_${name}`);
+  const OWN_IDS = PROTOTYPE_IDENTITIES.map(name => `ghid_42_${name}`);
   const session = createSession();
   const remote = validRemoteUser({
     suggestions: {
-      'cell_type:Alpha': PROTOTYPE_IDENTITIES.map((id, index) => ({
+      'cell_type:Alpha': REMOTE_IDS.map((id, index) => ({
         id,
         label: `Prototype identity ${index + 1}`,
         ontologyId: null,
@@ -232,7 +246,7 @@ test('votes, comments, and user-file export preserve every legal prototype-named
   });
   session.mergeFromUserFiles([remote]);
 
-  for (const id of PROTOTYPE_IDENTITIES) {
+  for (const id of REMOTE_IDS) {
     assert.equal(session.vote('cell_type', 0, id, 'up'), true);
     assert.ok(session.addComment('cell_type', 0, id, `Comment for ${id}`));
   }
@@ -240,17 +254,17 @@ test('votes, comments, and user-file export preserve every legal prototype-named
   const document = session.buildUserFileDocument({ githubUserId: 42 });
   assert.equal(Object.getPrototypeOf(document.votes), Object.prototype);
   assert.equal(Object.getPrototypeOf(document.comments), Object.prototype);
-  assert.deepEqual(Object.keys(document.votes).sort(), [...PROTOTYPE_IDENTITIES].sort());
-  assert.deepEqual(Object.keys(document.comments).sort(), [...PROTOTYPE_IDENTITIES].sort());
-  for (const id of PROTOTYPE_IDENTITIES) {
+  assert.deepEqual(Object.keys(document.votes).sort(), [...REMOTE_IDS].sort());
+  assert.deepEqual(Object.keys(document.comments).sort(), [...REMOTE_IDS].sort());
+  for (const id of REMOTE_IDS) {
     assert.equal(Object.hasOwn(document.votes, id), true);
     assert.equal(document.votes[id], 'up');
     assert.equal(Object.hasOwn(document.comments, id), true);
     assert.equal(document.comments[id].length, 1);
   }
   const roundTripped = parseExactJson(JSON.stringify(document));
-  assert.deepEqual(Object.keys(roundTripped.votes).sort(), [...PROTOTYPE_IDENTITIES].sort());
-  assert.deepEqual(Object.keys(roundTripped.comments).sort(), [...PROTOTYPE_IDENTITIES].sort());
+  assert.deepEqual(Object.keys(roundTripped.votes).sort(), [...REMOTE_IDS].sort());
+  assert.deepEqual(Object.keys(roundTripped.comments).sort(), [...REMOTE_IDS].sort());
   assert.doesNotThrow(() => assertUserDocument(roundTripped));
 
   const ownSession = createSession();
@@ -259,7 +273,7 @@ test('votes, comments, and user-file export preserve every legal prototype-named
     githubUserId: 42,
     login: 'researcher',
     suggestions: {
-      'cell_type:Alpha': PROTOTYPE_IDENTITIES.map((id, index) => ({
+      'cell_type:Alpha': OWN_IDS.map((id, index) => ({
         id,
         label: `Own-device identity ${index + 1}`,
         ontologyId: null,
@@ -271,7 +285,7 @@ test('votes, comments, and user-file export preserve every legal prototype-named
       })),
     },
     comments: exactOwnRecord(
-      PROTOTYPE_IDENTITIES.map((id, index) => [
+      OWN_IDS.map((id, index) => [
         id,
         [
           {
@@ -292,9 +306,9 @@ test('votes, comments, and user-file export preserve every legal prototype-named
   });
   assert.deepEqual(
     Object.keys(hydratedDocument.comments).sort(),
-    [...PROTOTYPE_IDENTITIES].sort()
+    [...OWN_IDS].sort()
   );
-  for (const id of PROTOTYPE_IDENTITIES) {
+  for (const id of OWN_IDS) {
     assert.equal(Object.hasOwn(ownSession._state.myComments, id), true);
     assert.equal(hydratedDocument.comments[id].length, 1);
   }
@@ -323,9 +337,10 @@ test('prototype-named annotation identities survive local persistence and atomic
       { minAnnotators: index + 1, threshold: index / 4 },
     ])
   );
+  const suggestionIds = identities.map(name => `ghid_7_${name}`);
   const remote = validRemoteUser({
     suggestions: {
-      'cell_type:Alpha': identities.map((id, index) => ({
+      'cell_type:Alpha': suggestionIds.map((id, index) => ({
         id,
         label: `Lifecycle identity ${index + 1}`,
         ontologyId: null,
@@ -354,11 +369,11 @@ test('prototype-named annotation identities survive local persistence and atomic
       0,
       { label: 'Local rollback sentinel' }
     );
-    for (const id of identities) {
-      producer.vote('cell_type', 0, id, 'up');
-      producer.addComment('cell_type', 0, id, `Persisted comment for ${id}`);
-      producer.setFieldCategories(id, ['Exact category']);
-      producer.setFieldAnnotated(id, true);
+    for (const [index, name] of identities.entries()) {
+      producer.vote('cell_type', 0, suggestionIds[index], 'up');
+      producer.addComment('cell_type', 0, suggestionIds[index], `Persisted comment for ${name}`);
+      producer.setFieldCategories(name, ['Exact category']);
+      producer.setFieldAnnotated(name, true);
     }
     producer.setAnnotatableConsensusSettingsMap(settings);
     producer.setClosedAnnotatableFields(identities);
@@ -371,7 +386,7 @@ test('prototype-named annotation identities survive local persistence and atomic
     const persisted = parseExactJson(
       values.get(toSessionStorageKey(scope))
     );
-    assert.deepEqual(Object.keys(persisted.myComments).sort(), [...identities].sort());
+    assert.deepEqual(Object.keys(persisted.myComments).sort(), [...suggestionIds].sort());
     assert.deepEqual(Object.keys(persisted.annotatableSettings).sort(), [...identities].sort());
     assert.deepEqual(Object.keys(persisted.datasets), ['__proto__']);
 
@@ -412,9 +427,11 @@ test('prototype-named annotation identities survive local persistence and atomic
         ],
       },
     });
+    // ghid_7's file cannot hold ghid_42's suggestion id: the contract
+    // refuses it before it can collide with the local suggestion.
     assert.throws(
       () => consumer.rebuildMergedViewFromUserFiles(remoteFiles(consumer, [conflicting])),
-      /conflicts with the suggestion owned by/
+      /must start with "ghid_7_"/
     );
     assert.equal(Object.getPrototypeOf(consumer._state.myComments), null);
     assert.equal(Object.getPrototypeOf(consumer._state.annotatableSettings), null);
@@ -466,19 +483,19 @@ test('prototype-named annotation identities survive local persistence and atomic
       consumer.addComment(
         'cell_type',
         0,
-        '__proto__',
+        'ghid_7___proto__',
         'Comment added after rollback and successful Pull'
       )
     );
     consumer._saveNow();
 
     const document = consumer.buildUserFileDocument({ githubUserId: 42 });
-    for (const id of identities) {
+    for (const id of suggestionIds) {
       assert.equal(Object.hasOwn(document.votes, id), true);
     }
     assert.equal(Object.hasOwn(document.votes, localSuggestionId), true);
-    assert.deepEqual(Object.keys(document.comments).sort(), [...identities].sort());
-    assert.equal(document.comments.__proto__.length, 2);
+    assert.deepEqual(Object.keys(document.comments).sort(), [...suggestionIds].sort());
+    assert.equal(document.comments.ghid_7___proto__.length, 2);
     assert.deepEqual(Object.keys(document.datasets), ['__proto__']);
     assert.equal(Object.getPrototypeOf(document.votes), Object.prototype);
     assert.equal(Object.getPrototypeOf(document.comments), Object.prototype);
@@ -574,7 +591,7 @@ test('config publication detects a prototype-named field settings-only change', 
       branch: 'main',
       workerOrigin: 'https://worker.example',
     });
-    sync.validateAndLoadConfig = async () => ({
+    sync.openSnapshot = async () => ({
       repoInfo,
       branch: 'main',
     });
@@ -740,16 +757,16 @@ test('suggestion identifiers reject the vote-key delimiter at every wire boundar
   const encodedColonField = validRemoteUser({
     suggestions: {
       'fk~foo%3Abar:Category:with:colon': [{
-        id: 'legal-id',
+        id: 'ghid_7_legal-id',
         label: 'Legal',
         proposedBy: 'ghid_7',
         proposedAt: '2026-07-25T01:02:03.456Z',
       }],
     },
-    votes: { 'legal-id': 'up' },
-    comments: { 'legal-id': [] },
+    votes: { 'ghid_7_legal-id': 'up' },
+    comments: { 'ghid_7_legal-id': [] },
     deletedSuggestions: {
-      'fk~foo%3Abar:Category:with:colon': ['legal-deleted-id'],
+      'fk~foo%3Abar:Category:with:colon': ['ghid_7_legal-deleted-id'],
     },
   });
   assert.doesNotThrow(() => assertUserDocument(encodedColonField));
@@ -897,11 +914,11 @@ test('every session field-key boundary rejects the reserved raw alias atomically
 test('safe suggestion lookalikes and non-suggestion identifiers retain colons', () => {
   const user = validRemoteUser();
   const suggestion = user.suggestions['cell_type:Alpha'][0];
-  suggestion.id = 'suggestion%3A1';
+  suggestion.id = 'ghid_7_suggestion%3A1';
   suggestion.ontologyId = 'CL:0000084';
-  user.votes = { 'suggestion%3A1': 'up' };
+  user.votes = { 'ghid_7_suggestion%3A1': 'up' };
   user.comments = {
-    'suggestion%3A1': [{
+    'ghid_7_suggestion%3A1': [{
       id: 'comment:1',
       text: 'Exact',
       authorUsername: 'ghid_7',
@@ -909,7 +926,7 @@ test('safe suggestion lookalikes and non-suggestion identifiers retain colons', 
     }],
   };
   user.deletedSuggestions = {
-    'cell_type:Alpha': ['suggestion：fullwidth-colon'],
+    'cell_type:Alpha': ['ghid_7_suggestion：fullwidth-colon'],
   };
   assert.doesNotThrow(() => assertUserDocument(user));
 });
@@ -918,7 +935,7 @@ test('user export preserves a valid dangling cross-user vote before the next Pul
   const session = createSession();
   session.mergeFromUserFiles([validRemoteUser()]);
   assert.equal(
-    session.vote('cell_type', 0, 'suggestion-remote', 'up'),
+    session.vote('cell_type', 0, 'ghid_7_suggestion-remote', 'up'),
     true
   );
 
@@ -927,30 +944,33 @@ test('user export preserves a valid dangling cross-user vote before the next Pul
   session._state.suggestions = {};
   const document = session.buildUserFileDocument({ githubUserId: 42 });
   assert.deepEqual(document.suggestions, {});
-  assert.deepEqual(document.votes, { 'suggestion-remote': 'up' });
+  assert.deepEqual(document.votes, { 'ghid_7_suggestion-remote': 'up' });
   assert.doesNotThrow(() => assertUserDocument(document));
 });
 
 
-test('local suggestion producer rejects overlong values instead of clipping them', () => {
+test('local suggestion producer keeps long text whole: the file bound is the only bound', () => {
   const session = createSession();
-  assert.throws(
-    () => session.addSuggestion('cell_type', 0, { label: 'x'.repeat(121) }),
-    /label.*120|120.*label/i
-  );
-  assert.deepEqual(session.getSuggestions('cell_type', 0), []);
+  const label = 'x'.repeat(5000);
+  const evidence = 'e'.repeat(50_000);
+  const id = session.addSuggestion('cell_type', 0, { label, evidence, markers: ['G'.repeat(500)] });
+  const [suggestion] = session.getSuggestions('cell_type', 0);
+  assert.equal(suggestion.id, id);
+  assert.equal(suggestion.label, label);
+  assert.equal(suggestion.evidence, evidence);
+  assert.deepEqual(suggestion.markers, ['G'.repeat(500)]);
 });
 
 
-test('local marker producer rejects blank and overlong marker strings', () => {
+test('local marker producer rejects blank marker strings', () => {
   const session = createSession();
   assert.throws(
     () =>
       session.addSuggestion('cell_type', 0, {
         label: 'T cell',
-        markers: ['   ', 'G'.repeat(65)],
+        markers: ['   '],
       }),
-    /marker.*nonblank|marker.*64|64.*marker/i
+    /marker.*nonblank/i
   );
   assert.deepEqual(session.getSuggestions('cell_type', 0), []);
   assert.throws(
@@ -1018,18 +1038,20 @@ test('remote user documents require one exact checksum-valid ORCID representatio
   }
 });
 
-test('repository merge rejects cross-user suggestion id collisions atomically', () => {
+test('a file holding another contributor\'s suggestion id is rejected atomically', () => {
   const session = createSession();
   const first = validRemoteUser();
   const second = validRemoteUser({
     username: 'ghid_8',
     githubUserId: 8,
   });
+  // ghid_8 reuses ghid_7's public id: ids name their owner, so this is no
+  // collision to resolve but an invalid file.
   second.suggestions['cell_type:Alpha'][0].proposedBy = 'ghid_8';
   const before = session.getStateSnapshot();
   assert.throws(
     () => session.mergeFromUserFiles([first, second]),
-    /conflicts with the suggestion owned by "ghid_7"/
+    /must start with "ghid_8_"/
   );
   assert.deepEqual(session.getStateSnapshot(), before);
 });
@@ -1038,7 +1060,7 @@ test('repository merge preserves equal comment ids from different users', () => 
   const session = createSession();
   const first = validRemoteUser({
     comments: {
-      'suggestion-remote': [
+      'ghid_7_suggestion-remote': [
         {
           id: 'same-comment-id',
           text: 'First author',
@@ -1053,7 +1075,7 @@ test('repository merge preserves equal comment ids from different users', () => 
     githubUserId: 8,
     suggestions: {},
     comments: {
-      'suggestion-remote': [
+      'ghid_7_suggestion-remote': [
         {
           id: 'same-comment-id',
           text: 'Second author',
@@ -1078,7 +1100,7 @@ test('numeric category labels remain exact and are never migrated by index', () 
     suggestions: {
       'cell_type:0': [
         {
-          id: 'suggestion-numeric-label',
+          id: 'ghid_7_suggestion-numeric-label',
           label: 'Numeric category',
           ontologyId: null,
           evidence: null,
@@ -1107,8 +1129,8 @@ test('moderation document rejects invalid entries instead of filtering them', ()
         merges: [
           {
             bucket: 'cell_type:Alpha',
-            fromSuggestionId: 'same',
-            intoSuggestionId: 'same',
+            fromSuggestionId: 'ghid_42_same',
+            intoSuggestionId: 'ghid_42_same',
             by: 'ghid_42',
             at: '2026-07-25T01:02:03.456Z',
           },
@@ -1242,19 +1264,40 @@ test('annotation identities reject every true trailing line terminator', () => {
   }
 });
 
-test('wire length limits count Unicode code points identically to JSON Schema', () => {
-  const boundary = validRemoteUser();
-  boundary.suggestions['cell_type:Alpha'][0].label = '😀'.repeat(120);
-  assert.doesNotThrow(() =>
-    assertUserDocument(boundary, { filename: 'ghid_7.json' })
-  );
-
-  const over = validRemoteUser();
-  over.suggestions['cell_type:Alpha'][0].label = '😀'.repeat(121);
-  assert.throws(
-    () => assertUserDocument(over, { filename: 'ghid_7.json' }),
-    /at most 120/
-  );
+test('wire text has no length limit; the file is the only bound', () => {
+  assert.equal(Object.hasOwn(wireContract, 'ANNOTATION_LIMITS'), false);
+  const long = validRemoteUser({
+    login: 'l'.repeat(5_000),
+    displayName: '\u{1F600}'.repeat(5_000),
+    title: 't'.repeat(5_000),
+    linkedin: 'a'.repeat(500),
+    comments: {
+      'ghid_8_elsewhere': [{
+        id: 'c'.repeat(5_000),
+        text: 'x'.repeat(50_000),
+        authorUsername: 'ghid_7',
+        createdAt: '2026-07-25T01:02:03.456Z',
+      }],
+    },
+  });
+  const suggestion = long.suggestions['cell_type:Alpha'][0];
+  suggestion.id = `ghid_7_${'i'.repeat(5_000)}`;
+  suggestion.label = '\u{1F600}'.repeat(5_000);
+  suggestion.evidence = 'e'.repeat(50_000);
+  suggestion.ontologyId = 'o'.repeat(5_000);
+  suggestion.markers = ['g'.repeat(5_000), { gene: 'g'.repeat(5_000) }];
+  long.datasets = { ['d'.repeat(5_000)]: { fieldsToAnnotate: ['f'.repeat(5_000)], lastAccessedAt: '2026-07-25T01:02:03.456Z' } };
+  assert.doesNotThrow(() => assertUserDocument(long, { filename: 'ghid_7.json' }));
+  const merges = validMerges();
+  merges.merges[0].note = 'n'.repeat(50_000);
+  assert.doesNotThrow(() => assertMergesDocument(merges));
+  const config = validConfig();
+  config.supportedDatasets[0].name = 'n'.repeat(5_000);
+  config.supportedDatasets[0].datasetId = 'd'.repeat(5_000);
+  config.supportedDatasets[0].annotatableSettings.cell_type.minAnnotators = Number.MAX_SAFE_INTEGER;
+  assert.doesNotThrow(() => assertConfigDocument(config));
+  config.supportedDatasets[0].annotatableSettings.cell_type.minAnnotators = Number.MAX_SAFE_INTEGER + 1;
+  assert.throws(() => assertConfigDocument(config), /safe integer/);
 });
 
 test('remote SHA state rejects unknown paths and values without filtering', () => {
@@ -1363,133 +1406,6 @@ test('GitHub annotation requests compose and physically honor an owner abort sig
     await rejection;
     assert.equal(requestSignal.aborted, true);
     assert.equal(abortEvents, 1);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('GitHub annotation errors expose an exact Retry-After header', async () => {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ error: 'try later' }), {
-      status: 503,
-      headers: {
-        'content-type': 'application/json',
-        'retry-after': '7',
-        'x-ratelimit-reset': '2000000000',
-      },
-    });
-  try {
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId: 'synthetic',
-      owner: 'owner',
-      repo: 'repo',
-      token: 'test-token',
-      branch: 'main',
-      workerOrigin: 'https://worker.example',
-    });
-    await assert.rejects(
-      () => sync.validateAndLoadConfig(),
-      error => {
-        assert.equal(error?.status, 503);
-        assert.equal(error?.retryAfter, '7');
-        assert.equal(
-          Object.hasOwn(error, 'rateLimitResetEpochSeconds'),
-          false,
-        );
-        return true;
-      },
-    );
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('GitHub retry metadata accepts only a canonical x-ratelimit-reset when Retry-After is absent', async (t) => {
-  const previousFetch = globalThis.fetch;
-  const createSync = () => new CommunityAnnotationGitHubSync({
-    datasetId: 'synthetic',
-    owner: 'owner',
-    repo: 'repo',
-    token: 'test-token',
-    branch: 'main',
-    workerOrigin: 'https://worker.example',
-  });
-  try {
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ error: 'rate limited' }), {
-        status: 429,
-        headers: {
-          'content-type': 'application/json',
-          'x-ratelimit-reset': '2000000000',
-        },
-      });
-    await assert.rejects(
-      () => createSync().validateAndLoadConfig(),
-      error => {
-        assert.equal(error?.rateLimitResetEpochSeconds, 2_000_000_000);
-        assert.equal(Object.hasOwn(error, 'retryAfter'), false);
-        return true;
-      },
-    );
-
-    await t.test(
-      'present Retry-After wins even when its value is unusable',
-      async () => {
-        globalThis.fetch = async () =>
-          new Response(JSON.stringify({ error: 'rate limited' }), {
-            status: 429,
-            headers: {
-              'content-type': 'application/json',
-              'retry-after': 'not-a-retry-delay',
-              'x-ratelimit-reset': '2000000000',
-            },
-          });
-        await assert.rejects(
-          () => createSync().validateAndLoadConfig(),
-          error => {
-            assert.equal(error?.retryAfter, 'not-a-retry-delay');
-            assert.equal(
-              Object.hasOwn(error, 'rateLimitResetEpochSeconds'),
-              false,
-            );
-            return true;
-          },
-        );
-      },
-    );
-
-    for (const invalidReset of [
-      '02000000000',
-      '-1',
-      '+2000000000',
-      '2000000000.5',
-      '9007199254740992',
-    ]) {
-      await t.test(
-        `invalid reset ${JSON.stringify(invalidReset)} is ignored`,
-        async () => {
-          globalThis.fetch = async () =>
-            new Response(JSON.stringify({ error: 'rate limited' }), {
-              status: 429,
-              headers: {
-                'content-type': 'application/json',
-                'x-ratelimit-reset': invalidReset,
-              },
-            });
-          await assert.rejects(
-            () => createSync().validateAndLoadConfig(),
-            error => {
-              assert.equal(
-                Object.hasOwn(error, 'rateLimitResetEpochSeconds'),
-                false,
-              );
-              return true;
-            },
-          );
-        },
-      );
-    }
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -1689,7 +1605,7 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
         : {
           status: 'ok',
           service: 'Cellucid GitHub Auth',
-          contractVersion: 2,
+          contractVersion: 3,
           endpoints: [
             '/auth/login',
             '/auth/callback',
@@ -1698,6 +1614,8 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
             '/auth/installations',
             '/auth/installation-repos',
             '/cap/lookup-cells',
+            '/graphql/snapshot',
+            '/graphql/blobs',
             '/api/repos/*',
           ],
         };
@@ -1925,7 +1843,7 @@ test('GitHub sign-in verifies the exact current Worker before navigation and pre
     return new Response(JSON.stringify({
       status: 'ok',
       service: 'Cellucid GitHub Auth',
-      contractVersion: 2,
+      contractVersion: 3,
       endpoints: [
         '/auth/login',
         '/auth/callback',
@@ -1934,6 +1852,8 @@ test('GitHub sign-in verifies the exact current Worker before navigation and pre
         '/auth/installations',
         '/auth/installation-repos',
         '/cap/lookup-cells',
+        '/graphql/snapshot',
+        '/graphql/blobs',
         '/api/repos/*',
       ],
     }), { status: 200 });
@@ -2003,6 +1923,8 @@ test('stale Worker capabilities fail before OAuth navigation or token exposure',
         '/auth/installations',
         '/auth/installation-repos',
         '/cap/lookup-cells',
+        '/graphql/snapshot',
+        '/graphql/blobs',
         '/api/repos/*',
       ],
     }), { status: 200 });
@@ -2012,8 +1934,9 @@ test('stale Worker capabilities fail before OAuth navigation or token exposure',
     await assert.rejects(
       () => auth.signIn(),
       error =>
-        error?.code === 'GITHUB_WORKER_INCOMPATIBLE' &&
-        /Deploy the current Cellucid Worker/.test(error.message)
+        error?.code === 'GITHUB_WORKER_OUTDATED' &&
+        error.workerContractVersion === 0 &&
+        /its owner must redeploy the Worker/.test(error.message)
     );
     assert.deepEqual(assignments, []);
     assert.equal(authorizationObserved, false);
@@ -2021,308 +1944,6 @@ test('stale Worker capabilities fail before OAuth navigation or token exposure',
     globalThis.fetch = previousFetch;
     if (previousWindow === undefined) delete globalThis.window;
     else globalThis.window = previousWindow;
-    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
-    else globalThis.sessionStorage = previousSessionStorage;
-  }
-});
-
-test('chunked oversized Worker health responses are cancelled before trust or navigation', async () => {
-  const storage = {
-    getItem: () => null,
-    setItem() {},
-    removeItem() {},
-  };
-  const previousSessionStorage = globalThis.sessionStorage;
-  const previousWindow = globalThis.window;
-  const previousFetch = globalThis.fetch;
-  const assignments = [];
-  let cancelled = false;
-  globalThis.sessionStorage = storage;
-  globalThis.window = {
-    location: {
-      origin: 'https://app.example',
-      pathname: '/',
-      search: '',
-      hash: '',
-      assign(url) {
-        assignments.push(url);
-      },
-    },
-  };
-  globalThis.fetch = async () => new Response(
-    new ReadableStream({
-      cancel() {
-        cancelled = true;
-      },
-      start(controller) {
-        controller.enqueue(new Uint8Array(10_000));
-        controller.enqueue(new Uint8Array(10_000));
-      },
-    }),
-    { status: 200 }
-  );
-  try {
-    const auth = new GitHubAuthSession();
-    await assert.rejects(
-      () => auth.signIn(),
-      error =>
-        error?.code === 'GITHUB_WORKER_INCOMPATIBLE' &&
-        error?.cause?.code === 'GITHUB_AUTH_RESPONSE_TOO_LARGE'
-    );
-    assert.equal(cancelled, true);
-    assert.deepEqual(assignments, []);
-  } finally {
-    globalThis.fetch = previousFetch;
-    if (previousWindow === undefined) delete globalThis.window;
-    else globalThis.window = previousWindow;
-    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
-    else globalThis.sessionStorage = previousSessionStorage;
-  }
-});
-
-test('Worker health trust failures cancel known oversize and invalid UTF-8 bodies', async (t) => {
-  async function runSignIn(fetchImpl, verify) {
-    const previousSessionStorage = globalThis.sessionStorage;
-    const previousWindow = globalThis.window;
-    const previousFetch = globalThis.fetch;
-    const assignments = [];
-    globalThis.sessionStorage = {
-      getItem: () => null,
-      setItem() {},
-      removeItem() {},
-    };
-    globalThis.window = {
-      location: {
-        origin: 'https://app.example',
-        pathname: '/',
-        search: '',
-        hash: '',
-        assign(url) {
-          assignments.push(url);
-        },
-      },
-    };
-    globalThis.fetch = fetchImpl;
-    try {
-      const auth = new GitHubAuthSession();
-      await verify(auth);
-      assert.deepEqual(assignments, []);
-    } finally {
-      globalThis.fetch = previousFetch;
-      if (previousWindow === undefined) delete globalThis.window;
-      else globalThis.window = previousWindow;
-      if (previousSessionStorage === undefined) {
-        delete globalThis.sessionStorage;
-      } else {
-        globalThis.sessionStorage = previousSessionStorage;
-      }
-    }
-  }
-
-  await t.test('known oversized Content-Length', async () => {
-    let cancelled = false;
-    let readerOpened = false;
-    await runSignIn(
-      async () => ({
-        status: 200,
-        ok: true,
-        headers: {
-          get(name) {
-            return name.toLowerCase() === 'content-length'
-              ? '16385'
-              : null;
-          },
-        },
-        body: {
-          async cancel() {
-            cancelled = true;
-          },
-          getReader() {
-            readerOpened = true;
-            throw new Error('known oversized body reader must not open');
-          },
-        },
-      }),
-      auth => assert.rejects(
-        () => auth.signIn(),
-        error =>
-          error?.code === 'GITHUB_WORKER_INCOMPATIBLE' &&
-          error?.cause?.code === 'GITHUB_AUTH_RESPONSE_TOO_LARGE'
-      )
-    );
-    assert.equal(cancelled, true);
-    assert.equal(readerOpened, false);
-  });
-
-  await t.test('invalid UTF-8', async () => {
-    let cancelled = false;
-    await runSignIn(
-      async () => ({
-        status: 200,
-        ok: true,
-        headers: { get: () => null },
-        body: {
-          getReader() {
-            return {
-              async read() {
-                return {
-                  done: false,
-                  value: new Uint8Array([0xc3, 0x28]),
-                };
-              },
-              async cancel() {
-                cancelled = true;
-              },
-            };
-          },
-        },
-      }),
-      auth => assert.rejects(
-        () => auth.signIn(),
-        error =>
-          error?.code === 'GITHUB_WORKER_INCOMPATIBLE' &&
-          error?.cause?.code === 'GITHUB_AUTH_RESPONSE_INVALID'
-      )
-    );
-    assert.equal(cancelled, true);
-  });
-
-  await t.test('caller abort cancels the active response reader', async () => {
-    let cancelled = false;
-    let markReaderStarted;
-    const readerStarted = new Promise(resolve => {
-      markReaderStarted = resolve;
-    });
-    await runSignIn(
-      async (_url, options) => ({
-        status: 200,
-        ok: true,
-        headers: { get: () => null },
-        body: {
-          getReader() {
-            return {
-              read() {
-                markReaderStarted();
-                return new Promise((resolve, reject) => {
-                  options.signal.addEventListener('abort', () => {
-                    reject(new DOMException(
-                      'Synthetic Worker health read aborted',
-                      'AbortError'
-                    ));
-                  }, { once: true });
-                });
-              },
-              async cancel() {
-                cancelled = true;
-              },
-            };
-          },
-        },
-      }),
-      async auth => {
-        const caller = new AbortController();
-        const pending = auth.signIn({ signal: caller.signal });
-        await readerStarted;
-        const reason = new Error('caller retired Worker health ownership');
-        caller.abort(reason);
-        await assert.rejects(
-          () => pending,
-          error => error?.name === 'AbortError'
-        );
-      }
-    );
-    assert.equal(cancelled, true);
-  });
-
-  await t.test('response read failure cancels the active reader', async () => {
-    let cancelled = false;
-    const readFailure = new Error('synthetic Worker health read failure');
-    await runSignIn(
-      async () => ({
-        status: 200,
-        ok: true,
-        headers: { get: () => null },
-        body: {
-          getReader() {
-            return {
-              async read() {
-                throw readFailure;
-              },
-              async cancel() {
-                cancelled = true;
-              },
-            };
-          },
-        },
-      }),
-      auth => assert.rejects(
-        () => auth.signIn(),
-        error =>
-          error?.code === 'GITHUB_WORKER_INCOMPATIBLE' &&
-          error?.cause === readFailure
-      )
-    );
-    assert.equal(cancelled, true);
-  });
-});
-
-test('GitHub capability setup retires abort listeners when timer creation fails', async () => {
-  const storage = {
-    getItem: () => null,
-    setItem() {},
-    removeItem() {},
-  };
-  const previousSessionStorage = globalThis.sessionStorage;
-  const previousFetch = globalThis.fetch;
-  const previousSetTimeout = globalThis.setTimeout;
-  const signalPrototype = Object.getPrototypeOf(new AbortController().signal);
-  const previousAddEventListener = signalPrototype.addEventListener;
-  const previousRemoveEventListener = signalPrototype.removeEventListener;
-  const activeAbortListeners = new Map();
-  let fetchCalls = 0;
-  const setupFailure = new Error('synthetic timer creation failure');
-
-  signalPrototype.addEventListener = function (type, listener, options) {
-    if (type === 'abort') {
-      const listeners = activeAbortListeners.get(this) ?? new Set();
-      listeners.add(listener);
-      activeAbortListeners.set(this, listeners);
-    }
-    return previousAddEventListener.call(this, type, listener, options);
-  };
-  signalPrototype.removeEventListener = function (type, listener, options) {
-    if (type === 'abort') {
-      activeAbortListeners.get(this)?.delete(listener);
-    }
-    return previousRemoveEventListener.call(this, type, listener, options);
-  };
-  globalThis.sessionStorage = storage;
-  globalThis.fetch = async () => {
-    fetchCalls += 1;
-    return new Response('{}', { status: 200 });
-  };
-  globalThis.setTimeout = () => {
-    throw setupFailure;
-  };
-
-  try {
-    const auth = new GitHubAuthSession();
-    const caller = new AbortController();
-    await assert.rejects(
-      () => auth.ensureWorkerCompatible({ signal: caller.signal }),
-      error =>
-        error?.code === 'GITHUB_WORKER_INCOMPATIBLE' &&
-        error?.cause === setupFailure
-    );
-    assert.equal(fetchCalls, 0);
-    for (const listeners of activeAbortListeners.values()) {
-      assert.equal(listeners.size, 0);
-    }
-  } finally {
-    globalThis.setTimeout = previousSetTimeout;
-    globalThis.fetch = previousFetch;
-    signalPrototype.addEventListener = previousAddEventListener;
-    signalPrototype.removeEventListener = previousRemoveEventListener;
     if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
     else globalThis.sessionStorage = previousSessionStorage;
   }
@@ -2359,7 +1980,7 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
       return new Response(JSON.stringify({
         status: 'ok',
         service: 'Cellucid GitHub Auth',
-        contractVersion: 2,
+        contractVersion: 3,
         endpoints: [
           '/auth/login',
           '/auth/callback',
@@ -2368,6 +1989,8 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
           '/auth/installations',
           '/auth/installation-repos',
           '/cap/lookup-cells',
+          '/graphql/snapshot',
+          '/graphql/blobs',
           '/api/repos/*',
         ],
       }), { status: 200 });
@@ -2422,7 +2045,7 @@ test('restored GitHub sessions prove Worker capabilities before token-bearing re
       return new Response(JSON.stringify({
         status: 'ok',
         service: 'Cellucid GitHub Auth',
-        contractVersion: 2,
+        contractVersion: 3,
         endpoints: [
           '/auth/login',
           '/auth/callback',
@@ -2431,6 +2054,8 @@ test('restored GitHub sessions prove Worker capabilities before token-bearing re
           '/auth/installations',
           '/auth/installation-repos',
           '/cap/lookup-cells',
+          '/graphql/snapshot',
+          '/graphql/blobs',
           '/api/repos/*',
         ],
       }), { status: 200 });
@@ -2495,7 +2120,7 @@ test('overlapping GitHub sign-in preflights are generation-owned and caller-abor
   const liveResponse = () => new Response(JSON.stringify({
     status: 'ok',
     service: 'Cellucid GitHub Auth',
-    contractVersion: 2,
+    contractVersion: 3,
     endpoints: [
       '/auth/login',
       '/auth/callback',
@@ -2504,6 +2129,8 @@ test('overlapping GitHub sign-in preflights are generation-owned and caller-abor
       '/auth/installations',
       '/auth/installation-repos',
       '/cap/lookup-cells',
+      '/graphql/snapshot',
+      '/graphql/blobs',
       '/api/repos/*',
     ],
   }), { status: 200 });
@@ -3075,73 +2702,6 @@ test('GitHub auth observes caller cancellation at the final publication boundary
   }
 });
 
-test('GitHub auth request cancellation preserves the first abort cause', async () => {
-  const values = new Map([
-    [
-      'cellucid:github-app-auth:session',
-      '{"expiresAt":4102444800000,"token":"token-a","user":{"id":101,"login":"user-a"}}',
-    ],
-  ]);
-  const storage = {
-    getItem: (key) => values.has(key) ? values.get(key) : null,
-    setItem: (key, value) => values.set(String(key), String(value)),
-    removeItem: (key) => values.delete(String(key)),
-  };
-  const timers = [];
-  const previousSessionStorage = globalThis.sessionStorage;
-  const previousFetch = globalThis.fetch;
-  const previousSetTimeout = globalThis.setTimeout;
-  const previousClearTimeout = globalThis.clearTimeout;
-  globalThis.sessionStorage = storage;
-  globalThis.setTimeout = (callback) => {
-    timers.push(callback);
-    return timers.length;
-  };
-  globalThis.clearTimeout = () => {};
-  globalThis.fetch = (_url, options) =>
-    new Promise((_resolve, reject) => {
-      options.signal.addEventListener('abort', () => {
-        queueMicrotask(() => {
-          const error = new Error('synthetic transport abort');
-          error.name = 'AbortError';
-          reject(error);
-        });
-      }, { once: true });
-    });
-  try {
-    const auth = new GitHubAuthSession();
-    auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
-    // The restored sign-in's own end is a timer too; only request timers count here.
-    timers.length = 0;
-
-    const timeoutThenCaller = new AbortController();
-    const timeoutFirst = auth.listInstallations({
-      signal: timeoutThenCaller.signal,
-    });
-    timers[0]();
-    timeoutThenCaller.abort();
-    await assert.rejects(timeoutFirst, {
-      code: 'TIMEOUT',
-    });
-
-    const callerThenTimeout = new AbortController();
-    const callerFirst = auth.listInstallations({
-      signal: callerThenTimeout.signal,
-    });
-    callerThenTimeout.abort();
-    timers[1]();
-    await assert.rejects(callerFirst, { name: 'AbortError' });
-    assert.equal(auth.isAuthenticated(), true);
-    assert.deepEqual(auth.getUser(), { id: 101, login: 'user-a' });
-  } finally {
-    globalThis.fetch = previousFetch;
-    globalThis.setTimeout = previousSetTimeout;
-    globalThis.clearTimeout = previousClearTimeout;
-    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
-    else globalThis.sessionStorage = previousSessionStorage;
-  }
-});
-
 test('GitHub auth publishes only storage-durable generations', async () => {
   const values = new Map([
     [
@@ -3322,7 +2882,7 @@ test('GitHub installation discovery rejects response fields outside its contract
   globalThis.sessionStorage = storage;
   globalThis.fetch = async () =>
     new Response(
-      '{"installations":[{"id":7,"account":{"login":"owner"},"extra":true}]}',
+      '{"items":[{"id":7,"account":{"login":"owner"},"extra":true}],"nextPage":null}',
       { status: 200 }
     );
   try {
@@ -3331,56 +2891,6 @@ test('GitHub installation discovery rejects response fields outside its contract
     await assert.rejects(
       () => auth.listInstallations(),
       /must contain exactly: account, id \(unexpected: extra\)/
-    );
-  } finally {
-    globalThis.fetch = previousFetch;
-    if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
-    else globalThis.sessionStorage = previousSessionStorage;
-  }
-});
-
-test('GitHub installation discovery bounds every client-side collection', async () => {
-  const values = new Map([
-    [
-      'cellucid:github-app-auth:session',
-      '{"expiresAt":4102444800000,"token":"token","user":{"id":42,"login":"researcher"}}',
-    ],
-  ]);
-  const storage = {
-    getItem: key => values.has(key) ? values.get(key) : null,
-    setItem: (key, value) => values.set(String(key), String(value)),
-    removeItem: key => values.delete(String(key)),
-  };
-  const installations = Array.from({ length: 10_001 }, (_, index) => ({
-    id: index + 1,
-    account: { login: `owner-${index}` },
-  }));
-  const repositories = Array.from({ length: 10_001 }, (_, index) => ({
-    id: index + 1,
-    full_name: `owner/repository-${index}`,
-    private: false,
-  }));
-  const previousSessionStorage = globalThis.sessionStorage;
-  const previousFetch = globalThis.fetch;
-  globalThis.sessionStorage = storage;
-  globalThis.fetch = async url => new Response(
-    JSON.stringify(
-      String(url).endsWith('/auth/installations')
-        ? { installations }
-        : { repositories }
-    ),
-    { status: 200 }
-  );
-  try {
-    const auth = new GitHubAuthSession();
-    auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
-    await assert.rejects(
-      () => auth.listInstallations(),
-      /array of at most 10000 items/
-    );
-    await assert.rejects(
-      () => auth.listInstallationRepos(7),
-      /array of at most 10000 items/
     );
   } finally {
     globalThis.fetch = previousFetch;
@@ -3657,15 +3167,15 @@ test('merge contract rejects duplicate mappings and cycles', () => {
   const duplicate = validMerges();
   duplicate.merges.push({
     ...duplicate.merges[0],
-    intoSuggestionId: 'other',
+    intoSuggestionId: 'ghid_9_other',
   });
   assert.throws(() => assertMergesDocument(duplicate), /duplicates an existing/);
 
   const cycle = validMerges();
   cycle.merges.push({
     bucket: 'cell_type:Alpha',
-    fromSuggestionId: 'into',
-    intoSuggestionId: 'from',
+    fromSuggestionId: 'ghid_8_into',
+    intoSuggestionId: 'ghid_7_from',
     by: 'ghid_42',
     at: '2026-07-25T01:02:04.456Z',
   });
@@ -3710,23 +3220,16 @@ test('local publisher rejects unknown in-memory suggestion fields instead of dro
 });
 
 
-test('schema identities are exact and do not accept alternate ids', () => {
-  for (const [kind, id] of Object.entries(ANNOTATION_CONTRACT_IDS)) {
-    assert.doesNotThrow(() =>
-      assertSchemaIdentity({
-        $schema: 'https://json-schema.org/draft/2020-12/schema',
-        $id: id,
-      }, kind)
-    );
-    assert.throws(
-      () =>
-        assertSchemaIdentity({
-          $schema: 'https://json-schema.org/draft/2020-12/schema',
-          $id: `${id}.alternate`,
-        }, kind),
-      /must equal/
-    );
+test('schema identity is the canonical schema content, by git blob id', () => {
+  // tests/community-annotation-contract-corpus.test.mjs recomputes these ids
+  // from the schema texts; the $id-only check they replace is gone.
+  assert.deepEqual(Object.keys(ANNOTATION_SCHEMA_BLOB_OIDS).sort(), ['config', 'merges', 'user']);
+  for (const oid of Object.values(ANNOTATION_SCHEMA_BLOB_OIDS)) {
+    assert.match(oid, /^[0-9a-f]{40}$/);
   }
+  assert.ok(Object.isFrozen(ANNOTATION_SCHEMA_BLOB_OIDS));
+  assert.equal(Object.hasOwn(wireContract, 'assertSchemaIdentity'), false);
+  assert.equal(Object.hasOwn(wireContract, 'ANNOTATION_CONTRACT_IDS'), false);
 });
 
 test('local persistence rejects ambiguous compound vote keys before applying state', () => {
@@ -3759,11 +3262,12 @@ test('local persistence rejects ambiguous compound vote keys before applying sta
     producer._saveNow();
 
     const payload = parseExactJson(values.get(key));
-    payload.suggestions['cell_type:Alpha'][0].id = 'C';
+    payload.suggestions['cell_type:Alpha'][0].id = 'ghid_42_C';
     payload.myVotes = {
       // If an ID containing ":" were parsed by the old last-delimiter rule,
-      // this would silently move B:C from Alpha to legal id C in Alpha:B.
-      'cell_type:Alpha:B:C': 'up',
+      // this would silently move B:ghid_42_C from Alpha to legal id
+      // ghid_42_C in Alpha:B.
+      'cell_type:Alpha:B:ghid_42_C': 'up',
     };
     values.set(key, JSON.stringify(payload));
     producer._scopeLock.release();
@@ -3788,15 +3292,15 @@ test('local persistence rejects ambiguous compound vote keys before applying sta
       'cell_type:Alpha:B': [suggestion],
     };
     payload.myVotes = {
-      'cell_type:Alpha:B:C': 'up',
+      'cell_type:Alpha:B:ghid_42_C': 'up',
     };
     values.set(key, JSON.stringify(payload));
 
     const accepted = new CommunityAnnotationSession();
     accepted.setCacheContext(scope);
-    assert.equal(accepted.getSuggestions('cell_type', 'Alpha:B')[0].id, 'C');
+    assert.equal(accepted.getSuggestions('cell_type', 'Alpha:B')[0].id, 'ghid_42_C');
     assert.equal(
-      accepted.getMyVoteDirect('cell_type', 'Alpha:B', 'C'),
+      accepted.getMyVoteDirect('cell_type', 'Alpha:B', 'ghid_42_C'),
       'up'
     );
     accepted._scopeLock.release();
@@ -4145,176 +3649,6 @@ test('local persistence stores only exact wire suggestion fields', () => {
 });
 
 
-test('GitHub pull returns only exact path/SHA/document records', async () => {
-  const previousFetch = globalThis.fetch;
-  // The repository holds the contributor's file; the pull hands the app the
-  // open dataset's view of it.
-  const document = composeUserFile(null, 'synthetic', validRemoteUser());
-  const responses = [
-    {
-      tree: [
-        {
-          type: 'blob',
-          path: 'annotations/users/ghid_7.json',
-          sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          size: Buffer.byteLength(JSON.stringify(document), 'utf8'),
-        },
-      ],
-      truncated: false,
-    },
-    {
-      encoding: 'base64',
-      content: Buffer.from(JSON.stringify(document), 'utf8').toString('base64'),
-    },
-  ];
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify(responses.shift()), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  try {
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId: 'synthetic',
-      owner: 'owner',
-      repo: 'repo',
-      token: 'test-token',
-      branch: 'main',
-      workerOrigin: 'https://worker.example',
-    });
-    const docs = [];
-    const result = await sync.pullAllUsers({ onRecords: async records => { docs.push(...records); } });
-    result.docs = docs;
-    assert.deepEqual(result.docs, [
-      {
-        path: 'annotations/users/ghid_7.json',
-        sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        doc: projectUserFile(document, 'synthetic'),
-      },
-    ]);
-    assert.equal(Object.hasOwn(result.docs[0], '__path'), false);
-    assert.equal(Object.hasOwn(result.docs[0].doc, '__invalid'), false);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-
-test('GitHub pull rejects one invalid user blob instead of returning a partial set', async () => {
-  const previousFetch = globalThis.fetch;
-  const invalid = {
-    ...composeUserFile(null, 'synthetic', validRemoteUser()),
-    unknownField: true,
-  };
-  const responses = [
-    {
-      tree: [
-        {
-          type: 'blob',
-          path: 'annotations/users/ghid_7.json',
-          sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          size: Buffer.byteLength(JSON.stringify(invalid), 'utf8'),
-        },
-      ],
-      truncated: false,
-    },
-    {
-      encoding: 'base64',
-      content: Buffer.from(JSON.stringify(invalid), 'utf8').toString('base64'),
-    },
-  ];
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify(responses.shift()), { status: 200 });
-  try {
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId: 'synthetic',
-      owner: 'owner',
-      repo: 'repo',
-      token: 'test-token',
-      branch: 'main',
-      workerOrigin: 'https://worker.example',
-    });
-    await assert.rejects(
-      () => sync.pullAllUsers({ onRecords: async () => {} }),
-      /unknown field.*unknownField|unknownField.*unknown field/i
-    );
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('browser JSON boundary rejects decoded duplicate object keys', async () => {
-  const previousFetch = globalThis.fetch;
-  const encodedDuplicate = JSON.stringify(validRemoteUser()).replace(
-    '{"version":1,',
-    '{"version":1,"\\u0076ersion":1,'
-  );
-  const responses = [
-    {
-      tree: [
-        {
-          type: 'blob',
-          path: 'annotations/users/ghid_7.json',
-          sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          size: Buffer.byteLength(encodedDuplicate, 'utf8'),
-        },
-      ],
-      truncated: false,
-    },
-    {
-      encoding: 'base64',
-      content: Buffer.from(encodedDuplicate, 'utf8').toString('base64'),
-    },
-  ];
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify(responses.shift()), { status: 200 });
-  try {
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId: 'synthetic',
-      owner: 'owner',
-      repo: 'repo',
-      token: 'test-token',
-      branch: 'main',
-      workerOrigin: 'https://worker.example',
-    });
-    await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), /duplicate JSON object key "version"/);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('GitHub HTTP success requires one exact JSON response document', async (t) => {
-  for (const scenario of [
-    {
-      name: 'duplicate response keys',
-      body: '{"tree":[],"\\u0074ree":[]}',
-      pattern: /duplicate JSON object key "tree"/,
-    },
-    {
-      name: 'non-JSON response',
-      body: 'ok',
-      pattern: /returned invalid JSON/,
-    },
-  ]) {
-    await t.test(scenario.name, async () => {
-      const previousFetch = globalThis.fetch;
-      globalThis.fetch = async () => new Response(scenario.body, { status: 200 });
-      try {
-        const sync = new CommunityAnnotationGitHubSync({
-          datasetId: 'synthetic',
-          owner: 'owner',
-          repo: 'repo',
-          token: 'test-token',
-          branch: 'main',
-          workerOrigin: 'https://worker.example',
-        });
-        await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), scenario.pattern);
-      } finally {
-        globalThis.fetch = previousFetch;
-      }
-    });
-  }
-});
-
 test('CAP exact ontology lookup never substitutes the first approximate result', async (t) => {
   const capResult = (overrides = {}) => ({
     id: 'cap-result-1',
@@ -4331,7 +3665,7 @@ test('CAP exact ontology lookup never substitutes the first approximate result',
   });
   const responseFor = results =>
     new Response(JSON.stringify({
-      contractVersion: 2,
+      contractVersion: 3,
       results,
       omittedInvalidCount: 0,
     }), {
@@ -4363,7 +3697,7 @@ test('CAP HTTP success rejects duplicate JSON keys', async () => {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response(
-      '{"contractVersion":2,"results":[],"\\u0072esults":[],"omittedInvalidCount":0}',
+      '{"contractVersion":3,"results":[],"\\u0072esults":[],"omittedInvalidCount":0}',
       { status: 200 }
     );
   try {
@@ -4373,109 +3707,6 @@ test('CAP HTTP success rejects duplicate JSON keys', async () => {
     );
   } finally {
     globalThis.fetch = previousFetch;
-  }
-});
-
-test('GitHub pull rejects non-current JSON filenames under annotations/users', async () => {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({
-      tree: [
-        {
-          type: 'blob',
-          path: 'annotations/users/researcher.json',
-          sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          size: 0,
-        },
-      ],
-      truncated: false,
-    }), { status: 200 });
-  try {
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId: 'synthetic',
-      owner: 'owner',
-      repo: 'repo',
-      token: 'test-token',
-      branch: 'main',
-      workerOrigin: 'https://worker.example',
-    });
-    await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), /Invalid annotation user-file path/);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('GitHub pull rejects truncated trees instead of compiling a partial repository', async () => {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ tree: [], truncated: true }), { status: 200 });
-  try {
-    const sync = new CommunityAnnotationGitHubSync({
-      datasetId: 'synthetic',
-      owner: 'owner',
-      repo: 'repo',
-      token: 'test-token',
-      branch: 'main',
-      workerOrigin: 'https://worker.example',
-    });
-    await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), /truncated git tree/);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('GitHub pull rejects alternate blob encodings and UTF-8 BOM input', async (t) => {
-  const document = validRemoteUser();
-  for (const scenario of [
-    {
-      name: 'alternate encoding',
-      blob: { encoding: 'utf-8', content: JSON.stringify(document) },
-      pattern: /must use base64 encoding/,
-    },
-    {
-      name: 'UTF-8 BOM',
-      blob: {
-        encoding: 'base64',
-        content: Buffer.from(`\uFEFF${JSON.stringify(document)}`, 'utf8').toString('base64'),
-      },
-      pattern: /invalid JSON value/,
-    },
-  ]) {
-    await t.test(scenario.name, async () => {
-      const previousFetch = globalThis.fetch;
-      const responses = [
-        {
-          tree: [
-            {
-              type: 'blob',
-              path: 'annotations/users/ghid_7.json',
-              sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-              size: Buffer.from(
-                scenario.blob.content,
-                scenario.blob.encoding === 'base64' ? 'base64' : 'utf8'
-              ).byteLength,
-            },
-          ],
-          truncated: false,
-        },
-        scenario.blob,
-      ];
-      globalThis.fetch = async () =>
-        new Response(JSON.stringify(responses.shift()), { status: 200 });
-      try {
-        const sync = new CommunityAnnotationGitHubSync({
-          datasetId: 'synthetic',
-          owner: 'owner',
-          repo: 'repo',
-          token: 'test-token',
-          branch: 'main',
-          workerOrigin: 'https://worker.example',
-        });
-        await assert.rejects(() => sync.pullAllUsers({ onRecords: async () => {} }), scenario.pattern);
-      } finally {
-        globalThis.fetch = previousFetch;
-      }
-    });
   }
 });
 
@@ -4553,54 +3784,6 @@ test('raw-file cache fails visibly when IndexedDB is unavailable', async () => {
   }
 });
 
-test('raw-file SHA index and prefix filters use one exact representation', () => {
-  const previousLocalStorage = globalThis.localStorage;
-  const values = new Map();
-  globalThis.localStorage = {
-    getItem: (key) => values.has(key) ? values.get(key) : null,
-    setItem: (key, value) => values.set(String(key), String(value)),
-    removeItem: (key) => values.delete(String(key)),
-  };
-  const scope = {
-    datasetId: 'cache-exact',
-    repoRef: 'owner/repo@main',
-    userId: 42,
-  };
-  const indexKey = toFileShaIndexKey(scope);
-  const cache = new CommunityAnnotationFileCache();
-  cache._db = {};
-  try {
-    values.set(indexKey, JSON.stringify({
-      'annotations/users/ghid_42.json':
-        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    }));
-    assert.deepEqual(
-      cache.getKnownShas(scope, {
-        prefixes: ['annotations/users/'],
-      }),
-      {
-        'annotations/users/ghid_42.json':
-          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      }
-    );
-    assert.throws(
-      () => cache.getKnownShas(scope, { prefixes: 'annotations/users/' }),
-      /array or null/
-    );
-    values.set(indexKey, JSON.stringify({
-      'annotations/users/ghid_42.json': 'short-sha',
-    }));
-    assert.throws(
-      () => cache.getKnownShas(scope),
-      /SHA index/
-    );
-  } finally {
-    if (previousLocalStorage === undefined) delete globalThis.localStorage;
-    else globalThis.localStorage = previousLocalStorage;
-  }
-});
-
-
 test('counts and exported keys have no fixed limit; the 1 MB file bounds them', () => {
   // A category label as long as an export may write, many markers, many
   // buckets, and a minimum voter count above the former 50.
@@ -4613,7 +3796,7 @@ test('counts and exported keys have no fixed limit; the 1 MB file bounds them', 
       ...buckets,
       [longBucket]: [
         {
-          id: 'suggestion-long',
+          id: 'ghid_7_suggestion-long',
           label: 'T cell',
           ontologyId: null,
           evidence: null,
@@ -4701,4 +3884,179 @@ test('GitHub sign-in lasts as long as its token: an expired one is forgotten, an
     if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
     else globalThis.sessionStorage = previousSessionStorage;
   }
+});
+
+test('user and merges files are version 3; dataset views keep version 1 of their own', () => {
+  assert.equal(ANNOTATION_USER_FILE_VERSION, 3);
+  assert.equal(ANNOTATION_MERGES_FILE_VERSION, 3);
+  const file = composeUserFile(null, 'synthetic', validRemoteUser(), { filename: 'ghid_7.json' });
+  assert.equal(file.version, 3);
+  assert.equal(projectUserFile(file, 'synthetic').version, 1);
+  for (const version of [1, 2, 4, '3']) {
+    assert.throws(() => assertUserFile({ ...file, version }), /\["version"\]: must equal 3/);
+    assert.throws(() => projectUserFile({ ...file, version }, 'synthetic'), /\["version"\]: must equal 3/);
+  }
+  const merges = composeMergesFile(null, 'synthetic', validMerges());
+  assert.equal(merges.version, 3);
+  assert.equal(projectMergesFile(merges, 'synthetic').version, 1);
+  for (const version of [1, 2, 4]) {
+    assert.throws(() => assertMergesFile({ ...merges, version }), /\["version"\]: must equal 3/);
+    assert.throws(() => projectMergesFile({ ...merges, version }, 'synthetic'), /\["version"\]: must equal 3/);
+  }
+});
+
+test('a suggestion id names its owner, and only its proposer may own it', () => {
+  assert.equal(annotationSuggestionIdOwner('ghid_7_0f8fad5b-d9cb-469f-a165-70867728950e'), 'ghid_7');
+  assert.equal(annotationSuggestionIdOwner('ghid_12_x'), 'ghid_12');
+  assert.equal(annotationSuggestionIdOwner('ghid_1_2_x'), 'ghid_1');
+  assert.equal(annotationSuggestionIdOwner('ghid_7__x'), 'ghid_7');
+  assert.equal(annotationSuggestionIdOwner('ghid_7_a\nb'), 'ghid_7');
+  for (const id of [
+    'suggestion', 'ghid_7', 'ghid_7_', 'ghid_7x', 'ghid_07_x', 'ghid_0_x', 'GHID_7_x',
+    'ghid_7_ x', 'ghid_7_x ', 'ghid_7_a:b', ` ghid_7_x`, null, 7,
+    `ghid_7_x${String.fromCharCode(0x85)}`, `ghid_7_${String.fromCharCode(0xfeff)}x`,
+  ]) {
+    assert.equal(annotationSuggestionIdOwner(id), null, JSON.stringify(id));
+  }
+
+  // ghid_1_ never prefixes ghid_12_: the digits end at the separator.
+  const twelve = validRemoteUser({ username: 'ghid_12', githubUserId: 12 });
+  const suggestion = twelve.suggestions['cell_type:Alpha'][0];
+  suggestion.proposedBy = 'ghid_12';
+  suggestion.id = 'ghid_1_2_x';
+  assert.throws(() => assertUserDocument(twelve), /\["id"\]: must start with "ghid_12_"/);
+  suggestion.id = 'ghid_12_x';
+  assert.doesNotThrow(() => assertUserDocument(twelve));
+  const one = validRemoteUser({ username: 'ghid_1', githubUserId: 1 });
+  one.suggestions['cell_type:Alpha'][0].proposedBy = 'ghid_1';
+  one.suggestions['cell_type:Alpha'][0].id = 'ghid_12_x';
+  assert.throws(() => assertUserDocument(one), /must start with "ghid_1_"/);
+
+  // Votes, comments and merges may name anyone's suggestion; deletion
+  // markers name only the owner's.
+  assert.doesNotThrow(() => assertUserDocument(validRemoteUser({
+    votes: { 'ghid_99_theirs': 'up' },
+    comments: { 'ghid_99_theirs': [] },
+    deletedSuggestions: { 'cell_type:Alpha': ['ghid_7_mine'] },
+  })));
+  assert.throws(
+    () => assertUserDocument(validRemoteUser({ deletedSuggestions: { 'cell_type:Alpha': ['ghid_99_theirs'] } })),
+    /must name a suggestion of the file owner \(start with "ghid_7_"\)/
+  );
+  for (const field of ['votes', 'comments']) {
+    assert.throws(
+      () => assertUserDocument(validRemoteUser({ [field]: { legacy: field === 'votes' ? 'up' : [] } })),
+      /must have the form ghid_<n>_<id>/
+    );
+  }
+  const merges = validMerges();
+  merges.merges[0].fromSuggestionId = 'from';
+  assert.throws(() => assertMergesDocument(merges), /fromSuggestionId"\]: suggestion identifiers must have the form/);
+});
+
+test('whitespace is the contract class at every text edge, and is kept inside text', () => {
+  for (const code of [0x1c, 0x1f, 0x85, 0xa0, 0x2028, 0x3000, 0xfeff]) {
+    const character = String.fromCharCode(code);
+    assert.equal(isAnnotationExactNonblank(`${character}T cell`), false);
+    assert.equal(isAnnotationExactNonblank(`T cell${character}`), false);
+    assert.equal(isAnnotationExactNonblank(`T${character}cell`), true);
+    const label = validRemoteUser();
+    label.suggestions['cell_type:Alpha'][0].label = `T cell${character}`;
+    assert.throws(() => assertUserDocument(label), /leading or trailing whitespace/);
+    const blank = validRemoteUser();
+    blank.suggestions['cell_type:Alpha'][0].label = character;
+    assert.throws(() => assertUserDocument(blank), /must be nonblank/);
+  }
+  for (const code of [0x180e, 0x200b, 0x2060]) {
+    assert.equal(isAnnotationExactNonblank(`${String.fromCharCode(code)}T`), true);
+  }
+  assert.equal(isAnnotationExactNonblank(''), false);
+  assert.equal(isAnnotationExactNonblank(7), false);
+});
+
+test('reading one dataset of a user file judges only the profile and that section', () => {
+  const file = composeUserFile(null, 'synthetic', validRemoteUser(), { filename: 'ghid_7.json' });
+  const clean = projectUserFile(file, 'synthetic', { filename: 'ghid_7.json' });
+  const broken = structuredClone(file);
+  broken.datasets.other = { suggestions: 'not a map' };
+  broken.datasets['other '] = 5;
+  assert.throws(() => assertUserFile(broken, { filename: 'ghid_7.json' }), /datasets/);
+  assert.deepEqual(projectUserFile(broken, 'synthetic', { filename: 'ghid_7.json' }), clean);
+  // A dataset the file has no section for reads as an empty view.
+  const empty = projectUserFile(broken, 'absent', { filename: 'ghid_7.json' });
+  assert.deepEqual([empty.suggestions, empty.votes], [{}, {}]);
+  assert.equal(Object.hasOwn(empty, 'datasets'), false);
+  // The open dataset's own section and the profile still decide.
+  assert.throws(() => projectUserFile(broken, 'other'), /\["datasets"\]\["other"\]/);
+  const badSection = structuredClone(file);
+  badSection.datasets.synthetic.votes = { 'ghid_8_x': 'sideways' };
+  assert.throws(() => projectUserFile(badSection, 'synthetic'), /must equal "up" or "down"/);
+  assert.throws(
+    () => projectUserFile({ ...file, orcid: '0000-0002-1825-0098' }, 'absent'),
+    /ORCID/
+  );
+  assert.throws(() => projectUserFile(file, 'synthetic', { filename: 'ghid_8.json' }), /filename must be exactly/);
+  // The view is the app's own copy.
+  clean.suggestions['cell_type:Alpha'][0].label = 'changed';
+  assert.equal(file.datasets.synthetic.suggestions['cell_type:Alpha'][0].label, 'T cell');
+});
+
+test('reading one dataset of the merges file judges only that dataset', () => {
+  const file = composeMergesFile(null, 'synthetic', validMerges());
+  const broken = structuredClone(file);
+  broken.merges.push(
+    { ...file.merges[0], datasetId: 'other', intoSuggestionId: file.merges[0].fromSuggestionId },
+    5,
+    { datasetId: 7 }
+  );
+  assert.throws(() => assertMergesFile(broken), /merges/);
+  assert.deepEqual(projectMergesFile(broken, 'synthetic'), projectMergesFile(file, 'synthetic'));
+  assert.throws(() => projectMergesFile(broken, 'other'), /must differ/);
+  assert.deepEqual(projectMergesFile(broken, 'absent').merges, []);
+  assert.throws(() => projectMergesFile({ ...file, merges: {} }, 'synthetic'), /must be a JSON array/);
+});
+
+test('exact JSON parsing returns what JSON.parse returns and names the first problem', () => {
+  for (const text of [
+    '{"a":[1,-0,1.5E+2,1e400,-1e-400,"x\\n\\u0041\\ud800",true,false,null],"b":{}}',
+    ' [ ] ',
+    '"text"',
+    '{"constructor":1,"toString":{"valueOf":2},"2":"two","1":"one"}',
+  ]) {
+    const exact = parseExactJson(text);
+    assert.deepEqual(exact, JSON.parse(text));
+    assert.deepEqual(Object.keys(exact), Object.keys(JSON.parse(text)));
+  }
+  const negativeZero = parseExactJson('[-0]')[0];
+  assert.ok(Object.is(negativeZero, -0));
+  const proto = parseExactJson('{"__proto__":{"polluted":true}}');
+  assert.equal(Object.getPrototypeOf(proto), Object.prototype);
+  assert.deepEqual(Object.keys(proto), ['__proto__']);
+  assert.equal(({}).polluted, undefined);
+
+  for (const [text, message] of [
+    ['{"a":1,"a":2}', /at character 7: duplicate JSON object key "a"/],
+    ['{"a":1,"\\u0061":2}', /duplicate JSON object key "a"/],
+    ['{"a":"x\ty"}', /at character 7: unescaped control character in JSON string/],
+    ['{"a":"\\x"}', /at character 6: invalid JSON string escape/],
+    ['{"a":"\\u12"}', /invalid JSON Unicode escape/],
+    ['{"a":"x', /at character 5: unterminated JSON string/],
+    ['{"a":1} x', /unexpected content after the JSON value/],
+    ['{a:1}', /expected a JSON string/],
+    ['{"a" 1}', /expected ":" after JSON object key/],
+    ['[1 2]', /expected "," or "\]" in JSON array/],
+    ['{"a":1 "b":2}', /expected "," or "\}" in JSON object/],
+    ['', /expected a JSON value/],
+    ['NaN', /invalid JSON value/],
+    ['01', /unexpected content after the JSON value/],
+    [`${String.fromCharCode(0xfeff)}{}`, /invalid JSON value/],
+    ['['.repeat(513) + ']'.repeat(513), /at character 512: JSON nesting exceeds 512 levels/],
+  ]) {
+    assert.throws(() => parseExactJson(text, { path: 'file.json' }), (error) => (
+      error.code === 'COMMUNITY_ANNOTATION_CONTRACT_INVALID' &&
+      error.message.startsWith('file.json at character') &&
+      message.test(error.message)
+    ), text);
+  }
+  assert.throws(() => parseExactJson(7), /JSON input must be a string/);
 });

@@ -113,6 +113,6 @@ test('a link opened from the bar over a dataset says its host\'s fault in a noti
   failing = false;
   await card.locator('.notification-action').click();
   await expect(page.locator('#notification-center .notification')
-    .filter({ hasText: /atlas\.h5ad was not found at data\.example\.test \(HTTP 404, not found\)/ })).toHaveCount(1, { timeout: 30_000 });
+    .filter({ hasText: /atlas\.h5ad was not found at data\.example\.test \(HTTP 404, not found\)/ })).toHaveCount(1);
   await expect(page.locator('#dataset-name')).toHaveText(shown);
 });

@@ -12,6 +12,7 @@ import { StateValidator } from '../../utils/state-validator.js';
 import { createButton, createDisclosure } from '../components/controls.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { dispatchFromControl } from '../../actions/control-dispatch.js';
 
 const INIT_KEYS = new Set(['state', 'deletedFieldsSection']);
 
@@ -23,21 +24,6 @@ function requireMethod(owner, methodName, label) {
   ) {
     throw new TypeError(`${label} must implement ${methodName}()`);
   }
-}
-
-function requireBoolean(value, label) {
-  if (typeof value !== 'boolean') {
-    throw new TypeError(`${label} must be exactly boolean`);
-  }
-  return value;
-}
-
-function requireTrue(value, label) {
-  requireBoolean(value, label);
-  if (value !== true) {
-    throw new Error(`${label} did not complete`);
-  }
-  return true;
 }
 
 function requireError(value, label) {
@@ -150,39 +136,6 @@ function readPanelOpen(section) {
   );
 }
 
-function requireRestoreFieldResult(value) {
-  requireExactKeys(
-    value,
-    new Set(['ok', 'originalKey', 'key', 'userDefinedId']),
-    'Restore field result'
-  );
-  requireTrue(value.ok, 'Restore field result.ok');
-  StateValidator.validateFieldKey(value.originalKey);
-  StateValidator.validateFieldKey(value.key);
-  if (value.userDefinedId !== null) {
-    requireIdentifier(
-      value.userDefinedId,
-      'Restore field result.userDefinedId'
-    );
-  }
-  return value;
-}
-
-function requireRestoreVirtualResult(value) {
-  requireExactKeys(
-    value,
-    new Set(['ok', 'key', 'userDefinedId']),
-    'Restore virtual field result'
-  );
-  requireTrue(value.ok, 'Restore virtual field result.ok');
-  StateValidator.validateFieldKey(value.key);
-  requireIdentifier(
-    value.userDefinedId,
-    'Restore virtual field result.userDefinedId'
-  );
-  return value;
-}
-
 /**
  * @param {object} options
  * @param {import('../../state/core/data-state.js').DataState} options.state
@@ -195,11 +148,7 @@ export function initDeletedFieldsPanel(options) {
     'getDatasetGeneration',
     'getFields',
     'getUserDefinedFieldsRegistry',
-    'getVarFields',
-    'purgeDeletedField',
-    'purgeUserDefinedField',
-    'restoreField',
-    'restoreUserDefinedField'
+    'getVarFields'
   ]) {
     requireMethod(state, methodName, 'Deleted fields panel state');
   }
@@ -279,15 +228,6 @@ export function initDeletedFieldsPanel(options) {
         'Deleted field transient cleanup failed'
       );
     }
-  }
-
-  function reportActionFailure(error, action) {
-    const exactError = requireError(error, `Deleted field ${action}`);
-    console.error(exactError);
-    getNotificationCenter().error(
-      `Failed to ${action} field: ${exactError.message}`,
-      { category: 'filter' }
-    );
   }
 
   function readInventories() {
@@ -495,20 +435,17 @@ export function initDeletedFieldsPanel(options) {
           retired = true;
           releaseTransient();
           if (!ownsInteraction || !isCapturedFieldCurrent()) return;
-          try {
-            requireTrue(
-              index >= 0
-                ? state.purgeDeletedField(source, index)
-                : state.purgeUserDefinedField(userDefinedId, source),
-              'Deleted field purge result'
-            );
+          void dispatchFromControl(
+            'field.purge',
+            { field: { source, key: field.key } },
+            { failure: 'Failed to confirm deletion of field', category: 'filter' }
+          ).then(done => {
+            if (done === null) return;
             getNotificationCenter().success(
               `Confirmed deletion of "${field.key}"`,
               { category: 'filter', duration: 2500 }
             );
-          } catch (error) {
-            reportActionFailure(error, 'confirm deletion of');
-          }
+          });
         },
         onCancel: () => {
           retired = true;
@@ -522,19 +459,17 @@ export function initDeletedFieldsPanel(options) {
       return;
     }
 
-    try {
-      const result = index >= 0
-        ? requireRestoreFieldResult(state.restoreField(source, index))
-        : requireRestoreVirtualResult(
-            state.restoreUserDefinedField(userDefinedId, source)
-          );
+    void dispatchFromControl(
+      'field.restore',
+      { field: { source, key: field.key } },
+      { failure: 'Failed to restore field', category: 'filter' }
+    ).then(done => {
+      if (done === null) return;
       getNotificationCenter().success(
-        `Restored "${result.key}"`,
+        `Restored "${done.outcome.name}"`,
         { category: 'filter', duration: 2500 }
       );
-    } catch (error) {
-      reportActionFailure(error, 'restore');
-    }
+    });
   }, { signal: lifecycle.signal });
 
   function destroy() {

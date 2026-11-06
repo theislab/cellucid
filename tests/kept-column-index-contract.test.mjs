@@ -35,6 +35,8 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { annData, countingStore, dataFrame, dense, mapping, sparse, strings } from './helpers/anndata-store.mjs';
@@ -897,6 +899,8 @@ const LEFT_OUT = new Map([
   ['assets/js/formats/io/link.js', 'link measurement'],
   ['assets/js/formats/io/mirrors.js', 'transport'],
   ['assets/js/utils/abort.js', 'cancellation'],
+  // Which opening is planned (which cells, in which order, read when), from rates held or measured: never what an index of those cells holds.
+  ['assets/js/utils/machine.js', 'the rates a plan weighs'],
   ['assets/js/formats/io/activity.js', 'progress reporting'],
   ['assets/js/formats/io/decode-pool.js', 'runs the codecs (guarded through the decode worker) on worker threads'],
   ['assets/js/data/memory-budget.js', 'residency policy'],
@@ -914,6 +918,11 @@ const INDEX_REVISIONS = [
   { revision: 3, digest: '7d85049a16f011129dc54e2fcca3740d65c227545a8bf2b3d52590ff9bcc0777' },
   { revision: 4, digest: 'ec7d398d15e12de0e37b53ef532581e5e96f2a726d492005a818a0bace7cd80c' },
   { revision: 5, digest: '60a10902a751aacecf49d4934ffbaba36b8aa90e69699de936e06fae3567ccff' },
+  { revision: 6, digest: '07c69ba853b46f61dac4cc636e9b8d26692dd255c1afe777bc33fd08a1c96b67' },
+  { revision: 7, digest: '6a7969a3f8993fa1d559e83a189234d1a11620bc026f2a84e646c7ecee15369d' },
+  { revision: 8, digest: '8560778575098ff604f63c6564bbfb1d23c5ccf4b32bd8605fb77ab0567ac4ab' },
+  // The rates a plan weighs are read through `utils/machine.js` (the kept-read rate, the index pass rates, the cores); nothing an index holds changed.
+  { revision: 9, digest: 'cec9f65e01ec9f5d74e721e8267e00b9c0ef60256190787e3592e0d99646b927' },
 ];
 
 test('the kept-index revision is raised whenever the code that decides what an index holds changes', () => {

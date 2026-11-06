@@ -16,14 +16,11 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { armSelection } from './helpers/selection-gesture.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
   + '&dataset=current-ui&acceptance=annotation-pane-field-ci';
-
-// How long a gesture that did land may take to arm its tool before it counts
-// as dropped; see highlight-selection-feedback.spec.mjs.
-const GESTURE_LANDING_TIMEOUT_MS = 3_000;
 
 // Mirrors `ANNOTATION_DRAG_VALUE_SCALE` in annotation-cells.js: the value
 // span one CSS pixel of vertical drag covers, as a fraction of the range.
@@ -122,23 +119,6 @@ async function findPaneCells(page, viewId, limit) {
   return points;
 }
 
-/** Repeat `gesture` until the annotation step controls appear. */
-async function armAnnotation(page, gesture) {
-  const controls = page.locator('#annotation-step-controls');
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await gesture();
-    const armed = await controls.waitFor({
-      state: 'attached',
-      timeout: GESTURE_LANDING_TIMEOUT_MS,
-    }).then(() => true, error => {
-      if (error?.name !== 'TimeoutError') throw error;
-      return false;
-    });
-    if (armed) return;
-  }
-  await expect(controls).toBeAttached();
-}
-
 /**
  * Two panes: `live` colored by the categorical `cell_type` with `alpha`
  * hidden, and a kept view colored by the continuous `score` with every cell
@@ -178,7 +158,7 @@ test('Alt+click in an unfocused pane selects that pane\'s category among the cel
   const keptId = await openTwoPanes(page);
   const [point] = await findPaneCells(page, 'live', 1);
 
-  await armAnnotation(page, async () => {
+  await armSelection(page, 'annotation', async () => {
     await page.mouse.move(point.x, point.y);
     await page.keyboard.down('Alt');
     await page.mouse.down();
@@ -348,7 +328,7 @@ test('Alt+click in a colored pane selects although the focused view has no field
   );
 
   const [point] = await findPaneCells(page, 'live', 1);
-  await armAnnotation(page, async () => {
+  await armSelection(page, 'annotation', async () => {
     await page.mouse.move(point.x, point.y);
     await page.keyboard.down('Alt');
     await page.mouse.down();

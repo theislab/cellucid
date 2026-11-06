@@ -130,8 +130,9 @@ export function resolveExactGene(key, { keys, pending, failure }) {
  * @param {Error|null} [failure] - Why the gene names could not be read
  * @returns {string}
  */
-export function describeUnavailableGene(name, outcome, failure = null) {
-  const shown = String(name).trim();
+export function describeUnavailableGene(name, outcome, failure = null, quote = text => text) {
+  // `quote`: how the sentence writes the name (an agent's refusal marks it as data, `targets/names.js` `quoteName`).
+  const shown = quote(String(name).trim());
   switch (outcome?.kind) {
     case 'pending':
       return `Gene names are still being read: ${shown} can be chosen once they are listed.`;

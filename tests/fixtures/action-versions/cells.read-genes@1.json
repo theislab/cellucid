@@ -1,0 +1,22 @@
+{
+  "examples": [
+    {
+      "cells": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "cells": {
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "cells"
+    ],
+    "type": "object"
+  },
+  "type": "cells.read-genes",
+  "version": 1
+}

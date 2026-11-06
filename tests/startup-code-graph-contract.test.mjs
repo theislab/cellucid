@@ -97,6 +97,33 @@ test('the code-load watch runs before the module graph it watches, and hears eve
   assert.match(watchSource, /window\.addEventListener\('cellucid-code-load-failed'/);
 });
 
+test('the document is parsed, and the code started, only once the stylesheet is in', () => {
+  // A script waits for the stylesheets before it, so the style gate, straight
+  // after the stylesheet link, holds the parser there: no <body> exists in an
+  // unstyled page, and DOMContentLoaded (the boot's cue) follows the styles in
+  // every engine. WebKit does not hold DOMContentLoaded for a stylesheet by
+  // itself (tests/browser/style-gate.spec.mjs runs it in the engines).
+  const page = readFileSync(path.join(ROOT, 'index.html'), 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+  const head = page.slice(0, page.indexOf('</head>'));
+  const stylesheets = [...head.matchAll(/<link rel="stylesheet"[^>]*>/g)];
+  assert.equal(stylesheets.length, 1, 'the page has one stylesheet link, in its head');
+  assert.doesNotMatch(page.slice(page.indexOf('</head>')), /<link rel="stylesheet"/, 'no stylesheet link follows the gate');
+  const afterStylesheet = head.slice(stylesheets[0].index + stylesheets[0][0].length);
+  const gate = /^\s*<script id="cellucid-style-gate">([\s\S]*?)<\/script>\s*$/.exec(afterStylesheet);
+  assert.ok(gate !== null, 'the style gate is the next and last element of the head after the stylesheet link');
+  assert.match(gate[0], /^\s*<script id="cellucid-style-gate">/, 'a classic inline script: not a module, not deferred, not async');
+  assert.match(gate[1], /\.sheet\.cssRules\.length > 0/, 'it reads whether the stylesheet has rules');
+  assert.match(gate[1], /dataset\.styleLoadFailed = 'true'/, 'and says when it has none');
+  const boot = /<script id="cellucid-page-boot">([\s\S]*?)<\/script>/.exec(head);
+  assert.match(
+    boot[1],
+    /if \(document\.documentElement\.dataset\.styleLoadFailed === 'true'\) \{[\s\S]*?stylesheet: true[\s\S]*?return;\s*\}\s*import\(entry\)/,
+    'the boot starts no code in a page whose stylesheet did not load',
+  );
+  const watchSource = readFileSync(path.join(ROOT, 'assets', 'js', 'app', 'ui', 'core', 'code-load-watch.js'), 'utf8');
+  assert.match(watchSource, /if \(stylesheet === true\) \{\s*fail\('download'/);
+});
+
 test('main.js marks that its code started before anything else it runs', () => {
   const source = readFileSync(path.join(ROOT, 'assets', 'js', 'app', 'main.js'), 'utf8');
   const body = source

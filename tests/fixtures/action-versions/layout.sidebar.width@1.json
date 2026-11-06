@@ -1,0 +1,22 @@
+{
+  "examples": [
+    {
+      "width": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "width": {
+        "exclusiveMinimum": 0,
+        "type": "number"
+      }
+    },
+    "required": [
+      "width"
+    ],
+    "type": "object"
+  },
+  "type": "layout.sidebar.width",
+  "version": 1
+}

@@ -2,7 +2,8 @@
  * @fileoverview Highlight summary UI renderer.
  *
  * Renders the list of highlight groups and the highlighted cell count, and
- * wires basic interactions (enable/disable, remove, clear all) back to state.
+ * turns its interactions (enable/disable, remove, clear the page) into
+ * highlight actions (`highlight-actions.js`) naming the page and the group.
  *
  * The count and Clear appear on two surfaces, the Highlighting panel and the
  * selection bar over the plot; both are drawn and handled here, so the bar's
@@ -24,7 +25,7 @@ import {
 } from '../../components/controls.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
-import { removeWithUndo } from './undo-removal.js';
+import { dispatchFromControl } from '../../../actions/control-dispatch.js';
 
 function requireDomElementList(elements, label, methods = []) {
   if (!Array.isArray(elements) || elements.length === 0) {
@@ -52,14 +53,10 @@ export function initHighlightSummaryUI(options) {
     state,
     'Highlight summary state',
     [
-      'clearActivePageHighlights',
+      'getActivePage',
       'getHighlightedCellCount',
       'getHighlightedGroups',
-      'getTotalHighlightedCellCount',
-      'highlightGroupRecord',
-      'removeHighlightGroup',
-      'restoreHighlightGroup',
-      'toggleHighlightEnabled'
+      'getTotalHighlightedCellCount'
     ]
   );
   requireExactKeys(
@@ -97,10 +94,16 @@ export function initHighlightSummaryUI(options) {
     }, { signal: lifecycleController.signal });
   }
 
-  function requireStateOperation(result, label) {
-    if (result !== true) {
-      throw new Error(`${label} was rejected by highlight state.`);
-    }
+  function act(type, params, failure) {
+    return dispatchFromControl(type, params, { failure, category: 'highlight' });
+  }
+
+  /** The shown page's name and the label of its group `id`, or null once gone. */
+  function namesOf(id) {
+    const page = state.getActivePage();
+    if (page === null) return null;
+    const group = page.highlightedGroups.find(candidate => candidate.id === id);
+    return group === undefined ? null : { page: page.name, group: group.label };
   }
 
   // Validating a group walks every one of its cells, and the summary is
@@ -136,10 +139,16 @@ export function initHighlightSummaryUI(options) {
   listen(highlightedGroupsEl, 'change', (event) => {
     const id = rowGroupId(event.target);
     if (id === null) return;
-    requireStateOperation(
-      state.toggleHighlightEnabled(id, event.target.checked),
-      'Highlight toggle'
-    );
+    const names = namesOf(id);
+    if (names === null) return;
+    const enabled = event.target.checked;
+    void act('highlight.group.toggle', { ...names, enabled }, 'Turning the highlight on or off failed')
+      .then(done => {
+        // Not applied: the box shows what the state holds again.
+        if (done !== null || destroyed) return;
+        renderedGroupsKey = null;
+        renderHighlightSummary();
+      });
   });
   listen(highlightedGroupsEl, 'click', (event) => {
     const target = event.target;
@@ -150,16 +159,9 @@ export function initHighlightSummaryUI(options) {
     const id = rowGroupId(button);
     if (id === null) return;
     event.stopPropagation();
-    const record = state.highlightGroupRecord(id);
-    requireStateOperation(
-      removeWithUndo({
-        record,
-        remove: () => state.removeHighlightGroup(id),
-        restore: removed => state.restoreHighlightGroup(removed),
-        removed: `Highlight "${record === null ? id : record.group.label}"`
-      }),
-      'Highlight removal'
-    );
+    const names = namesOf(id);
+    if (names === null) return;
+    void act('highlight.group.remove', names, 'Removing the highlight failed');
   });
 
   let renderedGroupsKey = null;
@@ -246,7 +248,9 @@ export function initHighlightSummaryUI(options) {
 
   for (const clearButton of clearButtons) {
     listen(clearButton, 'click', () => {
-      state.clearActivePageHighlights();
+      const page = state.getActivePage();
+      if (page === null) return;
+      void act('highlight.page.clear', { page: page.name }, 'Clearing the highlight page failed');
     });
   }
 

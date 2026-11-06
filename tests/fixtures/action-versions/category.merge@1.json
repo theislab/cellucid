@@ -1,0 +1,51 @@
+{
+  "examples": [
+    {
+      "category": "T cells",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "into": "T cells"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "category": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "into": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "field",
+      "category",
+      "into"
+    ],
+    "type": "object"
+  },
+  "type": "category.merge",
+  "version": 1
+}

@@ -203,7 +203,7 @@ test('zero-size hosts wait for an observed positive box without guessed dimensio
 });
 
 for (const lifecycleAction of ['invalidate', 'destroy']) {
-  test(`${lifecycleAction} releases a zero-size measurement waiter`, { timeout: 1000 }, async () => {
+  test(`${lifecycleAction} releases a zero-size measurement waiter`, async () => {
     const harness = createZeroSizeObserverHarness();
     const result = harness.slot.render({ name: lifecycleAction });
     await harness.observerReady.promise;
@@ -611,7 +611,7 @@ test('a failed committed-plot lease does not poison later leases', async () => {
   );
 });
 
-test('destroy waits for an active committed-plot lease without tail deadlock', { timeout: 1000 }, async () => {
+test('destroy waits for an active committed-plot lease without tail deadlock', async () => {
   const leaseGate = deferred();
   const leaseStarted = deferred();
   const harness = createHarness();

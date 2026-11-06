@@ -800,7 +800,23 @@ export function isExplainedFailure(error) {
   if (error instanceof AggregateError && error.errors.length > 0) {
     return isExplainedFailure(error.errors[0]);
   }
-  return error?.details?.explained === true;
+  return error?.details?.explained === true || isChangedOnHost(error);
+}
+
+/**
+ * Whether a read failed because the file or store changed on its host while
+ * it was open (`BYTE_SOURCE_FAILURES.CHANGED`, a sentence written for the
+ * person). Reading again in this session gives the same answer: it keeps what
+ * it was first answered with, so a host that redeploys the same bytes under
+ * new validators counts as changed too (it cannot be told apart from new
+ * bytes). Opening the data again reads what is there now.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isChangedOnHost(error) {
+  if (error instanceof AggregateError && error.errors.length > 0) return isChangedOnHost(error.errors[0]);
+  return error?.code === BYTE_SOURCE_FAILURES.CHANGED;
 }
 
 /**

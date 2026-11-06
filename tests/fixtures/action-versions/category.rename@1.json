@@ -1,0 +1,51 @@
+{
+  "examples": [
+    {
+      "category": "T cells",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "name": "T cells"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "category": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "name": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "field",
+      "category",
+      "name"
+    ],
+    "type": "object"
+  },
+  "type": "category.rename",
+  "version": 1
+}

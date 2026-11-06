@@ -143,16 +143,34 @@ function createState() {
     addHighlightDirect() {
       return null;
     },
-    clearActivePageHighlights() {},
+    addHighlightFromCategory() {
+      return null;
+    },
+    addHighlightFromRange() {
+      return null;
+    },
+    clearHighlightPage() {
+      return 0;
+    },
+    clearHighlightsOnAllPages() {
+      return 0;
+    },
     clearPreviewHighlight() {},
     combineHighlightPages() {},
     createHighlightPage() {},
     deleteHighlightPage() {},
-    highlightPageRecord() { return null; },
-    restoreHighlightPage() { return false; },
-    highlightGroupRecord() { return null; },
-    restoreHighlightGroup() { return false; },
+    ensureFieldLoaded() {},
+    ensureVarFieldLoaded() {},
     ensureHighlightPage() {},
+    getActivePage() {
+      return page;
+    },
+    getFields() {
+      return [];
+    },
+    getVarFields() {
+      return [];
+    },
     getActiveField() {
       return state.getFieldForView(state.activeViewId);
     },

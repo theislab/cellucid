@@ -1,0 +1,31 @@
+{
+  "examples": [
+    {
+      "direction": "up",
+      "keyframe": "x"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "direction": {
+        "enum": [
+          "up",
+          "down"
+        ]
+      },
+      "keyframe": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "keyframe",
+      "direction"
+    ],
+    "type": "object"
+  },
+  "type": "camera-path.keyframe.move",
+  "version": 1
+}

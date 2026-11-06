@@ -15,18 +15,19 @@ import {
   indexedFieldCount,
   releaseInactiveFieldsOverBudget,
 } from '../assets/js/app/state/managers/field/residency.js';
-import { hasOutlierFilter, hasRangeFilter } from '../assets/js/app/state/managers/filter-manager.js';
-import { hiddenCategoryCount } from '../assets/js/app/utils/category-state.js';
+import { hasCategoryFilter, hasOutlierFilter, hasRangeFilter } from '../assets/js/app/state/managers/filter-manager.js';
 
 const GENES = 30_000;
 
 /** The full walk the count must equal: every field of every view. */
 function referenceInactiveBytes(state) {
   const key = (field, index) => field._originalKey || field.key || String(index);
-  const filtered = field => (field.kind === 'category'
-    ? hasOutlierFilter(field) || field._missingVisible === false
-      || (field._categoryVisible !== undefined && hiddenCategoryCount(field._categoryVisible) > 0)
-    : hasRangeFilter(field));
+  const filtered = field => {
+    const kept = { ...field, _isDeleted: false };
+    return kept.kind === 'category' ? hasCategoryFilter(kept) || hasOutlierFilter(kept) : hasRangeFilter(kept);
+  };
+  // A user's own arrays exist nowhere else; only a copy of a file's continuous column is read again.
+  const ownArrays = field => field._isUserDefined === true && !(field.kind === 'continuous' && typeof field._sourceField?.sourceKey === 'string');
   const views = [state];
   for (const ctx of state.viewContexts?.values?.() ?? []) {
     if (ctx.obsData === state.obsData && ctx.varData === state.varData) continue;
@@ -39,7 +40,7 @@ function referenceInactiveBytes(state) {
       const active = view.activeFieldSource === source
         ? (source === 'obs' ? view.activeFieldIndex : view.activeVarFieldIndex) : -1;
       fields.forEach((field, index) => {
-        if (index === active || field._loadingPromise || filtered(field)) inUse[source].add(key(field, index));
+        if (index === active || field._loadingPromise || filtered(field) || ownArrays(field)) inUse[source].add(key(field, index));
         if (field.loaded === true && typeof field._sourceField?.sourceKey === 'string') inUse[source].add(field._sourceField.sourceKey);
       });
     }
@@ -178,4 +179,49 @@ test('the count equals the full walk through every change that moves a field in 
   assert.ok(released > 0);
   check('after a release');
   assert.equal(state.varData.fields[0].loaded, true, 'the kept view still shows gene 0');
+});
+
+test('a release lets go only of what can be read again: a user\'s own arrays and every narrowing filter stay', () => {
+  const array = () => new Uint8Array(8);
+  const values = () => new Float32Array(8);
+  const fields = [
+    { key: 'shown once', kind: 'category', loaded: true, codes: array(), categories: ['a', 'b'], _categoryVisible: Uint8Array.of(1, 1), _categoryColors: Uint8Array.of(1, 2, 3, 4, 5, 6) },
+    { key: 'hidden', kind: 'category', loaded: true, codes: array(), categories: ['a', 'b'], _categoryVisible: Uint8Array.of(0, 1) },
+    { key: 'missing hidden', kind: 'category', loaded: true, codes: array(), categories: ['a', 'b'], _missingVisible: false },
+    { key: 'cell count', kind: 'category', loaded: true, codes: array(), categories: ['a', 'b'], _categoryCellLimits: Object.freeze([{ category: 0, count: 2, seed: 1 }]) },
+    { key: 'deleted with a filter', kind: 'continuous', loaded: true, values: values(), _isDeleted: true, _continuousStats: { min: 0, max: 1 }, _continuousFilter: { min: 0.5, max: 1 } },
+    { key: 'my labels', kind: 'category', loaded: true, codes: array(), categories: ['a', 'b'], _isUserDefined: true, _sourceField: null },
+    { key: 'pushed', kind: 'continuous', loaded: true, values: values(), _isUserDefined: true, _sourceField: null },
+    { key: 'copy of a column', kind: 'continuous', loaded: true, values: values(), _isUserDefined: true, _sourceField: { sourceKey: 'read again' } },
+    { key: 'read again', kind: 'continuous', loaded: true, values: values() },
+    { key: 'full range', kind: 'continuous', loaded: true, values: values(), _continuousStats: { min: 0, max: 1 }, _continuousFilter: { min: 0, max: 1 } },
+  ];
+  const state = {
+    obsData: { fields },
+    varData: { fields: [] },
+    activeFieldSource: null,
+    activeFieldIndex: -1,
+    activeVarFieldIndex: -1,
+    _fieldDataCache: new Map(fields.map(field => [field.key, field.kind === 'category' ? { codes: field.codes } : { values: field.values }])),
+    _varFieldDataCache: new Map(),
+  };
+  releaseInactiveFieldsOverBudget(state, 0);
+  const loaded = Object.fromEntries(fields.map(field => [field.key, field.loaded]));
+  assert.deepEqual(loaded, {
+    'shown once': false,
+    hidden: true,
+    'missing hidden': true,
+    'cell count': true,
+    'deleted with a filter': true,
+    'my labels': true,
+    pushed: true,
+    // A copy of a file's column shares its source's array and reads it again.
+    'copy of a column': false,
+    'read again': true,
+    'full range': false,
+  });
+  // What was set on it stays; only its arrays went.
+  assert.deepEqual(fields[0]._categoryColors, Uint8Array.of(1, 2, 3, 4, 5, 6));
+  assert.equal('codes' in fields[0], false);
+  assert.deepEqual(fields[9]._continuousFilter, { min: 0, max: 1 });
 });

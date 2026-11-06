@@ -497,7 +497,7 @@ test('activity and cancellation reach every read of the byte reader, through the
   seen.length = 0;
   const cancel = new AbortController();
   const reading = root.get('a').read([[2, 4]], { activity, signal: cancel.signal });
-  for (let i = 0; i < 20 && seen.length === 0; i++) await new Promise(resolve => setImmediate(resolve));
+  while (seen.length === 0) await new Promise(resolve => setImmediate(resolve));
   assert.ok(seen.length > 0, 'the chunk is being read');
   cancel.abort(new DOMException('cancelled', 'AbortError'));
   await assert.rejects(reading, error => error.name === 'AbortError');

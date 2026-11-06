@@ -3,6 +3,12 @@ import test from 'node:test';
 
 import { CommunityAnnotationGitHubSync } from '../assets/js/app/community-annotations/github-sync.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
+import {
+  configFor,
+  MockAnnotationGitHub,
+  virtualTransport,
+  WORKER_ORIGIN,
+} from './helpers/community-annotation-worker.mjs';
 
 const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
 const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
@@ -53,20 +59,16 @@ function forkIdentity({
   };
 }
 
+/** One entry of GitHub's list of forks (no `parent`: every entry is a fork of the source). */
 function forkRecord({
   owner = 'researcher',
   name = 'repo',
-  includeParent = true,
 } = {}) {
-  const record = {
+  return {
     full_name: `${owner}/${name}`,
     name,
     owner: { login: owner },
   };
-  if (includeParent) {
-    record.parent = { full_name: 'owner/repo' };
-  }
-  return record;
 }
 
 function fillerForks(page) {
@@ -74,8 +76,7 @@ function fillerForks(page) {
     const identity = (page - 1) * 100 + index;
     return forkRecord({
       owner: `user-${identity}`,
-      name: `repo-${identity}`,
-      includeParent: false,
+      name: `repo-${identity}`
     });
   });
 }
@@ -118,62 +119,33 @@ function requestRecord(rawUrl, options = {}) {
   };
 }
 
-function createSync() {
-  return new CommunityAnnotationGitHubSync({
-    datasetId: 'synthetic',
-    owner: 'owner',
-    repo: 'repo',
-    token: 'test-token',
-    branch: 'main',
-    workerOrigin: 'https://worker.example',
-  });
-}
-
-async function withGlobalFetch(fetchImpl, operation) {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = fetchImpl;
-  try {
-    return await operation();
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-}
-
-async function withImmediateForkLookupDeadline(operation) {
-  const previousSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (handler, delay, ...args) =>
-    previousSetTimeout(
-      handler,
-      delay === 10_000 ? 0 : delay,
-      ...args,
-    );
-  try {
-    return await operation();
-  } finally {
-    globalThis.setTimeout = previousSetTimeout;
-  }
-}
-
 class ForkDiscoveryWorkerMock {
   constructor({
     canonical = null,
-    createStatus = 202,
     completePublication = false,
-    loseCreateResponse = false,
     sourceCanPush = false,
     sourceFullName = 'owner/repo',
     listPage = () => [],
     onListRequest = null,
   } = {}) {
     this.canonical = canonical;
-    this.createStatus = createStatus;
     this.completePublication = completePublication;
-    this.loseCreateResponse = loseCreateResponse;
     this.sourceCanPush = sourceCanPush;
     this.sourceFullName = sourceFullName;
     this.listPage = listPage;
     this.onListRequest = onListRequest;
     this.requests = [];
+    const [sourceOwner, sourceRepo] = sourceFullName.split('/');
+    // The source repository's annotation layout, for the snapshot a
+    // publication opens first (contract 3).
+    this.repository = new MockAnnotationGitHub({
+      owner: sourceOwner,
+      repo: sourceRepo,
+      files: {
+        'annotations/config.json': configFor('synthetic', ['cell_type']),
+        'annotations/users/.gitkeep': '\n',
+      },
+    });
   }
 
   async fetch(rawUrl, options = {}) {
@@ -183,11 +155,21 @@ class ForkDiscoveryWorkerMock {
     const destinationRepo =
       this.canonical?.full_name?.split('/')[1] ?? sourceRepo;
 
+    if (request.method === 'POST' && request.path === '/graphql/snapshot') {
+      assert.deepEqual(request.body, { owner: sourceOwner, repo: sourceRepo, branch: 'main' });
+      return this.repository.fetch(rawUrl, options);
+    }
     if (
       request.method === 'GET' &&
-      request.path === `/api/repos/owner/repo/contents/${USER_PATH}`
+      request.path === `/api/repos/${sourceOwner}/${sourceRepo}/contents/${USER_PATH}`
     ) {
       return errorResponse('Not Found', 404);
+    }
+    if (
+      request.method === 'GET' &&
+      request.path === `/api/repos/${sourceOwner}/${sourceRepo}/pulls`
+    ) {
+      return jsonResponse([]);
     }
     if (
       request.method === 'GET' &&
@@ -218,31 +200,6 @@ class ForkDiscoveryWorkerMock {
       return this.canonical === null
         ? errorResponse('Not Found', 404)
         : jsonResponse(this.canonical);
-    }
-    if (
-      request.method === 'POST' &&
-      request.path ===
-        `/api/repos/${sourceOwner}/${sourceRepo}/forks`
-    ) {
-      const operationId = request.headers.get(OPERATION_ID_HEADER);
-      assert.ok(operationId, 'fork creation must carry an operation id');
-      assert.deepEqual(request.body, {});
-      if (this.loseCreateResponse) {
-        throw new TypeError(
-          'Synthetic transport loss after fork creation dispatch',
-        );
-      }
-      if (this.createStatus === 202) {
-        return jsonResponse(
-          forkRecord(),
-          { status: 202, operationId, outcome: 'applied' },
-        );
-      }
-      return errorResponse(
-        'Fork already exists',
-        this.createStatus,
-        operationId,
-      );
     }
     if (
       request.method === 'GET' &&
@@ -283,6 +240,13 @@ class ForkDiscoveryWorkerMock {
         `/api/repos/researcher/${destinationRepo}`;
       if (
         request.method === 'GET' &&
+        request.path === `${destinationPrefix}/git/ref/heads/main`
+      ) {
+        // The fork is copied: it has the base branch.
+        return jsonResponse({ object: { sha: SHA_A } });
+      }
+      if (
+        request.method === 'GET' &&
         request.path.startsWith(
           `${destinationPrefix}/git/ref/heads/cellucid-annotations/`,
         )
@@ -317,13 +281,6 @@ class ForkDiscoveryWorkerMock {
           { content: { sha: SHA_B } },
           { status: 200, operationId, outcome: 'applied' },
         );
-      }
-      if (
-        request.method === 'GET' &&
-        request.path ===
-          `/api/repos/${sourceOwner}/${sourceRepo}/pulls`
-      ) {
-        return jsonResponse([]);
       }
       if (
         request.method === 'POST' &&
@@ -362,18 +319,27 @@ async function attemptForkPublication(worker, { signal = null } = {}) {
   });
 }
 
+/** One publication through `worker`, on virtual time (`worker.time` after it). */
 async function attemptPublication(
   worker,
   { publicationMode, signal = null },
 ) {
-  return withGlobalFetch(
-    worker.fetch.bind(worker),
-    () => createSync().pushMyUserFile({
-      userDoc: validUserDocument(),
-      publicationMode,
-      signal,
-    }),
-  );
+  const { transport, time } = virtualTransport(worker.fetch.bind(worker));
+  worker.time = time;
+  const sync = new CommunityAnnotationGitHubSync({
+    datasetId: 'synthetic',
+    owner: 'owner',
+    repo: 'repo',
+    token: 'test-token',
+    branch: 'main',
+    workerOrigin: WORKER_ORIGIN,
+    transport,
+  });
+  return time.run(sync.pushMyUserFile({
+    userDoc: validUserDocument(),
+    publicationMode,
+    signal,
+  }));
 }
 
 function requestsFor(worker, method, path) {
@@ -383,7 +349,7 @@ function requestsFor(worker, method, path) {
 }
 
 test(
-  'a canonical owned fork is ancestry-verified without listing or creating forks',
+  'a canonical owned fork is ancestry-verified without listing forks',
   { concurrency: false },
   async () => {
     const worker = new ForkDiscoveryWorkerMock({
@@ -405,10 +371,6 @@ test(
       requestsFor(worker, 'GET', '/api/repos/owner/repo/forks').length,
       0,
     );
-    assert.equal(
-      requestsFor(worker, 'POST', '/api/repos/owner/repo/forks').length,
-      0,
-    );
     assert.ok(
       worker.requests.some(
         request =>
@@ -422,14 +384,18 @@ test(
 );
 
 test(
-  'an absent canonical fork is created before any fork-network listing',
+  'without any fork, Publish stops with the link to fork on GitHub and never creates one',
   { concurrency: false },
   async () => {
     const worker = new ForkDiscoveryWorkerMock();
 
     await assert.rejects(
       attemptForkPublication(worker),
-      error => error?.status === 418,
+      error => (
+        error?.code === 'GITHUB_FORK_MISSING' &&
+        error.forkUrl === 'https://github.com/owner/repo/fork' &&
+        error.message.startsWith('You have no fork of owner/repo yet: fork it on GitHub, then Publish again.\nFork it at https://github.com/owner/repo/fork.')
+      ),
     );
 
     const canonicalIndex = worker.requests.findIndex(
@@ -437,15 +403,16 @@ test(
         request.method === 'GET' &&
         request.path === '/api/repos/researcher/repo',
     );
-    const createIndex = worker.requests.findIndex(
+    const listIndex = worker.requests.findIndex(
       request =>
-        request.method === 'POST' &&
+        request.method === 'GET' &&
         request.path === '/api/repos/owner/repo/forks',
     );
-    assert.ok(canonicalIndex >= 0 && canonicalIndex < createIndex);
+    assert.ok(canonicalIndex >= 0 && canonicalIndex < listIndex, 'the same-name fork first, then the list');
     assert.equal(
-      requestsFor(worker, 'GET', '/api/repos/owner/repo/forks').length,
-      0,
+      worker.requests.some(request => request.method !== 'GET' && request.path.startsWith('/api/')),
+      false,
+      'no write of any kind',
     );
   },
 );
@@ -521,20 +488,17 @@ test(
 );
 
 test(
-  'a renamed owned fork is recovered newest-first after a creation conflict',
+  'a renamed owned fork is found newest-first',
   { concurrency: false },
   async () => {
     const worker = new ForkDiscoveryWorkerMock({
-      createStatus: 422,
       listPage(page) {
         if (page === 1) return fillerForks(page);
         if (page === 2) {
           return [
             forkRecord({
               owner: 'researcher',
-              name: 'renamed-repo',
-              includeParent: false,
-            }),
+              name: 'renamed-repo' }),
           ];
         }
         throw new Error(`Unexpected fork page ${page}`);
@@ -546,15 +510,6 @@ test(
       error => error?.status === 418,
     );
 
-    const createIndex = worker.requests.findIndex(
-      request => request.method === 'POST',
-    );
-    const listIndex = worker.requests.findIndex(
-      request =>
-        request.method === 'GET' &&
-        request.path === '/api/repos/owner/repo/forks',
-    );
-    assert.ok(createIndex >= 0 && createIndex < listIndex);
     assert.deepEqual(
       requestsFor(worker, 'GET', '/api/repos/owner/repo/forks')
         .map(request => request.query.get('page')),
@@ -613,15 +568,12 @@ test(
   async () => {
     const worker = new ForkDiscoveryWorkerMock({
       canonical: forkIdentity({ parentFullName: 'other/project' }),
-      createStatus: 422,
       listPage(page) {
         assert.equal(page, 1);
         return [
           forkRecord({
             owner: 'researcher',
-            name: 'renamed-repo',
-            includeParent: false,
-          }),
+            name: 'renamed-repo' }),
         ];
       },
     });
@@ -631,11 +583,6 @@ test(
       error => error?.status === 418,
     );
 
-    assert.equal(
-      requestsFor(worker, 'POST', '/api/repos/owner/repo/forks').length,
-      0,
-      'a canonical name collision cannot be repaired by blind creation',
-    );
     assert.ok(
       worker.requests.some(
         request =>
@@ -671,30 +618,37 @@ test(
 );
 
 test(
-  'renamed-fork discovery has an exact 1,000-item bound and typed recovery',
+  'renamed-fork discovery pages the forks newest-first until GitHub has no more',
   { concurrency: false },
   async () => {
-    const worker = new ForkDiscoveryWorkerMock({
-      createStatus: 422,
+    const found = new ForkDiscoveryWorkerMock({
       listPage(page) {
-        return fillerForks(page);
+        if (page < 14) return fillerForks(page);
+        if (page === 14) {
+          return [forkRecord({ owner: 'researcher', name: 'renamed-repo' })];
+        }
+        throw new Error(`Unexpected fork page ${page}`);
       },
     });
-
-    await assert.rejects(
-      attemptForkPublication(worker),
-      error => (
-        error?.code === 'GITHUB_FORK_LOOKUP_LIMIT' &&
-        /newest 1,000 forks/.test(error.message) &&
-        /rename/.test(error.message)
-      ),
-    );
-
+    await assert.rejects(attemptForkPublication(found), error => error?.status === 418);
     assert.deepEqual(
-      requestsFor(worker, 'GET', '/api/repos/owner/repo/forks')
-        .map(request => request.query.get('page')),
-      ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+      requestsFor(found, 'GET', '/api/repos/owner/repo/forks').map(request => request.query.get('page')),
+      Array.from({ length: 14 }, (_unused, index) => String(index + 1)),
+      'past the old 10-page cap: every page is asked until the fork is found',
     );
+    assert.ok(found.requests.some(request => request.path.startsWith('/api/repos/researcher/renamed-repo/')));
+
+    const exhausted = new ForkDiscoveryWorkerMock({
+      listPage(page) {
+        return page < 12 ? fillerForks(page) : fillerForks(page).slice(0, 40);
+      },
+    });
+    await assert.rejects(
+      attemptForkPublication(exhausted),
+      error => error?.code === 'GITHUB_FORK_MISSING',
+      'no fork anywhere: Publish asks to fork on GitHub',
+    );
+    assert.equal(requestsFor(exhausted, 'GET', '/api/repos/owner/repo/forks').length, 12);
   },
 );
 
@@ -705,7 +659,6 @@ test(
     const controller = new AbortController();
     const reason = new Error('Annotation modal closed');
     const worker = new ForkDiscoveryWorkerMock({
-      createStatus: 422,
       onListRequest(request, page) {
         assert.equal(page, 1);
         queueMicrotask(() => controller.abort(reason));
@@ -731,15 +684,6 @@ test(
       ),
     );
 
-    const createIndex = worker.requests.findIndex(
-      request => request.method === 'POST',
-    );
-    const listIndex = worker.requests.findIndex(
-      request =>
-        request.method === 'GET' &&
-        request.path === '/api/repos/owner/repo/forks',
-    );
-    assert.ok(createIndex >= 0 && createIndex < listIndex);
     assert.equal(
       requestsFor(worker, 'GET', '/api/repos/owner/repo/forks').length,
       1,
@@ -748,86 +692,29 @@ test(
 );
 
 test(
-  'renamed-fork discovery deadline cancels the active page with an actionable error',
+  'a silent renamed-fork page is stalled by the transport, never ended by a lookup deadline',
   { concurrency: false },
   async () => {
-    let pageSignal = null;
+    const pageSignals = [];
     const worker = new ForkDiscoveryWorkerMock({
-      createStatus: 422,
       onListRequest(request, page) {
         assert.equal(page, 1);
-        pageSignal = request.signal;
+        pageSignals.push(request.signal);
         return new Promise((_resolve, reject) => {
-          const rejectAbort = () => {
-            const error = new Error('Synthetic deadline abort');
-            error.name = 'AbortError';
-            reject(error);
-          };
-          request.signal.addEventListener('abort', rejectAbort, {
-            once: true,
-          });
+          const rejectAbort = () => reject(request.signal.reason);
+          request.signal.addEventListener('abort', rejectAbort, { once: true });
           if (request.signal.aborted) rejectAbort();
         });
       },
     });
 
-    await withImmediateForkLookupDeadline(() =>
-      assert.rejects(
-        attemptForkPublication(worker),
-        error => (
-          error?.code === 'GITHUB_FORK_LOOKUP_LIMIT' &&
-          /10s/.test(error.message)
-        ),
-      ));
-
-    assert.equal(pageSignal?.aborted, true);
-    assert.equal(
-      requestsFor(worker, 'GET', '/api/repos/owner/repo/forks').length,
-      1,
+    await assert.rejects(
+      attemptForkPublication(worker),
+      error => error?.code === 'GITHUB_WORKER_UNREACHABLE',
+      'a lookup that never answered is never taken for a missing fork',
     );
-  },
-);
-
-test(
-  'a reconciliation deadline cannot replace an unknown fork-creation outcome',
-  { concurrency: false },
-  async () => {
-    const worker = new ForkDiscoveryWorkerMock({
-      loseCreateResponse: true,
-      onListRequest(request, page) {
-        assert.equal(page, 1);
-        return new Promise((_resolve, reject) => {
-          const rejectAbort = () => {
-            const error = new Error('Synthetic reconciliation abort');
-            error.name = 'AbortError';
-            reject(error);
-          };
-          request.signal.addEventListener('abort', rejectAbort, {
-            once: true,
-          });
-          if (request.signal.aborted) rejectAbort();
-        });
-      },
-    });
-
-    await withImmediateForkLookupDeadline(() =>
-      assert.rejects(
-        attemptForkPublication(worker),
-        error => (
-          error?.code === 'GITHUB_MUTATION_OUTCOME_UNKNOWN' &&
-          error?.operation?.kind === 'forks-post' &&
-          error?.operation?.outcome === 'unknown' &&
-          !/rename/i.test(error.message)
-        ),
-      ));
-
-    assert.equal(
-      requestsFor(worker, 'POST', '/api/repos/owner/repo/forks').length,
-      1,
-    );
-    assert.equal(
-      requestsFor(worker, 'GET', '/api/repos/owner/repo/forks').length,
-      1,
-    );
+    assert.ok(pageSignals.length >= 2, 'a stalled page is asked again');
+    assert.ok(pageSignals.every(signal => signal.aborted), 'every stalled page was ended by its stall');
+    assert.ok(worker.time.now() >= 100_000, `stalls are asked again for RFC 1122's patience (${worker.time.now()} ms), not 10 s`);
   },
 );

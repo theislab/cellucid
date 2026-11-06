@@ -44,6 +44,7 @@ import './plots/types/volcanoplot.js';
 import './plots/types/scatterplot.js';
 import './plots/types/gene-heatmap.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { isLeftOutResult } from './shared/analysis-result-session.js';
 import { failureText } from '../../utils/errors.js';
 import { GeneUnavailableError, describeUnavailableGene } from '../utils/gene-lookup.js';
 
@@ -227,6 +228,9 @@ export class ComparisonModule {
       const item = header.closest('.analysis-mode');
       if (!item) return;
       this._setAnalysisMode(item.dataset.mode);
+      // The person opened (or closed) a mode: a step.
+      const open = this._getOpenMode();
+      this.recordAnalysisChange(null, open === null ? 'close' : 'open', { mode: open ?? item.dataset.mode });
     });
 
     // Build container map from accordion content areas
@@ -261,7 +265,7 @@ export class ComparisonModule {
     this.currentConfig.pages = [...selectablePageIds];
 
     // Seed shared page selection before first mode switch
-    this._uiManager.setCurrentPages(this.currentConfig.pages, { notifyActiveUI: false });
+    this._uiManager.seedCurrentPages(this.currentConfig.pages);
     this._lastKnownPageIds = pages.map(p => p.id);
     this._lastKnownSelectablePageIds = [...selectablePageIds];
 
@@ -447,8 +451,9 @@ export class ComparisonModule {
 
     try {
       // A mode whose data is missing shows a notice, not a form, so there are
-      // no settings to copy: say why instead of opening a window.
-      const data = this._uiManager.getUI(mode)?.validateDataRequirements();
+      // no settings to copy: say why instead of opening a window (and leave
+      // the panel as it was: checking makes no state).
+      const data = this.readPanelUI(mode, ui => ui?.validateDataRequirements());
       if (data?.valid === false) {
         this._notifications.info(data.error, { category: 'analysis' });
         return;
@@ -464,6 +469,12 @@ export class ComparisonModule {
           headerTitle
         }
       );
+      // The person opened the mode in a window: a step once it stands,
+      // holding what its analysis's first update changes.
+      void Promise.resolve(creation).then(windowId => {
+        if (typeof windowId !== 'string') return;
+        this.recordAnalysisChange(null, 'window-open', { mode }, { after: this._analysisWindowManager.whenWindowSettled(windowId) });
+      }, () => {});
       if (creation && typeof creation.then === 'function') {
         void creation.catch(error => {
           console.error(
@@ -627,8 +638,10 @@ export class ComparisonModule {
       }
     }
 
-    // If selection is empty after a page-topology change, select every non-empty page.
-    if (nextSelectionSet.size === 0) {
+    // If selection is empty after a page-topology change, the module's default:
+    // every non-empty page (none when no base page has cells), not a choice.
+    const defaulted = nextSelectionSet.size === 0;
+    if (defaulted) {
       for (const id of selectablePageIds) {
         nextSelectionSet.add(id);
       }
@@ -639,7 +652,11 @@ export class ComparisonModule {
     );
 
     this.currentConfig.pages = nextSelection;
-    this._uiManager.onPageSelectionChange(nextSelection);
+    if (defaulted) {
+      this._uiManager.seedCurrentPages(nextSelection, { notifyActiveUI: true });
+    } else {
+      this._uiManager.onPageSelectionChange(nextSelection);
+    }
     this._lastKnownPageIds = currentPageIds;
     this._lastKnownSelectablePageIds = selectablePageIds;
 
@@ -712,6 +729,116 @@ export class ComparisonModule {
    *
    * @returns {any|null}
    */
+  // ===========================================================================
+  // Actions (`analysis/actions.js`)
+  // ===========================================================================
+
+  /**
+   * How the open dataset is named in a result's provenance
+   * (`shared/result-provenance.js`): `() => {id, method, seed}`, given by
+   * the page, which knows the dataset's source.
+   * @param {(() => ({id: string|null, method: string|null, seed: number|null}|null))|null} describe
+   */
+  setOpenDatasetDescriber(describe) {
+    this._describeOpenDataset = describe;
+  }
+
+  /** The open dataset as a result's provenance names it, or null. */
+  describeOpenDataset() {
+    return this._describeOpenDataset?.() ?? null;
+  }
+
+  /**
+   * Who records the changes a person makes in the analyses as steps
+   * (`(ui, kind, detail, {after}) => void`, `analysis/actions.js`), or null.
+   */
+  setChangeRecorder(recorder) {
+    this._changeRecorder = recorder;
+  }
+
+  /**
+   * A change a person made in an analysis (`kind`: open, close,
+   * window-open, window-copy, window-close, window-place, pages, set, run;
+   * `ui` the analysis it was made in, null for the panel's own controls).
+   * `options.after`: the work the change set off, recorded once it settles.
+   */
+  recordAnalysisChange(ui, kind, detail, options) {
+    this._changeRecorder?.(ui, kind, detail, options);
+  }
+
+  /** The mode open in the panel, or null. */
+  getOpenMode() {
+    return this._getOpenMode();
+  }
+
+  /** Open a mode in the panel (no change when it is open). */
+  openMode(modeId) {
+    if (this._getOpenMode() !== modeId) this._setAnalysisMode(modeId);
+  }
+
+  /** Close the mode open in the panel (no change when none is). */
+  closeOpenMode() {
+    const open = this._getOpenMode();
+    if (open !== null) this._setAnalysisMode(open);
+  }
+
+  /** The panel's analysis of a mode, made on first use (what a change uses). */
+  getPanelUI(modeId) {
+    return this._uiManager.getUI(modeId);
+  }
+
+  /**
+   * Read the panel's analysis of a mode without leaving state behind: a mode
+   * the panel never made counts as never opened (`exportSessionState` leaves
+   * it out), so it is made for the read and unmade in the same task
+   * (`releaseMode` unmakes it at once and lets it go after), opening with its
+   * opening settings when it is next used. The read is synchronous, so
+   * nothing else can run between the making and the unmaking (another
+   * action cannot start using the mode the read made): a read never changes
+   * the `analysis` state domain.
+   *
+   * @template T
+   * @param {string} modeId
+   * @param {(ui: object) => T} read - synchronous
+   * @returns {T}
+   */
+  readPanelUI(modeId, read) {
+    const uiManager = this._uiManager;
+    const made = uiManager.isInitialized(modeId);
+    const ui = uiManager.getUI(modeId);
+    try {
+      const value = read(ui);
+      if (value !== null && typeof value?.then === 'function') {
+        throw new TypeError(`A read of the analysis "${modeId}" must be synchronous, so the panel is as it was when it ends`);
+      }
+      return value;
+    } finally {
+      if (!made && uiManager.isInitialized(modeId) && this._getOpenMode() !== modeId) {
+        uiManager.releaseMode(modeId).catch(error => console.error(`[ComparisonModule] Releasing the analysis "${modeId}" after a read failed:`, error));
+      }
+    }
+  }
+
+  /** The panel's analyses made so far, by mode. */
+  listPanelUIs() {
+    return [...this._uiManager._uis].filter(([, entry]) => entry.initialized && entry.ui)
+      .map(([modeId, entry]) => ({ modeId, ui: entry.ui }));
+  }
+
+  /**
+   * Where an analysis stands: its mode, and `'panel'` or its window's
+   * number (`AnalysisWindowManager.listWindows`); null when it is neither.
+   */
+  locateUI(ui) {
+    for (const entry of this._analysisWindowManager?.listWindows?.() ?? []) {
+      if (entry.ui === ui) return { modeId: entry.modeId, where: entry.number };
+    }
+    for (const { modeId, ui: panelUi } of this.listPanelUIs()) {
+      if (panelUi === ui) return { modeId, where: 'panel' };
+    }
+    return null;
+  }
+
   getAnalysisWindowManager() {
     return this._analysisWindowManager || null;
   }
@@ -1120,29 +1247,14 @@ export class ComparisonModule {
   }
 
   /**
-   * Get individual analysis UIs via manager
-   * @returns {Object} Object with individual UI instances
-   */
-  getAnalysisUIs() {
-    return {
-      quick: this._uiManager?.getUI('simple'),
-      detailed: this._uiManager?.getUI('detailed'),
-      correlation: this._uiManager?.getUI('correlation'),
-      de: this._uiManager?.getUI('differential'),
-      signature: this._uiManager?.getUI('signature'),
-      genesPanel: this._uiManager?.getUI('genesPanel'),
-      dotplot: this._uiManager?.getUI('dotplot'),
-      composition: this._uiManager?.getUI('composition')
-    };
-  }
-
-  /**
-   * Get a specific analysis UI by mode ID
-   * @param {string} modeId - Mode ID (simple, detailed, correlation, differential, signature, genesPanel)
+   * The panel's analysis of a mode when the panel has made it, else null:
+   * never makes one (a mode made is analysis state; `getPanelUI` makes one
+   * for a change, `readPanelUI` for a read).
+   * @param {string} modeId - Mode ID (simple, detailed, correlation, differential, signature, genesPanel, …)
    * @returns {Object|null} UI instance or null
    */
   getUI(modeId) {
-    return this._uiManager?.getUI(modeId) || null;
+    return this._uiManager?.peekUI(modeId) ?? null;
   }
 
   /**
@@ -1201,6 +1313,13 @@ export class ComparisonModule {
       throw new Error(`Analysis "${modeId}" does not accept presets`);
     }
     await ui.applyPreset(preset);
+    // One person's click ("Score as signature", "Dot plot"): one step that
+    // opens the analysis with the options it was sent
+    // (`analysis.<name>.set` with `show`), the whole record, as the preset
+    // sets every option. Pages a preset names are their own step.
+    await ui.whenSettled();
+    if (preset.selectedPages !== undefined) this.recordAnalysisChange(ui, 'pages', { pageIds: [...ui.getSelectedPages()] });
+    this.recordAnalysisChange(ui, 'set', { options: ui.getOptions(), show: true });
     this._modeToggleContainer
       ?.querySelector(`.analysis-mode[data-mode="${modeId}"]`)
       ?.scrollIntoView?.({ block: 'nearest' });
@@ -1254,7 +1373,8 @@ export class ComparisonModule {
   /**
    * Restore `exportSessionState()` output: open the saved mode row the way a
    * click does (or close the open one), then for each mode apply its
-   * settings and then its result. The value is checked whole before anything
+   * settings and then its result (or the record of a result a shared
+   * session left out). The value is checked whole before anything
    * changes; a mode's own settings and result are checked by its UI, and the
    * first refusal is thrown.
    *
@@ -1301,10 +1421,17 @@ export class ComparisonModule {
       // _setAnalysisMode toggles: naming the open row closes it.
       this._setAnalysisMode(openMode ?? currentOpenMode);
     }
+    // A mode the restored state never opened holds its opening settings
+    // there: its panel made since is unmade, so it opens as it would have.
+    for (const { id } of uiManager.getAllTypes()) {
+      if (uiManager.isInitialized(id) && !Object.hasOwn(state.modes, id)) await uiManager.releaseMode(id);
+    }
     for (const [modeId, mode] of Object.entries(state.modes)) {
       const ui = uiManager.getUI(modeId);
       ui.importSettings(structuredClone(mode.settings));
-      await ui.importResult(mode.result);
+      // A result a shared session left out: its settings, no result (`importLeftOutResult`).
+      if (isLeftOutResult(mode.result)) await ui.importLeftOutResult(mode.result);
+      else await ui.importResult(mode.result);
     }
   }
 }

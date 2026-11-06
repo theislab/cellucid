@@ -11,8 +11,11 @@
  *   a subsample chosen there is written to the address as its specification
  *   (`app/subsample-url.js`), never its cells; sessions carry the cells.
  * - **The next opening's request** overrides it once: the subsample a link
- *   names (`app/main.js`). The opening that takes it
- *   (`takeCellSubsetRequest`) clears it, whether it succeeds or not.
+ *   names (`app/main.js`), the cells a dataset of My datasets was last
+ *   opened with (`app/library/my-datasets.js`). The opening that takes it
+ *   (`takeCellSubsetRequest`) clears it, whether it succeeds or not; whoever
+ *   set it withdraws it once its opening ends without having taken it
+ *   (`withdrawNextCellSubsetRequest`).
  * - The open dataset read again with other cells (Apply, Open all, a
  *   session's exact cells, a progressive opening's steps) is given its
  *   request by its caller (`AnnDataFileSource.reopenCells`), never through
@@ -123,12 +126,28 @@ export function onTabCellSubsetRequest(listener) {
 }
 
 /**
- * Open the next dataset with `request`, once.
+ * Open the next dataset with `request`, once. Returns the request as it is
+ * held, which `withdrawNextCellSubsetRequest` takes back.
  *
  * @param {Object} request
+ * @returns {Readonly<Object>}
  */
 export function setNextCellSubsetRequest(request) {
   nextRequest = requireCellSubsetRequest(request);
+  return nextRequest;
+}
+
+/**
+ * Take back the next opening's request `held` (what
+ * `setNextCellSubsetRequest` returned) when no opening has taken it: an
+ * opening that ended before it reached its reader (a link that did not
+ * resolve, a reopen cancelled) leaves no request behind for whatever opens
+ * next. A request set since stays.
+ *
+ * @param {Readonly<Object>} held
+ */
+export function withdrawNextCellSubsetRequest(held) {
+  if (nextRequest === held) nextRequest = null;
 }
 
 /** The request of an opening starting now: the next opening's, else the tab's. */

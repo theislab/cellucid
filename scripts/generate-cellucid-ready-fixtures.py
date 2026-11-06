@@ -16,7 +16,8 @@ Written into ``tests/fixtures/cellucid-ready/``:
 - ``ready.h5ad``: six cells, three genes, a categorical ``cluster``, a
   continuous ``score``, ``obsm['X_umap']`` (2 columns) and ``obsm['X_pca']``
   (3 columns), ``uns['title']`` and a complete ``uns['cellucid']``, including
-  a ``session`` record the viewer never reads;
+  the records the Python and R packages keep on the data (``history_applied``,
+  ``gene_sets``, ``pulled``), which the viewer never reads;
 - ``ready.zarr.zip``: the same data as an AnnData Zarr v2 store with
   consolidated metadata, zipped with fixed ZIP metadata; tests that need the
   store as a folder (``ready.zarr/``, picked or on a web host) unpack it in
@@ -56,7 +57,10 @@ CELLUCID = {
     "citation": {"text": "Doe et al. 2026", "url": "https://doi.org/10.0000/tiny"},
     "source": {"name": "Example lab", "url": "https://example.org/tiny"},
     "defaults": {"embedding2d": "X_umap", "obsKeys": ["cluster"], "centroidMinPoints": 2},
-    "session": {"manifest": {"note": "a session applied in Python"}},
+    # The packages' own records (an applied history, a pull), never read.
+    "history_applied": '[{"step": "s4", "package": "python"}]',
+    "gene_sets": {"Markers": {"genes": ["GENE_A", "GENE_B"], "description": "", "origin": "notebook"}},
+    "pulled": {"cellucid_highlight__highlight_1": {"kind": "highlight", "id": "highlight_1"}},
 }
 
 

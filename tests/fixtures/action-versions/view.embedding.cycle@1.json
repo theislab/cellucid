@@ -1,0 +1,31 @@
+{
+  "examples": [
+    {
+      "dimension": 1,
+      "view": "View 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "dimension": {
+        "enum": [
+          1,
+          2,
+          3
+        ]
+      },
+      "view": {
+        "pattern": "^View [1-9][0-9]*$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "view",
+      "dimension"
+    ],
+    "type": "object"
+  },
+  "type": "view.embedding.cycle",
+  "version": 1
+}

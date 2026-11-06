@@ -4,9 +4,8 @@
  * External navigation and clipboard access are refused rather than degraded:
  * a non-HTTPS or non-canonical URL is not opened, and a missing clipboard API
  * throws instead of silently doing nothing. `describeGitHubAuthReachabilityError`
- * turns the two failure shapes a user can actually act on — an over-large GitHub
- * account and a Worker origin allowlist that does not include this site — into
- * instructions rather than raw fetch text.
+ * turns the failure a user can act on (a Worker origin allowlist that does not
+ * include this site) into an instruction rather than raw fetch text.
  *
  * @module ui/modules/community-annotation/browser-integration
  */
@@ -30,7 +29,17 @@ export function openExternal(url) {
   if (typeof window.open !== 'function') {
     throw new TypeError('External navigation requires window.open()');
   }
-  return window.open(parsed.toString(), '_blank', 'noopener,noreferrer') !== null;
+  // `window.open` with the `noopener` feature returns null whether or not a
+  // window opened (HTML: "the window open steps", noopener), so it cannot
+  // tell a blocked popup from an opened one. Open a blank window instead: null
+  // means the browser refused it; otherwise cut its opener (what `noopener`
+  // gives) before it navigates to the external page, so that page can never
+  // reach this one.
+  const opened = window.open('about:blank', '_blank');
+  if (opened === null || opened === undefined) return false;
+  opened.opener = null;
+  opened.location.replace(parsed.toString());
+  return true;
 }
 
 export async function copyTextToClipboard(text) {
@@ -53,34 +62,18 @@ export async function copyTextToClipboard(text) {
   throw new TypeError('Community annotation copying requires navigator.clipboard.writeText()');
 }
 
+/**
+ * What to tell the person when GitHub sign-in or repository discovery could
+ * not reach the Worker. A Worker never reached (no answer this page may
+ * read, and none before: `worker-request.js` `answeredBefore`) is most often
+ * one whose `ALLOWED_ORIGINS` does not list this site; anything else keeps
+ * its own sentence.
+ */
 export function describeGitHubAuthReachabilityError(err) {
   const msg = String(err?.message || '').trim();
-  if (msg === 'GitHub installations total_count exceeds 10000') {
-    return (
-      'GitHub returned more than 10,000 installations, which Cellucid ' +
-      'will not truncate. Reduce the Cellucid GitHub App installations ' +
-      'available to this GitHub account, then click Reload.'
-    );
-  }
-  if (msg === 'GitHub repositories total_count exceeds 10000') {
-    return (
-      'GitHub returned more than 10,000 repositories for one Cellucid ' +
-      'GitHub App installation, which Cellucid will not truncate. In ' +
-      'GitHub App settings, select fewer repositories for that ' +
-      'installation, then click Reload.'
-    );
-  }
-  if (msg === 'GitHub repository discovery exceeds 10000 repositories') {
-    return (
-      'Cellucid found more than 10,000 repositories across your GitHub ' +
-      'App installations, which it will not truncate. In GitHub App ' +
-      'settings, select fewer repositories, then click Reload.'
-    );
+  if (err?.code !== 'GITHUB_WORKER_UNREACHABLE' || err.answeredBefore === true) {
+    return msg || 'Request failed';
   }
   const origin = String(window.location.origin || '').trim();
-  const looksLikeCors =
-    err instanceof TypeError ||
-    /failed to fetch|load failed/i.test(msg);
-  if (!looksLikeCors) return msg || 'Request failed';
   return `Couldn’t reach the GitHub sign-in server from ${origin || 'this site'}. If you recently changed domains, update your Cloudflare Worker allowlist (ALLOWED_ORIGINS) to include ${origin || 'this origin'}, then reload.`;
 }

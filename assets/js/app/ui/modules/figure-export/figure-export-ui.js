@@ -40,10 +40,15 @@ import { applyColorblindSimulationToImageData } from './utils/colorblindness.js'
 import { assertCropRect01 } from './utils/crop.js';
 import {
   assertFigureExportSessionSettings,
+  changedFigureExportSettings,
+  figureExportParamsOf,
+  figureExportSettingsOf,
   FIGURE_EXPORT_SESSION_SETTINGS_VERSION,
   FIGURE_EXPORT_SETTING_RANGES,
   trackCommittedNumber,
 } from './utils/session-settings.js';
+import { getActions } from '../../../actions/index.js';
+import { ActionRefused } from '../../../actions/dispatcher.js';
 import { rgb01ToHex } from './utils/color-utils.js';
 import { resolveFigureInk } from './utils/figure-ink.js';
 import {
@@ -58,7 +63,7 @@ import {
   assertCameraState,
   assertNavigationMode
 } from '../../../../rendering/camera-state-contract.js';
-import { cancel } from '../../../../utils/abort.js';
+import { cancel, onAbort } from '../../../../utils/abort.js';
 
 const DEFAULT_SIZE = { width: 1600, height: 1200 };
 const PREVIEW_PRESENTATION_SETTLE_MS = 120;
@@ -3054,23 +3059,47 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       cancel(activeExportAbortController, 'user', 'Figure export was cancelled.');
       return;
     }
+    await runFigureExport({ forAction: false });
+  }
+
+  /**
+   * One export, as the Download button makes it, or for `figure.export`
+   * (`forAction`): the button turns into its Cancel while it runs. The
+   * button's export asks the person about anything the figure cannot
+   * reproduce; the action's is refused with the same words (an agent cannot
+   * answer the person's dialog), and a setting the form refuses is said in
+   * the refusal. `signal`: the action's own stop.
+   */
+  async function runFigureExport({ forAction, signal = null }) {
     exportInFlight = true;
     const abortController = new AbortController();
     activeExportAbortController = abortController;
+    const stopWithCaller = signal === null ? () => {} : onAbort(signal, () => cancel(abortController, 'user', 'Figure export was cancelled.'));
     let ended;
     exportEnded = new Promise(resolve => {
       ended = resolve;
     });
     setBusy(true);
     try {
-      await exportFigureFromUi(abortController.signal);
+      const written = await exportFigureFromUi(abortController.signal, { forAction });
+      if (forAction && written === null) {
+        const invalid = container.querySelector(':invalid');
+        throw new ActionRefused(
+          `The figure export settings are not valid${invalid?.validationMessage ? `: ${invalid.validationMessage}` : ''}; figure_export_set changes them.`,
+          { code: 'bad-value', type: 'figure.export' },
+        );
+      }
+      return written;
     } catch (error) {
+      if (forAction) throw error;
       if (!abortController.signal.aborted) {
         // Engine failures are already marked; UI/request failures enter the
         // same reporter here. Either path produces one visible notification.
         reportFigureExportFailure(error);
       }
+      return null;
     } finally {
+      stopWithCaller();
       cancel(abortController, 'closed', 'The figure export ended.');
       if (activeExportAbortController === abortController) {
         activeExportAbortController = null;
@@ -3081,11 +3110,24 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
   }
 
-  async function exportFigureFromUi(signal) {
+  // An agent's, a notebook's or a replay's export (`figure.export`): the Download button's, with the settings as they are.
+  cleanupFns.push(getActions().provide('figure.export', async (params, { signal }) => {
+    if (exportInFlight) {
+      throw new ActionRefused('A figure export is running already; wait for it to finish.', { code: 'busy', type: 'figure.export' });
+    }
+    return runFigureExport({ forAction: true, signal });
+  }));
+
+  /**
+   * Read the form and export: resolves to the files written, or to null
+   * when the form refused a value (said on its control) or the person
+   * declined what the figure cannot reproduce.
+   */
+  async function exportFigureFromUi(signal, { forAction = false } = {}) {
     const width = readExactIntegerInput(widthInput, 'Width', 100, 20_000);
-    if (width === null) return;
+    if (width === null) return null;
     const height = readExactIntegerInput(heightInput, 'Height', 100, 20_000);
-    if (height === null) return;
+    if (height === null) return null;
 
     const mode = downloadSelect.value;
     if (!['svg', 'png', 'svg+png', 'png-multi', 'all'].includes(mode)) {
@@ -3097,7 +3139,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const dpi = needsPng && !multiPng
       ? readExactIntegerInput(dpiSelect, 'DPI', 72, 1200)
       : null;
-    if (needsPng && !multiPng && dpi === null) return;
+    if (needsPng && !multiPng && dpi === null) return null;
 
     const strategy = needsSvg ? strategySelect.value : null;
     if (
@@ -3106,7 +3148,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ) {
       strategySelect.setCustomValidity('Choose an SVG point strategy.');
       strategySelect.reportValidity();
-      return;
+      return null;
     }
     strategySelect.setCustomValidity('');
     const optimizedTargetCount = strategy === 'optimized-vector'
@@ -3117,7 +3159,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           5_000_000
         )
       : null;
-    if (strategy === 'optimized-vector' && optimizedTargetCount === null) return;
+    if (strategy === 'optimized-vector' && optimizedTargetCount === null) return null;
 
     const activeViewId = getActiveViewIdForPreview();
 
@@ -3165,31 +3207,38 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       })
     );
 
+    if (forAction && warnings.length > 0) {
+      // The person's dialog would block it: the agent hears the same words.
+      throw new ActionRefused(
+        `The figure cannot reproduce what the view shows: ${warnings.map(warning => `${warning.title}: ${warning.detail}`).join(' ')}`,
+        { code: 'unavailable', type: 'figure.export' },
+      );
+    }
     const proceed = await confirmExportFidelityWarnings({
       warnings,
       signal,
     });
-    if (!proceed) return;
+    if (!proceed) return null;
 
       const baseFontSizePx = readExactIntegerInput(fontSizeInput, 'Base font size', 1, 500);
-      if (baseFontSizePx === null) return;
+      if (baseFontSizePx === null) return null;
       const legendFontSizePx = readExactIntegerInput(legendFontSizeInput, 'Legend font size', 1, 500);
-      if (legendFontSizePx === null) return;
+      if (legendFontSizePx === null) return null;
       const tickFontSizePx = readExactIntegerInput(tickFontSizeInput, 'Tick font size', 1, 500);
-      if (tickFontSizePx === null) return;
+      if (tickFontSizePx === null) return null;
       const axisLabelFontSizePx = readExactIntegerInput(axisLabelFontSizeInput, 'Axis-label font size', 1, 500);
-      if (axisLabelFontSizePx === null) return;
+      if (axisLabelFontSizePx === null) return null;
       const titleFontSizePx = readExactIntegerInput(titleFontSizeInput, 'Title font size', 1, 500);
-      if (titleFontSizePx === null) return;
+      if (titleFontSizePx === null) return null;
       const centroidLabelFontSizePx = readExactIntegerInput(centroidLabelFontSizeInput, 'Centroid-label font size', 1, 500);
-      if (centroidLabelFontSizePx === null) return;
+      if (centroidLabelFontSizePx === null) return null;
       const selectionMutedOpacity = readExactDecimalInput(
         selectionMutedOpacityInput,
         'Muted selection opacity',
         0,
         1
       );
-      if (selectionMutedOpacity === null) return;
+      if (selectionMutedOpacity === null) return null;
       if (!['right', 'bottom'].includes(legendPosSelect.value)) {
         throw new TypeError('Figure export legend position is not a current UI value.');
       }
@@ -3199,7 +3248,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       if (!/^#[0-9a-fA-F]{6}$/.test(backgroundColorInput.value)) {
         backgroundColorInput.setCustomValidity('Background color must be #RRGGBB.');
         backgroundColorInput.reportValidity();
-        return;
+        return null;
       }
       backgroundColorInput.setCustomValidity('');
       if (fontSelect.value.trim().length === 0) {
@@ -3236,7 +3285,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         optimizedTargetCount
       };
 
-      let result;
       /** @type {{ format: 'svg'|'png'; dpi: number|null }[]} */
       const jobs = [];
       if (needsSvg) jobs.push({ format: 'svg', dpi: null });
@@ -3245,21 +3293,22 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         else jobs.push({ format: 'png', dpi });
       }
 
-      if (jobs.length === 1) {
-        result = await engine.exportFigure({
+      const results = jobs.length === 1
+        ? [await engine.exportFigure({
           ...baseOptions,
           signal,
           format: jobs[0].format,
           dpi: jobs[0].dpi,
-        });
-      } else {
-        const results = await engine.exportFigures({
+        })]
+        : await engine.exportFigures({
           ...baseOptions,
           signal,
           jobs
         });
-        result = results[0];
-      }
+      return {
+        files: results.map((written, index) => ({ format: written.format, file: written.filename, dpi: jobs[index].dpi })),
+        zip: results.length > 1,
+      };
 
   }
 
@@ -3482,7 +3531,93 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     } else {
       clearPreview();
     }
+    observedSettings = settingsNow();
   }
+
+  // ---------------------------------------------------------------------------
+  // The settings as steps: `figure-export.set` (app/actions/definitions/settings.js)
+  // ---------------------------------------------------------------------------
+
+  /** The settings now, or null while a box holds a value never valid. */
+  function settingsNow() {
+    try {
+      return exportSessionSettings();
+    } catch {
+      return null;
+    }
+  }
+
+  /** The text sizes the panel shows (derived while Auto text is on). */
+  function shownFontSizes() {
+    return Object.fromEntries(['base', 'legend', 'ticks', 'axisLabel', 'title', 'centroidLabel']
+      .map(key => [key, committedNumbers[key].read()]));
+  }
+
+  /** A refusal in the step's own words: the parameters' names, not the record's. */
+  function refusalOf(error) {
+    const message = String(error?.message ?? error)
+      .replace(/^Figure-export session settings\.?/, '')
+      .replace(/\b[a-z]+(?:[A-Z][a-z0-9]*)+\b/g, word => Object.keys(figureExportParamsOf({ [word]: null }))[0]);
+    return new ActionRefused(`These figure export settings do not go together: ${message.trim()}`, { code: 'bad-value', type: 'figure-export.set' });
+  }
+
+  // An agent's, a notebook's or a replay's step: the settings it names, the
+  // rest as they are, applied whole through the session path.
+  cleanupFns.push(getActions().provide('figure-export.set', params => {
+    const current = exportSessionSettings();
+    const given = figureExportSettingsOf(params);
+    const next = { ...current, ...given };
+    // A value the panel derives becomes the person's when its switch is turned off,
+    // and is derived again when it is turned back on.
+    if (Object.hasOwn(given, 'autoTextSize') && !Object.hasOwn(given, 'fontSizes')) {
+      next.fontSizes = given.autoTextSize ? null : (current.fontSizes ?? shownFontSizes());
+    }
+    if (Object.hasOwn(given, 'titleFollowsDataset') && !Object.hasOwn(given, 'title')) {
+      next.title = given.titleFollowsDataset ? null : (current.title ?? titleInput.value);
+    }
+    let exact;
+    try {
+      exact = assertFigureExportSessionSettings(next);
+    } catch (error) {
+      throw refusalOf(error);
+    }
+    const changed = changedFigureExportSettings(current, exact);
+    if (Object.keys(changed).length === 0) return null;
+    importSessionSettings(exact);
+    return { changed: Object.keys(changed).length };
+  }));
+
+  // What the person's changes are compared with: the settings last recorded
+  // or put back (`importSessionSettings`).
+  let observedSettings = settingsNow();
+
+  /**
+   * A person's change of a setting, made by its control's own handler, is
+   * recorded as one `figure-export.set` step by observation, from the event
+   * that made it, as the sidebar's settings are (`settings-actions.js`).
+   * This panel's controls are not in the generic control inventory: its
+   * settings are one record, with a frame drawn on the preview and a title
+   * that follows the dataset. Any control that changes the record, one added
+   * later included, is recorded here with no code of its own. The events a
+   * history restore or the action itself causes are not steps: the history
+   * compares with what it shows.
+   */
+  function observeSettings() {
+    const now = settingsNow();
+    const before = observedSettings;
+    observedSettings = now;
+    if (now === null || before === null) return;
+    const changed = changedFigureExportSettings(before, now);
+    if (Object.keys(changed).length === 0) return;
+    try {
+      getActions()
+        .recordObserved('figure-export.set', figureExportParamsOf(changed))
+        .catch(error => console.error('[FigureExport] A setting could not be recorded.', error));
+    } catch (error) {
+      console.error('[FigureExport] A setting could not be recorded.', error);
+    }
+  }
+  for (const type of ['input', 'change', 'click', 'pointerup', 'keyup']) listen(container, type, observeSettings);
 
   return { setCellsPresent, destroy, exportSessionSettings, importSessionSettings };
 }

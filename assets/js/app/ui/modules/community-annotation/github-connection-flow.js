@@ -57,7 +57,9 @@ import {
 } from './browser-integration.js';
 import { onAbort } from '../../../../utils/abort.js';
 
-const GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS = 10_000;
+/** Where a person installs Cellucid's GitHub App on their account, or changes which repositories it reaches. */
+export const GITHUB_APP_INSTALL_URL = 'https://github.com/apps/cellucid-community-annotations/installations/new';
+
 const SYNC_SKIPPED_MESSAGE =
   'Another GitHub sync is still running. Wait for it to finish, then try again.';
 
@@ -71,21 +73,34 @@ const SYNC_SKIPPED_MESSAGE =
  * @param {string} doneText
  * @returns {string}
  */
+/**
+ * What a finished Publish did: written to the repository, only a pull
+ * request opened (the repository has it once its authors merge it), or
+ * nothing new.
+ * @param {{mode?: string, prUrl?: string|null}} outcome
+ */
+export function describePublished(outcome) {
+  if (outcome.mode === 'fork-pull-request') return `Opened a pull request: ${outcome.prUrl}. The repository has your changes once its authors merge it.`;
+  if (outcome.changed === false) return 'Nothing new to publish: GitHub already has your changes.';
+  return 'Published.';
+}
+
 export function describeSyncOutcome(outcome, doneText) {
-  if (typeof doneText !== 'string' || !doneText) {
-    throw new TypeError('Sync outcome success text must be a non-empty string');
+  if (!(typeof doneText === 'function' || (typeof doneText === 'string' && doneText))) {
+    throw new TypeError('Sync outcome success text must be a non-empty string or a function of the outcome');
   }
   if (outcome === null || typeof outcome !== 'object') {
     throw new TypeError('GitHub sync must return an explicit outcome');
   }
   switch (outcome.status) {
     case 'done':
-      return doneText;
+      return typeof doneText === 'function' ? doneText(outcome) : doneText;
     case 'skipped':
       return SYNC_SKIPPED_MESSAGE;
     case 'cancelled':
       return 'Cancelled.';
     case 'failed':
+    case 'unknown':
       if (typeof outcome.error !== 'string' || !outcome.error) {
         throw new TypeError('A failed GitHub sync outcome must carry its error message');
       }
@@ -115,6 +130,7 @@ const REQUIRED_CONTROLLER_MEMBERS = Object.freeze([
   'releaseActiveConnectionClose',
   'disconnectAnnotationRepo',
   'disconnectGitHubAndAnnotationRepo',
+  'forgetRefusedSignIn',
   'ensureIdentityForUserKey',
   'getCacheContext',
   'getCacheUserId',
@@ -188,7 +204,7 @@ export function createGitHubConnectionFlow(controller) {
     login = null,
     currentRepo = null,
   } = {}) {
-    const appInstallUrl = 'https://github.com/apps/cellucid-community-annotations/installations/new';
+    const appInstallUrl = GITHUB_APP_INSTALL_URL;
     const settingsUrl = 'https://github.com/settings/installations';
     const openingOwner = publishContextOwner(
       getCacheContext({ datasetId: datasetId ?? undefined })
@@ -387,7 +403,6 @@ export function createGitHubConnectionFlow(controller) {
             className: 'obs-select',
             'aria-label': 'Filter repositories',
             autocomplete: 'off',
-            maxlength: '256',
             placeholder: 'Filter repositories…',
             value: ''
           });
@@ -622,7 +637,6 @@ export function createGitHubConnectionFlow(controller) {
           let uiStep = null;
           /** @type {number|null} */
           let lastUiStep = null;
-          let canGoNext = false;
           let clearStatusOnStepChange = false;
 
           const setActiveStep = (n) => {
@@ -983,17 +997,21 @@ export function createGitHubConnectionFlow(controller) {
             }
 
             setStatusTone(datasetRow.chip, did ? 'ok' : 'warn');
-            datasetRow.valueEl.textContent = did ? ` ${did}` : ' —';
+            // The dataset by its name; the id the repository files it under on hover.
+            const datasetName = String(dataSourceManager?.getCurrentMetadata?.()?.name ?? '').trim() || did;
+            datasetRow.valueEl.textContent = did ? ` ${datasetName}` : ' —';
+            datasetRow.row.title = did && datasetName !== did ? `Dataset id in the repository: ${did}` : '';
 
             setStatusTone(githubRow.chip, authed ? 'ok' : 'warn');
             githubRow.valueEl.textContent = authed ? (who ? ` @${who}` : ' signed in') : ' not connected';
-            githubSettingsBtn.disabled = !authed;
-            disconnectGitHubBtn.disabled = !authed;
+            // Shown only when they can act: a greyed icon says nothing and takes no focus.
+            githubSettingsBtn.hidden = !authed;
+            disconnectGitHubBtn.hidden = !authed;
 
             setStatusTone(repoRow.chip, connectedName ? 'ok' : 'warn');
             repoRow.valueEl.textContent =
               connectedName ? ` ${connectedName}` : (storedRepoName && !authed ? ` ${storedRepoName} (sign in)` : ' not connected');
-            disconnectRepoBtn.disabled = !(authed && connectedName);
+            disconnectRepoBtn.hidden = !(authed && connectedName);
 
             const showFilter = repoListLoaded && allRepos.length > 20;
             filterRow.hidden = !(authed && uiStep === 3 && showFilter);
@@ -1125,7 +1143,6 @@ export function createGitHubConnectionFlow(controller) {
             nextBtn.disabled = !nextEnabled;
             if (nextEnabled) nextBtn.removeAttribute('title');
             else nextBtn.title = nextBlocker;
-            canGoNext = Boolean(nextEnabled);
 
             ensureAutoPullTimer();
             renderRepoCards();
@@ -1181,14 +1198,6 @@ export function createGitHubConnectionFlow(controller) {
                       `GitHub returned duplicate repository ${repo.full_name}`
                     );
                   }
-                  if (
-                    repos.length >=
-                    GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS
-                  ) {
-                    throw new Error(
-                      'GitHub repository discovery exceeds 10000 repositories'
-                    );
-                  }
                   seenRepoIds.add(repo.id);
                   seenRepoNames.add(nameKey);
                   repos.push({
@@ -1224,7 +1233,7 @@ export function createGitHubConnectionFlow(controller) {
                 return;
               }
               if (isTokenAuthFailure(err)) {
-                disconnectGitHubSession({ message: 'GitHub session expired or was revoked. Please connect again.', notify: 'error' });
+                controller.forgetRefusedSignIn();
                 return;
               }
               status.textContent = describeGitHubAuthReachabilityError(err);
@@ -1498,7 +1507,7 @@ export function createGitHubConnectionFlow(controller) {
               () => runSyncAction(
                 'Publishing…',
                 pushToGitHub,
-                'Publish complete.'
+                describePublished,
               ),
               { label: 'GitHub annotation publish action failed' },
             );

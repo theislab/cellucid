@@ -15,6 +15,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { armSelection } from './helpers/selection-gesture.mjs';
 
 // Every test here draws a multiview grid frame by frame, some at pixel ratio
 // 2 (four times the pixels). The macOS Firefox runners render in software,
@@ -228,7 +229,7 @@ async function toggleSidebar(page, hidden) {
 /**
  * Sample one sidebar slide at evenly spaced points of its run. The toggle
  * and the sampler are started in the same task; the slide is paused, stepped
- * to each point, and one frame drawn there before it is sampled, then played
+ * to each point, and one frame drawn there before it is sampled, then taken
  * to its end and sampled settled.
  *
  * Sampling the frames the browser happened to draw saw nothing of the slide
@@ -238,6 +239,14 @@ async function toggleSidebar(page, hidden) {
  * paused slide keeps the sidebar's transition running, which is all the
  * product watches while it slides (`sidebar-controls.js`), so a stepped
  * point is a real frame of the slide on any runner.
+ *
+ * Finding the slide to pause it had the same flaw one step earlier: where
+ * two frames were more than its 300 ms apart it had started and ended
+ * between two looks, and the sampler waited for a slide that was over
+ * ("the sidebar toggle started no slide", Linux WebKit, push run of
+ * 2026-11-05). The slide sampled is therefore one that does not end by
+ * itself: its duration is set far past any wait, it is stepped by share of
+ * its run as before, and finished by the sampler.
  */
 const SLIDE_POINTS = 6;
 
@@ -245,10 +254,17 @@ function sampleToggleAnimation(page) {
   return page.evaluate(async points => {
     const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
     const sidebar = document.getElementById('sidebar');
+    sidebar.style.transitionDuration = '100000s';
     document.getElementById('sidebar-toggle').click();
-    const slide = sidebar.getAnimations();
-    if (slide.length === 0) throw new Error('the sidebar toggle started no slide');
+    // The toggle asks through its action (`layout.sidebar.show`), which the dispatcher runs once the
+    // actions before it have finished: the slide starts when they have, however long that takes here.
+    let slide = sidebar.getAnimations();
+    while (slide.length === 0) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      slide = sidebar.getAnimations();
+    }
     for (const animation of slide) animation.pause();
+    sidebar.style.transitionDuration = '';
     const samples = [];
     for (let point = 0; point < points; point++) {
       for (const animation of slide) {
@@ -258,7 +274,7 @@ function sampleToggleAnimation(page) {
       await nextFrame();
       samples.push(window.__measurePresented());
     }
-    for (const animation of slide) animation.play();
+    for (const animation of slide) animation.finish();
     while (sidebar.getAnimations().length > 0) await nextFrame();
     await nextFrame();
     samples.push(window.__measurePresented());
@@ -695,22 +711,6 @@ const unifiedState = page => page.evaluate(
     return { ...state, candidates: Array.from(state.candidates) };
   },
 );
-
-async function armSelection(page, tool, gesture) {
-  const controls = page.locator(`#${tool}-step-controls`);
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await gesture();
-    const armed = await controls.waitFor({
-      state: 'attached',
-      timeout: 3_000,
-    }).then(() => true, error => {
-      if (error?.name !== 'TimeoutError') throw error;
-      return false;
-    });
-    if (armed) return;
-  }
-  await expect(controls).toBeAttached();
-}
 
 async function altPath(page, points) {
   await page.mouse.move(points[0].x, points[0].y);

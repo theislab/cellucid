@@ -226,7 +226,7 @@ export async function writeModel(model, space, context) {
     }
   } else {
     writer.group('mod', { 'mod-order': model.modalities.map(modality => modality.name) });
-    writer.group('obsmap', {});
+    writer.dict('obsmap');
     const allFeatures = [];
     const rowOfName = new Map(model.obs.names.map((name, index) => [name, priority === null ? index : priority.position[index]]));
     for (const modality of model.modalities) {

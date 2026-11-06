@@ -1,0 +1,46 @@
+{
+  "examples": [
+    {
+      "name": "Page 1",
+      "operation": "intersection",
+      "pages": [
+        "Page 1",
+        "Page 11"
+      ]
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "operation": {
+        "enum": [
+          "intersection",
+          "union"
+        ]
+      },
+      "pages": {
+        "items": {
+          "minLength": 1,
+          "pattern": "^\\S(?:.*\\S)?$",
+          "type": "string"
+        },
+        "maxItems": 2,
+        "minItems": 2,
+        "type": "array",
+        "uniqueItems": true
+      }
+    },
+    "required": [
+      "pages",
+      "operation"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.page.combine",
+  "version": 1
+}

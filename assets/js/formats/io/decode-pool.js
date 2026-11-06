@@ -86,6 +86,7 @@ import { decodeWorkerScript } from '../../../workers/scripts.js';
 import { startWorker } from '../../workers/worker-script.js';
 import { WORKER_IDLE_MS } from '../../workers/idle-retirement.js';
 import { fromWire } from '../../utils/error-wire.js';
+import { reportedCores } from '../../utils/machine.js';
 import { DecoderProbe, adoptDecidedDecoders, choiceKey, fixDecoders, forgetDecidedDecoders } from './decoder-choice.js';
 import { decoderMemoryStore, decoderMemoryVersion, keepDecoderDecisions, recallDecoderDecisions } from './decoder-memory.js';
 
@@ -136,7 +137,7 @@ const BATCH_MESSAGES = 4;
  * @returns {number}
  */
 export function decodeWorkerCount(memoryBytes, environment = globalThis) {
-  const cores = Number(environment?.navigator?.hardwareConcurrency) || 4;
+  const cores = reportedCores(environment) ?? 4;
   return Math.max(0, Math.min(Math.max(1, cores - 2), Math.floor(memoryBytes / DECODE_WORKER_BYTES)));
 }
 

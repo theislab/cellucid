@@ -87,6 +87,7 @@ export function createAccordionInteractions({
   undock,
   dock,
   floatingArea,
+  placed,
   constants
 }) {
   const {
@@ -254,7 +255,12 @@ export function createAccordionInteractions({
     state.floatTop = rect.top;
   }
 
+  /**
+   * A gesture placed the panel (moved, resized, fitted, maximized): its
+   * owner records the box it ends in, and hears the size the user chose.
+   */
   function notifyGeometry(details) {
+    placed(details, 'place');
     const state = getState(details);
     if (typeof state.onGeometryChange !== 'function') return;
     const frame = panelFrame(details);
@@ -461,7 +467,34 @@ export function createAccordionInteractions({
     state.floatLeft = x;
     state.floatTop = y;
     announceKeyboardMove(document, `Window moved to ${Math.round(x)}, ${Math.round(y)}.`);
+    placed(details, 'place');
     return true;
+  }
+
+  /**
+   * Put a floating panel at `rect` (an action's box): inside the area the
+   * windows keep to, never below the panel's smallest working size.
+   * Returns the box it stands in.
+   *
+   * @param {HTMLElement} details
+   * @param {{left: number, top: number, width: number, height: number}} rect
+   */
+  function placeFloating(details, rect) {
+    const frame = panelFrame(details);
+    const state = getState(details);
+    const { minWidth, minHeight } = sizeLimits(details, state);
+    const { viewportWidth, viewportHeight } = floatingArea();
+    const width = Math.max(minWidth, Math.min(rect.width, viewportWidth - 2 * FLOATING_MARGIN));
+    const height = Math.max(minHeight, Math.min(rect.height, viewportHeight - 2 * FLOATING_MARGIN));
+    const { x, y } = clampFloatingPosition({
+      left: rect.left, top: rect.top, width, height, viewportWidth, viewportHeight
+    });
+    const box = { left: x, top: y, width, height };
+    clearMaximized(details);
+    applyRect(details, box);
+    syncHandles(details, box);
+    raiseToTop(frame);
+    return box;
   }
 
   function onHandleKeydown(details, handle, e) {
@@ -703,6 +736,7 @@ export function createAccordionInteractions({
           const targetTop = ev.clientY - offsetY;
           undock(details, targetLeft, targetTop);
           state.suppressNextClick = true;
+          if (isFloating(details)) placed(details, 'float');
         }
       }
 
@@ -844,6 +878,7 @@ export function createAccordionInteractions({
             dock(details);
           }
         }
+        placed(details, isFloating(details) ? 'place' : 'dock');
       }
 
       summary.addEventListener('pointermove', onMove, { signal });
@@ -859,6 +894,8 @@ export function createAccordionInteractions({
     setupFloatingDrag,
     syncResizeHandles: syncHandles,
     firstControlHeight,
+    frameRect,
+    placeFloating,
     toggleMaximize,
     moveByKeyboard,
     syncMaximized,

@@ -1,0 +1,150 @@
+{
+  "examples": [
+    {
+      "in": "panel",
+      "options": {
+        "colorBy": "x",
+        "method": "pearson",
+        "variableX": null,
+        "variableY": null
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "colorBy": "x",
+        "method": "pearson",
+        "variableX": null,
+        "variableY": null
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "colorBy": "x",
+        "method": "pearson",
+        "variableX": {
+          "key": "x",
+          "type": "continuous_obs"
+        },
+        "variableY": null
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "colorBy": "x",
+        "method": "pearson",
+        "variableX": null,
+        "variableY": {
+          "key": "x",
+          "type": "continuous_obs"
+        }
+      },
+      "show": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "options": {
+        "additionalProperties": false,
+        "properties": {
+          "colorBy": {
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "pearson",
+              "spearman"
+            ],
+            "type": "string"
+          },
+          "variableX": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": {
+                    "enum": [
+                      "continuous_obs",
+                      "gene_expression"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "key"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "variableY": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": {
+                    "enum": [
+                      "continuous_obs",
+                      "gene_expression"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "key"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "show": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "options"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.correlation.set",
+  "version": 1
+}

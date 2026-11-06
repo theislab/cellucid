@@ -7,6 +7,14 @@ import {
   composeUserFile,
   parseExactJson,
 } from '../assets/js/app/community-annotations/wire-contract.js';
+import { createHostBook } from '../assets/js/formats/io/hosts.js';
+import { ResponseClock } from '../assets/js/formats/io/link.js';
+import {
+  configFor,
+  createVirtualTime,
+  MockAnnotationGitHub,
+  WORKER_ORIGIN,
+} from './helpers/community-annotation-worker.mjs';
 
 const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
 const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
@@ -151,15 +159,6 @@ function forkOnlyRepoInfo() {
   };
 }
 
-function forkRecord() {
-  return {
-    full_name: 'researcher/repo',
-    name: 'repo',
-    owner: { login: 'researcher' },
-    parent: { full_name: 'owner/repo' },
-  };
-}
-
 function forkIdentityRecord() {
   return {
     full_name: 'researcher/repo',
@@ -175,55 +174,59 @@ function pullRequestRecord() {
   };
 }
 
-function schemaDocument(kind) {
-  const ids = {
-    user:
-      'https://cellucid.com/contracts/community-annotation/user-v2.schema.json',
-    config:
-      'https://cellucid.com/contracts/community-annotation/config-v1.schema.json',
-    merges:
-      'https://cellucid.com/contracts/community-annotation/merges-v2.schema.json',
-  };
-  return {
-    $schema: 'https://json-schema.org/draft/2020-12/schema',
-    $id: ids[kind],
-  };
-}
+/**
+ * The Worker every sync of a test talks to, and the virtual time it runs on:
+ * `withWorkerFetch(fetchImpl, operation)` points them at `fetchImpl` and
+ * settles `operation()` on a fresh virtual clock (retries, stalls and fork
+ * readiness waits never wait in real time).
+ */
+const current = { fetch: null, time: createVirtualTime() };
 
 function createSync() {
+  const transport = Object.freeze({
+    fetch: (url, init) => current.fetch(url, init),
+    hosts: createHostBook({
+      now: () => current.time.now(),
+      after: (ms, callback) => current.time.after(ms, callback),
+      epoch: () => 1_800_000_000_000 + current.time.now(),
+    }),
+    clock: new ResponseClock({
+      clock: () => current.time.now(),
+      after: (ms, callback) => current.time.after(ms, callback),
+    }),
+  });
   return new CommunityAnnotationGitHubSync({
     datasetId: 'synthetic',
     owner: 'owner',
     repo: 'repo',
     token: 'test-token',
     branch: 'main',
-    workerOrigin: 'https://worker.example',
+    workerOrigin: WORKER_ORIGIN,
+    transport,
   });
 }
 
-async function withGlobalFetch(fetchImpl, operation) {
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = fetchImpl;
-  try {
-    return await operation();
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
+async function withWorkerFetch(fetchImpl, operation) {
+  current.fetch = fetchImpl;
+  current.time = createVirtualTime();
+  return current.time.run(Promise.resolve().then(operation));
 }
 
-async function withImmediateReadinessTimers(operation) {
-  const previousSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (handler, delay, ...args) =>
-    previousSetTimeout(
-      handler,
-      Number(delay) < 5_000 ? 0 : delay,
-      ...args,
-    );
-  try {
-    return await operation();
-  } finally {
-    globalThis.setTimeout = previousSetTimeout;
-  }
+/** The repository's annotation layout as the snapshot names it (contract 3). */
+function snapshotRepository() {
+  return new MockAnnotationGitHub({
+    files: {
+      'annotations/config.json': configFor('synthetic', ['cell_type']),
+      'annotations/users/.gitkeep': '\n',
+    },
+  });
+}
+
+/** An error and its causes, outermost first. */
+function causeChain(error) {
+  const chain = [];
+  for (let at = error; at !== undefined && at !== null && chain.length < 10; at = at.cause) chain.push(at);
+  return chain;
 }
 
 async function withDeterministicOperationIds(operation) {
@@ -290,10 +293,10 @@ function mutationKind(request) {
     return 'git-refs-post';
   }
   if (
-    request.method === 'POST' &&
-    request.path.endsWith('/forks')
+    request.method === 'PATCH' &&
+    request.path.includes('/git/refs/heads/')
   ) {
-    return 'forks-post';
+    return 'git-ref-patch';
   }
   if (
     request.method === 'POST' &&
@@ -328,36 +331,28 @@ function requireMutationOperation(request, seenOperationIds) {
 class ForkPublicationWorkerMock {
   constructor({
     lossKind = null,
-    forkExists = true,
     branchExists = true,
     branchSha = SHA_A,
     createdBranchSha = SHA_A,
     forkFileText = exactPublishedJson(validUserFile()),
     pullRequestExists = true,
     malformedAppliedKind = null,
-    forkReady = true,
-    forkTransient404s = 0,
-    abortOnForkProbe = null,
-    enforceForkReadiness = false,
+    forkCopied = true,
   } = {}) {
     this.lossKind = lossKind;
-    this.forkExists = forkExists;
     this.branchExists = branchExists;
     this.branchSha = branchSha;
     this.createdBranchSha = createdBranchSha;
     this.forkFileText = forkFileText;
     this.pullRequestExists = pullRequestExists;
     this.malformedAppliedKind = malformedAppliedKind;
-    this.forkReady = forkReady;
-    this.forkTransient404s = forkTransient404s;
-    this.abortOnForkProbe = abortOnForkProbe;
-    this.enforceForkReadiness = enforceForkReadiness;
-    this.forkProbeCount = 0;
+    this.forkCopied = forkCopied;
     this.requests = [];
     this.seenOperationIds = new Set();
     this.lossRequestIndex = null;
     this.branch = null;
     this.mutationCounts = new Map();
+    this.repository = snapshotRepository();
   }
 
   countMutations(kind = null) {
@@ -393,6 +388,13 @@ class ForkPublicationWorkerMock {
     this.requests.push(request);
 
     if (
+      request.method === 'POST' &&
+      request.path === '/graphql/snapshot'
+    ) {
+      return this.repository.fetch(rawUrl, options);
+    }
+
+    if (
       request.method === 'GET' &&
       request.path === '/auth/user'
     ) {
@@ -417,31 +419,7 @@ class ForkPublicationWorkerMock {
     ) {
       assert.equal(request.query.get('fork_identity'), '1');
       assert.equal(request.query.size, 1);
-      return this.forkExists
-        ? jsonResponse(forkIdentityRecord())
-        : errorResponse('Not Found', 404);
-    }
-    if (
-      request.method === 'GET' &&
-      request.path === '/api/repos/owner/repo/forks'
-    ) {
-      assert.equal(request.query.get('sort'), 'newest');
-      assert.equal(request.query.get('per_page'), '100');
-      assert.equal(request.query.get('page'), '1');
-      return jsonResponse(this.forkExists ? [forkRecord()] : []);
-    }
-    if (
-      request.method === 'POST' &&
-      request.path === '/api/repos/owner/repo/forks'
-    ) {
-      assert.deepEqual(request.body, {});
-      this.forkExists = true;
-      return this.#mutationResult(
-        request,
-        kind,
-        forkRecord(),
-        202,
-      );
+      return jsonResponse(forkIdentityRecord());
     }
     if (
       request.method === 'GET' &&
@@ -454,26 +432,13 @@ class ForkPublicationWorkerMock {
       request.path ===
         '/api/repos/researcher/repo/git/ref/heads/main'
     ) {
-      this.forkProbeCount += 1;
-      if (
-        this.abortOnForkProbe !== null &&
-        this.forkProbeCount === this.abortOnForkProbe.probe
-      ) {
-        this.abortOnForkProbe.controller.abort(
-          this.abortOnForkProbe.reason,
-        );
-      }
-      if (
-        !this.forkReady &&
-        this.forkProbeCount <= this.forkTransient404s
-      ) {
-        return errorResponse('Fork is not ready', 404);
-      }
-      this.forkReady = true;
-      return jsonResponse({ object: { sha: SHA_A } });
+      // A fork GitHub is still copying has no branches yet.
+      return this.forkCopied
+        ? jsonResponse({ object: { sha: SHA_A } })
+        : errorResponse('Not Found', 404);
     }
     if (
-      this.enforceForkReadiness &&
+      !this.forkCopied &&
       (
         request.path.startsWith(
           '/api/repos/researcher/repo/git/ref/heads/cellucid-annotations/',
@@ -484,11 +449,7 @@ class ForkPublicationWorkerMock {
         request.path === '/api/repos/owner/repo/pulls'
       )
     ) {
-      assert.equal(
-        this.forkReady,
-        true,
-        'branch/file/PR operations must wait for exact fork ref readiness',
-      );
+      assert.fail('branch/file/PR operations must wait until GitHub has copied the fork');
     }
     if (
       request.method === 'GET' &&
@@ -518,6 +479,18 @@ class ForkPublicationWorkerMock {
       this.branchExists = true;
       this.branchSha = this.createdBranchSha;
       return this.#mutationResult(request, kind, {}, 201);
+    }
+    if (
+      request.method === 'PATCH' &&
+      request.path.startsWith(
+        '/api/repos/researcher/repo/git/refs/heads/cellucid-annotations/',
+      )
+    ) {
+      this.#observeBranch(request.path.replace('/api/repos/researcher/repo/git/refs/heads/', ''));
+      assert.deepEqual(request.body, { sha: SHA_A, force: true });
+      assert.equal(this.branchExists, true);
+      this.branchSha = SHA_A;
+      return this.#mutationResult(request, kind, { object: { sha: SHA_A } }, 200);
     }
     if (
       request.method === 'GET' &&
@@ -553,12 +526,10 @@ class ForkPublicationWorkerMock {
       request.method === 'GET' &&
       request.path === '/api/repos/owner/repo/pulls'
     ) {
-      assert.notEqual(this.branch, null);
       assert.equal(request.query.get('state'), 'open');
-      assert.equal(
-        request.query.get('head'),
-        `researcher:${this.branch}`,
-      );
+      const head = request.query.get('head');
+      assert.match(head, /^researcher:cellucid-annotations\/ghid_42\/[a-z0-9]+$/);
+      this.#observeBranch(head.slice('researcher:'.length));
       assert.equal(request.query.get('base'), 'main');
       assert.equal(request.query.get('per_page'), '100');
       return jsonResponse(
@@ -635,6 +606,7 @@ class DirectContentsWorkerMock {
     this.seenOperationIds = new Set();
     this.putCount = 0;
     this.putRequestIndex = null;
+    this.repository = snapshotRepository();
   }
 
   async fetch(rawUrl, options = {}) {
@@ -647,6 +619,13 @@ class DirectContentsWorkerMock {
       );
     }
     this.requests.push(request);
+
+    if (
+      request.method === 'POST' &&
+      request.path === '/graphql/snapshot'
+    ) {
+      return this.repository.fetch(rawUrl, options);
+    }
 
     if (
       request.method === 'GET' &&
@@ -725,6 +704,7 @@ class DirectMutationWorkerMock {
     this.seenOperationIds = new Set();
     this.contentReads = 0;
     this.putCount = 0;
+    this.repository = snapshotRepository();
   }
 
   async fetch(rawUrl, options = {}) {
@@ -737,6 +717,13 @@ class DirectMutationWorkerMock {
       );
     }
     this.requests.push(request);
+
+    if (
+      request.method === 'POST' &&
+      request.path === '/graphql/snapshot'
+    ) {
+      return this.repository.fetch(rawUrl, options);
+    }
 
     if (
       request.method === 'GET' &&
@@ -760,6 +747,8 @@ class DirectMutationWorkerMock {
         this.abortDuringReconciliation.controller.abort(
           this.abortDuringReconciliation.reason,
         );
+        // A request whose signal ends before its answer is rejected.
+        if (options.signal?.aborted) throw options.signal.reason;
       }
       return document === null
         ? errorResponse('Not Found', 404)
@@ -812,7 +801,7 @@ test(
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -856,15 +845,19 @@ test(
   async t => {
     const cases = [
       {
+        // Another version than the one the write replaced: whoever wrote
+        // it, the file changed under this write.
         label: 'mismatched bytes',
         reconciliationContent: contentDocument(
           '{"different":true}\n',
           SHA_D,
         ),
+        code: 'COMMUNITY_ANNOTATION_CONFLICT',
       },
       {
         label: '404 after the mutation',
         reconciliationContent: null,
+        code: 'GITHUB_MUTATION_OUTCOME_UNKNOWN',
       },
     ];
 
@@ -881,7 +874,7 @@ test(
           },
         });
         const { calls } = await withDeterministicOperationIds(() =>
-          withGlobalFetch(
+          withWorkerFetch(
             worker.fetch.bind(worker),
             () => assert.rejects(
               createSync().pushMyUserFile({
@@ -889,15 +882,17 @@ test(
                 publicationMode: 'direct',
               }),
               error => {
-                assert.equal(
-                  error?.message,
-                  'GitHub mutation outcome is unknown after a transport failure',
-                );
-                assert.equal(
-                  error?.code,
-                  'GITHUB_MUTATION_OUTCOME_UNKNOWN',
-                );
-                assert.equal(error?.cause, transportError);
+                assert.equal(error?.code, contract.code);
+                if (contract.code === 'GITHUB_MUTATION_OUTCOME_UNKNOWN') {
+                  assert.equal(
+                    error?.message,
+                    'GitHub mutation outcome is unknown after a transport failure',
+                  );
+                } else {
+                  assert.equal(error?.path, USER_PATH);
+                }
+                assert.ok(causeChain(error).includes(transportError), 'the lost answer is its cause');
+                // Either way the write's outcome stays unknown: Pull first.
                 assert.deepEqual(error?.operation, {
                   id: OPERATION_IDS[0],
                   kind: 'contents-put',
@@ -946,7 +941,7 @@ test(
     });
 
     const { calls } = await withDeterministicOperationIds(() =>
-      withGlobalFetch(
+      withWorkerFetch(
         worker.fetch.bind(worker),
         () => assert.rejects(
           createSync().pushMyUserFile({
@@ -959,13 +954,13 @@ test(
               error?.code,
               'GITHUB_MUTATION_OUTCOME_UNKNOWN',
             );
-            assert.equal(error?.cause, transportError);
+            assert.ok(causeChain(error).includes(transportError), 'the lost answer is its cause');
             assert.deepEqual(error?.operation, {
               id: OPERATION_IDS[0],
               kind: 'contents-put',
               outcome: 'unknown',
             });
-            assert.notEqual(error?.cause, callerReason);
+            assert.ok(!causeChain(error).includes(callerReason), 'the caller abort does not replace it');
             return true;
           },
         ),
@@ -996,7 +991,7 @@ test(
         });
         const { calls, value: result } =
           await withDeterministicOperationIds(() =>
-            withGlobalFetch(
+            withWorkerFetch(
               worker.fetch.bind(worker),
               () => createSync().pushMyUserFile({
                 userDoc: validUserDocument(),
@@ -1031,7 +1026,7 @@ test(
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -1053,29 +1048,13 @@ test(
   async t => {
     const cases = [
       {
-        label: 'fork POST',
-        kind: 'forks-post',
-        state: {
-          forkExists: false,
-          branchExists: true,
-          forkFileText: exactPublishedJson(validUserFile()),
-          pullRequestExists: true,
-        },
-        isReconciliationRead(request) {
-          return (
-            request.method === 'GET' &&
-            request.path === '/api/repos/researcher/repo' &&
-            request.query.get('fork_identity') === '1'
-          );
-        },
-      },
-      {
         label: 'ref POST',
         kind: 'git-refs-post',
+        // The new head branch, then the file written on it.
+        mutations: 2,
         state: {
-          forkExists: true,
           branchExists: false,
-          forkFileText: exactPublishedJson(validUserFile()),
+          forkFileText: null,
           pullRequestExists: true,
         },
         isReconciliationRead(request) {
@@ -1090,8 +1069,8 @@ test(
       {
         label: 'fork-branch contents PUT',
         kind: 'contents-put',
+        mutations: 1,
         state: {
-          forkExists: true,
           branchExists: true,
           forkFileText: null,
           pullRequestExists: true,
@@ -1107,10 +1086,11 @@ test(
       {
         label: 'pull request POST',
         kind: 'pulls-post',
+        // The file written on the head branch, then the pull request.
+        mutations: 2,
         state: {
-          forkExists: true,
           branchExists: true,
-          forkFileText: exactPublishedJson(validUserFile()),
+          forkFileText: null,
           pullRequestExists: false,
         },
         isReconciliationRead(request) {
@@ -1130,7 +1110,7 @@ test(
         });
         const { calls, value: result } =
           await withDeterministicOperationIds(() =>
-            withGlobalFetch(
+            withWorkerFetch(
               worker.fetch.bind(worker),
               () => createSync().pushMyUserFile({
                 userDoc: validUserDocument(),
@@ -1138,8 +1118,8 @@ test(
               }),
             ));
 
-        assert.equal(calls, 1);
-        assert.equal(worker.countMutations(), 1);
+        assert.equal(calls, contract.mutations);
+        assert.equal(worker.countMutations(), contract.mutations);
         assert.equal(worker.countMutations(contract.kind), 1);
         assert.equal(
           contract.isReconciliationRead(
@@ -1168,203 +1148,38 @@ test(
 );
 
 test(
-  'new and reconciled forks wait for exact base-ref readiness without replay',
-  { concurrency: false, timeout: 2_000 },
-  async t => {
-    const cases = [
-      {
-        label: 'successful 202 creation',
-        lossKind: null,
-      },
-      {
-        label: 'applied creation reconciled after response loss',
-        lossKind: 'forks-post',
-      },
-    ];
-
-    for (const contract of cases) {
-      await t.test(
-        contract.label,
-        { concurrency: false, timeout: 2_000 },
-        async () => {
-          const worker = new ForkPublicationWorkerMock({
-            lossKind: contract.lossKind,
-            forkExists: false,
-            forkReady: false,
-            forkTransient404s: 2,
-            enforceForkReadiness: true,
-            branchExists: true,
-            forkFileText: exactPublishedJson(validUserFile()),
-            pullRequestExists: true,
-          });
-          const { calls, value: result } =
-            await withImmediateReadinessTimers(() =>
-              withDeterministicOperationIds(() =>
-                withGlobalFetch(
-                  worker.fetch.bind(worker),
-                  () => createSync().pushMyUserFile({
-                    userDoc: validUserDocument(),
-                    publicationMode: 'fork-pull-request',
-                  }),
-                )));
-
-          assert.equal(calls, 1);
-          assert.equal(worker.countMutations('forks-post'), 1);
-          assert.equal(worker.countMutations(), 1);
-          assert.equal(
-            worker.forkProbeCount,
-            3,
-            'two transient 404s must be followed by one exact readable ref',
-          );
-          assert.equal(
-            countRequests(
-              worker.requests,
-              'POST',
-              '/api/repos/owner/repo/forks',
-            ),
-            1,
-            'readiness must never replay fork creation',
-          );
-          const lastProbeIndex = worker.requests.findLastIndex(request =>
-            request.method === 'GET' &&
-            request.path ===
-              '/api/repos/researcher/repo/git/ref/heads/main'
-          );
-          const firstPublicationIndex = worker.requests.findIndex(request =>
-            request.path.startsWith(
-              '/api/repos/researcher/repo/git/ref/heads/cellucid-annotations/',
-            ) ||
-            request.path ===
-              `/api/repos/researcher/repo/contents/${USER_PATH}` ||
-            request.path === '/api/repos/owner/repo/pulls'
-          );
-          assert.notEqual(lastProbeIndex, -1);
-          assert.notEqual(firstPublicationIndex, -1);
-          assert.ok(
-            lastProbeIndex < firstPublicationIndex,
-            'fork readiness must precede branch/file/PR operations',
-          );
-          assert.equal(result.mode, 'fork-pull-request');
-          assert.equal(result.prNumber, 7);
-        },
-      );
-    }
-  },
-);
-
-test(
-  'caller abort stops fork-readiness probes before publication operations',
-  { concurrency: false, timeout: 2_000 },
+  'a fork GitHub is still copying stops Publish before any write, without a fixed wait',
+  { concurrency: false },
   async () => {
-    const owner = new AbortController();
-    const callerReason = new Error('Annotation dialog closed during fork readiness');
     const worker = new ForkPublicationWorkerMock({
-      forkExists: false,
-      forkReady: false,
-      forkTransient404s: Number.MAX_SAFE_INTEGER,
-      abortOnForkProbe: {
-        probe: 1,
-        controller: owner,
-        reason: callerReason,
-      },
-      enforceForkReadiness: true,
+      forkCopied: false,
       branchExists: true,
       forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
 
-    const { calls } = await withImmediateReadinessTimers(() =>
-      withDeterministicOperationIds(() =>
-        withGlobalFetch(
-          worker.fetch.bind(worker),
-          () => assert.rejects(
-            createSync().pushMyUserFile({
-              userDoc: validUserDocument(),
-              publicationMode: 'fork-pull-request',
-              signal: owner.signal,
-            }),
-            error => {
-              assert.equal(error?.name, 'AbortError');
-              assert.equal(error?.cause, callerReason);
-              return true;
-            },
-          ),
-        )));
+    const { calls } = await withDeterministicOperationIds(() =>
+      withWorkerFetch(
+        worker.fetch.bind(worker),
+        () => assert.rejects(
+          createSync().pushMyUserFile({
+            userDoc: validUserDocument(),
+            publicationMode: 'fork-pull-request',
+          }),
+          error => {
+            assert.equal(error?.code, 'GITHUB_FORK_NOT_READY');
+            assert.equal(error?.message, 'GitHub is still copying your fork researcher/repo; Publish again in a minute.');
+            return true;
+          },
+        ),
+      ));
 
-    assert.equal(calls, 1);
-    assert.equal(worker.countMutations('forks-post'), 1);
-    assert.equal(worker.forkProbeCount, 1);
+    assert.equal(calls, 0);
+    assert.equal(worker.countMutations(), 0);
+    assert.equal(current.time.now(), 0, 'asked once, never polled on a deadline');
     assert.equal(
-      worker.requests.some(request =>
-        request.path.startsWith(
-          '/api/repos/researcher/repo/git/ref/heads/cellucid-annotations/',
-        ) ||
-        request.path ===
-          `/api/repos/researcher/repo/contents/${USER_PATH}` ||
-        request.path === '/api/repos/owner/repo/pulls'
-      ),
-      false,
-    );
-  },
-);
-
-test(
-  'fork-readiness exhaustion is bounded and actionable without replay',
-  { concurrency: false, timeout: 2_000 },
-  async () => {
-    const worker = new ForkPublicationWorkerMock({
-      forkExists: false,
-      forkReady: false,
-      forkTransient404s: Number.MAX_SAFE_INTEGER,
-      enforceForkReadiness: true,
-      branchExists: true,
-      forkFileText: exactPublishedJson(validUserFile()),
-      pullRequestExists: true,
-    });
-
-    const { calls } = await withImmediateReadinessTimers(() =>
-      withDeterministicOperationIds(() =>
-        withGlobalFetch(
-          worker.fetch.bind(worker),
-          () => assert.rejects(
-            createSync().pushMyUserFile({
-              userDoc: validUserDocument(),
-              publicationMode: 'fork-pull-request',
-            }),
-            error => {
-              assert.equal(error?.code, 'GITHUB_FORK_NOT_READY');
-              assert.match(error?.message ?? '', /researcher\/repo/);
-              assert.match(error?.message ?? '', /main/);
-              assert.match(error?.message ?? '', /retry|try again/i);
-              return true;
-            },
-          ),
-        )));
-
-    assert.equal(calls, 1);
-    assert.equal(worker.countMutations('forks-post'), 1);
-    assert.ok(
-      worker.forkProbeCount >= 2 && worker.forkProbeCount <= 8,
-      `readiness used an unbounded attempt count: ${worker.forkProbeCount}`,
-    );
-    assert.equal(
-      countRequests(
-        worker.requests,
-        'POST',
-        '/api/repos/owner/repo/forks',
-      ),
+      countRequests(worker.requests, 'GET', '/api/repos/researcher/repo/git/ref/heads/main'),
       1,
-    );
-    assert.equal(
-      worker.requests.some(request =>
-        request.path.startsWith(
-          '/api/repos/researcher/repo/git/ref/heads/cellucid-annotations/',
-        ) ||
-        request.path ===
-          `/api/repos/researcher/repo/contents/${USER_PATH}` ||
-        request.path === '/api/repos/owner/repo/pulls'
-      ),
-      false,
     );
   },
 );
@@ -1374,15 +1189,14 @@ test(
   { concurrency: false },
   async () => {
     const worker = new ForkPublicationWorkerMock({
-      forkExists: true,
       branchExists: true,
-      forkFileText: exactPublishedJson(validUserFile()),
+      forkFileText: null,
       pullRequestExists: false,
       malformedAppliedKind: 'pulls-post',
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -1390,8 +1204,8 @@ test(
           }),
         ));
 
-    assert.equal(calls, 1);
-    assert.equal(worker.countMutations(), 1);
+    assert.equal(calls, 2);
+    assert.equal(worker.countMutations(), 2, 'the head file, then the pull request');
     assert.equal(worker.countMutations('pulls-post'), 1);
     assert.equal(
       countRequests(
@@ -1412,19 +1226,18 @@ test(
 );
 
 test(
-  'an existing deterministic branch remains reusable at a different tip',
+  'an existing head branch at another tip is reset to the upstream tip before the write',
   { concurrency: false },
   async () => {
     const worker = new ForkPublicationWorkerMock({
-      forkExists: true,
       branchExists: true,
       branchSha: SHA_D,
-      forkFileText: exactPublishedJson(validUserFile()),
+      forkFileText: null,
       pullRequestExists: true,
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -1432,78 +1245,53 @@ test(
           }),
         ));
 
-    assert.equal(calls, 0);
-    assert.equal(worker.countMutations(), 0);
-    assert.equal(
-      countRequests(
-        worker.requests,
-        'POST',
-        '/api/repos/researcher/repo/git/refs',
-      ),
-      0,
-      'a persistent publication branch must not be recreated or reset',
-    );
+    assert.equal(calls, 2);
+    assert.equal(worker.countMutations('git-ref-patch'), 1, 'moved with the forced update');
+    assert.equal(worker.countMutations('contents-put'), 1);
+    assert.equal(worker.countMutations('git-refs-post'), 0, 'never created again');
+    assert.equal(worker.branchSha, SHA_A, 'the head branch is at the upstream tip');
+    const patchIndex = worker.requests.findIndex(request => request.method === 'PATCH');
+    const putIndex = worker.requests.findIndex(request => request.method === 'PUT');
+    assert.ok(patchIndex >= 0 && patchIndex < putIndex, 'reset before the write');
     assert.equal(result.mode, 'fork-pull-request');
     assert.equal(result.prNumber, 7);
+    assert.equal(result.reused, true);
   },
 );
 
 test(
-  'post-create ref reconciliation rejects a different branch tip without replay',
+  'a lost branch create that finds the branch at another tip moves it, never creating it twice',
   { concurrency: false },
   async () => {
     const worker = new ForkPublicationWorkerMock({
       lossKind: 'git-refs-post',
-      forkExists: true,
       branchExists: false,
       createdBranchSha: SHA_D,
-      forkFileText: exactPublishedJson(validUserFile()),
+      forkFileText: null,
       pullRequestExists: true,
     });
-    const { calls } = await withDeterministicOperationIds(() =>
-      withGlobalFetch(
+    const { calls, value: result } = await withDeterministicOperationIds(() =>
+      withWorkerFetch(
         worker.fetch.bind(worker),
-        () => assert.rejects(
-          createSync().pushMyUserFile({
-            userDoc: validUserDocument(),
-            publicationMode: 'fork-pull-request',
-          }),
-          error => {
-            assert.equal(
-              error?.code,
-              'GITHUB_MUTATION_OUTCOME_UNKNOWN',
-            );
-            assert.deepEqual(error?.operation, {
-              id: OPERATION_IDS[0],
-              kind: 'git-refs-post',
-              outcome: 'unknown',
-            });
-            assert.match(
-              error?.cause?.message ?? '',
-              /applied git-refs-post/,
-            );
-            return true;
-          },
-        ),
+        () => createSync().pushMyUserFile({
+          userDoc: validUserDocument(),
+          publicationMode: 'fork-pull-request',
+        }),
       ));
 
-    assert.equal(calls, 1);
-    assert.equal(worker.countMutations(), 1);
-    assert.equal(worker.countMutations('git-refs-post'), 1);
+    assert.equal(calls, 3);
+    assert.equal(worker.countMutations('git-refs-post'), 1, 'the create is never replayed');
+    assert.equal(worker.countMutations('git-ref-patch'), 1);
+    assert.equal(worker.countMutations('contents-put'), 1);
     assert.equal(
-      worker.requestsAfterLoss(request =>
-        request.method === 'GET' &&
-        request.path.startsWith(
-          '/api/repos/researcher/repo/git/ref/heads/',
-        )
-      ).length,
-      1,
+      worker.requests[worker.lossRequestIndex + 1].method === 'GET' &&
+        worker.requests[worker.lossRequestIndex + 1].path.startsWith('/api/repos/researcher/repo/git/ref/heads/'),
+      true,
+      'the lost create is settled by reading the branch first',
     );
-    assert.equal(
-      worker.requestsAfterLoss(request => request.method !== 'GET').length,
-      0,
-      'a mismatched reconciliation tip must stop the flow',
-    );
+    assert.equal(worker.branchSha, SHA_A);
+    assert.equal(result.mode, 'fork-pull-request');
+    assert.equal(result.prNumber, 7);
   },
 );
 
@@ -1512,14 +1300,13 @@ test(
   { concurrency: false },
   async () => {
     const worker = new ForkPublicationWorkerMock({
-      forkExists: true,
       branchExists: true,
       forkFileText: exactPublishedJson(validUserFile()),
       pullRequestExists: true,
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -1531,11 +1318,13 @@ test(
     assert.equal(worker.countMutations(), 0);
     assert.equal(result.mode, 'fork-pull-request');
     assert.equal(result.prNumber, 7);
+    assert.equal(result.reused, true);
+    assert.equal(result.changed, false);
   },
 );
 
 test(
-  'exact user bytes short-circuit a stale baseline before metadata or PUT',
+  'exact user bytes short-circuit a stale baseline before any PUT',
   { concurrency: false },
   async () => {
     const worker = new DirectContentsWorkerMock({
@@ -1544,7 +1333,7 @@ test(
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -1559,10 +1348,10 @@ test(
       countRequests(
         worker.requests,
         'GET',
-        '/api/repos/owner/repo',
+        `/api/repos/owner/repo/contents/${USER_PATH}`,
       ),
-      0,
-      'an exact user no-op must finish before repository metadata',
+      1,
+      'one read of the published file decides the no-op',
     );
     assert.equal(result.mode, 'none');
     assert.equal(result.sha, SHA_B);
@@ -1590,7 +1379,7 @@ test(
     });
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch.bind(worker),
           () => createSync().pushMyUserFile({
             userDoc: validUserDocument(),
@@ -1602,14 +1391,6 @@ test(
     assert.equal(calls, 0);
     assert.equal(worker.contentReads, 1);
     assert.equal(worker.putCount, 0);
-    assert.equal(
-      countRequests(
-        worker.requests,
-        'GET',
-        '/api/repos/owner/repo',
-      ),
-      0,
-    );
     assert.equal(result.mode, 'none');
     assert.equal(result.sha, SHA_B);
   },
@@ -1632,7 +1413,7 @@ test(
       },
     });
     const { calls } = await withDeterministicOperationIds(() =>
-      withGlobalFetch(
+      withWorkerFetch(
         worker.fetch.bind(worker),
         () => assert.rejects(
           createSync().pushMyUserFile({
@@ -1653,14 +1434,6 @@ test(
     assert.equal(calls, 0);
     assert.equal(worker.contentReads, 1);
     assert.equal(worker.putCount, 0);
-    assert.equal(
-      countRequests(
-        worker.requests,
-        'GET',
-        '/api/repos/owner/repo',
-      ),
-      0,
-    );
   },
 );
 
@@ -1673,7 +1446,7 @@ test(
       remoteSha: SHA_B,
     });
     await withDeterministicOperationIds(() =>
-      withGlobalFetch(
+      withWorkerFetch(
         worker.fetch.bind(worker),
         () => assert.rejects(
           createSync().pushMyUserFile({
@@ -1695,6 +1468,7 @@ test(
 
 function createConfigNoOpWorker(remoteText) {
   const requests = [];
+  const repository = snapshotRepository();
   const fetch = async (rawUrl, options = {}) => {
     const request = requestRecord(rawUrl, options);
     requests.push(request);
@@ -1705,34 +1479,10 @@ function createConfigNoOpWorker(remoteText) {
       return jsonResponse(directRepoInfo({ canManage: true }));
     }
     if (
-      request.method === 'GET' &&
-      request.path ===
-        '/api/repos/owner/repo/contents/annotations/schema.json'
+      request.method === 'POST' &&
+      request.path === '/graphql/snapshot'
     ) {
-      return jsonResponse(contentDocument(
-        JSON.stringify(schemaDocument('user')),
-        SHA_A,
-      ));
-    }
-    if (
-      request.method === 'GET' &&
-      request.path ===
-        '/api/repos/owner/repo/contents/annotations/config.schema.json'
-    ) {
-      return jsonResponse(contentDocument(
-        JSON.stringify(schemaDocument('config')),
-        SHA_B,
-      ));
-    }
-    if (
-      request.method === 'GET' &&
-      request.path ===
-        '/api/repos/owner/repo/contents/annotations/moderation/merges.schema.json'
-    ) {
-      return jsonResponse(contentDocument(
-        JSON.stringify(schemaDocument('merges')),
-        SHA_C,
-      ));
+      return repository.fetch(rawUrl, options);
     }
     if (
       request.method === 'GET' &&
@@ -1757,7 +1507,7 @@ test(
     const worker = createConfigNoOpWorker(exactPublishedJson(config));
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch,
           () => createSync().updateDatasetFieldsToAnnotate({
             datasetId: 'synthetic',
@@ -1774,7 +1524,7 @@ test(
 
     assert.equal(calls, 0);
     assert.equal(
-      worker.requests.some(request => request.method !== 'GET'),
+      worker.requests.some(request => request.method === 'PUT'),
       false,
     );
     assert.equal(result.mode, 'none');
@@ -1790,7 +1540,7 @@ test(
     const config = validConfigDocument();
     const worker = createConfigNoOpWorker(JSON.stringify(config));
     await withDeterministicOperationIds(() =>
-      withGlobalFetch(
+      withWorkerFetch(
         worker.fetch,
         () => assert.rejects(
           createSync().updateDatasetFieldsToAnnotate({
@@ -1813,7 +1563,7 @@ test(
         ),
       ));
     assert.equal(
-      worker.requests.some(request => request.method !== 'GET'),
+      worker.requests.some(request => request.method === 'PUT'),
       false,
     );
   },
@@ -1821,6 +1571,7 @@ test(
 
 function createMergesNoOpWorker(remoteText) {
   const requests = [];
+  const repository = snapshotRepository();
   const fetch = async (rawUrl, options = {}) => {
     const request = requestRecord(rawUrl, options);
     requests.push(request);
@@ -1829,6 +1580,12 @@ function createMergesNoOpWorker(remoteText) {
       request.path === '/api/repos/owner/repo'
     ) {
       return jsonResponse(directRepoInfo({ canManage: true }));
+    }
+    if (
+      request.method === 'POST' &&
+      request.path === '/graphql/snapshot'
+    ) {
+      return repository.fetch(rawUrl, options);
     }
     if (
       request.method === 'GET' &&
@@ -1853,7 +1610,7 @@ test(
     const worker = createMergesNoOpWorker(exactPublishedJson(validMergesFile(merges)));
     const { calls, value: result } =
       await withDeterministicOperationIds(() =>
-        withGlobalFetch(
+        withWorkerFetch(
           worker.fetch,
           () => createSync().pushModerationMerges({
             mergesDoc: merges,
@@ -1864,7 +1621,7 @@ test(
 
     assert.equal(calls, 0);
     assert.equal(
-      worker.requests.some(request => request.method !== 'GET'),
+      worker.requests.some(request => request.method === 'PUT'),
       false,
     );
     assert.equal(result.mode, 'none');
@@ -1880,7 +1637,7 @@ test(
     const merges = validMergesDocument();
     const worker = createMergesNoOpWorker(JSON.stringify(validMergesFile(merges)));
     await withDeterministicOperationIds(() =>
-      withGlobalFetch(
+      withWorkerFetch(
         worker.fetch,
         () => assert.rejects(
           createSync().pushModerationMerges({
@@ -1897,7 +1654,7 @@ test(
         ),
       ));
     assert.equal(
-      worker.requests.some(request => request.method !== 'GET'),
+      worker.requests.some(request => request.method === 'PUT'),
       false,
     );
   },
@@ -1918,7 +1675,7 @@ test(
 
     const { calls, value: retryResult } =
       await withDeterministicOperationIds(async () =>
-        withGlobalFetch(worker.fetch.bind(worker), async () => {
+        withWorkerFetch(worker.fetch.bind(worker), async () => {
           await assert.rejects(
             sync.pushMyUserFile({
               userDoc: validUserDocument(),

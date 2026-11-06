@@ -4,13 +4,24 @@
  *
  * `exportResult()` of an analysis UI returns
  *
- *   { kind, version, payload }
+ *   { kind, version, payload, provenance }
  *
  * where `kind` names the analysis, `version` is the layout of `payload` for
- * that kind (`ANALYSIS_RESULT_VERSION`), and `payload` is the analysis's own
- * result encoded by `shared/analysis-result-codec.js`: JSON values plus typed
- * numeric arrays. Genes, observation fields and categories are named by key;
- * `importResult()` refuses a result that names one the open dataset lacks.
+ * that kind (`ANALYSIS_RESULT_VERSION`), `payload` is the analysis's own
+ * result encoded by `shared/analysis-result-codec.js` (JSON values plus typed
+ * numeric arrays), and `provenance` is what it was computed on
+ * (`shared/result-provenance.js`), so a restored result is current or stale
+ * as it is against the page it is restored on. Genes, observation fields and
+ * categories are named by key; `importResult()` refuses a result that names
+ * one the open dataset lacks.
+ *
+ * A result **left out** of a shared session (Share › Results: compute again
+ * on open, `session/share-scope.js`) is `{kind, leftOut: true, provenance}`:
+ * the envelope without its payload, so it stays apart from an analysis that
+ * never ran, and keeps what it was computed on. An analysis restored with
+ * one shows its settings and no result (`importLeftOutResult`) and gives
+ * the same record back until it has a result again; opening the file runs
+ * it again (`session/recompute-results.js`).
  *
  * @module shared/analysis-result-session
  */
@@ -18,11 +29,15 @@
 import { decodeAnalysisResult, encodeAnalysisResult } from './analysis-result-codec.js';
 import { isPlainRecord } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { requireProvenance } from './result-provenance.js';
 
 /** Layout version of every analysis result payload written today. */
 export const ANALYSIS_RESULT_VERSION = 2;
 
 /**
+ * The result part of an envelope (the analysis UI adds its provenance,
+ * `FormBasedAnalysisUI.exportResult`).
+ *
  * @param {string} kind
  * @param {unknown} payload - The plain result value to encode
  * @returns {{kind: string, version: number, payload: unknown}}
@@ -36,7 +51,8 @@ export function createResultEnvelope(kind, payload) {
 }
 
 /**
- * Decode an envelope written for `kind`.
+ * Decode an envelope written for `kind`; its provenance is checked here and
+ * handed to `_restoreAnalysisResult` by the caller (`envelope.provenance`).
  *
  * @param {unknown} envelope
  * @param {string} kind
@@ -47,9 +63,10 @@ export function readResultEnvelope(envelope, kind) {
     throw new TypeError(`A ${kind} result must be an object`);
   }
   const keys = Object.keys(envelope).sort();
-  if (keys.join(',') !== 'kind,payload,version') {
-    throw new TypeError(`A ${kind} result must hold exactly kind, version and payload`);
+  if (keys.join(',') !== 'kind,payload,provenance,version') {
+    throw new TypeError(`A ${kind} result must hold exactly kind, version, payload and provenance`);
   }
+  requireProvenance(envelope.provenance, `${kind} result provenance`);
   if (envelope.kind !== kind) {
     throw new TypeError(
       `A ${String(envelope.kind)} result cannot be restored into the ${kind} analysis`
@@ -62,6 +79,30 @@ export function readResultEnvelope(envelope, kind) {
     );
   }
   return decodeAnalysisResult(envelope.payload, `${kind} result`);
+}
+
+/**
+ * The record of a result left out of a shared session: `envelope` without
+ * its payload (null, and a record already left out, as they are).
+ *
+ * @param {null|{kind: string, provenance?: object}} envelope
+ * @returns {null|{kind: string, leftOut: true, provenance: object|null}}
+ */
+export function leftOutResultOf(envelope) {
+  if (envelope === null || isLeftOutResult(envelope)) return envelope;
+  return { kind: envelope.kind, leftOut: true, provenance: envelope.provenance ?? null };
+}
+
+/**
+ * Whether a session's result is the record of one left out
+ * (`leftOutResultOf`): exactly `kind`, `leftOut: true` and `provenance`.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isLeftOutResult(value) {
+  return isPlainRecord(value) && value.leftOut === true && typeof value.kind === 'string'
+    && Object.keys(value).sort().join(',') === 'kind,leftOut,provenance';
 }
 
 function missingList(missing) {

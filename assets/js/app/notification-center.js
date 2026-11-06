@@ -84,6 +84,7 @@ const DEFAULT_DURATIONS_MS = Object.freeze({
 
 const NOTIFICATION_OPTION_KEYS = new Set([
   'action',
+  'secondaryAction',
   'announce',
   'category',
   'details',
@@ -214,8 +215,9 @@ function assertNotificationOptions(options, { partial = false } = {}) {
       );
     }
   }
-  if (Object.hasOwn(options, 'action')) {
-    const action = options.action;
+  for (const key of ['action', 'secondaryAction']) {
+    if (!Object.hasOwn(options, key)) continue;
+    const action = options[key];
     if (
       !isPlainRecord(action) ||
       Object.keys(action).sort().join(',') !== 'label,run' ||
@@ -227,6 +229,10 @@ function assertNotificationOptions(options, { partial = false } = {}) {
         'A notification action must be exactly { label, run } with a non-empty label.'
       );
     }
+  }
+  // The other choice beside an action ("Start fresh" beside "Continue"): never alone.
+  if (Object.hasOwn(options, 'secondaryAction') && !Object.hasOwn(options, 'action')) {
+    throw new TypeError('A notification secondary action stands beside an action.');
   }
 }
 
@@ -268,7 +274,7 @@ function describeThrownError(error) {
  * @param {Node} node
  */
 function appendAboveButtons(content, node) {
-  content.insertBefore(node, content.querySelector(':scope > .notification-action, :scope > [data-role="cancel"]'));
+  content.insertBefore(node, content.querySelector(':scope > .notification-action, :scope > .notification-actions, :scope > [data-role="cancel"]'));
 }
 
 class NotificationCenter {
@@ -403,6 +409,7 @@ class NotificationCenter {
       dismissible = true,
       onCancel = null,
       action = null,
+      secondaryAction = null,
       details = ''
     } = options;
 
@@ -450,7 +457,13 @@ class NotificationCenter {
       }
     }
 
-    if (action !== null) {
+    if (action !== null && secondaryAction !== null) {
+      // Two choices side by side: the action, then the other one.
+      html += '<div class="notification-actions">'
+        + `<button type="button" class="btn btn-compact notification-action">${escapeHtml(action.label)}</button>`
+        + `<button type="button" class="btn btn-compact notification-secondary-action">${escapeHtml(secondaryAction.label)}</button>`
+        + '</div>';
+    } else if (action !== null) {
       html += `<button type="button" class="btn btn-compact notification-action">${escapeHtml(action.label)}</button>`;
     }
 
@@ -499,6 +512,13 @@ class NotificationCenter {
       actionBtn.addEventListener('click', () => {
         this.dismiss(id);
         action.run();
+      });
+    }
+    const secondaryBtn = el.querySelector('.notification-secondary-action');
+    if (secondaryBtn !== null) {
+      secondaryBtn.addEventListener('click', () => {
+        this.dismiss(id);
+        secondaryAction.run();
       });
     }
 
@@ -715,7 +735,7 @@ class NotificationCenter {
         'Notification progress, speed, and cancellation require an active notification type.'
       );
     }
-    for (const key of ['action', 'dismissible', 'onCancel']) {
+    for (const key of ['action', 'secondaryAction', 'dismissible', 'onCancel']) {
       if (
         Object.hasOwn(options, key) &&
         options[key] !== notif.options[key]

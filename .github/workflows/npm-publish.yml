@@ -1,0 +1,135 @@
+name: Publish to npm
+
+# Publishing a GitHub Release named `vX.Y.Z` (X.Y.Z = npm/package.json's
+# version, its tag on main) is the one way to publish the `cellucid` npm
+# package, the name-reservation placeholder in npm/. Pushing a tag publishes
+# nothing. A failed run is retried with "Re-run jobs" on that run.
+#
+# Authentication is npm trusted publishing (OIDC): the package's Trusted
+# Publisher on npmjs.com names this repository and this workflow file, and no
+# token is stored anywhere. npm publishes provenance for it by itself.
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish npm/
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the release tag with complete history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Node with the npm registry
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      # Trusted publishing needs npm 11.5.1 or later (and Node 22.14 or later).
+      - name: Require npm 11.5.1 or later
+        run: |
+          node -e 'const [a, b] = process.versions.node.split(".").map(Number); if (a < 22 || (a === 22 && b < 14)) { console.error("Node " + process.versions.node + " is older than 22.14"); process.exit(1); }'
+          older() { [[ "$(printf '%s\n%s\n' "$1" "11.5.1" | sort -V | head -n1)" != "11.5.1" ]]; }
+          if older "$(npm --version)"; then
+            # Without setup-node's registry config, whose placeholder token is for publishing.
+            env -u NPM_CONFIG_USERCONFIG npm install --global "npm@^11.5.1"
+          fi
+          if older "$(npm --version)"; then
+            echo "::error::npm $(npm --version) is older than 11.5.1."
+            exit 1
+          fi
+          echo "Node $(node --version), npm $(npm --version)"
+
+      - name: Require a published release whose tag equals the package version
+        working-directory: npm
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          VERSION="$(node -p 'require("./package.json").version')"
+          test "$(node -p 'require("./package.json").name')" = "cellucid"
+          if [[ "${RELEASE_DRAFT}" != "false" ]]; then
+            echo "::error::A draft release is never published."
+            exit 1
+          fi
+          # A SemVer pre-release (X.Y.Z-rc.1) must be marked pre-release, and a
+          # release marked pre-release must carry one.
+          if [[ "${VERSION}" == *-* ]]; then IS_PRERELEASE=true; else IS_PRERELEASE=false; fi
+          if [[ "${RELEASE_PRERELEASE}" != "${IS_PRERELEASE}" ]]; then
+            echo "::error::The release's pre-release mark (${RELEASE_PRERELEASE}) does not match version ${VERSION}."
+            exit 1
+          fi
+          test "${GITHUB_REF_TYPE}" = "tag"
+          test "${RELEASE_TAG}" = "${GITHUB_REF_NAME}"
+          if [[ "${RELEASE_TAG}" != "v${VERSION}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must equal v${VERSION}, npm/package.json's version."
+            exit 1
+          fi
+
+      - name: Require the tagged commit to belong to origin/main
+        run: |
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
+          if ! git merge-base --is-ancestor \
+            "${GITHUB_SHA}" "refs/remotes/origin/main"; then
+            echo "::error::Release commit ${GITHUB_SHA} is not on origin/main."
+            exit 1
+          fi
+
+      # The tarball holds package.json and exactly the tracked files its
+      # `files` list names: nothing more (no stray file), nothing less.
+      - name: Require the package contents to be exactly the files list
+        working-directory: npm
+        run: |
+          npm pack --dry-run --json > "${RUNNER_TEMP}/pack.json"
+          git ls-files > "${RUNNER_TEMP}/tracked.txt"
+          node - "${RUNNER_TEMP}/pack.json" "${RUNNER_TEMP}/tracked.txt" <<'EOF'
+          const { readFileSync } = require('node:fs');
+          const [packPath, trackedPath] = process.argv.slice(2);
+          const { files } = require('./package.json');
+          const tracked = readFileSync(trackedPath, 'utf8').split('\n').filter(Boolean);
+          const expected = new Set(['package.json']);
+          for (const entry of files) {
+            const named = tracked.filter(path => (entry.endsWith('/') ? path.startsWith(entry) : path === entry));
+            if (named.length === 0) throw new Error(`"files" entry ${entry} names no tracked file`);
+            named.forEach(path => expected.add(path));
+          }
+          const [pack] = JSON.parse(readFileSync(packPath, 'utf8'));
+          const packed = pack.files.map(file => file.path).sort();
+          const want = [...expected].sort();
+          if (JSON.stringify(packed) !== JSON.stringify(want)) {
+            console.error(`npm pack would publish:\n  ${packed.join('\n  ')}\nexpected exactly:\n  ${want.join('\n  ')}`);
+            process.exit(1);
+          }
+          console.log(`${pack.id}: ${packed.join(', ')}`);
+          EOF
+
+      - name: Run the placeholder as a user would
+        working-directory: npm
+        run: |
+          node bin/cellucid.mjs
+          node --input-type=module -e 'const m = await import("./index.mjs"); if (m.default.app !== "https://www.cellucid.com") process.exit(1);'
+
+      - name: Publish through npm trusted publishing
+        working-directory: npm
+        run: |
+          if [[ "$(node -p 'require("./package.json").version')" == *-* ]]; then
+            npm publish --access public --tag next
+          else
+            npm publish --access public
+          fi

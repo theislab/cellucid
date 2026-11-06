@@ -39,15 +39,12 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
     // crossfade (a 3-D dataset replacing a 2-D one moves the studio surface
     // from dots to floor) would otherwise differ between the two captures.
     const settled = async () => {
-      for (let attempt = 0; attempt < 600; attempt += 1) {
-        // Settled, not merely still: a frame still owed (a draw order that
-        // waits its turn to be adopted, one a frame) asks for another frame
-        // without an animation, and a capture taken before it compares a
-        // pane drawn in its previous order.
-        if (viewer.getFrameScheduleState().settled) return;
-        await frames(1);
-      }
-      throw new Error(`Scene never settled: ${JSON.stringify(viewer.getFrameScheduleState())}`);
+      // Settled, not merely still: a frame still owed (a draw order that
+      // waits its turn to be adopted, one a frame) asks for another frame
+      // without an animation, and a capture taken before it compares a
+      // pane drawn in its previous order. Frame by frame, as long as the
+      // renderer takes: the test's timeout is the fence.
+      while (!viewer.getFrameScheduleState().settled) await frames(1);
     };
     const capture = async culling => {
       viewer.setAdaptiveLOD(false);
@@ -73,17 +70,14 @@ test('a culled frame draws exactly the pixels of an unculled one', async ({
     // the store adopted its order overlaps translucent points in another
     // order, and comparing it with one drawn after measures the adoption,
     // not culling. Culling runs only on an adopted order, so wait for it
-    // (the store asks for its own frames once the tree lands), by the clock:
-    // a slow runner draws few frames while the worker builds.
+    // (the store asks for its own frames once the tree lands), as long as
+    // the worker takes: a count of frames ran out on a slow runner ("The
+    // live store never adopted its tree order", Linux Firefox, push run of
+    // 2026-10-31), and a clock is the same guess in other units.
     await capture(true);
     const adopted = () => viewer.getHPRenderer().getStats('live').frustumCulled === true
       && viewer.isPresentedGeometrySettled();
-    for (const deadline = performance.now() + 120_000; !adopted();) {
-      if (performance.now() > deadline) {
-        throw new Error(`The live store never adopted its tree order: ${JSON.stringify(viewer.getHPRenderer().getStats('live'))}`);
-      }
-      await frames(1);
-    }
+    while (!adopted()) await frames(1);
     await settled();
     const unculled = await capture(false);
     const culled = await capture(true);

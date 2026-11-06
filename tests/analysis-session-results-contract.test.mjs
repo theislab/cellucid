@@ -3,10 +3,11 @@
  *
  * The docked panel saves which mode row is open and, for every mode it has
  * created, its settings and its shown result. Results are JSON values plus
- * typed numeric arrays (session/codecs/typed-json.js), name genes, fields and
- * categories by key, and come back deep-equal to the live result through the
- * same render path a fresh run takes. A result that names something the open
- * dataset lacks is refused.
+ * typed numeric arrays, stored as every history value is
+ * (`app/history/value-parts.js`), name genes, fields and categories by key,
+ * and come back deep-equal to the live result through the same render path a
+ * fresh run takes. A result that names something the open dataset lacks is
+ * refused.
  */
 
 import assert from 'node:assert/strict';
@@ -15,7 +16,6 @@ import test from 'node:test';
 import {
   decodeAnalysisResult,
   encodeAnalysisResult,
-  requireTypedJsonValue,
 } from '../assets/js/app/analysis/shared/analysis-result-codec.js';
 import { ANALYSIS_RESULT_VERSION } from '../assets/js/app/analysis/shared/analysis-result-session.js';
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
@@ -25,7 +25,8 @@ import { DetailedAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
 import { AnalysisWindowManager } from '../assets/js/app/analysis/ui/analysis-window-manager.js';
-import { decodeTypedJson, encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
+import { hashValue } from '../assets/js/app/history/value-pool.js';
+import { joinValue, parseArrayDigest, splitValue } from '../assets/js/app/history/value-parts.js';
 
 // No result container is mounted: staleness has nothing to dim.
 globalThis.HTMLElement ??= class HTMLElement {};
@@ -77,6 +78,19 @@ function createDataLayer({ genes = GENES, categories = CATEGORIES, pages = PAGES
 }
 
 /** A UI whose render path is recorded instead of drawn. */
+/**
+ * Show `result` in `ui` as a run leaves it: the result and what it was
+ * computed on (`shared/result-provenance.js`), the page as it is now.
+ */
+async function shown(ui, result) {
+  ui._lastResult = result;
+  const genes = ui._resultGeneSample(result);
+  ui._resultInputs = {
+    options: structuredClone(ui._requireOptions()),
+    provenance: await ui._currentProvenance(ui._requireOptions(), [...ui._selectedPages], genes === null ? null : { cells: genes.cells, of: genes.of }),
+  };
+}
+
 function createUI(UI, dataLayer = createDataLayer()) {
   const ui = new UI({ comparisonModule: {}, dataLayer, multiVariableAnalysis: {} });
   ui.shown = [];
@@ -86,10 +100,23 @@ function createUI(UI, dataLayer = createDataLayer()) {
   return ui;
 }
 
-/** The session's own storage step: typed JSON bytes and back. */
-function throughSession(value) {
-  requireTypedJsonValue(value);
-  return decodeTypedJson(encodeTypedJson(value));
+/**
+ * The session's own storage step (`app/history/value-parts.js`, as the
+ * session file and the autosave keep a history value): the value's skeleton
+ * as JSON text, each typed array as its bytes, joined again and checked
+ * against the hash the history keeps the value by.
+ */
+async function throughSession(value) {
+  const hash = await hashValue(value);
+  const arrays = new Map();
+  const text = JSON.stringify(await splitValue(value, arrays));
+  const restored = joinValue(JSON.parse(text), digest => {
+    const { type } = parseArrayDigest(digest);
+    const array = arrays.get(digest);
+    return new type(new Uint8Array(array.buffer, array.byteOffset, array.byteLength).slice().buffer);
+  });
+  assert.equal(await hashValue(restored), hash, 'what is read back is the value saved');
+  return restored;
 }
 
 /** What a DE run returns (`MultiVariableAnalysis.differentialExpression`). */
@@ -212,7 +239,7 @@ function markersRun() {
   return { stats, metadata };
 }
 
-test('the result codec round-trips special numbers, sharing, records and labels exactly', () => {
+test('the result codec round-trips special numbers, sharing, records and labels exactly', async () => {
   const shared = { kept: true };
   const typed = Float32Array.of(1, NaN, -0);
   const value = {
@@ -231,7 +258,7 @@ test('the result codec round-trips special numbers, sharing, records and labels 
   };
   Object.defineProperty(value, '__proto__', { value: 'own', enumerable: true, configurable: true, writable: true });
   const encoded = encodeAnalysisResult(value);
-  const decoded = decodeAnalysisResult(throughSession(encoded));
+  const decoded = decodeAnalysisResult(await throughSession(encoded));
   assert.deepStrictEqual(decoded, value);
   assert.equal(decoded.twice[0], decoded.twice[1]);
   assert.equal(decoded.typed, decoded.sameTyped);
@@ -244,13 +271,12 @@ test('the result codec round-trips special numbers, sharing, records and labels 
 
 test('differential expression results restore deep-equal through the session and the render path', async () => {
   const source = createUI(DEAnalysisUI);
-  source._lastResult = source._buildResult(deFull(), source._requireOptions());
+  await shown(source, source._buildResult(deFull(), source._requireOptions()));
   const exported = source.exportResult();
   assert.equal(exported.kind, 'differential');
   assert.equal(exported.version, ANALYSIS_RESULT_VERSION);
-  requireTypedJsonValue(exported);
   const target = createUI(DEAnalysisUI);
-  await target.importResult(throughSession(exported));
+  await target.importResult(await throughSession(exported));
   assert.deepStrictEqual(target._lastResult.full, deFull());
   assert.equal(target.shown[0], target._lastResult, 'the rendered and published result are one value');
   assert.equal(createUI(DEAnalysisUI).exportResult(), null);
@@ -258,14 +284,14 @@ test('differential expression results restore deep-equal through the session and
   assert.equal(target._lastResult, null);
   await assert.rejects(createUI(DEAnalysisUI).importResult({ ...exported, version: ANALYSIS_RESULT_VERSION - 1 }), /version/);
   await assert.rejects(
-    createUI(DEAnalysisUI, createDataLayer({ genes: ['MS4A1'] })).importResult(throughSession(exported)),
+    createUI(DEAnalysisUI, createDataLayer({ genes: ['MS4A1'] })).importResult(await throughSession(exported)),
     /"CD3E".*lacks|lacks: "CD3E"/,
   );
 });
 
 test('a restored result is current at once; its drawing, which waits for its panel to be shown, is never waited for', async () => {
   const source = createUI(DEAnalysisUI);
-  source._lastResult = source._buildResult(deFull(), source._requireOptions());
+  await shown(source, source._buildResult(deFull(), source._requireOptions()));
   const exported = source.exportResult();
 
   // A panel not shown (a closed row or window, a tab in the background):
@@ -275,7 +301,7 @@ test('a restored result is current at once; its drawing, which waits for its pan
   hidden._showResult = result => new Promise(resolve => {
     show = () => { hidden.shown.push(result); resolve(); };
   });
-  await hidden.importResult(throughSession(exported));
+  await hidden.importResult(await throughSession(exported));
   assert.deepStrictEqual(hidden._lastResult.full, deFull(), 'restored before anything is drawn');
   assert.equal(hidden.shown.length, 0);
   assert.notEqual(hidden.exportResult(), null, 'saved again before it is drawn, the result is kept');
@@ -290,7 +316,7 @@ test('a restored result is current at once; its drawing, which waits for its pan
   failing._notifications = { error: message => said.push(message) };
   let fail;
   failing._showResult = () => new Promise((_, reject) => { fail = reject; });
-  await failing.importResult(throughSession(exported));
+  await failing.importResult(await throughSession(exported));
   assert.notEqual(failing._lastResult, null);
   fail(new Error('no graphics'));
   await new Promise(resolve => setTimeout(resolve, 0));
@@ -300,20 +326,19 @@ test('a restored result is current at once; its drawing, which waits for its pan
 
 test('gene signature results restore deep-equal through the session and the render path', async () => {
   const source = createUI(GeneSignatureUI);
-  source._lastResult = await source._buildResult(signatureRaw(), source._requireOptions());
+  await shown(source, await source._buildResult(signatureRaw(), source._requireOptions()));
   const exported = source.exportResult();
   assert.equal(exported.kind, 'signature');
-  requireTypedJsonValue(exported);
   const target = createUI(GeneSignatureUI);
-  await target.importResult(throughSession(exported));
+  await target.importResult(await throughSession(exported));
   assert.deepStrictEqual(target._lastResult.raw, signatureRaw());
   assert.equal(target.shown[0], target._lastResult);
   await assert.rejects(
-    createUI(GeneSignatureUI, createDataLayer({ genes: ['MS4A1'] })).importResult(throughSession(exported)),
+    createUI(GeneSignatureUI, createDataLayer({ genes: ['MS4A1'] })).importResult(await throughSession(exported)),
     /"CD3E".*lacks|lacks: "CD3E"/,
   );
   await assert.rejects(
-    createUI(GeneSignatureUI, createDataLayer({ pages: new Map([['page-a', 5]]) })).importResult(throughSession(exported)),
+    createUI(GeneSignatureUI, createDataLayer({ pages: new Map([['page-a', 5]]) })).importResult(await throughSession(exported)),
     /do not exist: "page-b"/,
   );
 });
@@ -321,25 +346,24 @@ test('gene signature results restore deep-equal through the session and the rend
 test('correlation results restore deep-equal through the session and the render path', async () => {
   const original = correlationResult();
   const source = createUI(CorrelationAnalysisUI);
-  source._lastResult = original;
+  await shown(source, original);
   const exported = source.exportResult();
-  requireTypedJsonValue(exported);
   const target = createUI(CorrelationAnalysisUI);
-  await target.importResult(throughSession(exported));
+  await target.importResult(await throughSession(exported));
   assert.deepStrictEqual(target.shown, [original]);
   assert.deepStrictEqual(target._lastResult, original);
   await assert.rejects(
-    createUI(CorrelationAnalysisUI, createDataLayer({ pages: new Map([['page-a', 5]]) })).importResult(throughSession(exported)),
+    createUI(CorrelationAnalysisUI, createDataLayer({ pages: new Map([['page-a', 5]]) })).importResult(await throughSession(exported)),
     /do not exist: "page-b"/,
   );
 });
 
 test('a signature result is refused when a group no longer has its scored cells', async () => {
   const source = createUI(GeneSignatureUI);
-  source._lastResult = await source._buildResult(signatureRaw(), source._requireOptions());
+  await shown(source, await source._buildResult(signatureRaw(), source._requireOptions()));
   await assert.rejects(
     createUI(GeneSignatureUI, createDataLayer({ pages: new Map([['page-a', 4], ['page-b', 3]]) }))
-      .importResult(throughSession(source.exportResult())),
+      .importResult(await throughSession(source.exportResult())),
     /5 scores for cell group "page-a", which now has 4 cells/,
   );
 });
@@ -350,29 +374,29 @@ test('a signature scored on the cells genes were read for restores with them, an
   raw.geneSample = { cells: 6, of: 8, groups: [{ name: 'PAGE-A', used: 5, of: 5 }, { name: 'PAGE-B', used: 1, of: 3 }] };
   raw.sets[0].pages[1] = { pageId: 'page-b', pageName: 'PAGE-B', scores: Float32Array.of(2), cellIndices: Uint32Array.of(5) };
   const source = createUI(GeneSignatureUI);
-  source._lastResult = await source._buildResult(raw, source._requireOptions());
+  await shown(source, await source._buildResult(raw, source._requireOptions()));
   assert.deepEqual(source._lastResult.geneSample, raw.geneSample, 'the result names its gene sample');
   const target = createUI(GeneSignatureUI);
-  await target.importResult(throughSession(source.exportResult()));
+  await target.importResult(await throughSession(source.exportResult()));
   assert.deepStrictEqual(target._lastResult.raw, raw);
   assert.deepEqual(target._lastResult.geneSample, raw.geneSample);
   // Scores for more of a page's cells than genes were read for: refused, naming the sample.
   const wrong = signatureRaw();
   wrong.geneSample = raw.geneSample;
   const refused = createUI(GeneSignatureUI);
-  refused._lastResult = await refused._buildResult(wrong, refused._requireOptions());
+  await shown(refused, await refused._buildResult(wrong, refused._requireOptions()));
   await assert.rejects(
-    createUI(GeneSignatureUI).importResult(throughSession(refused.exportResult())),
+    createUI(GeneSignatureUI).importResult(await throughSession(refused.exportResult())),
     /3 scores for cell group "page-b", which now has 1 cell among the first 6 open cells, those genes were read for/,
   );
 });
 
 test('a correlation result is refused when its colour field lacks a category', async () => {
   const source = createUI(CorrelationAnalysisUI);
-  source._lastResult = correlationResult();
+  await shown(source, correlationResult());
   await assert.rejects(
     createUI(CorrelationAnalysisUI, createDataLayer({ categories: ['T cell'] }))
-      .importResult(throughSession(source.exportResult())),
+      .importResult(await throughSession(source.exportResult())),
     /category "B cell"/,
   );
 });
@@ -380,10 +404,9 @@ test('a correlation result is refused when its colour field lacks a category', a
 test('marker results name groups by category and restore by category, whatever the codes', async () => {
   const { stats, metadata } = markersRun();
   const source = createUI(GenesPanelUI);
-  source._lastResult = { stats, metadata };
+  await shown(source, { stats, metadata });
   const exported = source.exportResult();
-  requireTypedJsonValue(exported);
-  const text = new TextDecoder().decode(encodeTypedJson(exported));
+  const text = JSON.stringify(await splitValue(exported, new Map()));
   assert.equal(text.includes('category-code:'), false, 'codes never reach the session');
   assert.equal(text.includes('category:\\"Monocyte\\"'), true);
 
@@ -391,7 +414,7 @@ test('marker results name groups by category and restore by category, whatever t
   const reordered = ['Monocyte', 'NK cell', 'B cell', 'T cell'];
   const target = createUI(GenesPanelUI, createDataLayer({ categories: reordered }));
   target._show = 'list';
-  await target.importResult(throughSession(exported));
+  await target.importResult(await throughSession(exported));
   assert.deepStrictEqual(
     target._lastResult.stats.groups.map(group => group.groupId),
     ['category-code:0', 'category-code:3', 'category-code:1'],
@@ -400,11 +423,11 @@ test('marker results name groups by category and restore by category, whatever t
   assert.equal(target.shown[0], target._lastResult);
 
   await assert.rejects(
-    createUI(GenesPanelUI, createDataLayer({ categories: ['T cell', 'NK cell'] })).importResult(throughSession(exported)),
+    createUI(GenesPanelUI, createDataLayer({ categories: ['T cell', 'NK cell'] })).importResult(await throughSession(exported)),
     /category "Monocyte", which field "cell_type" lacks/,
   );
   await assert.rejects(
-    createUI(GenesPanelUI, createDataLayer({ genes: ['CD3E'] })).importResult(throughSession(exported)),
+    createUI(GenesPanelUI, createDataLayer({ genes: ['CD3E'] })).importResult(await throughSession(exported)),
     /genes the open dataset lacks/,
   );
 });
@@ -470,6 +493,10 @@ function createPanel({ openMode = null } = {}) {
       return uis.get(id);
     },
     switchToMode(id) { calls.push(`switch:${id}`); },
+    async releaseMode(id) {
+      calls.push(`release:${id}`);
+      initialized.delete(id);
+    },
     onVisibilityChanged() {},
     clearActiveMode() { calls.push('clear'); },
   };
@@ -491,10 +518,9 @@ test('the docked panel exports its open row and every created mode, and restores
       },
     },
   });
-  requireTypedJsonValue(state);
 
   const restored = createPanel();
-  await restored.module.importSessionState(throughSession(state));
+  await restored.module.importSessionState(await throughSession(state));
   assert.deepStrictEqual(restored.calls, [
     'switch:differential',
     'simple:settings',
@@ -506,9 +532,13 @@ test('the docked panel exports its open row and every created mode, and restores
   assert.equal(restored.module._getOpenMode(), 'differential');
   assert.deepStrictEqual(restored.module.exportSessionState(), state);
 
-  // A closed row in the session closes the open one.
+  // A closed row in the session closes the open one, and a mode the state
+  // never opened is unmade: the panel exports exactly what was restored.
+  restored.calls.length = 0;
   await restored.module.importSessionState({ openMode: null, modes: {} });
   assert.equal(restored.module._getOpenMode(), null);
+  assert.deepStrictEqual(restored.calls.filter(call => call.startsWith('release:')), ['release:simple', 'release:differential']);
+  assert.deepStrictEqual(restored.module.exportSessionState(), { openMode: null, modes: {} });
 });
 
 test('docked panel session state is refused whole when its shape is wrong', async () => {
@@ -532,7 +562,7 @@ test('docked panel session state is refused whole when its shape is wrong', asyn
   );
 });
 
-test('floating windows carry their result through the session and restore it after their settings', async () => {
+test('floating windows carry their result through the session and restore it after their settings; their place is apart', async () => {
   const result = { kind: 'differential', version: ANALYSIS_RESULT_VERSION, payload: null };
   const calls = [];
   const manager = Object.create(AnalysisWindowManager.prototype);
@@ -541,19 +571,21 @@ test('floating windows carry their result through the session and restore it aft
   manager._createWindow = (modeId, settings, options) => {
     calls.push(`create:${modeId}:${settings.marker}`);
     const id = `window-${manager._windows.size + 1}`;
-    // The window's own box and layer, as the dockable owner writes them.
+    // The window's own box, as the dockable owner writes it (which window is
+    // in front is not part of the record: a press raises a window); without
+    // a place, where a new window opens.
     const style = new Map([
-      ['--pos-x', `${options.left}px`],
-      ['--pos-y', `${options.top}px`],
-      ['--pos-width', `${options.preferredSize.width}px`],
-      ['--pos-height', `${options.preferredSize.height}px`],
-      ['--z-layer', String(options.z)],
+      ['--pos-x', `${options.left ?? 40}px`],
+      ['--pos-y', `${options.top ?? 40}px`],
+      ['--pos-width', `${options.preferredSize?.width ?? 320}px`],
+      ['--pos-height', `${options.preferredSize?.height ?? 240}px`],
+      ['--z-layer', '7'],
     ]);
     manager._windows.set(id, {
       id,
       modeId,
       headerTitle: 'DE',
-      details: { open: options.open },
+      details: { open: options.open ?? true },
       frame: {
         getBoundingClientRect: () => ({ left: 1, top: 2, width: 300, height: 34 }),
         style: { getPropertyValue: name => style.get(name) ?? '' },
@@ -573,27 +605,32 @@ test('floating windows carry their result through the session and restore it aft
     calls.push(`close:${id}`);
     manager._windows.delete(id);
   };
-  // A collapsed window: its saved box is the one it reopens at, never the
-  // header-high box the stylesheet draws.
+  // The window's analysis (the `analysis` domain), and its place (the
+  // `layout` domain): a collapsed window's saved box is the one it reopens
+  // at, never the header-high box the stylesheet draws.
   const descriptor = {
     modeId: 'differential',
-    open: false,
-    rect: { left: 1, top: 2, width: 300, height: 200 },
-    z: 93,
     settings: { marker: 'saved' },
     result,
     headerTitle: 'DE',
   };
+  const place = { rect: { left: 1, top: 2, width: 300, height: 200 }, open: false };
 
-  assert.equal(await manager.createFromSessionDescriptor(descriptor), 'window-1');
+  assert.equal(await manager.createFromSessionDescriptor(descriptor, place), 'window-1');
   assert.deepStrictEqual(calls, ['create:differential:saved', 'result:differential']);
   const exported = manager.exportSessionWindows();
   assert.deepStrictEqual(exported, [descriptor]);
-  requireTypedJsonValue(exported);
+  assert.deepStrictEqual(manager.exportWindowPlaces(), [place]);
+  assert.deepStrictEqual(await throughSession(exported), exported, 'the window record is a storable history value');
+  assert.deepStrictEqual(await throughSession(manager.exportWindowPlaces()), [place], 'so are the places');
 
   calls.length = 0;
   assert.equal(manager.createFromSessionDescriptor({ ...descriptor, result: null }), 'window-2');
   assert.deepStrictEqual(calls, ['create:differential:saved'], 'no result, nothing to restore');
+  assert.deepStrictEqual(manager.exportWindowPlaces()[1], { rect: { left: 40, top: 40, width: 320, height: 240 }, open: true },
+    'without a place, where a new window of its analysis opens');
+  assert.throws(() => manager.createFromSessionDescriptor(descriptor, { rect: place.rect }), /must contain exactly/);
+  assert.throws(() => manager.createFromSessionDescriptor({ ...descriptor, open: true }), /unexpected: open/, 'a window\'s fold is its place, not its analysis');
 
   calls.length = 0;
   await assert.rejects(
@@ -607,4 +644,5 @@ test('floating windows carry their result through the session and restore it aft
   );
   const { result: _omitted, ...withoutResult } = descriptor;
   assert.throws(() => manager.createFromSessionDescriptor(withoutResult), /must contain exactly/);
+  assert.throws(() => manager.createFromSessionDescriptor({ ...descriptor, z: 3 }), /unexpected: z/);
 });

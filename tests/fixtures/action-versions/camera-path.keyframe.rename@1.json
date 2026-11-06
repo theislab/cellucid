@@ -1,0 +1,30 @@
+{
+  "examples": [
+    {
+      "keyframe": "x",
+      "label": "x"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "keyframe": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "label": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "keyframe",
+      "label"
+    ],
+    "type": "object"
+  },
+  "type": "camera-path.keyframe.rename",
+  "version": 1
+}

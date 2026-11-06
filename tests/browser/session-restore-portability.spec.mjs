@@ -27,23 +27,18 @@
  * published sample view that applies says nothing: the person opened a
  * sample, not a session, so its camera landing is the only sign.
  */
-import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
-import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
-import { writeBundle } from '../../assets/js/app/session/bundle/writer.js';
+import { cameraStatesIn, rewriteShownValue, sessionManifest, startingViewBytes } from './helpers/session-files.mjs';
 import { NOT_A_SESSION_FILE_MESSAGE, otherSessionFormatMessage } from '../../assets/js/app/session/bundle/format.js';
-import {
-  gzipCompress,
-  gzipDecompress,
-} from '../../assets/js/app/session/codecs/gzip.js';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -54,10 +49,6 @@ const CATALOG_PATH = path.join(
   'fixtures',
   'catalog',
   'datasets.json',
-);
-
-const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
-  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => profile.id),
 );
 
 const RESTORED = 'Session fully restored.';
@@ -106,78 +97,27 @@ async function poseCamera(page) {
 
 async function saveSession(page, testInfo, name) {
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath(name);
   await download.saveAs(sessionPath);
   return readFile(sessionPath);
 }
 
-async function readChunks(bytes) {
-  const { manifest, chunkStream } = await readBundle(
-    new Blob([bytes]),
-    { signal: null, onProgress: null },
-  );
-  const chunks = [];
-  for await (const chunk of chunkStream) chunks.push(chunk);
-  return { manifest, chunks };
-}
-
-/**
- * Rewrite the `core/state` chunk and, optionally, keep only `chunkIds` as a
- * published default does: with no recorded source, since it is applied to the
- * sample it ships beside. The rewritten chunk keeps its canonical codec.
- */
-async function rewriteSession(bytes, editCoreState, chunkIds = null) {
-  const { manifest, chunks } = await readChunks(bytes);
-  const selected = chunkIds === null
-    ? chunks
-    : chunkIds.map(chunkId => {
-      const chunk = chunks.find(candidate => candidate.meta.id === chunkId);
-      if (chunk === undefined) throw new Error(`no "${chunkId}" chunk`);
-      return chunk;
-    });
-  const rewritten = [];
-  for (const chunk of selected) {
-    if (chunk.meta.id !== 'core/state') {
-      rewritten.push(chunk);
-      continue;
-    }
-    const raw = chunk.meta.codec === 'gzip'
-      ? await gzipDecompress(chunk.bytes, {
-        maxOutputBytes: chunk.meta.uncompressedBytes,
-        signal: null,
-      })
-      : chunk.bytes;
-    const payload = JSON.parse(new TextDecoder().decode(raw));
-    editCoreState(payload);
-    const encoded = new TextEncoder().encode(JSON.stringify(payload));
-    const stored = chunk.meta.codec === 'gzip'
-      ? await gzipCompress(encoded, { signal: null })
-      : encoded;
-    rewritten.push({
-      meta: {
-        ...chunk.meta,
-        storedBytes: stored.byteLength,
-        uncompressedBytes: encoded.byteLength,
-      },
-      bytes: stored,
-    });
-  }
-  const blob = writeBundle({
-    manifest: {
-      ...manifest,
-      source: chunkIds === null ? manifest.source : null,
-      chunks: rewritten.map(chunk => chunk.meta),
-    },
-    chunks: rewritten.map(chunk => chunk.bytes),
-  });
-  return Buffer.from(await blob.arrayBuffer());
-}
-
 /** One unit in the last place, away from zero. */
 function nextUp(value) {
   return value === 0 ? Number.MIN_VALUE : value * (1 + Number.EPSILON);
+}
+
+/**
+ * A saved session whose shown values are edited (`edits`: domain id → edit
+ * of a copy of its value) and, with `startingView`, published as the
+ * dataset's starting view (`helpers/session-files.mjs`).
+ */
+async function rewriteSession(bytes, edits, { startingView = false } = {}) {
+  let rewritten = bytes;
+  for (const [domain, edit] of Object.entries(edits)) rewritten = await rewriteShownValue(rewritten, domain, edit);
+  return startingView ? startingViewBytes(rewritten) : rewritten;
 }
 
 /**
@@ -193,13 +133,6 @@ function deriveInAnotherEngine(camera) {
     camera.freefly.position = camera.freefly.position.map(nextUp);
     camera.freefly.yaw = nextUp(camera.freefly.yaw);
     camera.freefly.pitch = nextUp(camera.freefly.pitch);
-  }
-}
-
-function moveDerivedCameraBits(payload) {
-  deriveInAnotherEngine(payload.multiview.live.cameraState);
-  for (const snapshot of payload.multiview.snapshots) {
-    deriveInAnotherEngine(snapshot.cameraState);
   }
 }
 
@@ -257,6 +190,22 @@ async function expectAnnounced(page, predicate, count, description) {
   expect(matches, description).toHaveLength(count);
 }
 
+/** Every camera state the views and the cameras hold, each moved as another engine derives it. */
+const moveDerivedCameraBits = Object.freeze({
+  views: value => cameraStatesIn(value).forEach(deriveInAnotherEngine),
+  camera: value => cameraStatesIn(value).forEach(deriveInAnotherEngine),
+});
+
+/** A select setting given a value its control does not offer; false when the value holds none. */
+function breakFirstSelect(value) {
+  if (value === null || typeof value !== 'object' || ArrayBuffer.isView(value)) return false;
+  if (value.type === 'select' && typeof value.value === 'string') {
+    value.value = 'not-an-offered-option';
+    return true;
+  }
+  return Object.values(value).some(breakFirstSelect);
+}
+
 const restored = ({ message }) => message === RESTORED;
 const loadingFailed = ({ title }) => title === 'Loading failed';
 const sampleViewUnavailable = ({ title }) => title === 'Sample view unavailable';
@@ -295,7 +244,7 @@ test('a session saved by another engine restores, and says so once', async ({
   await forgetNotifications(page);
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles({
     name: 'other-engine.cellucid-session',
@@ -309,9 +258,11 @@ test('a session saved by another engine restores, and says so once', async ({
     1,
     'a successful restore is announced exactly once',
   );
-  // Load State used to add a third announcement of the same event.
+  // Load State used to add a third announcement of the same event. The one other notice is the
+  // offer to undo the load (its trackers were added beside the ones shown).
   expect(await publishedNotifications(page)).toEqual([
     { title: 'Loaded', message: RESTORED },
+    { title: '', message: 'Loaded "Tracker 1 (shared)" from other-engine.cellucid-session beside yours.' },
   ]);
   await expect(page.locator('#split-view-badges-list > *')).not.toHaveCount(0);
   expect(await readLiveOrbit(page)).toEqual(savedOrbit);
@@ -341,7 +292,7 @@ test('a session saved on one route restores on the same dataset opened from a li
   await forgetNotifications(page);
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles({
     name: 'catalog.cellucid-session',
@@ -356,7 +307,7 @@ test('a session saved on one route restores on the same dataset opened from a li
 
 async function loadSessionFile(page, name, bytes) {
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles({
     name,
@@ -376,7 +327,7 @@ test('a session reopens the dataset it records, from a sample or a link', async 
   await poseCamera(page);
   const sampleOrbit = await readLiveOrbit(page);
   const sampleSession = await saveSession(page, testInfo, 'sample.cellucid-session');
-  expect((await readChunks(sampleSession)).manifest.source).toEqual({
+  expect((await sessionManifest(sampleSession)).source).toEqual({
     kind: 'sample',
     dataset: 'current-ui',
   });
@@ -401,7 +352,7 @@ test('a session reopens the dataset it records, from a sample or a link', async 
   await poseCamera(page);
   const linkOrbit = await readLiveOrbit(page);
   const linkSession = await saveSession(page, testInfo, 'link.cellucid-session');
-  expect((await readChunks(linkSession)).manifest.source).toEqual({
+  expect((await sessionManifest(linkSession)).source).toEqual({
     kind: 'link',
     locator: link,
     dataset: expect.any(String),
@@ -452,7 +403,7 @@ test('a published sample view saved by another engine applies, without a word', 
   const stateBytes = await rewriteSession(
     await saveSession(page, testInfo, 'published.cellucid-session'),
     moveDerivedCameraBits,
-    PUBLISHED_DEFAULT_CHUNK_IDS,
+    { startingView: true },
   );
   await servePublishedDefault(page, stateBytes);
 
@@ -485,18 +436,12 @@ test('a published sample view that cannot be applied is reported once', async ({
   let rewroteSelect = false;
   const stateBytes = await rewriteSession(
     await saveSession(page, testInfo, 'broken.cellucid-session'),
-    payload => {
-      // A select value the control does not offer: refused by the restore
-      // after the bundle has been read, inside the restore transaction.
-      for (const control of Object.values(payload.uiControls)) {
-        if (control.type === 'select') {
-          control.value = 'not-an-offered-option';
-          rewroteSelect = true;
-          return;
-        }
-      }
+    {
+      // A select value the control does not offer: refused when the settings
+      // are put back, after the file has been read.
+      settings: value => { rewroteSelect = breakFirstSelect(value); },
     },
-    PUBLISHED_DEFAULT_CHUNK_IDS,
+    { startingView: true },
   );
   expect(rewroteSelect, 'the saved session must contain a select').toBe(true);
   await servePublishedDefault(page, stateBytes);
@@ -518,6 +463,42 @@ test('a published sample view that cannot be applied is reported once', async ({
   expect(published.filter(restored)).toEqual([]);
 });
 
+test('a published sample view of another session format: the dataset opens on its default view, with one short line', async ({
+  page,
+}, testInfo) => {
+  // The app and the datasets are deployed minutes apart: a new app meets an
+  // old view, or a cached app a new one. No format is read but this one, and
+  // nothing about formats reaches the person.
+  const productErrors = observeProductErrors(page);
+  await recordNotifications(page);
+  await openDataset(page);
+  const current = await saveSession(page, testInfo, 'current.cellucid-session');
+  const signature = Buffer.from('CELLUCID_SESSION/4\n');
+  expect(current.subarray(0, signature.length).equals(signature)).toBe(true);
+  for (const prefix of ['CELLUCID_SESSION/3\n', 'CELLUCID_SESSION/9\n']) {
+    await page.unrouteAll({ behavior: 'wait' });
+    await servePublishedDefault(page, Buffer.concat([Buffer.from(prefix), current.subarray(signature.length)]));
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await dismissWelcome(page);
+    await openCollapsedPanels(page);
+    await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+    await expectAnnounced(
+      page,
+      ({ message }) => /starting view isn\u2019t available right now/.test(message),
+      1,
+      `${prefix.trim()}: one short line`,
+    );
+    const published = await publishedNotifications(page);
+    expect(published.filter(sampleViewUnavailable)).toEqual([]);
+    expect(published.filter(loadingFailed)).toEqual([]);
+    expect(published.filter(({ message }) => /session format|earlier version|newer version/i.test(message))).toEqual([]);
+    await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
+    // The dataset's history starts from what is shown, after the line is said.
+    await expect.poll(() => page.evaluate(() => window._cellucidHistories?.current()?.active != null)).toBe(true);
+  }
+  expect(productErrors).toEqual([]);
+});
+
 test('a published sample view applies when its catalog is opened from a link', async ({
   page,
 }, testInfo) => {
@@ -530,8 +511,8 @@ test('a published sample view applies when its catalog is opened from a link', a
   const savedOrbit = await readLiveOrbit(page);
   const stateBytes = await rewriteSession(
     await saveSession(page, testInfo, 'published.cellucid-session'),
-    () => {},
-    PUBLISHED_DEFAULT_CHUNK_IDS,
+    {},
+    { startingView: true },
   );
   await servePublishedDefault(page, stateBytes);
 
@@ -551,24 +532,24 @@ test('a published sample view applies when its catalog is opened from a link', a
   expect(productErrors).toEqual([]);
 });
 
-test('a file without the format-3 signature is refused, and nothing changes', async ({
+test('a file without the format-4 signature is refused, and nothing changes', async ({
   page,
 }, testInfo) => {
-  // Format 3 carries its version in the signature. A session of format 2
-  // (saved by an earlier Cellucid, its cell check taken over drawn
-  // coordinates) is refused naming its format; a file with any other
-  // signature (here the unversioned "CELLUCID_SESSION\n") with the one
-  // sentence naming the expected format. Nothing of either is restored.
+  // Format 4 carries its version in the signature. A session of format 3
+  // (saved by an earlier Cellucid: one state, not the history of its steps)
+  // is refused naming its format; a file with any other signature (here the
+  // unversioned "CELLUCID_SESSION\n") with the one sentence naming the
+  // expected format. Nothing of either is restored.
   const productErrors = observeProductErrors(page);
   await recordNotifications(page);
   await openDataset(page);
   await poseCamera(page);
   const orbit = await readLiveOrbit(page);
   const current = await saveSession(page, testInfo, 'current.cellucid-session');
-  const signature = Buffer.from('CELLUCID_SESSION/3\n');
+  const signature = Buffer.from('CELLUCID_SESSION/4\n');
   expect(current.subarray(0, signature.length).equals(signature)).toBe(true);
   const refusals = [
-    ['format2.cellucid-session', 'CELLUCID_SESSION/2\n', otherSessionFormatMessage(2)],
+    ['format3.cellucid-session', 'CELLUCID_SESSION/3\n', otherSessionFormatMessage(3)],
     ['unversioned.cellucid-session', 'CELLUCID_SESSION\n', NOT_A_SESSION_FILE_MESSAGE],
   ];
   for (const [name, prefix, sentence] of refusals) {

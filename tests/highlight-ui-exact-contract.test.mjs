@@ -14,18 +14,13 @@ import { initHighlightModeUI } from '../assets/js/app/ui/modules/highlight/mode-
 import { createHighlightSelectionState } from '../assets/js/app/ui/modules/highlight/selection-state.js';
 import { initHighlightSelectionSync } from '../assets/js/app/ui/modules/highlight/selection-sync.js';
 import { highlightStateMethods } from '../assets/js/app/state/managers/highlight-manager.js';
+import { provideHighlightActions } from '../assets/js/app/ui/modules/highlight/highlight-actions.js';
+import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
+import { getActionCatalog, getActions } from '../assets/js/app/actions/index.js';
+import { provideStubHighlightActions, settleActions, withHighlightPage } from './helpers/highlight-state-pages.mjs';
 import { viewContextCoreMethods } from '../assets/js/app/state/managers/view-context-core.js';
-import {
-  capture as captureHighlightCells,
-  restore as restoreHighlightCells
-} from '../assets/js/app/session/contributors/highlights-cells.js';
-import {
-  capture as captureHighlightMeta,
-  restore as restoreHighlightMeta
-} from '../assets/js/app/session/contributors/highlights-meta.js';
-import {
-  createSessionRestoreTransaction
-} from '../assets/js/app/session/session-context.js';
+import { createHighlightsDomain } from '../assets/js/app/state/domains/highlights.js';
+import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
 
 const HIGHLIGHT_MODULE_ROOT = new URL(
@@ -192,6 +187,7 @@ function createCategoryHighlightState() {
   };
   const state = {
     pointCount: 5,
+    cellIdentity: createCellIdentity({ nObs: 5 }),
     obsData: { fields: [field] },
     varData: { fields: [] },
     categoryTransparency: Uint8Array.from([1, 1, 1, 1, 1]),
@@ -221,18 +217,8 @@ function createCategoryHighlightState() {
     getTotalHighlightedCellCount() {
       return this.highlightPages[0].highlightedGroups.length;
     },
-    clearActivePageHighlights() {},
-    removeHighlightGroup() {
-      return true;
-    },
-    highlightGroupRecord() {
-      return null;
-    },
-    restoreHighlightGroup() {
-      return false;
-    },
-    toggleHighlightEnabled() {
-      return true;
+    getActivePage() {
+      return this.highlightPages[0];
     },
     _recomputeHighlightArray() {},
     _notifyHighlightPageChange() {},
@@ -255,6 +241,7 @@ test('highlight modules expose one exact current UI contract without probes, tim
     'annotation-selection.js',
     'continuous-selection-preview.js',
     'exact-contract.js',
+    'highlight-actions.js',
     'highlight-pages-ui.js',
     'highlight-selection-tools.js',
     'highlight-summary-ui.js',
@@ -308,36 +295,17 @@ test('category highlights preserve primitive identity through save, restore, and
     expectedCategoryNames
   );
 
-  const [metaChunk] = captureHighlightMeta({ state: sourceState });
-  const cellChunks = captureHighlightCells({ state: sourceState });
-  // Each group is a whole category, so it is stored relative to that
-  // category: encoding 4 (reference-all), a few bytes whatever its size.
-  assert.deepEqual(cellChunks.map(chunk => chunk.payload[0]), [4, 4, 4, 4, 4]);
-  const restoredState = createCategoryHighlightState();
-  const restoreTransaction = createSessionRestoreTransaction();
-  const restoreContext = {
-    state: restoredState,
-    abortSignal: null,
-    restoreTransaction
-  };
-  restoreHighlightMeta(
-    restoreContext,
-    metaChunk,
-    metaChunk.payload
+  // Kept and put back through the highlights state domain, the way a
+  // session file and the history keep them (a copy of the value).
+  const saved = structuredClone(
+    createHighlightsDomain({ state: sourceState, refreshUi() {} }).capture()
   );
-  for (const cellChunk of cellChunks) {
-    const { payload, ...metadata } = cellChunk;
-    await restoreHighlightCells(
-      restoreContext,
-      {
-        ...metadata,
-        storedBytes: payload.byteLength,
-        uncompressedBytes: payload.byteLength
-      },
-      payload
-    );
-  }
-  restoreTransaction.commit();
+  assert.deepEqual(
+    saved.pages[0].groups.map(group => group.category),
+    expectedCategoryNames
+  );
+  const restoredState = createCategoryHighlightState();
+  await createHighlightsDomain({ state: restoredState, refreshUi() {} }).restore(saved);
 
   const restoredGroups = restoredState.getHighlightedGroups();
   assert.deepEqual(
@@ -498,7 +466,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
   const viewerCallbacks = new Map();
   const unsubscribeCalls = [];
   const mutations = [];
-  const state = {
+  const state = withHighlightPage({
     pointCount: 8,
     activeFieldIndex: -1,
     activeFieldSource: null,
@@ -535,7 +503,7 @@ test('selection-tool destruction retires subscriptions and fences retained callb
     setPreviewHighlightFromIndices() {
       mutations.push('preview');
     }
-  };
+  });
   const viewer = {
     cancelAnnotationSelection() {
       mutations.push('cancelAnnotation');
@@ -827,15 +795,6 @@ test('highlight pages reject alternate page schemas before rebuilding the tab st
     legacyColor: '#000000'
   };
   const state = {
-    combineHighlightPages() {},
-    createHighlightPage() {},
-    deleteHighlightPage() {},
-    highlightPageRecord() {
-      return null;
-    },
-    restoreHighlightPage() {
-      return false;
-    },
     ensureHighlightPage() {},
     getActivePageId() {
       return page.id;
@@ -876,7 +835,7 @@ test('highlight pages reject alternate page schemas before rebuilding the tab st
   assert.equal(appendedTabs, 0);
 });
 
-test('highlight summary rejects state-operation no-ops instead of accepting them', () => {
+test('highlight summary dispatches by name, and the handlers refuse state-operation no-ops', async () => {
   const countEl = createEventElement();
   const groupsEl = createEventElement();
   const clearButton = createEventElement();
@@ -888,14 +847,21 @@ test('highlight summary rejects state-operation no-ops instead of accepting them
     cellIndices: Uint32Array.of(0),
     cellCount: 1
   };
+  const page = { id: 'page_1', name: 'Page 1', color: '#2563eb', highlightedGroups: [group] };
   const state = {
     pointCount: 4,
-    clearActivePageHighlights() {},
+    ensureHighlightPage() {},
+    getActivePage() {
+      return page;
+    },
+    getHighlightPages() {
+      return [page];
+    },
     getHighlightedCellCount() {
       return 1;
     },
     getHighlightedGroups() {
-      return [group];
+      return page.highlightedGroups;
     },
     getTotalHighlightedCellCount() {
       return 1;
@@ -903,45 +869,72 @@ test('highlight summary rejects state-operation no-ops instead of accepting them
     removeHighlightGroup() {
       return false;
     },
-    highlightGroupRecord() {
-      return null;
-    },
-    restoreHighlightGroup() {
-      return false;
+    clearHighlightPage() {
+      return 0;
     },
     toggleHighlightEnabled() {
       return false;
     }
   };
+  const actions = createActionDispatcher({ catalog: getActionCatalog() });
+  provideHighlightActions({ state, actions });
+  await assert.rejects(
+    actions.dispatch('highlight.group.toggle', { group: 'Lasso (1 cell)', enabled: false, page: 'Page 1' }),
+    /could not be turned off/
+  );
+  await assert.rejects(
+    actions.dispatch('highlight.group.remove', { group: 'Lasso (1 cell)', page: 'Page 1' }),
+    /could not be removed/
+  );
+  await assert.rejects(
+    actions.dispatch('highlight.page.clear', { page: 'Page 1' }),
+    /could not be cleared/
+  );
 
-  withDocument({
-    createElement() {
-      return createEventElement();
-    }
-  }, () => {
-    const { renderHighlightSummary } = initHighlightSummaryUI({
-      state,
-      dom: {
-        countEls: [countEl],
-        groupsEl,
-        clearButtons: [clearButton]
-      }
-    });
-    renderHighlightSummary();
-    const renderedGroup = groupsEl.children[0];
-    const checkbox = renderedGroup.children[0];
-    checkbox.checked = false;
-    // The list delegates both row interactions.
-    assert.throws(
-      () => groupsEl.dispatch('change', { target: checkbox }),
-      /toggle.*rejected/i
-    );
-    const removeButton = renderedGroup.children[2];
-    assert.throws(
-      () => groupsEl.dispatch('click', { target: removeButton, stopPropagation() {} }),
-      /removal.*rejected/i
-    );
+  // The panel's own dispatches name the page and the group (applied here by
+  // a state whose operations succeed).
+  Object.assign(state, {
+    removeHighlightGroup: () => true,
+    clearHighlightPage: () => 1,
+    toggleHighlightEnabled: () => true
   });
+  const removeProvided = provideHighlightActions({ state });
+  const dispatched = [];
+  const stopListening = getActions().subscribe(event => {
+    if (event.kind === 'start') dispatched.push([event.type, event.params]);
+  });
+  try {
+    withDocument({
+      createElement() {
+        return createEventElement();
+      }
+    }, () => {
+      const { renderHighlightSummary } = initHighlightSummaryUI({
+        state,
+        dom: {
+          countEls: [countEl],
+          groupsEl,
+          clearButtons: [clearButton]
+        }
+      });
+      renderHighlightSummary();
+      const renderedGroup = groupsEl.children[0];
+      const checkbox = renderedGroup.children[0];
+      checkbox.checked = false;
+      groupsEl.dispatch('change', { target: checkbox });
+      groupsEl.dispatch('click', { target: renderedGroup.children[2], stopPropagation() {} });
+      clearButton.dispatch('click', {});
+    });
+    await settleActions();
+  } finally {
+    stopListening();
+    removeProvided();
+  }
+  assert.deepEqual(dispatched, [
+    ['highlight.group.toggle', { group: 'Lasso (1 cell)', page: 'Page 1', enabled: false }],
+    ['highlight.group.remove', { group: 'Lasso (1 cell)', page: 'Page 1' }],
+    ['highlight.page.clear', { page: 'Page 1' }]
+  ]);
 });
 
 test('highlight summary rejects alternate group schemas before mutating the DOM', () => {
@@ -959,7 +952,9 @@ test('highlight summary rejects alternate group schemas before mutating the DOM'
   };
   const state = {
     pointCount: 4,
-    clearActivePageHighlights() {},
+    getActivePage() {
+      return { id: 'page_1', name: 'Page 1', color: '#2563eb', highlightedGroups: [group] };
+    },
     getHighlightedCellCount() {
       return 1;
     },
@@ -968,18 +963,6 @@ test('highlight summary rejects alternate group schemas before mutating the DOM'
     },
     getTotalHighlightedCellCount() {
       return 1;
-    },
-    removeHighlightGroup() {
-      return true;
-    },
-    highlightGroupRecord(id) {
-      return { group: { id, label: id }, pageId: 'page_1', index: 0, cells: null };
-    },
-    restoreHighlightGroup() {
-      return true;
-    },
-    toggleHighlightEnabled() {
-      return true;
     }
   };
 
@@ -1132,7 +1115,7 @@ test('highlight mode requires exactly one explicitly pressed current-mode button
   });
 });
 
-test('malformed lasso events fail before history or permanent highlight mutation', () => {
+test('malformed lasso events fail before history or permanent highlight mutation', async () => {
   const selectionState = createHighlightSelectionState();
   const calls = [];
   let selectionCallback = null;
@@ -1146,11 +1129,11 @@ test('malformed lasso events fail before history or permanent highlight mutation
     setLassoPreviewCallback() {},
     setLassoStepCallback() {}
   };
-  const state = {
+  const state = withHighlightPage({
     pointCount: 8,
-    addHighlightDirect() {
+    addHighlightDirect({ type, label, cellIndices }) {
       calls.push('add');
-      return {};
+      return { id: 'highlight_1', type, label, enabled: true, cellIndices: cellIndices.slice(), cellCount: cellIndices.length };
     },
     clearPreviewHighlight() {
       calls.push('clear');
@@ -1158,7 +1141,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
     setPreviewHighlightFromIndices() {
       calls.push('preview');
     }
-  };
+  });
 
   withDocument(createDocumentStub(), () => {
     const { handleLassoStep } = initLassoSelection({
@@ -1196,17 +1179,34 @@ test('malformed lasso events fail before history or permanent highlight mutation
     );
     assert.deepEqual(calls, []);
 
-    assert.throws(
-      () => selectionCallback({
+  });
+
+  // A well-formed selection is one `highlight.cells` step naming exactly its
+  // cells by original position, on the page shown.
+  const removeProvided = provideStubHighlightActions(state);
+  const dispatched = [];
+  const stopListening = getActions().subscribe(event => {
+    if (event.kind === 'start') dispatched.push([event.type, event.params]);
+  });
+  try {
+    withDocument(createDocumentStub(), () => {
+      selectionCallback({
         type: 'lasso',
         cellIndices: Uint32Array.of(3),
         cellCount: 1,
         steps: 1
-      }),
-      /saved lasso highlight group/i
-    );
-    assert.deepEqual(calls, ['add']);
-  });
+      });
+    });
+    await settleActions();
+  } finally {
+    stopListening();
+    removeProvided();
+  }
+  assert.deepEqual(
+    dispatched.map(([type, params]) => [type, [...params.cells], params.label, params.tool, params.page]),
+    [['highlight.cells', [3], 'Lasso (1 cell)', 'lasso', 'Page 1']]
+  );
+  assert.deepEqual(calls, ['add']);
 });
 
 test('selection destruction drains viewer host delivery and suppresses late failure UI', async () => {
@@ -1225,7 +1225,7 @@ test('selection destruction drains viewer host delivery and suppresses late fail
     setLassoPreviewCallback() {},
     setLassoStepCallback() {}
   };
-  const state = {
+  const state = withHighlightPage({
     pointCount: 8,
     addHighlightDirect({ cellIndices }) {
       return {
@@ -1239,7 +1239,7 @@ test('selection destruction drains viewer host delivery and suppresses late fail
     },
     clearPreviewHighlight() {},
     setPreviewHighlightFromIndices() {}
-  };
+  });
   const notifications = getNotificationCenter();
   const originalError = notifications.error;
   const notificationCalls = [];
@@ -1247,6 +1247,7 @@ test('selection destruction drains viewer host delivery and suppresses late fail
   const originalConsoleError = console.error;
   const consoleErrors = [];
   console.error = (...args) => consoleErrors.push(args);
+  const removeProvided = provideStubHighlightActions(state);
 
   try {
     await withDocument(createDocumentStub(), async () => {
@@ -1291,6 +1292,7 @@ test('selection destruction drains viewer host delivery and suppresses late fail
   } finally {
     notifications.error = originalError;
     console.error = originalConsoleError;
+    removeProvided();
   }
 });
 
@@ -1333,7 +1335,7 @@ test('annotation undo republishes the exact candidate state to the unified rende
     codes: Uint8Array.from([0, 0, 1, 1]),
     categories: ['A', 'B']
   };
-  const state = {
+  const state = withHighlightPage({
     pointCount: 4,
     addHighlightDirect() {},
     clearPreviewHighlight() {},
@@ -1356,7 +1358,7 @@ test('annotation undo republishes the exact candidate state to the unified rende
       return () => {};
     },
     setPreviewHighlightFromIndices() {}
-  };
+  });
   const restoreCalls = [];
   const viewer = {
     cancelAnnotationSelection() {},

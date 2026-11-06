@@ -26,9 +26,12 @@ import { initSelectBarPlacement } from '../modules/select-bar-placement.js';
  *   setViewportLeftOcclusionRatio: (ratio: number) => void,
  *   onPresentedLayoutChange: (listener: (layout: Object) => void) => () => void
  * }} options.viewer
- * @returns {{destroy: () => void}}
+ * @param {object} options.actions The page's action dispatcher (`app/actions`)
+ * @returns {{destroy: () => void, describeSidebar: () => {shown: boolean, width: number},
+ *   isSidebarShown: () => boolean, showSidebar: (shown: boolean) => void,
+ *   setSidebarWidth: (width: number|null) => void}}
  */
-export function initSidebarLayout({ documentOwner, viewer }) {
+export function initSidebarLayout({ documentOwner, viewer, actions }) {
   const byId = id => documentOwner.getElementById(id);
   const selectBarPlacement = initSelectBarPlacement({ bar: byId('select-bar') });
   const sidebarControls = initSidebarControls({
@@ -39,11 +42,17 @@ export function initSidebarLayout({ documentOwner, viewer }) {
       canvas: byId('glcanvas'),
     },
     onViewportOcclusionChange: viewer.setViewportLeftOcclusionRatio,
+    actions,
   });
   const unsubscribeSelectBarPlacement = viewer.onPresentedLayoutChange(
     layout => selectBarPlacement.place(layout)
   );
   return {
+    describeSidebar: () => sidebarControls.describe(),
+    // Shown as chosen: on a phone, not whether its sheet is open (chrome, no state).
+    isSidebarShown: () => sidebarControls.isShownChosen(),
+    showSidebar: shown => sidebarControls.show(shown),
+    setSidebarWidth: width => sidebarControls.setWidth(width),
     destroy() {
       sidebarControls.destroy();
       unsubscribeSelectBarPlacement();

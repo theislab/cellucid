@@ -2,7 +2,9 @@
  * @fileoverview Highlight selection UI wiring.
  *
  * Encapsulates the highlight mode toolbelt (annotation/lasso/proximity/knn),
- * highlight page tabs, and selection preview plumbing with the viewer.
+ * highlight page tabs, and selection preview plumbing with the viewer, and
+ * provides the highlight actions (`highlight/highlight-actions.js`) while it
+ * is up: every change to highlight pages and groups is one of them.
  *
  * @module ui/modules/highlight-controls
  */
@@ -10,6 +12,7 @@
 import { initHighlightPagesUI } from './highlight/highlight-pages-ui.js';
 import { initHighlightSelectionTools } from './highlight/highlight-selection-tools.js';
 import { initHighlightSummaryUI } from './highlight/highlight-summary-ui.js';
+import { provideHighlightActions } from './highlight/highlight-actions.js';
 import { annotationFieldKindForPane } from './highlight/annotation-cells.js';
 import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
 import {
@@ -21,18 +24,18 @@ import {
   pickSelectModeDom,
 } from './highlight/exact-contract.js';
 import { requireExactKeys } from '../../../utils/exact-record.js';
+import { deleteRetiredHighlightDrafts } from '../../history/autosave-store.js';
 
 const REQUIRED_STATE_METHODS = Object.freeze([
   'getActiveField',
   'getHighlightPages',
+  'getActivePage',
   'getActivePageId',
   'getHighlightedCellCountForPage',
   'combineHighlightPages',
   'switchToPage',
   'renameHighlightPage',
   'deleteHighlightPage',
-  'highlightPageRecord',
-  'restoreHighlightPage',
   'setHighlightPageColor',
   'createHighlightPage',
   'ensureHighlightPage',
@@ -41,12 +44,17 @@ const REQUIRED_STATE_METHODS = Object.freeze([
   'getTotalHighlightedCellCount',
   'toggleHighlightEnabled',
   'removeHighlightGroup',
-  'highlightGroupRecord',
-  'restoreHighlightGroup',
-  'clearActivePageHighlights',
+  'clearHighlightPage',
+  'clearHighlightsOnAllPages',
   'clearPreviewHighlight',
   'setPreviewHighlightFromIndices',
   'addHighlightDirect',
+  'addHighlightFromCategory',
+  'addHighlightFromRange',
+  'ensureFieldLoaded',
+  'ensureVarFieldLoaded',
+  'getFields',
+  'getVarFields',
   'getCellIndicesForCategory',
   'getCellIndicesForRange',
   'getFieldForView',
@@ -96,6 +104,8 @@ export function initHighlightControls(options) {
     'Highlight controls options'
   );
   const { state, viewer, dom, viewerHostSource } = options;
+  // Dead storage an earlier Cellucid left in this origin (deleted, never read).
+  deleteRetiredHighlightDrafts();
   requireMethods(state, 'Highlight state', REQUIRED_STATE_METHODS);
   requireMethods(viewer, 'Highlight viewer', REQUIRED_VIEWER_METHODS);
   requireViewerHostSource(viewerHostSource);
@@ -178,6 +188,10 @@ export function initHighlightControls(options) {
     renderHighlightPages
   });
 
+  // Provided once every part of the panel stands (a part that fails to start
+  // leaves nothing provided); its controls dispatch them from here on.
+  const removeHighlightActions = provideHighlightActions({ state });
+
   let destructionPromise = null;
 
   // Whether an annotation press can start, and which cursor the armed tool
@@ -206,7 +220,8 @@ export function initHighlightControls(options) {
       },
       () => selectionTools.destroy(),
       () => pagesUi.destroy(),
-      () => summaryUi.destroy()
+      () => summaryUi.destroy(),
+      () => removeHighlightActions()
     ]) {
       try {
         const result = operation();

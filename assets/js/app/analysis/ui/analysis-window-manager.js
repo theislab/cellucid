@@ -23,6 +23,7 @@ import { isFiniteNumber } from '../shared/number-utils.js';
 import { analysisViewSizes } from '../shared/analysis-view-sizes.js';
 import { expandPagesWithDerived } from '../shared/page-derivation-utils.js';
 import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
+import { isLeftOutResult } from '../shared/analysis-result-session.js';
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -40,6 +41,7 @@ function requireDockableAccordions() {
     typeof dockable.floatingRoot.appendChild !== 'function' ||
     typeof dockable.register !== 'function' ||
     typeof dockable.float !== 'function' ||
+    typeof dockable.place !== 'function' ||
     typeof dockable.unregister !== 'function' ||
     typeof dockable.panelFrame !== 'function'
   ) {
@@ -119,12 +121,23 @@ function readWindowRect(frame, windowId) {
   };
 }
 
-function readWindowLayer(frame, windowId) {
-  const raw = frame.style.getPropertyValue('--z-layer').trim();
-  if (!/^(0|[1-9]\d*)$/.test(raw)) {
-    throw new TypeError(`Analysis window "${windowId}" must have an integer layer`);
+/** A window's place: its box and whether it is open (`exportWindowPlaces`). */
+function requireWindowPlace(place) {
+  requireExactKeys(place, ['open', 'rect'], 'Analysis window place');
+  requireSessionRect(place.rect);
+  if (typeof place.open !== 'boolean') {
+    throw new TypeError('Analysis window place open must be a boolean');
   }
-  return Number(raw);
+}
+
+function requireWindowEntry(entry) {
+  if (
+    entry === null ||
+    typeof entry !== 'object' ||
+    typeof entry.frame?.getBoundingClientRect !== 'function'
+  ) {
+    throw new TypeError('Analysis window registry contains an invalid entry');
+  }
 }
 
 function requireSettings(settings) {
@@ -221,34 +234,58 @@ export class AnalysisWindowManager {
     this._closeAllPromise = null;
   }
 
+  /**
+   * The open windows in the order they opened: their number (1 for the
+   * first) is how an action names one.
+   * @returns {Array<{id: string, number: number, modeId: string, title: string, ui: any, details: HTMLDetailsElement}>}
+   */
+  listWindows() {
+    return [...this._windows.values()].map((entry, index) => ({
+      id: entry.id,
+      number: index + 1,
+      modeId: entry.modeId,
+      title: entry.headerTitle,
+      ui: entry.ui,
+      details: entry.details
+    }));
+  }
+
+  /** A window's number (`listWindows`), or 0 when it is not open. */
+  windowNumberOf(windowId) {
+    return [...this._windows.keys()].indexOf(windowId) + 1;
+  }
+
+  /**
+   * Resolves once the work a window's analysis set off has settled (a new
+   * window's first update after its delay: `whenSettled`), so the step that
+   * opened or copied it holds what that work changes.
+   * @param {string} windowId
+   * @returns {Promise<void>}
+   */
+  whenWindowSettled(windowId) {
+    return this._windows.get(windowId)?.ui?.whenSettled?.() ?? Promise.resolve();
+  }
+
   getWindowCount() {
     return this._windows.size;
   }
 
   /**
-   * Export all floating analysis windows as session restore descriptors,
-   * back to front.
+   * Export all floating analysis windows as session restore descriptors, in
+   * the order they opened (window 1 first, as actions number them).
    *
-   * The session bundle stores analysis windows as eager JSON so the UI can be
-   * reconstructed quickly: the window's own box (not the collapsed or phone
-   * layout the stylesheet may be drawing), whether it is open, its layer,
+   * The `analysis` state domain holds these: each window's analysis, its
    * settings and the shown result (`ui.exportResult()`: null, or
    * `{kind, version, payload}` of JSON values and typed arrays; see
-   * shared/analysis-result-session.js).
+   * shared/analysis-result-session.js). Where a window stands, its size and
+   * whether it is folded are its place (`exportWindowPlaces`), which the
+   * `layout` domain holds with every other panel's (History v2 §3.15.5).
    *
-   * @returns {Array<{ modeId: string, open: boolean, rect: { left: number, top: number, width: number, height: number }, z: number, settings: any, result: null|Object, headerTitle: string }>}
+   * @returns {Array<{ modeId: string, settings: any, result: null|Object, headerTitle: string }>}
    */
   exportSessionWindows() {
-    const out = [];
-
-    for (const entry of this._windows.values()) {
-      if (
-        entry === null ||
-        typeof entry !== 'object' ||
-        typeof entry.frame?.getBoundingClientRect !== 'function'
-      ) {
-        throw new TypeError('Analysis window registry contains an invalid entry');
-      }
+    return [...this._windows.values()].map(entry => {
+      requireWindowEntry(entry);
       if (typeof entry.ui?.exportSettings !== 'function') {
         throw new TypeError(
           `Analysis window "${entry.id}" UI must implement exportSettings()`
@@ -256,27 +293,62 @@ export class AnalysisWindowManager {
       }
       requireNonEmptyString(entry.modeId, 'Analysis window modeId');
       requireNonEmptyString(entry.headerTitle, 'Analysis window headerTitle');
-
-      const rect = readWindowRect(entry.frame, entry.id);
-      requireSessionRect(rect);
-      const settings = requireSettings(entry.ui.exportSettings());
-
-      out.push({
+      return {
         modeId: entry.modeId,
-        open: entry.details.open === true,
-        rect,
-        z: readWindowLayer(entry.frame, entry.id),
-        settings,
+        settings: requireSettings(entry.ui.exportSettings()),
         result: entry.ui.exportResult(),
         headerTitle: entry.headerTitle
-      });
-    }
-
-    return out.sort((a, b) => a.z - b.z);
+      };
+    });
   }
 
   /**
-   * The sizes remembered per analysis, for the session.
+   * Each open window's place, in the order they opened: its own box (not
+   * the collapsed or phone layout the stylesheet may be drawing) and whether
+   * it is open (unfolded). Which window is in front is not part of it: a
+   * press on a window raises it (`dockable-accordions.js`), and raising a
+   * panel is not a step.
+   *
+   * @returns {Array<{ rect: { left: number, top: number, width: number, height: number }, open: boolean }>}
+   */
+  exportWindowPlaces() {
+    return [...this._windows.values()].map(entry => {
+      requireWindowEntry(entry);
+      const rect = readWindowRect(entry.frame, entry.id);
+      requireSessionRect(rect);
+      return { rect, open: entry.details.open === true };
+    });
+  }
+
+  /**
+   * Put each open window at its place (`exportWindowPlaces`'s shape, one
+   * per open window, in order). Every place is checked before any window
+   * moves; a window already where it should be is not touched, so which one
+   * is in front stays. Nothing here is a step: the folds and moves it makes
+   * find nothing new to record. Places for fewer or more windows than are
+   * open (the `analysis` domain left as it is, its recording switched off)
+   * are applied to the windows both name, in order: the rest stay where they
+   * are, and the extra places are ignored.
+   *
+   * @param {Array<{ rect: { left: number, top: number, width: number, height: number }, open: boolean }>} places
+   */
+  applyWindowPlaces(places) {
+    if (!Array.isArray(places)) throw new TypeError('Analysis window places must be a list');
+    const entries = [...this._windows.values()];
+    places.forEach(requireWindowPlace);
+    const dockable = requireDockableAccordions();
+    entries.slice(0, places.length).forEach((entry, index) => {
+      const { rect, open } = places[index];
+      const now = readWindowRect(entry.frame, entry.id);
+      if (now.left !== rect.left || now.top !== rect.top || now.width !== rect.width || now.height !== rect.height) {
+        dockable.place(entry.details, { ...rect });
+      }
+      if (entry.details.open !== open) entry.details.open = open;
+    });
+  }
+
+  /**
+   * The sizes remembered per analysis (the `layout` domain holds them).
    * @returns {{window: Object, expandedView: Object}}
    */
   exportViewSizes() {
@@ -293,29 +365,27 @@ export class AnalysisWindowManager {
 
   /**
    * Create a floating analysis window from a session restore descriptor:
-   * its box, open state and layer, its settings, then its result. With a
-   * result the window ID comes once the result is shown; a refused result
-   * closes the window again.
+   * its analysis and settings, then its result, at `place` (its box and
+   * open state, `exportWindowPlaces`'s shape), or where a new window of its
+   * analysis opens when `place` is null. With a result the window ID comes
+   * once the result is shown; a refused result closes the window again. A
+   * result a shared session left out (`isLeftOutResult`) opens the window
+   * with its settings and no result (`importLeftOutResult`).
    *
-   * @param {{ modeId: string, open: boolean, rect: { left: number, top: number, width: number, height: number }, z: number, settings: Object, result: null|Object, headerTitle: string }} descriptor
+   * @param {{ modeId: string, settings: Object, result: null|Object, headerTitle: string }} descriptor
+   * @param {{ rect: { left: number, top: number, width: number, height: number }, open: boolean }|null} [place]
    * @returns {string|Promise<string>} windowId, or a promise of it (or of the
    *   failure, after rollback)
    */
-  createFromSessionDescriptor(descriptor) {
+  createFromSessionDescriptor(descriptor, place = null) {
     this._assertWindowCreationAvailable();
     requireExactKeys(
       descriptor,
-      ['headerTitle', 'modeId', 'open', 'rect', 'result', 'settings', 'z'],
+      ['headerTitle', 'modeId', 'result', 'settings'],
       'Analysis window descriptor'
     );
     requireNonEmptyString(descriptor.modeId, 'Analysis window descriptor modeId');
-    requireSessionRect(descriptor.rect);
-    if (typeof descriptor.open !== 'boolean') {
-      throw new TypeError('Analysis window descriptor open must be a boolean');
-    }
-    if (!Number.isSafeInteger(descriptor.z) || descriptor.z < 0) {
-      throw new TypeError('Analysis window descriptor z must be a non-negative integer');
-    }
+    if (place !== null) requireWindowPlace(place);
     const settings = requireSettings(descriptor.settings);
     requireNonEmptyString(
       descriptor.headerTitle,
@@ -327,21 +397,20 @@ export class AnalysisWindowManager {
       throw new TypeError('Analysis window descriptor result must be null or an object');
     }
 
-    const created = this._createWindow(descriptor.modeId, settings, {
-      left: descriptor.rect.left,
-      top: descriptor.rect.top,
-      preferredSize: {
-        width: descriptor.rect.width,
-        height: descriptor.rect.height
-      },
-      headerTitle: descriptor.headerTitle,
-      open: descriptor.open,
-      z: descriptor.z
-    });
+    const remembered = analysisViewSizes.windowSize(descriptor.modeId);
+    const created = this._createWindow(descriptor.modeId, settings, place === null
+      ? { headerTitle: descriptor.headerTitle, ...(remembered === null ? {} : { preferredSize: remembered }) }
+      : {
+        left: place.rect.left,
+        top: place.rect.top,
+        preferredSize: { width: place.rect.width, height: place.rect.height },
+        headerTitle: descriptor.headerTitle,
+        open: place.open
+      });
     if (result === null || typeof created !== 'string') return created;
     const ui = this._windows.get(created)?.ui;
     return Promise.resolve()
-      .then(() => ui.importResult(result))
+      .then(() => (isLeftOutResult(result) ? ui.importLeftOutResult(result) : ui.importResult(result)))
       .then(
         () => created,
         async error => {
@@ -765,6 +834,20 @@ export class AnalysisWindowManager {
     // Floating analysis windows are reconstructed from session bundles; exclude them from
     // generic UI control capture/restore.
     details.setAttribute('data-state-serializer-skip', 'true');
+    // Folded or unfolded from its title bar: a step (`analysis.window.collapse`).
+    // The toggle a restore or the action itself causes finds nothing new to
+    // record. The toggle its own opening queues (open as it was made, or as
+    // a restored window was saved) is no fold at all: it is let pass, so a
+    // step that waits for the new window's first update is not preceded by
+    // a fold step.
+    let madeOpen = details.open;
+    details.addEventListener('toggle', () => {
+      if (!this._windows.has(windowId) || details.open === madeOpen) return;
+      madeOpen = null;
+      this._comparisonModule.recordAnalysisChange?.(null, 'window-collapse', {
+        window: this.windowNumberOf(windowId), collapsed: !details.open
+      });
+    });
 
     const summary = document.createElement('summary');
 
@@ -787,8 +870,11 @@ export class AnalysisWindowManager {
     copyBtn.title = copyLabel;
     copyBtn.setAttribute('aria-label', copyLabel);
     copyBtn.addEventListener('click', () => {
+      const from = this.windowNumberOf(windowId);
       observeWindowAction(
-        () => this.copyFromWindow(windowId),
+        () => Promise.resolve(this.copyFromWindow(windowId)).then(copyId => {
+          this._comparisonModule.recordAnalysisChange?.(null, 'window-copy', { window: from }, { after: this.whenWindowSettled(copyId) });
+        }),
         `copy of analysis window "${windowId}"`
       );
     });
@@ -816,8 +902,11 @@ export class AnalysisWindowManager {
     closeBtn.title = closeLabel;
     closeBtn.setAttribute('aria-label', closeLabel);
     closeBtn.addEventListener('click', () => {
+      const number = this.windowNumberOf(windowId);
       observeWindowAction(
-        () => this.closeWindow(windowId),
+        () => Promise.resolve(this.closeWindow(windowId)).then(() => {
+          this._comparisonModule.recordAnalysisChange?.(null, 'window-close', { window: number, title: headerTitle });
+        }),
         `close of analysis window "${windowId}"`
       );
     });
@@ -924,6 +1013,10 @@ export class AnalysisWindowManager {
         // The size the user gives a window is the size the next window of
         // this analysis opens at.
         onGeometryChange: size => analysisViewSizes.rememberWindowSize(modeId, size),
+        // A move or resize the person made: a step (`analysis.window.place`).
+        onPlaced: rect => this._comparisonModule.recordAnalysisChange?.(null, 'window-place', {
+          window: this.windowNumberOf(windowId), ...rect
+        }),
         sheet: true
       });
       windowEntry.frame = dockable.panelFrame(details);
@@ -937,11 +1030,9 @@ export class AnalysisWindowManager {
         // position keeps it.
         besideOpenWindows: !hasLeft
       });
-      // A restored window takes back its saved open state and layer.
+      // A restored window takes back its saved open state; it opens in front, as any window does.
       if (options.open !== undefined) details.open = options.open;
-      if (options.z !== undefined) {
-        windowEntry.frame.style.setProperty('--z-layer', String(options.z));
-      }
+      madeOpen = details.open;
       this._windows.set(windowId, windowEntry);
       return windowId;
     } catch (error) {

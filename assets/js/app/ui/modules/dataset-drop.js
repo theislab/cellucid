@@ -9,8 +9,11 @@
  * exactly as a picked file is. A dropped folder's files are listed
  * concurrently (`data/local-folder.js`), and where the browser gives the
  * item's handle (Chromium) it travels with the drop, to be kept for a
- * one-click reopen (`app/local-file-handles.js`). Anything else is refused
- * with a message that says what can be dropped.
+ * one-click reopen (`app/library/local-file-handles.js`). A library file of
+ * My datasets (`.cellucid-library`, `CELLUCID_FILES`) goes to its Import; a
+ * session file is refused with the sentence saying what it is and where it
+ * goes. Anything else is refused with a message that says what can be
+ * dropped.
  *
  * The browser's own reaction to a dropped file is to navigate to it, which
  * would leave the application. `ui/core/file-drop-guard.js`, a classic script
@@ -22,7 +25,7 @@
  * @module ui/modules/dataset-drop
  */
 
-import { fileFormatOfName, openableNamePhrases } from '../../../data/input-formats.js';
+import { cellucidFileOfName, fileFormatOfName, openableNamePhrases } from '../../../data/input-formats.js';
 import { readFolderEntry, readFolderHandle } from '../../../data/local-folder.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
@@ -95,7 +98,7 @@ function droppedHandleOf(item) {
  * gave one; `signal` stops the listing).
  * `handle` is the browser's handle of the dropped file or folder where it
  * gives one (Chromium's `getAsFileSystemHandle`), so it can be kept for a
- * reopen (`app/local-file-handles.js`); null elsewhere, and its promise
+ * reopen (`app/library/local-file-handles.js`); null elsewhere, and its promise
  * answers null when the browser has none for this item.
  *
  * @param {DataTransfer} dataTransfer
@@ -103,8 +106,9 @@ function droppedHandleOf(item) {
  *   {kind: 'file'|'zip'|'folder', label: string,
  *     readFiles: (options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<File>>,
  *     handle: Promise<FileSystemHandle|null>|null} |
+ *   {kind: 'library', label: string, file: File} |
  *   {kind: 'refused', message: string}
- * >}
+ * >} `library`: a library file of My datasets, to import
  */
 export function describeDatasetDrop(dataTransfer) {
   const items = dataTransfer.items == null
@@ -151,6 +155,10 @@ export function describeDatasetDrop(dataTransfer) {
   if (file === null || file === undefined) {
     return refusal(`The dropped item could not be read. ${WHAT_CAN_BE_DROPPED}`);
   }
+  // Cellucid's own files are no dataset: a library file is imported, a session file says where it goes.
+  const own = cellucidFileOfName(file.name);
+  if (own?.id === 'library') return Object.freeze({ kind: 'library', label: file.name, file });
+  if (own !== null) return refusal(own.said);
   const readFiles = async () => [file];
   const layout = localFileLayout(file);
   if (layout !== null) return Object.freeze({ kind: layout, label: file.name, readFiles, handle });
@@ -166,10 +174,11 @@ export function describeDatasetDrop(dataTransfer) {
  * @param {(drop: {kind: string, label: string,
  *   readFiles: (options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<File>>,
  *   handle: Promise<FileSystemHandle|null>|null}) => void} options.openDataset
+ * @param {(file: File) => void} options.importLibrary A library file of My datasets dropped: its import.
  * @param {(message: string) => void} options.refuse
  * @returns {() => void} Retires the drop target.
  */
-export function initDatasetDrop({ documentOwner, overlay, openDataset, refuse }) {
+export function initDatasetDrop({ documentOwner, overlay, openDataset, importLibrary, refuse }) {
   if (
     documentOwner === null ||
     typeof documentOwner?.addEventListener !== 'function' ||
@@ -180,8 +189,8 @@ export function initDatasetDrop({ documentOwner, overlay, openDataset, refuse })
   if (overlay === null || typeof overlay !== 'object' || !('hidden' in overlay)) {
     throw new TypeError('Dataset drop requires its overlay element.');
   }
-  if (typeof openDataset !== 'function' || typeof refuse !== 'function') {
-    throw new TypeError('Dataset drop requires openDataset and refuse.');
+  if (typeof openDataset !== 'function' || typeof importLibrary !== 'function' || typeof refuse !== 'function') {
+    throw new TypeError('Dataset drop requires openDataset, importLibrary and refuse.');
   }
   const view = documentOwner.defaultView;
   const lifecycle = new AbortController();
@@ -216,6 +225,10 @@ export function initDatasetDrop({ documentOwner, overlay, openDataset, refuse })
     const drop = describeDatasetDrop(event.dataTransfer);
     if (drop.kind === 'refused') {
       refuse(drop.message);
+      return;
+    }
+    if (drop.kind === 'library') {
+      importLibrary(drop.file);
       return;
     }
     openDataset(drop);

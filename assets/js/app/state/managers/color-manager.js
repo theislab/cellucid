@@ -1019,6 +1019,7 @@ export class DataStateColorMethods {
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();
+    this._notifyColorChange(field);
   }
 
   setContinuousColorRange(fieldIndex, min, max) {
@@ -1043,6 +1044,7 @@ export class DataStateColorMethods {
       this._pushColorsToViewer();
       this._syncActiveContext();
     }
+    this._notifyColorChange(field);
   }
 
   setContinuousLogScale(fieldIndex, enabled) {
@@ -1055,6 +1057,7 @@ export class DataStateColorMethods {
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();
+    this._notifyColorChange(field);
   }
 
   /**
@@ -1075,6 +1078,7 @@ export class DataStateColorMethods {
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();
+    this._notifyColorChange(field);
   }
 
   setContinuousColormap(fieldIndex, colormapId) {
@@ -1086,10 +1090,22 @@ export class DataStateColorMethods {
     this.updateColorsContinuous(field);
     this._pushColorsToViewer();
     this._syncActiveContext();
+    this._notifyColorChange(field);
   }
 
   getContinuousColormaps() {
     return CONTINUOUS_COLORMAPS;
+  }
+
+  /**
+   * A field's colours changed (a category recoloured, a colour scale set):
+   * what draws them (the legend) follows, whoever changed them (a control,
+   * an undo, an agent, a notebook).
+   *
+   * @param {object} field
+   */
+  _notifyColorChange(field) {
+    this.emit('colors:changed', { field });
   }
 
 }

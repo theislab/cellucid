@@ -1,0 +1,36 @@
+{
+  "examples": [
+    {
+      "analysis": "markers",
+      "window": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "analysis": {
+        "enum": [
+          "markers",
+          "differential",
+          "dotplot",
+          "signature",
+          "composition",
+          "quick",
+          "detailed",
+          "correlation"
+        ],
+        "type": "string"
+      },
+      "window": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "analysis"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.open",
+  "version": 1
+}

@@ -35,13 +35,13 @@ import {
   requireViewerHostSource,
   requireMethods,
   requireSafeInteger,
-  requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
   requireUnifiedSelectionState,
 } from './exact-contract.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { createSelectionConfirmer } from './highlight-actions.js';
 
 /**
  * @param {object} options
@@ -64,8 +64,9 @@ export function initKnnSelection(options) {
     state,
     'KNN selection state',
     [
-      'addHighlightDirect',
       'clearPreviewHighlight',
+      'ensureHighlightPage',
+      'getActivePage',
       'setPreviewHighlightFromIndices'
     ]
   );
@@ -102,6 +103,8 @@ export function initKnnSelection(options) {
   const lifecycleController = new AbortController();
   const pendingDeliveries = new Set();
   let destroyed = false;
+  // Confirm makes one `highlight.cells` step (`highlight-actions.js`).
+  const confirmer = createSelectionConfirmer({ state, isDestroyed: () => destroyed });
   let destructionPromise = null;
 
   function listen(target, eventName, listener) {
@@ -124,18 +127,11 @@ export function initKnnSelection(options) {
     requireCompletedSelectionEvent(knnEvent, 'knn', state.pointCount);
 
     const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
-    const savedGroup = state.addHighlightDirect({
-      type: 'knn',
+    void confirmer.confirm({
+      tool: 'knn',
       label: `KNN${stepsLabel} (${formatCountOf(knnEvent.cellCount, 'cell')})`,
       cellIndices: knnEvent.cellIndices
     });
-    requireSavedHighlightGroup(
-      savedGroup,
-      'knn',
-      knnEvent.cellIndices,
-      'Saved KNN highlight group',
-      state.pointCount
-    );
 
     debug.log(`[UI] KNN selected ${formatCountOf(knnEvent.cellCount, 'cell')} from ${knnEvent.steps} selection(s)`);
     trackDelivery(deliverSelectionToViewerHost({
@@ -322,7 +318,7 @@ export function initKnnSelection(options) {
         redo: handleKnnRedo,
         confirm: () => {
           viewer.confirmKnnSelection();
-          state.clearPreviewHighlight();
+          confirmer.clearPreview();
         },
         cancel: () => {
           viewer.cancelKnnSelection();

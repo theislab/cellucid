@@ -13,7 +13,7 @@
  */
 
 import { getNotificationCenter } from '../../../notification-center.js';
-import { isExplainedFailure } from '../../../../data/data-source.js';
+import { isChangedOnHost, isExplainedFailure } from '../../../../data/data-source.js';
 import { getReadActivityLog } from '../../../../data/read-activity-log.js';
 import { factsText, geneReadPlanFacts } from '../../../../data/gene-read-plan.js';
 import { formatCount, formatCountOf, formatRemaining } from '../../../../utils/format-units.js';
@@ -40,7 +40,9 @@ import { markReported } from '../../../../utils/errors.js';
  * Say that a field or gene could not be read: why, in one sentence (a
  * failure written for the person is said as it is; any other is named, its
  * raw text under Details), and Try again, which reads it again and shows it
- * (the load that failed was the person's to see it).
+ * (the load that failed was the person's to see it). A store that changed on
+ * its host offers none: this session keeps its validators, so reading again
+ * can only meet the same answer, and the sentence says to open it again.
  *
  * @param {Object} notifications
  * @param {string} what - `field cell_type`, `gene CD3E`
@@ -56,7 +58,7 @@ function announceLoadFailure(notifications, what, error, again) {
     {
       category: 'data',
       ...(isExplainedFailure(error) ? {} : { details: raw }),
-      action: { label: 'Try again', run: again }
+      ...(isChangedOnHost(error) ? {} : { action: { label: 'Try again', run: again } })
     }
   );
 }
@@ -1231,13 +1233,14 @@ export class FieldLoadingMethods {
   setActiveField(fieldIndex) {
     const nextField = this.obsData?.fields?.[fieldIndex];
     if (!nextField || nextField._isDeleted === true) return null;
-    this.activeFieldIndex = fieldIndex;
-    this.activeVarFieldIndex = -1;
-    this.activeFieldSource = 'obs';
     const field = nextField;
+    // Refused before anything changes: the view stays what it shows.
     if (!field.loaded) {
       throw new Error(`Field "${field.key}" not loaded yet.`);
     }
+    this.activeFieldIndex = fieldIndex;
+    this.activeVarFieldIndex = -1;
+    this.activeFieldSource = 'obs';
 
     if (field.kind === 'continuous') {
       this.updateColorsContinuous(field);
@@ -1281,13 +1284,14 @@ export class FieldLoadingMethods {
   setActiveVarField(fieldIndex) {
     const nextField = this.varData?.fields?.[fieldIndex];
     if (!nextField || nextField._isDeleted === true) return null;
-    this.activeVarFieldIndex = fieldIndex;
-    this.activeFieldIndex = -1;
-    this.activeFieldSource = 'var';
     const field = nextField;
+    // Refused before anything changes: the view stays what it shows.
     if (!field.loaded) {
       throw new Error(`Var field "${field.key}" not loaded yet.`);
     }
+    this.activeVarFieldIndex = fieldIndex;
+    this.activeFieldIndex = -1;
+    this.activeFieldSource = 'var';
 
     // Gene expression is always continuous
     this.updateColorsContinuous(field);

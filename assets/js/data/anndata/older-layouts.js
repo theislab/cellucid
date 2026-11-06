@@ -79,7 +79,7 @@ function asElement(node) {
   });
 }
 
-function asMapping(node, childOf) {
+function asMapping(node, childOf, leaveOut = new Set()) {
   if (isArrayNode(node) && node.dtype.kind === 'compound') return compoundMapping(node);
   if (!isGroup(node)) return node;
   const declared = attributeValue(node, 'encoding-type') !== undefined;
@@ -88,7 +88,7 @@ function asMapping(node, childOf) {
     real: node,
     attrs: declared ? node.attrs : { ...node.attrs, ...encodingAttrs('dict') },
     ownAttributes: declared ? [] : ['encoding-type', 'encoding-version'],
-    children: new Map(node.keys().map(key => [key, () => childOf(node.get(key))])),
+    children: new Map(node.keys().filter(key => !leaveOut.has(key)).map(key => [key, () => childOf(node.get(key))])),
   });
 }
 
@@ -107,8 +107,30 @@ function asUnsValue(node) {
   return asElement(node);
 }
 
-function asUns(node) {
-  return asMapping(node, item => (isGroup(item) ? asUns(item) : asUnsValue(item)));
+/**
+ * `uns` and every mapping in it, each child as the element it is: a
+ * dataframe (a table anndata 0.7 wrote: version 0.1.0, its categoricals'
+ * codes in place with their categories under `__categories`) as a current
+ * one, as obs and var are; any other declared element (a `csr_matrix`, an
+ * `array`) or an h5sparse group as an element (`asElement`, never its
+ * arrays as `uns` values); only an undeclared group or a `dict` is a
+ * mapping whose children are `uns` values again.
+ */
+function asUns(node, leaveOut = new Set()) {
+  return asMapping(node, item => {
+    if (!isGroup(item)) return asUnsValue(item);
+    const declared = attributeValue(item, 'encoding-type');
+    if (declared === 'dataframe') return asDataFrame(item, () => null);
+    if ((declared !== undefined && declared !== 'dict') || attributeValue(item, 'h5sparse_format') !== undefined) return asElement(item);
+    return asUns(item);
+  }, leaveOut);
+}
+
+/** The column names of a frame of any earlier layout: a group's children, a compound's members. */
+function columnNamesOf(frame) {
+  if (isGroup(frame)) return frame.keys();
+  if (isArrayNode(frame) && frame.dtype.kind === 'compound') return frame.dtype.fields.map(field => field.name);
+  return [];
 }
 
 function asRaw(node, categoriesOf) {
@@ -227,6 +249,13 @@ export async function currentLayoutView(root, options = {}) {
   const rootKeys = root.keys();
   // anndata 0.6 stores raw as root entries `raw.X`, `raw.var`, `raw.varm`.
   const flatRaw = rootKeys.includes('raw.X') && !rootKeys.includes('raw');
+  // The categories a column takes from uns are the column's: uns is presented
+  // without them, as anndata reads such a file (they are not data of uns).
+  const frames = ['obs', 'var', 'raw.var'].map(key => root.get(key));
+  if (root.has('raw') && isGroup(root.get('raw'))) frames.push(root.get('raw').get('var'));
+  const consumed = new Set(frames.flatMap(frame => columnNamesOf(frame))
+    .map(column => `${column}_categories`)
+    .filter(key => isGroup(uns) && uns.has(key)));
   const children = new Map();
   for (const key of rootKeys) {
     if (flatRaw && key.startsWith('raw.')) continue;
@@ -235,7 +264,7 @@ export async function currentLayoutView(root, options = {}) {
       if (key === 'obs' || key === 'var') return asDataFrame(node, categoriesOf);
       if (key === 'X') return asElement(node);
       if (key === 'raw') return asRaw(node, categoriesOf);
-      if (key === 'uns') return asUns(node);
+      if (key === 'uns') return asUns(node, consumed);
       if (MAPPING_ROLES.includes(key)) return asMapping(node, asElement);
       return node;
     });

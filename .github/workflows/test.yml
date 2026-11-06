@@ -26,8 +26,13 @@ jobs:
     # cross-repository contracts read: `../cellucid-datasets` (the published
     # session presets), and `../cellucid-python` and `../cellucid-r` (the
     # notebook widget's front end both packages ship, driven by
-    # `tests/notebook-widget-requests-contract.test.mjs`), so those contracts
-    # run here. The siblings are checked out at their default branch when the
+    # `tests/notebook-widget-requests-contract.test.mjs`; the shared documents
+    # and golden history they hold copies of; the documentation site), so those
+    # contracts run here. Each list holds every file a contract reads of that
+    # sibling: `tests/ci-sibling-checkouts-contract.test.mjs` compares them with
+    # the generators' lists. Only `anndata-copy-cross-language` reads more (a
+    # whole package, with a Python of its dependencies): it runs where those
+    # are, never here. The siblings are checked out at their default branch when the
     # job starts: a cross-repository change pushed here before its sibling's
     # push lands fails these contracts until the next run (run 41213981681:
     # cellucid-python's widget push landed after the job had checked out the
@@ -55,7 +60,7 @@ jobs:
             anndata/*.cellucid-session
           sparse-checkout-cone-mode: false
 
-      - name: Check out the Python package's notebook widget front end
+      - name: Check out the Python package's copies of the shared documents and golden history, and the documentation
         uses: actions/checkout@v7
         with:
           repository: theislab/cellucid-python
@@ -63,9 +68,14 @@ jobs:
           filter: blob:none
           sparse-checkout: |
             src/cellucid/jupyter/static/widget.js
+            src/cellucid/action_catalog.json
+            src/cellucid/history_model.schema.json
+            src/cellucid/mcp_tools.json
+            tests/fixtures/history_golden/
+            docs/**/*.md
           sparse-checkout-cone-mode: false
 
-      - name: Check out the R package's copy of the widget front end
+      - name: Check out the R package's copies of the shared documents and golden history
         uses: actions/checkout@v7
         with:
           repository: theislab/cellucid-r
@@ -73,6 +83,10 @@ jobs:
           filter: blob:none
           sparse-checkout: |
             inst/widget/widget.js
+            inst/action_catalog.json
+            inst/history_model.schema.json
+            inst/mcp_tools.json
+            tests/testthat/fixtures/history_golden/
           sparse-checkout-cone-mode: false
 
       - name: Install Node.js
@@ -90,6 +104,10 @@ jobs:
       - name: Validate the deployable community-annotation Worker bundle
         if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
         run: npm run test:worker-bundle
+
+      - name: Validate the deployable agent relay Worker bundle
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        run: npm run test:relay-bundle
 
   browsers:
     name: ${{ matrix.os }} / ${{ matrix.browser }} / shard ${{ matrix.shard }}
@@ -112,44 +130,50 @@ jobs:
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
         browser: [chromium, firefox, webkit]
-        shard: ["1/7", "2/7", "3/7", "4/7", "5/7", "6/7", "7/7"]
+        shard: ["1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8", "8/8"]
         exclude:
           - os: windows-latest
             browser: webkit
         include:
           - os: macos-latest
             browser: webkit
-            shard: "1/7"
+            shard: "1/8"
           - os: macos-latest
             browser: webkit
-            shard: "2/7"
+            shard: "2/8"
           - os: macos-latest
             browser: webkit
-            shard: "3/7"
+            shard: "3/8"
           - os: macos-latest
             browser: webkit
-            shard: "4/7"
+            shard: "4/8"
           - os: macos-latest
             browser: webkit
-            shard: "5/7"
+            shard: "5/8"
           - os: macos-latest
             browser: webkit
-            shard: "6/7"
+            shard: "6/8"
           - os: macos-latest
             browser: webkit
-            shard: "7/7"
+            shard: "7/8"
+          - os: macos-latest
+            browser: webkit
+            shard: "8/8"
 
     steps:
       - name: Check out the exact source
+        timeout-minutes: 5
         uses: actions/checkout@v7
 
       - name: Install Node.js
+        timeout-minutes: 5
         uses: actions/setup-node@v7
         with:
           node-version: "24"
           package-manager-cache: false
 
       - name: Install exact dependencies
+        timeout-minutes: 10
         run: npm ci
 
       # Windows: a browser context per test and hundreds of module requests
@@ -167,12 +191,36 @@ jobs:
           netsh int ipv6 set dynamicport tcp start=1025 num=64510
           netsh int ipv4 show dynamicport tcp
 
-      - name: Install the selected browser engine and Linux libraries
+      # What the shard runs on is downloaded here, and each download has a
+      # bound of its own: the Linux libraries come from the runner's apt
+      # mirror, the engine from Playwright's CDN. One runner's mirror
+      # delivered them at 35.8 kB/s (130 MB in 1 h 0 min 35 s, while another
+      # runner of the same run got 139 MB in 7 s), so its shard began 61
+      # minutes into the job and was cancelled, green so far, at the job's 75
+      # (run 42180485733, Linux WebKit shard 7/8); a second runner's mirror
+      # was as slow the same day (run 42262565061, Linux Firefox shard 6/8,
+      # the 10-minute bound). The slowness is a runner's own apt mirror
+      # (`azure.archive.ubuntu.com` through its mirror list), so the
+      # libraries are fetched by the runner's apt with every package tried
+      # at most a few times and a connection that idles for 30 s given up,
+      # under a bound that fails within minutes under the name of the step it
+      # is; the job is then run again, and the shard's own time is never
+      # spent waiting for a mirror.
+      - name: Install the Linux libraries the selected engine needs
         if: runner.os == 'Linux'
-        run: npx playwright install --with-deps ${{ matrix.browser }}
+        timeout-minutes: 10
+        env:
+          # Playwright runs `apt-get install` for the engine's library list;
+          # apt reads these from the environment: no package is retried
+          # forever, and a connection that sends nothing for 30 s is dropped
+          # and the next mirror of the list tried.
+          APT_CONFIG: /tmp/cellucid-apt.conf
+        run: |
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > "$APT_CONFIG"
+          npx playwright install-deps ${{ matrix.browser }}
 
       - name: Install the selected browser engine
-        if: runner.os != 'Linux'
+        timeout-minutes: 10
         run: npx playwright install ${{ matrix.browser }}
 
       # Once per engine and operating system: the WebGL2 contract, and the
@@ -190,11 +238,13 @@ jobs:
       # the cores): on these runners those measures differ from a developer
       # machine's. Every spec therefore runs on a fixed device, the `device`
       # fixture (`tests/browser/helpers/device.mjs`): a fast GPU timed
-      # exactly, a held opening cost, fixed cores; a spec about one of those
-      # choices sets its own. See the web developer docs, "Testing, CI and
-      # release process".
+      # exactly, fixed cores, and every rate the reader plans from held (the
+      # link it plans on, the decoding rate, the opening cost:
+      # `assets/js/utils/machine.js`), on the page and in its workers; a spec
+      # about one of those choices sets its own. See the web developer docs,
+      # "Testing, CI and release process".
       - name: Record the WebGL2 runtime through the Linux display server
-        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/7'
+        if: matrix.browser == 'firefox' && runner.os == 'Linux' && matrix.shard == '1/8'
         run: >-
           xvfb-run --auto-servernum --
           npm run test:browser --
@@ -203,7 +253,7 @@ jobs:
           tests/browser/webgl2-runtime.spec.mjs
 
       - name: Record the WebGL2 runtime
-        if: (matrix.browser != 'firefox' || runner.os != 'Linux') && matrix.shard == '1/7'
+        if: (matrix.browser != 'firefox' || runner.os != 'Linux') && matrix.shard == '1/8'
         run: >-
           npm run test:browser --
           --project=${{ matrix.browser }}
@@ -221,7 +271,7 @@ jobs:
       # one workload proven to degrade the shared host GPU service in an
       # absolute-final singleton. Multiple host-terminal files are rejected so
       # future stress growth must use separate CI shards. Even those largest
-      # shards are capped at nine real browsers. Seven shards keep every engine
+      # shards are capped at nine real browsers. Eight shards keep every engine
       # on every runner at eight or fewer: Playwright splits by test order, and
       # the process-intensive files all fall into the first shard. Tests are neither retried nor
       # skipped, mocked, or given more time.

@@ -12,7 +12,8 @@
  *   or the label that operates it), so nothing covers it — another control's
  *   touch hit area included;
  * - it is in the Tab order, unless it is one item of a roving-tabindex group
- *   whose active item is;
+ *   whose active item is, or a tool of such an item (a tree row's buttons,
+ *   which the row's keys operate);
  * - when it is disabled, it says why (a title, an `aria-describedby`
  *   description, or a hint or status line in its group).
  *
@@ -27,8 +28,9 @@
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { dismissWelcome, expectWelcomeShown } from './helpers/welcome.mjs';
 import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
+import { capability } from './helpers/community-annotation-github.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -189,7 +191,10 @@ async function auditScope(page, scope) {
         continue;
       }
       const focusable = element.localName === 'summary' || element.tabIndex >= 0;
-      if (!focusable && !rovingCovered(element)) {
+      // A tree row's own tools (the history graph's details and More buttons) are the row's keys'
+      // (Space opens the details, Shift+F10 the menu: `state/graph.js`), reached through the row.
+      const row = element.parentElement?.closest('[role="treeitem"]') ?? null;
+      if (!focusable && !rovingCovered(element) && !(row !== null && rovingCovered(row))) {
         offenders.push(`${name}: not in the Tab order (tabindex ${element.tabIndex})`);
       }
     }
@@ -302,7 +307,7 @@ for (const layout of LAYOUTS) {
         // (`_claimBusy`, base-analysis-ui.js), and moves every header below
         // it while it grows: its controls are walked, and the next header
         // clicked, once it is done.
-        await expect(page.locator(`#analysis-panel-${mode}`)).not.toHaveAttribute('aria-busy', 'true', { timeout: 30_000 });
+        await expect(page.locator(`#analysis-panel-${mode}`)).not.toHaveAttribute('aria-busy', 'true');
         await page.evaluate(region => {
           for (const inner of document.querySelectorAll(
             `#${region} .disclosure-header[aria-expanded="false"]`,
@@ -379,13 +384,13 @@ for (const layout of LAYOUTS) {
       await page.locator('#analysis-header-genesPanel').scrollIntoViewIfNeeded();
       await page.locator('#analysis-header-genesPanel').click();
       // The window is sized from the row: copied once the row has filled in.
-      await expect(page.locator('#analysis-panel-genesPanel')).not.toHaveAttribute('aria-busy', 'true', { timeout: 30_000 });
+      await expect(page.locator('#analysis-panel-genesPanel')).not.toHaveAttribute('aria-busy', 'true');
       await page.locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
         .click({ force: true });
       const analysisWindow = page.locator('#floating-panels-root .analysis-window-frame');
       await expect(analysisWindow).toHaveCount(1);
       // Its copy of the analysis fills in too (`aria-busy` until it has).
-      await expect(analysisWindow.locator('[aria-busy="true"]')).toHaveCount(0, { timeout: 30_000 });
+      await expect(analysisWindow.locator('[aria-busy="true"]')).toHaveCount(0);
       await setSheetOpen(page, false);
       await dismissNotifications(page);
       await expectReachable(
@@ -416,7 +421,7 @@ for (const layout of LAYOUTS) {
     test('dialogs keep every control reachable', async ({ page }) => {
       test.setTimeout(120_000);
       await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
-      await expect(page.locator('#welcome-modal')).toBeVisible();
+      await expectWelcomeShown(page);
       await expectReachable(page, '#welcome-modal', `${layout.name} welcome`, 2);
       await page.keyboard.press('Escape');
       await expect(page.locator('#welcome-modal')).toBeHidden();
@@ -535,35 +540,29 @@ for (const layout of LAYOUTS) {
       await page.route(`${WORKER_ORIGIN}/`, route => route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({
-          status: 'ok',
-          service: 'Cellucid GitHub Auth',
-          contractVersion: 2,
-          endpoints: [
-            '/auth/login', '/auth/callback', '/auth/revoke', '/auth/user', '/auth/installations',
-            '/auth/installation-repos', '/cap/lookup-cells', '/api/repos/*',
-          ],
-        }),
+        body: JSON.stringify(capability()),
       }));
       await page.route(`${WORKER_ORIGIN}/auth/user`, route => route.fulfill({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({ id: 4242, login: 'tester' }),
       }));
-      await page.route(`${WORKER_ORIGIN}/auth/installations`, route => route.fulfill({
+      // One page each (`?page=1`), as the Worker answers a collection.
+      await page.route(url => url.origin === WORKER_ORIGIN && url.pathname === '/auth/installations', route => route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({ installations: [{ id: 501, account: { login: 'team' } }] }),
+        body: JSON.stringify({ items: [{ id: 501, account: { login: 'team' } }], nextPage: null }),
       }));
-      await page.route(`${WORKER_ORIGIN}/auth/installation-repos`, route => route.fulfill({
+      await page.route(url => url.origin === WORKER_ORIGIN && url.pathname === '/auth/installation-repos', route => route.fulfill({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
-          repositories: Array.from({ length: 6 }, (_, index) => ({
+          items: Array.from({ length: 6 }, (_, index) => ({
             id: index + 1,
             full_name: `team/labels-${index + 1}`,
             private: index % 2 === 0,
           })),
+          nextPage: null,
         }),
       }));
       await openDataset(page);

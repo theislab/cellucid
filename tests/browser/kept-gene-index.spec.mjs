@@ -18,6 +18,28 @@
  * asked for no longer than a round trip, `formats/io/link.js`), and a link
  * to a server on this machine, measured at a millisecond or two, varies from
  * run to run and engine to engine.
+ *
+ * Both visits plan on the fixture's device (`helpers/device.mjs`): the link
+ * and the decoding rate held, genes are read for every open cell in the
+ * share's own order on each. Measured, a hosted macOS WebKit runner read
+ * them for a sample on one visit only, twice: on the first (its gene shown
+ * on 606 of the 1,000 cells, the rest NaN, Web contracts run 42180511574),
+ * and on the later (811 of the 1,000, in the file's cell order of blocks of
+ * 1,792, where the first visit had read every cell in the share's own
+ * order, run 42202865024). Every value of both visits is its cell's (each
+ * checked against the fixture's own formula); what differed is which cells
+ * were read and where they stand, which the spec compares position by
+ * position. A sample on the later visit also indexes the matrix again: an
+ * index kept under the share's own order is not looked for under a sample's
+ * cell order.
+ *
+ * WebKit keeps a persistent context's origin storage outside its profile
+ * folder (`helpers/test.mjs` `clearOriginStorage`), and two workers running
+ * specs of `persistentStorage` at once lose what they kept: this spec and
+ * `kept-parts.spec.mjs` failed 6 of 12 runs with two workers ("no gene
+ * index is built again", "no byte downloaded again"), and in none of 120
+ * with one, as CI runs them, was anything kept lost (2026-11-06). Run them
+ * with `--workers=1`.
  */
 
 import { expect, test } from './helpers/test.mjs';
@@ -188,11 +210,14 @@ async function chooseGene(page, name) {
   }, name), { timeout: 60_000 }).toBe(true);
 }
 
+/** The gene's values once every open cell's is in: it is shown as its cells are read, the rest NaN until then. */
 async function geneValues(page) {
-  return page.evaluate(() => {
+  const values = () => page.evaluate(() => {
     const state = window._cellucidState;
     return Array.from(state.varData.fields[state.activeVarFieldIndex].values);
   });
+  await expect.poll(async () => (await values()).filter(Number.isNaN).length, { timeout: 60_000 }).toBe(0);
+  return values();
 }
 
 test('a later visit opening the same cells shows genes at once from the gene index kept in this browser', async ({ page }) => {
@@ -221,7 +246,7 @@ test('a later visit opening the same cells shows genes at once from the gene ind
   if (keeps) {
     await expect.poll(() => keptIndexFiles(page), { timeout: 60_000 }).toBe(1);
     // The line hears the runs kept after the opening ended.
-    await expect(page.locator('#kept-stores-line')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('#kept-stores-line')).toBeVisible();
   } else {
     expect(await keptIndexFiles(page)).toBeNull();
     await expect(page.locator('#kept-stores-text'), 'nothing kept for a later visit (the row may name the connection speeds remembered)').not.toContainText('dataset');
@@ -243,7 +268,7 @@ test('a later visit opening the same cells shows genes at once from the gene ind
     expect(errors).toEqual([]);
     return;
   }
-  await expect(page.locator('#kept-stores-line')).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator('#kept-stores-line')).toBeVisible();
   await recordPartials(page);
   const before = counter.requests;
   const rangesBefore = counter.ranges.length;

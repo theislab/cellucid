@@ -1,0 +1,57 @@
+{
+  "examples": [
+    {
+      "enabled": false,
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "kind": "category"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "obs",
+              "var"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "kind": {
+        "enum": [
+          "category",
+          "continuous",
+          "outlier"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "field",
+      "kind",
+      "enabled"
+    ],
+    "type": "object"
+  },
+  "type": "filter.enable",
+  "version": 1
+}

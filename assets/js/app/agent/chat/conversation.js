@@ -1,0 +1,332 @@
+/**
+ * @fileoverview A conversation of the chat bar: what the person and the
+ * agent said, the tool calls and their results, as plain data, and what of
+ * it is sent to a model and what is saved with the history.
+ *
+ * A conversation is `{id, createdAt, updatedAt, epoch, summary, messages}`.
+ * Messages are the providers' neutral messages (`providers/contract.js`)
+ * with what the chat shows besides:
+ *
+ * - `{role: 'user', text, turn, at, context?, attached?}`: one per message
+ *   the person sends; its `turn` names every step the agent takes in answer
+ *   (`meta.turn`), so the history undoes the turn in one click; `context`
+ *   is what Cellucid tells the model with it and the person does not see
+ *   (their permissions for agents and the dataset's switch, when they
+ *   changed); `attached`: what the person attached (`{selection}`: a
+ *   reference to their highlighted cells, `selection.js`), shown on the
+ *   message and told to the model with it;
+ * - `{role: 'assistant', turn, provider, agent, model, parts, at, epoch,
+ *   stop, detail?, usage?, otherCalls?}`: one per model call (`usage`: its
+ *   tokens; `otherCalls`, here and on a note: the calls before it with no
+ *   reply of their own, `usageOf`);
+ * - `{role: 'tool', turn, results: [{id, name, title, content, isError,
+ *   step}]}`: the results of one call's tool calls, `step` the history step
+ *   a change made (`{id, label}`) or null;
+ * - `{role: 'note', turn, kind, text, otherCalls?}`: what the chat tells the person and
+ *   never sends to a model (`stopped`, `error`, `refusal`, `limit`,
+ *   `summary`).
+ *
+ * **Append only.** Nothing sent to a model is edited afterwards: a model's
+ * reasoning is bound to the conversation that produced it (Anthropic, and
+ * OpenAI's encrypted reasoning, are sent back unchanged), and a prompt cache
+ * holds only for a prefix that did not change.
+ *
+ * **Summary** (`context.js` decides when): the messages before
+ * `summary.before` are replaced, for the model, by one user message holding
+ * their summary (and what Cellucid last told the model among them, the
+ * permissions and the person's instructions); the person still sees them
+ * all. A summary starts a new
+ * `epoch`: reasoning parts from an earlier epoch are not sent again (they
+ * were made with the messages the summary replaced).
+ *
+ * **Saved with the history** (`transcriptOf`, `history.setChat`): the
+ * messages without the providers' reasoning (opaque, of no use to a reader,
+ * and bound to the conversation) and with each picture a tool returned
+ * replaced by a line saying it was there. Such a transcript continues as a
+ * conversation of its own (`conversationFrom`). One kept mid-turn (the page
+ * closed or reloaded while a call ran or waited for the person) has calls
+ * with no result: continued, each is answered with what became of it
+ * (`closeInterrupted`: its step, when the history kept one, else nothing
+ * applied), so the conversation stays one a model accepts.
+ *
+ * @module app/agent/chat/conversation
+ */
+
+import { quoteName } from '../../actions/targets/names.js';
+import { createOpaqueId } from '../../utils/opaque-id.js';
+import { selectionContext } from './selection.js';
+import { ASK_TOOL } from './ask.js';
+
+export const TRANSCRIPT_SCHEMA = 1;
+
+/** How the summary of earlier messages is put to the model. */
+export const SUMMARY_LEAD = 'Summary of the conversation so far (the earlier messages are no longer shown to you; the history, read with history_get, holds every step taken):';
+
+const ROLES = new Set(['user', 'assistant', 'tool', 'note']);
+const NOTE_KINDS = new Set(['stopped', 'error', 'refusal', 'limit', 'summary']);
+
+/** A new conversation. */
+export function createConversation({ id = `chat-${createOpaqueId()}`, now = Date.now() } = {}) {
+  return { id, createdAt: now, updatedAt: now, epoch: 0, summary: null, messages: [] };
+}
+
+/** Add one message (module overview) and mark the conversation changed. */
+export function appendMessage(conversation, message, now = Date.now()) {
+  if (!ROLES.has(message?.role)) throw new TypeError(`A conversation message has a role (${[...ROLES].join(', ')})`);
+  if (message.role === 'note' && !NOTE_KINDS.has(message.kind)) throw new TypeError(`A note is one of ${[...NOTE_KINDS].join(', ')}`);
+  conversation.messages.push(message);
+  conversation.updatedAt = now;
+  return message;
+}
+
+/** What Cellucid adds to a message of the person for the model: its attachments. */
+function attachedText(message) {
+  return message.attached?.selection ? selectionContext(message.attached.selection) : null;
+}
+
+/** A message of the person as the model reads it: their words, then what Cellucid tells with them. */
+function userText(message) {
+  const told = [message.context, attachedText(message)].filter(Boolean);
+  return [message.text, ...told.map(text => `[Cellucid: ${text}]`)].join('\n\n');
+}
+
+/**
+ * The messages a model is sent now: the summary (when there is one), then
+ * everything after it. `contentOf`: what an earlier tool result is sent as
+ * (left out: as it is; the chat gives the dataset switch's rule,
+ * `bridge/data-guard.js` `earlierResultContent`).
+ * @param {object} conversation
+ * @param {{contentOf?: ((result: object) => object[])|null}} [options]
+ */
+export function modelMessages(conversation, { contentOf = null } = {}) {
+  const out = [];
+  const start = conversation.summary?.before ?? 0;
+  if (conversation.summary !== null) {
+    // What Cellucid last told the model before the summary (the permissions, the person's instructions) goes with it.
+    const told = conversation.messages.slice(0, start).findLast(message => message.role === 'user' && message.context)?.context ?? null;
+    out.push({ role: 'user', text: `${SUMMARY_LEAD}\n\n${conversation.summary.text}${told === null ? '' : `\n\n[Cellucid: ${told}]`}` });
+  }
+  for (const message of conversation.messages.slice(start)) {
+    if (message.role === 'user') {
+      out.push({ role: 'user', text: userText(message) });
+    } else if (message.role === 'assistant') {
+      const current = (message.epoch ?? 0) === conversation.epoch;
+      const parts = message.parts.filter(part => part.type !== 'opaque' || current);
+      if (parts.length > 0) out.push({ role: 'assistant', parts });
+    } else if (message.role === 'tool') {
+      out.push({ role: 'tool', results: message.results.map(result => ({
+        id: result.id, name: result.name, content: contentOf === null ? result.content : contentOf(result), isError: result.isError,
+      })) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Replace, for the model, every message before `before` by `text`: the
+ * conversation's next request starts with the summary.
+ */
+export function summarize(conversation, text, before, now = Date.now()) {
+  if (!Number.isSafeInteger(before) || before < 0 || before > conversation.messages.length) {
+    throw new RangeError('A summary replaces the messages before a position of the conversation');
+  }
+  conversation.summary = { text, before, at: now };
+  conversation.epoch += 1;
+  conversation.updatedAt = now;
+}
+
+/** Each turn of the conversation: its user message's index and the turn id. */
+export function turnsOf(conversation) {
+  const out = [];
+  conversation.messages.forEach((message, index) => {
+    if (message.role === 'user') out.push({ turn: message.turn, index });
+  });
+  return out;
+}
+
+/** The text of an assistant message (its text parts joined). */
+export function replyText(message) {
+  return message.parts.filter(part => part.type === 'text').map(part => part.text).join('');
+}
+
+function savedContent(content) {
+  return content.map(item => (item.type === 'image'
+    ? { type: 'text', text: `[A picture (${item.mimeType}) was returned here; it is not kept with the conversation.]` }
+    : { type: 'text', text: item.text }));
+}
+
+/**
+ * The conversation as kept with the history: plain JSON, without the
+ * providers' reasoning and without pictures (module overview).
+ */
+export function transcriptOf(conversation) {
+  return {
+    schema: TRANSCRIPT_SCHEMA,
+    id: conversation.id,
+    createdAt: conversation.createdAt,
+    updatedAt: conversation.updatedAt,
+    summary: conversation.summary === null ? null : { ...conversation.summary },
+    messages: conversation.messages.map(message => {
+      if (message.role === 'assistant') {
+        const { parts, ...rest } = message;
+        return { ...rest, epoch: null, parts: parts.filter(part => part.type !== 'opaque').map(part => ({ ...part })) };
+      }
+      if (message.role === 'tool') {
+        return { ...message, results: message.results.map(result => ({ ...result, content: savedContent(result.content) })) };
+      }
+      return { ...message };
+    }),
+  };
+}
+
+function requireTranscript(transcript) {
+  if (transcript?.schema !== TRANSCRIPT_SCHEMA) {
+    throw new RangeError(`This conversation was saved by another version of Cellucid (transcript schema ${JSON.stringify(transcript?.schema)})`);
+  }
+  if (typeof transcript.id !== 'string' || !Array.isArray(transcript.messages)) throw new TypeError('A saved conversation has an id and messages');
+  for (const message of transcript.messages) {
+    if (!ROLES.has(message?.role)) throw new TypeError('A saved conversation holds a message of no known role');
+  }
+  return transcript;
+}
+
+/**
+ * A saved transcript as a conversation that continues: its reasoning was
+ * not kept, so every assistant message is of an earlier epoch.
+ */
+export function conversationFrom(transcript) {
+  const exact = requireTranscript(structuredClone(transcript));
+  return {
+    id: exact.id,
+    createdAt: exact.createdAt ?? Date.now(),
+    updatedAt: exact.updatedAt ?? exact.createdAt ?? Date.now(),
+    epoch: 0,
+    summary: exact.summary ?? null,
+    messages: exact.messages.map(message => (message.role === 'assistant' ? { ...message, epoch: -1 } : message)),
+  };
+}
+
+/** The words a call answered by `closeInterrupted` begins with. */
+export const INTERRUPTED_LEAD = 'The page closed before this call';
+
+/**
+ * Answer every call a kept conversation holds without a result (the page
+ * closed mid-turn): with its step, when the history kept one the turn's
+ * results do not name (the call was applied, its answer was not kept),
+ * else "nothing was applied". The answers go right after the call's reply,
+ * marked `interrupted`. Returns how many calls were answered.
+ *
+ * @param {object} conversation - continued from a transcript (`conversationFrom`): nothing of it was sent in this page
+ * @param {{
+ *   stepsOfTurn: (turn: string) => Array<{id: string, type: string, label: string}>,
+ *   toolOf: (name: string) => ({type: string, title: string}|undefined),
+ * }} history - `stepsOfTurn`: the turn's steps in the tracker shown, oldest first;
+ *   `toolOf`: the action a tool name runs
+ * @returns {number}
+ */
+export function closeInterrupted(conversation, { stepsOfTurn, toolOf }) {
+  let closed = 0;
+  const messages = conversation.messages;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.role !== 'assistant') continue;
+    const calls = message.parts.filter(part => part.type === 'tool-call');
+    if (calls.length === 0) continue;
+    const next = messages[index + 1];
+    const answered = next?.role === 'tool' ? next : null;
+    const missing = calls.filter(call => !answered?.results.some(result => result.id === call.id));
+    if (missing.length === 0) continue;
+    // The turn's steps no kept result names: made by the calls whose answers were lost, in their order.
+    const named = new Set(messages.filter(other => other.role === 'tool' && other.turn === message.turn)
+      .flatMap(other => other.results).map(result => result.step?.id).filter(Boolean));
+    const unnamed = stepsOfTurn(message.turn).filter(step => !named.has(step.id));
+    const answers = new Map(missing.map(call => {
+      const tool = toolOf(call.name);
+      const at = tool === undefined ? -1 : unnamed.findIndex(step => step.type === tool.type);
+      const step = at === -1 ? null : unnamed.splice(at, 1)[0];
+      const text = step === null
+        ? `${INTERRUPTED_LEAD} finished; nothing was applied.`
+        : `${INTERRUPTED_LEAD}'s answer was kept; it was applied: ${quoteName(step.label)}, a step of the history.`;
+      return [call.id, {
+        id: call.id, name: call.name, title: tool?.title ?? call.name, isError: step === null, interrupted: true,
+        step: step === null ? null : { id: step.id, label: step.label }, content: [{ type: 'text', text }],
+      }];
+    }));
+    const results = calls.map(call => answered?.results.find(result => result.id === call.id) ?? answers.get(call.id));
+    if (answered !== null) answered.results = results;
+    else messages.splice(index + 1, 0, { role: 'tool', turn: message.turn, results });
+    closed += missing.length;
+  }
+  if (closed > 0) conversation.updatedAt = Date.now();
+  return closed;
+}
+
+/**
+ * The tokens of a conversation, or of one of its turns: `{input, output,
+ * cacheRead, cacheWrite, calls}` summed over every model call it made
+ * (`input` counts each call's whole prompt, cached parts included): each
+ * reply's own call (`usage`), and the calls with no reply of their own that
+ * a reply or a note carries (`otherCalls`: tries that failed or were stopped
+ * after the provider began to answer, the summariser's).
+ * @param {object} conversation
+ * @param {string|null} [turn]
+ */
+export function usageOf(conversation, turn = null) {
+  const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 };
+  const add = (usage, calls) => {
+    for (const field of ['input', 'output', 'cacheRead', 'cacheWrite']) total[field] += usage[field] ?? 0;
+    total.calls += calls;
+  };
+  for (const message of conversation.messages) {
+    if (turn !== null && message.turn !== turn) continue;
+    if (message.role === 'assistant' && message.usage) add(message.usage, 1);
+    if (message.otherCalls) add(message.otherCalls, message.otherCalls.calls ?? 0);
+  }
+  return total;
+}
+
+/**
+ * What left this browser in a turn, for the provider: the person's message
+ * (and what Cellucid told the model with it), each tool result the model was
+ * sent (its characters), the pictures among them. The dataset's files never
+ * leave, but a result carries what the tool returned: names and counts, and
+ * for some tools part of the data itself (the values of cells
+ * `cells.values` reads, a picture of the plot), unless every result of the
+ * turn was made under the dataset's switch (names and summaries only: each
+ * result marked `summariesOnly` by the tool call).
+ * @param {object} conversation
+ * @param {string} turn
+ * @returns {{message: number, results: number, resultChars: number, pictures: number, tools: string[], summariesOnly: boolean}}
+ */
+export function sentOf(conversation, turn) {
+  const out = { message: 0, results: 0, resultChars: 0, pictures: 0, tools: [], summariesOnly: false };
+  let guarded = true;
+  for (const message of conversation.messages) {
+    if (message.turn !== turn) continue;
+    if (message.role === 'user') out.message += userText(message).length;
+    else if (message.role === 'tool') {
+      for (const result of message.results) {
+        out.results += 1;
+        // A question asked carries nothing of the data.
+        if (result.name !== ASK_TOOL.name) guarded = guarded && result.summariesOnly === true;
+        if (!out.tools.includes(result.name)) out.tools.push(result.name);
+        for (const item of result.content) {
+          if (item.type === 'image') out.pictures += 1;
+          else out.resultChars += item.text.length;
+        }
+      }
+    }
+  }
+  out.summariesOnly = out.results > 0 && guarded;
+  return out;
+}
+
+/** The most recent of the conversations kept with a tracker (`history.chatsOf`), or null. */
+export function latestConversation(chats) {
+  let latest = null;
+  for (const [, transcript] of chats) {
+    if (transcript?.schema !== TRANSCRIPT_SCHEMA) continue;
+    if (latest === null || (transcript.updatedAt ?? 0) > (latest.updatedAt ?? 0)) latest = transcript;
+  }
+  return latest;
+}

@@ -98,7 +98,7 @@ test('a share of the cells is read in place, and a highlight keeps its cells tha
   await page.locator('#subsample-method').selectOption('uniform');
   await page.locator('#subsample-seed').fill('7');
   await page.locator('#subsample-apply').click();
-  await expect.poll(() => pointCount(page), { timeout: 30_000 }).toBe(120);
+  await expect.poll(() => pointCount(page)).toBe(120);
 
   // Exactly the cells the specification keeps.
   const { kept, expected, isSubset, nOriginal } = await page.evaluate(async () => {
@@ -133,7 +133,7 @@ test('a share of the cells is read in place, and a highlight keeps its cells tha
   await page.locator('#subsample-percent').fill('100');
   await expect(page.locator('#subsample-apply')).toBeEnabled();
   await page.locator('#subsample-apply').click();
-  await expect.poll(() => pointCount(page), { timeout: 30_000 }).toBe(300);
+  await expect.poll(() => pointCount(page)).toBe(300);
   expect(await page.evaluate(() => window._cellucidState.cellIdentity.isSubset)).toBe(false);
   await expect(page.locator('#dataset-cells')).toHaveText('300');
   // Every cell: no line, no Details.
@@ -153,7 +153,7 @@ test('a link with a subsample opens exactly those cells and keeps them in the ad
   const bytes = await readFile(FILE);
   await page.route(url, route => fulfillFile(route, bytes));
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(url)}&cells=40%25&sample=uniform&seed=7`, { waitUntil: 'domcontentloaded' });
-  await expect.poll(() => pointCount(page), { timeout: 30_000 }).toBe(120);
+  await expect.poll(() => pointCount(page)).toBe(120);
   const { kept, expected, digest } = await page.evaluate(async () => {
     const { subsampleUniform } = await import('/assets/js/data/subsample.js');
     const identity = window._cellucidState.cellIdentity;
@@ -219,7 +219,7 @@ test.describe('in a locale that writes a decimal comma', () => {
     await expect(page.locator('#subsample-count')).toHaveText('15 of 120 cells');
     await expect(page.locator('#subsample-slider')).toHaveValue('12.5');
     await page.locator('#subsample-apply').click();
-    await expect.poll(() => pointCount(page), { timeout: 30_000 }).toBe(15);
+    await expect.poll(() => pointCount(page)).toBe(15);
     // The box says the share the open cells are, written as every number in the app is.
     await expect(box).toHaveValue('12.5');
     // "9,969" is a share of about ten per cent, never nine thousand.
@@ -233,7 +233,7 @@ test.describe('in a locale that writes a decimal comma', () => {
 test('every count of the open cells says how many of every cell they are, the picker\'s too', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&cells=60&sample=uniform&seed=0`, { waitUntil: 'domcontentloaded' });
-  await expect.poll(() => pointCount(page), { timeout: 30_000 }).toBe(60);
+  await expect.poll(() => pointCount(page)).toBe(60);
   await dismissWelcome(page);
   const option = page.locator('#dataset-select option', { hasText: 'Current UI fixture' });
   await expect(option).toHaveText('Current UI fixture (60 of 120 cells)');
@@ -242,7 +242,7 @@ test('every count of the open cells says how many of every cell they are, the pi
   await openCollapsedPanels(page);
   await page.locator('#subsample-percent').fill('100');
   await page.locator('#subsample-apply').click();
-  await expect.poll(() => pointCount(page), { timeout: 30_000 }).toBe(120);
+  await expect.poll(() => pointCount(page)).toBe(120);
   await expect(option).toHaveText('Current UI fixture (120 cells)');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
   expect(errors).toEqual([]);

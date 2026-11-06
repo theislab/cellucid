@@ -1,15 +1,19 @@
 /**
- * @fileoverview Session serializer context construction helpers.
- *
- * Contributors receive a small `ctx` object so they can capture/restore
- * feature-owned state without the orchestrator knowing any feature internals.
+ * @fileoverview What a session says about its dataset, and how it is
+ * checked: the dataset fingerprint (identity, counts, cell-order digest,
+ * data mapping: `getDatasetFingerprint`, `verifySessionFingerprint`), the
+ * fields its state uses (`collectRequiredFields`,
+ * `describeMissingRequiredFields`), and the refusals that name what differs.
+ * Session files (`history-file.js`) and saved states (`app/history/autosave.js`)
+ * carry them in their header.
  *
  * @module session/session-context
  */
 
-import { getNotificationCenter } from '../notification-center.js';
-import { getDockableAccordions } from '../dockable-accordions-registry.js';
-import { hasFilterState } from '../state-serializer/filters.js';
+import { captureViewFilters } from '../state/domains/filters.js';
+import { captureViewColors } from '../state/domains/colors.js';
+import { captureViewActiveField } from '../state/domains/active-field.js';
+import { fieldRef } from '../state/domains/fields.js';
 import {
   assertNonEmptyString,
   assertNullableString,
@@ -33,434 +37,6 @@ import { sameJson } from '../utils/same-json.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf, countNoun } from '../../utils/format-units.js';
 
-const PARTICIPANT_KEYS = ['value', 'prepare', 'commit', 'rollback'];
-const PRESENTATION_PARTICIPANT_KEYS = [...PARTICIPANT_KEYS, 'stage'];
-
-/**
- * A participant commits either restored state (the default) or a presentation
- * of it. Presentation participants, such as reopened analysis windows, read
- * what the state participants publish, so every state commit runs first,
- * whatever order the bundle's chunks registered them in.
- */
-function assertRestoreParticipant(participant, context) {
-  const presentation = (
-    participant !== null
-    && typeof participant === 'object'
-    && Object.hasOwn(participant, 'stage')
-  );
-  requireExactKeys(
-    participant,
-    presentation ? PRESENTATION_PARTICIPANT_KEYS : PARTICIPANT_KEYS,
-    context
-  );
-  if (presentation && participant.stage !== 'presentation') {
-    throw new TypeError(`${context} stage must be exactly "presentation".`);
-  }
-  requireMethod(participant, 'prepare', context);
-  requireMethod(participant, 'commit', context);
-  requireMethod(participant, 'rollback', context);
-  return participant;
-}
-
-function isPresentationParticipant(participant) {
-  return Object.hasOwn(participant, 'stage');
-}
-
-function preserveRollbackFailure(error, rollbackError) {
-  if (error instanceof Error && error.cause === undefined) {
-    error.cause = rollbackError;
-  }
-}
-
-const RESTORE_SNAPSHOTS_PARTICIPANT_ID =
-  'session/restore-snapshots';
-
-function isPromiseLike(value) {
-  return (
-    value !== null
-    && (typeof value === 'object' || typeof value === 'function')
-    && typeof value.then === 'function'
-  );
-}
-
-/**
- * Create the exact transaction shared by contributors during one restore.
- *
- * Contributors stage feature state under a unique id. The serializer prepares
- * and commits every participant only after the complete bundle stream has been
- * consumed. Any restore or commit failure rolls registered participants back.
- *
- * @returns {{
- *   register: (id: string, participant: object) => void,
- *   get: (id: string) => any,
- *   commit: () => Promise<void>|void,
- *   rollback: () => Promise<void>|void
- * }}
- */
-export function createSessionRestoreTransaction() {
-  const participants = new Map();
-  let phase = 'open';
-  let rollbackTask = null;
-
-  function requireOpen(operation) {
-    if (phase !== 'open') {
-      throw new Error(
-        `Session restore transaction cannot ${operation} while ${phase}.`
-      );
-    }
-  }
-
-  function finishRollback(rollbackErrors) {
-    phase = 'rolled-back';
-    rollbackTask = null;
-    if (rollbackErrors.length === 1) throw rollbackErrors[0];
-    if (rollbackErrors.length > 1) {
-      throw new AggregateError(
-        rollbackErrors,
-        'Multiple session restore participants failed to roll back.'
-      );
-    }
-  }
-
-  function rollbackParticipants() {
-    if (phase === 'rolled-back') return;
-    if (phase === 'rolling-back') {
-      return rollbackTask;
-    }
-    phase = 'rolling-back';
-    const rollbackErrors = [];
-    const entries = [...participants.values()];
-    let pending = null;
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const participant = entries[index];
-      const invokeRollback = () => {
-        try {
-          const result = participant.rollback();
-          if (isPromiseLike(result)) {
-            return Promise.resolve(result).catch(error => {
-              rollbackErrors.push(error);
-            });
-          }
-          return undefined;
-        } catch (error) {
-          rollbackErrors.push(error);
-          return undefined;
-        }
-      };
-      if (pending === null) {
-        const result = invokeRollback();
-        if (isPromiseLike(result)) pending = result;
-      } else {
-        pending = pending.then(invokeRollback);
-      }
-    }
-    if (pending === null) {
-      finishRollback(rollbackErrors);
-      return;
-    }
-    rollbackTask = pending.then(() => finishRollback(rollbackErrors));
-    return rollbackTask;
-  }
-
-  function runParticipantMethod(entries, methodName) {
-    for (let index = 0; index < entries.length; index++) {
-      const result = entries[index][methodName]();
-      if (!isPromiseLike(result)) continue;
-      return (async () => {
-        await result;
-        for (
-          let remainingIndex = index + 1;
-          remainingIndex < entries.length;
-          remainingIndex++
-        ) {
-          await entries[remainingIndex][methodName]();
-        }
-      })();
-    }
-    return undefined;
-  }
-
-  function failCommit(error) {
-    let rollbackResult;
-    try {
-      rollbackResult = rollbackParticipants();
-    } catch (rollbackError) {
-      preserveRollbackFailure(error, rollbackError);
-      throw error;
-    }
-    if (!isPromiseLike(rollbackResult)) throw error;
-    return Promise.resolve(rollbackResult).then(
-      () => {
-        throw error;
-      },
-      rollbackError => {
-        preserveRollbackFailure(error, rollbackError);
-        throw error;
-      }
-    );
-  }
-
-  return Object.freeze({
-    register(participantId, participant) {
-      requireOpen('register a participant');
-      const exactId = assertNonEmptyString(
-        participantId,
-        'Session restore participant id'
-      );
-      if (participants.has(exactId)) {
-        throw new TypeError(
-          `Session restore participant "${exactId}" is already registered.`
-        );
-      }
-      participants.set(
-        exactId,
-        assertRestoreParticipant(
-          participant,
-          `Session restore participant "${exactId}"`
-        )
-      );
-    },
-
-    get(participantId) {
-      requireOpen('read a participant');
-      const exactId = assertNonEmptyString(
-        participantId,
-        'Session restore participant id'
-      );
-      const participant = participants.get(exactId);
-      if (participant === undefined) {
-        throw new RangeError(
-          `Session restore participant "${exactId}" is not registered.`
-        );
-      }
-      return participant.value;
-    },
-
-    commit() {
-      requireOpen('commit');
-      const entries = [...participants.values()];
-      const commitEntries = [
-        ...entries.filter(participant => !isPresentationParticipant(participant)),
-        ...entries.filter(isPresentationParticipant)
-      ];
-
-      const commitPreparedParticipants = () => {
-        phase = 'committing';
-        const commitResult = runParticipantMethod(commitEntries, 'commit');
-        if (!isPromiseLike(commitResult)) {
-          phase = 'committed';
-          return undefined;
-        }
-        return Promise.resolve(commitResult).then(() => {
-          phase = 'committed';
-        });
-      };
-
-      try {
-        phase = 'preparing';
-        const prepareResult = runParticipantMethod(entries, 'prepare');
-        if (isPromiseLike(prepareResult)) {
-          return Promise.resolve(prepareResult)
-            .then(commitPreparedParticipants)
-            .catch(error => failCommit(error));
-        }
-        const commitResult = commitPreparedParticipants();
-        if (isPromiseLike(commitResult)) {
-          return Promise.resolve(commitResult)
-            .catch(error => failCommit(error));
-        }
-      } catch (error) {
-        return failCommit(error);
-      }
-    },
-
-    rollback() {
-      return rollbackParticipants();
-    }
-  });
-}
-
-/**
- * Register the immutable pre-restore payload inventory used by reversible
- * contributors. The serializer owns population before contributor dispatch.
- *
- * @param {object} restoreTransaction
- * @param {Map<string, any>} snapshots
- */
-export function registerSessionRestoreSnapshots(
-  restoreTransaction,
-  snapshots
-) {
-  if (
-    restoreTransaction === null
-    || typeof restoreTransaction !== 'object'
-  ) {
-    throw new TypeError(
-      'Session restore snapshots require the current restore transaction.'
-    );
-  }
-  requireMethod(
-    restoreTransaction,
-    'register',
-    'Session restore snapshot transaction'
-  );
-  if (!(snapshots instanceof Map)) {
-    throw new TypeError('Session restore snapshots must be a Map.');
-  }
-  restoreTransaction.register(
-    RESTORE_SNAPSHOTS_PARTICIPANT_ID,
-    {
-      value: snapshots,
-      prepare() {},
-      commit() {},
-      rollback() {}
-    }
-  );
-}
-
-/**
- * Read one pre-restore JSON payload when the serializer captured it.
- * Direct contributor unit calls may omit the shared snapshot participant.
- *
- * @param {object} ctx
- * @param {string} chunkId
- * @returns {any|undefined}
- */
-export function getSessionRestoreSnapshot(ctx, chunkId) {
-  const exactChunkId = assertNonEmptyString(
-    chunkId,
-    'Session restore snapshot chunk id'
-  );
-  const restoreTransaction = ctx?.restoreTransaction;
-  if (
-    restoreTransaction === null
-    || typeof restoreTransaction !== 'object'
-  ) {
-    return undefined;
-  }
-  requireMethod(
-    restoreTransaction,
-    'get',
-    'Session restore snapshot transaction'
-  );
-  let snapshots;
-  try {
-    snapshots = restoreTransaction.get(
-      RESTORE_SNAPSHOTS_PARTICIPANT_ID
-    );
-  } catch (error) {
-    if (error instanceof RangeError) return undefined;
-    throw error;
-  }
-  if (!(snapshots instanceof Map)) {
-    throw new TypeError(
-      'Session restore snapshot participant must own a Map.'
-    );
-  }
-  return snapshots.get(exactChunkId);
-}
-
-function assertRestoreTransaction(value) {
-  if (value === null) return value;
-  requireExactKeys(
-    value,
-    ['register', 'get', 'commit', 'rollback'],
-    'Session restore transaction'
-  );
-  for (const methodName of ['register', 'get', 'commit', 'rollback']) {
-    requireMethod(value, methodName, 'Session restore transaction');
-  }
-  return value;
-}
-
-/**
- * @typedef {object} SessionContextBase
- * @property {import('../state/core/data-state.js').DataState} state
- * @property {object} viewer
- * @property {HTMLElement|null} sidebar
- * @property {import('../../data/data-source-manager.js').DataSourceManager|null} dataSourceManager
- * @property {any|null} comparisonModule
- * @property {any|null} analysisWindowManager
- * @property {any|null} cinematicCamera
- */
-
-/**
- * Build the context passed to all contributors.
- *
- * @param {SessionContextBase} base
- * @param {{
- *   abortSignal: AbortSignal | null,
- *   restoreTransaction: object | null
- * }} options
- * @returns {object}
- */
-export function buildSessionContext(base, options) {
-  requireExactKeys(
-    base,
-    [
-      'state',
-      'viewer',
-      'sidebar',
-      'dataSourceManager',
-      'comparisonModule',
-      'analysisWindowManager',
-      'cinematicCamera',
-      'figureExport'
-    ],
-    'Session context base'
-  );
-  requireExactKeys(
-    options,
-    ['abortSignal', 'restoreTransaction'],
-    'Session context options'
-  );
-  if (base.state === null || typeof base.state !== 'object') {
-    throw new TypeError('Session context requires the current DataState owner.');
-  }
-  if (base.viewer === null || typeof base.viewer !== 'object') {
-    throw new TypeError('Session context requires the current viewer owner.');
-  }
-  if (
-    base.sidebar === null
-    || typeof base.sidebar !== 'object'
-  ) {
-    throw new TypeError('Session context requires the explicitly supplied current sidebar.');
-  }
-  if (
-    base.dataSourceManager !== null
-    && typeof base.dataSourceManager !== 'object'
-  ) {
-    throw new TypeError('Session context dataSourceManager must be an object or null.');
-  }
-  if (
-    options.abortSignal !== null
-    && (
-      typeof options.abortSignal !== 'object'
-      || typeof options.abortSignal.aborted !== 'boolean'
-    )
-  ) {
-    throw new TypeError('Session context abortSignal must be an AbortSignal or null.');
-  }
-  const restoreTransaction = assertRestoreTransaction(
-    options.restoreTransaction
-  );
-
-  return {
-    state: base.state,
-    viewer: base.viewer,
-    sidebar: base.sidebar,
-    dataSourceManager: base.dataSourceManager,
-    dockableAccordions: getDockableAccordions(),
-    comparisonModule: base.comparisonModule,
-    analysisWindowManager: base.analysisWindowManager,
-    cinematicCamera: base.cinematicCamera,
-    figureExport: base.figureExport,
-    notifications: getNotificationCenter(),
-    abortSignal: options.abortSignal,
-    restoreTransaction
-  };
-}
-
 /**
  * The dataset fields a session uses: every observation field and gene that a
  * view shows or filters on, or that a highlight group is bound to, by the key
@@ -473,30 +49,18 @@ export function buildSessionContext(base, options) {
  * @returns {{obs: string[], var: string[]}}
  */
 export function collectRequiredFields(state) {
-  const obs = new Set();
-  const vars = new Set();
-  const datasetKey = field => field._originalKey ?? field.key;
-  const add = (set, field) => {
-    if (
-      field === null
-      || typeof field !== 'object'
-      || field._isUserDefined === true
-      || field._isDeleted === true
-    ) {
-      return;
-    }
-    set.add(datasetKey(field));
-  };
-  const visit = ({ obsData, varData, activeFieldSource, activeFieldIndex, activeVarFieldIndex }) => {
-    const obsFields = Array.isArray(obsData?.fields) ? obsData.fields : [];
-    const varFields = Array.isArray(varData?.fields) ? varData.fields : [];
-    for (const field of obsFields) if (hasFilterState(field)) add(obs, field);
-    for (const field of varFields) if (hasFilterState(field)) add(vars, field);
-    if (activeFieldSource === 'obs') add(obs, obsFields[activeFieldIndex] ?? null);
-    if (activeFieldSource === 'var') add(vars, varFields[activeVarFieldIndex] ?? null);
+  const required = { obs: new Set(), var: new Set() };
+  // A user field (`{source, user}`) is made by the session itself.
+  const add = ref => {
+    if (ref !== null && ref.key !== undefined) required[ref.source].add(ref.key);
   };
   // The focused view's state is the top level; every other view's is parked
-  // in its context.
+  // in its context. Each names its fields as its domain values do.
+  const visit = owner => {
+    for (const entry of captureViewFilters(owner)) add(entry.field);
+    for (const entry of captureViewColors(owner)) add(entry.field);
+    add(captureViewActiveField(owner));
+  };
   visit(state);
   const activeViewId = state.getActiveViewId();
   if (state.viewContexts instanceof Map) {
@@ -507,11 +71,12 @@ export function collectRequiredFields(state) {
   for (const page of state.getHighlightPages?.() ?? []) {
     for (const group of page.highlightedGroups ?? []) {
       if (typeof group.fieldKey !== 'string') continue;
-      const fields = group.fieldSource === 'var' ? state.varData?.fields : state.obsData?.fields;
-      add(group.fieldSource === 'var' ? vars : obs, fields?.[group.fieldIndex] ?? null);
+      const source = group.fieldSource === 'var' ? 'var' : 'obs';
+      const field = (source === 'var' ? state.varData?.fields : state.obsData?.fields)?.[group.fieldIndex] ?? null;
+      if (field !== null && typeof field === 'object') add(fieldRef(field, source));
     }
   }
-  return { obs: [...obs].sort(), var: [...vars].sort() };
+  return { obs: [...required.obs].sort(), var: [...required.var].sort() };
 }
 
 /**
@@ -992,8 +557,8 @@ const CELL_ORDER_MISMATCH_MESSAGE =
  * share, in priority order or as the file gives them.
  *
  * A dataset's published starting view (`profile` 'published-default') is
- * saved on every cell and holds no per-cell state (its seven static chunks,
- * `published-default.js`): it applies to any subsample of its dataset --
+ * saved on every cell and holds no content a person made (one tracker of one
+ * root, `published-default.js`): it applies to any subsample of its dataset --
  * fitted to the device, or named in the link -- as it does to every cell.
  * The cell count is then the dataset's (`nOriginal` of the open cells'
  * identity), and the cell-order digest, a sum over every cell, cannot be
@@ -1080,58 +645,4 @@ export async function verifySessionFingerprint(ctx, saved, { profile = null } = 
     'Session restore DimensionManager'
   ).call(dimensionManager, layoutKey);
   return digest === saved.cellOrder.digest ? null : CELL_ORDER_MISMATCH_MESSAGE;
-}
-
-/**
- * Restore the representations a verified session enables, before its views
- * are restored, as a participant of the restore transaction.
- *
- * Every representation the session enables is enabled now, beside the ones
- * enabled already, with the session's defaults, so the views it restores
- * find their layouts and no view loses its own before it is restored. At
- * commit the session's mapping is applied exactly, which disables the extras
- * once no restored view shows them. Rollback runs after the contributors have
- * restored the previous views, and restores the previous mapping.
- *
- * @param {object} ctx
- * @param {object} saved - The verified `datasetFingerprint.dataMapping`.
- * @returns {Promise<void>}
- */
-export async function restoreSessionDataMapping(ctx, saved) {
-  const state = ctx.state;
-  const previous = requireMethod(
-    state,
-    'getDataMapping',
-    'Session data-mapping restore'
-  ).call(state);
-  if (sameJson(saved, previous)) return;
-  for (const method of ['applyDataMapping', 'getDataMappingOrigin']) {
-    requireMethod(state, method, 'Session data-mapping restore');
-  }
-  const previousOrigin = state.getDataMappingOrigin();
-  ctx.restoreTransaction.register('core/data-mapping', {
-    value: null,
-    prepare() {},
-    async commit() {
-      if (!sameJson(state.getDataMapping(), saved)) {
-        await state.applyDataMapping(saved, { origin: 'session' });
-      }
-    },
-    async rollback() {
-      if (!sameJson(state.getDataMapping(), previous)) {
-        await state.applyDataMapping(previous, { origin: previousOrigin });
-      }
-    }
-  });
-  const enabled = [...saved.embeddings.enabled];
-  for (const ref of previous.embeddings.enabled) {
-    if (!enabled.some(candidate => compareEmbeddingRefs(candidate, ref) === 0)) {
-      enabled.push(ref);
-    }
-  }
-  enabled.sort(compareEmbeddingRefs);
-  await state.applyDataMapping(
-    { ...saved, embeddings: { enabled, defaults: saved.embeddings.defaults } },
-    { origin: 'session' }
-  );
 }

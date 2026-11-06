@@ -35,13 +35,13 @@ import {
   requireViewerHostSource,
   requireMethods,
   requireSafeInteger,
-  requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
   requireUnifiedSelectionState,
 } from './exact-contract.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { createSelectionConfirmer } from './highlight-actions.js';
 
 /**
  * @param {object} options
@@ -64,8 +64,9 @@ export function initLassoSelection(options) {
     state,
     'Lasso selection state',
     [
-      'addHighlightDirect',
       'clearPreviewHighlight',
+      'ensureHighlightPage',
+      'getActivePage',
       'setPreviewHighlightFromIndices'
     ]
   );
@@ -102,6 +103,8 @@ export function initLassoSelection(options) {
   const lifecycleController = new AbortController();
   const pendingDeliveries = new Set();
   let destroyed = false;
+  // Confirm makes one `highlight.cells` step (`highlight-actions.js`).
+  const confirmer = createSelectionConfirmer({ state, isDestroyed: () => destroyed });
   let destructionPromise = null;
 
   function listen(target, eventName, listener) {
@@ -124,18 +127,11 @@ export function initLassoSelection(options) {
     requireCompletedSelectionEvent(lassoEvent, 'lasso', state.pointCount);
 
     const stepsLabel = lassoEvent.steps > 1 ? ` (${formatCountOf(lassoEvent.steps, 'view')})` : '';
-    const savedGroup = state.addHighlightDirect({
-      type: 'lasso',
+    void confirmer.confirm({
+      tool: 'lasso',
       label: `Lasso${stepsLabel} (${formatCountOf(lassoEvent.cellCount, 'cell')})`,
       cellIndices: lassoEvent.cellIndices
     });
-    requireSavedHighlightGroup(
-      savedGroup,
-      'lasso',
-      lassoEvent.cellIndices,
-      'Saved lasso highlight group',
-      state.pointCount
-    );
 
     debug.log(`[UI] Lasso selected ${formatCountOf(lassoEvent.cellCount, 'cell')} from ${lassoEvent.steps} view(s)`);
     trackDelivery(deliverSelectionToViewerHost({
@@ -315,7 +311,7 @@ export function initLassoSelection(options) {
         redo: handleLassoRedo,
         confirm: () => {
           viewer.confirmLassoSelection();
-          state.clearPreviewHighlight();
+          confirmer.clearPreview();
         },
         cancel: () => {
           viewer.cancelLassoSelection();

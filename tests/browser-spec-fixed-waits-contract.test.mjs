@@ -114,13 +114,6 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
   },
   {
     file: 'tests/browser/data-source-failure-modes.spec.mjs',
-    source: 'await page.waitForTimeout(200);',
-    count: 1,
-    kind: 'poll',
-    reason: 'The interval of `captureFirstErrorNotification`, which samples an auto-dismissing notification until its deadline.',
-  },
-  {
-    file: 'tests/browser/data-source-failure-modes.spec.mjs',
     source: 'await page.waitForTimeout(3_000);',
     count: 1,
     kind: 'time',
@@ -155,6 +148,20 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
     reason: '`countDrawsDuring` counts draw calls over an observation window; `sceneQuietness` uses it only once the frame loop reports itself settled.',
   },
   {
+    file: 'tests/browser/helpers/control-walk.mjs',
+    source: 'const budget = new Promise(resolve => { timer = setTimeout(() => { over = true; resolve(); }, ms); });',
+    count: 1,
+    kind: 'deadline',
+    reason: 'A control\'s budget (`withBudget`): its expiry fails the control, once the control\'s own work has ended.',
+  },
+  {
+    file: 'tests/browser/helpers/control-walk.mjs',
+    source: 'new Promise(resolve => { grace = setTimeout(() => resolve(\'running\'), BUDGET_GRACE * ms); }),',
+    count: 1,
+    kind: 'deadline',
+    reason: 'Bounds the wait for an over-budget control\'s work to end; its expiry ends the part as a failure.',
+  },
+  {
     file: 'tests/browser/helpers/unattached-webkit.mjs',
     source: 'timer = setTimeout(() => resolve(`reported nothing within ${timeoutMs} ms`), timeoutMs);',
     count: 1,
@@ -167,6 +174,13 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
     count: 6,
     kind: 'time',
     reason: 'An observation window after page-wide input in which the viewer must issue no draw call.',
+  },
+  {
+    file: 'tests/browser/held-machine.spec.mjs',
+    source: 'if (lateMs > 0) await new Promise(resolve => setTimeout(resolve, lateMs));',
+    count: 1,
+    kind: 'time',
+    reason: 'A host answering late (each answer 370 ms late, as a loaded runner answers itself) is the subject: no plan may follow it.',
   },
   {
     file: 'tests/browser/kept-parts.spec.mjs',
@@ -223,6 +237,13 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
     count: 1,
     kind: 'time',
     reason: 'A short press fires the shot; the press length is the input.',
+  },
+  {
+    file: 'tests/browser/style-gate.spec.mjs',
+    source: 'await new Promise(resolve => setTimeout(resolve, HELD_MS));',
+    count: 1,
+    kind: 'time',
+    reason: 'A slow link (the stylesheet 2.5 s behind the document) is the subject: nothing of the page may be parsed or started before it arrives.',
   },
   {
     file: 'tests/browser/ui-keyboard-lifecycle.spec.mjs',

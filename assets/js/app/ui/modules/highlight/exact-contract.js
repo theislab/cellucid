@@ -1,6 +1,5 @@
 import {
   CellSet,
-  cellListsEqual,
   requireCellList
 } from '../../../utils/cell-set.js';
 import {
@@ -346,45 +345,6 @@ export function requireHighlightGroup(value, label, pointCount) {
     if (value.rangeMin > value.rangeMax) {
       throw new RangeError(`${label} rangeMin must not exceed rangeMax.`);
     }
-  }
-  return value;
-}
-
-export function requireSavedHighlightGroup(
-  value,
-  expectedType,
-  expectedCellIndices,
-  label,
-  pointCount
-) {
-  requireHighlightGroup(value, label, pointCount);
-  if (!DIRECT_HIGHLIGHT_GROUP_TYPES.has(expectedType)) {
-    throw new TypeError(
-      `Saved highlight expected type is unsupported: ${expectedType}.`
-    );
-  }
-  if (value.type !== expectedType) {
-    throw new TypeError(
-      `${label} type must be exactly "${expectedType}".`
-    );
-  }
-  requireCellIndices(
-    expectedCellIndices,
-    `${label} source cellIndices`,
-    { allowEmpty: false, pointCount }
-  );
-  if (value.cellCount !== expectedCellIndices.length) {
-    throw new RangeError(
-      `${label} cellCount must match the completed selection.`
-    );
-  }
-  // Both are cell lists, so equal sets are equal lists. A permuted, offset,
-  // or substituted index set is rejected here instead of being saved as a
-  // selection nobody made.
-  if (!cellListsEqual(value.cellIndices, expectedCellIndices)) {
-    throw new RangeError(
-      `${label} cellIndices must be exactly the completed selection.`
-    );
   }
   return value;
 }

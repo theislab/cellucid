@@ -22,6 +22,7 @@
 
 import { getNotificationCenter } from './notification-center.js';
 import { onWorkerScriptFailure } from '../workers/worker-script.js';
+import { PLACES, placePath } from './ui/place-names.js';
 
 const BUILD_ID_META = /<meta\s+name="cellucid-web-build-id"\s+content="([^"]+)"/;
 const UPDATE_NOTICE_ID = 'cellucid-code-updated';
@@ -84,7 +85,7 @@ export function announceIfUpdated({
       notifications.error(
         'This page was opened before Cellucid was updated, so it cannot load the rest of its ' +
           'code. Reload to use the current version. Reloading starts over: to keep what you ' +
-          'have open, save a session file first (Session file, Save).',
+          `have open, save a session file first (${placePath(PLACES.state, PLACES.sessionFile)} › Share…, Save file).`,
         {
           id: UPDATE_NOTICE_ID,
           title: 'Cellucid has been updated',

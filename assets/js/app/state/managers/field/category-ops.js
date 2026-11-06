@@ -91,9 +91,9 @@ export class FieldCategoryOpsMethods {
    * - For source fields, we create a user-defined derived field and soft-delete
    *   the source field (restorable via Deleted Fields).
    * - For already user-defined derived fields, we edit the field in place to
-   *   keep the workflow fast and avoid cluttering the field list. In this path
-   *   we remap per-cell codes in place when possible to avoid allocating an
-   *   additional full codes array on every edit.
+   *   keep the workflow fast and avoid cluttering the field list: the field
+   *   takes new codes, categories and centroid tables (never written into the
+   *   ones it had, which every view's copy shares), published to every copy.
    *
    * @param {number} fieldIndex
    * @param {number} categoryIndex

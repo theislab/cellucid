@@ -34,16 +34,20 @@ test('a long file with the wrong signature is refused in the same words', async 
 });
 
 test('a session of another format version is refused naming it, not as some other file', async () => {
-  // Saved by an earlier Cellucid (format 2: its cell-order digest was taken
-  // over display coordinates, which no later version can check), or by a
-  // newer one.
-  for (const [version, pattern] of [[2, /earlier version of Cellucid \(session format 2\).*cannot be verified/], [1, /session format 1/], [4, /newer version of Cellucid \(session format 4\)/]]) {
+  // Saved by an earlier Cellucid (format 3 held one state, not the history of
+  // its steps; formats 1 and 2 before it), or by a newer one.
+  for (const [version, pattern] of [
+    [3, /earlier version of Cellucid \(session format 3\), which this version no longer reads: a session file now holds the history of every step \(session format 4\)\. It was not opened\./],
+    [2, /session format 2/],
+    [1, /session format 1/],
+    [5, /newer version of Cellucid \(session format 5\)/],
+  ]) {
     const error = await refusal(new TextEncoder().encode(`CELLUCID_SESSION/${version}\n{"manifest": "of another format"}`));
     assert.equal(error.message, otherSessionFormatMessage(version));
     assert.match(error.message, pattern);
     assert.notEqual(error.message, NOT_A_SESSION_FILE_MESSAGE);
   }
-  assert.equal(SESSION_FORMAT_VERSION, 3);
+  assert.equal(SESSION_FORMAT_VERSION, 4);
   // Not a version: not a session.
   for (const text of ['CELLUCID_SESSION/x\n and more bytes', 'CELLUCID_SESSION\n and more bytes!!']) {
     assert.equal((await refusal(new TextEncoder().encode(text))).message, NOT_A_SESSION_FILE_MESSAGE, text);

@@ -15,6 +15,8 @@
  * - `failureText`: never an empty failure; no notification shows
  *   `error.message` alone.
  */
+import { blocksRun } from './helpers/block-counts.mjs';
+
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -182,7 +184,7 @@ test('matrixRowsCost prices an export\'s rows before reading them: the bytes the
   assert.equal(cost.ms, null, 'no time without a measured link');
 });
 
-test('the page\'s range cache keeps and looks up ranges exactly, in logarithmic time', () => {
+test('the page\'s range cache keeps and looks up ranges exactly, in logarithmic time', async () => {
   const cache = createByteRangeCache({ budgetBytes: 1 << 30 });
   // A naive model: the bytes held at each offset.
   const held = new Map();
@@ -203,13 +205,21 @@ test('the page\'s range cache keeps and looks up ranges exactly, in logarithmic 
       piece.bytes.forEach((value, k) => assert.equal(value, held.get(piece.start + k)));
     }
   }
-  // Tens of thousands of scattered chunks, as an export reads them.
-  const big = createByteRangeCache({ budgetBytes: 1 << 30 });
-  const started = performance.now();
-  for (let i = 0; i < 40000; i++) big.keep('g', i * 3000, new Uint8Array(1000));
-  for (let i = 0; i < 40000; i++) big.lookup('g', i * 3000 + 10, 20);
-  assert.ok(performance.now() - started < 1500, `40,000 keeps and lookups took ${Math.round(performance.now() - started)} ms`);
-  assert.equal(big.stats().ranges, 40000);
+  // Tens of thousands of scattered chunks, as an export reads them: blocks run
+  // (`helpers/block-counts.mjs`), not milliseconds. Ten times the chunks runs
+  // about ten times the blocks; a scan of the ranges per lookup, a hundred.
+  const chunks = async count => {
+    const big = createByteRangeCache({ budgetBytes: 1 << 30 });
+    const blocks = await blocksRun('/byte-range-cache.js', () => {
+      for (let i = 0; i < count; i++) big.keep('g', i * 3000, new Uint8Array(1000));
+      for (let i = 0; i < count; i++) big.lookup('g', i * 3000 + 10, 20);
+    });
+    assert.equal(big.stats().ranges, count);
+    return blocks;
+  };
+  const few = await chunks(4000);
+  const many = await chunks(40000);
+  assert.ok(many / few < 20, `ten times the chunks ran ${(many / few).toFixed(1)} times the blocks (${few}, then ${many})`);
 });
 
 test('a failure is never shown without words: its class and cause when its message is empty, across a thread too', () => {

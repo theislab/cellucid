@@ -15,6 +15,7 @@ import { installIosWebGLCapabilities } from './helpers/ios-webgl-capabilities.mj
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { decodePng } from './helpers/png-pixels.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -156,7 +157,7 @@ test('a smoke session restored on an iPhone-class device opens in Points with th
   await page.locator('#render-mode').selectOption('smoke');
   await expect(page.locator('#render-mode')).toHaveValue('smoke');
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath('smoke.cellucid-session');
   await download.saveAs(sessionPath);
@@ -166,7 +167,7 @@ test('a smoke session restored on an iPhone-class device opens in Points with th
   await installIosWebGLCapabilities(page);
   await openDataset(page);
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 

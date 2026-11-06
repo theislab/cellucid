@@ -1,0 +1,31 @@
+{
+  "examples": [
+    {
+      "setting": "point-size",
+      "value": 20
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "setting": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "value": {
+        "type": [
+          "string",
+          "number",
+          "boolean"
+        ]
+      }
+    },
+    "required": [
+      "setting",
+      "value"
+    ],
+    "type": "object"
+  },
+  "type": "setting.set",
+  "version": 1
+}

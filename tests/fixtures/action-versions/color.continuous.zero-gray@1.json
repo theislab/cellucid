@@ -1,0 +1,47 @@
+{
+  "examples": [
+    {
+      "enabled": false,
+      "field": {
+        "key": "x",
+        "source": "obs"
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "obs",
+              "var"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "field",
+      "enabled"
+    ],
+    "type": "object"
+  },
+  "type": "color.continuous.zero-gray",
+  "version": 1
+}

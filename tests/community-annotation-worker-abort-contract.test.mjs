@@ -11,22 +11,20 @@ const ENV = Object.freeze({
   GITHUB_CLIENT_SECRET: 'client-secret',
 });
 
-const WORKER_DEADLINE_MS = 15_000;
+// GitHub's own 10 s request timeout plus a 3 s connection set-up (the Worker's comment cites both).
+const WORKER_STALL_TIMEOUT_MS = 13_000;
 const CALLER_ABORT_DOCUMENT = Object.freeze({
   error: 'Worker request was cancelled',
 });
-const TIMEOUT_DOCUMENT = Object.freeze({
-  error: `Worker request timed out after ${WORKER_DEADLINE_MS}ms`,
+const STALL_DOCUMENT = Object.freeze({
+  error: 'Worker request stalled: nothing moved for 13 s',
 });
 const USER_DOCUMENT = Object.freeze({
   id: 1,
   login: 'cellucid-user',
 });
-const TREE_PATH =
-  '/api/repos/owner/repo/git/trees/main?recursive=1';
-const CONTENT_PATH =
-  '/api/repos/owner/repo/contents/' +
-  'annotations/users/ghid_42.json?ref=main';
+const TREE_SHA = 'b'.repeat(40);
+const TREE_PATH = `/api/repos/owner/repo/git/trees/${TREE_SHA}`;
 const TREE_DOCUMENT_TEXT = JSON.stringify({
   tree: [{
     path: 'annotations/users/ghid_1.json',
@@ -122,6 +120,10 @@ function installFakeTimers() {
       assert.equal(record.fired, false);
       record.fired = true;
       record.callback(...record.args);
+    },
+    /** The timers armed and neither cleared nor fired: the stall clock while it runs. */
+    live() {
+      return records.filter(record => !record.cleared && !record.fired);
     },
     restore() {
       globalThis.setTimeout = previousSetTimeout;
@@ -243,7 +245,7 @@ function createStalledTreeFetchHarness() {
     bodyCancellations: () => bodyCancellations,
     bodyPulled: bodyPulled.promise,
     fetch(url, options = {}) {
-      assert.match(String(url), /\/git\/trees\/main\?recursive=1$/);
+      assert.equal(String(url), `https://api.github.com/repos/owner/repo/git/trees/${TREE_SHA}`);
       upstreamSignal = options.signal;
       assert.ok(
         upstreamSignal,
@@ -331,6 +333,15 @@ function createOpenChunkedFetchHarness(chunks) {
     pulls: () => pulls,
     signal: () => upstreamSignal,
   };
+}
+
+/** Let queued work run until `condition` holds (a bounded number of macrotasks, never a clock). */
+async function until(condition, label) {
+  for (let turn = 0; turn < 100; turn += 1) {
+    if (condition()) return;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.fail(`never reached: ${label}`);
 }
 
 async function settleBeforeImmediate(promise) {
@@ -444,7 +455,7 @@ test('caller abort while fetch is pending reaches the exact upstream signal', as
   });
 });
 
-test('timeout first remains the first cause when caller aborts later', async () => {
+test('an upstream silent for a whole stall window stops the request with 504; a later caller abort changes nothing', async () => {
   const owner = new AbortController();
   const harness = createPendingFetchHarness();
   const timers = installFakeTimers();
@@ -456,27 +467,20 @@ test('timeout first remains the first cause when caller aborts later', async () 
         workerRequest('/auth/user', { signal: owner.signal }),
         ENV
       );
-      await harness.called;
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
+      const upstream = await harness.called;
+      const [stall] = timers.live();
+      assert.equal(timers.live().length, 1, 'the stall clock runs while the answer is awaited');
+      assert.equal(stall.delay, WORKER_STALL_TIMEOUT_MS);
 
-      timers.fire(deadline);
-      owner.abort(abortError('Caller cancelled after deadline'));
+      timers.fire(stall);
+      owner.abort(abortError('Caller cancelled after the stall'));
       const response = await workerPromise;
 
-      assert.deepEqual(
-        {
-          deadlineMs: deadline.delay,
-          document: await responseDocument(response),
-          status: response.status,
-        },
-        {
-          deadlineMs: WORKER_DEADLINE_MS,
-          document: TIMEOUT_DOCUMENT,
-          status: 504,
-        }
-      );
-      assert.equal(deadline.cleared, true);
+      assert.equal(response.status, 504);
+      assert.deepEqual(await responseDocument(response), STALL_DOCUMENT);
+      assert.equal(upstream.signal.aborted, true);
+      assert.equal(upstream.abortEvents(), 1);
+      assert.deepEqual(timers.live(), []);
     });
   } finally {
     harness.resolve();
@@ -485,7 +489,7 @@ test('timeout first remains the first cause when caller aborts later', async () 
   }
 });
 
-test('caller first remains the first cause when timeout fires later', async () => {
+test('a caller abort first stops the stall clock, so no stall follows it', async () => {
   const owner = new AbortController();
   const harness = createPendingFetchHarness();
   const timers = installFakeTimers();
@@ -498,26 +502,15 @@ test('caller first remains the first cause when timeout fires later', async () =
         ENV
       );
       await harness.called;
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
+      const [stall] = timers.live();
 
       owner.abort(abortError('Caller won the cancellation race'));
-      timers.fire(deadline);
+      assert.equal(stall.cleared, true);
       const response = await workerPromise;
 
-      assert.deepEqual(
-        {
-          deadlineMs: deadline.delay,
-          document: await responseDocument(response),
-          status: response.status,
-        },
-        {
-          deadlineMs: WORKER_DEADLINE_MS,
-          document: CALLER_ABORT_DOCUMENT,
-          status: 499,
-        }
-      );
-      assert.equal(deadline.cleared, true);
+      assert.equal(response.status, 499);
+      assert.deepEqual(await responseDocument(response), CALLER_ABORT_DOCUMENT);
+      assert.deepEqual(timers.live(), []);
     });
   } finally {
     harness.resolve();
@@ -526,7 +519,7 @@ test('caller first remains the first cause when timeout fires later', async () =
   }
 });
 
-test('independent upstream AbortError is a gateway failure, not a timeout', async () => {
+test('independent upstream AbortError is a gateway failure, not a stall', async () => {
   await withMockedFetch(async () => {
     throw abortError('Upstream aborted independently');
   }, async () => {
@@ -538,7 +531,7 @@ test('independent upstream AbortError is a gateway failure, not a timeout', asyn
     assert.equal(response.status, 502);
     assert.deepEqual(Object.keys(document), ['error']);
     assert.equal(typeof document.error, 'string');
-    assert.doesNotMatch(document.error, /timed out/i);
+    assert.doesNotMatch(document.error, /stalled/i);
   });
 });
 
@@ -581,7 +574,7 @@ test('caller abort after headers cancels stalled response-body consumption', asy
   });
 });
 
-test('deadline after headers cancels stalled response-body consumption', async () => {
+test('a response body silent for a whole stall window stops the request with 504', async () => {
   const harness = createStalledBodyFetchHarness();
   const timers = installFakeTimers();
   let workerPromise = null;
@@ -594,31 +587,20 @@ test('deadline after headers cancels stalled response-body consumption', async (
       );
       const upstream = await harness.called;
       await harness.bodyPulled;
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
-      const activeDuringBody = !deadline.cleared && !deadline.fired;
+      // The answer's arrival was progress: its timer is gone, and a fresh one
+      // runs while the body is awaited.
+      await until(() => timers.records.length === 2, 'the body is awaited');
+      assert.equal(timers.records[0].cleared, true);
+      const [stall] = timers.live();
+      assert.equal(stall, timers.records[1]);
 
-      if (activeDuringBody) timers.fire(deadline);
-      else harness.finish();
+      timers.fire(stall);
       const response = await workerPromise;
 
-      assert.deepEqual(
-        {
-          activeDuringBody,
-          bodyAbortEvents: upstream.abortEvents(),
-          deadlineMs: deadline.delay,
-          document: await responseDocument(response),
-          status: response.status,
-        },
-        {
-          activeDuringBody: true,
-          bodyAbortEvents: 1,
-          deadlineMs: WORKER_DEADLINE_MS,
-          document: TIMEOUT_DOCUMENT,
-          status: 504,
-        }
-      );
-      assert.equal(deadline.cleared, true);
+      assert.equal(response.status, 504);
+      assert.deepEqual(await responseDocument(response), STALL_DOCUMENT);
+      assert.equal(upstream.abortEvents(), 1);
+      assert.deepEqual(timers.live(), []);
     });
   } finally {
     harness.finish();
@@ -650,6 +632,7 @@ test('successful tree reads return an exact unprojected stream before the upstre
         'tree response headers must not wait for full-body buffering'
       );
       assert.equal(earlyResponse.status, 200);
+      assert.equal(earlyResponse.headers.get('content-type'), 'application/json');
 
       const textPromise = earlyResponse.text();
       await harness.bodyPulled;
@@ -711,52 +694,74 @@ test('caller ownership remains active while a streamed tree response drains', as
   });
 });
 
-test('deadline ownership remains active while a streamed tree response drains', async () => {
+test('a relayed body runs the stall clock only while it waits on the upstream, never while the browser has not asked for more', async () => {
   const harness = createStalledTreeFetchHarness();
   const timers = installFakeTimers();
   let workerPromise = null;
 
   try {
     await withMockedFetch(harness.fetch, async () => {
-      workerPromise = worker.fetch(
-        workerRequest(TREE_PATH),
-        ENV
-      );
-      const earlyResponse = await settleBeforeImmediate(workerPromise);
-      const returnedBeforeDrain =
-        earlyResponse !== PROMISE_STILL_PENDING;
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
-      if (!returnedBeforeDrain) {
-        timers.fire(deadline);
-        harness.finish();
-        await workerPromise;
-      }
-      assert.equal(
-        returnedBeforeDrain,
-        true,
-        'tree response must stream while its deadline remains active'
-      );
-      assert.equal(deadline.cleared, false);
-      assert.equal(deadline.fired, false);
+      workerPromise = worker.fetch(workerRequest(TREE_PATH), ENV);
+      const response = await workerPromise;
+      assert.equal(response.status, 200);
+      // The relay reads one chunk ahead (the first half) and stops: the
+      // browser has not asked for more, so no clock runs.
+      await until(() => timers.records.length === 2, 'the first chunk is read ahead');
+      assert.deepEqual(timers.live(), []);
 
-      const bodyOutcomePromise = earlyResponse.text().then(
+      const reader = response.body.getReader();
+      const first = await reader.read();
+      assert.equal(first.done, false);
+      // The browser asked: the relay waits on the upstream for the rest, and
+      // its stall clock runs.
+      await until(() => timers.live().length === 1, 'the rest is awaited');
+      // The rest arrives: progress, and nothing more is awaited while the
+      // browser has not read it, so no clock runs however long it waits.
+      harness.finish();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(timers.live(), []);
+
+      const rest = await reader.read();
+      assert.equal(rest.done, false);
+      // The browser asks again: waiting on the upstream, the clock runs; the
+      // upstream ends at once, and the clock stops for good.
+      assert.equal((await reader.read()).done, true);
+      assert.deepEqual(timers.live(), []);
+      for (const record of timers.records) assert.equal(record.delay, WORKER_STALL_TIMEOUT_MS);
+    });
+  } finally {
+    harness.finish();
+    if (workerPromise !== null) await workerPromise;
+    timers.restore();
+  }
+});
+
+test('a relayed body silent for a whole stall window ends in a stall error and stops the upstream', async () => {
+  const harness = createStalledTreeFetchHarness();
+  const timers = installFakeTimers();
+  let workerPromise = null;
+
+  try {
+    await withMockedFetch(harness.fetch, async () => {
+      workerPromise = worker.fetch(workerRequest(TREE_PATH), ENV);
+      const response = await workerPromise;
+      const bodyOutcomePromise = response.text().then(
         value => ({ kind: 'resolved', value }),
         error => ({ error, kind: 'rejected' })
       );
-      await harness.bodyPulled;
-      timers.fire(deadline);
-      const bodyOutcome = await settleBeforeImmediate(
-        bodyOutcomePromise
-      );
+      await until(() => timers.live().length === 1, 'the rest is awaited');
+      const [stall] = timers.live();
+      timers.fire(stall);
+      const bodyOutcome = await settleBeforeImmediate(bodyOutcomePromise);
       if (bodyOutcome === PROMISE_STILL_PENDING) harness.finish();
 
       assert.notEqual(bodyOutcome, PROMISE_STILL_PENDING);
       assert.equal(bodyOutcome.kind, 'rejected');
-      assert.equal(deadline.delay, WORKER_DEADLINE_MS);
-      assert.equal(deadline.cleared, true);
+      assert.equal(bodyOutcome.error.status, 504);
+      assert.equal(bodyOutcome.error.message, STALL_DOCUMENT.error);
       assert.equal(harness.signal()?.aborted, true);
       assert.equal(harness.abortEvents(), 1);
+      assert.deepEqual(timers.live(), []);
     });
   } finally {
     harness.finish();
@@ -782,14 +787,15 @@ test('downstream cancellation cancels its streamed upstream and releases request
     await withMockedFetch(harness.fetch, async () => {
       const response = await worker.fetch(request, ENV);
       assert.equal(response.status, 200);
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
-      assert.equal(deadline.cleared, false);
+      const reader = response.body.getReader();
+      assert.equal((await reader.read()).done, false);
+      await until(() => timers.live().length === 1, 'the relay waits on the upstream body');
 
-      await response.body.cancel(cancellationReason);
+      await reader.cancel(cancellationReason);
       assert.equal(harness.cancellations(), 1);
       assert.equal(harness.cancellationReason(), cancellationReason);
-      assert.equal(deadline.cleared, true);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(timers.live(), []);
 
       for (const [listener, additions] of listenerObserver.additions) {
         assert.equal(
@@ -807,138 +813,7 @@ test('downstream cancellation cancels its streamed upstream and releases request
   }
 });
 
-test('a streamed byte overrun without Content-Length cancels upstream and releases ownership', async () => {
-  const harness = createOpenChunkedFetchHarness([
-    new Uint8Array(1_000_000).fill(0x61),
-    new Uint8Array(500_001).fill(0x62),
-  ]);
-  const timers = installFakeTimers();
-
-  try {
-    await withMockedFetch(harness.fetch, async () => {
-      const response = await worker.fetch(
-        workerRequest(CONTENT_PATH),
-        ENV
-      );
-      assert.equal(response.status, 200);
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
-      assert.equal(deadline.cleared, false);
-
-      await assert.rejects(
-        response.text(),
-        /body exceeds 1,500,000 bytes/
-      );
-      await harness.cancellationStarted;
-      await new Promise(resolve => setImmediate(resolve));
-
-      assert.equal(harness.cancellations(), 1);
-      assert.equal(harness.pulls(), 3);
-      assert.equal(harness.signal()?.aborted, false);
-      assert.equal(deadline.cleared, true);
-    });
-  } finally {
-    harness.finish();
-    timers.restore();
-  }
-});
-
-test('invalid UTF-8 in a streamed response cancels upstream and releases ownership', async () => {
-  const encoder = new TextEncoder();
-  const harness = createOpenChunkedFetchHarness([
-    encoder.encode('{"tree":['),
-    new Uint8Array([0xff]),
-  ]);
-  const timers = installFakeTimers();
-
-  try {
-    await withMockedFetch(harness.fetch, async () => {
-      const response = await worker.fetch(
-        workerRequest(TREE_PATH),
-        ENV
-      );
-      assert.equal(response.status, 200);
-      assert.equal(timers.records.length, 1);
-      const deadline = timers.records[0];
-      assert.equal(deadline.cleared, false);
-
-      await assert.rejects(
-        response.text(),
-        /body contains invalid UTF-8/
-      );
-      await harness.cancellationStarted;
-      await new Promise(resolve => setImmediate(resolve));
-
-      assert.equal(harness.cancellations(), 1);
-      assert.equal(harness.pulls(), 3);
-      assert.equal(harness.signal()?.aborted, false);
-      assert.equal(deadline.cleared, true);
-    });
-  } finally {
-    harness.finish();
-    timers.restore();
-  }
-});
-
-test('pagination abort at a page boundary prevents the next fetch', async () => {
-  const owner = new AbortController();
-  const firstBody = deferred();
-  const firstFetch = deferred();
-  const upstreamUrls = [];
-
-  firstBody.promise.then(() => {
-    owner.abort(abortError('Caller cancelled between pages'));
-  });
-
-  await withMockedFetch(async (url, options = {}) => {
-    upstreamUrls.push(String(url));
-    if (upstreamUrls.length === 1) {
-      firstFetch.resolve();
-      return {
-        ok: true,
-        status: 200,
-        text: () => firstBody.promise,
-      };
-    }
-    if (options.signal?.aborted) throw abortError();
-    return jsonResponse({
-      total_count: 2,
-      installations: [
-        { id: 2, account: { login: 'second-user' } },
-      ],
-    });
-  }, async () => {
-    const workerPromise = worker.fetch(
-      workerRequest('/auth/installations', { signal: owner.signal }),
-      ENV
-    );
-    await firstFetch.promise;
-    firstBody.resolve(JSON.stringify({
-      total_count: 2,
-      installations: [
-        { id: 1, account: { login: 'first-user' } },
-      ],
-    }));
-    const response = await workerPromise;
-
-    assert.deepEqual(
-      {
-        document: await responseDocument(response),
-        status: response.status,
-        upstreamUrls,
-      },
-      {
-        document: CALLER_ABORT_DOCUMENT,
-        status: 499,
-        upstreamUrls: [
-          'https://api.github.com/user/installations?per_page=100&page=1',
-        ],
-      }
-    );
-  });
-});
-
-test('successful read removes caller listener and clears its deadline', async () => {
+test('successful read removes caller listener and leaves no stall clock running', async () => {
   const owner = new AbortController();
   const request = workerRequest('/auth/user', { signal: owner.signal });
   const listenerObserver = observeAbortListeners(request.signal);
@@ -954,7 +829,6 @@ test('successful read removes caller listener and clears its deadline', async ()
       assert.equal(response.status, 200);
       assert.deepEqual(await responseDocument(response), USER_DOCUMENT);
 
-      assert.equal(timers.records.length, 1);
       const listenerAdditions = Array.from(
         listenerObserver.additions.values()
       ).reduce((sum, count) => sum + count, 0);
@@ -967,19 +841,17 @@ test('successful read removes caller listener and clears its deadline', async ()
           additions
         );
       }
+      assert.ok(timers.records.length >= 1);
       assert.deepEqual(
         {
-          activeDeadlines:
-            timers.records.filter(
-              record => !record.cleared && !record.fired
-            ).length,
-          deadlineMs: timers.records[0].delay,
+          live: timers.live().length,
+          delays: [...new Set(timers.records.map(record => record.delay))],
           listenerAdditions,
           listenerRemovals,
         },
         {
-          activeDeadlines: 0,
-          deadlineMs: WORKER_DEADLINE_MS,
+          live: 0,
+          delays: [WORKER_STALL_TIMEOUT_MS],
           listenerAdditions: 1,
           listenerRemovals: 1,
         }

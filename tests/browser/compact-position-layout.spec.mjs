@@ -398,13 +398,10 @@ test('1D, 2D and 3D views each keep their own layout through switching, kept vie
     viewer.setForceLOD(0);
     // The trees with their levels are built off the main thread; until they
     // land each pane draws full detail, and each store then takes its tree's
-    // order a band at a time. Waited for by the clock: a slow runner draws
-    // few frames while the workers build.
-    for (const deadline = performance.now() + 120_000; ;) {
+    // order a band at a time. Waited for however long the workers take.
+    do {
       await frames(1);
-      if (viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(id) >= 0 && viewer.isPresentedGeometrySettled()) break;
-      if (performance.now() > deadline) throw new Error(`The trees never landed: ${JSON.stringify(viewer.debugRendererStatus())}`);
-    }
+    } while (!(viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(id) >= 0 && viewer.isPresentedGeometrySettled()));
     await frames(2);
     const lodLevels = {
       live: viewer.getCurrentLODLevel('live'),

@@ -62,6 +62,28 @@ function makeCategoryId(source, originalFieldKey, originalLabel) {
   );
 }
 
+/**
+ * The parts of a `makeCategoryId` key: its source, field and label, the label
+ * of its own type again (the tag says which).
+ *
+ * @param {string} id
+ * @returns {{source: string, field: string, category: string|number|boolean}}
+ */
+function parseCategoryId(id) {
+  const sourceEnd = id.indexOf(':');
+  const lengthEnd = id.indexOf(':', sourceEnd + 1);
+  const length = Number(id.slice(sourceEnd + 1, lengthEnd));
+  const fieldStart = lengthEnd + 1;
+  const field = id.slice(fieldStart, fieldStart + length);
+  const tag = id.slice(fieldStart + length + 1, fieldStart + length + 2);
+  const text = id.slice(fieldStart + length + 3);
+  const category = tag === 'n' ? Number(text) : tag === 'b' ? text === 'true' : text;
+  if (sourceEnd < 1 || !Number.isSafeInteger(length) || makeCategoryId(id.slice(0, sourceEnd), field, category) !== id) {
+    throw new TypeError(`Category rename key "${id}" is malformed`);
+  }
+  return { source: id.slice(0, sourceEnd), field, category };
+}
+
 export class RenameRegistry extends BaseRegistry {
   constructor() {
     super();
@@ -201,6 +223,53 @@ export class RenameRegistry extends BaseRegistry {
   clear() {
     this._fieldRenames.clear();
     this._categoryRenames.clear();
+    this._recordReplacement();
+  }
+
+  /**
+   * Every rename by name, in the order made: a field by its source and
+   * original key, a category by its field's original key and its original
+   * label (of its own type), each with the name it is shown under.
+   *
+   * @returns {{fields: Array<{source: string, key: string, name: string}>,
+   *   categories: Array<{source: string, field: string, category: string|number|boolean, name: string|number|boolean}>}}
+   */
+  toEntries() {
+    return {
+      fields: [...this._fieldRenames].map(([id, name]) => {
+        const at = id.indexOf(':');
+        return { source: id.slice(0, at), key: id.slice(at + 1), name };
+      }),
+      categories: [...this._categoryRenames].map(([id, name]) => ({ ...parseCategoryId(id), name })),
+    };
+  }
+
+  /**
+   * Replace every rename with `entries` (`toEntries`'s shape), checked whole
+   * before anything changes.
+   *
+   * @param {ReturnType<RenameRegistry['toEntries']>} entries
+   */
+  fromEntries(entries) {
+    requirePlainRecord(entries, 'Rename entries');
+    const fields = new Map();
+    for (const { source, key, name } of entries.fields) {
+      requireSource(source);
+      StateValidator.validateFieldKey(key);
+      StateValidator.validateFieldKey(name);
+      fields.set(makeFieldId(source, key), name);
+    }
+    const categories = new Map();
+    for (const { source, field, category, name } of entries.categories) {
+      requireSource(source);
+      StateValidator.validateFieldKey(field);
+      StateValidator.validateCategoryLabel(category);
+      StateValidator.validateCategoryLabel(name);
+      categories.set(makeCategoryId(source, field, category), name);
+    }
+    this._fieldRenames = fields;
+    this._categoryRenames = categories;
+    this._data = this._fieldRenames;
     this._recordReplacement();
   }
 

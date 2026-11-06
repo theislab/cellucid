@@ -1,28 +1,16 @@
 import { createHash } from 'node:crypto';
-import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
 import { filePickerAccept } from '../../assets/js/data/input-formats.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
 import { openZarrFolder } from './helpers/dataset-drop.mjs';
-import {
-  readBundle,
-} from '../../assets/js/app/session/bundle/reader.js';
-import {
-  writeBundle,
-} from '../../assets/js/app/session/bundle/writer.js';
-import {
-  gzipDecompress,
-} from '../../assets/js/app/session/codecs/gzip.js';
+import { shownDomainValue, startingViewBytes } from './helpers/session-files.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
-
-const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
-  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => profile.id),
-);
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const fixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -108,66 +96,6 @@ async function colorByCellType(page) {
   const field = page.locator('#categorical-field');
   await field.selectOption({ label: 'cell_type' });
   await expect(field.locator('option:checked')).toHaveText('cell_type');
-}
-
-async function createPublishedDefaultBytes(genericBytes) {
-  const { manifest, chunkStream } = await readBundle(
-    new Blob([genericBytes]),
-    {
-      signal: null,
-      onProgress: null,
-    },
-  );
-  const chunksById = new Map();
-  for await (const chunk of chunkStream) {
-    if (chunksById.has(chunk.meta.id)) {
-      throw new Error(
-        `Generic browser fixture duplicated chunk "${chunk.meta.id}".`,
-      );
-    }
-    chunksById.set(chunk.meta.id, chunk);
-  }
-  const selected = PUBLISHED_DEFAULT_CHUNK_IDS.map(chunkId => {
-    const chunk = chunksById.get(chunkId);
-    if (chunk === undefined) {
-      throw new Error(
-        `Generic browser fixture omitted published chunk "${chunkId}".`,
-      );
-    }
-    return chunk;
-  });
-  const published = writeBundle({
-    manifest: {
-      ...manifest,
-      // A published default is applied to the sample it ships beside.
-      source: null,
-      chunks: selected.map(chunk => chunk.meta),
-    },
-    chunks: selected.map(chunk => chunk.bytes),
-  });
-  return Buffer.from(await published.arrayBuffer());
-}
-
-async function readCoreStatePayload(sessionPath) {
-  const bytes = await readFile(sessionPath);
-  const { chunkStream } = await readBundle(
-    new Blob([bytes]),
-    {
-      signal: null,
-      onProgress: null,
-    },
-  );
-  for await (const chunk of chunkStream) {
-    if (chunk.meta.id !== 'core/state') continue;
-    const payloadBytes = chunk.meta.codec === 'gzip'
-      ? await gzipDecompress(chunk.bytes, {
-          maxOutputBytes: chunk.meta.uncompressedBytes,
-          signal: null,
-        })
-      : chunk.bytes;
-    return JSON.parse(new TextDecoder().decode(payloadBytes));
-  }
-  throw new Error('Downloaded session omitted the core/state chunk.');
 }
 
 test('loads the current H5AD contract with a planar 2-D camera and no playback', async ({ page }) => {
@@ -333,7 +261,7 @@ test('saves and restores the exact current UI state through one file-input contr
   const savedPointSize = await page.locator('#point-size').inputValue();
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath('current.cellucid-session');
   await download.saveAs(sessionPath);
@@ -349,7 +277,7 @@ test('saves and restores the exact current UI state through one file-input contr
   await expect(page.locator('#visualization-section')).not.toHaveAttribute('open', '');
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 
@@ -400,7 +328,7 @@ test('session restore rebuilds saved smoke once after retiring current snapshots
   ).toBe(true);
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath('saved-smoke.cellucid-session');
   await download.saveAs(sessionPath);
@@ -421,7 +349,7 @@ test('session restore rebuilds saved smoke once after retiring current snapshots
   });
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
   await expect(page.locator('#render-mode')).toHaveValue('smoke');
@@ -472,7 +400,7 @@ test('session restore catches a real control-owner failure and rolls back', asyn
   ).toBe(1);
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath(
     'control-owner.cellucid-session',
@@ -505,7 +433,7 @@ test('session restore catches a real control-owner failure and rolls back', asyn
   });
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 
@@ -571,7 +499,7 @@ test(
       downloadObserved = true;
     });
     const downloadPromise = page.waitForEvent('download');
-    await page.locator('#save-state-btn').click();
+    await clickSaveSession(page);
     await page.evaluate(() => new Promise(resolve => {
       requestAnimationFrame(() => queueMicrotask(resolve));
     }));
@@ -583,11 +511,10 @@ test(
       'deferred-field.cellucid-session',
     );
     await download.saveAs(sessionPath);
-    const coreState = await readCoreStatePayload(sessionPath);
-    expect(coreState.activeFields).toEqual({
-      activeFieldKey: 'stage',
-      activeFieldSource: 'obs',
-    });
+    // The session's coloured field is the one chosen while its codes were
+    // still read: the shown value of the active-field domain names it.
+    const activeField = await shownDomainValue(await readFile(sessionPath), 'active-field');
+    expect(JSON.stringify(activeField)).toContain('"stage"');
     expect(browserErrors).toEqual([]);
   },
 );
@@ -619,14 +546,14 @@ test('an advertised sample applies one verified static state without camera moti
   await page.locator('#point-size').dispatchEvent('input');
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const statePath = testInfo.outputPath(
     'published-default.cellucid-session',
   );
   await download.saveAs(statePath);
   const genericStateBytes = await readFile(statePath);
-  const stateBytes = await createPublishedDefaultBytes(genericStateBytes);
+  const stateBytes = await startingViewBytes(genericStateBytes);
   const stateSha256 = createHash('sha256')
     .update(stateBytes)
     .digest('hex');
@@ -710,13 +637,13 @@ test('a published no-vector sample replaces a prior vector-field select generati
   await expectPlanarCurrentDataset(page, 'Current UI fixture');
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const statePath = testInfo.outputPath(
     'published-no-vector.cellucid-session',
   );
   await download.saveAs(statePath);
-  const stateBytes = await createPublishedDefaultBytes(
+  const stateBytes = await startingViewBytes(
     await readFile(statePath),
   );
   const stateSha256 = createHash('sha256')
@@ -854,7 +781,7 @@ test('camera path state round-trips every owned control and commits autoplay', a
   await expect(page.locator('.cinematic-play-btn')).toHaveAttribute('title', 'Pause');
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath('camera-autoplay.cellucid-session');
   await download.saveAs(sessionPath);
@@ -893,7 +820,7 @@ test('camera path state round-trips every owned control and commits autoplay', a
   });
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 

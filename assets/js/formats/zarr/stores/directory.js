@@ -92,8 +92,19 @@ export function directoryStore(files, {
     }, signal, activity);
   }
 
-  const get = async (key, { signal = null, activity = null } = {}) => {
+  // A key the store's documents name in another Unicode form than the
+  // folder's file name (a decomposed `café` from macOS, a composed one in
+  // the metadata) finds its file in one form (`open.js` `sameForm`).
+  let byForm = null;
+  const fileOf = key => {
     const file = map.get(key);
+    if (file !== undefined) return file;
+    byForm ??= new Map([...map].map(([path, item]) => [path.normalize('NFC'), item]));
+    return byForm.get(key.normalize('NFC'));
+  };
+
+  const get = async (key, { signal = null, activity = null } = {}) => {
+    const file = fileOf(key);
     if (file === undefined) return null;
     return readSlice(file, 0, file.size, signal, activity);
   };
@@ -110,7 +121,7 @@ export function directoryStore(files, {
     get,
     getMany: (keys, options) => Promise.all(keys.map(key => get(key, options))),
     async getRanges(key, ranges, options = {}) {
-      const file = map.get(key);
+      const file = fileOf(key);
       if (file === undefined) return null;
       return Promise.all(ranges.map(range => {
         const start = range.suffix !== undefined ? Math.max(0, file.size - range.suffix) : range.offset;
@@ -120,7 +131,7 @@ export function directoryStore(files, {
       }));
     },
     mergeGapBytes,
-    storedSize: key => map.get(key)?.size ?? 0,
+    storedSize: key => fileOf(key)?.size ?? 0,
     list: () => [...map.keys()],
     stats: () => ({ ...stats }),
   });

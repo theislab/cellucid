@@ -18,6 +18,7 @@ import { fulfillFile } from './anndata-zarr-zip.mjs';
 import { jsonResponse, serveAnnDataServer } from './anndata-server.mjs';
 import { dismissWelcome } from './welcome.mjs';
 import { openCollapsedPanels } from './panels.mjs';
+import { clickSaveSession, clickLoadSession } from './session-buttons.mjs';
 
 export const fixturesDirectory = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -410,7 +411,7 @@ export async function savedSessionFor(page, testInfo, target, label) {
   await page.locator('#background-select').selectOption('black');
   await expect(page.locator('#background-select')).toHaveValue('black');
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath(`${label}.cellucid-session`);
   await download.saveAs(sessionPath);
@@ -419,7 +420,7 @@ export async function savedSessionFor(page, testInfo, target, label) {
 
 export async function chooseSessionFile(page, sessionPath) {
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 }

@@ -193,5 +193,23 @@
         "folder": []
       }
     }
+  ],
+  "cellucidFiles": [
+    {
+      "id": "library",
+      "label": "Cellucid library file",
+      "names": [
+        ".cellucid-library"
+      ],
+      "said": "This is a Cellucid library file: datasets of My datasets and their saved states, exported by the Cellucid web app. It is not a dataset: import it in the web app with Session › Open data › My datasets › All… › Import…."
+    },
+    {
+      "id": "session",
+      "label": "Cellucid session file",
+      "names": [
+        ".cellucid-session"
+      ],
+      "said": "This is a Cellucid session file: the history of one dataset, not a dataset. Open its dataset, then load it with State › Session › Load… › Open a session file…; in Python read it with cellucid.read_session(), in R with cellucid_read_session()."
+    }
   ]
 }

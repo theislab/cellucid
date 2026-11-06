@@ -142,8 +142,11 @@ test('an incompatible Worker preserves repository ownership in role, pull, and p
   assert.ok(roleDisconnect > incompatibleRole);
   assert.match(
     roleResolution.slice(incompatibleRole, roleDisconnect),
-    /repository connection was preserved[\s\S]*?Deploy the matching Cellucid Worker[\s\S]*?return false;/
+    /repository connection was preserved\.`;[\s\S]*?return false;/
   );
+  // The error's own words say the remedy (redeploy an older Worker, reload
+  // Cellucid for a newer one): no fixed remedy is appended.
+  assert.doesNotMatch(source, /Deploy the matching Cellucid Worker/);
 
   const pull = functionSlice(
     'async function pullFromGitHub',
@@ -244,10 +247,8 @@ test('every async confirmation is physically owned by the exact context signal',
 });
 
 test('repository discovery stays serial while its active DOM is bounded and memoized', () => {
-  assert.match(
-    connectionFlowSource,
-    /const GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS = 10_000;/
-  );
+  // Discovery lists every repository an installation reaches: no count cap.
+  assert.doesNotMatch(connectionFlowSource, /DISCOVERY_MAX_ITEMS/);
   assert.match(
     connectionFlowSource,
     /const GITHUB_REPOSITORY_PAGE_SIZE = 100;/
@@ -289,10 +290,6 @@ test('repository discovery stays serial while its active DOM is bounded and memo
     /for \(const inst of installations\) \{[\s\S]*?await githubAuth\.listInstallationRepos/
   );
   assert.doesNotMatch(discovery, /Promise\.all/);
-  assert.match(
-    discovery,
-    /repos\.length >=[\s\S]*?GITHUB_REPOSITORY_DISCOVERY_MAX_ITEMS/
-  );
   assert.match(discovery, /searchKey: nameKey/);
   assert.match(
     discovery,

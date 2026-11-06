@@ -5,15 +5,17 @@
  * `dockable-accordions.js` used to keep a private copy of each:
  *
  * - **Which panel is on top.** A `zIndexCounter` counted this module's own
- *   calls, but `--z-layer` on the panels is what the browser stacks by, and a
- *   session restore writes it directly
- *   (`session/contributors/dockable-layout.js`). After a restore the counter
- *   was back at its base while the restored panels sat far above it, so every
- *   panel torn off afterwards opened *behind* them and clicking it raised it by
- *   one from the same stale base — it could never be brought to the front.
+ *   calls, but `--z-layer` on the panels is what the browser stacks by. When a
+ *   saved layout still carried each panel's layer and its restore wrote it
+ *   directly, the counter was back at its base while the restored panels sat
+ *   far above it, so every panel torn off afterwards opened *behind* them and
+ *   clicking it raised it by one from the same stale base — it could never be
+ *   brought to the front. A layout now holds no layer at all (the `layout`
+ *   state domain, `state/domains/layout.js`), and the stack is still read from
+ *   the panels.
  * - **Where a panel belongs when docked.** The placeholder holds the slot, and
  *   whether to leave one was passed in by the caller rather than read off the
- *   panel. The restore path floats a panel that is standing in the sidebar but
+ *   panel. A layout restore floats a panel that is standing in the sidebar but
  *   shares an entry point with analysis windows, which have no slot, so a
  *   restored panel docked to the end of the sidebar instead of to its place.
  * - **How big a panel is.** `--pos-width/height` is the panel's box;
@@ -35,10 +37,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { initDockableAccordions } from '../assets/js/app/dockable-accordions.js';
-import {
-  capture as captureDockableLayout,
-  restore as restoreDockableLayout,
-} from '../assets/js/app/session/contributors/dockable-layout.js';
+import { getActionCatalog } from '../assets/js/app/actions/index.js';
+import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
+import { createLayoutDomain } from '../assets/js/app/state/domains/layout.js';
 
 /* ------------------------------------------------------------------ *
  * A DOM small enough to read and complete enough to drive the module. *
@@ -324,6 +325,27 @@ class FakeHTMLDetailsElement extends FakeHTMLElement {
 }
 
 /** Capture down the ancestor chain, then the target, then bubble back up. */
+/**
+ * A dispatcher of its own for each panel system under test: the section
+ * actions (`layout.panel.*`) are provided on it, and its buttons dispatch
+ * through it.
+ */
+function freshActions() {
+  return createActionDispatcher({ catalog: getActionCatalog() });
+}
+
+/** Resolves once `dispatcher` has applied an action of `type` (a button's dispatch is not awaited by its click). */
+function applied(dispatcher, type) {
+  return new Promise((resolve, reject) => {
+    const stop = dispatcher.subscribe(event => {
+      if (event.type !== type || (event.kind !== 'done' && event.kind !== 'failed')) return;
+      stop();
+      if (event.kind === 'done') resolve(event.outcome);
+      else reject(event.error);
+    });
+  });
+}
+
 function dispatch(target, type, init = {}) {
   let propagationStopped = false;
   let immediateStopped = false;
@@ -515,8 +537,27 @@ function isFloatingPanel(details) {
   return frameOf(details).classList.contains('accordion-floating');
 }
 
-function panelPayload(id, { left, top, width, height, z, open = true }) {
-  return { id, open, rect: { left, top, width, height }, z };
+/**
+ * The `layout` state domain over this page's sidebar and dockable owner (the
+ * sidebar's own paths unused here; no analysis code, so no analysis window).
+ */
+function layoutOf(sidebar, dockable) {
+  const sidebarLayout = {
+    isSidebarShown: () => true,
+    showSidebar() { throw new Error('the sidebar is not shown or hidden in these cases'); },
+    setSidebarWidth() { throw new Error('the sidebar is not resized in these cases'); },
+  };
+  return createLayoutDomain({ sidebar, getDockable: () => dockable, analysis: async () => null, sidebarLayout });
+}
+
+/** One floating panel of a layout value: its id and its box. */
+function panelAt(id, { left, top, width, height }) {
+  return { id, rect: { left, top, width, height } };
+}
+
+/** Restore the layout shown now with exactly `panels` floating. */
+async function restorePanels(layout, panels) {
+  await layout.restore({ ...(await layout.capture()), panels });
 }
 
 /* ------------------------------------------------------------------ *
@@ -524,27 +565,19 @@ function panelPayload(id, { left, top, width, height, z, open = true }) {
  * ------------------------------------------------------------------ */
 
 test(
-  'a panel torn off after a session restore opens above the restored panels',
-  (t) => {
+  'a panel torn off after a layout restore opens above the restored panels',
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha', 'beta', 'gamma']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
-    // A saved session carries whatever layers the panels reached while the
-    // user worked; every click on a floating panel raised one.
-    restoreDockableLayout({ dockableAccordions: dockable }, null, {
-      panels: [
-        panelPayload('alpha', {
-          left: 500, top: 40, width: 320, height: 300, z: 141,
-        }),
-        panelPayload('beta', {
-          left: 900, top: 60, width: 320, height: 300, z: 142,
-        }),
-      ],
-    });
-
-    assert.equal(layerOf(panels.get('alpha').details), 141);
-    assert.equal(layerOf(panels.get('beta').details), 142);
+    await restorePanels(layoutOf(sidebar, dockable), [
+      panelAt('alpha', { left: 500, top: 40, width: 320, height: 300 }),
+      panelAt('beta', { left: 900, top: 60, width: 320, height: 300 }),
+    ]);
+    const alphaLayer = layerOf(panels.get('alpha').details);
+    const betaLayer = layerOf(panels.get('beta').details);
+    assert.equal(Number.isFinite(alphaLayer) && Number.isFinite(betaLayer), true);
 
     // The user now tears off a third panel. It must land on top.
     const gamma = panels.get('gamma').details;
@@ -552,32 +585,29 @@ test(
 
     assert.equal(isFloatingPanel(gamma), true);
     assert.ok(
-      layerOf(gamma) > 142,
+      layerOf(gamma) > Math.max(alphaLayer, betaLayer),
       `a newly torn-off panel opened at layer ${layerOf(gamma)}, `
-      + 'below the restored panels at 141 and 142',
+      + `below the restored panels at ${alphaLayer} and ${betaLayer}`,
     );
   },
 );
 
 test(
   'clicking a panel brings it to the front of a restored stack',
-  (t) => {
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha', 'beta', 'gamma']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
-    restoreDockableLayout({ dockableAccordions: dockable }, null, {
-      panels: [
-        panelPayload('alpha', {
-          left: 500, top: 40, width: 320, height: 300, z: 141,
-        }),
-        panelPayload('beta', {
-          left: 900, top: 60, width: 320, height: 300, z: 142,
-        }),
-      ],
-    });
-
+    await restorePanels(layoutOf(sidebar, dockable), [
+      panelAt('alpha', { left: 500, top: 40, width: 320, height: 300 }),
+      panelAt('beta', { left: 900, top: 60, width: 320, height: 300 }),
+    ]);
     const alpha = panels.get('alpha').details;
+    assert.ok(
+      layerOf(alpha) < layerOf(panels.get('beta').details),
+      'the panel floated first stands behind the one floated after it',
+    );
     dispatch(panels.get('alpha').summary, 'pointerdown', {
       clientX: 520,
       clientY: 50,
@@ -596,7 +626,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha', 'beta']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     dockable.undock(panels.get('alpha').details);
     dockable.undock(panels.get('beta').details);
@@ -630,22 +660,18 @@ test(
  * ------------------------------------------------------------------ */
 
 test(
-  'a session-restored panel docks back into the slot it came from',
-  (t) => {
+  'a layout-restored panel docks back into the slot it came from',
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, accordion, panels } = buildSidebar(
       doc,
       ['alpha', 'beta', 'gamma'],
     );
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
-    restoreDockableLayout({ dockableAccordions: dockable }, null, {
-      panels: [
-        panelPayload('beta', {
-          left: 600, top: 80, width: 320, height: 300, z: 91,
-        }),
-      ],
-    });
+    await restorePanels(layoutOf(sidebar, dockable), [
+      panelAt('beta', { left: 600, top: 80, width: 320, height: 300 }),
+    ]);
 
     const beta = panels.get('beta').details;
     assert.equal(frameOf(beta).parentElement, dockable.floatingRoot);
@@ -667,7 +693,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, accordion } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     // Analysis windows are built straight into the floating root and are
     // registered as not dockable (`analysis/ui/analysis-window-manager.js`).
@@ -716,11 +742,11 @@ test(
 
 test(
   'a collapsed floating panel reopens at the size it was saved with',
-  (t) => {
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
-    const ctx = { dockableAccordions: dockable };
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
+    const layout = layoutOf(sidebar, dockable);
 
     const alpha = panels.get('alpha').details;
     dockable.float(alpha, {
@@ -730,17 +756,18 @@ test(
     });
     assert.equal(pixels(alpha, '--pos-height'), 420);
 
-    // The user collapses the panel and saves.
+    // The user collapses the panel, and its layout is kept.
     alpha.open = false;
-    const captured = captureDockableLayout(ctx)[0].payload;
-    assert.deepEqual(
-      captured.panels.map(panel => ({ id: panel.id, open: panel.open })),
-      [{ id: 'alpha', open: false }],
-    );
+    const captured = (await layout.capture());
+    assert.deepEqual(captured.panels, [
+      panelAt('alpha', { left: 620, top: 90, width: 360, height: 420 }),
+    ], 'a collapsed panel is kept with its own box, not the header it is drawn as');
+    assert.equal(captured.sections.alpha, false);
 
-    // Reopening it in a fresh page must give back the same panel.
+    // Putting that layout back must give back the same panel.
     dockable.dock(alpha);
-    restoreDockableLayout(ctx, null, captured);
+    await layout.restore(captured);
+    assert.equal(alpha.open, false);
     alpha.open = true;
 
     assert.equal(
@@ -754,12 +781,12 @@ test(
 );
 
 test(
-  'floating geometry survives a save and restore unchanged',
-  (t) => {
+  'floating geometry survives a capture and restore unchanged',
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha', 'beta']);
-    const dockable = initDockableAccordions({ sidebar });
-    const ctx = { dockableAccordions: dockable };
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
+    const layout = layoutOf(sidebar, dockable);
 
     dockable.float(panels.get('alpha').details, {
       left: 480,
@@ -772,9 +799,13 @@ test(
       preferredSize: { width: 340, height: 300 },
     });
 
-    const first = captureDockableLayout(ctx)[0].payload;
-    restoreDockableLayout(ctx, null, first);
-    const second = captureDockableLayout(ctx)[0].payload;
+    const first = (await layout.capture());
+    // Docked again, then floated back by the restore.
+    dockable.dock(panels.get('alpha').details);
+    dockable.dock(panels.get('beta').details);
+    assert.deepEqual((await layout.capture()).panels, []);
+    await layout.restore(first);
+    const second = (await layout.capture());
 
     assert.deepEqual(second, first);
   },
@@ -789,7 +820,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     const { details, summary } = panels.get('alpha');
     dockable.float(details, {
@@ -823,7 +854,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     const { details, summary } = panels.get('alpha');
     dockable.float(details, {
@@ -854,7 +885,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     const { details, summary } = panels.get('alpha');
     dockable.unregister(details);
@@ -879,7 +910,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     const alpha = panels.get('alpha').details;
     dockable.undock(alpha);
@@ -905,7 +936,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     const { details, summary } = panels.get('alpha');
     dockable.unregister(details);
@@ -933,23 +964,21 @@ test(
 
 test(
   'restoring a layout measures no panel whose geometry the payload carries',
-  (t) => {
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, panels } = buildSidebar(doc, ['alpha', 'beta', 'gamma']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
+
+    const layout = layoutOf(sidebar, dockable);
+    const shown = (await layout.capture());
 
     doc.measurements.length = 0;
-    restoreDockableLayout({ dockableAccordions: dockable }, null, {
+    await layout.restore({
+      ...shown,
       panels: [
-        panelPayload('alpha', {
-          left: 500, top: 40, width: 320, height: 300, z: 91,
-        }),
-        panelPayload('beta', {
-          left: 900, top: 60, width: 320, height: 300, z: 92,
-        }),
-        panelPayload('gamma', {
-          left: 1200, top: 80, width: 320, height: 300, z: 93,
-        }),
+        panelAt('alpha', { left: 500, top: 40, width: 320, height: 300 }),
+        panelAt('beta', { left: 900, top: 60, width: 320, height: 300 }),
+        panelAt('gamma', { left: 1200, top: 80, width: 320, height: 300 }),
       ],
     });
 
@@ -967,7 +996,7 @@ test(
       assert.ok(
         count <= 1,
         `restoring "${panelId}" forced ${count} layout measurements; the `
-        + 'payload already carries its position and its size',
+        + 'layout already carries its position and its size',
       );
     }
   },
@@ -975,19 +1004,15 @@ test(
 
 test(
   'shrinking the viewport keeps a floating panel reachable',
-  (t) => {
+  async (t) => {
     const doc = installDom(t, { viewportWidth: 1600, viewportHeight: 900 });
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     // Placed against a wide window, near its right edge.
-    restoreDockableLayout({ dockableAccordions: dockable }, null, {
-      panels: [
-        panelPayload('alpha', {
-          left: 1200, top: 500, width: 320, height: 300, z: 90,
-        }),
-      ],
-    });
+    await restorePanels(layoutOf(sidebar, dockable), [
+      panelAt('alpha', { left: 1200, top: 500, width: 320, height: 300 }),
+    ]);
 
     const details = panels.get('alpha').details;
     const readLeft = () => pixels(details, '--pos-x');
@@ -1019,17 +1044,13 @@ test(
 
 test(
   'a viewport resize does not move a panel that is already inside it',
-  (t) => {
+  async (t) => {
     const doc = installDom(t, { viewportWidth: 1600, viewportHeight: 900 });
     const { sidebar, panels } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
-    restoreDockableLayout({ dockableAccordions: dockable }, null, {
-      panels: [
-        panelPayload('alpha', {
-          left: 100, top: 80, width: 320, height: 300, z: 90,
-        }),
-      ],
-    });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
+    await restorePanels(layoutOf(sidebar, dockable), [
+      panelAt('alpha', { left: 100, top: 80, width: 320, height: 300 }),
+    ]);
 
     const details = panels.get('alpha').details;
     doc.defaultView.resizeTo(1400, 800);
@@ -1047,10 +1068,11 @@ test(
 
 test(
   'a panel\'s window controls stand beside its summary, never inside it',
-  (t) => {
+  async (t) => {
     const doc = installDom(t);
     const { sidebar, accordion, panels } = buildSidebar(doc, ['alpha', 'beta']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dispatcher = freshActions();
+    const dockable = initDockableAccordions({ sidebar, actions: dispatcher });
 
     // Registration framed every panel in place, in sidebar order.
     assert.deepEqual(
@@ -1081,13 +1103,18 @@ test(
     let summaryClicks = 0;
     summary.addEventListener('click', () => { summaryClicks += 1; });
     details.open = false;
+    // The button dispatches the section's action (`layout.panel.float`).
+    const floated = applied(dispatcher, 'layout.panel.float');
     dispatch(undock, 'click');
+    assert.deepEqual(await floated, { panel: 'alpha' });
     assert.equal(summaryClicks, 0);
     assert.equal(isFloatingPanel(details), true);
     assert.equal(frame.parentElement, dockable.floatingRoot);
     assert.equal(doc.activeElement, dockBack, 'focus moves to the control that reverses the move');
 
+    const docked = applied(dispatcher, 'layout.panel.dock');
     dispatch(dockBack, 'click');
+    assert.deepEqual(await docked, { panel: 'alpha' });
     assert.equal(summaryClicks, 0);
     assert.equal(isFloatingPanel(details), false);
     assert.equal(frame.parentElement, accordion);
@@ -1106,7 +1133,7 @@ test(
   (t) => {
     const doc = installDom(t);
     const { sidebar } = buildSidebar(doc, ['alpha']);
-    const dockable = initDockableAccordions({ sidebar });
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
 
     const window_ = new FakeHTMLDetailsElement(doc);
     window_.className = 'accordion-section analysis-window-panel';

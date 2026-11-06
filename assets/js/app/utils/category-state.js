@@ -34,13 +34,16 @@ const HIDDEN = new WeakMap();
 /** Each visibility array's complement: 1 where a category is hidden (made once per array). */
 const HIDDEN_BYTES = new WeakMap();
 
-/** Category lists checked to hold distinct labels of a category's kinds. */
+/**
+ * Category lists checked to hold distinct labels of a category's kinds. A
+ * field's category list is never written once made (a rename makes a new
+ * one, `renameCategory`), so a list checked stays checked.
+ */
 const CHECKED_LABELS = new WeakSet();
 
 /**
- * Whether a category list was checked (`markLabelsChecked`) and not changed
- * since: a list is checked once, not on every colouring of a field of a
- * million categories.
+ * Whether a category list was checked (`markLabelsChecked`): a list is
+ * checked once, not on every colouring of a field of a million categories.
  *
  * @param {ReadonlyArray<unknown>} categories
  */
@@ -51,11 +54,6 @@ export function labelsChecked(categories) {
 /** Record that `categories` holds distinct labels of a category's kinds. */
 export function markLabelsChecked(categories) {
   CHECKED_LABELS.add(categories);
-}
-
-/** A category list changed in place (a label renamed): checked again on its next use. */
-export function forgetLabelsChecked(categories) {
-  CHECKED_LABELS.delete(categories);
 }
 
 /** One colour channel from 0 to 1 as the byte it is drawn in. */

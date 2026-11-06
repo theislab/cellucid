@@ -13,7 +13,8 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 import { until } from './helpers/until.mjs';
@@ -22,15 +23,22 @@ import { until } from './helpers/until.mjs';
 // behaviour contracts below run on each copy, so when the two differ (a
 // sibling repository checked out before its push landed, in CI) the copy
 // that is behind is the one named by its failing behaviour tests.
+// The checkouts are next to this one, or where CELLUCID_PYTHON_ROOT and
+// CELLUCID_R_ROOT say (a worktree, a CI checkout elsewhere).
+const here = path.dirname(fileURLToPath(import.meta.url));
+const ROOTS = Object.freeze({
+  'cellucid-python': process.env.CELLUCID_PYTHON_ROOT ?? path.resolve(here, '..', '..', 'cellucid-python'),
+  'cellucid-r': process.env.CELLUCID_R_ROOT ?? path.resolve(here, '..', '..', 'cellucid-r'),
+});
 const COPIES = [
-  { repository: 'cellucid-python', file: new URL('../../cellucid-python/src/cellucid/jupyter/static/widget.js', import.meta.url) },
-  { repository: 'cellucid-r', file: new URL('../../cellucid-r/inst/widget/widget.js', import.meta.url) },
+  { repository: 'cellucid-python', file: pathToFileURL(path.join(ROOTS['cellucid-python'], 'src', 'cellucid', 'jupyter', 'static', 'widget.js')) },
+  { repository: 'cellucid-r', file: pathToFileURL(path.join(ROOTS['cellucid-r'], 'inst', 'widget', 'widget.js')) },
 ];
 const APP = 'https://www.cellucid.com';
 
 /** The commit a sibling checkout is at, with its date, or why it is unknown. */
 function checkoutOf(repository) {
-  const directory = fileURLToPath(new URL(`../../${repository}`, import.meta.url));
+  const directory = ROOTS[repository];
   try {
     return execFileSync('git', ['-C', directory, 'log', '-1', '--format=%h committed %cI'], { encoding: 'utf8' }).trim();
   } catch {

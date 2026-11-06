@@ -1,20 +1,17 @@
 /**
  * Field-owned highlight groups name a field and a category, and only the
- * names are saved. Positions move whenever a dataset is exported again with
+ * names are kept. Positions move whenever a dataset is exported again with
  * one more obs column or one more category, and nothing in the dataset
  * fingerprint pins them: it covers the cells, not the obs schema. These tests
- * hold restore to the names, and hold the refusals to naming what is missing.
+ * hold restore to the names, and hold the refusals to naming what is missing,
+ * through the `highlights` state domain's own capture and restore
+ * (`app/state/domains/highlights.js`), which a session file and the history
+ * both use.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  getNotificationCenter,
-} from '../assets/js/app/notification-center.js';
-import * as highlightsCellsContributor from
-  '../assets/js/app/session/contributors/highlights-cells.js';
-import * as highlightsMetaContributor from
-  '../assets/js/app/session/contributors/highlights-meta.js';
+import { createHighlightsDomain } from '../assets/js/app/state/domains/highlights.js';
 import {
   highlightStateMethods,
 } from '../assets/js/app/state/managers/highlight-manager.js';
@@ -24,9 +21,7 @@ import {
 import {
   getDatasetFingerprint,
 } from '../assets/js/app/session/session-context.js';
-import {
-  SessionSerializer,
-} from '../assets/js/app/session/session-serializer.js';
+import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import {
   createInMemoryAnnDataDimensionManager,
   describeOwnVarCount,
@@ -38,7 +33,7 @@ const VAR_COUNT = 4;
 const SELECTED_ROWS = [0, 2];
 const CATEGORIES = ['alpha', 'beta', 'gamma'];
 
-/** The obs schema the session is saved against. */
+/** The obs schema the highlights are kept on. */
 const SAVED_OBS = ['donor', 'batch', 'phase', 'cell_type'];
 
 const STATE_PROTOTYPE = (() => {
@@ -99,6 +94,7 @@ function makeDatasetState({ obs = SAVED_OBS, pages }) {
     })),
   };
   state.pointCount = CELL_COUNT;
+  state.cellIdentity = createCellIdentity({ nObs: CELL_COUNT });
   state.positionsArray = positions();
   state.dimensionManager = createInMemoryAnnDataDimensionManager({
     positions: state.positionsArray,
@@ -129,21 +125,14 @@ function dataSourceManager() {
   };
 }
 
-function makeSerializer(state) {
-  return new SessionSerializer({
-    state,
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: dataSourceManager(),
-    comparisonModule: null,
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    figureExport: null,
-    contributors: [
-      highlightsMetaContributor,
-      highlightsCellsContributor,
-    ],
-  });
+/** The highlights value of `state`, as a saved state holds it (a copy). */
+function capture(state) {
+  return structuredClone(createHighlightsDomain({ state, refreshUi: () => {} }).capture());
+}
+
+/** Put a captured highlights value back on `state`. */
+function restore(state, value) {
+  return createHighlightsDomain({ state, refreshUi: () => {} }).restore(value);
 }
 
 /**
@@ -170,7 +159,7 @@ function categoryPages({
       fieldSource: 'obs',
       categoryIndex,
       categoryName,
-      cellIndices: [...SELECTED_ROWS],
+      cellIndices: Uint32Array.from(SELECTED_ROWS),
       cellCount: SELECTED_ROWS.length,
     }],
   }];
@@ -185,42 +174,9 @@ function emptyPages() {
   }];
 }
 
-async function withNotificationHarness(run) {
-  const notifications = getNotificationCenter();
-  const names = [
-    'completeDownload',
-    'dismissDownload',
-    'error',
-    'failDownload',
-    'info',
-    'startDownload',
-    'success',
-    'updateDownload',
-    'warning',
-  ];
-  const originals = new Map(names.map(name => [name, notifications[name]]));
-  for (const name of names) notifications[name] = () => {};
-  notifications.startDownload = () => 'session-highlight-field-identity-test';
-  const previousAnimationFrame = globalThis.requestAnimationFrame;
-  globalThis.requestAnimationFrame = callback => {
-    queueMicrotask(() => callback(0));
-    return 1;
-  };
-  try {
-    return await run();
-  } finally {
-    for (const [name, original] of originals) notifications[name] = original;
-    if (previousAnimationFrame === undefined) {
-      delete globalThis.requestAnimationFrame;
-    } else {
-      globalThis.requestAnimationFrame = previousAnimationFrame;
-    }
-  }
-}
-
-async function captureCategoryBundle(options) {
+function captureCategoryValue(options) {
   const source = makeDatasetState({ pages: categoryPages(options) });
-  return makeSerializer(source).createSessionBundle();
+  return capture(source);
 }
 
 function restoredGroup(state) {
@@ -246,22 +202,22 @@ function boundNames(state) {
   };
 }
 
-test('a saved group records names, never positions', () => {
+test('a kept group records names, never positions', () => {
   const source = makeDatasetState({ pages: categoryPages() });
-  const [chunk] = highlightsMetaContributor.capture({ state: source });
-  const [group] = chunk.payload.pages[0].highlightedGroups;
+  const [group] = capture(source).pages[0].groups;
   assert.deepEqual(Object.keys(group).sort(), [
-    'categoryName', 'cellCount', 'enabled', 'fieldKey', 'fieldSource', 'id', 'label', 'type',
+    'category', 'cells', 'enabled', 'field', 'id', 'label', 'type',
   ]);
+  assert.deepEqual(group.field, { source: 'obs', key: 'cell_type' });
+  assert.equal(group.category, 'beta');
+  assert.deepEqual([...group.cells], SELECTED_ROWS);
 });
 
 test('an unchanged dataset restores the exact saved binding', async () => {
-  const bundle = await captureCategoryBundle();
+  const saved = captureCategoryValue();
   const destination = makeDatasetState({ pages: emptyPages() });
 
-  await withNotificationHarness(async () => {
-    await makeSerializer(destination).restoreFromBlob(bundle);
-  });
+  await restore(destination, saved);
 
   assert.deepEqual(boundNames(destination), {
     fieldKey: 'cell_type',
@@ -281,7 +237,7 @@ test('an unchanged dataset restores the exact saved binding', async () => {
 test(
   'an obs column added before the highlighted field does not move the binding',
   async () => {
-    const bundle = await captureCategoryBundle();
+    const saved = captureCategoryValue();
     const destination = makeDatasetState({
       obs: ['donor', 'batch', 'phase', 'doublet_score', 'cell_type'],
       pages: emptyPages(),
@@ -299,9 +255,7 @@ test(
       }),
     );
 
-    await withNotificationHarness(async () => {
-      await makeSerializer(destination).restoreFromBlob(bundle);
-    });
+    await restore(destination, saved);
 
     assert.equal(restoredGroup(destination).fieldIndex, 4);
     assert.deepEqual(boundNames(destination), {
@@ -324,15 +278,13 @@ test(
 test(
   'an obs column removed before the highlighted field does not move the binding',
   async () => {
-    const bundle = await captureCategoryBundle();
+    const saved = captureCategoryValue();
     const destination = makeDatasetState({
       obs: ['donor', 'phase', 'cell_type'],
       pages: emptyPages(),
     });
 
-    await withNotificationHarness(async () => {
-      await makeSerializer(destination).restoreFromBlob(bundle);
-    });
+    await restore(destination, saved);
 
     assert.equal(restoredGroup(destination).fieldIndex, 2);
     assert.deepEqual(boundNames(destination), {
@@ -347,53 +299,49 @@ test(
 );
 
 test('a renamed highlighted field is refused by name', async () => {
-  const bundle = await captureCategoryBundle();
+  const saved = captureCategoryValue();
   const destination = makeDatasetState({
     obs: ['donor', 'batch', 'phase', 'cell_type_v2'],
     pages: emptyPages(),
   });
   const untouched = destination.highlightPages;
 
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      makeSerializer(destination).restoreFromBlob(bundle),
-      error => {
-        assert.match(error.message, /"cell_type"/);
-        assert.match(error.message, /does not have/);
-        return true;
-      },
-    );
-  });
+  await assert.rejects(
+    restore(destination, saved),
+    error => {
+      assert.match(error.message, /"cell_type"/);
+      assert.match(error.message, /does not have/);
+      return true;
+    },
+  );
   assert.strictEqual(destination.highlightPages, untouched);
   assert.deepEqual(untouched[0].highlightedGroups, []);
 });
 
 test('a highlighted field that is gone entirely is refused by name', async () => {
-  const bundle = await captureCategoryBundle();
+  const saved = captureCategoryValue();
   const destination = makeDatasetState({
     obs: ['donor', 'batch', 'phase'],
     pages: emptyPages(),
   });
   const untouched = destination.highlightPages;
 
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      makeSerializer(destination).restoreFromBlob(bundle),
-      error => {
-        // The manifest's `requires` names every dataset field the session
-        // uses, so a missing one is refused before any chunk is applied.
-        assert.ok(error instanceof RangeError);
-        assert.match(error.message, /observation field "cell_type"/);
-        assert.match(error.message, /was not opened/);
-        return true;
-      },
-    );
-  });
+  await assert.rejects(
+    restore(destination, saved),
+    error => {
+      // The group names its field, so a field that is gone is refused by
+      // that name before anything is replaced (a session file's `requires`
+      // names it before anything is read: `session-cell-order-identity`).
+      assert.ok(error instanceof RangeError);
+      assert.match(error.message, /saved on the obs field "cell_type", which the dataset that is open now does not have/);
+      return true;
+    },
+  );
   assert.strictEqual(destination.highlightPages, untouched);
 });
 
 test('a highlighted field that changed kind is refused by name', async () => {
-  const bundle = await captureCategoryBundle();
+  const saved = captureCategoryValue();
   const destination = makeDatasetState({
     obs: [
       'donor',
@@ -404,22 +352,20 @@ test('a highlighted field that changed kind is refused by name', async () => {
     pages: emptyPages(),
   });
 
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      makeSerializer(destination).restoreFromBlob(bundle),
-      error => {
-        assert.match(error.message, /obs field "cell_type"/);
-        assert.match(error.message, /continuous/);
-        return true;
-      },
-    );
-  });
+  await assert.rejects(
+    restore(destination, saved),
+    error => {
+      assert.match(error.message, /obs field "cell_type"/);
+      assert.match(error.message, /continuous/);
+      return true;
+    },
+  );
 });
 
 test(
   'a category added before the highlighted category does not move the binding',
   async () => {
-    const bundle = await captureCategoryBundle();
+    const saved = captureCategoryValue();
     const destination = makeDatasetState({
       obs: [
         'donor',
@@ -430,9 +376,7 @@ test(
       pages: emptyPages(),
     });
 
-    await withNotificationHarness(async () => {
-      await makeSerializer(destination).restoreFromBlob(bundle);
-    });
+    await restore(destination, saved);
 
     assert.equal(restoredGroup(destination).categoryIndex, 2);
     assert.deepEqual(boundNames(destination), {
@@ -451,7 +395,7 @@ test(
 );
 
 test('a highlighted category that is gone is refused by name', async () => {
-  const bundle = await captureCategoryBundle();
+  const saved = captureCategoryValue();
   const destination = makeDatasetState({
     obs: [
       'donor',
@@ -463,41 +407,16 @@ test('a highlighted category that is gone is refused by name', async () => {
   });
   const untouched = destination.highlightPages;
 
-  await withNotificationHarness(async () => {
-    await assert.rejects(
-      makeSerializer(destination).restoreFromBlob(bundle),
-      error => {
-        assert.ok(error instanceof RangeError);
-        assert.match(error.message, /category "beta"/);
-        assert.match(error.message, /"cell_type"/);
-        return true;
-      },
-    );
-  });
-  assert.strictEqual(destination.highlightPages, untouched);
-});
-
-test('capture refuses to write a group whose name and position disagree', () => {
-  const source = makeDatasetState({
-    pages: categoryPages({ fieldIndex: 1 }),
-  });
-  assert.throws(
-    () => highlightsMetaContributor.capture({ state: source }),
+  await assert.rejects(
+    restore(destination, saved),
     error => {
       assert.ok(error instanceof RangeError);
+      assert.match(error.message, /category "beta"/);
       assert.match(error.message, /"cell_type"/);
-      assert.match(error.message, /different field/);
       return true;
     },
   );
-
-  const wrongCategory = makeDatasetState({
-    pages: categoryPages({ categoryIndex: 2 }),
-  });
-  assert.throws(
-    () => highlightsMetaContributor.capture({ state: wrongCategory }),
-    /different category/,
-  );
+  assert.strictEqual(destination.highlightPages, untouched);
 });
 
 test(
@@ -517,14 +436,14 @@ test(
         fieldSource: 'obs',
         rangeMin: 0.25,
         rangeMax: 0.75,
-        cellIndices: [...SELECTED_ROWS],
+        cellIndices: Uint32Array.from(SELECTED_ROWS),
         cellCount: SELECTED_ROWS.length,
       }],
     }];
-    const bundle = await makeSerializer(makeDatasetState({
+    const saved = capture(makeDatasetState({
       obs: ['donor', { key: 'score', kind: 'continuous' }, 'cell_type'],
       pages: rangePages,
-    })).createSessionBundle();
+    }));
 
     const destination = makeDatasetState({
       obs: [
@@ -535,9 +454,7 @@ test(
       ],
       pages: emptyPages(),
     });
-    await withNotificationHarness(async () => {
-      await makeSerializer(destination).restoreFromBlob(bundle);
-    });
+    await restore(destination, saved);
     assert.equal(restoredGroup(destination).fieldIndex, 2);
     assert.equal(
       destination.obsData.fields[restoredGroup(destination).fieldIndex].key,
@@ -548,12 +465,10 @@ test(
       obs: ['donor', 'batch', 'cell_type'],
       pages: emptyPages(),
     });
-    await withNotificationHarness(async () => {
-      await assert.rejects(
-        makeSerializer(gone).restoreFromBlob(bundle),
-        /observation field "score"/,
-      );
-    });
+    await assert.rejects(
+      restore(gone, saved),
+      /saved on the obs field "score", which the dataset that is open now does not have/,
+    );
   },
 );
 
@@ -570,7 +485,7 @@ test('restoring many category highlights reads each inventory once', async () =>
     fieldSource: 'obs',
     categoryIndex,
     categoryName,
-    cellIndices: [...SELECTED_ROWS],
+    cellIndices: Uint32Array.from(SELECTED_ROWS),
     cellCount: SELECTED_ROWS.length,
   }));
   const pages = [{
@@ -585,7 +500,7 @@ test('restoring many category highlights reads each inventory once', async () =>
     )),
     pages,
   });
-  const bundle = await makeSerializer(source).createSessionBundle();
+  const saved = capture(source);
 
   const destination = makeDatasetState({
     obs: SAVED_OBS.map(key => (
@@ -602,9 +517,7 @@ test('restoring many category highlights reads each inventory once', async () =>
     },
   });
 
-  await withNotificationHarness(async () => {
-    await makeSerializer(destination).restoreFromBlob(bundle);
-  });
+  await restore(destination, saved);
   const restored = destination.highlightPages.flatMap(page => page.highlightedGroups);
   assert.equal(restored.length, count);
   assert.equal(restored.at(-1).categoryIndex, count - 1);

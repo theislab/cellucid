@@ -18,6 +18,7 @@ import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { waitForDatasetReady } from './helpers/dataset-ready.mjs';
 import { openPhoneSheet } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const DATASET = 'zero-gray';
 const ROOT = appUrl('/tests/browser/fixtures/generated-zero-gray/');
@@ -96,7 +97,7 @@ test('gray for zero: off by default, on draws zeros gray beneath, offered for co
   await chooseGene(page, 'COUNTS');
   await expect(zeroSwitch).toHaveAttribute('aria-checked', 'true');
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('zero-gray.cellucid-session');
   await (await downloadPromise).saveAs(sessionPath);
   const bytes = await readFile(sessionPath);
@@ -105,7 +106,7 @@ test('gray for zero: off by default, on draws zeros gray beneath, offered for co
   await waitForDatasetReady(page, CELLS);
   await openPhoneSheet(page);
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles({ name: 'zero-gray.cellucid-session', mimeType: 'application/octet-stream', buffer: bytes });
   await expect.poll(() => page.evaluate(() => {
     const state = window._cellucidState;
@@ -116,7 +117,7 @@ test('gray for zero: off by default, on draws zeros gray beneath, offered for co
   expect(errors).toEqual([]);
 });
 
-test('the Session panel: Stored and Session file above Subsampling and Data mapping, collapsed with a summary, kept as this viewer left them', async ({ page }) => {
+test('the Session panel: Stored above Subsampling and Data mapping, collapsed with a summary, kept as this viewer left them', async ({ page }) => {
   await serveSyntheticCatalog(page, ROOT, {
     id: DATASET,
     name: 'Zero gray fixture',
@@ -131,7 +132,8 @@ test('the Session panel: Stored and Session file above Subsampling and Data mapp
   await openPhoneSheet(page);
   // The order of the panel's blocks.
   const ids = await page.evaluate(() => [...document.querySelectorAll('#session-section > .accordion-content > [id]')].map(node => node.id));
-  expect(ids).toEqual(['dataset-facts', 'open-data-controls', 'kept-stores-line', 'session-state-controls', 'reading-section', 'data-mapping-controls']);
+  // (Share… and Load… of the history are the State panel's: `session-state-controls`.)
+  expect(ids).toEqual(['dataset-facts', 'open-data-controls', 'kept-stores-line', 'reading-section', 'data-mapping-controls']);
   // Collapsed, each says what it holds.
   for (const toggle of ['#reading-toggle', '#data-mapping-toggle']) await expect(page.locator(toggle)).toHaveAttribute('aria-expanded', 'false');
   await expect(page.locator('#subsample-slider')).toBeHidden();

@@ -597,9 +597,10 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
     let held = false;
     // The request is cancelled once every read waiting on its members has
     // withdrawn (`SharedWork`), never before.
-    // Bytes every read of every member reads once (a cell export's,
-    // `ReadActivity.readOnce`) are not kept in the page's memory for other
-    // readers (`range-cache.js`).
+    // Bytes every read of every member reads once (a cell export's, a copy
+    // of the dataset's: `ReadActivity.readOnce`) are not kept in the page's
+    // memory for other readers (`range-cache.js`), nor in this browser's
+    // kept parts (`kept-parts.js` `withKeptParts`).
     const keepInMemory = !members.every(member => member.readOnceOnly === true);
     const carrier = new SharedWork(signal => source.read(start, end - start, {
       signal,

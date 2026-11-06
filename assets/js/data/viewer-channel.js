@@ -6,9 +6,9 @@
  * - `open()` connects, says `hello` with the viewer's id and token, and
  *   resolves on the host's `welcome`.
  * - Commands from the host reach `onCommand` in the order they were sent: a
- *   text frame as its JSON object, a binary frame (a command that names
- *   cells) as its header's fields with `cells`, a Uint32Array read in place
- *   (`decodeViewerBinaryCommand`).
+ *   text frame as its JSON object, a binary frame (an `action` whose
+ *   parameters hold typed arrays) as its command with each array in place in
+ *   its parameters, read in place (`decodeViewerBinaryCommand`).
  * - Events go out with `sendEvent` (a JSON text frame) and `sendBinary` (a
  *   header and a body, sent as one Blob so the body is never copied here).
  *   While the socket is reconnecting they wait, in order; a newer hover
@@ -29,6 +29,7 @@
 
 import {
   VIEWER_BINARY_COMMAND_HEADER_FIELDS,
+  VIEWER_COMMAND_FIELDS,
   VIEWER_CHANNEL_PATH,
   VIEWER_CLOSE_CODES,
   VIEWER_WELCOME_FIELDS,
@@ -213,7 +214,10 @@ export class ViewerChannel {
         if (!isPlainRecord(command) || typeof command.type !== 'string') {
           throw new TypeError('a command must be a JSON object with a type');
         }
-        if (Object.hasOwn(VIEWER_BINARY_COMMAND_HEADER_FIELDS, command.type)) {
+        // A command with a text form may come as text (an `action` without
+        // arrays); one that only has a binary form may not.
+        if (!Object.hasOwn(VIEWER_COMMAND_FIELDS, command.type)
+          && Object.hasOwn(VIEWER_BINARY_COMMAND_HEADER_FIELDS, command.type)) {
           throw new TypeError(`a ${command.type} command is sent as a binary frame`);
         }
       }
@@ -348,7 +352,8 @@ export class ViewerChannel {
 
   /**
    * Send one binary event: the header and the body as one Blob, so the body
-   * (a selection's cells, a session file) is handed to the socket as it is.
+   * (a selection's cells, a session file, an action's outcome) is handed to
+   * the socket as it is.
    *
    * @param {Object} header
    * @param {Uint8Array|Blob} body

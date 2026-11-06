@@ -1,0 +1,25 @@
+{
+  "examples": [
+    {
+      "color": "#e41a1c",
+      "name": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "color": {
+        "pattern": "^#[0-9a-fA-F]{6}$",
+        "type": "string"
+      },
+      "name": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "type": "highlight.page.create",
+  "version": 1
+}

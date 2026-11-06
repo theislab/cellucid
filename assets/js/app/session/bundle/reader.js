@@ -1,7 +1,8 @@
 /**
  * @fileoverview Session bundle reader with streaming chunk iteration.
  *
- * Reads the `.cellucid-session` container format:
+ * Reads the `.cellucid-session` container format (or another file kind of the
+ * framing, such as a `.cellucid-library`, by its `signature`):
  *  - MAGIC bytes
  *  - manifest length (u32 LE) + manifest bytes
  *  - repeated chunks: [chunk length (u32 LE), chunk bytes]
@@ -14,9 +15,7 @@
 
 import {
   MAX_FRAME_BYTES,
-  NOT_A_SESSION_FILE_MESSAGE,
-  SESSION_BUNDLE_MAGIC_BYTES,
-  sessionSignatureRefusal,
+  SESSION_SIGNATURE,
   U32_BYTES,
   bytesToU32LE
 } from './format.js';
@@ -24,7 +23,7 @@ import {
   assertNonEmptyString,
   assertSafeInteger,
 } from '../schema-contract.js';
-import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
+import { requireExactKeys, requireKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { throwIfAborted, cancelled } from '../../../utils/abort.js';
 
@@ -42,15 +41,17 @@ class UnexpectedEndOfFileError extends Error {
 class StreamByteReader {
   /**
    * @param {ReadableStreamDefaultReader<Uint8Array>} reader
-   * @param {{ totalBytes: number | null, signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null }} options
+   * @param {{ totalBytes: number | null, signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null,
+   *   file: string }} options - `file`: how a sentence names the file read
    */
   constructor(reader, options) {
     requireExactKeys(
       options,
-      ['totalBytes', 'signal', 'onProgress'],
-      'Session byte reader options'
+      ['totalBytes', 'signal', 'onProgress', 'file'],
+      'Bundle byte reader options'
     );
     this._reader = reader;
+    this._file = options.file;
     this._signal = options.signal;
     this._onProgress = options.onProgress;
     this._totalBytes = options.totalBytes;
@@ -153,13 +154,13 @@ class StreamByteReader {
   async assertEnd() {
     await this._fill();
     if (this._queue.length !== 0) {
-      throw new Error('Invalid session file: trailing bytes after declared chunks.');
+      throw new Error(`Invalid ${this._file}: trailing bytes after declared chunks.`);
     }
     if (!this._streamDone) {
-      throw new Error('Invalid session file: byte stream did not reach its exact end.');
+      throw new Error(`Invalid ${this._file}: byte stream did not reach its exact end.`);
     }
     if (this._totalBytes !== null && this._position !== this._totalBytes) {
-      throw new Error('Invalid session file: consumed byte count does not match file size.');
+      throw new Error(`Invalid ${this._file}: consumed byte count does not match file size.`);
     }
   }
 }
@@ -172,22 +173,27 @@ class StreamByteReader {
  */
 
 /**
- * Read a session bundle and return its manifest plus a streaming chunk iterator.
+ * Read a session bundle (or another file kind of the framing, by its
+ * `signature`: `SESSION_SIGNATURE` by default) and return its manifest plus a
+ * streaming chunk iterator.
  *
  * @param {Blob|ReadableStream<Uint8Array>} source
- * @param {{ signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null }} options
+ * @param {{ signal: AbortSignal | null, onProgress: ((loadedBytes: number) => void) | null,
+ *   signature?: import('./format.js').BundleSignature }} options
  * `cancel(reason)` releases the source for a consumer that abandons the
  * bundle before its chunk stream ends; it is a no-op once the stream ended.
  *
  * @returns {Promise<{ manifest: any, totalBytes: number|null, chunkStream: AsyncGenerator<BundleChunkRead, void, void>, cancel: (reason: unknown) => Promise<void> }>}
  */
 export async function readBundle(source, options) {
-  requireExactKeys(
+  requireKeys(
     options,
     ['signal', 'onProgress'],
-    'Session bundle reader options'
+    ['signature'],
+    'Bundle reader options'
   );
-  const signal = options.signal;
+  const { signal, signature = SESSION_SIGNATURE } = options;
+  const { file, label } = signature;
   throwIfAborted(signal);
 
   let totalBytes = null;
@@ -230,7 +236,8 @@ export async function readBundle(source, options) {
   const byteReader = new StreamByteReader(reader, {
     totalBytes,
     signal,
-    onProgress
+    onProgress,
+    file,
   });
 
   // The reader is owned here until the chunk stream reaches its exact end.
@@ -246,21 +253,24 @@ export async function readBundle(source, options) {
 
   let manifest;
   try {
-    // 1) MAGIC. A file shorter than the signature is not a session file
+    // 1) MAGIC. A file shorter than the signature is not a file of this kind
     // either, and says so in the same words as one with the wrong signature
     // rather than as an end-of-file error about byte counts.
     let magic;
     try {
-      magic = await byteReader.readExactly(SESSION_BUNDLE_MAGIC_BYTES.byteLength);
+      magic = await byteReader.readExactly(signature.bytes.byteLength);
     } catch (error) {
       if (error instanceof UnexpectedEndOfFileError) {
-        throw new Error(NOT_A_SESSION_FILE_MESSAGE, { cause: error });
+        throw new Error(signature.refusal(new Uint8Array(0)), { cause: error });
       }
       throw error;
     }
-    if (!SESSION_BUNDLE_MAGIC_BYTES.every((byte, i) => magic[i] === byte)) {
-      // Another format version's signature says which; anything else is not a session.
-      throw new Error(sessionSignatureRefusal(magic));
+    if (!signature.bytes.every((byte, i) => magic[i] === byte)) {
+      // Another format version's signature, or another file kind's, says which; anything else is not this kind.
+      const refused = new Error(signature.refusal(magic));
+      const otherFormat = signature.otherFormat?.(magic) ?? null;
+      if (otherFormat !== null) refused.otherSessionFormat = otherFormat;
+      throw refused;
     }
 
     // 2) Manifest length
@@ -273,7 +283,7 @@ export async function readBundle(source, options) {
       && manifestByteLength > byteReader.totalBytes - byteReader.position
     ) {
       throw new Error(
-        `Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')} is more than the session file holds (session file truncated?).`
+        `Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')} is more than the ${file} holds (${file} truncated?).`
       );
     }
 
@@ -287,20 +297,20 @@ export async function readBundle(source, options) {
       if (error instanceof RangeError) {
         // The browser's longest string is the only limit left on a manifest.
         throw new Error(
-          `Session manifest of ${formatCountOf(manifestByteLength, 'byte')} is longer than this browser can hold as text.`,
+          `${label} manifest of ${formatCountOf(manifestByteLength, 'byte')} is longer than this browser can hold as text.`,
           { cause: error },
         );
       }
-      throw new Error('Invalid session file (manifest JSON parse failed).', {
+      throw new Error(`Invalid ${file} (manifest JSON parse failed).`, {
         cause: error,
       });
     }
 
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-      throw new Error('Invalid session file (manifest must be a JSON object).');
+      throw new Error(`Invalid ${file} (manifest must be a JSON object).`);
     }
     if (!Array.isArray(manifest.chunks)) {
-      throw new Error('Invalid session file (manifest.chunks must be an array).');
+      throw new Error(`Invalid ${file} (manifest.chunks must be an array).`);
     }
   } catch (error) {
     await cancel(error);
@@ -312,16 +322,16 @@ export async function readBundle(source, options) {
       for (let i = 0; i < manifest.chunks.length; i++) {
         throwIfAborted(signal);
         const meta = manifest.chunks[i];
-        requirePlainRecord(meta, `Session manifest chunk ${i}`);
+        requirePlainRecord(meta, `${label} manifest chunk ${i}`);
         const metaId = assertNonEmptyString(
           meta.id,
-          `Session manifest chunk ${i} id`,
+          `${label} manifest chunk ${i} id`,
         );
         const chunkByteLength = await byteReader.readU32LE();
 
         const storedBytes = assertSafeInteger(
           meta.storedBytes,
-          `Session manifest chunk "${metaId}" storedBytes`,
+          `${label} manifest chunk "${metaId}" storedBytes`,
           { maximum: MAX_FRAME_BYTES },
         );
         if (storedBytes !== chunkByteLength) {
@@ -333,7 +343,7 @@ export async function readBundle(source, options) {
           const remaining = byteReader.totalBytes - byteReader.position;
           if (chunkByteLength > remaining) {
             throw new Error(
-              `Invalid chunk length for ${metaId}: ${chunkByteLength} > remaining ${remaining} (session file truncated?)`
+              `Invalid chunk length for ${metaId}: ${chunkByteLength} > remaining ${remaining} (${file} truncated?)`
             );
           }
         }
@@ -349,7 +359,7 @@ export async function readBundle(source, options) {
     } finally {
       // A consumer that stopped iterating early still owns an unsettled
       // reader here; after the exact end or a failure this is a no-op.
-      await cancel(cancelled('closed', 'Session bundle reading stopped.'));
+      await cancel(cancelled('closed', `${label} bundle reading stopped.`));
     }
   }
 

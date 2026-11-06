@@ -2,7 +2,12 @@
  * @fileoverview Categorical legend rendering + interactions.
  *
  * Owns the categorical legend UI: category visibility checkboxes, color picker,
- * rename/delete operations, and drag-to-merge behavior.
+ * rename/delete operations, drag-to-merge behavior, and the count that keeps
+ * only some of a category's cells.
+ *
+ * Every change is an action (`app/actions/`): a control dispatches it, and
+ * the rows follow the state whoever changed it (`syncRows`: a step undone,
+ * an agent's, a notebook's), checkbox, colour and count, in place.
  *
  * @module ui/modules/legend/categorical-legend
  */
@@ -15,6 +20,7 @@ import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
 import { getCommunityAnnotationSession } from '../../../community-annotations/session.js';
 import { syncCommunityAnnotationCacheContext } from '../../../community-annotations/runtime-context.js';
+import { annotationCategories, annotationFieldKey } from '../../../community-annotations/field-names.js';
 import {
   getCommunityAnnotationAccessStore,
   isAnnotationRepoConnected
@@ -34,29 +40,22 @@ import {
 } from '../../components/controls.js';
 import { MISSING_LABEL } from '../../../state/managers/filter-manager.js';
 import { formatCount, formatCountOf, formatOpenCells } from '../../../../utils/format-units.js';
-import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
+import { requireExactKeys } from '../../../../utils/exact-record.js';
 import { categoryRgbAt, categoryShownAt } from '../../../utils/category-state.js';
-import { failureText } from '../../../../utils/errors.js';
+import { categoryCellLimitAt } from '../../../state/managers/category-cell-sample.js';
+import { createLatestDispatch, dispatchFromControl } from '../../../actions/control-dispatch.js';
 
 const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 const INIT_KEYS = new Set(['state', 'legendEl', 'dataSourceManager']);
 const REQUIRED_STATE_METHODS = [
-  'addHighlightFromCategory',
-  'deleteCategoryToUnassigned',
   'findHighlightGroupByCategory',
   'getActiveField',
+  'getActivePage',
   'getDatasetGeneration',
   'getFields',
   'getLegendModel',
-  'hideAllCategories',
-  'mergeCategoriesToNewField',
   'on',
-  'removeHighlightGroup',
-  'renameCategory',
-  'rgbToCss',
-  'setColorForCategory',
-  'setVisibilityForCategory',
-  'showAllCategories'
+  'rgbToCss'
 ];
 const CATEGORY_TYPE_ORDER = new Map([
   ['boolean', 0],
@@ -242,6 +241,31 @@ function requireCategoryCounts(visibleCount, availableCount) {
       'Legend counts must be non-negative safe integers with visible at most available'
     );
   }
+}
+
+/**
+ * What a category's count button says it does, and, when the category keeps
+ * only some of its cells, how many and the sample's seed.
+ */
+function describeCountButton(label, limit, availableCount) {
+  if (limit === null) return `Keep only some cells of ${label}`;
+  return `Keeps a random ${formatCountOf(Math.min(limit.count, availableCount), 'cell')} of ${label} `
+    + `(seed ${limit.seed}); click to change, or type all`;
+}
+
+/**
+ * A count typed in the count button's editor: a whole number of cells, or
+ * "all" (null: every cell).
+ *
+ * @param {string} text
+ * @returns {number|null|undefined} undefined when it is neither
+ */
+function parseCellCount(text) {
+  const trimmed = text.trim().replaceAll(',', '').replaceAll(' ', '');
+  if (/^all$/i.test(trimmed)) return null;
+  if (!/^(0|[1-9][0-9]*)$/.test(trimmed)) return undefined;
+  const count = Number(trimmed);
+  return Number.isSafeInteger(count) ? count : undefined;
 }
 
 function formatCategoryCount(visibleCount, availableCount) {
@@ -615,6 +639,8 @@ export function initCategoricalLegend(options) {
   let renderedCellsNote = null;
   /** @type {((counts: Object) => void)|null} Keeps the Missing row's count current. */
   let renderedMissingRow = null;
+  /** @type {((visible: boolean) => void)|null} Keeps the Missing row's checkbox current. */
+  let renderedMissingToggle = null;
 
   const syncCategoryHighlightButtons = () => {
     if (isRendering) return;
@@ -777,6 +803,7 @@ export function initCategoricalLegend(options) {
         syncCategoryHighlightButton(entry.highlightBtn, idx, visible > 0);
       }
     }
+    syncRows(activeField, model);
     if (renderedCellsNote !== null) setTextIfChanged(renderedCellsNote, describeCountedCells(state, activeField));
     renderedMissingRow?.(counts);
     if (annotationAvailabilityChanged) {
@@ -793,11 +820,12 @@ export function initCategoricalLegend(options) {
     closeTransientInteractions();
     isRendering = true;
     try {
-      const { section, rows, annotating, mount, cellsNote, syncMissingRow } = _doRenderCategoricalLegend(field, model);
+      const { section, rows, annotating, mount, cellsNote, syncMissingRow, syncMissingToggle } = _doRenderCategoricalLegend(field, model);
       legendEl.replaceChildren(section);
       mount();
       renderedCellsNote = cellsNote;
       renderedMissingRow = syncMissingRow;
+      renderedMissingToggle = syncMissingToggle;
       renderedRows = rows;
       renderedField = field;
       renderedModel = model;
@@ -824,6 +852,7 @@ export function initCategoricalLegend(options) {
     annotating,
     consensus,
     originalLabel,
+    limit,
     prototypes
   }) {
     const hasCells = availableCount > 0;
@@ -919,9 +948,14 @@ export function initCategoricalLegend(options) {
       labelMain.setAttribute('aria-label', `Vote on category ${label}`);
     }
 
-    const countSpan = ownerDocument.createElement('span');
+    // The count is a button: it keeps only some of the category's cells
+    // (`filter.category.cell-count`).
+    const countSpan = ownerDocument.createElement('button');
+    countSpan.type = 'button';
     countSpan.className = 'legend-count';
+    countSpan.dataset.analyticsId = 'legend:category-cell-count';
     countSpan.textContent = formatCategoryCount(visibleCount, availableCount);
+    syncCountButton(countSpan, label, limit, availableCount);
 
     row.append(checkbox, swatch, labelSpan, countSpan);
     if (!annotating) {
@@ -930,7 +964,36 @@ export function initCategoricalLegend(options) {
         prototypes.remove.cloneNode(true)
       );
     }
-    return { row, checkbox, colorInput, swatch, countSpan, highlightBtn };
+    return { row, checkbox, colorInput, swatch, countSpan, highlightBtn, label };
+  }
+
+  /** A count button's state: whether its category keeps only some cells, and what it says. */
+  function syncCountButton(button, label, limit, availableCount) {
+    const limited = limit !== null && limit.count < availableCount;
+    if (button.classList.contains('is-limited') !== limited) button.classList.toggle('is-limited', limited);
+    const words = describeCountButton(label, limit, availableCount);
+    if (button.title !== words) button.title = words;
+    const name = `${button.textContent}. ${words}`;
+    if (button.getAttribute('aria-label') !== name) button.setAttribute('aria-label', name);
+  }
+
+  /**
+   * The rows drawn show the field's state as it is now: each category's
+   * checkbox, colour and count limit, and the Missing row's checkbox (a
+   * change made by an undo, an agent or a notebook reaches the rows here).
+   * A colour picker being used is left alone: it shows what is chosen.
+   */
+  function syncRows(field, model) {
+    for (const [idx, entry] of renderedRows) {
+      const shown = categoryShownAt(field._categoryVisible, idx);
+      if (entry.checkbox.checked !== shown) entry.checkbox.checked = shown;
+      if (ownerDocument.activeElement !== entry.colorInput) {
+        const color = categoryRgbAt(field._categoryColors, idx);
+        if (entry.colorInput.value !== rgbToHex(color)) paintSwatch(entry.swatch, entry.colorInput, color);
+      }
+      syncCountButton(entry.countSpan, entry.label, categoryCellLimitAt(field, idx), model.counts.available[idx]);
+    }
+    renderedMissingToggle?.(field._missingVisible !== false);
   }
 
   function paintSwatch(swatch, colorInput, color) {
@@ -950,15 +1013,14 @@ export function initCategoricalLegend(options) {
 
     const controlsDiv = ownerDocument.createElement('div');
     controlsDiv.className = 'legend-controls';
+    // The field as the actions name it; the rows follow the state (`syncRows`).
+    const fieldRef = { source: FieldSource.OBS, key: field.key };
     const setAllVisible = visible => {
-      if (visible) {
-        state.showAllCategories(field, { onlyAvailable: true });
-      } else {
-        state.hideAllCategories(field, { onlyAvailable: true });
-      }
-      for (const entry of renderedRows.values()) {
-        if (!entry.checkbox.disabled) entry.checkbox.checked = visible;
-      }
+      void dispatchFromControl(
+        'filter.category.all',
+        { field: fieldRef, visible },
+        { failure: visible ? 'Could not show every category' : 'Could not hide every category' }
+      );
     };
     controlsDiv.append(
       createButton({
@@ -981,16 +1043,16 @@ export function initCategoricalLegend(options) {
 
     const categories = model.categories;
     const labels = categories.map(formatCategoryLabel);
-    const visibleCounts = model.counts.visible;
-    const availableCounts = model.counts.available;
     const sortedIndices = categories
       .map((_category, idx) => idx)
       .sort((left, right) => (
         compareValidatedCategoryLabels(categories[left], categories[right])
       ));
 
-    const fieldKey = field.key;
-    annotationSession.setFieldCategories(fieldKey, categories);
+    // Community annotation keys the field and its categories on the
+    // dataset's names; a local rename is a display name (`field-names.js`).
+    const fieldKey = annotationFieldKey(field);
+    annotationSession.setFieldCategories(fieldKey, annotationCategories(field));
     const fieldAnnotated = annotationSession.isFieldAnnotated(fieldKey);
     if (typeof fieldAnnotated !== 'boolean') {
       throw new TypeError('Annotation field state must be boolean');
@@ -1071,6 +1133,7 @@ export function initCategoricalLegend(options) {
           ? computeTopConsensusSummary(annotationSession, fieldKey, catIdx)
           : null,
         originalLabel,
+        limit: categoryCellLimitAt(field, catIdx),
         prototypes
       });
     };
@@ -1182,8 +1245,17 @@ export function initCategoricalLegend(options) {
     const missingToggle = createCheckbox({
       label: MISSING_LABEL,
       checked: field._missingVisible !== false,
-      onChange: visible => state.setMissingCategoryVisibility(field, visible),
+      onChange: visible => {
+        void dispatchFromControl(
+          'filter.category.missing',
+          { field: fieldRef, visible },
+          { failure: 'Could not change the cells without a category' }
+        );
+      },
     });
+    const syncMissingToggle = visible => {
+      if (missingToggle.input.checked !== visible) missingToggle.input.checked = visible;
+    };
     const missingCount = ownerDocument.createElement('span');
     missingCount.className = 'legend-count';
     const missingRow = ownerDocument.createElement('div');
@@ -1199,7 +1271,7 @@ export function initCategoricalLegend(options) {
       setTextIfChanged(missingCount, formatCategoryCount(counts.missing.visible, counts.missing.available));
     };
     syncMissingRow(model.counts);
-    return { section: catSection, rows, annotating, mount, cellsNote, syncMissingRow };
+    return { section: catSection, rows, annotating, mount, cellsNote, syncMissingRow, syncMissingToggle };
   }
 
   /**
@@ -1217,6 +1289,7 @@ export function initCategoricalLegend(options) {
     datasetGeneration
   }) {
     const fieldKey = field.key;
+    const fieldRef = { source: FieldSource.OBS, key: fieldKey };
     const rowOf = target => {
       const row = target instanceof view.Element
         ? target.closest('.legend-item')
@@ -1301,33 +1374,20 @@ export function initCategoricalLegend(options) {
           })) {
             return;
           }
-          try {
-            const result = state.mergeCategoriesToNewField(
-              fieldIndex,
-              fromIdx,
-              toIdx,
-              { editInPlace: inPlace }
-            );
-            requirePlainRecord(result, 'Category merge result');
-            if (
-              typeof result.updatedInPlace !== 'boolean'
-              || typeof result.mergedCategoryLabel !== 'string'
-              || result.mergedCategoryLabel.length === 0
-            ) {
-              throw new TypeError(
-                'Category merge result requires updatedInPlace and mergedCategoryLabel'
-              );
-            }
-            const mergedLabel = ` → \"${result.mergedCategoryLabel}\"`;
-            const suffix = result.updatedInPlace ? ' (edited in place)' : '';
+          void dispatchFromControl(
+            'category.merge',
+            { field: fieldRef, category: fromLabel, into: toLabel },
+            { failure: 'Could not merge the categories' }
+          ).then(done => {
+            if (done === null) return;
+            const result = done.outcome;
+            const mergedLabel = ` → \"${result.merged}\"`;
+            const suffix = result.in_place ? ' (edited in place)' : '';
             getNotificationCenter().success(
               `Merged \"${fromLabel}\" into \"${toLabel}\"${mergedLabel}${suffix}`,
               { category: 'filter', duration: 2400 }
             );
-          } catch (error) {
-            if (!(error instanceof Error)) throw error;
-            getNotificationCenter().error(failureText(error), { category: 'filter' });
-          }
+          });
         },
         onCancel: () => {
           retired = true;
@@ -1362,22 +1422,14 @@ export function initCategoricalLegend(options) {
           })) {
             return;
           }
-          const renamed = state.renameCategory(
-            FieldSource.OBS,
-            fieldIndex,
-            catIdx,
-            newLabel
-          );
-          if (typeof renamed !== 'boolean') {
-            throw new TypeError(
-              'Category rename must return an exact boolean result'
-            );
-          }
-          if (!renamed) {
-            getNotificationCenter().error('Failed to rename category', { category: 'filter' });
-            return;
-          }
-          getNotificationCenter().success(`Category renamed to \"${newLabel}\"`, { category: 'filter', duration: 2000 });
+          void dispatchFromControl(
+            'category.rename',
+            { field: fieldRef, category: currentLabel, name: newLabel },
+            { failure: 'Failed to rename category' }
+          ).then(done => {
+            if (done?.outcome == null) return;
+            getNotificationCenter().success(`Category renamed to \"${newLabel}\"`, { category: 'filter', duration: 2000 });
+          });
         },
         onCancel: () => {
           releaseTransient();
@@ -1430,26 +1482,17 @@ export function initCategoricalLegend(options) {
           })) {
             return;
           }
-          try {
-            const result = state.deleteCategoryToUnassigned(
-              fieldIndex,
-              catIdx,
-              { unassignedLabel, editInPlace: inPlace }
-            );
-            requirePlainRecord(result, 'Category deletion result');
-            if (typeof result.updatedInPlace !== 'boolean') {
-              throw new TypeError(
-                'Category deletion result updatedInPlace must be boolean'
-              );
-            }
-            const msg = result.updatedInPlace
+          void dispatchFromControl(
+            'category.delete',
+            { field: fieldRef, category: currentLabel, unassigned_label: unassignedLabel },
+            { failure: 'Could not delete the category' }
+          ).then(done => {
+            if (done === null) return;
+            const msg = done.outcome.in_place
               ? `Merged into \"${unassignedLabel}\" (edited in place)`
               : `Moved into \"${unassignedLabel}\"`;
             getNotificationCenter().success(msg, { category: 'filter', duration: 2400 });
-          } catch (error) {
-            if (!(error instanceof Error)) throw error;
-            getNotificationCenter().error(failureText(error), { category: 'filter' });
-          }
+          });
         },
         onCancel: () => {
           retired = true;
@@ -1462,37 +1505,23 @@ export function initCategoricalLegend(options) {
       });
     };
 
+    // The legend's highlight button: a highlight action naming the field,
+    // the category and the page shown (`highlight/highlight-actions.js`).
     const toggleCategoryHighlight = catIdx => {
-      const fIdx = state.activeFieldSource === FieldSource.OBS ? state.activeFieldIndex : -1;
-      requireExactIndex(fIdx, 'Active observation field index');
+      const { fieldIndex: fIdx, currentField } = requireCurrentCategoryField(catIdx);
       const group = state.findHighlightGroupByCategory(fIdx, catIdx, 'obs');
+      const page = state.getActivePage()?.name;
+      if (page === undefined) return;
+      const context = { failure: 'Highlighting the category failed', category: 'highlight' };
       if (group !== null) {
-        if (
-          typeof group !== 'object'
-          || typeof group.id !== 'string'
-          || group.id.length === 0
-        ) {
-          throw new TypeError(
-            'Category highlight lookup returned an invalid group'
-          );
-        }
-        const removed = state.removeHighlightGroup(group.id);
-        if (removed !== true) {
-          throw new Error(
-            `Category highlight "${group.id}" was not removed`
-          );
-        }
+        void dispatchFromControl('highlight.group.remove', { group: group.label, page }, context);
         return;
       }
-      const added = state.addHighlightFromCategory(fIdx, catIdx, 'obs');
-      if (
-        added === null
-        || typeof added !== 'object'
-        || typeof added.id !== 'string'
-        || added.id.length === 0
-      ) {
-        throw new Error('Category highlight was not created');
-      }
+      void dispatchFromControl('highlight.category', {
+        field: { source: 'obs', key: currentField.key },
+        category: currentField.categories[catIdx],
+        page,
+      }, context);
     };
 
     const resolveVoteTrigger = catIdx => {
@@ -1539,12 +1568,45 @@ export function initCategoricalLegend(options) {
 
     // Dragging a native colour picker fires `input` many times per frame, and
     // every recolour rebuilds the whole colour buffer: the swatch follows
-    // each event, the state takes at most one per frame, and the release
-    // commits the last one.
+    // each event, the state takes at most one per frame (the latest value,
+    // `createLatestDispatch`), and the release commits the last one. The
+    // drag is one step (`color.category` coalesces).
+    const colorDispatch = createLatestDispatch('color.category', { failure: 'Could not change the colour' });
     const applyColor = coalesceToFrame((catIdx, hex) => {
       if (destroyed) return;
-      state.setColorForCategory(field, catIdx, hexToRgb01(hex));
+      colorDispatch.push({ field: fieldRef, category: labels[catIdx], color: hex });
     });
+
+    /**
+     * Keep only some cells of a category: the count typed in the count
+     * button's place, or "all" (`filter.category.cell-count`). The sample's
+     * seed stays the one in force, so a larger count adds cells.
+     */
+    const startCellCount = (catIdx, button) => {
+      const limit = categoryCellLimitAt(field, catIdx);
+      const available = renderedModel?.counts.available[catIdx] ?? 0;
+      let releaseTransient = () => {};
+      const editor = InlineEditor.create(button, limit === null ? 'all' : String(limit.count), {
+        minWidth: 64,
+        validate: text => (parseCellCount(text) === undefined ? 'Type a whole number of cells, or all' : true),
+        onSave: text => {
+          releaseTransient();
+          const typed = parseCellCount(text);
+          if (typed === undefined) return;
+          const count = typed === null || typed >= available ? null : typed;
+          void dispatchFromControl(
+            'filter.category.cell-count',
+            { field: fieldRef, category: labels[catIdx], count, seed: limit?.seed ?? 0 },
+            { failure: 'Could not keep that many cells' }
+          );
+        },
+        onCancel: () => releaseTransient(),
+      });
+      if (editor === null) return;
+      editor.setAttribute('aria-label', `Cells of ${labels[catIdx]} to keep shown: a number, or all`);
+      editor.setAttribute('inputmode', 'numeric');
+      releaseTransient = ownTransient(() => InlineEditor.cancel(editor));
+    };
 
     // One keyboard-move controller per label, made on first use.
     const moves = new WeakMap();
@@ -1578,7 +1640,11 @@ export function initCategoricalLegend(options) {
       if (target instanceof view.HTMLInputElement && target.classList.contains('legend-checkbox')) {
         const hit = rowOf(target);
         if (hit !== null) {
-          state.setVisibilityForCategory(field, hit.catIdx, target.checked);
+          void dispatchFromControl(
+            'filter.category.visibility',
+            { field: fieldRef, categories: [labels[hit.catIdx]], visible: target.checked },
+            { failure: 'Could not change the category' }
+          );
         }
         return;
       }
@@ -1613,6 +1679,9 @@ export function initCategoricalLegend(options) {
         } else if (button.classList.contains('legend-highlight-btn')) {
           event.stopPropagation();
           toggleCategoryHighlight(hit.catIdx);
+        } else if (button.classList.contains('legend-count')) {
+          event.stopPropagation();
+          startCellCount(hit.catIdx, button);
         }
         return;
       }
@@ -1727,12 +1796,25 @@ export function initCategoricalLegend(options) {
     renderedAnnotating = false;
     renderedCellsNote = null;
     renderedMissingRow = null;
+    renderedMissingToggle = null;
+  }
+
+  /**
+   * The rows follow a change of colours or category state that changed no
+   * visibility (a recolour made by an undo, an agent or a notebook).
+   */
+  function syncCategoryState() {
+    if (destroyed || isRendering || renderedField === null) return;
+    const field = state.getActiveField();
+    if (field !== renderedField || renderedModel === null) return;
+    syncRows(field, renderedModel);
   }
 
   return {
     refreshCategoryCounts,
     renderCategoricalLegend,
     releaseCategoricalLegend,
+    syncCategoryState,
     destroy: () => {
       if (destroyed) return;
       destroyed = true;

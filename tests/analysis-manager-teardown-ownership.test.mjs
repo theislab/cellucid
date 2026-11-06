@@ -9,13 +9,10 @@ import { PlotRenderSlot } from '../assets/js/app/analysis/shared/plot-render-slo
 import { releaseResidentMemory } from '../assets/js/data/memory-budget.js';
 import { createDataState } from '../assets/js/app/state/index.js';
 import { EventEmitter } from '../assets/js/app/utils/event-emitter.js';
-import { encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
 import {
   setDockableAccordions,
 } from '../assets/js/app/dockable-accordions-registry.js';
-import {
-  restore as restoreAnalysisWindows,
-} from '../assets/js/app/session/contributors/analysis-windows.js';
+import { createAnalysisDomain } from '../assets/js/app/state/domains/analysis.js';
 
 function deferred() {
   let reject;
@@ -204,6 +201,7 @@ function installDockableRegistry(events = []) {
     },
     register() {},
     float() {},
+    place() {},
     unregister(details) {
       events.push(`unregister:${details.id}`);
     },
@@ -907,6 +905,7 @@ test(
     setDockableAccordions({
       floatingRoot,
       float() {},
+      place() {},
       register() {
         throw primaryFailure;
       },
@@ -953,6 +952,7 @@ test(
     setDockableAccordions({
       floatingRoot,
       float() {},
+      place() {},
       register() {
         throw primaryFailure;
       },
@@ -1030,6 +1030,7 @@ test(
     setDockableAccordions({
       floatingRoot,
       float() {},
+      place() {},
       register(_details, options) {
         registration = options;
       },
@@ -1565,45 +1566,57 @@ test(
 );
 
 test(
-  'analysis-window session restore awaits prior window teardown before creating replacements',
+  'the analysis domain restore awaits prior window teardown before creating replacements',
   async () => {
     const destruction = deferred();
     const events = [];
     const manager = {
+      exportSessionWindows() {
+        return [];
+      },
+      exportWindowPlaces() {
+        return [];
+      },
       closeAll() {
         events.push('close:start');
         return destruction.promise.then(() => {
           events.push('close:done');
         });
       },
-      createFromSessionDescriptor(descriptor) {
-        events.push(`create:${descriptor.modeId}`);
-      },
-      importViewSizes() {
-        events.push('sizes');
+      createFromSessionDescriptor(descriptor, place) {
+        events.push(`create:${descriptor.modeId}:${place}`);
       },
     };
-
-    const result = restoreAnalysisWindows(
-      { analysisWindowManager: manager },
-      {},
-      encodeTypedJson({
-        windows: [{ modeId: 'replacement' }],
-        sizes: { window: {}, expandedView: {} },
+    const docked = { openMode: null, modes: {} };
+    const analysis = createAnalysisDomain({
+      analysis: async () => ({
+        comparisonModule: {
+          exportSessionState: () => structuredClone(docked),
+          async importSessionState() {
+            events.push('docked');
+          },
+        },
+        analysisWindowManager: manager,
       }),
-    );
-    const createdBeforeCloseSettled = events.includes('create:replacement');
+    });
+
+    const result = analysis.restore({
+      windows: [{ modeId: 'replacement' }],
+      docked,
+    });
+    // Let the restore run until it waits on the teardown.
+    await new Promise(resolve => setImmediate(resolve));
+    const eventsBeforeCloseSettled = [...events];
 
     destruction.resolve();
-    await Promise.resolve(result);
+    await result;
 
     assert.equal(isThenable(result), true);
-    assert.equal(createdBeforeCloseSettled, false);
+    assert.deepEqual(eventsBeforeCloseSettled, ['close:start'], 'nothing is created while the teardown runs');
     assert.deepEqual(events, [
       'close:start',
       'close:done',
-      'sizes',
-      'create:replacement',
+      'create:replacement:null',
     ]);
   },
 );

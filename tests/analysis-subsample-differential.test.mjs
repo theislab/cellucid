@@ -60,6 +60,8 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';

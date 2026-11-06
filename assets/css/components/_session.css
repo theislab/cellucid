@@ -154,6 +154,20 @@
   box-shadow: var(--shadow-md);
 }
 
+/* An open menu shown above the page, under its button (`open-data-menu.js`):
+   no panel it belongs to clips it. */
+.open-menu-list.open-menu-placed {
+  position: fixed;
+  left: var(--open-menu-left, 0px);
+  right: auto;
+  top: var(--open-menu-top, 0px);
+  width: var(--open-menu-width, max-content);
+  min-width: 0;
+  max-height: calc(100dvh - var(--space-4));
+  overflow-y: auto;
+  z-index: var(--z-popover);
+}
+
 .open-menu-item {
   display: flex;
   align-items: baseline;

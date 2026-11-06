@@ -1,0 +1,53 @@
+{
+  "examples": [
+    {
+      "embedding": {
+        "columns": [
+          0
+        ],
+        "key": "x"
+      },
+      "view": "View 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "embedding": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "columns"
+        ],
+        "type": "object"
+      },
+      "view": {
+        "pattern": "^View [1-9][0-9]*$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "view",
+      "embedding"
+    ],
+    "type": "object"
+  },
+  "type": "view.embedding.set",
+  "version": 1
+}

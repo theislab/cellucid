@@ -70,7 +70,7 @@ function pythonNotebook(appUrl) {
         'print("RESULT", viewer.state.ready is not None, viewer._server.is_running(), ',
         'None if selection is None else len(selection["cells"]), None if selection is None else selection["source"])',
       ]),
-      code(['viewer.set_color_by("cell_type")']),
+      code(['viewer.color_by(field={"source": "obs", "key": "cell_type"})']),
     ],
     metadata: { kernelspec: { name: 'python3', display_name: 'Python 3 (ipykernel)', language: 'python' } },
     nbformat: 4,
@@ -89,7 +89,7 @@ function rNotebook(appUrl) {
         'selection <- cellucid_selection(viewer)\n',
         'cat("RESULT", !is.null(viewer$ready), is.null(viewer$server), length(selection$cells), selection$source, "\\n")',
       ]),
-      code(['cellucid_color_by(viewer, "cell_type")']),
+      code(['cellucid_color_by(viewer, field = list(source = "obs", key = "cell_type"))']),
     ],
     metadata: { kernelspec: { name: 'ir', display_name: 'R', language: 'R' } },
     nbformat: 4,
@@ -224,7 +224,7 @@ async function exerciseNotebook(page, url, appOrigin, label) {
 
   // A lasso over the canvas's visible part, confirmed: a saved selection,
   // sent to the kernel.
-  await app.locator('.highlight-mode-btn[data-mode="lasso"]').click({ timeout: 30_000 });
+  await app.locator('.highlight-mode-btn[data-mode="lasso"]').click();
   await app.locator('#glcanvas').scrollIntoViewIfNeeded();
   const box = await app.locator('#glcanvas').boundingBox();
   const viewport = page.viewportSize();
@@ -252,19 +252,24 @@ async function exerciseNotebook(page, url, appOrigin, label) {
   // output, JupyterLab's own side panel may cover it.
   await app.locator('#lasso-confirm-btn').dispatchEvent('click');
   const lassoLabel = app.locator('text=/Lasso \\([\\d,]+ cells?\\)/').first();
-  await expect(lassoLabel).toBeVisible({ timeout: 30_000 });
+  await expect(lassoLabel).toBeVisible();
   const lassoed = Number((await lassoLabel.textContent()).match(/\(([\d,]+) cells?\)/)[1].replace(/,/g, ''));
   expect(lassoed).toBeGreaterThan(0);
 
   // The next cell reads what reached the kernel between the cells.
   await runCell(page, 1);
   const result = page.locator('.jp-Notebook .jp-Cell').nth(1).locator('.jp-OutputArea-output');
-  await expect(result).toContainText('RESULT', { timeout: 30_000 });
+  await expect(result).toContainText('RESULT');
   const report = (await result.textContent()).trim();
 
   // A command from the kernel reaches the viewer: colour by the categorical column.
   await runCell(page, 2);
-  await expect(app.locator('#categorical-field option:checked')).toHaveText('cell_type', { timeout: 30_000 });
+  await expect(app.locator('#categorical-field option:checked')).toHaveText('cell_type');
+  // It is a step of the viewer's history, labelled with the notebook's
+  // language (a Python widget's runtime is "jupyter"; its steps are Python's).
+  const hostSteps = await appFrame.evaluate(() => [...window._cellucidHistories.current().active.steps.values()]
+    .filter(step => step.by.origin === 'host').map(step => [step.type, step.by.host]));
+  expect(hostSteps).toEqual([['color.by', label.toLowerCase()]]);
   expect(consoleErrors.filter(text => /cellucid/i.test(text))).toEqual([]);
   return { report, lassoed };
 }

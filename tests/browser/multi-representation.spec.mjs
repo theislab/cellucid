@@ -27,6 +27,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -299,13 +300,13 @@ test('four views of four representations pick, highlight, build LOD, label, expo
     theta: window._cellucidViewer.getViewCameraState(id).orbit.theta,
   })), ids);
   const sessionDownload = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('four-representations.cellucid-session');
   await (await sessionDownload).saveAs(sessionPath);
 
   await openRepresentations(page);
   const chooser = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooser).setFiles(sessionPath);
   await expect(page.locator('.split-badge')).toHaveCount(4);
   await expect.poll(() => page.evaluate(() => [...window._cellucidState.viewContexts.keys()].map(
@@ -344,6 +345,53 @@ test('keys 1, 2 and 3 show a dimension’s default, then step through its repres
   await expect.poll(() => shows(page, 'live')).toBe(phate);
   await page.keyboard.press('1');
   await expect(page.locator('#notification-center .notification').filter({ hasText: 'No 1D embedding is on' })).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
+test('a number key pressed while a switch is under way is not dropped: no embedding is said at once, and the key of another dimension is done next', async ({ page }) => {
+  // On a slow renderer the view names its new embedding seconds before the
+  // switch has ended, and a key pressed in that time was dropped without a
+  // word (hosted WebKit and macOS Firefox: "No 1D embedding is on" never
+  // shown). Here the switch is held under way, however fast the machine.
+  test.setTimeout(180_000);
+  const errors = collectBrowserErrors(page);
+  await openRepresentations(page);
+  const umap2d = await layoutOf(page, 'UMAP', 2);
+  const tsne = await layoutOf(page, 't-SNE', 2);
+  await page.locator('#glcanvas').click({ position: { x: 700, y: 400 } });
+  await page.keyboard.press('2');
+  await expect.poll(() => shows(page, 'live')).toBe(umap2d);
+  await expect(page.locator('#notification-center .notification').filter({ hasText: '2D · UMAP (1 of 2)' })).toHaveCount(1);
+  // t-SNE has not been shown: showing it loads its positions, and that load
+  // waits until the test lets it go.
+  expect(await page.evaluate(key => window._cellucidState.getDimensionManager().getResidentPositions(key), tsne)).toBeNull();
+  await page.evaluate(() => {
+    const manager = window._cellucidState.getDimensionManager();
+    const load = manager.loadLayout.bind(manager);
+    const held = {};
+    held.reached = new Promise(resolve => { held.onReached = resolve; });
+    const gate = new Promise(resolve => { held.release = resolve; });
+    manager.loadLayout = async (...args) => {
+      manager.loadLayout = load;
+      held.onReached();
+      await gate;
+      return load(...args);
+    };
+    window.__heldSwitch = held;
+  });
+  await page.keyboard.press('2');
+  await page.evaluate(() => window.__heldSwitch.reached);
+  // Under way: the view still shows UMAP.
+  expect(await shows(page, 'live')).toBe(umap2d);
+  // No embedding of that dimension: said now, not after the switch.
+  await page.keyboard.press('1');
+  await expect(page.locator('#notification-center .notification').filter({ hasText: 'No 1D embedding is on' })).toHaveCount(1);
+  expect(await shows(page, 'live')).toBe(umap2d);
+  // A key of another dimension: done once the switch has ended.
+  await page.keyboard.press('3');
+  await page.evaluate(() => window.__heldSwitch.release());
+  await expect(page.locator('#notification-center .notification').filter({ hasText: '2D · t-SNE (2 of 2)' })).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => window._cellucidState.getDimensionLevel())).toBe(3);
   expect(errors).toEqual([]);
 });
 

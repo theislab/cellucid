@@ -2,68 +2,27 @@
  * Exact current public-profile identifier contracts.
  *
  * UI callers may display validation errors, but must not rewrite aliases such
- * as ORCID URLs, compact ORCID values, LinkedIn URLs, or @handles.
+ * as ORCID URLs, compact ORCID values, LinkedIn URLs, or @handles. The rules
+ * themselves are the annotation wire contract's (`wire-contract.js`); this
+ * module words them for people and reads ORCID's public API.
+ *
+ * ORCID records are human-entered public data. The ORCID parsers read each
+ * record on its own: a search leaves out a record without an exact iD (and a
+ * repeat of one already listed), a name part that is not text counts as
+ * missing, and a name's edge whitespace is removed. One untidy record never
+ * empties a search, and an untidy name never fails a lookup.
  */
 
-import { requireObjectRecord } from '../../utils/exact-record.js';
+import { isObjectRecord, requireObjectRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import {
+  ANNOTATION_WHITESPACE_CLASS,
+  isAnnotationExactNonblank,
+  isExactLinkedInHandle,
+  isExactOrcidId,
+} from './wire-contract.js';
 
-const ORCID_ID = /^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$/;
-const LINKEDIN_HANDLE = /^[a-z0-9-]{3,120}$/;
-const PROFILE_NAME_MAX_CODEPOINTS = 120;
-
-function exceedsCodePointLimit(value, maximum) {
-  if (value.length <= maximum) return false;
-  if (value.length > maximum * 2) return true;
-  let count = 0;
-  for (const _character of value) {
-    count += 1;
-    if (count > maximum) return true;
-  }
-  return false;
-}
-
-function optionalExactString(
-  value,
-  label,
-  maximumLength = PROFILE_NAME_MAX_CODEPOINTS
-) {
-  if (value === null || value === undefined) return null;
-  if (
-    typeof value !== 'string' ||
-    /^\s|\s$/.test(value) ||
-    exceedsCodePointLimit(value, maximumLength)
-  ) {
-    throw new Error(
-      `${label} must be null or an exact string of at most ` +
-      `${formatCountOf(maximumLength, 'character')}`
-    );
-  }
-  return value || null;
-}
-
-function joinOrcidName(parts, label) {
-  if (parts.length === 0) return null;
-  const name = parts.join(' ');
-  if (exceedsCodePointLimit(name, PROFILE_NAME_MAX_CODEPOINTS)) {
-    throw new Error(
-      `${label} must be at most ${PROFILE_NAME_MAX_CODEPOINTS} characters`
-    );
-  }
-  return name;
-}
-
-export function isExactOrcidId(value) {
-  if (typeof value !== 'string' || !ORCID_ID.test(value)) return false;
-  const compact = value.replaceAll('-', '');
-  let total = 0;
-  for (let index = 0; index < 15; index += 1) {
-    total = (total + Number(compact[index])) * 2;
-  }
-  const result = (12 - (total % 11)) % 11;
-  const expected = result === 10 ? 'X' : `${result}`;
-  return compact[15] === expected;
-}
+const WHITESPACE = new RegExp(ANNOTATION_WHITESPACE_CLASS);
 
 export function assertExactOrcidId(value, { allowEmpty = false } = {}) {
   if (allowEmpty && value === '') return '';
@@ -75,54 +34,80 @@ export function assertExactOrcidId(value, { allowEmpty = false } = {}) {
 
 export function assertExactLinkedInHandle(value, { allowEmpty = false } = {}) {
   if (allowEmpty && value === '') return '';
-  if (typeof value !== 'string' || !LINKEDIN_HANDLE.test(value)) {
+  if (!isExactLinkedInHandle(value)) {
     throw new Error('LinkedIn must be an exact lowercase handle without @ or a URL');
   }
   return value;
 }
 
-export function assertExactOptionalProfileText(value, label, maximumLength) {
-  if (
-    typeof value !== 'string' ||
-    /^\s|\s$/.test(value) ||
-    exceedsCodePointLimit(value, maximumLength)
-  ) {
-    throw new Error(
-      `${label} must be an exact string of at most ${formatCountOf(maximumLength, 'character')}`
-    );
+/**
+ * Optional profile text: empty, or exact nonblank text (no leading or
+ * trailing whitespace). It is never trimmed for the caller.
+ *
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {string}
+ */
+export function assertExactOptionalProfileText(value, label) {
+  if (typeof value !== 'string' || (value !== '' && !isAnnotationExactNonblank(value))) {
+    throw new Error(`${label} must be text without leading or trailing whitespace`);
   }
   return value;
 }
 
-export function parseOrcidPersonName(document) {
-  const root = requireObjectRecord(document, 'ORCID person response');
-  if (root.name === null) return null;
-  const name = requireObjectRecord(root.name, 'ORCID person response.name');
-  const givenNode = name['given-names'];
-  const familyNode = name['family-name'];
-  const given =
-    givenNode === null
-      ? null
-      : optionalExactString(
-          requireObjectRecord(givenNode, 'ORCID person response.name.given-names').value,
-          'ORCID person response.name.given-names.value'
-        );
-  const family =
-    familyNode === null
-      ? null
-      : optionalExactString(
-          requireObjectRecord(familyNode, 'ORCID person response.name.family-name').value,
-          'ORCID person response.name.family-name.value'
-        );
-  const parts = [given, family].filter((part) => part !== null);
-  return joinOrcidName(parts, 'ORCID person response name');
+/** One part of an ORCID name, without its edge whitespace; null when none. */
+function orcidNamePart(value) {
+  if (typeof value !== 'string') return null;
+  let start = 0;
+  let end = value.length;
+  while (start < end && WHITESPACE.test(value[start])) start += 1;
+  while (end > start && WHITESPACE.test(value[end - 1])) end -= 1;
+  return start === end ? null : value.slice(start, end);
 }
 
-export function parseOrcidExpandedSearch(document, { maximumResults = 8 } = {}) {
+function joinOrcidName(given, family) {
+  const parts = [orcidNamePart(given), orcidNamePart(family)].filter(
+    (part) => part !== null
+  );
+  return parts.length === 0 ? null : parts.join(' ');
+}
+
+/**
+ * The name of an ORCID person record (`GET /v3.0/<iD>/person`), or null when
+ * the record shows none.
+ *
+ * @param {unknown} document
+ * @returns {string|null}
+ */
+export function parseOrcidPersonName(document) {
+  const root = requireObjectRecord(document, 'ORCID person response');
+  const name = root.name;
+  if (!isObjectRecord(name)) return null;
+  const given = name['given-names'];
+  const family = name['family-name'];
+  return joinOrcidName(
+    isObjectRecord(given) ? given.value : null,
+    isObjectRecord(family) ? family.value : null
+  );
+}
+
+/**
+ * The records of an ORCID expanded search (`GET /v3.0/expanded-search/`).
+ * ORCID answers a search without matches with `"expanded-result": null`.
+ *
+ * @param {unknown} document
+ * @param {{maximumResults: number}} options - The `rows` the search asked for
+ * @returns {{orcid: string, name: string|null}[]}
+ */
+export function parseOrcidExpandedSearch(document, { maximumResults }) {
+  if (!Number.isSafeInteger(maximumResults) || maximumResults < 1) {
+    throw new TypeError('ORCID expanded-search maximumResults must be the requested row count');
+  }
   const root = requireObjectRecord(document, 'ORCID expanded-search response');
   const results = root['expanded-result'];
+  if (results === null) return [];
   if (!Array.isArray(results)) {
-    throw new Error('ORCID expanded-search response.expanded-result must be an array');
+    throw new Error('ORCID expanded-search response.expanded-result must be an array or null');
   }
   if (results.length > maximumResults) {
     throw new Error(
@@ -130,31 +115,16 @@ export function parseOrcidExpandedSearch(document, { maximumResults = 8 } = {}) 
     );
   }
   const seen = new Set();
-  return results.map((entry, index) => {
-    const record = requireObjectRecord(
-      entry,
-      `ORCID expanded-search response.expanded-result[${index}]`
-    );
-    const orcid = assertExactOrcidId(record['orcid-id']);
-    if (seen.has(orcid)) {
-      throw new Error(`ORCID expanded-search returned duplicate iD ${orcid}`);
-    }
+  const records = [];
+  for (const entry of results) {
+    if (!isObjectRecord(entry)) continue;
+    const orcid = entry['orcid-id'];
+    if (!isExactOrcidId(orcid) || seen.has(orcid)) continue;
     seen.add(orcid);
-    const given = optionalExactString(
-      record['given-names'],
-      `ORCID expanded-search response.expanded-result[${index}].given-names`
-    );
-    const family = optionalExactString(
-      record['family-names'],
-      `ORCID expanded-search response.expanded-result[${index}].family-names`
-    );
-    const parts = [given, family].filter((part) => part !== null);
-    return {
+    records.push({
       orcid,
-      name: joinOrcidName(
-        parts,
-        `ORCID expanded-search response.expanded-result[${index}] name`
-      ),
-    };
-  });
+      name: joinOrcidName(entry['given-names'], entry['family-names']),
+    });
+  }
+  return records;
 }

@@ -38,6 +38,8 @@ class AnalysisViewSizes {
     this._window = new Map();
     /** @type {Map<string, {width: number, height: number, optionsWidth: number, footerHeight: number, statsWidth: number}>} */
     this._expandedView = new Map();
+    /** @type {Set<(modeId: string, size: object) => void>} */
+    this._listeners = new Set();
   }
 
   /** @param {string} modeId */
@@ -71,6 +73,32 @@ class AnalysisViewSizes {
       modeId,
       requireSize(size, EXPANDED_VIEW_KEYS, `Expanded view size of "${modeId}"`)
     );
+  }
+
+  /**
+   * A person resized the expanded view of `modeId` (`ui/components/modal.js`):
+   * remembered, and told to the listeners (`analysis/actions.js` records it
+   * as a step, `analysis.size.set`). An action and a restore remember through
+   * `rememberExpandedViewSize` / `importSizes`, which tell nobody.
+   * @param {string} modeId
+   * @param {{width: number, height: number, optionsWidth: number, footerHeight: number, statsWidth: number}} size
+   */
+  personResizedExpandedView(modeId, size) {
+    this.rememberExpandedViewSize(modeId, size);
+    for (const listener of [...this._listeners]) {
+      try { listener(modeId, { ...size }); } catch (error) { console.error('[analysis] a size listener failed', error); }
+    }
+  }
+
+  /**
+   * Hear every expanded view a person resizes; returns what stops it.
+   * @param {(modeId: string, size: object) => void} listener
+   * @returns {() => void}
+   */
+  onPersonResize(listener) {
+    if (typeof listener !== 'function') throw new TypeError('An expanded-view size listener must be a function');
+    this._listeners.add(listener);
+    return () => this._listeners.delete(listener);
   }
 
   /** The session record: `{window: {[modeId]: size}, expandedView: {[modeId]: size}}`. */

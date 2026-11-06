@@ -26,6 +26,95 @@ import { getCommunityAnnotationSession } from './session.js';
 import { isSimulateRepoConnectedEnabled } from './access-store.js';
 import { getAnnotationRepoForDataset } from './repo-store.js';
 import { getGitHubAuthSession, toGitHubUserKey } from './github-auth.js';
+import { toCacheScopeKey } from './cache-scope.js';
+import { getCommunityAnnotationScopeLock } from './scope-lock.js';
+
+// ---------------------------------------------------------------- Paused here
+//
+// One tab at a time annotates a scope (dataset + repository@branch + GitHub
+// user): the scope lock (`scope-lock.js`). Another tab on the same scope is
+// not an error. Its annotation is paused here: its session stays unscoped
+// (nothing read, nothing written, nothing published), the dataset controls
+// work as ever, and the panel says "Open in another tab — annotation paused
+// here" with Use here (`useAnnotationScopeHere`), which takes the lock over;
+// the other tab then pauses in turn.
+
+/** What a tab says while another tab annotates the same scope. */
+export const ANNOTATION_PAUSED_HERE = 'Open in another tab — annotation paused here';
+
+/** What the scope lock refuses because another tab holds the scope. */
+const HELD_ELSEWHERE = new Set(['LOCK_HELD', 'LOCK_VERIFY_FAILED', 'LOCK_LOST']);
+
+/** Scope keys paused in this tab. */
+const pausedScopes = new Set();
+const pauseListeners = new Set();
+
+function pauseChanged() {
+  for (const listener of [...pauseListeners]) {
+    try { listener(); } catch (error) { console.error('[community annotation] a pause listener failed', error); }
+  }
+}
+
+/** Whether `error` is the scope lock saying another tab holds the scope. */
+export function isHeldElsewhere(error) {
+  return HELD_ELSEWHERE.has(error?.code);
+}
+
+/**
+ * Pause annotation of a scope in this tab (another tab holds it).
+ * @param {string} scopeKey - `toCacheScopeKey`
+ */
+export function pauseAnnotationScopeHere(scopeKey) {
+  if (typeof scopeKey !== 'string' || scopeKey === '' || pausedScopes.has(scopeKey)) return;
+  pausedScopes.add(scopeKey);
+  pauseChanged();
+}
+
+/**
+ * Hear when a scope is paused or used here again. Returns the unsubscribe.
+ * @param {() => void} listener
+ */
+export function onAnnotationPauseChange(listener) {
+  pauseListeners.add(listener);
+  return () => pauseListeners.delete(listener);
+}
+
+/**
+ * The connected scope of the dataset shown when it is paused in this tab,
+ * else null: `{datasetId, repoRef, userId, scopeKey}`.
+ * @param {{dataSourceManager?: object|null, datasetId?: string|null}} [options]
+ */
+export function annotationPauseOf({ dataSourceManager = null, datasetId = undefined } = {}) {
+  const ctx = connectedScopeOf({ dataSourceManager, datasetId });
+  return ctx !== null && pausedScopes.has(ctx.scopeKey) ? ctx : null;
+}
+
+/**
+ * Use annotation of the paused scope here (the person's Use here): take the
+ * lock over from the other tab, then scope the session to it.
+ * @param {{dataSourceManager?: object|null, datasetId?: string|null}} [options]
+ * @returns {ReturnType<typeof getCommunityAnnotationCacheContext>}
+ */
+export function useAnnotationScopeHere({ dataSourceManager = null, datasetId = undefined } = {}) {
+  const pause = annotationPauseOf({ dataSourceManager, datasetId });
+  if (pause === null) return syncCommunityAnnotationCacheContext({ dataSourceManager, datasetId });
+  const taken = getCommunityAnnotationScopeLock().takeOver(pause.scopeKey);
+  if (!taken?.ok) {
+    const error = new Error(taken?.message || 'Annotation could not be taken over from the other tab');
+    error.code = taken?.code || 'LOCK_TAKEOVER_FAILED';
+    throw error;
+  }
+  pausedScopes.delete(pause.scopeKey);
+  pauseChanged();
+  return syncCommunityAnnotationCacheContext({ dataSourceManager, datasetId });
+}
+
+/** The fully connected scope of the dataset (a repository and a GitHub user), or null. */
+function connectedScopeOf({ dataSourceManager, datasetId }) {
+  const ctx = computeContext({ dataSourceManager, datasetId });
+  const scopeKey = toCacheScopeKey(ctx);
+  return scopeKey === null ? null : { datasetId: ctx.datasetId, repoRef: ctx.repoRef, userId: ctx.userId, scopeKey };
+}
 
 function parseGitHubUserIdFromKey(userKey) {
   if (typeof userKey !== 'string') return null;
@@ -69,9 +158,20 @@ export function annotationDatasetIdOf(dataSourceManager) {
  *   userId: number|null,
  *   repoRef: string|null,
  *   simulated: boolean
- * }}
+ * }} `repoRef` is null while another tab annotates the scope
+ *   (`annotationPauseOf`), until the person chooses Use here
  */
 export function getCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = undefined } = {}) {
+  const ctx = computeContext({ dataSourceManager, datasetId });
+  const scopeKey = toCacheScopeKey(ctx);
+  // Paused here (another tab annotates the scope): unscoped, so this tab
+  // reads and writes nothing of it.
+  // reads and writes nothing of it (`annotationPauseOf` says so).
+  if (scopeKey !== null && pausedScopes.has(scopeKey)) return { ...ctx, repoRef: null };
+  return ctx;
+}
+
+function computeContext({ dataSourceManager, datasetId }) {
   const auth = getGitHubAuthSession();
   const simulated = isSimulateRepoConnectedEnabled();
 
@@ -126,10 +226,20 @@ export function getCommunityAnnotationCacheContext({ dataSourceManager = null, d
 export function syncCommunityAnnotationCacheContext({ dataSourceManager = null, datasetId = undefined } = {}) {
   const session = getCommunityAnnotationSession();
   const ctx = getCommunityAnnotationCacheContext({ dataSourceManager, datasetId });
-  session.setCacheContext({
-    datasetId: ctx.datasetId,
-    repoRef: ctx.repoRef,
-    userId: ctx.userId,
-  });
-  return ctx;
+  try {
+    session.setCacheContext({
+      datasetId: ctx.datasetId,
+      repoRef: ctx.repoRef,
+      userId: ctx.userId,
+    });
+    return ctx;
+  } catch (error) {
+    // Another tab annotates this scope: pause it here, never fail the caller
+    // (the dataset controls, the legend, the field list run through here).
+    const scopeKey = toCacheScopeKey(ctx);
+    if (!isHeldElsewhere(error) || scopeKey === null) throw error;
+    pauseAnnotationScopeHere(scopeKey);
+    session.setCacheContext({ datasetId: ctx.datasetId, repoRef: null, userId: null });
+    return { ...ctx, repoRef: null };
+  }
 }

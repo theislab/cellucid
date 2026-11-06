@@ -1,0 +1,29 @@
+{
+  "examples": [
+    {
+      "color": "#e41a1c",
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "color": {
+        "pattern": "^#[0-9a-fA-F]{6}$",
+        "type": "string"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "page",
+      "color"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.page.recolor",
+  "version": 1
+}

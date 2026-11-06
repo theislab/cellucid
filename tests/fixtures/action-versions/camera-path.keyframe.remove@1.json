@@ -1,0 +1,23 @@
+{
+  "examples": [
+    {
+      "keyframe": "x"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "keyframe": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "keyframe"
+    ],
+    "type": "object"
+  },
+  "type": "camera-path.keyframe.remove",
+  "version": 1
+}

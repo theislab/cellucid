@@ -107,6 +107,11 @@ python scripts/generate-browser-catalog-fixtures.py
 - `uint32-categories.h5ad` is the current-ui cells with a 70,000-category
   `cell_type`: gamma at code 0, alpha at 65,536 and beta at 69,999, so a
   16-bit copy of a code names another category; five gamma cells are missing.
+- `replay-other.h5ad` ("Replay fixture") is the current-ui cells as another
+  sample, for a history recorded on current-ui replayed on it
+  (`history-replay-other-dataset.spec.mjs`): its `cell_type` shares only
+  gamma (alpha is delta, beta is epsilon), `score` is the same, and of the
+  genes CD3E is CD3D.
 - `broken-catalogs/` holds one catalog per way listing fails: a listed file
   missing, truncated or not a file at all, a file stating another id, a
   truncated `datasets.json`, and a catalog without `schema`.

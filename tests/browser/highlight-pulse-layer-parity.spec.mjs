@@ -64,22 +64,22 @@ function compareLayers(page) {
     // Frames until the change made is drawn: the viewer clears its
     // invalidation when it draws the frame that shows it.
     const drawn = async () => {
-      for (let attempt = 0; attempt < 600; attempt += 1) {
+      do {
         await frames(1);
-        if (!viewer.getFrameScheduleState().invalidated) return;
-      }
-      throw new Error('The change was never drawn.');
+      } while (viewer.getFrameScheduleState().invalidated);
     };
     const capture = async caching => {
       viewer.setPulseLayerCaching(caching);
       if (caching) {
         // Frames until a pulse frame has reused the base (pulse-only frames
         // are paced: ambient-frame-pacing.js); then the next one is captured.
+        // As many animation frames as that takes: on a slow renderer the
+        // pulse's frames are far apart, and a count of animation frames ran
+        // out before them, leaving a frame that had reused nothing.
         const startReused = viewer.getPulseLayerStats().basesReused;
-        for (let attempt = 0; attempt < 600; attempt += 1) {
+        do {
           await frames(1);
-          if (viewer.getPulseLayerStats().basesReused >= startReused + 3) break;
-        }
+        } while (viewer.getPulseLayerStats().basesReused < startReused + 3);
       } else {
         await drawn();
       }
@@ -171,20 +171,21 @@ function compareMaskedSamples(page, from, phase) {
     // Frames until the change made is drawn: the viewer clears its
     // invalidation when it draws the frame that shows it.
     const drawn = async () => {
-      for (let attempt = 0; attempt < 600; attempt += 1) {
+      do {
         await frames(1);
-        if (!viewer.getFrameScheduleState().invalidated) return;
-      }
-      throw new Error('The change was never drawn.');
+      } while (viewer.getFrameScheduleState().invalidated);
     };
     // Frames until `count` more panes were drawn under their rings (pulse-only
     // frames are paced: ambient-frame-pacing.js).
+    // As many animation frames as that takes: a count of them ran out on a
+    // slow renderer and the frame read was not one drawn under its rings
+    // ("under the rings vs whole: 126568 of 921600 lit pixels differ", Linux
+    // Firefox, push run of 2026-10-31).
     const maskedFrames = async count => {
       const start = viewer.getPulseLayerStats().panesMasked;
-      for (let attempt = 0; attempt < 600; attempt += 1) {
+      do {
         await frames(1);
-        if (viewer.getPulseLayerStats().panesMasked >= start + count) return;
-      }
+      } while (viewer.getPulseLayerStats().panesMasked < start + count);
     };
     const read = () => {
       const width = gl.drawingBufferWidth;
@@ -287,11 +288,9 @@ test('nothing is kept while highlights do not pulse, or while the frame is multi
     // Frames until the change made is drawn: the viewer clears its
     // invalidation when it draws the frame that shows it.
     const drawn = async () => {
-      for (let attempt = 0; attempt < 600; attempt += 1) {
+      do {
         await frames(1);
-        if (!viewer.getFrameScheduleState().invalidated) return;
-      }
-      throw new Error('The change was never drawn.');
+      } while (viewer.getFrameScheduleState().invalidated);
     };
     const start = viewer.getPulseLayerStats();
     viewer.setPointSize(5);

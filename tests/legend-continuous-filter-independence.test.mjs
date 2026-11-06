@@ -92,6 +92,13 @@ test.after(() => {
 
 const { initLegendRenderer } = await import('../assets/js/app/ui/modules/legend-renderer.js');
 const { DataStateColorMethods } = await import('../assets/js/app/state/managers/color-manager.js');
+const { installFieldActions } = await import('../assets/js/app/state/actions/field-actions.js');
+
+// The legend's controls dispatch actions (`app/actions/`): the state's own
+// implementations, installed for the legend drawn last.
+let removeFieldActions = null;
+test.after(() => removeFieldActions?.());
+const settle = () => new Promise(resolve => setImmediate(resolve));
 
 function renderLegend(values, prepare = () => {}) {
   const field = {
@@ -137,8 +144,13 @@ function renderLegend(values, prepare = () => {}) {
       return 0;
     },
     getFields() {
-      return [];
+      return this.obsData.fields;
     },
+    getVarFields() {
+      return this.varData.fields;
+    },
+    // A DataState is an event emitter: a colour change says so (`colors:changed`).
+    emit() {},
   };
   for (const name of Object.getOwnPropertyNames(DataStateColorMethods.prototype)) {
     if (name !== 'constructor') state[name] = DataStateColorMethods.prototype[name];
@@ -159,6 +171,8 @@ function renderLegend(values, prepare = () => {}) {
     },
     createElement: (tagName) => new FakeElement(tagName),
   };
+  removeFieldActions?.();
+  removeFieldActions = installFieldActions({ state: proxy });
   const legend = initLegendRenderer({
     state: proxy,
     viewer: null,
@@ -186,80 +200,83 @@ function renderLegend(values, prepare = () => {}) {
     logToggle: switchNamed('Log color scale'),
     zeroGrayToggle: switchNamed('Gray for zero'),
     resetButton: buttons.find((node) => node.textContent === 'Reset'),
-    fire(node, type) {
+    // A control's change is dispatched: it has applied once the dispatch settles.
+    async fire(node, type) {
       node.listeners[type].forEach((listener) => listener({ target: node }));
+      runFrames();
+      await settle();
       runFrames();
     },
   };
 }
 
-test('a log colour scale never stops the range filter from applying', () => {
+test('a log colour scale never stops the range filter from applying', async () => {
   const legend = renderLegend([0, 0.5, 5, 10]);
-  legend.fire(legend.logToggle, 'click');
+  await legend.fire(legend.logToggle, 'click');
   assert.equal(legend.field._useLogScale, true);
 
   // Max at the track's start (the zeros' step, below the smallest positive
   // value 0.5): the filter is in data units and must follow the slider.
   legend.maxSlider.value = '0';
-  legend.fire(legend.maxSlider, 'input');
+  await legend.fire(legend.maxSlider, 'input');
   assert.deepEqual(legend.field._continuousFilter, { min: 0, max: 0 });
   // And a typed bound below it, exactly as typed.
   legend.maxBox.value = '0,3';
-  legend.fire(legend.maxBox, 'change');
+  await legend.fire(legend.maxBox, 'change');
   assert.deepEqual(legend.field._continuousFilter, { min: 0, max: 0.3 });
   assert.deepEqual(legend.visibilityPublications.at(-1), { min: 0, max: 0.3 });
 });
 
-test('RESET and the sliders work on a constant field', () => {
+test('RESET and the sliders work on a constant field', async () => {
   const legend = renderLegend([2, 2, 2]);
   assert.equal(legend.minSlider.value, '0');
   assert.equal(legend.maxSlider.value, '1000');
 
-  legend.fire(legend.resetButton, 'click');
+  await legend.fire(legend.resetButton, 'click');
   assert.deepEqual(legend.field._continuousFilter, { min: 2, max: 2 });
 
   legend.maxSlider.value = '400';
-  legend.fire(legend.maxSlider, 'input');
+  await legend.fire(legend.maxSlider, 'input');
   assert.deepEqual(legend.field._continuousFilter, { min: 2, max: 2 });
 });
 
-test('the slider track ends are the exact data bounds', () => {
+test('the slider track ends are the exact data bounds', async () => {
   const legend = renderLegend([0.1, 0.4, 0.7]);
   legend.minSlider.value = '0';
-  legend.fire(legend.minSlider, 'input');
+  await legend.fire(legend.minSlider, 'input');
   legend.maxSlider.value = '1000';
-  legend.fire(legend.maxSlider, 'input');
+  await legend.fire(legend.maxSlider, 'input');
   assert.deepEqual(
     legend.field._continuousFilter,
     { min: Math.fround(0.1), max: Math.fround(0.7) },
   );
 });
 
-test('a bound is typed exactly, a slider sets a short one, and only the moved bound changes (NS-10)', () => {
+test('a bound is typed exactly, a slider sets a short one, and only the moved bound changes (NS-10)', async () => {
   // total_counts from 500 to 100,000: a 1 % step was 995 counts, so "≥ 1,500" could not be set.
   const legend = renderLegend([500, 900, 1500, 2000, 40000, 100000]);
   legend.minBox.value = '1500';
-  legend.fire(legend.minBox, 'change');
+  await legend.fire(legend.minBox, 'change');
   assert.deepEqual(legend.field._continuousFilter, { min: 1500, max: 100000 });
   assert.equal(legend.minSlider.value, '10', 'the slider follows the typed bound');
   // The other slider moves; the typed bound stays exactly as typed.
   legend.maxSlider.value = '500';
-  legend.fire(legend.maxSlider, 'input');
+  await legend.fire(legend.maxSlider, 'input');
   assert.deepEqual(legend.field._continuousFilter, { min: 1500, max: 50250 });
   assert.equal(legend.maxBox.value, '50250', 'the box shows the bound applied');
   assert.equal(legend.minBox.value, '1500');
   // Text that is not a number is not applied; the box shows the bound again.
   legend.minBox.value = '1.2.3';
-  legend.fire(legend.minBox, 'change');
+  await legend.fire(legend.minBox, 'change');
   assert.equal(legend.minBox.value, '1500');
   assert.deepEqual(legend.field._continuousFilter, { min: 1500, max: 50250 });
   // A bound past the data is the data's end; a minimum past the maximum moves it.
   legend.minBox.value = '70000';
-  legend.fire(legend.minBox, 'change');
+  await legend.fire(legend.minBox, 'change');
   assert.deepEqual(legend.field._continuousFilter, { min: 70000, max: 70000 });
 });
 
-test("a session's exact bounds are shown exactly and survive the other slider moving", () => {
+test("a session's exact bounds are shown exactly and survive the other slider moving", async () => {
   const legend = renderLegend([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], (field) => {
     field._continuousFilter.min = 1.234;
     field._continuousFilter.max = 8.765;
@@ -267,7 +284,7 @@ test("a session's exact bounds are shown exactly and survive the other slider mo
   assert.equal(legend.minBox.value, '1.234');
   assert.equal(legend.maxBox.value, '8.765');
   legend.maxSlider.value = '900';
-  legend.fire(legend.maxSlider, 'input');
+  await legend.fire(legend.maxSlider, 'input');
   assert.deepEqual(legend.field._continuousFilter, { min: 1.234, max: 9 });
 });
 
@@ -288,7 +305,7 @@ test('a colour range following a filter of "≥ 1" on counts keeps the cells at 
   legend.state.activeFieldSource = 'var';
   legend.state.setContinuousZeroGray(0, true);
   legend.minBox.value = '1';
-  legend.fire(legend.minBox, 'change');
+  await legend.fire(legend.minBox, 'change');
   legend.state.setContinuousColorRescale(0, true);
   legend.state.setContinuousColorRange(0, 1, 9);
   legend.state.updateColorsContinuous(legend.field, { expression: true });

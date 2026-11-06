@@ -6,6 +6,7 @@ import {
   describeDatasetDrop,
 } from '../assets/js/app/ui/modules/dataset-drop.js';
 import { readFolderEntry } from '../assets/js/data/local-folder.js';
+import { cellucidFileOfName } from '../assets/js/data/input-formats.js';
 
 function fileItem(name, entry = null) {
   const file = new File([new Uint8Array([1])], name);
@@ -138,4 +139,14 @@ test('a dropped folder is read through its handle where the drop gives one, else
   // A browser without handles: none asked for.
   const plain = describeDatasetDrop(transfer([fileItem('cells.zarr', entry)]));
   assert.equal(plain.handle, null);
+});
+
+test('a library file dropped goes to My datasets\' Import; a session file is refused saying what it is', () => {
+  const library = describeDatasetDrop(transfer([fileItem('Backup.cellucid-library')]));
+  assert.equal(library.kind, 'library');
+  assert.equal(library.label, 'Backup.cellucid-library');
+  assert.equal(library.file.name, 'Backup.cellucid-library');
+  const session = describeDatasetDrop(transfer([fileItem('cellucid-session-2026.cellucid-session')]));
+  assert.equal(session.kind, 'refused');
+  assert.equal(session.message, cellucidFileOfName('x.cellucid-session').said);
 });

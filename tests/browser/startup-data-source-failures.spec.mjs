@@ -16,7 +16,7 @@ import { expect, test } from './helpers/test.mjs';
 import { fulfillFile, zipEntryData } from './helpers/anndata-zarr-zip.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
+import { goOffline } from './helpers/offline.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
 
 const fixturesDirectory = path.join(
@@ -155,12 +155,10 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
-  // The first opening is over before the link goes: a read of it still
-  // under way (its gene list, a tree its frames asked for) would fail
-  // offline on its own and say so beside the switch's failure.
-  await waitForPageAtRest(page);
-
-  await context.setOffline(true);
+  // The first opening is over before the link goes (`goOffline`): a read of
+  // it still under way (its gene list, a tree its frames asked for) would
+  // fail offline on its own and say so beside the switch's failure.
+  await goOffline(context);
   await page.locator('#dataset-select').selectOption(
     optionValue(OTHER_DATASET.id),
   );

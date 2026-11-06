@@ -1,0 +1,76 @@
+{
+  "examples": [
+    {
+      "categories": [
+        "x"
+      ],
+      "cells": [
+        0
+      ],
+      "key": "x",
+      "kind": "categorical",
+      "n_obs": 0,
+      "values": [
+        0
+      ]
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "categories": {
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "cells": {
+        "items": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": [
+          "array",
+          "null"
+        ],
+        "x-cells": true
+      },
+      "key": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "kind": {
+        "enum": [
+          "categorical",
+          "continuous"
+        ],
+        "type": "string"
+      },
+      "n_obs": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "values": {
+        "items": {
+          "type": "number"
+        },
+        "type": "array",
+        "x-values": true
+      }
+    },
+    "required": [
+      "key",
+      "kind",
+      "categories",
+      "n_obs",
+      "cells",
+      "values"
+    ],
+    "type": "object"
+  },
+  "type": "field.push",
+  "version": 1
+}

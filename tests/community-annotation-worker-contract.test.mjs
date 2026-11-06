@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
+import { WORKER_EXPOSED_RESPONSE_HEADERS } from '../assets/js/app/community-annotations/worker-contract.js';
 
 const ENV = Object.freeze({
   ALLOWED_ORIGINS: 'https://app.example,http://localhost:8000',
@@ -90,7 +91,7 @@ test('worker exposes only the exact current route inventory', async () => {
   assert.deepEqual(await responseJson(response), {
     status: 'ok',
     service: 'Cellucid GitHub Auth',
-    contractVersion: 2,
+    contractVersion: 3,
     endpoints: [
       '/auth/login',
       '/auth/callback',
@@ -99,6 +100,8 @@ test('worker exposes only the exact current route inventory', async () => {
       '/auth/installations',
       '/auth/installation-repos',
       '/cap/lookup-cells',
+      '/graphql/snapshot',
+      '/graphql/blobs',
       '/api/repos/*',
     ],
   });
@@ -171,6 +174,11 @@ test('authenticated reads forward only safe GitHub retry metadata', async () => 
         headers: {
           'Retry-After': '7',
           'X-RateLimit-Reset': '2000000000',
+          'X-RateLimit-Remaining': '0',
+          'X-RateLimit-Limit': '5000',
+          'X-RateLimit-Used': '5000',
+          'X-RateLimit-Resource': 'core',
+          ETag: 'W/"abc"',
           'X-GitHub-Request-Id': 'ABCD:1234:5678:9ABC:DEF0',
           'Set-Cookie': 'github-secret=must-not-leak',
           'X-OAuth-Scopes': 'repo',
@@ -200,6 +208,15 @@ test('authenticated reads forward only safe GitHub retry metadata', async () => 
       response.headers.get('X-GitHub-Request-Id'),
       'ABCD:1234:5678:9ABC:DEF0'
     );
+    assert.equal(response.headers.get('X-RateLimit-Remaining'), '0');
+    assert.equal(response.headers.get('X-RateLimit-Limit'), '5000');
+    assert.equal(response.headers.get('X-RateLimit-Used'), '5000');
+    assert.equal(response.headers.get('X-RateLimit-Resource'), 'core');
+    assert.equal(response.headers.get('ETag'), 'W/"abc"');
+    assert.deepEqual(
+      response.headers.get('Access-Control-Expose-Headers').split(', '),
+      [...WORKER_EXPOSED_RESPONSE_HEADERS]
+    );
     assert.equal(response.headers.get('Set-Cookie'), null);
     assert.equal(response.headers.get('X-OAuth-Scopes'), null);
   } finally {
@@ -224,31 +241,50 @@ test('worker preflight exposes only the current mutation methods and headers', a
     response.headers.get('access-control-allow-origin'),
     'https://app.example'
   );
-  assert.match(
+  assert.equal(
     response.headers.get('access-control-allow-methods'),
-    /(?:^|, )PUT(?:,|$)/
+    'GET, POST, PUT, PATCH, OPTIONS'
   );
-  assert.doesNotMatch(
-    response.headers.get('access-control-allow-methods'),
-    /(?:^|, )PATCH(?:,|$)/
-  );
-  assert.doesNotMatch(
+  assert.equal(
     response.headers.get('access-control-allow-headers'),
-    /x-github-api-version/i
+    'authorization, content-type, if-none-match, x-cellucid-operation-id'
   );
+  // Chromium keeps a preflight 2 hours at most: every route asks for that.
+  assert.equal(response.headers.get('access-control-max-age'), '7200');
 
-  const removedPatch = await worker.fetch(
+  for (const [path, method] of [
+    ['/graphql/snapshot', 'POST'],
+    ['/graphql/blobs', 'POST'],
+    ['/api/repos/owner/repo/git/blobs/' + 'a'.repeat(40), 'GET'],
+    ['/auth/user', 'GET'],
+  ]) {
+    const preflight = await worker.fetch(
+      request(path, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://app.example',
+          'Access-Control-Request-Method': method,
+          'Access-Control-Request-Headers': 'authorization, if-none-match',
+        },
+      }),
+      ENV
+    );
+    assert.equal(preflight.status, 204, path);
+    assert.equal(preflight.headers.get('access-control-max-age'), '7200', path);
+  }
+
+  const removedDelete = await worker.fetch(
     request('/api/repos/owner/repo/pulls/1', {
       method: 'OPTIONS',
       headers: {
         Origin: 'https://app.example',
-        'Access-Control-Request-Method': 'PATCH',
+        'Access-Control-Request-Method': 'DELETE',
         'Access-Control-Request-Headers': 'Authorization, Content-Type',
       },
     }),
     ENV
   );
-  assert.equal(removedPatch.status, 400);
+  assert.equal(removedDelete.status, 400);
 });
 
 test('worker rejects inexact origin allowlists instead of normalizing them', async () => {
@@ -810,17 +846,16 @@ test('OAuth owner cookies enforce an exact serialized byte boundary', async () =
         'https://app.example/view?padding=' +
           unit.repeat(count)
       );
-    assert.equal((await responseFor(acceptedCount)).response.status, 302);
-    assert.equal((await responseFor(rejectedCount)).response.status, 400);
+    const startsSignIn = result => result.location.origin === 'https://github.com';
+    assert.equal(startsSignIn(await responseFor(acceptedCount)), true);
+    assert.equal(startsSignIn(await responseFor(rejectedCount)), false);
 
     while (rejectedCount - acceptedCount > 1) {
       const candidate =
         Math.floor((acceptedCount + rejectedCount) / 2);
-      const result = await responseFor(candidate);
-      if (result.response.status === 302) {
+      if (startsSignIn(await responseFor(candidate))) {
         acceptedCount = candidate;
       } else {
-        assert.equal(result.response.status, 400);
         rejectedCount = candidate;
       }
     }
@@ -833,16 +868,22 @@ test('OAuth owner cookies enforce an exact serialized byte boundary', async () =
       new TextEncoder().encode(cookies[0]).byteLength <= 4096
     );
     assert.equal(rejectedCount, acceptedCount + 1);
-    assert.equal(rejected.response.status, 400);
-    assert.equal(rejected.response.headers.get('location'), null);
+    // A top-level navigation: the page comes back with the reason, no cookie is set.
+    assert.equal(rejected.response.status, 302);
     assert.equal(rejected.response.headers.getSetCookie().length, 0);
-    assert.deepEqual(await responseJson(rejected.response), {
-      error: 'OAuth owner cookie exceeds 4096 serialized bytes',
-    });
+    const back = new URL(rejected.response.headers.get('location'));
+    assert.equal(back.origin, 'https://app.example');
+    assert.equal(back.pathname, '/view');
+    assert.match(
+      new URLSearchParams(back.hash.slice(1)).get('cellucid_github_error'),
+      /^GitHub sign-in could not start: this page address is [0-9,]+ characters long, more than the 4,096 bytes a browser keeps/
+    );
   }
 
   await assertBoundary('a');
   await assertBoundary('😀');
+  // Only what a cookie value cannot hold is escaped: a plain address costs its own length.
+  await assertBoundary('/');
 });
 
 test('OAuth state and callback token exchange use one exact flow', async () => {
@@ -886,20 +927,18 @@ test('OAuth state and callback token exchange use one exact flow', async () => {
   );
   assert.doesNotMatch(loginCookies[0], /;\s*Domain=/i);
   const ownerPair = loginCookies[0].split(';', 1)[0];
-  const ownerDocument = parseExactJson(
-    decodeURIComponent(
-      ownerPair.slice(ownerPair.indexOf('=') + 1)
-    )
-  );
-  assert.deepEqual(Object.keys(ownerDocument), [
-    'return_to',
-    'code_verifier',
-  ]);
+  const ownerValue = ownerPair.slice(ownerPair.indexOf('=') + 1);
+  // The PKCE verifier, a dot, and the return address with only `%`, `"`,
+  // `,`, `;` and `\` escaped (what a cookie value cannot hold, RFC 6265 4.1.1).
+  assert.match(ownerValue, /^[a-f0-9]{64}\.[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]+$/);
+  const ownerDocument = {
+    code_verifier: ownerValue.slice(0, 64),
+    return_to: decodeURIComponent(ownerValue.slice(65)),
+  };
   assert.equal(
     ownerDocument.return_to,
     `https://app.example/view?dataset=synthetic#${returnToHash}`
   );
-  assert.match(ownerDocument.code_verifier, /^[a-f0-9]{64}$/);
   const cookies = ownerPair;
 
   const previousFetch = globalThis.fetch;
@@ -1134,26 +1173,38 @@ test('OAuth callback never substitutes an allowlist origin for missing cookies',
 });
 
 test('installation repository requests reject coerced and unknown fields', async (t) => {
-  for (const body of [
-    '{"installation_id":"42"}',
-    '{"installation_id":42.5}',
-    '{"installation_id":42,"unknown":true}',
-    '{"installation_id":42,"\\u0069nstallation_id":43}',
+  for (const [path, body] of [
+    ['/auth/installation-repos?page=1', '{"installation_id":"42"}'],
+    ['/auth/installation-repos?page=1', '{"installation_id":42.5}'],
+    ['/auth/installation-repos?page=1', '{"installation_id":42,"unknown":true}'],
+    ['/auth/installation-repos', '{"installation_id":42}'],
+    ['/auth/installation-repos?page=0', '{"installation_id":42}'],
+    ['/auth/installation-repos?page=01', '{"installation_id":42}'],
+    ['/auth/installation-repos?page=1&page=2', '{"installation_id":42}'],
+    ['/auth/installation-repos?page=1&per_page=100', '{"installation_id":42}'],
   ]) {
-    await t.test(body, async () => {
-      const response = await worker.fetch(
-        request('/auth/installation-repos', {
-          method: 'POST',
-          headers: {
-            Authorization: 'Bearer token',
-            'Content-Type': 'application/json',
-            Origin: 'https://app.example',
-          },
-          body,
-        }),
-        ENV
-      );
-      assert.equal(response.status, 400);
+    await t.test(`${path} ${body}`, async () => {
+      const previousFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        throw new Error('An invalid request must not reach GitHub');
+      };
+      try {
+        const response = await worker.fetch(
+          request(path, {
+            method: 'POST',
+            headers: {
+              Authorization: 'Bearer token',
+              'Content-Type': 'application/json',
+              Origin: 'https://app.example',
+            },
+            body,
+          }),
+          ENV
+        );
+        assert.equal(response.status, 400);
+      } finally {
+        globalThis.fetch = previousFetch;
+      }
     });
   }
 });
@@ -1175,12 +1226,12 @@ test('worker projects installation repositories to the browser contract', async 
           },
         ],
       }),
-      { status: 200 }
+      { status: 200, headers: { 'X-RateLimit-Remaining': '4321' } }
     );
   };
   try {
     const response = await worker.fetch(
-      request('/auth/installation-repos', {
+      request('/auth/installation-repos?page=3', {
         method: 'POST',
         headers: {
           Authorization: 'Bearer token',
@@ -1193,13 +1244,15 @@ test('worker projects installation repositories to the browser contract', async 
     );
     assert.equal(response.status, 200);
     assert.deepEqual(await responseJson(response), {
-      repositories: [
+      items: [
         { id: 7, full_name: 'owner/annotations', private: true },
       ],
+      nextPage: null,
     });
+    assert.equal(response.headers.get('X-RateLimit-Remaining'), '4321');
     assert.equal(
       githubRequest.url,
-      'https://api.github.com/user/installations/42/repositories?per_page=100&page=1'
+      'https://api.github.com/user/installations/42/repositories?per_page=100&page=3'
     );
     assert.equal(
       githubRequest.options.headers.get('authorization'),
@@ -1210,376 +1263,159 @@ test('worker projects installation repositories to the browser contract', async 
   }
 });
 
-test('worker returns every GitHub installation page without truncation', async () => {
+// Cloudflare Free allows 50 subrequests per request: a collection is one
+// GitHub page per Worker request, however large it is (repro r05: 10,000
+// installations were 100 subrequests in one request).
+test('a collection is one GitHub page per Worker request, paged by GitHub\'s Link header', async () => {
   const previousFetch = globalThis.fetch;
   const githubRequests = [];
-  globalThis.fetch = async (url) => {
+  const pages = 101;
+  globalThis.fetch = async (url, options) => {
     const parsed = new URL(url);
-    githubRequests.push(parsed.toString());
-    const page = parsed.searchParams.get('page');
-    const firstPage = Array.from({ length: 100 }, (_, index) => ({
-      id: index + 1,
-      account: { login: `account-${index + 1}` },
+    githubRequests.push({ url: parsed.toString(), ifNoneMatch: options.headers.get('If-None-Match') });
+    const page = Number(parsed.searchParams.get('page'));
+    const installations = Array.from({ length: page === pages ? 1 : 100 }, (_, index) => ({
+      id: (page - 1) * 100 + index + 1,
+      account: { login: `account-${(page - 1) * 100 + index + 1}` },
+      unused_remote_field: 'not forwarded',
     }));
-    const installations =
-      page === '1'
-        ? firstPage
-        : [{ id: 101, account: { login: 'account-101' } }];
+    const link = [
+      ...(page < pages ? [`<https://api.github.com/user/installations?per_page=100&page=${page + 1}>; rel="next"`] : []),
+      `<https://api.github.com/user/installations?per_page=100&page=${pages}>; rel="last"`,
+    ].join(', ');
     return new Response(
-      JSON.stringify({ total_count: 101, installations }),
-      { status: 200 }
+      JSON.stringify({ total_count: 10_001, installations }),
+      { status: 200, headers: { Link: link, ETag: `"page-${page}"` } }
     );
   };
   try {
-    const response = await worker.fetch(
-      request('/auth/installations', {
-        headers: {
-          Authorization: 'Bearer token',
-          Origin: 'https://app.example',
-        },
-      }),
-      ENV
-    );
-    assert.equal(response.status, 200);
-    const document = await responseJson(response);
-    assert.equal(document.installations.length, 101);
-    assert.deepEqual(document.installations[100], {
-      id: 101,
-      account: { login: 'account-101' },
-    });
-    assert.deepEqual(githubRequests, [
-      'https://api.github.com/user/installations?per_page=100&page=1',
-      'https://api.github.com/user/installations?per_page=100&page=2',
-    ]);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('worker fetches bounded GitHub collection pages concurrently in order', async () => {
-  const previousFetch = globalThis.fetch;
-  const startedPages = [];
-  const pendingPages = [];
-  let released = false;
-  let markSecondPageStarted;
-  const secondPageStarted = new Promise(resolve => {
-    markSecondPageStarted = resolve;
-  });
-
-  const pageResponse = page => {
-    const count = page === 4 ? 1 : 100;
-    const installations = Array.from({ length: count }, (_, index) => {
-      const id = (page - 1) * 100 + index + 1;
-      return { id, account: { login: `account-${id}` } };
-    });
-    return new Response(
-      JSON.stringify({ total_count: 301, installations }),
-      { status: 200 }
-    );
-  };
-  globalThis.fetch = async url => {
-    const page = Number(new URL(url).searchParams.get('page'));
-    startedPages.push(page);
-    if (page === 1 || released) return pageResponse(page);
-    if (page === 2) markSecondPageStarted();
-    return new Promise(resolve => {
-      pendingPages.push(() => resolve(pageResponse(page)));
-    });
-  };
-
-  let schedulingError = null;
-  let responsePromise;
-  try {
-    responsePromise = worker.fetch(
-      request('/auth/installations', {
-        headers: {
-          Authorization: 'Bearer token',
-          Origin: 'https://app.example',
-        },
-      }),
-      ENV
-    );
-    await secondPageStarted;
-    await Promise.resolve();
-    await Promise.resolve();
-    try {
-      assert.deepEqual(startedPages, [1, 2, 3, 4]);
-    } catch (error) {
-      schedulingError = error;
-    }
-    released = true;
-    for (const release of pendingPages.splice(0)) release();
-
-    const response = await responsePromise;
-    assert.equal(response.status, 200);
-    const document = await responseJson(response);
-    assert.equal(document.installations.length, 301);
-    assert.deepEqual(document.installations[300], {
-      id: 301,
-      account: { login: 'account-301' },
-    });
-    if (schedulingError !== null) throw schedulingError;
-  } finally {
-    released = true;
-    for (const release of pendingPages.splice(0)) release();
-    if (responsePromise) await responsePromise;
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('worker validates and projects the first collection page before dispatching another page', async () => {
-  const previousFetch = globalThis.fetch;
-  let upstreamCalls = 0;
-  globalThis.fetch = async url => {
-    upstreamCalls += 1;
-    const page = Number(new URL(url).searchParams.get('page'));
-    if (page === 1) {
-      return new Response(
-        JSON.stringify({ total_count: 301 }),
-        { status: 200 }
-      );
-    }
-    const count = page === 4 ? 1 : 100;
-    return new Response(JSON.stringify({
-      total_count: 301,
-      installations: Array.from({ length: count }, (_, index) => {
-        const id = (page - 1) * 100 + index + 1;
-        return { id, account: { login: `account-${id}` } };
-      }),
-    }), { status: 200 });
-  };
-
-  try {
-    const response = await worker.fetch(
-      request('/auth/installations', {
-        headers: {
-          Authorization: 'Bearer token',
-          Origin: 'https://app.example',
-        },
-      }),
-      ENV
-    );
-    assert.equal(response.status, 502);
-    assert.deepEqual(await responseJson(response), {
-      error: 'GitHub installations response is missing installations',
-    });
-    assert.equal(upstreamCalls, 1);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('a failed concurrent collection page launches no work beyond the current bounded window', async () => {
-  const previousFetch = globalThis.fetch;
-  const pageTwoStarted = deferred();
-  const pendingPages = [];
-  const startedPages = [];
-  let released = false;
-  let responsePromise = null;
-
-  const pageResponse = page => new Response(JSON.stringify({
-    total_count: 1_000,
-    installations: Array.from({ length: 100 }, (_, index) => {
-      const id = (page - 1) * 100 + index + 1;
-      return { id, account: { login: `account-${id}` } };
-    }),
-  }), { status: 200 });
-
-  globalThis.fetch = async (url, options = {}) => {
-    const page = Number(new URL(url).searchParams.get('page'));
-    startedPages.push(page);
-    if (page === 1 || released) return pageResponse(page);
-    if (page === 2) {
-      pageTwoStarted.resolve();
-      return new Response('{"message":"collection denied"}', {
-        status: 403,
-      });
-    }
-    return new Promise((resolve, reject) => {
-      const signal = options.signal;
-      const onAbort = () => {
-        signal?.removeEventListener('abort', onAbort);
-        reject(new DOMException('collection sibling cancelled', 'AbortError'));
-      };
-      if (signal?.aborted) {
-        onAbort();
-        return;
-      }
-      signal?.addEventListener('abort', onAbort, { once: true });
-      pendingPages.push(() => {
-        signal?.removeEventListener('abort', onAbort);
-        resolve(pageResponse(page));
-      });
-    });
-  };
-
-  let schedulingError = null;
-  try {
-    responsePromise = worker.fetch(
-      request('/auth/installations', {
-        headers: {
-          Authorization: 'Bearer token',
-          Origin: 'https://app.example',
-        },
-      }),
-      ENV
-    );
-    await pageTwoStarted.promise;
-    await new Promise(resolve => setImmediate(resolve));
-    try {
-      assert.deepEqual(
-        [...startedPages],
-        [1, 2, 3, 4, 5, 6, 7]
-      );
-    } catch (error) {
-      schedulingError = error;
-    }
-
-    released = true;
-    for (const release of pendingPages.splice(0)) release();
-    const response = await responsePromise;
-    assert.equal(response.status, 403);
-    assert.deepEqual(await responseJson(response), {
-      error: 'collection denied',
-    });
-    if (schedulingError !== null) throw schedulingError;
-  } finally {
-    released = true;
-    for (const release of pendingPages.splice(0)) release();
-    if (responsePromise !== null) await responsePromise;
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('collection pages discard ignored raw fields when each page is projected and preserve exact order', async () => {
-  const previousFetch = globalThis.fetch;
-  const previousJsonParse = JSON.parse;
-  const projectionAtPageStart = new Map();
-  const projectedPages = new Set();
-  const ignoredPadding = 'x'.repeat(1_024);
-
-  JSON.parse = function observedJsonParse(text, ...args) {
-    const value = Reflect.apply(previousJsonParse, JSON, [text, ...args]);
-    const page = value?._cellucid_test_page;
-    if (
-      Number.isSafeInteger(page) &&
-      page >= 1 &&
-      Array.isArray(value.installations)
-    ) {
-      value.installations = value.installations.map(raw => {
-        const pageForItem = page;
-        return new Proxy(raw, {
-          get(target, property, receiver) {
-            if (
-              property === 'id' ||
-              property === 'account'
-            ) {
-              projectedPages.add(pageForItem);
-            }
-            return Reflect.get(target, property, receiver);
+    let page = 1;
+    let seen = 0;
+    while (page !== null) {
+      const before = githubRequests.length;
+      const response = await worker.fetch(
+        request(`/auth/installations?page=${page}`, {
+          headers: {
+            Authorization: 'Bearer token',
+            Origin: 'https://app.example',
           },
-        });
+        }),
+        ENV
+      );
+      assert.equal(response.status, 200);
+      assert.equal(githubRequests.length, before + 1, 'one subrequest per Worker request');
+      assert.equal(response.headers.get('ETag'), `"page-${page}"`);
+      const document = await responseJson(response);
+      assert.deepEqual(Object.keys(document), ['items', 'nextPage']);
+      assert.deepEqual(document.items[0], {
+        id: (page - 1) * 100 + 1,
+        account: { login: `account-${(page - 1) * 100 + 1}` },
       });
+      seen += document.items.length;
+      assert.equal(document.nextPage, page < pages ? page + 1 : null);
+      page = document.nextPage;
     }
-    return value;
-  };
-
-  globalThis.fetch = async url => {
-    const page = Number(new URL(url).searchParams.get('page'));
-    projectionAtPageStart.set(page, new Set(projectedPages));
-    const count = page === 9 ? 1 : 100;
-    return new Response(JSON.stringify({
-      _cellucid_test_page: page,
-      total_count: 801,
-      installations: Array.from({ length: count }, (_, index) => {
-        const id = (page - 1) * 100 + index + 1;
-        return {
-          id,
-          account: { login: `account-${id}` },
-          ignored_padding: ignoredPadding,
-        };
-      }),
-    }), { status: 200 });
-  };
-
-  try {
-    const response = await worker.fetch(
-      request('/auth/installations', {
-        headers: {
-          Authorization: 'Bearer token',
-          Origin: 'https://app.example',
-        },
-      }),
-      ENV
-    );
-    assert.equal(response.status, 200);
-    const document = await responseJson(response);
-    assert.deepEqual(
-      document.installations.map(installation => installation.id),
-      Array.from({ length: 801 }, (_, index) => index + 1)
-    );
-    assert.equal(
-      document.installations.every(installation =>
-        Object.keys(installation).length === 2 &&
-        Object.hasOwn(installation, 'id') &&
-        Object.hasOwn(installation, 'account') &&
-        !Object.hasOwn(installation, 'ignored_padding')
-      ),
-      true
-    );
-    assert.equal(
-      projectionAtPageStart.get(2)?.has(1),
-      true,
-      'page 1 must be projected before the concurrent window starts'
-    );
-    assert.equal(
-      projectionAtPageStart.get(8)?.has(2),
-      true,
-      'a worker must discard page 2 raw fields before requesting page 8'
-    );
+    assert.equal(seen, 10_001, 'no item limit: every installation is listed');
+    assert.equal(githubRequests[0].url, 'https://api.github.com/user/installations?per_page=100&page=1');
+    assert.equal(githubRequests.at(-1).url, `https://api.github.com/user/installations?per_page=100&page=${pages}`);
   } finally {
     globalThis.fetch = previousFetch;
-    JSON.parse = previousJsonParse;
   }
 });
 
-test('worker rejects oversized GitHub collections before a second page', async () => {
+test('a collection page passes a conditional request on and answers 304 with the GitHub headers', async () => {
   const previousFetch = globalThis.fetch;
-  let upstreamCalls = 0;
-  globalThis.fetch = async () => {
-    upstreamCalls += 1;
-    return new Response(
-      JSON.stringify({
-        total_count: 10_001,
-        installations: Array.from({ length: 100 }, (_, index) => ({
-          id: index + 1,
-          account: { login: `account-${index + 1}` },
-        })),
-      }),
-      { status: 200 }
-    );
+  let forwardedTag = null;
+  globalThis.fetch = async (_url, options) => {
+    forwardedTag = options.headers.get('If-None-Match');
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: '"same"', 'X-RateLimit-Remaining': '4999' },
+    });
   };
   try {
     const response = await worker.fetch(
-      request('/auth/installations', {
+      request('/auth/installations?page=1', {
         headers: {
           Authorization: 'Bearer token',
           Origin: 'https://app.example',
+          'If-None-Match': '"same"',
         },
       }),
       ENV
     );
-    assert.equal(response.status, 502);
-    assert.deepEqual(await responseJson(response), {
-      error: 'GitHub installations total_count exceeds 10000',
-    });
-    assert.equal(upstreamCalls, 1);
+    assert.equal(forwardedTag, '"same"');
+    assert.equal(response.status, 304);
+    assert.equal(await response.text(), '');
+    assert.equal(response.headers.get('ETag'), '"same"');
+    assert.equal(response.headers.get('X-RateLimit-Remaining'), '4999');
+    assert.equal(response.headers.get('Access-Control-Allow-Origin'), 'https://app.example');
   } finally {
     globalThis.fetch = previousFetch;
   }
 });
 
-test('worker rejects duplicate-key JSON returned by GitHub', async () => {
+test('a collection page is checked whole and named next page must follow it', async (t) => {
+  const installation = index => ({ id: index, account: { login: `account-${index}` } });
+  const scenarios = [
+    {
+      name: 'repeated id',
+      document: { total_count: 2, installations: [installation(1), { id: 1, account: { login: 'other' } }] },
+      error: 'GitHub installations page repeats 1',
+    },
+    {
+      name: 'repeated account, other case',
+      document: { total_count: 2, installations: [installation(1), { id: 2, account: { login: 'ACCOUNT-1' } }] },
+      error: 'GitHub installations page repeats account-1',
+    },
+    {
+      name: 'more than a page',
+      document: { total_count: 101, installations: Array.from({ length: 101 }, (_, index) => installation(index + 1)) },
+      error: 'GitHub installations page holds more than 100 items',
+    },
+    {
+      name: 'invalid total_count',
+      document: { total_count: -1, installations: [] },
+      error: 'GitHub installations response has an invalid total_count',
+    },
+    {
+      name: 'next page skips one',
+      document: { total_count: 300, installations: [installation(1)] },
+      link: '<https://api.github.com/user/installations?per_page=100&page=3>; rel="next"',
+      error: 'GitHub installations names a next page that is not page 2',
+    },
+    {
+      name: 'malformed Link',
+      document: { total_count: 300, installations: [installation(1)] },
+      link: 'https://api.github.com/user/installations?page=2; rel=next',
+      error: 'GitHub installations Link header is malformed',
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const previousFetch = globalThis.fetch;
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(scenario.document), {
+          status: 200,
+          headers: scenario.link === undefined ? {} : { Link: scenario.link },
+        });
+      try {
+        const response = await worker.fetch(
+          request('/auth/installations?page=1', {
+            headers: { Authorization: 'Bearer token', Origin: 'https://app.example' },
+          }),
+          ENV
+        );
+        assert.equal(response.status, 502);
+        assert.deepEqual(await responseJson(response), { error: scenario.error });
+      } finally {
+        globalThis.fetch = previousFetch;
+      }
+    });
+  }
+});
+
+test('GitHub responses are parsed natively: a repeated key keeps its last value, which is what is checked and relayed', async () => {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response('{"id":42,"\\u0069d":43,"login":"researcher"}', {
@@ -1595,10 +1431,8 @@ test('worker rejects duplicate-key JSON returned by GitHub', async () => {
       }),
       ENV
     );
-    assert.equal(response.status, 502);
-    assert.deepEqual(await responseJson(response), {
-      error: 'GitHub API GET /user response contains invalid JSON',
-    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await responseJson(response), { id: 43, login: 'researcher' });
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -1614,7 +1448,7 @@ test('worker method allowlist rejects unsupported methods before proxying', asyn
   try {
     const response = await worker.fetch(
       request('/api/repos/owner/repo/pulls/1', {
-        method: 'PATCH',
+        method: 'DELETE',
         headers: {
           Authorization: 'Bearer token',
           'Content-Type': 'application/json',
@@ -1626,8 +1460,22 @@ test('worker method allowlist rejects unsupported methods before proxying', asyn
     );
     assert.equal(response.status, 405);
     assert.deepEqual(await responseJson(response), {
-      error: 'Method is not allowed: PATCH',
+      error: 'Method is not allowed: DELETE',
     });
+    // PATCH is allowed only on the caller's own contribution branch ref.
+    const patchPull = await worker.fetch(
+      request('/api/repos/owner/repo/pulls/1', {
+        method: 'PATCH',
+        headers: {
+          Authorization: 'Bearer token',
+          'Content-Type': 'application/json',
+          Origin: 'https://app.example',
+        },
+        body: '{"state":"open"}',
+      }),
+      ENV
+    );
+    assert.equal(patchPull.status, 404);
     assert.equal(forwarded, false);
   } finally {
     globalThis.fetch = previousFetch;
@@ -1658,7 +1506,10 @@ test('GitHub API proxy requires auth and the current /repos route family', async
 test('GitHub API proxy exposes only exact annotation operations and bodies', async () => {
   const previousFetch = globalThis.fetch;
   let forwarded = 0;
-  globalThis.fetch = async (_url, options = {}) => {
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === 'https://api.github.com/user') {
+      return new Response('{"id":42,"login":"researcher"}', { status: 200 });
+    }
     forwarded += 1;
     if (options.method === 'PUT') {
       return new Response(JSON.stringify({
@@ -1692,6 +1543,7 @@ test('GitHub API proxy exposes only exact annotation operations and bodies', asy
       request('/api/repos/owner/repo/contents/annotations/config.json', {
         headers,
       }),
+      // Cellucid never creates a fork (that needs the app's Administration permission).
       request('/api/repos/owner/repo/forks', {
         method: 'POST',
         headers: {
@@ -1699,7 +1551,7 @@ test('GitHub API proxy exposes only exact annotation operations and bodies', asy
           'Content-Type': 'application/json',
           'X-Cellucid-Operation-Id': OPERATION_ID,
         },
-        body: '{"organization":"alias-owner"}',
+        body: '{}',
       }),
       request('/api/repos/owner/repo/contents/annotations/config.json', {
         method: 'PUT',

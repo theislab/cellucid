@@ -1,0 +1,185 @@
+{
+  "examples": [
+    {
+      "camera": {
+        "freefly": {
+          "pitch": 0,
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "yaw": 0
+        },
+        "navigationMode": "orbit",
+        "orbit": {
+          "phi": 0,
+          "radius": 1,
+          "target": [
+            0,
+            0,
+            0
+          ],
+          "targetRadius": 1,
+          "theta": 0
+        }
+      },
+      "embedding": {
+        "columns": [
+          0
+        ],
+        "key": "x"
+      },
+      "label": "x"
+    },
+    {
+      "camera": {
+        "freefly": {
+          "pitch": 0,
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "yaw": 0
+        },
+        "navigationMode": "orbit",
+        "orbit": {
+          "phi": 0,
+          "radius": 1,
+          "target": [
+            0,
+            0,
+            0
+          ],
+          "targetRadius": 1,
+          "theta": 0
+        }
+      },
+      "embedding": null,
+      "label": "x"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "camera": {
+        "additionalProperties": false,
+        "properties": {
+          "freefly": {
+            "additionalProperties": false,
+            "properties": {
+              "pitch": {
+                "type": "number"
+              },
+              "position": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "yaw": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "position",
+              "yaw",
+              "pitch"
+            ],
+            "type": "object"
+          },
+          "navigationMode": {
+            "enum": [
+              "orbit",
+              "planar",
+              "free"
+            ]
+          },
+          "orbit": {
+            "additionalProperties": false,
+            "properties": {
+              "phi": {
+                "type": "number"
+              },
+              "radius": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "target": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "targetRadius": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "theta": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "radius",
+              "targetRadius",
+              "theta",
+              "phi",
+              "target"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "navigationMode",
+          "orbit",
+          "freefly"
+        ],
+        "type": "object"
+      },
+      "embedding": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "items": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "maxItems": 3,
+                "minItems": 1,
+                "type": "array",
+                "uniqueItems": true
+              },
+              "key": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "key",
+              "columns"
+            ],
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "label": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "type": "camera-path.keyframe.add",
+  "version": 1
+}

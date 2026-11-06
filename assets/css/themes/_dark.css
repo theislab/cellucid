@@ -59,4 +59,14 @@
   --color-info: var(--blue-400);
   --color-info-soft: color-mix(in srgb, var(--color-info) 12%, var(--color-surface-elevated));
   --color-info-text: var(--blue-300);
+
+  /* History branch lanes (see _light.css). */
+  --history-lane-0: var(--cyan-400);
+  --history-lane-1: var(--blue-400);
+  --history-lane-2: var(--green-400);
+  --history-lane-3: var(--yellow-400);
+  --history-lane-4: var(--gray-300);
+  --history-lane-5: var(--cyan-200);
+  --history-lane-6: var(--blue-200);
+  --history-lane-7: var(--green-200);
 }

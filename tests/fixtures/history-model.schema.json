@@ -1,0 +1,2676 @@
+{
+  "$defs": {
+    "ActionStamp": {
+      "additionalProperties": false,
+      "description": "One version of one action a session's steps use (one stamp per type and version present).",
+      "properties": {
+        "params": {
+          "description": "SHA-256 of the shape of that version's params schema (actionParamsShape, canonical JSON) when the writer's catalogue is at that version; null for an earlier version, whose upgraders take it forward.",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "description": "The action.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "The version of its parameters the steps were recorded with (Step.v).",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "type",
+        "version",
+        "params"
+      ],
+      "type": "object"
+    },
+    "AppStamp": {
+      "additionalProperties": false,
+      "description": "What wrote a session file.",
+      "properties": {
+        "catalog": {
+          "description": "The SHA-256 of the action catalogue document it was written with.",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "version": {
+          "description": "The Cellucid version.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "catalog"
+      ],
+      "type": "object"
+    },
+    "ApplyPlan": {
+      "additionalProperties": false,
+      "description": "What applying a step would change, written nowhere yet (a dry run).",
+      "properties": {
+        "branch": {
+          "description": "The branch.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "requires": {
+          "$ref": "#/$defs/Requires",
+          "description": "The fields the step's state uses."
+        },
+        "rows": {
+          "description": "Every change, in domain order.",
+          "items": {
+            "$ref": "#/$defs/ApplyPlanRow"
+          },
+          "type": "array"
+        },
+        "session_sha256": {
+          "description": "The session file's SHA-256.",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "step": {
+          "description": "The step applied.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "tracker": {
+          "description": "The tracker.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        }
+      },
+      "required": [
+        "session_sha256",
+        "tracker",
+        "branch",
+        "step",
+        "requires",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "ApplyPlanRow": {
+      "additionalProperties": false,
+      "description": "One change an apply makes to an AnnData, a Seurat object or a SingleCellExperiment.",
+      "properties": {
+        "cells": {
+          "description": "The cells it marks or labels.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "column": {
+          "description": "The column a category row is in.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domain": {
+          "description": "The state domain it comes from.",
+          "enum": [
+            "cells",
+            "mapping",
+            "field-overlays",
+            "gene-sets",
+            "views",
+            "active-field",
+            "filters",
+            "colors",
+            "visibility",
+            "highlights",
+            "camera",
+            "camera-path",
+            "settings",
+            "analysis",
+            "layout"
+          ]
+        },
+        "from": {
+          "description": "The earlier names (renames, merges).",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "description": "What it is.",
+          "enum": [
+            "user-field",
+            "highlight",
+            "column-renamed",
+            "categories-renamed",
+            "categories-merged",
+            "field-deleted",
+            "gene-set",
+            "presentation"
+          ]
+        },
+        "name": {
+          "description": "The column, gene set or domain it writes or reports.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "note": {
+          "description": "Why, when not applied or replaced.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "write, replace (an earlier apply's column, with overwrite), unchanged (already applied) or not-applied.",
+          "enum": [
+            "write",
+            "replace",
+            "unchanged",
+            "not-applied"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "domain",
+        "name",
+        "column",
+        "from",
+        "cells",
+        "status",
+        "note"
+      ],
+      "type": "object"
+    },
+    "ApplyReport": {
+      "additionalProperties": false,
+      "description": "What an apply did.",
+      "properties": {
+        "applied": {
+          "description": "False when every row was already applied (nothing written).",
+          "type": "boolean"
+        },
+        "plan": {
+          "$ref": "#/$defs/ApplyPlan",
+          "description": "Its plan."
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The record written; null when nothing was."
+        }
+      },
+      "required": [
+        "plan",
+        "applied",
+        "provenance"
+      ],
+      "type": "object"
+    },
+    "Branch": {
+      "additionalProperties": false,
+      "description": "A line of steps with a unique name, from its fork step to its tip.",
+      "properties": {
+        "archived": {
+          "description": "Hidden from the graph and the pickers; kept.",
+          "type": "boolean"
+        },
+        "base": {
+          "description": "The step it forks from; null for the branch that holds the root.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-id": "step"
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Who made it."
+        },
+        "createdAt": {
+          "description": "When its first step was made.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "id": {
+          "description": "b<n>, never reused in its tracker.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "lane": {
+          "description": "Its colour slot (--history-lane-<lane>).",
+          "maximum": 7,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "locked": {
+          "description": "No new step, rename, delete or compaction until unlocked.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Unique in its tracker (by its key).",
+          "minLength": 1,
+          "type": "string",
+          "x-name": true
+        },
+        "notes": {
+          "description": "Its notes, oldest first.",
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "type": "array"
+        },
+        "tip": {
+          "description": "Its last step, one of its own.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "base",
+        "tip",
+        "createdAt",
+        "by",
+        "lane",
+        "locked",
+        "archived",
+        "notes"
+      ],
+      "type": "object"
+    },
+    "BranchName": {
+      "additionalProperties": false,
+      "description": "A branch as a link names it.",
+      "properties": {
+        "id": {
+          "description": "Its id.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "name": {
+          "description": "Its name then.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "BranchTip": {
+      "additionalProperties": false,
+      "description": "Another branch's last step, an input a kept view of a branch reads.",
+      "properties": {
+        "branch": {
+          "description": "The branch.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "tip": {
+          "description": "Its tip when the step was recorded.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "tracker": {
+          "description": "The tracker of the branch.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        }
+      },
+      "required": [
+        "tracker",
+        "branch",
+        "tip"
+      ],
+      "type": "object"
+    },
+    "By": {
+      "additionalProperties": false,
+      "description": "Who acted: a person, an agent for them, a notebook, a replay, a session, the opening, or a change made outside an action.",
+      "properties": {
+        "agent": {
+          "description": "The agent (Claude, ChatGPT, …) when the origin is agent.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "description": "The notebook language when the origin is host.",
+          "enum": [
+            "python",
+            "r",
+            null
+          ]
+        },
+        "model": {
+          "description": "The agent's model when known (claude-sonnet-4-6, …).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "description": "Who acted.",
+          "enum": [
+            "user",
+            "agent",
+            "host",
+            "session",
+            "replay",
+            "startup",
+            "outside"
+          ]
+        },
+        "person": {
+          "description": "The person's display name, only when they chose to record it.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn": {
+          "description": "The agent or notebook turn it belongs to.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "origin",
+        "agent",
+        "model",
+        "host",
+        "person",
+        "turn"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "agent is set exactly when origin is \"agent\"; model only for an agent.",
+        "host is set exactly when origin is \"host\".",
+        "turn is set only for an agent or a host."
+      ]
+    },
+    "Carried": {
+      "additionalProperties": false,
+      "description": "The notes and bookmarks of the steps a squash replaced, kept by the squashed step.",
+      "properties": {
+        "bookmarks": {
+          "description": "The bookmarks of the steps it replaced: jumping to one shows this step.",
+          "items": {
+            "minLength": 1,
+            "type": "string",
+            "x-name": true
+          },
+          "type": "array"
+        },
+        "notes": {
+          "description": "Its notes that were on the steps it replaced, the last one's included, each once (they keep their ids).",
+          "items": {
+            "pattern": "^n(0|[1-9][0-9]*)$",
+            "type": "string",
+            "x-id": "note"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "notes",
+        "bookmarks"
+      ],
+      "type": "object"
+    },
+    "CategoryMap": {
+      "additionalProperties": false,
+      "description": "One category label used in place of another, in a field.",
+      "properties": {
+        "field": {
+          "description": "The obs field (its recorded key).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "from": {
+          "description": "The recorded label.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "to": {
+          "description": "The label used here.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "CellOrder": {
+      "additionalProperties": false,
+      "description": "The cell-order digest of a dataset (session-context.js).",
+      "properties": {
+        "digest": {
+          "description": "16 lower-case hex digits.",
+          "pattern": "^[0-9a-f]{16}$",
+          "type": "string"
+        },
+        "dimension": {
+          "description": "Its dimension.",
+          "maximum": 3,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "embedding": {
+          "$ref": "#/$defs/CellOrderEmbedding",
+          "description": "The embedding it is over."
+        }
+      },
+      "required": [
+        "embedding",
+        "dimension",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "CellOrderEmbedding": {
+      "additionalProperties": false,
+      "description": "The embedding a cell-order digest is over.",
+      "properties": {
+        "columns": {
+          "description": "Its 0-based columns.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "key": {
+          "description": "Its obsm key.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "columns"
+      ],
+      "type": "object"
+    },
+    "DatasetIdentity": {
+      "additionalProperties": false,
+      "description": "The dataset a history is of.",
+      "properties": {
+        "cellOrder": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellOrder"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its cell order, when known."
+        },
+        "id": {
+          "description": "Its identity id.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Its name.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "cellOrder"
+      ],
+      "type": "object"
+    },
+    "DatasetName": {
+      "additionalProperties": false,
+      "description": "A dataset as a link names it.",
+      "properties": {
+        "id": {
+          "description": "Its identity id.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Its name.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "DomainValues": {
+      "additionalProperties": false,
+      "description": "The value hash of each state domain a step changed (or, for the root, of every domain).",
+      "properties": {
+        "active-field": {
+          "description": "The value hash of \"active-field\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "analysis": {
+          "description": "The value hash of \"analysis\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "camera": {
+          "description": "The value hash of \"camera\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "camera-path": {
+          "description": "The value hash of \"camera-path\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "cells": {
+          "description": "The value hash of \"cells\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "colors": {
+          "description": "The value hash of \"colors\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "field-overlays": {
+          "description": "The value hash of \"field-overlays\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "filters": {
+          "description": "The value hash of \"filters\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "gene-sets": {
+          "description": "The value hash of \"gene-sets\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "highlights": {
+          "description": "The value hash of \"highlights\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "layout": {
+          "description": "The value hash of \"layout\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "mapping": {
+          "description": "The value hash of \"mapping\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "settings": {
+          "description": "The value hash of \"settings\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "views": {
+          "description": "The value hash of \"views\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "visibility": {
+          "description": "The value hash of \"visibility\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "Group": {
+      "additionalProperties": false,
+      "description": "A named folder over consecutive steps of one branch (metadata only): each of its steps names it (Step.group).",
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Who made it."
+        },
+        "createdAt": {
+          "description": "When it was made.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "id": {
+          "description": "g<n>, never reused in its tracker.",
+          "pattern": "^g(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "group"
+        },
+        "name": {
+          "description": "Unique in its tracker (by its key).",
+          "minLength": 1,
+          "type": "string",
+          "x-name": true
+        },
+        "notes": {
+          "description": "Its notes, oldest first.",
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "createdAt",
+        "by",
+        "notes"
+      ],
+      "type": "object"
+    },
+    "History": {
+      "additionalProperties": false,
+      "description": "Every tracker of the open dataset.",
+      "properties": {
+        "activeTracker": {
+          "description": "The tracker in use.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        },
+        "dataset": {
+          "$ref": "#/$defs/DatasetIdentity",
+          "description": "The dataset."
+        },
+        "trackers": {
+          "description": "Its trackers, in the order they started.",
+          "items": {
+            "$ref": "#/$defs/Tracker"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dataset",
+        "activeTracker",
+        "trackers"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "Tracker ids are unique; names of trackers not removed are unique by key and none has the form of a tracker id.",
+        "The active tracker is one of them and is not removed."
+      ]
+    },
+    "JournalEntry": {
+      "additionalProperties": false,
+      "description": "One structural edit of the history, undoable from Recently deleted or the toast.",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Patch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What it made; null once purged."
+        },
+        "at": {
+          "description": "When.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Patch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What it replaced; null once purged."
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Who."
+        },
+        "id": {
+          "description": "j<n>, never reused in its tracker.",
+          "pattern": "^j(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "journal"
+        },
+        "label": {
+          "description": "What it did, in a sentence (\"Deleted branch \"X\" (4 steps)\").",
+          "minLength": 1,
+          "type": "string"
+        },
+        "op": {
+          "description": "The edit.",
+          "enum": [
+            "step.delete",
+            "branch.delete",
+            "branch.rename",
+            "branch.archive",
+            "branch.set-main",
+            "branch.lock",
+            "group.create",
+            "group.rename",
+            "group.extend",
+            "group.remove",
+            "squash",
+            "clear",
+            "note.add",
+            "note.edit",
+            "note.remove",
+            "bookmark.set",
+            "tracker.rename",
+            "tracker.remove",
+            "turn.undo",
+            "journal.undo",
+            "load"
+          ]
+        },
+        "purged": {
+          "description": "Emptied from Recently deleted: it can no longer be undone.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "op",
+        "at",
+        "by",
+        "label",
+        "before",
+        "after",
+        "purged"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "before and after are set exactly until it is purged, and replace the same tracker fields.",
+        "A group edit (group.*) records memberships, never steps.",
+        "A load (a tracker loaded beside the others from a file) records no change of its own: both patches are empty; undoing it removes the tracker to Recently deleted.",
+        "A squash makes one squashed step (cause steps) with the id of the last step it replaced (the one exception to ids never being reused), the first one's parent and the last one's children; the replaced steps are consecutive steps of one branch; its count adds up theirs (a squashed one counts its own); it carries their notes and bookmarks; it keeps a group only when every replaced step was in it."
+      ]
+    },
+    "Link": {
+      "additionalProperties": false,
+      "description": "Where a replayed or loaded tracker comes from.",
+      "properties": {
+        "branch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BranchName"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The branch replayed; null for a loaded tracker."
+        },
+        "dataset": {
+          "$ref": "#/$defs/DatasetName",
+          "description": "The dataset its steps were recorded on."
+        },
+        "file": {
+          "description": "The session file's name, when it came from one.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "saved": {
+          "description": "The saved state's id, when it came from one of this browser.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "step": {
+          "description": "The last step replayed; null for a loaded tracker.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-id": "step"
+        },
+        "tracker": {
+          "$ref": "#/$defs/TrackerName",
+          "description": "The tracker they come from."
+        }
+      },
+      "required": [
+        "dataset",
+        "tracker",
+        "branch",
+        "step",
+        "file",
+        "saved"
+      ],
+      "type": "object"
+    },
+    "Mapping": {
+      "additionalProperties": false,
+      "description": "The names a replay used in place of the recorded ones, applied before names resolve.",
+      "properties": {
+        "categories": {
+          "description": "Categories.",
+          "items": {
+            "$ref": "#/$defs/CategoryMap"
+          },
+          "type": "array"
+        },
+        "fields": {
+          "description": "obs fields.",
+          "items": {
+            "$ref": "#/$defs/NameMap"
+          },
+          "type": "array"
+        },
+        "genes": {
+          "description": "Genes.",
+          "items": {
+            "$ref": "#/$defs/NameMap"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "fields",
+        "categories",
+        "genes"
+      ],
+      "type": "object"
+    },
+    "Membership": {
+      "additionalProperties": false,
+      "description": "Which steps a group held: a run of consecutive steps of one branch, from its first to its last.",
+      "properties": {
+        "from": {
+          "description": "Its first step.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "group": {
+          "description": "The group.",
+          "pattern": "^g(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "group"
+        },
+        "to": {
+          "description": "Its last step (from itself for one step).",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        }
+      },
+      "required": [
+        "group",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "NameMap": {
+      "additionalProperties": false,
+      "description": "One name used in place of another.",
+      "properties": {
+        "from": {
+          "description": "The recorded name.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "to": {
+          "description": "The name used here.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "Note": {
+      "additionalProperties": false,
+      "description": "A note on a step, a branch, a turn or the tracker: history metadata, never part of a step's identity.",
+      "properties": {
+        "at": {
+          "description": "When it was written.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Its author."
+        },
+        "editedAt": {
+          "description": "When it was last edited, or null.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "fromReply": {
+          "description": "Written for an agent from the first sentence of its final reply (a turn summary it did not write).",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "n<n>, unique in its tracker.",
+          "pattern": "^n(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "note"
+        },
+        "text": {
+          "description": "Markdown subset: emphasis, inline code, http(s) links; rendered without HTML.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "by",
+        "at",
+        "editedAt",
+        "fromReply"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "fromReply only for a note by an agent."
+      ]
+    },
+    "OutsideAct": {
+      "additionalProperties": false,
+      "description": "What a turn did outside the state that no undo takes back (a vote published, a file written): no step records it.",
+      "properties": {
+        "at": {
+          "description": "When it was done.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "label": {
+          "description": "What it did, as its step would be labelled.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "description": "The action (annotation.vote, figure.export, …).",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "label",
+        "at"
+      ],
+      "type": "object"
+    },
+    "Patch": {
+      "additionalProperties": false,
+      "description": "The exact records an edit replaced or removed (before) or made (after), by id: in before only, it removed them; in after only, it made them.",
+      "properties": {
+        "branches": {
+          "description": "Branches.",
+          "items": {
+            "$ref": "#/$defs/Branch"
+          },
+          "type": "array"
+        },
+        "groups": {
+          "description": "Groups.",
+          "items": {
+            "$ref": "#/$defs/Group"
+          },
+          "type": "array"
+        },
+        "memberships": {
+          "description": "Which steps each group held (a group edit records these, never the member steps).",
+          "items": {
+            "$ref": "#/$defs/Membership"
+          },
+          "type": "array"
+        },
+        "steps": {
+          "description": "Steps.",
+          "items": {
+            "$ref": "#/$defs/Step"
+          },
+          "type": "array"
+        },
+        "tracker": {
+          "$ref": "#/$defs/TrackerPatch",
+          "description": "Tracker fields."
+        },
+        "turns": {
+          "description": "Turns.",
+          "items": {
+            "$ref": "#/$defs/Turn"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "steps",
+        "branches",
+        "groups",
+        "memberships",
+        "turns",
+        "tracker"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "memberships run from an earlier step to a later one, one per group."
+      ]
+    },
+    "Pause": {
+      "additionalProperties": false,
+      "description": "A tracker's recording, paused: since when, who acted, and what differs from its head.",
+      "properties": {
+        "at": {
+          "description": "When recording was paused.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "by": {
+          "description": "Who paused it, then everyone who acted while it was paused, each once.",
+          "items": {
+            "$ref": "#/$defs/By"
+          },
+          "type": "array"
+        },
+        "draft": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DomainValues"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The value hash of each domain that differs from the head (this browser's autosave keeps it, so a crash loses nothing; its values are referenced, never pruned); null in a file, which squashes it first, and when nothing differs."
+        }
+      },
+      "required": [
+        "at",
+        "by",
+        "draft"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "by is not empty and names each author once."
+      ]
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "description": "One apply, recorded in uns['cellucid']['history_applied'] (misc / metadata in R).",
+      "properties": {
+        "applied_at": {
+          "description": "Canonical ISO time (UTC).",
+          "minLength": 1,
+          "type": "string"
+        },
+        "branch": {
+          "description": "The branch.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "cellucid_version": {
+          "description": "The package version.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "columns": {
+          "description": "The columns it owns (replaced only with overwrite).",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "package": {
+          "description": "What applied it.",
+          "enum": [
+            "python",
+            "r",
+            "web"
+          ]
+        },
+        "renamed": {
+          "description": "What it renamed.",
+          "items": {
+            "$ref": "#/$defs/Renamed"
+          },
+          "type": "array"
+        },
+        "session": {
+          "description": "The session file itself, base64, when kept to rebuild the history.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_sha256": {
+          "description": "The session file's SHA-256.",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "skipped": {
+          "description": "What it did not apply.",
+          "items": {
+            "$ref": "#/$defs/Skipped"
+          },
+          "type": "array"
+        },
+        "step": {
+          "description": "The step applied.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "tracker": {
+          "description": "The tracker.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        }
+      },
+      "required": [
+        "session_sha256",
+        "tracker",
+        "branch",
+        "step",
+        "applied_at",
+        "cellucid_version",
+        "package",
+        "columns",
+        "renamed",
+        "skipped",
+        "session"
+      ],
+      "type": "object"
+    },
+    "Reads": {
+      "additionalProperties": false,
+      "description": "What a step's result depends on, as recorded: the value hash of each state domain its action reads, and another branch's tip for a view of a branch.",
+      "properties": {
+        "active-field": {
+          "description": "The value hash of \"active-field\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "analysis": {
+          "description": "The value hash of \"analysis\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "camera": {
+          "description": "The value hash of \"camera\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "camera-path": {
+          "description": "The value hash of \"camera-path\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "cells": {
+          "description": "The value hash of \"cells\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "colors": {
+          "description": "The value hash of \"colors\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "field-overlays": {
+          "description": "The value hash of \"field-overlays\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "filters": {
+          "description": "The value hash of \"filters\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "gene-sets": {
+          "description": "The value hash of \"gene-sets\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "highlights": {
+          "description": "The value hash of \"highlights\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "history": {
+          "$ref": "#/$defs/BranchTip",
+          "description": "The branch a kept view of a branch shows."
+        },
+        "layout": {
+          "description": "The value hash of \"layout\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "mapping": {
+          "description": "The value hash of \"mapping\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "settings": {
+          "description": "The value hash of \"settings\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "views": {
+          "description": "The value hash of \"views\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "visibility": {
+          "description": "The value hash of \"visibility\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "Removal": {
+      "additionalProperties": false,
+      "description": "A tracker in Recently deleted.",
+      "properties": {
+        "at": {
+          "description": "When it was removed.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Who removed it."
+        }
+      },
+      "required": [
+        "at",
+        "by"
+      ],
+      "type": "object"
+    },
+    "Renamed": {
+      "additionalProperties": false,
+      "description": "One rename an apply made.",
+      "properties": {
+        "column": {
+          "description": "The column of a category.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "description": "The earlier name.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "description": "A column or a category.",
+          "enum": [
+            "column",
+            "category"
+          ]
+        },
+        "to": {
+          "description": "The new name.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "column",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "ReplayEntry": {
+      "additionalProperties": false,
+      "description": "What became of one step of a replay.",
+      "properties": {
+        "label": {
+          "description": "Its label.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "missing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplayMissing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The name it gave that resolves to nothing here (a field, a category or a gene), so another can be used instead; null otherwise."
+        },
+        "outcome": {
+          "description": "What became of it.",
+          "enum": [
+            "applied",
+            "unchanged",
+            "unmatched",
+            "skipped",
+            "stopped"
+          ]
+        },
+        "reason": {
+          "description": "Why it was not applied.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "The step replayed.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "step": {
+          "description": "The step it became here.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-id": "step"
+        }
+      },
+      "required": [
+        "source",
+        "label",
+        "outcome",
+        "step",
+        "reason",
+        "missing"
+      ],
+      "type": "object"
+    },
+    "ReplayMissing": {
+      "additionalProperties": false,
+      "description": "A name a replayed step gave that resolves to nothing here.",
+      "properties": {
+        "field": {
+          "description": "For a category, the field it was looked for in; null otherwise.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "What it names: field, category or gene.",
+          "enum": [
+            "field",
+            "category",
+            "gene"
+          ]
+        },
+        "name": {
+          "description": "The name as the step gave it.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "field"
+      ],
+      "type": "object"
+    },
+    "ReplayOf": {
+      "additionalProperties": false,
+      "description": "The recorded step a replayed step was made from.",
+      "properties": {
+        "dataset": {
+          "$ref": "#/$defs/DatasetName",
+          "description": "The dataset it was recorded on."
+        },
+        "step": {
+          "description": "Its step.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "tracker": {
+          "description": "Its tracker.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        }
+      },
+      "required": [
+        "tracker",
+        "step",
+        "dataset"
+      ],
+      "type": "object"
+    },
+    "Requires": {
+      "additionalProperties": false,
+      "description": "The dataset fields a state uses.",
+      "properties": {
+        "obs": {
+          "description": "obs fields.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "var": {
+          "description": "Genes.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "obs",
+        "var"
+      ],
+      "type": "object"
+    },
+    "Scope": {
+      "additionalProperties": false,
+      "description": "What a Share or a Save chose to include.",
+      "properties": {
+        "branches": {
+          "description": "The branches included, per tracker.",
+          "items": {
+            "$ref": "#/$defs/ScopeBranches"
+          },
+          "type": "array"
+        },
+        "chats": {
+          "description": "Conversations included.",
+          "type": "boolean"
+        },
+        "content": {
+          "description": "history: the trackers and branches with their values; state: the current state only (one tracker: the root and one squashed step); steps: steps only, no values (a replay plan).",
+          "enum": [
+            "history",
+            "state",
+            "steps"
+          ]
+        },
+        "journal": {
+          "description": "Recently deleted included.",
+          "type": "boolean"
+        },
+        "notes": {
+          "description": "Notes and bookmarks included.",
+          "type": "boolean"
+        },
+        "results": {
+          "description": "include: analysis results kept; recompute: left out, computed again on open from their recorded inputs (always so for steps).",
+          "enum": [
+            "include",
+            "recompute"
+          ]
+        },
+        "source": {
+          "description": "full: where the dataset opens from; name: its name only (source null).",
+          "enum": [
+            "full",
+            "name"
+          ]
+        },
+        "times": {
+          "description": "exact; dates (each time rounded down to its UTC day); none (every time null).",
+          "enum": [
+            "exact",
+            "dates",
+            "none"
+          ]
+        },
+        "trackers": {
+          "description": "The trackers included.",
+          "items": {
+            "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "type": "string",
+            "x-id": "tracker"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "trackers",
+        "branches",
+        "content",
+        "results",
+        "notes",
+        "chats",
+        "journal",
+        "times",
+        "source"
+      ],
+      "type": "object"
+    },
+    "ScopeBranches": {
+      "additionalProperties": false,
+      "description": "The branches of one tracker a share includes.",
+      "properties": {
+        "branches": {
+          "description": "Its branches included.",
+          "items": {
+            "pattern": "^b(0|[1-9][0-9]*)$",
+            "type": "string",
+            "x-id": "branch"
+          },
+          "type": "array"
+        },
+        "tracker": {
+          "description": "The tracker.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        }
+      },
+      "required": [
+        "tracker",
+        "branches"
+      ],
+      "type": "object"
+    },
+    "Session": {
+      "additionalProperties": false,
+      "description": "A session file as read: its header and every tracker it holds.",
+      "properties": {
+        "actions": {
+          "description": "Each action type and version its steps use, sorted by type then version.",
+          "items": {
+            "$ref": "#/$defs/ActionStamp"
+          },
+          "type": "array"
+        },
+        "activeTracker": {
+          "description": "The tracker shown.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        },
+        "app": {
+          "$ref": "#/$defs/AppStamp",
+          "description": "What wrote it."
+        },
+        "cells": {
+          "description": "The subsample it was saved on (cell-subset-record.js).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "description": "Canonical ISO time of the save.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "datasetFingerprint": {
+          "description": "The dataset it was saved on (session-context.js).",
+          "type": "object"
+        },
+        "genes": {
+          "description": "The cells genes were read for.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "requires": {
+          "$ref": "#/$defs/Requires",
+          "description": "The fields the shown state uses."
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope",
+          "description": "What was shared."
+        },
+        "source": {
+          "description": "Where that dataset opens from (dataset-source-record.js).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "trackers": {
+          "description": "Its trackers.",
+          "items": {
+            "$ref": "#/$defs/Tracker"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "createdAt",
+        "app",
+        "actions",
+        "scope",
+        "datasetFingerprint",
+        "source",
+        "requires",
+        "cells",
+        "genes",
+        "activeTracker",
+        "trackers"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "scope.trackers names exactly its trackers, in order; scope.branches only theirs.",
+        "actions stamp exactly each action type and version its steps use (journal included), sorted by type then version.",
+        "No tracker keeps a paused draft (a file squashes it first).",
+        "What scope leaves out is not held: no conversation without chats, no journal without journal, no note or bookmark without notes.",
+        "scope.content steps has results recompute.",
+        "scope.content state holds one tracker of one branch: the root and one squashed step (cause share), shown, with no turn, group, note, journal or conversation, and names nobody (every by the person or the opening)."
+      ]
+    },
+    "Skipped": {
+      "additionalProperties": false,
+      "description": "One change an apply did not make.",
+      "properties": {
+        "kind": {
+          "description": "What it is.",
+          "enum": [
+            "user-field",
+            "highlight",
+            "column-renamed",
+            "categories-renamed",
+            "categories-merged",
+            "field-deleted",
+            "gene-set",
+            "presentation"
+          ]
+        },
+        "name": {
+          "description": "Its name.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "note": {
+          "description": "Why.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "note"
+      ],
+      "type": "object"
+    },
+    "Squash": {
+      "additionalProperties": false,
+      "description": "What a squashed step stands for: why it was made and from what.",
+      "properties": {
+        "by": {
+          "description": "Everyone who acted in what it replaced, in the order they first acted; empty for share.",
+          "items": {
+            "$ref": "#/$defs/By"
+          },
+          "type": "array"
+        },
+        "carried": {
+          "$ref": "#/$defs/Carried",
+          "description": "What the steps it replaced carried that it keeps: their notes (now its own) and bookmarks."
+        },
+        "cause": {
+          "description": "paused (changes made while recording was paused), steps (consecutive steps merged into one), clear (the history cleared, the state kept) or share (a state shared without its history).",
+          "enum": [
+            "paused",
+            "steps",
+            "clear",
+            "share"
+          ]
+        },
+        "count": {
+          "description": "How many steps it replaced; null for paused (no step was recorded) and share (left out).",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cause",
+        "count",
+        "by",
+        "carried"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "count is set exactly for steps and clear (the steps it replaced); paused and share leave it null.",
+        "by names each author once, in the order they first acted; it is empty exactly for share.",
+        "carried is empty but for cause steps."
+      ]
+    },
+    "Start": {
+      "additionalProperties": false,
+      "description": "What a tracker started from.",
+      "properties": {
+        "from": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Link"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where its steps come from (replay, import)."
+        },
+        "kind": {
+          "description": "opened, shown, replay or import.",
+          "enum": [
+            "opened",
+            "shown",
+            "replay",
+            "import"
+          ]
+        },
+        "mapping": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Mapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The names the replay mapped (replay only)."
+        },
+        "report": {
+          "description": "The replay's report (replay only).",
+          "items": {
+            "$ref": "#/$defs/ReplayEntry"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "from",
+        "report",
+        "mapping"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "from is set exactly for replay and import; report exactly for replay; mapping only for replay.",
+        "An import names its file (from.file)."
+      ]
+    },
+    "Step": {
+      "additionalProperties": false,
+      "description": "One action as recorded, or the root (which records none).",
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/DomainValues",
+          "description": "Each touched domain's value hash after it (the root: every domain)."
+        },
+        "at": {
+          "description": "When it was made (the first change, when several merged).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "before": {
+          "$ref": "#/$defs/DomainValues",
+          "description": "Each touched domain's value hash before it."
+        },
+        "bookmark": {
+          "description": "Its bookmark, unique in its tracker.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-name": true
+        },
+        "branch": {
+          "description": "The branch it was made on.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Who took it."
+        },
+        "children": {
+          "description": "The steps made after it, oldest first.",
+          "items": {
+            "pattern": "^s(0|[1-9][0-9]*)$",
+            "type": "string",
+            "x-id": "step"
+          },
+          "type": "array"
+        },
+        "coalesceKey": {
+          "description": "What a following change must share to merge into it.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "description": "Its pseudocode line as recorded; null for the root, an outside change and a squashed step.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "The group it is in, or null.",
+          "pattern": "^g(0|[1-9][0-9]*)$",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-id": "group"
+        },
+        "id": {
+          "description": "s<n>, greater than its parent's; the root is s0.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "kind": {
+          "description": "root, action, outside (a change made outside an action) or squashed (several merged into one, or what changed while paused).",
+          "enum": [
+            "root",
+            "action",
+            "outside",
+            "squashed"
+          ]
+        },
+        "label": {
+          "description": "What it did, in a sentence.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "merged": {
+          "description": "How many changes it holds (a drag, a gesture).",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "ms": {
+          "description": "How long its action took; null when not measured.",
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "notes": {
+          "description": "Its notes, oldest first.",
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "description": "What its action answered: counts, names, ids (never cells).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "The action's parameters, by name (cells by original position); null for the root and a squashed step.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "parent": {
+          "description": "The step it was made after; null for the root.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-id": "step"
+        },
+        "reads": {
+          "$ref": "#/$defs/Reads",
+          "description": "Each input its action declares (reads), as it was when it was recorded."
+        },
+        "reason": {
+          "description": "The system's sentence: why it no longer applies, or why it changes nothing.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replayOf": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplayOf"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recorded step it replays."
+        },
+        "squashed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Squash"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What a squashed step stands for; null for every other kind."
+        },
+        "status": {
+          "description": "Whether it still applies.",
+          "enum": [
+            "applied",
+            "unapplicable"
+          ]
+        },
+        "touches": {
+          "description": "The state domains it changed, in domain order.",
+          "items": {
+            "enum": [
+              "cells",
+              "mapping",
+              "field-overlays",
+              "gene-sets",
+              "views",
+              "active-field",
+              "filters",
+              "colors",
+              "visibility",
+              "highlights",
+              "camera",
+              "camera-path",
+              "settings",
+              "analysis",
+              "layout"
+            ]
+          },
+          "type": "array"
+        },
+        "type": {
+          "description": "The action (history.outside-change for a change made outside one); null for the root and a squashed step.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "until": {
+          "description": "Its last merged change (equal to at when one).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "v": {
+          "description": "The version of the action's parameters it was recorded with (the catalogue's version); null but for an action.",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "parent",
+        "children",
+        "branch",
+        "kind",
+        "type",
+        "params",
+        "v",
+        "code",
+        "label",
+        "by",
+        "at",
+        "until",
+        "merged",
+        "ms",
+        "touches",
+        "before",
+        "after",
+        "reads",
+        "status",
+        "reason",
+        "outcome",
+        "coalesceKey",
+        "replayOf",
+        "squashed",
+        "notes",
+        "bookmark",
+        "group"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "kind is root exactly for the root, s0: no parent, no action (type, params, v, code null; touches, before, reads empty; merged 1; ms null; status applied; no group).",
+        "Every other step's id is greater than its parent's.",
+        "An action names its type, its parameters and their version (v); an outside change its type (history.outside-change) and parameters; a squashed step none of them (type, params, v, code, coalesceKey, replayOf null) and says what it stands for (squashed).",
+        "squashed is set exactly for kind squashed; v only for kind action.",
+        "touches are distinct, in domain order, and before and after hold exactly those domains.",
+        "unapplicable steps say why (reason).",
+        "until is not before at.",
+        "kind is outside exactly when type is history.outside-change, and exactly when by.origin is \"outside\"."
+      ]
+    },
+    "Tracker": {
+      "additionalProperties": false,
+      "description": "One tree of steps on the dataset, with its branches, turns, notes and journal.",
+      "properties": {
+        "activeBranch": {
+          "description": "The branch redo follows and the panel shows.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "branches": {
+          "description": "Its branches in id order.",
+          "items": {
+            "$ref": "#/$defs/Branch"
+          },
+          "type": "array"
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "Who started it (the root step's by)."
+        },
+        "chats": {
+          "description": "Conversations kept with it: [conversation id, transcript].",
+          "items": {
+            "items": false,
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {}
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "createdAt": {
+          "description": "When it started.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "dataset": {
+          "$ref": "#/$defs/DatasetIdentity",
+          "description": "The dataset."
+        },
+        "groups": {
+          "description": "Its groups in id order.",
+          "items": {
+            "$ref": "#/$defs/Group"
+          },
+          "type": "array"
+        },
+        "headId": {
+          "description": "The step shown, on the active branch's path.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "id": {
+          "description": "t-<uuid>, unique in its history.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        },
+        "journal": {
+          "description": "Its structural edits in id order.",
+          "items": {
+            "$ref": "#/$defs/JournalEntry"
+          },
+          "type": "array"
+        },
+        "mainBranch": {
+          "description": "What sharing, replay and load default to.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "name": {
+          "description": "Unique among the history's trackers that are not removed.",
+          "minLength": 1,
+          "type": "string",
+          "x-name": true
+        },
+        "nextBranch": {
+          "description": "The number of its next branch.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "nextGroup": {
+          "description": "The number of its next group.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nextJournal": {
+          "description": "The number of its next journal entry.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nextNote": {
+          "description": "The number of its next note.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nextStep": {
+          "description": "The number of its next step.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "notes": {
+          "description": "Notes on the tracker (the first is its abstract).",
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "type": "array"
+        },
+        "paused": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Pause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Null while it records; while paused, changes apply without a step, and resuming adds one squashed step for what differs."
+        },
+        "removed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Removal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set while it is in Recently deleted."
+        },
+        "rootId": {
+          "description": "Its root, s0.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "start": {
+          "$ref": "#/$defs/Start",
+          "description": "What it started from."
+        },
+        "steps": {
+          "description": "Its steps in id order (parents before children).",
+          "items": {
+            "$ref": "#/$defs/Step"
+          },
+          "type": "array"
+        },
+        "turns": {
+          "description": "Its turns, in the order they started.",
+          "items": {
+            "$ref": "#/$defs/Turn"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "dataset",
+        "createdAt",
+        "by",
+        "start",
+        "removed",
+        "rootId",
+        "headId",
+        "activeBranch",
+        "mainBranch",
+        "paused",
+        "branches",
+        "groups",
+        "steps",
+        "turns",
+        "notes",
+        "journal",
+        "chats",
+        "nextStep",
+        "nextBranch",
+        "nextGroup",
+        "nextNote",
+        "nextJournal"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "Steps, branches and the journal are listed in id order; every id is below its counter (nextStep, …).",
+        "One root (s0); every step is its parent's child and every child its step's.",
+        "Exactly one branch has no fork step (base null); it holds the root.",
+        "The steps of a branch form one line, from the child of its base to its tip, with no other step.",
+        "A branch does not fork from its own step.",
+        "Branch and group names are unique by key, and none has the form of an id of its kind; bookmarks are unique by key.",
+        "Every group has at least one step; its steps (those naming it) are consecutive steps of one branch.",
+        "A group never cuts a run of one turn's consecutive steps on its branch: a step and its parent on the same branch, of the same turn, are in the same group (or both in none). A turn acting again after someone else's step starts a new run.",
+        "A paused tracker names who paused it, then who acted while paused, each once.",
+        "Bookmarks are unique by key across steps and the bookmarks squashed steps carry; a squashed step holds the notes it carries.",
+        "The head is on the path of the active branch's tip; an archived active branch holds the head.",
+        "The main branch is not archived.",
+        "Note ids are unique across the tracker (its notes, branches, groups, steps and turns).",
+        "Every step's turn is one of its turns; the root is by whoever started the tracker.",
+        "A removed tracker keeps its removal (an unpurged tracker.remove entry) in its journal."
+      ]
+    },
+    "TrackerName": {
+      "additionalProperties": false,
+      "description": "A tracker as a link names it.",
+      "properties": {
+        "id": {
+          "description": "Its id.",
+          "pattern": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "type": "string",
+          "x-id": "tracker"
+        },
+        "name": {
+          "description": "Its name then.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "TrackerPatch": {
+      "additionalProperties": false,
+      "description": "Tracker fields a journal entry replaced.",
+      "properties": {
+        "activeBranch": {
+          "description": "The active branch.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "headId": {
+          "description": "The step shown.",
+          "pattern": "^s(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "step"
+        },
+        "mainBranch": {
+          "description": "The main branch.",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "name": {
+          "description": "The tracker's name.",
+          "minLength": 1,
+          "type": "string",
+          "x-name": true
+        },
+        "notes": {
+          "description": "The tracker's notes.",
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "type": "array"
+        },
+        "removed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Removal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether it was removed."
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "Turn": {
+      "additionalProperties": false,
+      "description": "One agent or notebook turn: its steps undo together; what it did outside the state stays done.",
+      "properties": {
+        "branch": {
+          "description": "The branch it acts on (where it started, or where it switched to).",
+          "pattern": "^b(0|[1-9][0-9]*)$",
+          "type": "string",
+          "x-id": "branch"
+        },
+        "by": {
+          "$ref": "#/$defs/By",
+          "description": "The agent or notebook (by.turn is this id)."
+        },
+        "conversation": {
+          "description": "Its conversation, when a chat holds it.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endedAt": {
+          "description": "Its last step.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        },
+        "id": {
+          "description": "The turn id the dispatch carried.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "label": {
+          "description": "What it was asked to do, in a few words.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "message": {
+          "description": "The message that acted.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "description": "Its notes; the first is its summary.",
+          "items": {
+            "$ref": "#/$defs/Note"
+          },
+          "type": "array"
+        },
+        "outside": {
+          "description": "What it did outside the state, which Undo turn does not take back, oldest first.",
+          "items": {
+            "$ref": "#/$defs/OutsideAct"
+          },
+          "type": "array"
+        },
+        "startedAt": {
+          "description": "Its first step.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-time": "ms-since-1970-utc"
+        }
+      },
+      "required": [
+        "id",
+        "by",
+        "label",
+        "conversation",
+        "message",
+        "startedAt",
+        "endedAt",
+        "branch",
+        "notes",
+        "outside"
+      ],
+      "type": "object",
+      "x-invariants": [
+        "by.origin is agent or host, and by.turn is the turn's id.",
+        "Every turn has at least one step of its tracker."
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The records of a Cellucid history (app/history/model.js): what a session file and a saved state hold, and what Python and R read.",
+  "title": "Cellucid history model",
+  "version": 2,
+  "x-constants": {
+    "firstBranch": "b0",
+    "firstBranchName": "Main",
+    "freshStartBranchName": "Fresh start",
+    "laneCount": 8,
+    "outsideChangeType": "history.outside-change",
+    "rootLabels": {
+      "import": "Loaded from a session file",
+      "opened": "Opened",
+      "replay": "Started a replay",
+      "shown": "Started from the state shown"
+    },
+    "rootStep": "s0"
+  },
+  "x-domains": [
+    "cells",
+    "mapping",
+    "field-overlays",
+    "gene-sets",
+    "views",
+    "active-field",
+    "filters",
+    "colors",
+    "visibility",
+    "highlights",
+    "camera",
+    "camera-path",
+    "settings",
+    "analysis",
+    "layout"
+  ],
+  "x-ids": {
+    "branch": "^b(0|[1-9][0-9]*)$",
+    "group": "^g(0|[1-9][0-9]*)$",
+    "journal": "^j(0|[1-9][0-9]*)$",
+    "note": "^n(0|[1-9][0-9]*)$",
+    "step": "^s(0|[1-9][0-9]*)$",
+    "tracker": "^t-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+  },
+  "x-journalOps": [
+    "step.delete",
+    "branch.delete",
+    "branch.rename",
+    "branch.archive",
+    "branch.set-main",
+    "branch.lock",
+    "group.create",
+    "group.rename",
+    "group.extend",
+    "group.remove",
+    "squash",
+    "clear",
+    "note.add",
+    "note.edit",
+    "note.remove",
+    "bookmark.set",
+    "tracker.rename",
+    "tracker.remove",
+    "turn.undo",
+    "journal.undo",
+    "load"
+  ],
+  "x-names": {
+    "key": "The stored form lower-cased with the Unicode default full case mapping (JavaScript toLowerCase, Python str.lower), then NFC.",
+    "refused": "Empty; holding a control character (U+0000-U+001F, U+007F-U+009F); for a branch, a group or a tracker, a key of the form of its id.",
+    "stored": "NFC; white space (whiteSpace) trimmed from both ends; each inner run of it one U+0020.",
+    "whiteSpace": [
+      "U+0009",
+      "U+000A",
+      "U+000B",
+      "U+000C",
+      "U+000D",
+      "U+0020",
+      "U+00A0",
+      "U+1680",
+      "U+2000",
+      "U+2001",
+      "U+2002",
+      "U+2003",
+      "U+2004",
+      "U+2005",
+      "U+2006",
+      "U+2007",
+      "U+2008",
+      "U+2009",
+      "U+200A",
+      "U+2028",
+      "U+2029",
+      "U+202F",
+      "U+205F",
+      "U+3000",
+      "U+FEFF"
+    ]
+  },
+  "x-readInputs": [
+    "cells",
+    "mapping",
+    "field-overlays",
+    "gene-sets",
+    "views",
+    "active-field",
+    "filters",
+    "colors",
+    "visibility",
+    "highlights",
+    "camera",
+    "camera-path",
+    "settings",
+    "analysis",
+    "layout",
+    "history"
+  ],
+  "x-trackerPatchFields": [
+    "name",
+    "headId",
+    "activeBranch",
+    "mainBranch",
+    "notes",
+    "removed"
+  ]
+}

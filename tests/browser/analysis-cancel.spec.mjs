@@ -182,8 +182,8 @@ test('differential expression: Cancel stops the run, keeps nothing, and Run agai
 
   releaseReads(hold);
   await status.getByRole('button', { name: 'Run again' }).click();
-  await expect(status).toBeHidden({ timeout: 30_000 });
-  await expect(panel.locator('.js-plotly-plot').first()).toBeVisible({ timeout: 30_000 });
+  await expect(status).toBeHidden();
+  await expect(panel.locator('.js-plotly-plot').first()).toBeVisible();
   await expect(run).toHaveText(runLabel);
 
   expect(errors).toEqual([]);
@@ -206,7 +206,7 @@ test('marker genes: Cancel from the notification stops discovery, keeps nothing,
   await expect(status.locator('.job-status-plan')).toHaveText(`${GENE_COUNT} genes · 3 of 3 groups tested`);
   // The run's one progress notification, with its own Cancel.
   const notification = page.locator('.notification', { hasText: 'Marker genes:' });
-  await expect(notification).toHaveCount(1, { timeout: 5_000 });
+  await expect(notification).toHaveCount(1);
   await notification.locator('[data-role="cancel"]').click();
   await expect(status.locator('.job-status-title')).toHaveText('Marker genes cancelled');
   await expect(notification).toHaveCount(0);
@@ -215,8 +215,8 @@ test('marker genes: Cancel from the notification stops discovery, keeps nothing,
 
   releaseReads(hold);
   await status.getByRole('button', { name: 'Run again' }).click();
-  await expect(status).toBeHidden({ timeout: 30_000 });
-  await expect(panel.locator('.js-plotly-plot').first()).toBeVisible({ timeout: 30_000 });
+  await expect(status).toBeHidden();
+  await expect(panel.locator('.js-plotly-plot').first()).toBeVisible();
 
   expect(errors).toEqual([]);
 });

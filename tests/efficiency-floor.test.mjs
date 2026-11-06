@@ -35,6 +35,8 @@ import assert from 'node:assert/strict';
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
 import { ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';

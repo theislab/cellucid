@@ -318,11 +318,13 @@ test('single-representation adoption publishes the exact picker option', t => {
     on() {
       return () => {};
     },
-    async setViewRepresentation() {},
+    async setViewEmbeddingRef() {},
+    async showDefaultRepresentation() {},
     async cycleRepresentation() {},
   };
   const picker = initRepresentationControls({
     state,
+    viewer: { getLiveViewHidden: () => false, getSnapshotViews: () => [] },
     dom: { controls, label, select },
     callbacks: {
       viewLabel: () => null,

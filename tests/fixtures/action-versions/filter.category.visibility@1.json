@@ -1,0 +1,57 @@
+{
+  "examples": [
+    {
+      "categories": [
+        "T cells"
+      ],
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "visible": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "categories": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "visible": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "field",
+      "categories",
+      "visible"
+    ],
+    "type": "object"
+  },
+  "type": "filter.category.visibility",
+  "version": 1
+}

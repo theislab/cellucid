@@ -26,6 +26,7 @@ import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { workerScriptPattern } from './helpers/worker-scripts.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { goOffline } from './helpers/offline.mjs';
 
 const fixturesDirectory = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -183,20 +184,13 @@ async function derivedFile(testInfo, name, bytes) {
 }
 
 /**
- * Notifications auto-dismiss, so a failure message has to be sampled while it
- * is on screen rather than read once the dust settles.
+ * The error notifications on screen once there is one: waited for as the
+ * locator's own state (an error stays until it is dismissed), then read.
  */
-async function captureFirstErrorNotification(page, timeoutMs = 45_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const texts = await page.evaluate(() =>
-      [...document.querySelectorAll(
-        '#notification-center .notification-error',
-      )].map(node => node.textContent.trim().replace(/\s+/g, ' ')));
-    if (texts.length > 0) return texts;
-    await page.waitForTimeout(200);
-  }
-  return [];
+async function captureFirstErrorNotification(page) {
+  const errors = page.locator('#notification-center .notification-error');
+  await expect(errors.first()).toBeAttached();
+  return errors.evaluateAll(nodes => nodes.map(node => node.textContent.trim().replace(/\s+/g, ' ')));
 }
 
 /* ------------------------------------------------------------------ *
@@ -327,7 +321,7 @@ test('a catalog failure recovers in place once the catalog is reachable', async 
 
   // "Try again" while the host is still busy: one request, reported at once.
   await retry.click();
-  await expect(retry).toHaveText('Try again', { timeout: 5_000 });
+  await expect(retry).toHaveText('Try again');
   await expect(page.locator(CATALOG_NOTICE)).toContainText(
     /is not answering \(HTTP 503, service unavailable\) for datasets\.json: a problem on [^ ]+'s side/,
   );
@@ -561,7 +555,7 @@ test('an offline dataset switch is reported and the session survives', async ({
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
 
-  await context.setOffline(true);
+  await goOffline(context);
   await page.locator('#dataset-select').selectOption(
     optionValue(MIXED_DEFAULT.id),
   );

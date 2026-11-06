@@ -1826,7 +1826,7 @@ test('in-place reload stages one generation before reversible publication', asyn
     urlCommitIndex
   );
   const runtimeCommitIndex = reloadSource.indexOf(
-    'commitDatasetRuntimeStage(runtimeStage)',
+    'commitDatasetRuntimeStage(runtimeStage, { keepHistory })',
     managerCommitIndex
   );
   const publicationContinuationIndex = reloadSource.indexOf(
@@ -1848,7 +1848,7 @@ test('in-place reload stages one generation before reversible publication', asyn
     uiSyncIndex
   );
   const stateRestoreIndex = reloadSource.indexOf(
-    'const stateOutcome = await restoreAdvertisedDatasetState({',
+    'await restoreAdvertisedDatasetState({',
     finalizationIndex
   );
   const stateSettlementIndex = reloadSource.indexOf(
@@ -1947,7 +1947,7 @@ test(
     requireBefore(
       datasetCommit,
       'requireRestorablePublication(restorationPublication)',
-      'retireDatasetInteractions();',
+      'retireDatasetInteractions({ keepHistory });',
       'dataset restoration must reject a stale publication before mutation'
     );
     const syntheticCommit = slice(

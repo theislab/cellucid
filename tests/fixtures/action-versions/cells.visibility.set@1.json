@@ -1,0 +1,45 @@
+{
+  "examples": [
+    {
+      "cells": [
+        0
+      ],
+      "visible": false
+    },
+    {
+      "cells": null,
+      "visible": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "cells": {
+        "oneOf": [
+          {
+            "items": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "minItems": 1,
+            "type": "array",
+            "x-cells": true
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "visible": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "cells",
+      "visible"
+    ],
+    "type": "object"
+  },
+  "type": "cells.visibility.set",
+  "version": 1
+}

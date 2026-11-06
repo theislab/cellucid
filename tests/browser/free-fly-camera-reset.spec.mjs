@@ -31,6 +31,26 @@ function readPose(page) {
   });
 }
 
+/**
+ * Click Reset Camera and wait for the action it dispatches (`display.reset`)
+ * to finish: the button only dispatches it, so the pose changes after the
+ * click has returned.
+ */
+async function resetCamera(page) {
+  await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    window.__resetDone = new Promise((resolve, reject) => {
+      const stop = getActions().subscribe(event => {
+        if (event.type !== 'display.reset' || (event.kind !== 'done' && event.kind !== 'failed')) return;
+        stop();
+        if (event.kind === 'done') resolve(); else reject(event.error);
+      });
+    });
+  });
+  await page.locator('#reset-camera-btn').click();
+  await page.evaluate(() => window.__resetDone);
+}
+
 test('R in free-fly frames the data, and Reset Camera gives one framing from every mode', async ({ page }) => {
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
@@ -48,10 +68,10 @@ test('R in free-fly frames the data, and Reset Camera gives one framing from eve
 
   // The button resets the camera and returns to the default navigation mode;
   // coming from free-fly it must land on the same orbit angles as from orbit.
-  await page.locator('#reset-camera-btn').click();
+  await resetCamera(page);
   const fromFree = await readPose(page);
   expect(fromFree.mode).not.toBe('free');
-  await page.locator('#reset-camera-btn').click();
+  await resetCamera(page);
   const fromDefault = await readPose(page);
   // Free-fly positions are float32 vectors, so the round trip is exact to
   // float32 precision, not float64.

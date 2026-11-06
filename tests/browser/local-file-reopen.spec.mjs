@@ -7,17 +7,15 @@
  * read opens it without asking. Firefox and WebKit give no handle: Open…
  * uses the file inputs as before, and nothing is kept, offered or said.
  *
- * File… calls the browser's file picker, which no test can answer (with
- * Playwright's file chooser watched, Chromium aborts it as intercepted); it
- * is given a file of the origin-private file system holding the fixture (a
- * real `FileSystemFileHandle`, kept in IndexedDB and read back after the
- * reload). Leave to read it is the browser's to give. Chromium keeps it
- * across a reload of the tab (measured: a real dropped folder's handle is
- * `granted` after a reload); here it is withheld after the reload, as in a
- * new browser session, so it is asked for in the click, granted, and
- * recorded with whether the page had the click's user activation then. A
- * dropped folder is a real directory drop (Chromium's
- * `Input.dispatchDragEvent`), whose real handle is read again.
+ * File… is answered with a file of the origin-private file system holding
+ * the fixture (`helpers/local-file-pickers.mjs`). Leave to read it is the
+ * browser's to give. Chromium keeps it across a reload of the tab (measured:
+ * a real dropped folder's handle is `granted` after a reload); here it is
+ * withheld after the reload, as in a new browser session, so it is asked for
+ * in the click, granted, and recorded with whether the page had the click's
+ * user activation then. A dropped folder is a real directory drop
+ * (Chromium's `Input.dispatchDragEvent`), whose real handle is read again.
+ * The handles kept are listed by My datasets (`my-datasets.spec.mjs`).
  */
 import path from 'node:path';
 import { expect, test } from './helpers/test.mjs';
@@ -34,7 +32,9 @@ import {
 } from './helpers/dataset-loading.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
+import { answerPickers as answerPickersWith, pickWithFileItem } from './helpers/local-file-pickers.mjs';
 import { appUrl } from './helpers/origins.mjs';
+import { clickSaveSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -48,47 +48,29 @@ const NAME = path.basename(H5AD_PATH);
 const RELOAD_OFFER = `"${NAME}" was open in this tab before the page was reloaded.`;
 const SESSION_OFFER = `This session was saved on "${NAME}", opened from this computer.`;
 
-/**
- * File… answered with a file of the origin-private file system holding the
- * fixture, and the browser's leave to read a handle: granted for what was
- * picked or dropped in this page, else asked for (and granted) in a click.
- */
-async function answerPickers(page) {
-  await page.addInitScript(fixture => {
-    const asked = window.__reopenAsked = [];
-    let granted = false;
-    window.showOpenFilePicker = async () => {
-      const root = await navigator.storage.getDirectory();
-      const handle = await root.getFileHandle(fixture.name, { create: true });
-      if ((await handle.getFile()).size === 0) {
-        const writable = await handle.createWritable();
-        await writable.write(await (await fetch(fixture.url)).arrayBuffer());
-        await writable.close();
-      }
-      granted = true;
-      return [handle];
-    };
-    FileSystemHandle.prototype.queryPermission = async function queryPermission() {
-      return granted ? 'granted' : 'prompt';
-    };
-    FileSystemHandle.prototype.requestPermission = async function requestPermission({ mode }) {
-      asked.push({ mode, inClick: navigator.userActivation.isActive });
-      granted = true;
-      return 'granted';
-    };
-  }, { name: NAME, url: appUrl('/tests/browser/fixtures/current-ui-smoke.h5ad') });
-}
-
-async function pickWithFileItem(page) {
-  await openCollapsedPanels(page);
-  await page.locator('#user-data-open-btn').click();
-  await page.locator('#user-data-file-item').click();
+/** File… answered with the fixture's file of the origin-private file system. */
+function answerPickers(page) {
+  return answerPickersWith(page, { name: NAME, url: appUrl('/tests/browser/fixtures/current-ui-smoke.h5ad') });
 }
 
 async function reload(page) {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expectSettledOn(page, START);
+}
+
+/** The handles kept (`listLocalFiles`): the files of this computer reopened with one click. */
+function keptHandles(page) {
+  return page.evaluate(async () => (await import('/assets/js/app/library/local-file-handles.js')).listLocalFiles());
+}
+
+/** One handle is kept, and My datasets lists its file, to reopen with one click. */
+async function expectFileToReopen(page) {
+  await expect.poll(async () => (await keptHandles(page)).length).toBe(1);
+  await expect.poll(() => page.evaluate(async () => {
+    const { listMyDatasets } = await import('/assets/js/app/library/my-datasets.js');
+    return (await listMyDatasets()).filter(entry => entry.source.kind === 'file').map(entry => entry.source.name);
+  })).toHaveLength(1);
 }
 
 function offer(page, text) {
@@ -107,7 +89,7 @@ test('a file picked with File… is offered back after a reload, and its click r
   const productErrors = await openStarted(page);
   await pickWithFileItem(page);
   await expectSettledOn(page, H5AD);
-  await expect(page.locator('#kept-stores-text')).toHaveAttribute('title', /1 file to reopen/);
+  await expectFileToReopen(page);
 
   await reload(page);
   const reopen = offer(page, RELOAD_OFFER);
@@ -130,7 +112,7 @@ test('a session saved on a picked file reopens it with one click, then applies; 
   await pickWithFileItem(page);
   await expectSettledOn(page, H5AD);
   const download = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('picked.cellucid-session');
   await (await download).saveAs(sessionPath);
 
@@ -176,9 +158,9 @@ test('a real folder dropped on the viewer keeps its handle, and a session reads 
   }
   await expectSettledOn(page, ZARR_FOLDER);
   await openCollapsedPanels(page);
-  await expect(page.locator('#kept-stores-text')).toHaveAttribute('title', /1 file to reopen/);
+  await expectFileToReopen(page);
   const download = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('dropped.cellucid-session');
   await (await download).saveAs(sessionPath);
 
@@ -201,7 +183,7 @@ test('without handles, Open… uses the file inputs and a reload offers nothing'
   await page.locator('#user-data-file-item').click();
   await (await chooser).setFiles(H5AD_PATH);
   await expectSettledOn(page, H5AD);
-  await expect(page.locator('#kept-stores-text')).not.toHaveAttribute('title', /reopen/);
+  await expect.poll(() => keptHandles(page)).toEqual([]);
 
   await reload(page);
   // The page says nothing of a feature this browser lacks.

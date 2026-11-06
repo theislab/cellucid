@@ -16,6 +16,7 @@ import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN, encodedAppUrl } from './help
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -184,7 +185,7 @@ test(`a ${opened} wide X_pca is guessed at columns 0 and 1, and a column swap re
   await openFile(page, input, WIDE_H5AD, 'data-mapping-wide');
   await expect(guessNotification(page)).toContainText("Showing columns 0 and 1 of 'X_pca' as 2D.");
   await guessNotification(page).getByRole('button', { name: 'Show' }).click();
-  expect(await viewLayout(page, 'live')).toBe('X_pca[0,1]');
+  await expect.poll(() => viewLayout(page, 'live')).toBe('X_pca[0,1]');
   const pca = checklistRow(page, 'PCA 1,2');
   // The only embedding stays on, and says why.
   await expect(pca.locator('.data-mapping-enable')).toBeDisabled();
@@ -298,7 +299,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   await velocity.check();
   await expect(page.locator('#velocity-overlay-settings')).toBeVisible();
   let downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const onUmap = testInfo.outputPath('vector-field-on-umap.cellucid-session');
   await (await downloadPromise).saveAs(onUmap);
 
@@ -311,7 +312,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   await expect(velocity).toBeDisabled();
   await expect(field.locator('option')).toHaveCount(0);
   downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const onTsne = testInfo.outputPath('vector-field-on-tsne.cellucid-session');
   await (await downloadPromise).saveAs(onTsne);
 
@@ -321,7 +322,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
   await expect(field).toHaveValue('velocity');
   let chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles(onTsne);
   await expect(page.locator('.split-badge')).toHaveCount(2);
   await expect.poll(() => page.evaluate(
@@ -339,7 +340,7 @@ test('a session saved with the vector-field controls on one embedding restores o
   await expect.poll(() => viewLayout(page, 'live')).toBe('X_tsne');
   await expect(field.locator('option')).toHaveCount(0);
   chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles(onUmap);
   await expect.poll(() => viewLayout(page, 'live')).toBe('X_umap');
   await expect(field).toHaveValue('velocity');
@@ -389,7 +390,7 @@ test('a session restores the data mapping and every view’s embedding', async (
   ));
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('data-mapping.cellucid-session');
   await (await downloadPromise).saveAs(sessionPath);
 
@@ -399,7 +400,7 @@ test('a session restores the data mapping and every view’s embedding', async (
   await openFile(page, '#user-data-file-input', MULTI_H5AD, 'data-mapping-multi');
   expect(await mappingDefault(page, '2d')).toEqual({ key: 'X_umap', columns: [0, 1] });
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles(sessionPath);
 
   await expect.poll(() => mappingDefault(page, '2d')).toEqual({ key: 'X_pca', columns: [2, 3] });

@@ -454,9 +454,20 @@ export function renderPageBoot({ entry, preload }) {
           }, { once: true });
         }
       }
-      const start = () => import(entry).catch(error => {
-        window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry, error } }));
-      });
+      // The document is parsed only once its stylesheet is in (CELLUCID_STYLE_GATE,
+      // after the stylesheet link), so the code starts in a styled page. A
+      // stylesheet that did not load is reported like a file of the code that
+      // did not: nothing of the app can be shown without it.
+      const start = () => {
+        if (document.documentElement.dataset.styleLoadFailed === 'true') {
+          const stylesheet = document.querySelector('link[rel="stylesheet"]').href;
+          window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry: stylesheet, stylesheet: true } }));
+          return;
+        }
+        import(entry).catch(error => {
+          window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry, error } }));
+        });
+      };
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
       else start();
     })();
@@ -659,7 +670,7 @@ export const SITE_URL = 'https://www.cellucid.com/';
 // every deploy renews it and --check refuses one that names another day. It is
 // served from the site's origin only, so it is not in the runtime inventory.
 const SECURITY_TXT_PATH = '.well-known/security.txt';
-const SECURITY_CONTACT = 'mailto:k.inecik@gmail.com';
+const SECURITY_CONTACT = 'mailto:hello@cellucid.com';
 const SECURITY_POLICY_URL = 'https://github.com/theislab/cellucid/security/policy';
 const SECURITY_TXT_LIFETIME_DAYS = 365;
 

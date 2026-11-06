@@ -610,6 +610,16 @@ const geneHeatmapDefinition = {
    * Render the heatmap
    */
   async render(data, options, container, layoutEngine) {
+    // A result with no gene passing the filters has no matrix: every path
+    // that draws it (the expanded view, a redraw after a plot option, the
+    // preview) shows that, in the one place the heatmap is drawn.
+    if (data?.matrix === null) {
+      const empty = container.ownerDocument.createElement('p');
+      empty.className = 'empty-state';
+      empty.textContent = 'No genes pass the filters.';
+      container.replaceChildren(empty);
+      return null;
+    }
     return PlotFactory.render({
       definition: this,
       pageData: data,
@@ -623,6 +633,7 @@ const geneHeatmapDefinition = {
    * Update an existing heatmap
    */
   async update(figure, data, options, layoutEngine) {
+    if (data?.matrix === null) return this.render(data, options, figure, layoutEngine);
     return PlotFactory.update({
       definition: this,
       figure,
@@ -637,6 +648,14 @@ const geneHeatmapDefinition = {
    */
   exportCSV(data, options) {
     const { matrix } = data;
+    if (matrix === null) {
+      // No gene passes the filters: a table of no genes.
+      return {
+        rows: [],
+        columns: ['gene'],
+        metadata: { plotType: 'gene-heatmap', transform: null, geneCount: 0, groupCount: 0, exportDate: new Date().toISOString() },
+      };
+    }
     const { genes, groupNames, values, nRows, nCols, transform } = matrix;
 
     const rows = [];

@@ -33,6 +33,7 @@ import { createGeneIndex, geneIdentities, notebookGeneSets, resolveGenes } from 
 import { writePerCellCSV } from '../base-analysis-ui.js';
 import { cellsReadFor } from '../../shared/gene-sample-cells.js';
 import { failureText } from '../../../../utils/errors.js';
+import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
 
 const METHOD_LABELS = Object.freeze({
   mean: 'mean',
@@ -92,7 +93,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       getGenes: () => this._geneNames(),
       getGeneIdentities: () => geneIdentities(this.dataLayer.state?.varData),
       getMarkerSets: () => {
-        const sets = this.comparisonModule?.getUIManager?.()?.getUI?.('genesPanel')?.getMarkerGeneSets?.() ?? [];
+        // Read without making the marker genes' analysis (a read makes no state).
+        const sets = this.comparisonModule?.getUIManager?.()?.peekUI?.('genesPanel')?.getMarkerGeneSets?.() ?? [];
         return sets.length > 0 ? sets : null;
       },
       getNotebookSets: () => notebookGeneSets(this.dataLayer.state)
@@ -142,8 +144,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
       onSelectionChange: pageIds => {
-        this._selectedPages = pageIds || [];
-        this._currentConfig.pages = this._selectedPages;
+        this._assignPages(pageIds || []);
+        this._recordPersonChange('pages', { pageIds: [...this._selectedPages] });
         this._updateRunRow();
         this._updateStale();
       },
@@ -151,13 +153,12 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages.length > 0 ? this._selectedPages : undefined,
+      initialSelection: this._pageSelectionToShow(),
       includeDerivedPages: true,
       getCellCountForPageId: pageId => this.dataLayer.getCellCountForPageId(pageId),
       label: 'Pages'
     });
-    this._selectedPages = this._pageSelector.getSelectedPages();
-    this._currentConfig.pages = [...this._selectedPages];
+    this._adoptSelectorDefault();
   }
 
   // ===========================================================================
@@ -314,6 +315,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         button.setAttribute('aria-pressed', String(index === this._shownSet));
         button.addEventListener('click', () => {
           this._shownSet = index;
+          // Which set is shown is how the result is shown: a step (`analysis.view.set`).
+          this._recordPersonChange('view', { view: { set: set.name } });
           this._trackInteractiveTask(this._redrawForDisplay(), 'Gene signature set');
         });
         chips.appendChild(button);
@@ -435,6 +438,37 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     this._shownSet = view.shownSet;
   }
 
+  /** The gene sets of the shown result, as scored. */
+  _resultSets() {
+    return this._lastResult?.raw?.sets ?? null;
+  }
+
+  /** The set a result of one score per set shows, by its name (null with no result). @override */
+  _viewParams() {
+    const sets = this._resultSets();
+    return { set: sets === null || sets.length === 0 ? null : sets[Math.min(this._shownSet, sets.length - 1)].name };
+  }
+
+  /** @override */
+  _prepareViewParams(rest) {
+    for (const key of Object.keys(rest)) {
+      if (key !== 'set') throw new TypeError(`Gene signature has no view "${key}"; it takes "more", "groups", "plot" and "set".`);
+    }
+    if (rest.set === undefined) return () => false;
+    const sets = this._resultSets();
+    if (sets === null) throw new RangeError('Gene signature has no result yet: run it, then choose the set it shows.');
+    const index = sets.findIndex(set => set.name === rest.set);
+    if (index < 0) {
+      throw namedError(RangeError, `There is no gene set ${quoteName(rest.set)} in the gene signature result; its sets are ${listNames(sets.map(set => set.name))}.`);
+    }
+    return () => {
+      if (index === this._shownSet) return false;
+      this._shownSet = index;
+      void this._trackInteractiveTask(this._redrawForDisplay(), 'Gene signature set');
+      return true;
+    };
+  }
+
   /**
    * The shown result's scores and sets reach the dataset's derived results
    * (and from there a notebook): one score per set over every scored cell
@@ -483,6 +517,26 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
    * columns), its genes, controls and genes not found.
    * @returns {null|{kind: 'signature', version: number, payload: unknown}}
    */
+  /**
+   * Each gene set's score per page (cells scored, mean, median), as an agent
+   * reads the result (`describeResult`).
+   * @override
+   */
+  _resultTable(result, top) {
+    const sets = result?.raw?.sets ?? [];
+    const rows = [];
+    for (const set of sets) {
+      for (const page of set.pages) {
+        const scores = Array.from(page.scores ?? []).filter(Number.isFinite).sort((a, b) => a - b);
+        const m = scores.length;
+        const mean = m === 0 ? null : scores.reduce((sum, value) => sum + value, 0) / m;
+        const median = m === 0 ? null : (m % 2 === 1 ? scores[(m - 1) / 2] : (scores[m / 2 - 1] + scores[m / 2]) / 2);
+        rows.push([String(set.name), String(page.pageName ?? ''), m, mean, median]);
+      }
+    }
+    return { columns: ['gene_set', 'page', 'cells_scored', 'mean_score', 'median_score'], rows: rows.slice(0, top), total: rows.length };
+  }
+
   _exportResult() {
     const raw = this._lastResult?.raw;
     if (!raw) return null;
@@ -531,7 +585,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       }
     }
     const result = await this._buildResult(raw, this._requireOptions());
-    await this._restoreAnalysisResult(result);
+    await this._restoreAnalysisResult(result, envelope.provenance);
   }
 
   // ===========================================================================

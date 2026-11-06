@@ -56,18 +56,6 @@
   box-shadow: var(--shadow-md);
 }
 
-.community-annotation-suggestion-card.is-duplicate-label {
-  border-color: var(--color-warning);
-  background: var(--color-warning-soft);
-}
-
-.community-annotation-dup-note {
-  margin-top: var(--control-row-gap);
-  font-size: var(--type-hint);
-  color: var(--color-text-secondary);
-  line-height: var(--leading-relaxed);
-}
-
 .community-annotation-suggestion-top {
   display: flex;
   justify-content: space-between;

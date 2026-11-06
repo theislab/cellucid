@@ -39,13 +39,13 @@ test('a camera jump keeps drawing until the adaptive LOD reaches its level, then
       const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
       requestAnimationFrame(step);
     });
+    // Frame by frame, as long as the renderer takes: the test's timeout is the fence.
     const settled = async () => {
-      for (let attempt = 0; attempt < 900; attempt += 1) {
+      for (;;) {
         const state = viewer.getFrameScheduleState();
         if (state.settled && state.animationCause === null) return;
         await frames(1);
       }
-      throw new Error(`Scene never settled: ${JSON.stringify(viewer.getFrameScheduleState())}`);
     };
     viewer.setAdaptiveLOD(true);
     // The LOD levels are built off the main thread, and until they land the
@@ -54,13 +54,7 @@ test('a camera jump keeps drawing until the adaptive LOD reaches its level, then
     // running when the near level was read, so the near level was -1 and the
     // comparison below meaningless. The landed tree draws a frame of its own
     // (`onAsyncTreeReady`); wait for that level.
-    const buildDeadline = performance.now() + 120_000;
-    while (viewer.getCurrentLODLevel('live') < 0) {
-      if (performance.now() > buildDeadline) {
-        throw new Error('The live view never drew an adaptive LOD level.');
-      }
-      await frames(1);
-    }
+    while (viewer.getCurrentLODLevel('live') < 0) await frames(1);
     // Start close in, so the far jump below crosses many levels: the ladder
     // is fixed counts (draw-order.js `lodLadder`), and from the default
     // framing of 60,000 cells the adaptive floor is only two levels down.
@@ -79,7 +73,7 @@ test('a camera jump keeps drawing until the adaptive LOD reaches its level, then
     viewer.setViewCameraState('live', camera);
 
     const causes = new Set();
-    for (let attempt = 0; attempt < 900; attempt += 1) {
+    for (;;) {
       await frames(1);
       const state = viewer.getFrameScheduleState();
       if (state.animationCause !== null) causes.add(state.animationCause);

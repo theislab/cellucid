@@ -14,13 +14,13 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-11-01.c4f85e12" />
+  <meta name="cellucid-web-build-id" content="2026-11-06.150e67eb" />
   <!--
     The release version the web app shares with the Python and R packages. A
     deployment is still identified by the build id above; the version names
     the release line the three ship together, and the footer prints both.
   -->
-  <meta name="cellucid-version" content="0.9.6" /> <!-- CELLUCID_VERSION -->
+  <meta name="cellucid-version" content="0.9.7" /> <!-- CELLUCID_VERSION -->
 
   <!--
     CELLUCID_SAMPLE_CATALOG
@@ -40,9 +40,9 @@
 	  <!-- Security policy for the static application shell -->
 	  <!--
     This policy is expressed in markup so it is enforced on static hosts.
-    The `sha256-...` sources in `script-src` allow exactly this page's three inline scripts,
-    the import map and the boot script below and the JSON-LD block (SEO structured data),
-    without enabling `'unsafe-inline'`. scripts/generate-web-asset-inventory.mjs writes them from the
+    The `sha256-...` sources in `script-src` allow exactly this page's four inline scripts,
+    the import map, the boot script and the style gate below and the JSON-LD block (SEO
+    structured data), without enabling `'unsafe-inline'`. scripts/generate-web-asset-inventory.mjs writes them from the
     blocks' bytes; tests/web-asset-inventory-contract.test.mjs and
     tests/seo-head-contract.test.mjs recompute them. `'wasm-unsafe-eval'` lets the
     readers compile the WebAssembly decoders (assets/wasm/codecs.wasm: zstd, lz4,
@@ -56,7 +56,9 @@
     only when a Drive file needs them, with the picker in a frame from
     docs.google.com. A whole Google host would also serve scripts anyone can
     publish there (a Tag Manager container, a JSONP endpoint). No page submits a
-    form (`form-action 'none'`). Framing stays open: a notebook widget frames
+    form (`form-action 'none'`). Images may be `blob:` URLs: an analysis plot's PNG
+    export draws the plot's SVG through an image of one (Plotly `downloadImage`).
+    Framing stays open: a notebook widget frames
     the app (GitHub Pages sets no headers; a meta policy cannot restrict it).
   -->
   <meta http-equiv="Content-Security-Policy" content="
@@ -64,10 +66,10 @@
     base-uri 'none';
     object-src 'none';
     form-action 'none';
-    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com/gtag/ https://accounts.google.com/gsi/ https://apis.google.com/js/api.js https://apis.google.com/_/scs/ 'sha256-JP8khvDMYKvMAeofYxS9MjOyPIAnS3r04PP0KCs8ODY=' 'sha256-Ytqcm2nuHjIhCIhO6VlcHlO8cbQlrEfjvdjsts8HVK4=' 'sha256-K95CSEvfBh1Ndhg3ru5/oybOzsFpJb8MVhrDRe09L4k=';
+    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com/gtag/ https://accounts.google.com/gsi/ https://apis.google.com/js/api.js https://apis.google.com/_/scs/ 'sha256-+wJUme4UEDa6meTPgOmJbBNb6/H3GCmP9Ob1DBZ/kiY=' 'sha256-9hPQVHB1cjbFBg7jKW0VwagdfeWVneDqQ/ZrMMZ+sSw=' 'sha256-05DKWpucUHQFPuGSkvDzqWi96CsJ4S/hrBmf6W/PAT0=' 'sha256-UOEHgN4fdMfmwdl/Aa/vEENTTxrMdgE2HHOJc/J/eQQ=';
     frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com;
     style-src 'self' 'unsafe-inline';
-    img-src 'self' data: https:;
+    img-src 'self' data: https: blob:;
     font-src 'self' data:;
     connect-src 'self' https: wss: http: ws: blob:;
     worker-src 'self' blob:;
@@ -93,8 +95,80 @@
     "./assets/external/plotly.min.js": "./assets/external/plotly.min.js?v=91851e53f083",
     "./assets/js/analytics/performance.js": "./assets/js/analytics/performance.js?v=053702c9f220",
     "./assets/js/analytics/schema.js": "./assets/js/analytics/schema.js?v=f0c6a59215cc",
-    "./assets/js/analytics/tracker.js": "./assets/js/analytics/tracker.js?v=f07448daefab",
-    "./assets/js/app/analysis/comparison-module.js": "./assets/js/app/analysis/comparison-module.js?v=78dfacb98b52",
+    "./assets/js/analytics/tracker.js": "./assets/js/analytics/tracker.js?v=41662f60312a",
+    "./assets/js/app/actions/catalog.js": "./assets/js/app/actions/catalog.js?v=10eb05663e82",
+    "./assets/js/app/actions/classification.js": "./assets/js/app/actions/classification.js?v=55fdded01c8f",
+    "./assets/js/app/actions/control-dispatch.js": "./assets/js/app/actions/control-dispatch.js?v=781d865833c2",
+    "./assets/js/app/actions/definitions/analysis.js": "./assets/js/app/actions/definitions/analysis.js?v=92a6c96083fd",
+    "./assets/js/app/actions/definitions/annotation.js": "./assets/js/app/actions/definitions/annotation.js?v=f9014244dd68",
+    "./assets/js/app/actions/definitions/camera.js": "./assets/js/app/actions/definitions/camera.js?v=39d6faa31093",
+    "./assets/js/app/actions/definitions/coloring.js": "./assets/js/app/actions/definitions/coloring.js?v=17b67199b6bf",
+    "./assets/js/app/actions/definitions/datasets.js": "./assets/js/app/actions/definitions/datasets.js?v=1bfcb4d3811f",
+    "./assets/js/app/actions/definitions/exports.js": "./assets/js/app/actions/definitions/exports.js?v=25f934fbccd3",
+    "./assets/js/app/actions/definitions/fields.js": "./assets/js/app/actions/definitions/fields.js?v=ea7e296d81dc",
+    "./assets/js/app/actions/definitions/filters.js": "./assets/js/app/actions/definitions/filters.js?v=7c5f6a98b78b",
+    "./assets/js/app/actions/definitions/highlights.js": "./assets/js/app/actions/definitions/highlights.js?v=d0874cd35456",
+    "./assets/js/app/actions/definitions/history.js": "./assets/js/app/actions/definitions/history.js?v=739b3998ea69",
+    "./assets/js/app/actions/definitions/index.js": "./assets/js/app/actions/definitions/index.js?v=27d944ed67ff",
+    "./assets/js/app/actions/definitions/layout.js": "./assets/js/app/actions/definitions/layout.js?v=32bf8af01634",
+    "./assets/js/app/actions/definitions/mapping.js": "./assets/js/app/actions/definitions/mapping.js?v=59bc897d3ff8",
+    "./assets/js/app/actions/definitions/params.js": "./assets/js/app/actions/definitions/params.js?v=cd6e7d5f004e",
+    "./assets/js/app/actions/definitions/reads.js": "./assets/js/app/actions/definitions/reads.js?v=8d9ada0d499b",
+    "./assets/js/app/actions/definitions/settings.js": "./assets/js/app/actions/definitions/settings.js?v=005a3974ac3e",
+    "./assets/js/app/actions/definitions/stored.js": "./assets/js/app/actions/definitions/stored.js?v=49e44f241bca",
+    "./assets/js/app/actions/definitions/views.js": "./assets/js/app/actions/definitions/views.js?v=30c4b8f11797",
+    "./assets/js/app/actions/dispatcher.js": "./assets/js/app/actions/dispatcher.js?v=f8dde63b1423",
+    "./assets/js/app/actions/domains.js": "./assets/js/app/actions/domains.js?v=38c74ca5a2d5",
+    "./assets/js/app/actions/index.js": "./assets/js/app/actions/index.js?v=6c7928b01d08",
+    "./assets/js/app/actions/outcome.js": "./assets/js/app/actions/outcome.js?v=9e88f718d7e7",
+    "./assets/js/app/actions/schema.js": "./assets/js/app/actions/schema.js?v=2944c3ec5e48",
+    "./assets/js/app/actions/targets/datasets.js": "./assets/js/app/actions/targets/datasets.js?v=f2a309955bdd",
+    "./assets/js/app/actions/targets/fields.js": "./assets/js/app/actions/targets/fields.js?v=80f30625fc62",
+    "./assets/js/app/actions/targets/names.js": "./assets/js/app/actions/targets/names.js?v=7cf7f33c6bf3",
+    "./assets/js/app/actions/targets/pages.js": "./assets/js/app/actions/targets/pages.js?v=2609b378b640",
+    "./assets/js/app/actions/targets/views.js": "./assets/js/app/actions/targets/views.js?v=447503563505",
+    "./assets/js/app/agent/bridge/agent-calls.js": "./assets/js/app/agent/bridge/agent-calls.js?v=3b21e58250ad",
+    "./assets/js/app/agent/bridge/connect-code.js": "./assets/js/app/agent/bridge/connect-code.js?v=3fab423c797d",
+    "./assets/js/app/agent/bridge/connect-fragment.js": "./assets/js/app/agent/bridge/connect-fragment.js?v=2f7256905918",
+    "./assets/js/app/agent/bridge/data-guard.js": "./assets/js/app/agent/bridge/data-guard.js?v=5aee4f8cc7d0",
+    "./assets/js/app/agent/bridge/local-agents.js": "./assets/js/app/agent/bridge/local-agents.js?v=e02a4e01fe6a",
+    "./assets/js/app/agent/bridge/mcp-content.js": "./assets/js/app/agent/bridge/mcp-content.js?v=b1ab8a99d9cf",
+    "./assets/js/app/agent/bridge/mcp-tools.js": "./assets/js/app/agent/bridge/mcp-tools.js?v=092fdca87288",
+    "./assets/js/app/agent/bridge/relay-client.js": "./assets/js/app/agent/bridge/relay-client.js?v=72a95956d5eb",
+    "./assets/js/app/agent/bridge/relay-protocol.js": "./assets/js/app/agent/bridge/relay-protocol.js?v=fe492d6a6648",
+    "./assets/js/app/agent/bridge/tab-secret.js": "./assets/js/app/agent/bridge/tab-secret.js?v=b96e311003bc",
+    "./assets/js/app/agent/bridge/tool-call.js": "./assets/js/app/agent/bridge/tool-call.js?v=899dc7be8847",
+    "./assets/js/app/agent/chat/agent-loop.js": "./assets/js/app/agent/chat/agent-loop.js?v=c3cab251ec7e",
+    "./assets/js/app/agent/chat/ask.js": "./assets/js/app/agent/chat/ask.js?v=592300470930",
+    "./assets/js/app/agent/chat/context.js": "./assets/js/app/agent/chat/context.js?v=75b76e05fa84",
+    "./assets/js/app/agent/chat/conversation.js": "./assets/js/app/agent/chat/conversation.js?v=a1aca1274dc0",
+    "./assets/js/app/agent/chat/export.js": "./assets/js/app/agent/chat/export.js?v=548f41a41297",
+    "./assets/js/app/agent/chat/index.js": "./assets/js/app/agent/chat/index.js?v=171842788c49",
+    "./assets/js/app/agent/chat/keys.js": "./assets/js/app/agent/chat/keys.js?v=39742b58fbbc",
+    "./assets/js/app/agent/chat/markdown.js": "./assets/js/app/agent/chat/markdown.js?v=cb3a10b4bb46",
+    "./assets/js/app/agent/chat/preferences.js": "./assets/js/app/agent/chat/preferences.js?v=dab7e5b00ab0",
+    "./assets/js/app/agent/chat/selection.js": "./assets/js/app/agent/chat/selection.js?v=795c82dc1ae0",
+    "./assets/js/app/agent/chat/suggestions.js": "./assets/js/app/agent/chat/suggestions.js?v=f7f36033a447",
+    "./assets/js/app/agent/chat/transcript-view.js": "./assets/js/app/agent/chat/transcript-view.js?v=3e4dea8f9bef",
+    "./assets/js/app/agent/connect/approval-dialog.js": "./assets/js/app/agent/connect/approval-dialog.js?v=d5fcf2e3f909",
+    "./assets/js/app/agent/connect/connections-dialog.js": "./assets/js/app/agent/connect/connections-dialog.js?v=2ccb1c9ae2b6",
+    "./assets/js/app/agent/connect/index.js": "./assets/js/app/agent/connect/index.js?v=7f560ce009dc",
+    "./assets/js/app/agent/connect/model.js": "./assets/js/app/agent/connect/model.js?v=2d1256522433",
+    "./assets/js/app/agent/data-scope.js": "./assets/js/app/agent/data-scope.js?v=a2c87bd3f351",
+    "./assets/js/app/agent/dock.js": "./assets/js/app/agent/dock.js?v=e6f6bc2687ed",
+    "./assets/js/app/agent/history-link.js": "./assets/js/app/agent/history-link.js?v=47fc8ccad0ee",
+    "./assets/js/app/agent/index.js": "./assets/js/app/agent/index.js?v=95c21c8b4048",
+    "./assets/js/app/agent/instructions.js": "./assets/js/app/agent/instructions.js?v=5d4159481c09",
+    "./assets/js/app/agent/presence/activity.js": "./assets/js/app/agent/presence/activity.js?v=e928790ea131",
+    "./assets/js/app/agent/presence/index.js": "./assets/js/app/agent/presence/index.js?v=df294c3156f5",
+    "./assets/js/app/agent/presence/permissions.js": "./assets/js/app/agent/presence/permissions.js?v=9447441e85c1",
+    "./assets/js/app/agent/providers/anthropic.js": "./assets/js/app/agent/providers/anthropic.js?v=38b43629a8e7",
+    "./assets/js/app/agent/providers/contract.js": "./assets/js/app/agent/providers/contract.js?v=7080486218ae",
+    "./assets/js/app/agent/providers/index.js": "./assets/js/app/agent/providers/index.js?v=6e41b895ce23",
+    "./assets/js/app/agent/providers/openai.js": "./assets/js/app/agent/providers/openai.js?v=3dbf2b82c234",
+    "./assets/js/app/agent/providers/scripted.js": "./assets/js/app/agent/providers/scripted.js?v=9cbdb67d4172",
+    "./assets/js/app/analysis/actions.js": "./assets/js/app/analysis/actions.js?v=488e6c6e9d90",
+    "./assets/js/app/analysis/comparison-module.js": "./assets/js/app/analysis/comparison-module.js?v=3b5642822fd5",
     "./assets/js/app/analysis/compute/composition-counts.js": "./assets/js/app/analysis/compute/composition-counts.js?v=4bcb21196deb",
     "./assets/js/app/analysis/compute/compute-manager.js": "./assets/js/app/analysis/compute/compute-manager.js?v=e64537ec0c3d",
     "./assets/js/app/analysis/compute/csv-export.js": "./assets/js/app/analysis/compute/csv-export.js?v=767fe024df6c",
@@ -109,7 +183,7 @@
     "./assets/js/app/analysis/compute/worker-pool.js": "./assets/js/app/analysis/compute/worker-pool.js?v=98a0d05c1b66",
     "./assets/js/app/analysis/core/analysis-types.js": "./assets/js/app/analysis/core/analysis-types.js?v=8dd8203a3ad6",
     "./assets/js/app/analysis/core/plugin-contract.js": "./assets/js/app/analysis/core/plugin-contract.js?v=7d5dcaabb73e",
-    "./assets/js/app/analysis/data/data-layer.js": "./assets/js/app/analysis/data/data-layer.js?v=9b45c64d5d90",
+    "./assets/js/app/analysis/data/data-layer.js": "./assets/js/app/analysis/data/data-layer.js?v=45cdcffcad21",
     "./assets/js/app/analysis/data/gene-route.js": "./assets/js/app/analysis/data/gene-route.js?v=65fbf9c17e53",
     "./assets/js/app/analysis/genes-panel/clustering-engine.js": "./assets/js/app/analysis/genes-panel/clustering-engine.js?v=a0cd7bd2cab2",
     "./assets/js/app/analysis/genes-panel/constants.js": "./assets/js/app/analysis/genes-panel/constants.js?v=b11076dbd383",
@@ -118,6 +192,8 @@
     "./assets/js/app/analysis/genes-panel/marker-cache.js": "./assets/js/app/analysis/genes-panel/marker-cache.js?v=14a21fde0f10",
     "./assets/js/app/analysis/genes-panel/marker-discovery-engine.js": "./assets/js/app/analysis/genes-panel/marker-discovery-engine.js?v=97331f491918",
     "./assets/js/app/analysis/genes-panel/marker-selection.js": "./assets/js/app/analysis/genes-panel/marker-selection.js?v=b465094fe926",
+    "./assets/js/app/analysis/options/analysis-modes.js": "./assets/js/app/analysis/options/analysis-modes.js?v=ce72269871f2",
+    "./assets/js/app/analysis/options/analysis-views.js": "./assets/js/app/analysis/options/analysis-views.js?v=357468698841",
     "./assets/js/app/analysis/options/composition-options.js": "./assets/js/app/analysis/options/composition-options.js?v=0c137e3e320e",
     "./assets/js/app/analysis/options/correlation-options.js": "./assets/js/app/analysis/options/correlation-options.js?v=060889cac9f5",
     "./assets/js/app/analysis/options/de-options.js": "./assets/js/app/analysis/options/de-options.js?v=776df3f44247",
@@ -146,17 +222,17 @@
     "./assets/js/app/analysis/plots/types/composition-strips.js": "./assets/js/app/analysis/plots/types/composition-strips.js?v=88dd021fb64b",
     "./assets/js/app/analysis/plots/types/densityplot.js": "./assets/js/app/analysis/plots/types/densityplot.js?v=13bd26dd8180",
     "./assets/js/app/analysis/plots/types/dotplot.js": "./assets/js/app/analysis/plots/types/dotplot.js?v=c1e64b764c43",
-    "./assets/js/app/analysis/plots/types/gene-heatmap.js": "./assets/js/app/analysis/plots/types/gene-heatmap.js?v=c1660bd7cc6a",
+    "./assets/js/app/analysis/plots/types/gene-heatmap.js": "./assets/js/app/analysis/plots/types/gene-heatmap.js?v=8a4dfe2f6c2e",
     "./assets/js/app/analysis/plots/types/heatmap.js": "./assets/js/app/analysis/plots/types/heatmap.js?v=1dffa030a5c4",
     "./assets/js/app/analysis/plots/types/histogram.js": "./assets/js/app/analysis/plots/types/histogram.js?v=3fc51cbe1cfb",
     "./assets/js/app/analysis/plots/types/pieplot.js": "./assets/js/app/analysis/plots/types/pieplot.js?v=cb6ee9324b7b",
     "./assets/js/app/analysis/plots/types/scatterplot.js": "./assets/js/app/analysis/plots/types/scatterplot.js?v=26cea4b27ed8",
     "./assets/js/app/analysis/plots/types/violinplot.js": "./assets/js/app/analysis/plots/types/violinplot.js?v=0e5daa35d1f9",
     "./assets/js/app/analysis/plots/types/volcanoplot.js": "./assets/js/app/analysis/plots/types/volcanoplot.js?v=d13eb55e824d",
-    "./assets/js/app/analysis/shared/analysis-result-codec.js": "./assets/js/app/analysis/shared/analysis-result-codec.js?v=6bd057554b59",
-    "./assets/js/app/analysis/shared/analysis-result-session.js": "./assets/js/app/analysis/shared/analysis-result-session.js?v=34d38e144cbe",
+    "./assets/js/app/analysis/shared/analysis-result-codec.js": "./assets/js/app/analysis/shared/analysis-result-codec.js?v=ef6f5d70f1d1",
+    "./assets/js/app/analysis/shared/analysis-result-session.js": "./assets/js/app/analysis/shared/analysis-result-session.js?v=e27dda2b10ef",
     "./assets/js/app/analysis/shared/analysis-utils.js": "./assets/js/app/analysis/shared/analysis-utils.js?v=b0a4b7befaee",
-    "./assets/js/app/analysis/shared/analysis-view-sizes.js": "./assets/js/app/analysis/shared/analysis-view-sizes.js?v=564051094bfd",
+    "./assets/js/app/analysis/shared/analysis-view-sizes.js": "./assets/js/app/analysis/shared/analysis-view-sizes.js?v=c8b7923dc7a0",
     "./assets/js/app/analysis/shared/category-counts.js": "./assets/js/app/analysis/shared/category-counts.js?v=c2953a743ffa",
     "./assets/js/app/analysis/shared/color-utils.js": "./assets/js/app/analysis/shared/color-utils.js?v=7d72ad87d920",
     "./assets/js/app/analysis/shared/concurrency-utils.js": "./assets/js/app/analysis/shared/concurrency-utils.js?v=a3988b572591",
@@ -174,13 +250,14 @@
     "./assets/js/app/analysis/shared/open-cell-choice.js": "./assets/js/app/analysis/shared/open-cell-choice.js?v=5b392deb0897",
     "./assets/js/app/analysis/shared/page-derivation-utils.js": "./assets/js/app/analysis/shared/page-derivation-utils.js?v=62d597f502bb",
     "./assets/js/app/analysis/shared/page-overlap.js": "./assets/js/app/analysis/shared/page-overlap.js?v=c9edbbf050c7",
-    "./assets/js/app/analysis/shared/performance-config.js": "./assets/js/app/analysis/shared/performance-config.js?v=b8008d0c05a2",
+    "./assets/js/app/analysis/shared/performance-config.js": "./assets/js/app/analysis/shared/performance-config.js?v=0dee495c182d",
     "./assets/js/app/analysis/shared/plot-registry-utils.js": "./assets/js/app/analysis/shared/plot-registry-utils.js?v=1d510f946f66",
     "./assets/js/app/analysis/shared/plot-render-slot.js": "./assets/js/app/analysis/shared/plot-render-slot.js?v=35cadb6a1ccf",
     "./assets/js/app/analysis/shared/plot-theme.js": "./assets/js/app/analysis/shared/plot-theme.js?v=484501606c1d",
     "./assets/js/app/analysis/shared/plotly-render-slot.js": "./assets/js/app/analysis/shared/plotly-render-slot.js?v=8f6bb19c821d",
     "./assets/js/app/analysis/shared/progressive-cells.js": "./assets/js/app/analysis/shared/progressive-cells.js?v=691512efe25c",
     "./assets/js/app/analysis/shared/resource-cleanup.js": "./assets/js/app/analysis/shared/resource-cleanup.js?v=b329d75f170d",
+    "./assets/js/app/analysis/shared/result-provenance.js": "./assets/js/app/analysis/shared/result-provenance.js?v=5df7787e6744",
     "./assets/js/app/analysis/shared/run-tuner.js": "./assets/js/app/analysis/shared/run-tuner.js?v=ceb69599cc92",
     "./assets/js/app/analysis/stats/categorical-tests.js": "./assets/js/app/analysis/stats/categorical-tests.js?v=dbf3945f3f0d",
     "./assets/js/app/analysis/stats/composition-tests.js": "./assets/js/app/analysis/stats/composition-tests.js?v=5f913cd16b84",
@@ -189,174 +266,219 @@
     "./assets/js/app/analysis/stats/pseudobulk.js": "./assets/js/app/analysis/stats/pseudobulk.js?v=c6bf4a9f87b4",
     "./assets/js/app/analysis/stats/signature-score.js": "./assets/js/app/analysis/stats/signature-score.js?v=67c6c2fa440d",
     "./assets/js/app/analysis/stats/statistical-tests.js": "./assets/js/app/analysis/stats/statistical-tests.js?v=e888757e767d",
-    "./assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js": "./assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js?v=5cef3f711f1d",
-    "./assets/js/app/analysis/ui/analysis-types/composition-ui.js": "./assets/js/app/analysis/ui/analysis-types/composition-ui.js?v=c63f90ba8577",
-    "./assets/js/app/analysis/ui/analysis-types/correlation-analysis-ui.js": "./assets/js/app/analysis/ui/analysis-types/correlation-analysis-ui.js?v=93c08345cbc9",
-    "./assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js": "./assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js?v=99ea7734d4f2",
-    "./assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js": "./assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js?v=89821d886049",
-    "./assets/js/app/analysis/ui/analysis-types/dotplot-ui.js": "./assets/js/app/analysis/ui/analysis-types/dotplot-ui.js?v=45ced6ec3760",
+    "./assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js": "./assets/js/app/analysis/ui/analysis-types/base/form-based-analysis.js?v=92722c7d8bba",
+    "./assets/js/app/analysis/ui/analysis-types/composition-ui.js": "./assets/js/app/analysis/ui/analysis-types/composition-ui.js?v=7712b3918611",
+    "./assets/js/app/analysis/ui/analysis-types/correlation-analysis-ui.js": "./assets/js/app/analysis/ui/analysis-types/correlation-analysis-ui.js?v=9b0fc64e8e45",
+    "./assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js": "./assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js?v=2c9805b69937",
+    "./assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js": "./assets/js/app/analysis/ui/analysis-types/detailed-analysis-ui.js?v=5c1d36e14995",
+    "./assets/js/app/analysis/ui/analysis-types/dotplot-ui.js": "./assets/js/app/analysis/ui/analysis-types/dotplot-ui.js?v=8e1a0ef9588e",
     "./assets/js/app/analysis/ui/analysis-types/field-groups.js": "./assets/js/app/analysis/ui/analysis-types/field-groups.js?v=2a6974d32dcc",
-    "./assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js": "./assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js?v=f104c2205447",
-    "./assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js": "./assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js?v=1e1b863c5f4e",
-    "./assets/js/app/analysis/ui/analysis-types/quick-insights-ui.js": "./assets/js/app/analysis/ui/analysis-types/quick-insights-ui.js?v=7b5c2e9da9d6",
-    "./assets/js/app/analysis/ui/analysis-ui-manager.js": "./assets/js/app/analysis/ui/analysis-ui-manager.js?v=6f2f7773026c",
-    "./assets/js/app/analysis/ui/analysis-window-manager.js": "./assets/js/app/analysis/ui/analysis-window-manager.js?v=07c438181ffe",
-    "./assets/js/app/analysis/ui/base-analysis-ui.js": "./assets/js/app/analysis/ui/base-analysis-ui.js?v=241867880cc7",
-    "./assets/js/app/analysis/ui/components/control-accessibility.js": "./assets/js/app/analysis/ui/components/control-accessibility.js?v=810642213273",
+    "./assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js": "./assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js?v=b6411d300e0c",
+    "./assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js": "./assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js?v=177491416392",
+    "./assets/js/app/analysis/ui/analysis-types/quick-insights-ui.js": "./assets/js/app/analysis/ui/analysis-types/quick-insights-ui.js?v=8fba8fa7a093",
+    "./assets/js/app/analysis/ui/analysis-ui-manager.js": "./assets/js/app/analysis/ui/analysis-ui-manager.js?v=914d1a0f0dd0",
+    "./assets/js/app/analysis/ui/analysis-window-manager.js": "./assets/js/app/analysis/ui/analysis-window-manager.js?v=c24ad2722ce0",
+    "./assets/js/app/analysis/ui/base-analysis-ui.js": "./assets/js/app/analysis/ui/base-analysis-ui.js?v=a0af31787d21",
+    "./assets/js/app/analysis/ui/components/control-accessibility.js": "./assets/js/app/analysis/ui/components/control-accessibility.js?v=40426b85405c",
     "./assets/js/app/analysis/ui/components/export.js": "./assets/js/app/analysis/ui/components/export.js?v=3c74a5fe57cf",
     "./assets/js/app/analysis/ui/components/gene-set-editor.js": "./assets/js/app/analysis/ui/components/gene-set-editor.js?v=8635d9c2b4d8",
     "./assets/js/app/analysis/ui/components/group-picker.js": "./assets/js/app/analysis/ui/components/group-picker.js?v=8f4893357cf8",
     "./assets/js/app/analysis/ui/components/hover-context.js": "./assets/js/app/analysis/ui/components/hover-context.js?v=fbfea5ac8eb4",
     "./assets/js/app/analysis/ui/components/index.js": "./assets/js/app/analysis/ui/components/index.js?v=100734fbcfbf",
-    "./assets/js/app/analysis/ui/components/modal.js": "./assets/js/app/analysis/ui/components/modal.js?v=d79cc34564fc",
+    "./assets/js/app/analysis/ui/components/modal.js": "./assets/js/app/analysis/ui/components/modal.js?v=1ec32bf6409e",
     "./assets/js/app/analysis/ui/components/multi-select-dropdown.js": "./assets/js/app/analysis/ui/components/multi-select-dropdown.js?v=32e4cdfe91bc",
-    "./assets/js/app/analysis/ui/components/options.js": "./assets/js/app/analysis/ui/components/options.js?v=fa3244c9a91f",
+    "./assets/js/app/analysis/ui/components/options.js": "./assets/js/app/analysis/ui/components/options.js?v=d14aed6e98d0",
     "./assets/js/app/analysis/ui/components/selectors.js": "./assets/js/app/analysis/ui/components/selectors.js?v=ce0eea602f8e",
     "./assets/js/app/analysis/ui/components/stats-display.js": "./assets/js/app/analysis/ui/components/stats-display.js?v=2ac6debe8803",
     "./assets/js/app/analysis/ui/shared/page-selector.js": "./assets/js/app/analysis/ui/shared/page-selector.js?v=77760d4a9217",
     "./assets/js/app/analysis/ui/shared/variable-selector.js": "./assets/js/app/analysis/ui/shared/variable-selector.js?v=25a5e262c932",
-    "./assets/js/app/app-code.js": "./assets/js/app/app-code.js?v=3b26a54f906c",
+    "./assets/js/app/app-code.js": "./assets/js/app/app-code.js?v=d64d2df1484f",
     "./assets/js/app/asset-url.js": "./assets/js/app/asset-url.js?v=2249ac65ea7c",
     "./assets/js/app/cell-subset-carry.js": "./assets/js/app/cell-subset-carry.js?v=4a00f65086e2",
-    "./assets/js/app/citation.js": "./assets/js/app/citation.js?v=df98d2c26eef",
-    "./assets/js/app/community-annotations/_worker-code.js": "./assets/js/app/community-annotations/_worker-code.js?v=66c0513764c7",
+    "./assets/js/app/citation.js": "./assets/js/app/citation.js?v=f14594d46ede",
+    "./assets/js/app/community-annotations/_worker-code.js": "./assets/js/app/community-annotations/_worker-code.js?v=6df6541cef25",
     "./assets/js/app/community-annotations/access-store.js": "./assets/js/app/community-annotations/access-store.js?v=9fd0c1823c90",
     "./assets/js/app/community-annotations/auto-pull-preferences.js": "./assets/js/app/community-annotations/auto-pull-preferences.js?v=9de9fca8c8d4",
-    "./assets/js/app/community-annotations/cache-scope.js": "./assets/js/app/community-annotations/cache-scope.js?v=4fe39391feba",
-    "./assets/js/app/community-annotations/cap-api.js": "./assets/js/app/community-annotations/cap-api.js?v=d62c77d55771",
+    "./assets/js/app/community-annotations/cache-scope.js": "./assets/js/app/community-annotations/cache-scope.js?v=27d6ee81b78c",
+    "./assets/js/app/community-annotations/cap-api.js": "./assets/js/app/community-annotations/cap-api.js?v=d88fa01f9e07",
     "./assets/js/app/community-annotations/connection-events.js": "./assets/js/app/community-annotations/connection-events.js?v=9c1c0a2b5862",
-    "./assets/js/app/community-annotations/file-cache.js": "./assets/js/app/community-annotations/file-cache.js?v=d331180bfeba",
-    "./assets/js/app/community-annotations/github-auth.js": "./assets/js/app/community-annotations/github-auth.js?v=2c42be21f0ef",
+    "./assets/js/app/community-annotations/consensus-codes.js": "./assets/js/app/community-annotations/consensus-codes.js?v=ff5a32efb306",
+    "./assets/js/app/community-annotations/field-names.js": "./assets/js/app/community-annotations/field-names.js?v=14748baad379",
+    "./assets/js/app/community-annotations/file-cache.js": "./assets/js/app/community-annotations/file-cache.js?v=c45de9cdb655",
+    "./assets/js/app/community-annotations/github-auth.js": "./assets/js/app/community-annotations/github-auth.js?v=bbd19bc3ea41",
     "./assets/js/app/community-annotations/github-reference.js": "./assets/js/app/community-annotations/github-reference.js?v=e84bbe9b7024",
-    "./assets/js/app/community-annotations/github-sync.js": "./assets/js/app/community-annotations/github-sync.js?v=a5ad6b69120a",
-    "./assets/js/app/community-annotations/orcid-client.js": "./assets/js/app/community-annotations/orcid-client.js?v=2b2092fb1c30",
-    "./assets/js/app/community-annotations/profile-identifiers.js": "./assets/js/app/community-annotations/profile-identifiers.js?v=3f62afb0affc",
-    "./assets/js/app/community-annotations/repo-store.js": "./assets/js/app/community-annotations/repo-store.js?v=093d26c9c8ec",
-    "./assets/js/app/community-annotations/runtime-context.js": "./assets/js/app/community-annotations/runtime-context.js?v=5c0eda7bc11a",
-    "./assets/js/app/community-annotations/scope-lock.js": "./assets/js/app/community-annotations/scope-lock.js?v=cc7bb72a789c",
-    "./assets/js/app/community-annotations/session.js": "./assets/js/app/community-annotations/session.js?v=2ed81b577178",
-    "./assets/js/app/community-annotations/wire-contract.js": "./assets/js/app/community-annotations/wire-contract.js?v=4543fef3e8a5",
+    "./assets/js/app/community-annotations/github-sync.js": "./assets/js/app/community-annotations/github-sync.js?v=4bd9440c4836",
+    "./assets/js/app/community-annotations/orcid-client.js": "./assets/js/app/community-annotations/orcid-client.js?v=18e60252d4fc",
+    "./assets/js/app/community-annotations/profile-identifiers.js": "./assets/js/app/community-annotations/profile-identifiers.js?v=c57832548c66",
+    "./assets/js/app/community-annotations/repo-store.js": "./assets/js/app/community-annotations/repo-store.js?v=1daaaff9bb92",
+    "./assets/js/app/community-annotations/runtime-context.js": "./assets/js/app/community-annotations/runtime-context.js?v=ea1b0c16ec74",
+    "./assets/js/app/community-annotations/scope-lock.js": "./assets/js/app/community-annotations/scope-lock.js?v=2ee678aafc4f",
+    "./assets/js/app/community-annotations/session.js": "./assets/js/app/community-annotations/session.js?v=084816d7be3b",
+    "./assets/js/app/community-annotations/wire-contract.js": "./assets/js/app/community-annotations/wire-contract.js?v=232e80ceccb4",
+    "./assets/js/app/community-annotations/worker-contract.js": "./assets/js/app/community-annotations/worker-contract.js?v=c05d039e2632",
+    "./assets/js/app/community-annotations/worker-request.js": "./assets/js/app/community-annotations/worker-request.js?v=181f1723615a",
     "./assets/js/app/data-load-methods.js": "./assets/js/app/data-load-methods.js?v=4156a085281f",
     "./assets/js/app/dataset-reload-outcome.js": "./assets/js/app/dataset-reload-outcome.js?v=f2809395fde0",
     "./assets/js/app/dockable-accordions-registry.js": "./assets/js/app/dockable-accordions-registry.js?v=4e467a9a36a6",
-    "./assets/js/app/dockable-accordions.js": "./assets/js/app/dockable-accordions.js?v=28d53ee45a18",
+    "./assets/js/app/dockable-accordions.js": "./assets/js/app/dockable-accordions.js?v=946aa4045330",
     "./assets/js/app/dockable-accordions/geometry.js": "./assets/js/app/dockable-accordions/geometry.js?v=c90021c31cea",
-    "./assets/js/app/dockable-accordions/interactions.js": "./assets/js/app/dockable-accordions/interactions.js?v=5aa9c88fbe2d",
+    "./assets/js/app/dockable-accordions/interactions.js": "./assets/js/app/dockable-accordions/interactions.js?v=f0e9520afa01",
     "./assets/js/app/dockable-accordions/sheets.js": "./assets/js/app/dockable-accordions/sheets.js?v=8f9fb03d3f5e",
-    "./assets/js/app/exports/cell-exports.js": "./assets/js/app/exports/cell-exports.js?v=032cc30c2edc",
-    "./assets/js/app/graphics-reset-session.js": "./assets/js/app/graphics-reset-session.js?v=a9f989fbeb85",
-    "./assets/js/app/highlight-draft.js": "./assets/js/app/highlight-draft.js?v=db1a0416756c",
-    "./assets/js/app/jobs/cancellable-job.js": "./assets/js/app/jobs/cancellable-job.js?v=6122647a0342",
+    "./assets/js/app/exports/cell-exports.js": "./assets/js/app/exports/cell-exports.js?v=751b0bd43bd7",
+    "./assets/js/app/graphics-reset-session.js": "./assets/js/app/graphics-reset-session.js?v=4e97df548ebe",
+    "./assets/js/app/history/actions.js": "./assets/js/app/history/actions.js?v=d28aa5bcd12a",
+    "./assets/js/app/history/anndata-copy-save.js": "./assets/js/app/history/anndata-copy-save.js?v=52afa94660c5",
+    "./assets/js/app/history/autosave-store.js": "./assets/js/app/history/autosave-store.js?v=4419853a2d28",
+    "./assets/js/app/history/autosave.js": "./assets/js/app/history/autosave.js?v=4f221706a816",
+    "./assets/js/app/history/branches.js": "./assets/js/app/history/branches.js?v=ec13bea31752",
+    "./assets/js/app/history/current.js": "./assets/js/app/history/current.js?v=e77d5e6b8b06",
+    "./assets/js/app/history/dataset-history.js": "./assets/js/app/history/dataset-history.js?v=04b505eb7b41",
+    "./assets/js/app/history/delete-restore.js": "./assets/js/app/history/delete-restore.js?v=a45766a6c75c",
+    "./assets/js/app/history/describe.js": "./assets/js/app/history/describe.js?v=3d9fc3e45b72",
+    "./assets/js/app/history/exports/anndata-copy.js": "./assets/js/app/history/exports/anndata-copy.js?v=f262096bff31",
+    "./assets/js/app/history/exports/methods.js": "./assets/js/app/history/exports/methods.js?v=622b7a103b55",
+    "./assets/js/app/history/exports/pseudocode.js": "./assets/js/app/history/exports/pseudocode.js?v=78d46650a868",
+    "./assets/js/app/history/exports/report.js": "./assets/js/app/history/exports/report.js?v=7cebff4fd215",
+    "./assets/js/app/history/exports/step-text.js": "./assets/js/app/history/exports/step-text.js?v=15893048fc7d",
+    "./assets/js/app/history/history-settings.js": "./assets/js/app/history/history-settings.js?v=80802afa5c16",
+    "./assets/js/app/history/history.js": "./assets/js/app/history/history.js?v=96fc9201c5a7",
+    "./assets/js/app/history/journal.js": "./assets/js/app/history/journal.js?v=56a98cc0acd3",
+    "./assets/js/app/history/model.js": "./assets/js/app/history/model.js?v=d3a215358e97",
+    "./assets/js/app/history/persistence-actions.js": "./assets/js/app/history/persistence-actions.js?v=9026141bf24d",
+    "./assets/js/app/history/provenance.js": "./assets/js/app/history/provenance.js?v=1bc267afb035",
+    "./assets/js/app/history/replay.js": "./assets/js/app/history/replay.js?v=aab268be009e",
+    "./assets/js/app/history/search.js": "./assets/js/app/history/search.js?v=d775f77039c0",
+    "./assets/js/app/history/step-records.js": "./assets/js/app/history/step-records.js?v=8b817c9bcc9c",
+    "./assets/js/app/history/tree.js": "./assets/js/app/history/tree.js?v=64dac5c3db9b",
+    "./assets/js/app/history/turns.js": "./assets/js/app/history/turns.js?v=08156e8c18f2",
+    "./assets/js/app/history/value-parts.js": "./assets/js/app/history/value-parts.js?v=b3c06edd1bba",
+    "./assets/js/app/history/value-pool.js": "./assets/js/app/history/value-pool.js?v=4955ac1d012b",
+    "./assets/js/app/jobs/cancellable-job.js": "./assets/js/app/jobs/cancellable-job.js?v=03f118dfd7fa",
     "./assets/js/app/jobs/job-status-view.js": "./assets/js/app/jobs/job-status-view.js?v=2e367d7e259a",
-    "./assets/js/app/local-file-handles.js": "./assets/js/app/local-file-handles.js?v=d8c1f0f9eb03",
-    "./assets/js/app/main.js": "./assets/js/app/main.js?v=bfe3edca64c0",
+    "./assets/js/app/library/library-file.js": "./assets/js/app/library/library-file.js?v=e4a6da5e6e03",
+    "./assets/js/app/library/local-file-handles.js": "./assets/js/app/library/local-file-handles.js?v=5c15c040ecaf",
+    "./assets/js/app/library/my-datasets.js": "./assets/js/app/library/my-datasets.js?v=502b72704969",
+    "./assets/js/app/main.js": "./assets/js/app/main.js?v=6571a886255b",
     "./assets/js/app/matrix-share-notices.js": "./assets/js/app/matrix-share-notices.js?v=d2aca7a601c0",
-    "./assets/js/app/notification-center.js": "./assets/js/app/notification-center.js?v=03f70cef689b",
+    "./assets/js/app/notification-center.js": "./assets/js/app/notification-center.js?v=b5647478268f",
     "./assets/js/app/notification-center/benchmark-notifications.js": "./assets/js/app/notification-center/benchmark-notifications.js?v=406b645fbb0e",
     "./assets/js/app/notification-center/constants.js": "./assets/js/app/notification-center/constants.js?v=df1c62f3862f",
     "./assets/js/app/notification-center/download-tracking.js": "./assets/js/app/notification-center/download-tracking.js?v=870e2fa4bfeb",
-    "./assets/js/app/open-cells-resize.js": "./assets/js/app/open-cells-resize.js?v=552bd027c7ca",
+    "./assets/js/app/open-cells-resize.js": "./assets/js/app/open-cells-resize.js?v=5fe82e087f46",
     "./assets/js/app/opening-progress-view.js": "./assets/js/app/opening-progress-view.js?v=f7890360a62a",
     "./assets/js/app/optional-analytics.js": "./assets/js/app/optional-analytics.js?v=332bb37024c1",
     "./assets/js/app/page-memory.js": "./assets/js/app/page-memory.js?v=61bb31455902",
-    "./assets/js/app/read-progress-notifications.js": "./assets/js/app/read-progress-notifications.js?v=f61ea6640103",
+    "./assets/js/app/read-progress-notifications.js": "./assets/js/app/read-progress-notifications.js?v=0ae101110fbd",
+    "./assets/js/app/reads/dataset.js": "./assets/js/app/reads/dataset.js?v=dbadea02ec87",
+    "./assets/js/app/reads/index.js": "./assets/js/app/reads/index.js?v=662aef8490cd",
+    "./assets/js/app/reads/views.js": "./assets/js/app/reads/views.js?v=ebe5dfa9ff2f",
     "./assets/js/app/registries/base-registry.js": "./assets/js/app/registries/base-registry.js?v=d4b2c32b46a4",
-    "./assets/js/app/registries/delete-registry.js": "./assets/js/app/registries/delete-registry.js?v=b3fb0675e737",
-    "./assets/js/app/registries/derived-results.js": "./assets/js/app/registries/derived-results.js?v=7c83e28110c7",
-    "./assets/js/app/registries/rename-registry.js": "./assets/js/app/registries/rename-registry.js?v=d2c2f524f9b7",
-    "./assets/js/app/registries/user-defined-fields.js": "./assets/js/app/registries/user-defined-fields.js?v=fcfb07c3d9ef",
+    "./assets/js/app/registries/delete-registry.js": "./assets/js/app/registries/delete-registry.js?v=e05806dc2297",
+    "./assets/js/app/registries/derived-results.js": "./assets/js/app/registries/derived-results.js?v=ca995fe655a0",
+    "./assets/js/app/registries/rename-registry.js": "./assets/js/app/registries/rename-registry.js?v=52b5b005cb17",
+    "./assets/js/app/registries/user-defined-fields.js": "./assets/js/app/registries/user-defined-fields.js?v=6b24fb10d004",
     "./assets/js/app/registries/user-defined-fields/centroids.js": "./assets/js/app/registries/user-defined-fields/centroids.js?v=c6dce6084472",
-    "./assets/js/app/session/bundle/format.js": "./assets/js/app/session/bundle/format.js?v=d0d821117d20",
-    "./assets/js/app/session/bundle/reader.js": "./assets/js/app/session/bundle/reader.js?v=b1ab6d5d5f17",
-    "./assets/js/app/session/bundle/writer.js": "./assets/js/app/session/bundle/writer.js?v=e5017b00ad89",
-    "./assets/js/app/session/catalog-default-session.js": "./assets/js/app/session/catalog-default-session.js?v=067f612c8e21",
-    "./assets/js/app/session/cell-subset-record.js": "./assets/js/app/session/cell-subset-record.js?v=8801f40e563f",
-    "./assets/js/app/session/codecs/cell-set.js": "./assets/js/app/session/codecs/cell-set.js?v=4fb55c44c8c5",
+    "./assets/js/app/session/app-stamp.js": "./assets/js/app/session/app-stamp.js?v=97ad6f5c5231",
+    "./assets/js/app/session/bundle/format.js": "./assets/js/app/session/bundle/format.js?v=7c564bc04308",
+    "./assets/js/app/session/bundle/reader.js": "./assets/js/app/session/bundle/reader.js?v=75d5aa6af831",
+    "./assets/js/app/session/bundle/writer.js": "./assets/js/app/session/bundle/writer.js?v=f710eb6f3a8d",
+    "./assets/js/app/session/catalog-default-session.js": "./assets/js/app/session/catalog-default-session.js?v=61497221d483",
+    "./assets/js/app/session/cell-subset-record.js": "./assets/js/app/session/cell-subset-record.js?v=e7c0e1ae7d8b",
+    "./assets/js/app/session/codecs/cell-set.js": "./assets/js/app/session/codecs/cell-set.js?v=7eaa9ebfd74a",
     "./assets/js/app/session/codecs/gzip.js": "./assets/js/app/session/codecs/gzip.js?v=430621417451",
-    "./assets/js/app/session/codecs/typed-json.js": "./assets/js/app/session/codecs/typed-json.js?v=c40884e5ce23",
     "./assets/js/app/session/codecs/varint.js": "./assets/js/app/session/codecs/varint.js?v=d5857ce67fc3",
-    "./assets/js/app/session/contributors/analysis-docked.js": "./assets/js/app/session/contributors/analysis-docked.js?v=f9aed26c74bb",
-    "./assets/js/app/session/contributors/analysis-windows.js": "./assets/js/app/session/contributors/analysis-windows.js?v=c91d26c847b3",
-    "./assets/js/app/session/contributors/cinematic-camera.js": "./assets/js/app/session/contributors/cinematic-camera.js?v=b4b6404c548f",
-    "./assets/js/app/session/contributors/core-state.js": "./assets/js/app/session/contributors/core-state.js?v=8cc2285f47a7",
-    "./assets/js/app/session/contributors/dockable-layout.js": "./assets/js/app/session/contributors/dockable-layout.js?v=fbfab7cc72b8",
-    "./assets/js/app/session/contributors/field-overlays.js": "./assets/js/app/session/contributors/field-overlays.js?v=845590726135",
-    "./assets/js/app/session/contributors/figure-export.js": "./assets/js/app/session/contributors/figure-export.js?v=de86c70ea6dd",
-    "./assets/js/app/session/contributors/gene-sets.js": "./assets/js/app/session/contributors/gene-sets.js?v=4b4965137540",
-    "./assets/js/app/session/contributors/highlights-cells.js": "./assets/js/app/session/contributors/highlights-cells.js?v=4b561341ba1e",
-    "./assets/js/app/session/contributors/highlights-meta.js": "./assets/js/app/session/contributors/highlights-meta.js?v=98aece12c602",
-    "./assets/js/app/session/contributors/user-defined-code-inventory.js": "./assets/js/app/session/contributors/user-defined-code-inventory.js?v=1fbe84d5ea79",
-    "./assets/js/app/session/contributors/user-defined-codes.js": "./assets/js/app/session/contributors/user-defined-codes.js?v=578d18d4807a",
-    "./assets/js/app/session/contributors/user-defined-values.js": "./assets/js/app/session/contributors/user-defined-values.js?v=f40de0bb9f44",
-    "./assets/js/app/session/dataset-source-record.js": "./assets/js/app/session/dataset-source-record.js?v=6076af7111e1",
-    "./assets/js/app/session/index.js": "./assets/js/app/session/index.js?v=fb7ff62660b0",
-    "./assets/js/app/session/published-default.js": "./assets/js/app/session/published-default.js?v=2d655c394def",
+    "./assets/js/app/session/dataset-source-record.js": "./assets/js/app/session/dataset-source-record.js?v=1b223cb46809",
+    "./assets/js/app/session/history-file.js": "./assets/js/app/session/history-file.js?v=d54438b7b68b",
+    "./assets/js/app/session/index.js": "./assets/js/app/session/index.js?v=dafefe30ad04",
+    "./assets/js/app/session/published-default.js": "./assets/js/app/session/published-default.js?v=a84c96d21cdd",
+    "./assets/js/app/session/recompute-results.js": "./assets/js/app/session/recompute-results.js?v=1c43368c111d",
     "./assets/js/app/session/schema-contract.js": "./assets/js/app/session/schema-contract.js?v=23a548de5178",
-    "./assets/js/app/session/session-cell-order.js": "./assets/js/app/session/session-cell-order.js?v=c76c6fce59ad",
-    "./assets/js/app/session/session-context.js": "./assets/js/app/session/session-context.js?v=60cf4378d5c1",
-    "./assets/js/app/session/session-serializer.js": "./assets/js/app/session/session-serializer.js?v=0c4ed108cd43",
+    "./assets/js/app/session/session-context.js": "./assets/js/app/session/session-context.js?v=fb202bcca05d",
+    "./assets/js/app/session/session-serializer.js": "./assets/js/app/session/session-serializer.js?v=ae485efed96e",
+    "./assets/js/app/session/share-scope.js": "./assets/js/app/session/share-scope.js?v=2126ffcd6133",
+    "./assets/js/app/session/view-carry.js": "./assets/js/app/session/view-carry.js?v=0a55887ad85b",
     "./assets/js/app/sidebar-metrics.js": "./assets/js/app/sidebar-metrics.js?v=aaf24d3f9f8b",
     "./assets/js/app/source-sign-in-view.js": "./assets/js/app/source-sign-in-view.js?v=a2f05c4a7ff9",
     "./assets/js/app/startup-failure.js": "./assets/js/app/startup-failure.js?v=4b956923ba10",
     "./assets/js/app/startup-phase.js": "./assets/js/app/startup-phase.js?v=ebc2a9302489",
     "./assets/js/app/startup-url-intent.js": "./assets/js/app/startup-url-intent.js?v=d160bda7021e",
-    "./assets/js/app/state-serializer/active-fields.js": "./assets/js/app/state-serializer/active-fields.js?v=878390918884",
-    "./assets/js/app/state-serializer/filters.js": "./assets/js/app/state-serializer/filters.js?v=40af2d5845c2",
-    "./assets/js/app/state-serializer/multiview.js": "./assets/js/app/state-serializer/multiview.js?v=d74ed29424b1",
-    "./assets/js/app/state-serializer/ui-controls.js": "./assets/js/app/state-serializer/ui-controls.js?v=d36e0f90d8ad",
+    "./assets/js/app/state-serializer/ui-controls.js": "./assets/js/app/state-serializer/ui-controls.js?v=20bf605fa69d",
+    "./assets/js/app/state/actions/field-actions.js": "./assets/js/app/state/actions/field-actions.js?v=0721f8d2fffd",
     "./assets/js/app/state/core/base-manager.js": "./assets/js/app/state/core/base-manager.js?v=9d2f4093d601",
     "./assets/js/app/state/core/constants.js": "./assets/js/app/state/core/constants.js?v=869aa09da204",
     "./assets/js/app/state/core/data-state.js": "./assets/js/app/state/core/data-state.js?v=07da3de48f5c",
+    "./assets/js/app/state/domains/active-field.js": "./assets/js/app/state/domains/active-field.js?v=21ad07777c8d",
+    "./assets/js/app/state/domains/analysis.js": "./assets/js/app/state/domains/analysis.js?v=326a5ec7e633",
+    "./assets/js/app/state/domains/camera-path.js": "./assets/js/app/state/domains/camera-path.js?v=e7046ddfd1be",
+    "./assets/js/app/state/domains/camera.js": "./assets/js/app/state/domains/camera.js?v=12b7687c8a61",
+    "./assets/js/app/state/domains/cell-positions.js": "./assets/js/app/state/domains/cell-positions.js?v=7b654403d696",
+    "./assets/js/app/state/domains/cells.js": "./assets/js/app/state/domains/cells.js?v=fd5e66a5c8fe",
+    "./assets/js/app/state/domains/colors.js": "./assets/js/app/state/domains/colors.js?v=08be76509d58",
+    "./assets/js/app/state/domains/field-overlays.js": "./assets/js/app/state/domains/field-overlays.js?v=8baa2eedf305",
+    "./assets/js/app/state/domains/fields.js": "./assets/js/app/state/domains/fields.js?v=390bd3e9da7d",
+    "./assets/js/app/state/domains/filters.js": "./assets/js/app/state/domains/filters.js?v=0d5d701ab7cf",
+    "./assets/js/app/state/domains/fingerprint.js": "./assets/js/app/state/domains/fingerprint.js?v=d61c1e2ce9c4",
+    "./assets/js/app/state/domains/gene-sets.js": "./assets/js/app/state/domains/gene-sets.js?v=e2e8efad8c28",
+    "./assets/js/app/state/domains/highlights.js": "./assets/js/app/state/domains/highlights.js?v=b12f4ad7affc",
+    "./assets/js/app/state/domains/index.js": "./assets/js/app/state/domains/index.js?v=ae36c8de5a6a",
+    "./assets/js/app/state/domains/layout.js": "./assets/js/app/state/domains/layout.js?v=0244740f22f4",
+    "./assets/js/app/state/domains/mapping.js": "./assets/js/app/state/domains/mapping.js?v=03231053b05f",
+    "./assets/js/app/state/domains/same-value.js": "./assets/js/app/state/domains/same-value.js?v=33dcaff7f3dd",
+    "./assets/js/app/state/domains/settings.js": "./assets/js/app/state/domains/settings.js?v=d8c9845fe1d8",
+    "./assets/js/app/state/domains/view-list.js": "./assets/js/app/state/domains/view-list.js?v=a4d1388a2927",
+    "./assets/js/app/state/domains/views.js": "./assets/js/app/state/domains/views.js?v=dd656c10c998",
+    "./assets/js/app/state/domains/visibility.js": "./assets/js/app/state/domains/visibility.js?v=a066e0a820d4",
     "./assets/js/app/state/index.js": "./assets/js/app/state/index.js?v=c9d86efbe1df",
+    "./assets/js/app/state/managers/category-cell-sample.js": "./assets/js/app/state/managers/category-cell-sample.js?v=713b244d3b79",
     "./assets/js/app/state/managers/category-codes.js": "./assets/js/app/state/managers/category-codes.js?v=eaaff0d30860",
-    "./assets/js/app/state/managers/color-manager.js": "./assets/js/app/state/managers/color-manager.js?v=bfa92a2f980b",
+    "./assets/js/app/state/managers/color-manager.js": "./assets/js/app/state/managers/color-manager.js?v=f39656261dec",
     "./assets/js/app/state/managers/color-outliers.js": "./assets/js/app/state/managers/color-outliers.js?v=bbdbc719463a",
     "./assets/js/app/state/managers/continuous-colors.js": "./assets/js/app/state/managers/continuous-colors.js?v=3619f6b25831",
     "./assets/js/app/state/managers/field-manager.js": "./assets/js/app/state/managers/field-manager.js?v=8433708fec87",
     "./assets/js/app/state/managers/field/category-growth.js": "./assets/js/app/state/managers/field/category-growth.js?v=b6a4f295eadb",
-    "./assets/js/app/state/managers/field/category-ops.js": "./assets/js/app/state/managers/field/category-ops.js?v=f4cd8bde35bb",
+    "./assets/js/app/state/managers/field/category-ops.js": "./assets/js/app/state/managers/field/category-ops.js?v=1c067f32a805",
     "./assets/js/app/state/managers/field/descriptor-ownership.js": "./assets/js/app/state/managers/field/descriptor-ownership.js?v=b2872d083d8a",
     "./assets/js/app/state/managers/field/gene-sample.js": "./assets/js/app/state/managers/field/gene-sample.js?v=9789beb353b7",
-    "./assets/js/app/state/managers/field/loading.js": "./assets/js/app/state/managers/field/loading.js?v=3b8e96afccf0",
-    "./assets/js/app/state/managers/field/overlay-internals.js": "./assets/js/app/state/managers/field/overlay-internals.js?v=f93859e7ee5c",
-    "./assets/js/app/state/managers/field/overlay-public.js": "./assets/js/app/state/managers/field/overlay-public.js?v=b567c26d66a3",
-    "./assets/js/app/state/managers/field/pending-categories.js": "./assets/js/app/state/managers/field/pending-categories.js?v=040ddb0a5bba",
-    "./assets/js/app/state/managers/field/residency.js": "./assets/js/app/state/managers/field/residency.js?v=673c6fba606e",
-    "./assets/js/app/state/managers/field/summary.js": "./assets/js/app/state/managers/field/summary.js?v=3cd47c798d99",
-    "./assets/js/app/state/managers/filter-manager.js": "./assets/js/app/state/managers/filter-manager.js?v=53436a4114e7",
+    "./assets/js/app/state/managers/field/loading.js": "./assets/js/app/state/managers/field/loading.js?v=4543cf0f7569",
+    "./assets/js/app/state/managers/field/overlay-internals.js": "./assets/js/app/state/managers/field/overlay-internals.js?v=debf3ef026ee",
+    "./assets/js/app/state/managers/field/overlay-public.js": "./assets/js/app/state/managers/field/overlay-public.js?v=e9590e85fb8e",
+    "./assets/js/app/state/managers/field/pending-categories.js": "./assets/js/app/state/managers/field/pending-categories.js?v=0b87960dcc78",
+    "./assets/js/app/state/managers/field/residency.js": "./assets/js/app/state/managers/field/residency.js?v=395aa9160daf",
+    "./assets/js/app/state/managers/field/summary.js": "./assets/js/app/state/managers/field/summary.js?v=072f1c274c92",
+    "./assets/js/app/state/managers/filter-manager.js": "./assets/js/app/state/managers/filter-manager.js?v=fa13de6a9913",
     "./assets/js/app/state/managers/highlight-accessors.js": "./assets/js/app/state/managers/highlight-accessors.js?v=e4c5bf43f5fd",
-    "./assets/js/app/state/managers/highlight-manager.js": "./assets/js/app/state/managers/highlight-manager.js?v=b319134d4026",
+    "./assets/js/app/state/managers/highlight-manager.js": "./assets/js/app/state/managers/highlight-manager.js?v=eb232a185b3d",
     "./assets/js/app/state/managers/latent-space.js": "./assets/js/app/state/managers/latent-space.js?v=438566b1a695",
     "./assets/js/app/state/managers/mapping-groups.js": "./assets/js/app/state/managers/mapping-groups.js?v=4cf4823fd296",
     "./assets/js/app/state/managers/mapping-manager.js": "./assets/js/app/state/managers/mapping-manager.js?v=52fc71bed9c8",
-    "./assets/js/app/state/managers/open-cells.js": "./assets/js/app/state/managers/open-cells.js?v=090e5b327713",
+    "./assets/js/app/state/managers/open-cells.js": "./assets/js/app/state/managers/open-cells.js?v=dc39501688b5",
     "./assets/js/app/state/managers/outlier-quantiles.js": "./assets/js/app/state/managers/outlier-quantiles.js?v=26afb281a7e2",
     "./assets/js/app/state/managers/per-cell-array-ownership.js": "./assets/js/app/state/managers/per-cell-array-ownership.js?v=3643bb5d10ab",
     "./assets/js/app/state/managers/var-axis.js": "./assets/js/app/state/managers/var-axis.js?v=43a819ed8fa3",
-    "./assets/js/app/state/managers/view-context-core.js": "./assets/js/app/state/managers/view-context-core.js?v=19e11ee27f13",
+    "./assets/js/app/state/managers/view-context-core.js": "./assets/js/app/state/managers/view-context-core.js?v=be44d4cac12d",
     "./assets/js/app/state/managers/view-context-viewer-sync.js": "./assets/js/app/state/managers/view-context-viewer-sync.js?v=202a43dbb85d",
-    "./assets/js/app/state/managers/view-manager.js": "./assets/js/app/state/managers/view-manager.js?v=4bfb194491b7",
+    "./assets/js/app/state/managers/view-manager.js": "./assets/js/app/state/managers/view-manager.js?v=a2bcf53757d3",
     "./assets/js/app/subsample-url.js": "./assets/js/app/subsample-url.js?v=d75a755a324c",
-    "./assets/js/app/ui/category-builder.js": "./assets/js/app/ui/category-builder.js?v=f3c9310782ce",
+    "./assets/js/app/ui/category-builder.js": "./assets/js/app/ui/category-builder.js?v=17497b6c36d8",
     "./assets/js/app/ui/category-builder/dom.js": "./assets/js/app/ui/category-builder/dom.js?v=8accc96a7c59",
     "./assets/js/app/ui/category-builder/intersections.js": "./assets/js/app/ui/category-builder/intersections.js?v=1e148d672408",
     "./assets/js/app/ui/components/app-dialog.js": "./assets/js/app/ui/components/app-dialog.js?v=0173965923b1",
-    "./assets/js/app/ui/components/confirm-dialog.js": "./assets/js/app/ui/components/confirm-dialog.js?v=fe6abbef3489",
+    "./assets/js/app/ui/components/confirm-dialog.js": "./assets/js/app/ui/components/confirm-dialog.js?v=57545aa0f50f",
     "./assets/js/app/ui/components/controls.js": "./assets/js/app/ui/components/controls.js?v=25ae080b79cf",
     "./assets/js/app/ui/components/display-format.js": "./assets/js/app/ui/components/display-format.js?v=34edfb7f63df",
     "./assets/js/app/ui/components/dom-id.js": "./assets/js/app/ui/components/dom-id.js?v=a4c92c6d2f3f",
     "./assets/js/app/ui/components/drop-zone.js": "./assets/js/app/ui/components/drop-zone.js?v=d218e2b376cd",
     "./assets/js/app/ui/components/info-popovers.js": "./assets/js/app/ui/components/info-popovers.js?v=994d6db08469",
-    "./assets/js/app/ui/components/info-tips.js": "./assets/js/app/ui/components/info-tips.js?v=c5ecbc778a0b",
+    "./assets/js/app/ui/components/info-tips.js": "./assets/js/app/ui/components/info-tips.js?v=866a7f687db8",
     "./assets/js/app/ui/components/inline-editor.js": "./assets/js/app/ui/components/inline-editor.js?v=8857dd857c0a",
     "./assets/js/app/ui/components/modal-background-owner.js": "./assets/js/app/ui/components/modal-background-owner.js?v=4e12ca46501a",
     "./assets/js/app/ui/components/windowed-listbox.js": "./assets/js/app/ui/components/windowed-listbox.js?v=46f424398c39",
     "./assets/js/app/ui/core/antialias-preference.js": "./assets/js/app/ui/core/antialias-preference.js?v=f9ac4d15a62e",
     "./assets/js/app/ui/core/auth-fragment-init.js": "./assets/js/app/ui/core/auth-fragment-init.js?v=ffcded809c3c",
     "./assets/js/app/ui/core/build-version.js": "./assets/js/app/ui/core/build-version.js?v=e12145ee7231",
-    "./assets/js/app/ui/core/code-load-watch.js": "./assets/js/app/ui/core/code-load-watch.js?v=3cf941400c3e",
-    "./assets/js/app/ui/core/deferred-control-readiness.js": "./assets/js/app/ui/core/deferred-control-readiness.js?v=ca9dc3c5e244",
-    "./assets/js/app/ui/core/dom-cache.js": "./assets/js/app/ui/core/dom-cache.js?v=ca5692dcfa10",
+    "./assets/js/app/ui/core/code-load-watch.js": "./assets/js/app/ui/core/code-load-watch.js?v=3b33016efe1b",
+    "./assets/js/app/ui/core/deferred-control-readiness.js": "./assets/js/app/ui/core/deferred-control-readiness.js?v=9f82d7166466",
+    "./assets/js/app/ui/core/dom-cache.js": "./assets/js/app/ui/core/dom-cache.js?v=9ea9571c129f",
     "./assets/js/app/ui/core/file-drop-guard.js": "./assets/js/app/ui/core/file-drop-guard.js?v=fcd259f48cea",
     "./assets/js/app/ui/core/ga-init.js": "./assets/js/app/ui/core/ga-init.js?v=29c54aca4076",
     "./assets/js/app/ui/core/license-modal.js": "./assets/js/app/ui/core/license-modal.js?v=6c114d9f5c53",
@@ -364,9 +486,9 @@
     "./assets/js/app/ui/core/phone-sheet-memory.js": "./assets/js/app/ui/core/phone-sheet-memory.js?v=23e8570397a7",
     "./assets/js/app/ui/core/preconnect-init.js": "./assets/js/app/ui/core/preconnect-init.js?v=4fc6c204c0ba",
     "./assets/js/app/ui/core/selection-range-label.js": "./assets/js/app/ui/core/selection-range-label.js?v=6191234ed5f6",
-    "./assets/js/app/ui/core/sidebar-layout.js": "./assets/js/app/ui/core/sidebar-layout.js?v=8da5b6a61e44",
+    "./assets/js/app/ui/core/sidebar-layout.js": "./assets/js/app/ui/core/sidebar-layout.js?v=2c07bff9d2a7",
     "./assets/js/app/ui/core/theme-init.js": "./assets/js/app/ui/core/theme-init.js?v=65a0632676cd",
-    "./assets/js/app/ui/core/ui-coordinator.js": "./assets/js/app/ui/core/ui-coordinator.js?v=77420cdec329",
+    "./assets/js/app/ui/core/ui-coordinator.js": "./assets/js/app/ui/core/ui-coordinator.js?v=80979e621e6c",
     "./assets/js/app/ui/core/viewer-lifecycle.js": "./assets/js/app/ui/core/viewer-lifecycle.js?v=21bf9f7ad6b7",
     "./assets/js/app/ui/core/viewport-init.js": "./assets/js/app/ui/core/viewport-init.js?v=5ef0d5188516",
     "./assets/js/app/ui/core/visibility-gate.js": "./assets/js/app/ui/core/visibility-gate.js?v=6ceca774417b",
@@ -388,42 +510,44 @@
     "./assets/js/app/ui/modules/benchmark/render-probes.js": "./assets/js/app/ui/modules/benchmark/render-probes.js?v=adb49df6ab00",
     "./assets/js/app/ui/modules/benchmark/renderer-identity.js": "./assets/js/app/ui/modules/benchmark/renderer-identity.js?v=d3e6672a23b0",
     "./assets/js/app/ui/modules/benchmark/representations.js": "./assets/js/app/ui/modules/benchmark/representations.js?v=64b2d71690fe",
-    "./assets/js/app/ui/modules/camera-controls.js": "./assets/js/app/ui/modules/camera-controls.js?v=e4b96fff4db2",
+    "./assets/js/app/ui/modules/camera-controls.js": "./assets/js/app/ui/modules/camera-controls.js?v=4bd818b1c831",
     "./assets/js/app/ui/modules/camera-input-contract.js": "./assets/js/app/ui/modules/camera-input-contract.js?v=248ba7d635ec",
-    "./assets/js/app/ui/modules/cell-exports-ui.js": "./assets/js/app/ui/modules/cell-exports-ui.js?v=cf77229bc6d5",
+    "./assets/js/app/ui/modules/cell-exports-ui.js": "./assets/js/app/ui/modules/cell-exports-ui.js?v=aeb3e4cb1b9a",
     "./assets/js/app/ui/modules/cell-info.js": "./assets/js/app/ui/modules/cell-info.js?v=4eedb8b1567e",
-    "./assets/js/app/ui/modules/cinematic-camera/index.js": "./assets/js/app/ui/modules/cinematic-camera/index.js?v=245a32aac927",
+    "./assets/js/app/ui/modules/cinematic-camera/index.js": "./assets/js/app/ui/modules/cinematic-camera/index.js?v=6eee9f8b82ff",
     "./assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js": "./assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js?v=81b94c0c8d54",
-    "./assets/js/app/ui/modules/cinematic-camera/keyframe-store.js": "./assets/js/app/ui/modules/cinematic-camera/keyframe-store.js?v=dc61dd03c717",
+    "./assets/js/app/ui/modules/cinematic-camera/keyframe-store.js": "./assets/js/app/ui/modules/cinematic-camera/keyframe-store.js?v=72c8ceb0f206",
     "./assets/js/app/ui/modules/cinematic-camera/playback-controller.js": "./assets/js/app/ui/modules/cinematic-camera/playback-controller.js?v=85949c646032",
     "./assets/js/app/ui/modules/cinematic-camera/transport-bar.js": "./assets/js/app/ui/modules/cinematic-camera/transport-bar.js?v=79732b81aad3",
     "./assets/js/app/ui/modules/cite-dialog.js": "./assets/js/app/ui/modules/cite-dialog.js?v=8fd02f80a20a",
-    "./assets/js/app/ui/modules/community-annotation-controls.js": "./assets/js/app/ui/modules/community-annotation-controls.js?v=908a29e9649a",
+    "./assets/js/app/ui/modules/community-annotation-controls.js": "./assets/js/app/ui/modules/community-annotation-controls.js?v=5f1e9724765a",
     "./assets/js/app/ui/modules/community-annotation-modal-owner.js": "./assets/js/app/ui/modules/community-annotation-modal-owner.js?v=30fb73c55b17",
-    "./assets/js/app/ui/modules/community-annotation-voting-modal.js": "./assets/js/app/ui/modules/community-annotation-voting-modal.js?v=e7477fdd68a8",
+    "./assets/js/app/ui/modules/community-annotation-voting-modal.js": "./assets/js/app/ui/modules/community-annotation-voting-modal.js?v=9150e9cd7b2f",
     "./assets/js/app/ui/modules/community-annotation/auto-pull-storage.js": "./assets/js/app/ui/modules/community-annotation/auto-pull-storage.js?v=9c1dd0c31fce",
-    "./assets/js/app/ui/modules/community-annotation/browser-integration.js": "./assets/js/app/ui/modules/community-annotation/browser-integration.js?v=4939a049817c",
+    "./assets/js/app/ui/modules/community-annotation/browser-integration.js": "./assets/js/app/ui/modules/community-annotation/browser-integration.js?v=1f51f4a7bc4c",
     "./assets/js/app/ui/modules/community-annotation/cleanup.js": "./assets/js/app/ui/modules/community-annotation/cleanup.js?v=d2d92654c14d",
-    "./assets/js/app/ui/modules/community-annotation/consensus-column.js": "./assets/js/app/ui/modules/community-annotation/consensus-column.js?v=0aba10271172",
-    "./assets/js/app/ui/modules/community-annotation/consensus-math.js": "./assets/js/app/ui/modules/community-annotation/consensus-math.js?v=fb54d8fb5abb",
-    "./assets/js/app/ui/modules/community-annotation/controls-panel.js": "./assets/js/app/ui/modules/community-annotation/controls-panel.js?v=e2d4df913bc8",
-    "./assets/js/app/ui/modules/community-annotation/dom.js": "./assets/js/app/ui/modules/community-annotation/dom.js?v=a8225465cc8c",
-    "./assets/js/app/ui/modules/community-annotation/github-connection-flow.js": "./assets/js/app/ui/modules/community-annotation/github-connection-flow.js?v=1df1a6e7d46f",
-    "./assets/js/app/ui/modules/community-annotation/github-error-classification.js": "./assets/js/app/ui/modules/community-annotation/github-error-classification.js?v=c123267f00e1",
+    "./assets/js/app/ui/modules/community-annotation/consensus-column.js": "./assets/js/app/ui/modules/community-annotation/consensus-column.js?v=85596632c989",
+    "./assets/js/app/ui/modules/community-annotation/consensus-math.js": "./assets/js/app/ui/modules/community-annotation/consensus-math.js?v=bcf02e51c4ad",
+    "./assets/js/app/ui/modules/community-annotation/controls-panel.js": "./assets/js/app/ui/modules/community-annotation/controls-panel.js?v=16dcfcee0372",
+    "./assets/js/app/ui/modules/community-annotation/dom.js": "./assets/js/app/ui/modules/community-annotation/dom.js?v=0d2d6b5e576d",
+    "./assets/js/app/ui/modules/community-annotation/github-connection-flow.js": "./assets/js/app/ui/modules/community-annotation/github-connection-flow.js?v=62248f320ef8",
+    "./assets/js/app/ui/modules/community-annotation/github-error-classification.js": "./assets/js/app/ui/modules/community-annotation/github-error-classification.js?v=e83c5af6b51f",
     "./assets/js/app/ui/modules/community-annotation/identity-assertions.js": "./assets/js/app/ui/modules/community-annotation/identity-assertions.js?v=7d3382b01c64",
-    "./assets/js/app/ui/modules/community-annotation/identity-profile-modal.js": "./assets/js/app/ui/modules/community-annotation/identity-profile-modal.js?v=e3befd29de13",
+    "./assets/js/app/ui/modules/community-annotation/identity-profile-modal.js": "./assets/js/app/ui/modules/community-annotation/identity-profile-modal.js?v=17c2785376d8",
     "./assets/js/app/ui/modules/community-annotation/modal-shell.js": "./assets/js/app/ui/modules/community-annotation/modal-shell.js?v=def28b8a5e50",
-    "./assets/js/app/ui/modules/data-mapping-controls.js": "./assets/js/app/ui/modules/data-mapping-controls.js?v=f088481ad133",
+    "./assets/js/app/ui/modules/community-annotation/published-baseline.js": "./assets/js/app/ui/modules/community-annotation/published-baseline.js?v=caa7c42952a5",
+    "./assets/js/app/ui/modules/data-mapping-controls.js": "./assets/js/app/ui/modules/data-mapping-controls.js?v=24f116356d7c",
     "./assets/js/app/ui/modules/data-mapping/dom.js": "./assets/js/app/ui/modules/data-mapping/dom.js?v=0a85a30be8c8",
     "./assets/js/app/ui/modules/data-mapping/groups.js": "./assets/js/app/ui/modules/data-mapping/groups.js?v=0aeda2b9dc5e",
     "./assets/js/app/ui/modules/dataset-card.js": "./assets/js/app/ui/modules/dataset-card.js?v=2f462b73a14c",
-    "./assets/js/app/ui/modules/dataset-connections.js": "./assets/js/app/ui/modules/dataset-connections.js?v=b6bb113808d0",
-    "./assets/js/app/ui/modules/dataset-controls.js": "./assets/js/app/ui/modules/dataset-controls.js?v=043f17b9339b",
-    "./assets/js/app/ui/modules/dataset-drop.js": "./assets/js/app/ui/modules/dataset-drop.js?v=7634aee4c213",
-    "./assets/js/app/ui/modules/field-interaction-owner.js": "./assets/js/app/ui/modules/field-interaction-owner.js?v=06a7992f8233",
-    "./assets/js/app/ui/modules/field-selector-deleted-fields.js": "./assets/js/app/ui/modules/field-selector-deleted-fields.js?v=33bac847ae34",
-    "./assets/js/app/ui/modules/field-selector-gene-expression.js": "./assets/js/app/ui/modules/field-selector-gene-expression.js?v=2c704914ab03",
-    "./assets/js/app/ui/modules/field-selector.js": "./assets/js/app/ui/modules/field-selector.js?v=33037f57a254",
+    "./assets/js/app/ui/modules/dataset-connections.js": "./assets/js/app/ui/modules/dataset-connections.js?v=52860c0e0577",
+    "./assets/js/app/ui/modules/dataset-controls.js": "./assets/js/app/ui/modules/dataset-controls.js?v=637e45424b85",
+    "./assets/js/app/ui/modules/dataset-drop.js": "./assets/js/app/ui/modules/dataset-drop.js?v=ef3eca0fb7f9",
+    "./assets/js/app/ui/modules/dataset-open-action.js": "./assets/js/app/ui/modules/dataset-open-action.js?v=f500838a95ec",
+    "./assets/js/app/ui/modules/field-interaction-owner.js": "./assets/js/app/ui/modules/field-interaction-owner.js?v=e5d16ddcfce1",
+    "./assets/js/app/ui/modules/field-selector-deleted-fields.js": "./assets/js/app/ui/modules/field-selector-deleted-fields.js?v=6bef40b26374",
+    "./assets/js/app/ui/modules/field-selector-gene-expression.js": "./assets/js/app/ui/modules/field-selector-gene-expression.js?v=8b96fdc01616",
+    "./assets/js/app/ui/modules/field-selector.js": "./assets/js/app/ui/modules/field-selector.js?v=6afffb6fe4e1",
     "./assets/js/app/ui/modules/figure-export/components/axes-builder.js": "./assets/js/app/ui/modules/figure-export/components/axes-builder.js?v=ddcd9412bdf4",
     "./assets/js/app/ui/modules/figure-export/components/backdrop-look-export.js": "./assets/js/app/ui/modules/figure-export/components/backdrop-look-export.js?v=de58019454ff",
     "./assets/js/app/ui/modules/figure-export/components/centroid-overlay.js": "./assets/js/app/ui/modules/figure-export/components/centroid-overlay.js?v=b653f103d45b",
@@ -434,9 +558,9 @@
     "./assets/js/app/ui/modules/figure-export/components/reference-grid.js": "./assets/js/app/ui/modules/figure-export/components/reference-grid.js?v=3dc316a21d5d",
     "./assets/js/app/ui/modules/figure-export/components/studio-backdrop-export.js": "./assets/js/app/ui/modules/figure-export/components/studio-backdrop-export.js?v=92df544b22e4",
     "./assets/js/app/ui/modules/figure-export/figure-export-contract.js": "./assets/js/app/ui/modules/figure-export/figure-export-contract.js?v=5894747d67ee",
-    "./assets/js/app/ui/modules/figure-export/figure-export-engine.js": "./assets/js/app/ui/modules/figure-export/figure-export-engine.js?v=a6fcbae18966",
-    "./assets/js/app/ui/modules/figure-export/figure-export-ui.js": "./assets/js/app/ui/modules/figure-export/figure-export-ui.js?v=c3199aec809f",
-    "./assets/js/app/ui/modules/figure-export/index.js": "./assets/js/app/ui/modules/figure-export/index.js?v=b1f3b7b41f6b",
+    "./assets/js/app/ui/modules/figure-export/figure-export-engine.js": "./assets/js/app/ui/modules/figure-export/figure-export-engine.js?v=8504926fcccd",
+    "./assets/js/app/ui/modules/figure-export/figure-export-ui.js": "./assets/js/app/ui/modules/figure-export/figure-export-ui.js?v=39e80b23ad58",
+    "./assets/js/app/ui/modules/figure-export/index.js": "./assets/js/app/ui/modules/figure-export/index.js?v=eccbe12dfc0f",
     "./assets/js/app/ui/modules/figure-export/renderers/png-renderer.js": "./assets/js/app/ui/modules/figure-export/renderers/png-renderer.js?v=372bf488ac04",
     "./assets/js/app/ui/modules/figure-export/renderers/svg-point-markup.js": "./assets/js/app/ui/modules/figure-export/renderers/svg-point-markup.js?v=e8f3c3c92642",
     "./assets/js/app/ui/modules/figure-export/renderers/svg-renderer.js": "./assets/js/app/ui/modules/figure-export/renderers/svg-renderer.js?v=ebfb8e65a280",
@@ -464,71 +588,101 @@
     "./assets/js/app/ui/modules/figure-export/utils/point-size.js": "./assets/js/app/ui/modules/figure-export/utils/point-size.js?v=7992fd48d656",
     "./assets/js/app/ui/modules/figure-export/utils/render-mode.js": "./assets/js/app/ui/modules/figure-export/utils/render-mode.js?v=a0c19162cba1",
     "./assets/js/app/ui/modules/figure-export/utils/selection-badge.js": "./assets/js/app/ui/modules/figure-export/utils/selection-badge.js?v=3fba8f38ed89",
-    "./assets/js/app/ui/modules/figure-export/utils/session-settings.js": "./assets/js/app/ui/modules/figure-export/utils/session-settings.js?v=a39af411e26d",
+    "./assets/js/app/ui/modules/figure-export/utils/session-settings.js": "./assets/js/app/ui/modules/figure-export/utils/session-settings.js?v=90f99cbd5992",
     "./assets/js/app/ui/modules/figure-export/utils/tick-calculator.js": "./assets/js/app/ui/modules/figure-export/utils/tick-calculator.js?v=7a9b0a61c0ea",
     "./assets/js/app/ui/modules/figure-export/utils/viewer-background.js": "./assets/js/app/ui/modules/figure-export/utils/viewer-background.js?v=7b0b1b60a203",
     "./assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js": "./assets/js/app/ui/modules/figure-export/utils/webgl-point-rasterizer.js?v=23fa4892d335",
-    "./assets/js/app/ui/modules/figure-export/utils/zip-archive.js": "./assets/js/app/ui/modules/figure-export/utils/zip-archive.js?v=fc37f57db22d",
-    "./assets/js/app/ui/modules/filter-controls.js": "./assets/js/app/ui/modules/filter-controls.js?v=37ab472283a1",
-    "./assets/js/app/ui/modules/gene-read-control.js": "./assets/js/app/ui/modules/gene-read-control.js?v=f16f474c8acb",
-    "./assets/js/app/ui/modules/highlight-controls.js": "./assets/js/app/ui/modules/highlight-controls.js?v=aec5f33f0a73",
+    "./assets/js/app/ui/modules/figure-export/utils/zip-archive.js": "./assets/js/app/ui/modules/figure-export/utils/zip-archive.js?v=9aa866892b09",
+    "./assets/js/app/ui/modules/filter-controls.js": "./assets/js/app/ui/modules/filter-controls.js?v=bbc0fdc40f3f",
+    "./assets/js/app/ui/modules/gene-read-control.js": "./assets/js/app/ui/modules/gene-read-control.js?v=981618d8ba03",
+    "./assets/js/app/ui/modules/highlight-controls.js": "./assets/js/app/ui/modules/highlight-controls.js?v=929159feab69",
     "./assets/js/app/ui/modules/highlight/annotation-cells.js": "./assets/js/app/ui/modules/highlight/annotation-cells.js?v=520433860f8e",
-    "./assets/js/app/ui/modules/highlight/annotation-selection.js": "./assets/js/app/ui/modules/highlight/annotation-selection.js?v=5c9e5c127063",
+    "./assets/js/app/ui/modules/highlight/annotation-selection.js": "./assets/js/app/ui/modules/highlight/annotation-selection.js?v=c89b78815a30",
     "./assets/js/app/ui/modules/highlight/continuous-selection-preview.js": "./assets/js/app/ui/modules/highlight/continuous-selection-preview.js?v=5c96bff4df49",
-    "./assets/js/app/ui/modules/highlight/exact-contract.js": "./assets/js/app/ui/modules/highlight/exact-contract.js?v=4bbef0527d62",
-    "./assets/js/app/ui/modules/highlight/highlight-pages-ui.js": "./assets/js/app/ui/modules/highlight/highlight-pages-ui.js?v=09b52131c044",
-    "./assets/js/app/ui/modules/highlight/highlight-selection-tools.js": "./assets/js/app/ui/modules/highlight/highlight-selection-tools.js?v=5539a05fe227",
-    "./assets/js/app/ui/modules/highlight/highlight-summary-ui.js": "./assets/js/app/ui/modules/highlight/highlight-summary-ui.js?v=377ece4965e1",
-    "./assets/js/app/ui/modules/highlight/knn-selection.js": "./assets/js/app/ui/modules/highlight/knn-selection.js?v=d0c13e423f57",
-    "./assets/js/app/ui/modules/highlight/lasso-selection.js": "./assets/js/app/ui/modules/highlight/lasso-selection.js?v=f78494239caf",
+    "./assets/js/app/ui/modules/highlight/exact-contract.js": "./assets/js/app/ui/modules/highlight/exact-contract.js?v=29774642d715",
+    "./assets/js/app/ui/modules/highlight/highlight-actions.js": "./assets/js/app/ui/modules/highlight/highlight-actions.js?v=c941f36d87f9",
+    "./assets/js/app/ui/modules/highlight/highlight-pages-ui.js": "./assets/js/app/ui/modules/highlight/highlight-pages-ui.js?v=f61e92c0bb02",
+    "./assets/js/app/ui/modules/highlight/highlight-selection-tools.js": "./assets/js/app/ui/modules/highlight/highlight-selection-tools.js?v=c5422c53c59a",
+    "./assets/js/app/ui/modules/highlight/highlight-summary-ui.js": "./assets/js/app/ui/modules/highlight/highlight-summary-ui.js?v=5f6fe6ad81f2",
+    "./assets/js/app/ui/modules/highlight/knn-selection.js": "./assets/js/app/ui/modules/highlight/knn-selection.js?v=6c7f0498c21e",
+    "./assets/js/app/ui/modules/highlight/lasso-selection.js": "./assets/js/app/ui/modules/highlight/lasso-selection.js?v=20ed5689747c",
     "./assets/js/app/ui/modules/highlight/mode-copy.js": "./assets/js/app/ui/modules/highlight/mode-copy.js?v=0527551ffd99",
     "./assets/js/app/ui/modules/highlight/mode-ui.js": "./assets/js/app/ui/modules/highlight/mode-ui.js?v=071752334e36",
-    "./assets/js/app/ui/modules/highlight/proximity-selection.js": "./assets/js/app/ui/modules/highlight/proximity-selection.js?v=50e31e631710",
+    "./assets/js/app/ui/modules/highlight/proximity-selection.js": "./assets/js/app/ui/modules/highlight/proximity-selection.js?v=b1460c941086",
     "./assets/js/app/ui/modules/highlight/selection-notification.js": "./assets/js/app/ui/modules/highlight/selection-notification.js?v=dfbe88fd0b54",
     "./assets/js/app/ui/modules/highlight/selection-state.js": "./assets/js/app/ui/modules/highlight/selection-state.js?v=97065d70e708",
     "./assets/js/app/ui/modules/highlight/selection-sync.js": "./assets/js/app/ui/modules/highlight/selection-sync.js?v=634d33d61723",
     "./assets/js/app/ui/modules/highlight/step-controls.js": "./assets/js/app/ui/modules/highlight/step-controls.js?v=8aeabeb18d8d",
-    "./assets/js/app/ui/modules/highlight/undo-removal.js": "./assets/js/app/ui/modules/highlight/undo-removal.js?v=cd64cc00d9de",
-    "./assets/js/app/ui/modules/kept-stores-dialog.js": "./assets/js/app/ui/modules/kept-stores-dialog.js?v=c363eb26c8d7",
-    "./assets/js/app/ui/modules/kept-stores-line.js": "./assets/js/app/ui/modules/kept-stores-line.js?v=1cbe3de432bd",
-    "./assets/js/app/ui/modules/legend-renderer.js": "./assets/js/app/ui/modules/legend-renderer.js?v=117174815332",
-    "./assets/js/app/ui/modules/legend/categorical-legend.js": "./assets/js/app/ui/modules/legend/categorical-legend.js?v=0d538ade77ac",
+    "./assets/js/app/ui/modules/kept-stores-dialog.js": "./assets/js/app/ui/modules/kept-stores-dialog.js?v=5c2e5443d751",
+    "./assets/js/app/ui/modules/kept-stores-line.js": "./assets/js/app/ui/modules/kept-stores-line.js?v=f608a7b89025",
+    "./assets/js/app/ui/modules/layout-actions.js": "./assets/js/app/ui/modules/layout-actions.js?v=74de69cecc9e",
+    "./assets/js/app/ui/modules/legend-renderer.js": "./assets/js/app/ui/modules/legend-renderer.js?v=0008163d3e93",
+    "./assets/js/app/ui/modules/legend/categorical-legend.js": "./assets/js/app/ui/modules/legend/categorical-legend.js?v=3719f8a51997",
     "./assets/js/app/ui/modules/legend/range-bounds.js": "./assets/js/app/ui/modules/legend/range-bounds.js?v=7ecd8e962725",
+    "./assets/js/app/ui/modules/my-datasets/dialog.js": "./assets/js/app/ui/modules/my-datasets/dialog.js?v=f9f6316d08f0",
+    "./assets/js/app/ui/modules/my-datasets/index.js": "./assets/js/app/ui/modules/my-datasets/index.js?v=85a1a960f0c5",
+    "./assets/js/app/ui/modules/my-datasets/menu.js": "./assets/js/app/ui/modules/my-datasets/menu.js?v=2af98e928855",
+    "./assets/js/app/ui/modules/my-datasets/model.js": "./assets/js/app/ui/modules/my-datasets/model.js?v=973af545f89d",
     "./assets/js/app/ui/modules/navigation-settings.js": "./assets/js/app/ui/modules/navigation-settings.js?v=fa87cc37891a",
-    "./assets/js/app/ui/modules/open-data-menu.js": "./assets/js/app/ui/modules/open-data-menu.js?v=07c3ff839d05",
-    "./assets/js/app/ui/modules/outlier-filter-control.js": "./assets/js/app/ui/modules/outlier-filter-control.js?v=589561373549",
-    "./assets/js/app/ui/modules/render-controls.js": "./assets/js/app/ui/modules/render-controls.js?v=55e0ca8898bf",
-    "./assets/js/app/ui/modules/representation-controls.js": "./assets/js/app/ui/modules/representation-controls.js?v=af50add48772",
+    "./assets/js/app/ui/modules/open-data-menu.js": "./assets/js/app/ui/modules/open-data-menu.js?v=9d6b5a1df887",
+    "./assets/js/app/ui/modules/outlier-filter-control.js": "./assets/js/app/ui/modules/outlier-filter-control.js?v=d9795e6ac0ac",
+    "./assets/js/app/ui/modules/render-controls.js": "./assets/js/app/ui/modules/render-controls.js?v=958579bc4592",
+    "./assets/js/app/ui/modules/representation-controls.js": "./assets/js/app/ui/modules/representation-controls.js?v=a49c5426e5a0",
     "./assets/js/app/ui/modules/select-bar-placement.js": "./assets/js/app/ui/modules/select-bar-placement.js?v=339916a01eb0",
-    "./assets/js/app/ui/modules/session-controls.js": "./assets/js/app/ui/modules/session-controls.js?v=5c5f7def8291",
+    "./assets/js/app/ui/modules/session-controls.js": "./assets/js/app/ui/modules/session-controls.js?v=7f82036c4fcf",
     "./assets/js/app/ui/modules/session-sections.js": "./assets/js/app/ui/modules/session-sections.js?v=16f5d5a362b3",
-    "./assets/js/app/ui/modules/share-dialog.js": "./assets/js/app/ui/modules/share-dialog.js?v=50498a965251",
-    "./assets/js/app/ui/modules/sidebar-controls.js": "./assets/js/app/ui/modules/sidebar-controls.js?v=c48cd0b8d715",
+    "./assets/js/app/ui/modules/settings-actions.js": "./assets/js/app/ui/modules/settings-actions.js?v=cec887e452bf",
+    "./assets/js/app/ui/modules/share-dialog.js": "./assets/js/app/ui/modules/share-dialog.js?v=cc559ab83644",
+    "./assets/js/app/ui/modules/sidebar-controls.js": "./assets/js/app/ui/modules/sidebar-controls.js?v=68ddf7fd22b5",
     "./assets/js/app/ui/modules/smoke-availability.js": "./assets/js/app/ui/modules/smoke-availability.js?v=dc9e0d3c6b29",
     "./assets/js/app/ui/modules/smoke-control-scales.js": "./assets/js/app/ui/modules/smoke-control-scales.js?v=bb9dda1375d6",
+    "./assets/js/app/ui/modules/state/branch-map-dialog.js": "./assets/js/app/ui/modules/state/branch-map-dialog.js?v=8432ebdef980",
+    "./assets/js/app/ui/modules/state/branch-picker.js": "./assets/js/app/ui/modules/state/branch-picker.js?v=a338d7e72d0f",
+    "./assets/js/app/ui/modules/state/compare.js": "./assets/js/app/ui/modules/state/compare.js?v=a13b4420174c",
+    "./assets/js/app/ui/modules/state/dataset-facts.js": "./assets/js/app/ui/modules/state/dataset-facts.js?v=6fdfacc3346b",
+    "./assets/js/app/ui/modules/state/diff-dialog.js": "./assets/js/app/ui/modules/state/diff-dialog.js?v=d81a86424172",
+    "./assets/js/app/ui/modules/state/graph-layout.js": "./assets/js/app/ui/modules/state/graph-layout.js?v=00f9c874d7d8",
+    "./assets/js/app/ui/modules/state/graph.js": "./assets/js/app/ui/modules/state/graph.js?v=bbbe160bfb52",
+    "./assets/js/app/ui/modules/state/history-source.js": "./assets/js/app/ui/modules/state/history-source.js?v=0191f5e482d3",
+    "./assets/js/app/ui/modules/state/index.js": "./assets/js/app/ui/modules/state/index.js?v=cd87b0d20d4e",
+    "./assets/js/app/ui/modules/state/keyboard.js": "./assets/js/app/ui/modules/state/keyboard.js?v=f6f35f05d5a1",
+    "./assets/js/app/ui/modules/state/memory-dialog.js": "./assets/js/app/ui/modules/state/memory-dialog.js?v=8c307fbccebf",
+    "./assets/js/app/ui/modules/state/menu.js": "./assets/js/app/ui/modules/state/menu.js?v=9c3177392fd5",
+    "./assets/js/app/ui/modules/state/model.js": "./assets/js/app/ui/modules/state/model.js?v=8d875a8443aa",
+    "./assets/js/app/ui/modules/state/notes.js": "./assets/js/app/ui/modules/state/notes.js?v=eca59e9104a2",
+    "./assets/js/app/ui/modules/state/recently-deleted.js": "./assets/js/app/ui/modules/state/recently-deleted.js?v=43bb95245b0d",
+    "./assets/js/app/ui/modules/state/replay-report-dialog.js": "./assets/js/app/ui/modules/state/replay-report-dialog.js?v=01ca2a1be2bc",
+    "./assets/js/app/ui/modules/state/saved-states-dialog.js": "./assets/js/app/ui/modules/state/saved-states-dialog.js?v=cd5bf0e6a996",
+    "./assets/js/app/ui/modules/state/search.js": "./assets/js/app/ui/modules/state/search.js?v=af7fdb520797",
+    "./assets/js/app/ui/modules/state/share-dialog.js": "./assets/js/app/ui/modules/state/share-dialog.js?v=d8624de9b34a",
+    "./assets/js/app/ui/modules/state/share.js": "./assets/js/app/ui/modules/state/share.js?v=bdac0fc3b900",
+    "./assets/js/app/ui/modules/state/shared.js": "./assets/js/app/ui/modules/state/shared.js?v=63eeb0fb2900",
+    "./assets/js/app/ui/modules/state/step-details.js": "./assets/js/app/ui/modules/state/step-details.js?v=86bb16e3ac5c",
+    "./assets/js/app/ui/modules/state/tour.js": "./assets/js/app/ui/modules/state/tour.js?v=8b6f13e7d98e",
+    "./assets/js/app/ui/modules/state/workflow-banner.js": "./assets/js/app/ui/modules/state/workflow-banner.js?v=dc75bd313d7c",
     "./assets/js/app/ui/modules/stats-display.js": "./assets/js/app/ui/modules/stats-display.js?v=17b60f51006e",
-    "./assets/js/app/ui/modules/subsample-control.js": "./assets/js/app/ui/modules/subsample-control.js?v=9553fc4a6684",
+    "./assets/js/app/ui/modules/subsample-control.js": "./assets/js/app/ui/modules/subsample-control.js?v=519daada0581",
     "./assets/js/app/ui/modules/velocity-overlay-controls.js": "./assets/js/app/ui/modules/velocity-overlay-controls.js?v=5083d2827d82",
-    "./assets/js/app/ui/modules/view-controls.js": "./assets/js/app/ui/modules/view-controls.js?v=08bca1be64e9",
-    "./assets/js/app/ui/modules/visualization-reset.js": "./assets/js/app/ui/modules/visualization-reset.js?v=c3217f01bb42",
+    "./assets/js/app/ui/modules/view-controls.js": "./assets/js/app/ui/modules/view-controls.js?v=6e6778d11db5",
+    "./assets/js/app/ui/modules/visualization-reset.js": "./assets/js/app/ui/modules/visualization-reset.js?v=330afbf67502",
     "./assets/js/app/ui/onboarding/index.js": "./assets/js/app/ui/onboarding/index.js?v=fc522ed9de64",
-    "./assets/js/app/ui/onboarding/keyboard-shortcuts.js": "./assets/js/app/ui/onboarding/keyboard-shortcuts.js?v=7a2e07da591d",
+    "./assets/js/app/ui/onboarding/keyboard-shortcuts.js": "./assets/js/app/ui/onboarding/keyboard-shortcuts.js?v=63fc87b36366",
     "./assets/js/app/ui/onboarding/quotes.js": "./assets/js/app/ui/onboarding/quotes.js?v=a22c8e4fcf7c",
     "./assets/js/app/ui/onboarding/welcome-modal.js": "./assets/js/app/ui/onboarding/welcome-modal.js?v=47fad99638cb",
-    "./assets/js/app/ui/place-names.js": "./assets/js/app/ui/place-names.js?v=aafdcd868fc9",
+    "./assets/js/app/ui/place-names.js": "./assets/js/app/ui/place-names.js?v=c732630ff2b9",
     "./assets/js/app/ui/pointer-capture.js": "./assets/js/app/ui/pointer-capture.js?v=fdf7e58135c5",
     "./assets/js/app/ui/utils.js": "./assets/js/app/ui/utils.js?v=68c459855229",
     "./assets/js/app/unplaced-cells-notice.js": "./assets/js/app/unplaced-cells-notice.js?v=ca736f697cca",
     "./assets/js/app/url-state.js": "./assets/js/app/url-state.js?v=c060435ff6ec",
     "./assets/js/app/utils/categorical-ops.js": "./assets/js/app/utils/categorical-ops.js?v=5cfc3e022510",
-    "./assets/js/app/utils/category-state.js": "./assets/js/app/utils/category-state.js?v=028e0ba656ce",
+    "./assets/js/app/utils/category-state.js": "./assets/js/app/utils/category-state.js?v=8b80fb68abf4",
     "./assets/js/app/utils/cell-set.js": "./assets/js/app/utils/cell-set.js?v=4924a5ad3854",
     "./assets/js/app/utils/dom-utils.js": "./assets/js/app/utils/dom-utils.js?v=ade5b99619ed",
     "./assets/js/app/utils/download.js": "./assets/js/app/utils/download.js?v=f40ffdb5f4d9",
     "./assets/js/app/utils/event-emitter.js": "./assets/js/app/utils/event-emitter.js?v=17895d256d69",
     "./assets/js/app/utils/field-constants.js": "./assets/js/app/utils/field-constants.js?v=0d41fa0e0bbc",
     "./assets/js/app/utils/field-registry.js": "./assets/js/app/utils/field-registry.js?v=856391ef0c8d",
-    "./assets/js/app/utils/gene-lookup.js": "./assets/js/app/utils/gene-lookup.js?v=0fced99d001f",
+    "./assets/js/app/utils/gene-lookup.js": "./assets/js/app/utils/gene-lookup.js?v=f4262eaef64a",
     "./assets/js/app/utils/intent-prefetch.js": "./assets/js/app/utils/intent-prefetch.js?v=72021cf821ac",
     "./assets/js/app/utils/label-utils.js": "./assets/js/app/utils/label-utils.js?v=d1ff2d2654a5",
     "./assets/js/app/utils/local-dev.js": "./assets/js/app/utils/local-dev.js?v=d28ed1a4a437",
@@ -536,20 +690,23 @@
     "./assets/js/app/utils/opaque-id.js": "./assets/js/app/utils/opaque-id.js?v=004cf43f13d4",
     "./assets/js/app/utils/page-colors.js": "./assets/js/app/utils/page-colors.js?v=b5207497dbc5",
     "./assets/js/app/utils/page-membership.js": "./assets/js/app/utils/page-membership.js?v=b6b1a638de75",
+    "./assets/js/app/utils/page-version.js": "./assets/js/app/utils/page-version.js?v=d42abe62973a",
     "./assets/js/app/utils/random-utils.js": "./assets/js/app/utils/random-utils.js?v=b1421892d474",
     "./assets/js/app/utils/same-json.js": "./assets/js/app/utils/same-json.js?v=a2130ee545b8",
     "./assets/js/app/utils/sha256.js": "./assets/js/app/utils/sha256.js?v=04577b22864a",
+    "./assets/js/app/utils/stable-id.js": "./assets/js/app/utils/stable-id.js?v=5bfeacbf1770",
     "./assets/js/app/utils/state-validator.js": "./assets/js/app/utils/state-validator.js?v=d9897952e86d",
     "./assets/js/app/utils/text-match.js": "./assets/js/app/utils/text-match.js?v=95a93bccab96",
     "./assets/js/app/view-snapshot-publication.js": "./assets/js/app/view-snapshot-publication.js?v=6574ab48d63c",
-    "./assets/js/app/viewer-host-command-handler.js": "./assets/js/app/viewer-host-command-handler.js?v=64e0019f8f36",
-    "./assets/js/app/viewer-host-pointer-delivery.js": "./assets/js/app/viewer-host-pointer-delivery.js?v=b654bf70c27f",
-    "./assets/js/app/viewer-host-results.js": "./assets/js/app/viewer-host-results.js?v=99c806ad3be8",
-    "./assets/js/data/anndata-cellucid-metadata.js": "./assets/js/data/anndata-cellucid-metadata.js?v=5b68dd45bec9",
+    "./assets/js/app/viewer-host/command-handler.js": "./assets/js/app/viewer-host/command-handler.js?v=26c78cdb7cc1",
+    "./assets/js/app/viewer-host/history-events.js": "./assets/js/app/viewer-host/history-events.js?v=173c14bc09f2",
+    "./assets/js/app/viewer-host/pointer-delivery.js": "./assets/js/app/viewer-host/pointer-delivery.js?v=b654bf70c27f",
+    "./assets/js/app/viewer-host/results.js": "./assets/js/app/viewer-host/results.js?v=e564ab1811a6",
+    "./assets/js/data/anndata-cellucid-metadata.js": "./assets/js/data/anndata-cellucid-metadata.js?v=bf2d224b0c0a",
     "./assets/js/data/anndata-file-source.js": "./assets/js/data/anndata-file-source.js?v=9241a6debb60",
     "./assets/js/data/anndata-provider.js": "./assets/js/data/anndata-provider.js?v=244ffdbbabde",
-    "./assets/js/data/anndata-reader-client.js": "./assets/js/data/anndata-reader-client.js?v=1c5d25a42253",
-    "./assets/js/data/anndata-reader-worker.js": "./assets/js/data/anndata-reader-worker.js?v=edfeb16a39cb",
+    "./assets/js/data/anndata-reader-client.js": "./assets/js/data/anndata-reader-client.js?v=91cee337a294",
+    "./assets/js/data/anndata-reader-worker.js": "./assets/js/data/anndata-reader-worker.js?v=46d43cc91176",
     "./assets/js/data/anndata-storage.js": "./assets/js/data/anndata-storage.js?v=a3cb3ad3ea29",
     "./assets/js/data/anndata-value-kinds.js": "./assets/js/data/anndata-value-kinds.js?v=21087cb11011",
     "./assets/js/data/anndata/dataframe.js": "./assets/js/data/anndata/dataframe.js?v=e073e7856dbb",
@@ -558,16 +715,16 @@
     "./assets/js/data/anndata/graph-lines.js": "./assets/js/data/anndata/graph-lines.js?v=1df61f8271b1",
     "./assets/js/data/anndata/kept-column-index.js": "./assets/js/data/anndata/kept-column-index.js?v=571255526040",
     "./assets/js/data/anndata/matrix-access.js": "./assets/js/data/anndata/matrix-access.js?v=c10f3a862e0b",
-    "./assets/js/data/anndata/older-layouts.js": "./assets/js/data/anndata/older-layouts.js?v=6ef7dd666086",
-    "./assets/js/data/anndata/open.js": "./assets/js/data/anndata/open.js?v=bd94e4565d19",
-    "./assets/js/data/anndata/prefix-column-index.js": "./assets/js/data/anndata/prefix-column-index.js?v=29f4ce4a5259",
+    "./assets/js/data/anndata/older-layouts.js": "./assets/js/data/anndata/older-layouts.js?v=4c2482e022d0",
+    "./assets/js/data/anndata/open.js": "./assets/js/data/anndata/open.js?v=97bf9ac569d3",
+    "./assets/js/data/anndata/prefix-column-index.js": "./assets/js/data/anndata/prefix-column-index.js?v=5788f9109c24",
     "./assets/js/data/anndata/priority-layout.js": "./assets/js/data/anndata/priority-layout.js?v=d4df07cc278f",
-    "./assets/js/data/anndata/progressive-open.js": "./assets/js/data/anndata/progressive-open.js?v=406354152bc3",
-    "./assets/js/data/anndata/reader.js": "./assets/js/data/anndata/reader.js?v=b3677342353f",
+    "./assets/js/data/anndata/progressive-open.js": "./assets/js/data/anndata/progressive-open.js?v=bd8e6b51cc11",
+    "./assets/js/data/anndata/reader.js": "./assets/js/data/anndata/reader.js?v=4da4a0f4f4aa",
     "./assets/js/data/anndata/sparse.js": "./assets/js/data/anndata/sparse.js?v=89ec8ca982e7",
-    "./assets/js/data/anndata/subsample-plan.js": "./assets/js/data/anndata/subsample-plan.js?v=e4abcd7ee453",
+    "./assets/js/data/anndata/subsample-plan.js": "./assets/js/data/anndata/subsample-plan.js?v=7da3d0335e3b",
     "./assets/js/data/anndata/subset-entries.js": "./assets/js/data/anndata/subset-entries.js?v=7d53faeefd94",
-    "./assets/js/data/anndata/transcode/anndata-model.js": "./assets/js/data/anndata/transcode/anndata-model.js?v=e6ed67d50849",
+    "./assets/js/data/anndata/transcode/anndata-model.js": "./assets/js/data/anndata/transcode/anndata-model.js?v=077ee384a211",
     "./assets/js/data/anndata/transcode/entries.js": "./assets/js/data/anndata/transcode/entries.js?v=3ba75b6d7c61",
     "./assets/js/data/anndata/transcode/index.js": "./assets/js/data/anndata/transcode/index.js?v=3ca558dc8064",
     "./assets/js/data/anndata/transcode/kept-store.js": "./assets/js/data/anndata/transcode/kept-store.js?v=fcf723626879",
@@ -580,9 +737,9 @@
     "./assets/js/data/anndata/transcode/sce.js": "./assets/js/data/anndata/transcode/sce.js?v=4b061461bb7e",
     "./assets/js/data/anndata/transcode/session.js": "./assets/js/data/anndata/transcode/session.js?v=0d9581588031",
     "./assets/js/data/anndata/transcode/seurat.js": "./assets/js/data/anndata/transcode/seurat.js?v=46786fec79fc",
-    "./assets/js/data/anndata/transcode/space.js": "./assets/js/data/anndata/transcode/space.js?v=fe2354f5e3e7",
+    "./assets/js/data/anndata/transcode/space.js": "./assets/js/data/anndata/transcode/space.js?v=0e7b2f1a0f93",
     "./assets/js/data/anndata/transcode/tables.js": "./assets/js/data/anndata/transcode/tables.js?v=b6ffd1b23782",
-    "./assets/js/data/anndata/transcode/zarr-writer.js": "./assets/js/data/anndata/transcode/zarr-writer.js?v=1f7f6bb65472",
+    "./assets/js/data/anndata/transcode/zarr-writer.js": "./assets/js/data/anndata/transcode/zarr-writer.js?v=c7e9c4b231ed",
     "./assets/js/data/anndata/values.js": "./assets/js/data/anndata/values.js?v=cd69f662aad5",
     "./assets/js/data/anndata/views/cell-subset.js": "./assets/js/data/anndata/views/cell-subset.js?v=ae07c5204ad2",
     "./assets/js/data/anndata/views/h5seurat.js": "./assets/js/data/anndata/views/h5seurat.js?v=f47abf1faf2f",
@@ -594,13 +751,23 @@
     "./assets/js/data/anndata/views/tenx-h5.js": "./assets/js/data/anndata/views/tenx-h5.js?v=ec5e662aacc6",
     "./assets/js/data/anndata/views/tenx-outs.js": "./assets/js/data/anndata/views/tenx-outs.js?v=5883872f2900",
     "./assets/js/data/anndata/views/view-nodes.js": "./assets/js/data/anndata/views/view-nodes.js?v=eab503770ddd",
-    "./assets/js/data/base-anndata-adapter.js": "./assets/js/data/base-anndata-adapter.js?v=cd97c6b202d5",
+    "./assets/js/data/anndata/write/acknowledged-sink.js": "./assets/js/data/anndata/write/acknowledged-sink.js?v=eeee066b3a1d",
+    "./assets/js/data/anndata/write/changes.js": "./assets/js/data/anndata/write/changes.js?v=b90e9679aee8",
+    "./assets/js/data/anndata/write/copy-target.js": "./assets/js/data/anndata/write/copy-target.js?v=83cf4edfac67",
+    "./assets/js/data/anndata/write/copy.js": "./assets/js/data/anndata/write/copy.js?v=94928ee52060",
+    "./assets/js/data/anndata/write/element-writer.js": "./assets/js/data/anndata/write/element-writer.js?v=64ae2509f0ec",
+    "./assets/js/data/anndata/write/gene-major.js": "./assets/js/data/anndata/write/gene-major.js?v=441172f31c63",
+    "./assets/js/data/anndata/write/layout.js": "./assets/js/data/anndata/write/layout.js?v=c3480f3e3d93",
+    "./assets/js/data/anndata/write/names.js": "./assets/js/data/anndata/write/names.js?v=09b3ec0c2380",
+    "./assets/js/data/anndata/write/pool-encoder.js": "./assets/js/data/anndata/write/pool-encoder.js?v=cf42bd51e2ea",
+    "./assets/js/data/anndata/write/ready-writer.js": "./assets/js/data/anndata/write/ready-writer.js?v=ed18ebe68a42",
+    "./assets/js/data/base-anndata-adapter.js": "./assets/js/data/base-anndata-adapter.js?v=045d9f36625b",
     "./assets/js/data/byte-range-cache.js": "./assets/js/data/byte-range-cache.js?v=da19902626c5",
     "./assets/js/data/categorical-storage-contract.js": "./assets/js/data/categorical-storage-contract.js?v=14909d780185",
     "./assets/js/data/cell-identity.js": "./assets/js/data/cell-identity.js?v=81e759b67927",
     "./assets/js/data/cell-order-digest.js": "./assets/js/data/cell-order-digest.js?v=45f869cc9bf0",
     "./assets/js/data/cell-priority.js": "./assets/js/data/cell-priority.js?v=8c540de23be2",
-    "./assets/js/data/cell-subset-policy.js": "./assets/js/data/cell-subset-policy.js?v=04edbc74fc2d",
+    "./assets/js/data/cell-subset-policy.js": "./assets/js/data/cell-subset-policy.js?v=d071802dbf41",
     "./assets/js/data/column-forms.js": "./assets/js/data/column-forms.js?v=07ab6a189f55",
     "./assets/js/data/column-store-placement.js": "./assets/js/data/column-store-placement.js?v=351d02ad4a0c",
     "./assets/js/data/connectivity-edges.js": "./assets/js/data/connectivity-edges.js?v=aaaa36e738bb",
@@ -611,7 +778,7 @@
     "./assets/js/data/data-mapping-candidates.js": "./assets/js/data/data-mapping-candidates.js?v=a858b7c34641",
     "./assets/js/data/data-mapping.js": "./assets/js/data/data-mapping.js?v=2f68695db061",
     "./assets/js/data/data-source-manager.js": "./assets/js/data/data-source-manager.js?v=3e1d017a7b3b",
-    "./assets/js/data/data-source.js": "./assets/js/data/data-source.js?v=f7124f532a28",
+    "./assets/js/data/data-source.js": "./assets/js/data/data-source.js?v=2ebc776a9ab9",
     "./assets/js/data/dataset-lifecycle-errors.js": "./assets/js/data/dataset-lifecycle-errors.js?v=1b2e137a40cb",
     "./assets/js/data/dataset-mapping.js": "./assets/js/data/dataset-mapping.js?v=c1ace7653757",
     "./assets/js/data/dimension-manager.js": "./assets/js/data/dimension-manager.js?v=f44c11f68533",
@@ -621,20 +788,20 @@
     "./assets/js/data/gene-delivery.js": "./assets/js/data/gene-delivery.js?v=a56039306abc",
     "./assets/js/data/gene-names.js": "./assets/js/data/gene-names.js?v=15d21b8bfb64",
     "./assets/js/data/gene-read-plan.js": "./assets/js/data/gene-read-plan.js?v=be320011da8b",
-    "./assets/js/data/host-link-memory.js": "./assets/js/data/host-link-memory.js?v=e17298e1b3ab",
-    "./assets/js/data/input-formats.js": "./assets/js/data/input-formats.js?v=ad8d977030cf",
+    "./assets/js/data/host-link-memory.js": "./assets/js/data/host-link-memory.js?v=82cd49998fab",
+    "./assets/js/data/input-formats.js": "./assets/js/data/input-formats.js?v=138d904d8f0a",
     "./assets/js/data/latent-outliers-stream.js": "./assets/js/data/latent-outliers-stream.js?v=69b8886bf4d8",
     "./assets/js/data/latent-outliers.js": "./assets/js/data/latent-outliers.js?v=0c56268ef39c",
-    "./assets/js/data/link-source.js": "./assets/js/data/link-source.js?v=63f71b1dfd1a",
+    "./assets/js/data/link-source.js": "./assets/js/data/link-source.js?v=61b9dffb0214",
     "./assets/js/data/local-demo-source.js": "./assets/js/data/local-demo-source.js?v=7ea9938510f0",
-    "./assets/js/data/local-folder.js": "./assets/js/data/local-folder.js?v=e659f8a6de9e",
-    "./assets/js/data/local-user-source.js": "./assets/js/data/local-user-source.js?v=4d4005a4fb98",
+    "./assets/js/data/local-folder.js": "./assets/js/data/local-folder.js?v=1bc70cf95fc5",
+    "./assets/js/data/local-user-source.js": "./assets/js/data/local-user-source.js?v=cbb19c4e1b14",
     "./assets/js/data/matrix-market-files.js": "./assets/js/data/matrix-market-files.js?v=950ec92523df",
-    "./assets/js/data/memory-budget.js": "./assets/js/data/memory-budget.js?v=14c5d2418e0e",
+    "./assets/js/data/memory-budget.js": "./assets/js/data/memory-budget.js?v=3e393dddf7d3",
     "./assets/js/data/memory-census.js": "./assets/js/data/memory-census.js?v=c4e84f9c602c",
     "./assets/js/data/metadata-load-contract.js": "./assets/js/data/metadata-load-contract.js?v=0b912897952f",
     "./assets/js/data/open-cells-work.js": "./assets/js/data/open-cells-work.js?v=d1571b159975",
-    "./assets/js/data/opening-cost.js": "./assets/js/data/opening-cost.js?v=f8b3a626904e",
+    "./assets/js/data/opening-cost.js": "./assets/js/data/opening-cost.js?v=a9b25e2b63d0",
     "./assets/js/data/opening-progress.js": "./assets/js/data/opening-progress.js?v=9bcf834cb63f",
     "./assets/js/data/outlier-quantile-source.js": "./assets/js/data/outlier-quantile-source.js?v=064807e364cd",
     "./assets/js/data/palettes.js": "./assets/js/data/palettes.js?v=0f8579e860e1",
@@ -667,15 +834,15 @@
     "./assets/js/data/sources/providers/zenodo.js": "./assets/js/data/sources/providers/zenodo.js?v=1563f1826360",
     "./assets/js/data/sources/registry.js": "./assets/js/data/sources/registry.js?v=e394ff79a55a",
     "./assets/js/data/sources/remote-file.js": "./assets/js/data/sources/remote-file.js?v=6e07a3f168cc",
-    "./assets/js/data/sparse-column-index.js": "./assets/js/data/sparse-column-index.js?v=aeb52983e104",
+    "./assets/js/data/sparse-column-index.js": "./assets/js/data/sparse-column-index.js?v=6a1e8c4af987",
     "./assets/js/data/subsample.js": "./assets/js/data/subsample.js?v=9131e6cd81ce",
     "./assets/js/data/transfer-log.js": "./assets/js/data/transfer-log.js?v=6bd4717a2477",
     "./assets/js/data/vector-field-manager.js": "./assets/js/data/vector-field-manager.js?v=126598a90d04",
-    "./assets/js/data/viewer-channel.js": "./assets/js/data/viewer-channel.js?v=8ba224097fae",
+    "./assets/js/data/viewer-channel.js": "./assets/js/data/viewer-channel.js?v=d2f2b7eef38f",
     "./assets/js/data/viewer-embed.js": "./assets/js/data/viewer-embed.js?v=02c0893d6738",
-    "./assets/js/data/viewer-host-source.js": "./assets/js/data/viewer-host-source.js?v=e825caed96aa",
-    "./assets/js/data/viewer-protocol.js": "./assets/js/data/viewer-protocol.js?v=a577d5e4390a",
-    "./assets/js/data/whole-download.js": "./assets/js/data/whole-download.js?v=c89501c43ec9",
+    "./assets/js/data/viewer-host-source.js": "./assets/js/data/viewer-host-source.js?v=b7bc05a99f46",
+    "./assets/js/data/viewer-protocol.js": "./assets/js/data/viewer-protocol.js?v=4b3d3660d987",
+    "./assets/js/data/whole-download.js": "./assets/js/data/whole-download.js?v=8598c34218d8",
     "./assets/js/data/whole-read-notice.js": "./assets/js/data/whole-read-notice.js?v=6e544c4c0588",
     "./assets/js/dev/benchmark.js": "./assets/js/dev/benchmark.js?v=c348c394932b",
     "./assets/js/formats/hdf5/binary.js": "./assets/js/formats/hdf5/binary.js?v=e6a9c1045fbf",
@@ -704,23 +871,24 @@
     "./assets/js/formats/hdf5/writer.js": "./assets/js/formats/hdf5/writer.js?v=ac1d830f9ba1",
     "./assets/js/formats/io/activity.js": "./assets/js/formats/io/activity.js?v=a43fe1c19d55",
     "./assets/js/formats/io/byte-order.js": "./assets/js/formats/io/byte-order.js?v=bee2c2583350",
-    "./assets/js/formats/io/byte-reader.js": "./assets/js/formats/io/byte-reader.js?v=be7e6b6cc7a7",
-    "./assets/js/formats/io/byte-source.js": "./assets/js/formats/io/byte-source.js?v=9f3201458800",
-    "./assets/js/formats/io/decode-pool.js": "./assets/js/formats/io/decode-pool.js?v=2063ca6edbe3",
+    "./assets/js/formats/io/byte-reader.js": "./assets/js/formats/io/byte-reader.js?v=54c925047a91",
+    "./assets/js/formats/io/byte-source.js": "./assets/js/formats/io/byte-source.js?v=1a5f60cb9c7e",
+    "./assets/js/formats/io/decode-pool.js": "./assets/js/formats/io/decode-pool.js?v=a18010f0ca2f",
     "./assets/js/formats/io/decode-worker.js": "./assets/js/formats/io/decode-worker.js?v=a03f26e4d326",
     "./assets/js/formats/io/decoded-budget.js": "./assets/js/formats/io/decoded-budget.js?v=f17c35e16507",
     "./assets/js/formats/io/decoder-choice.js": "./assets/js/formats/io/decoder-choice.js?v=a4e446b2410f",
-    "./assets/js/formats/io/decoder-memory.js": "./assets/js/formats/io/decoder-memory.js?v=3cf45d3bfa61",
+    "./assets/js/formats/io/decoder-memory.js": "./assets/js/formats/io/decoder-memory.js?v=d4b534c9591e",
     "./assets/js/formats/io/deflate-seek.js": "./assets/js/formats/io/deflate-seek.js?v=c59138d00979",
     "./assets/js/formats/io/host-fetch.js": "./assets/js/formats/io/host-fetch.js?v=b9f81960fbd0",
     "./assets/js/formats/io/hosts.js": "./assets/js/formats/io/hosts.js?v=21dce238b5ad",
     "./assets/js/formats/io/inflate.js": "./assets/js/formats/io/inflate.js?v=e1b90d1dfc0c",
-    "./assets/js/formats/io/kept-parts.js": "./assets/js/formats/io/kept-parts.js?v=8aae7b587945",
-    "./assets/js/formats/io/link.js": "./assets/js/formats/io/link.js?v=b1c44abfa839",
+    "./assets/js/formats/io/kept-parts.js": "./assets/js/formats/io/kept-parts.js?v=f888eeb3ae06",
+    "./assets/js/formats/io/link.js": "./assets/js/formats/io/link.js?v=d6f7b8a139b1",
     "./assets/js/formats/io/lz-match.js": "./assets/js/formats/io/lz-match.js?v=9d69fd3a77aa",
     "./assets/js/formats/io/mirrors.js": "./assets/js/formats/io/mirrors.js?v=f52681624ce8",
     "./assets/js/formats/io/page-checks.js": "./assets/js/formats/io/page-checks.js?v=1261e5b6bbdf",
     "./assets/js/formats/io/range-cache.js": "./assets/js/formats/io/range-cache.js?v=52c76f6feab5",
+    "./assets/js/formats/io/read-witness.js": "./assets/js/formats/io/read-witness.js?v=ce4dec45450a",
     "./assets/js/formats/io/s3.js": "./assets/js/formats/io/s3.js?v=6b616df893c1",
     "./assets/js/formats/io/shuffle.js": "./assets/js/formats/io/shuffle.js?v=10528c69d50d",
     "./assets/js/formats/io/sync-access.js": "./assets/js/formats/io/sync-access.js?v=1de6183af12b",
@@ -750,23 +918,27 @@
     "./assets/js/formats/zarr/codecs/vlen.js": "./assets/js/formats/zarr/codecs/vlen.js?v=a4b150d1ac51",
     "./assets/js/formats/zarr/codecs/zstd.js": "./assets/js/formats/zarr/codecs/zstd.js?v=13166e7931f2",
     "./assets/js/formats/zarr/dtypes.js": "./assets/js/formats/zarr/dtypes.js?v=532c081bbb76",
+    "./assets/js/formats/zarr/encode-task.js": "./assets/js/formats/zarr/encode-task.js?v=28073e23e9d6",
     "./assets/js/formats/zarr/errors.js": "./assets/js/formats/zarr/errors.js?v=75c6745021df",
+    "./assets/js/formats/zarr/format-v2.js": "./assets/js/formats/zarr/format-v2.js?v=121e4f8f6351",
     "./assets/js/formats/zarr/group.js": "./assets/js/formats/zarr/group.js?v=2e86b7c648b8",
     "./assets/js/formats/zarr/index.js": "./assets/js/formats/zarr/index.js?v=1daec738aea8",
     "./assets/js/formats/zarr/json.js": "./assets/js/formats/zarr/json.js?v=6fb93d2b1e44",
     "./assets/js/formats/zarr/metadata.js": "./assets/js/formats/zarr/metadata.js?v=656764d89bad",
-    "./assets/js/formats/zarr/open.js": "./assets/js/formats/zarr/open.js?v=c1c267aafd53",
+    "./assets/js/formats/zarr/open.js": "./assets/js/formats/zarr/open.js?v=f87d6f663180",
     "./assets/js/formats/zarr/stores/common.js": "./assets/js/formats/zarr/stores/common.js?v=fa516c5377a5",
-    "./assets/js/formats/zarr/stores/directory.js": "./assets/js/formats/zarr/stores/directory.js?v=fddf06e8a5dc",
-    "./assets/js/formats/zarr/stores/http.js": "./assets/js/formats/zarr/stores/http.js?v=9f1d49280d53",
+    "./assets/js/formats/zarr/stores/directory.js": "./assets/js/formats/zarr/stores/directory.js?v=13f7043061c8",
+    "./assets/js/formats/zarr/stores/http.js": "./assets/js/formats/zarr/stores/http.js?v=7e4fda73c008",
     "./assets/js/formats/zarr/stores/mapped.js": "./assets/js/formats/zarr/stores/mapped.js?v=4da874a8b098",
     "./assets/js/formats/zarr/stores/memory.js": "./assets/js/formats/zarr/stores/memory.js?v=48c4ea978409",
-    "./assets/js/formats/zarr/stores/zip.js": "./assets/js/formats/zarr/stores/zip.js?v=89f01a0f161c",
+    "./assets/js/formats/zarr/stores/zip.js": "./assets/js/formats/zarr/stores/zip.js?v=869fcad52522",
+    "./assets/js/formats/zarr/writer.js": "./assets/js/formats/zarr/writer.js?v=dba6cc97b936",
     "./assets/js/formats/zip/archive.js": "./assets/js/formats/zip/archive.js?v=4b9df902f9f8",
     "./assets/js/formats/zip/crc32.js": "./assets/js/formats/zip/crc32.js?v=40e5be36e94a",
     "./assets/js/formats/zip/errors.js": "./assets/js/formats/zip/errors.js?v=f1d018bbf46f",
     "./assets/js/formats/zip/index.js": "./assets/js/formats/zip/index.js?v=4ff0b46aac4d",
     "./assets/js/formats/zip/names.js": "./assets/js/formats/zip/names.js?v=6e048343c736",
+    "./assets/js/formats/zip/writer.js": "./assets/js/formats/zip/writer.js?v=b3134f278800",
     "./assets/js/rendering/alpha-visibility.js": "./assets/js/rendering/alpha-visibility.js?v=80467d13cb5b",
     "./assets/js/rendering/ambient-frame-pacing.js": "./assets/js/rendering/ambient-frame-pacing.js?v=23a157fe1906",
     "./assets/js/rendering/backdrops/backdrop-look-raster.js": "./assets/js/rendering/backdrops/backdrop-look-raster.js?v=a944e0d5f1cc",
@@ -834,21 +1006,25 @@
     "./assets/js/rendering/studio-backdrop.js": "./assets/js/rendering/studio-backdrop.js?v=5c5955ba6337",
     "./assets/js/rendering/unplaced-positions.js": "./assets/js/rendering/unplaced-positions.js?v=44e2ea964df7",
     "./assets/js/rendering/viewer-backgrounds.js": "./assets/js/rendering/viewer-backgrounds.js?v=7562ef2f60c3",
-    "./assets/js/rendering/viewer.js": "./assets/js/rendering/viewer.js?v=2471ca9cb831",
+    "./assets/js/rendering/viewer.js": "./assets/js/rendering/viewer.js?v=e52a04851105",
     "./assets/js/rendering/viewer/field-of-view.js": "./assets/js/rendering/viewer/field-of-view.js?v=f4a8fc37e96a",
     "./assets/js/rendering/viewer/presented-view-layout.js": "./assets/js/rendering/viewer/presented-view-layout.js?v=34d57cbdd98b",
     "./assets/js/rendering/viewer/renderer-facade.js": "./assets/js/rendering/viewer/renderer-facade.js?v=9f77547d9016",
     "./assets/js/rendering/viewer/viewer-contracts.js": "./assets/js/rendering/viewer/viewer-contracts.js?v=c2c1da06d5a3",
     "./assets/js/rendering/viewport-center.js": "./assets/js/rendering/viewport-center.js?v=f8a0ed3fea4f",
     "./assets/js/utils/abort.js": "./assets/js/utils/abort.js?v=69ab08312206",
+    "./assets/js/utils/clean-string.js": "./assets/js/utils/clean-string.js?v=e8dd88a93666",
     "./assets/js/utils/deadline.js": "./assets/js/utils/deadline.js?v=73d9eee52efb",
     "./assets/js/utils/debug.js": "./assets/js/utils/debug.js?v=427bbc96ce9d",
     "./assets/js/utils/error-wire.js": "./assets/js/utils/error-wire.js?v=57b44cc196c4",
-    "./assets/js/utils/errors.js": "./assets/js/utils/errors.js?v=2a858dc241ff",
+    "./assets/js/utils/errors.js": "./assets/js/utils/errors.js?v=289595c3eb32",
     "./assets/js/utils/exact-record.js": "./assets/js/utils/exact-record.js?v=03033ddb63e4",
     "./assets/js/utils/format-units.js": "./assets/js/utils/format-units.js?v=5bffa0cc8abc",
-    "./assets/js/utils/indexed-db-store.js": "./assets/js/utils/indexed-db-store.js?v=8059004f92e4",
+    "./assets/js/utils/indexed-db-database.js": "./assets/js/utils/indexed-db-database.js?v=097ff3cdbb99",
+    "./assets/js/utils/indexed-db-store.js": "./assets/js/utils/indexed-db-store.js?v=c80fd5cc9901",
     "./assets/js/utils/large-arrays.js": "./assets/js/utils/large-arrays.js?v=3e10aac4de09",
+    "./assets/js/utils/machine.js": "./assets/js/utils/machine.js?v=8a2c54581f18",
+    "./assets/js/utils/origin-allowlist.js": "./assets/js/utils/origin-allowlist.js?v=ae03ce2c18e5",
     "./assets/js/utils/person-wait.js": "./assets/js/utils/person-wait.js?v=aca68bac275a",
     "./assets/js/utils/radix-order.js": "./assets/js/utils/radix-order.js?v=8e974dca45c2",
     "./assets/js/utils/string-index.js": "./assets/js/utils/string-index.js?v=8ff9a8c34e39",
@@ -857,8 +1033,8 @@
     "./assets/js/utils/yield-macrotask.js": "./assets/js/utils/yield-macrotask.js?v=73f4acddd831",
     "./assets/js/workers/idle-retirement.js": "./assets/js/workers/idle-retirement.js?v=3fbed04871a5",
     "./assets/js/workers/worker-failure.js": "./assets/js/workers/worker-failure.js?v=f48b038501a8",
-    "./assets/js/workers/worker-script.js": "./assets/js/workers/worker-script.js?v=3bc7fd989315",
-    "./assets/workers/scripts.js": "./assets/workers/scripts.js?v=ea77307e0bd9"
+    "./assets/js/workers/worker-script.js": "./assets/js/workers/worker-script.js?v=b974cb881d06",
+    "./assets/workers/scripts.js": "./assets/workers/scripts.js?v=cf638af03877"
   }
   }
   </script>
@@ -872,7 +1048,8 @@
     import map above. Anywhere else it runs the page bundle, the same code
     built into a few files named by their content (assets/page/), and asks
     for the entry and every file it imports at startup now, at once. The entry
-    is imported once the document is parsed. scripts/generate-web-asset-inventory.mjs
+    is imported once the document is parsed, which is once its stylesheet is
+    in (CELLUCID_STYLE_GATE, after the stylesheet link). scripts/generate-web-asset-inventory.mjs
     writes this script and its hash in the policy above; do not edit it by hand.
   -->
   <script id="cellucid-page-boot">
@@ -881,29 +1058,31 @@
     (() => {
       const thisMachine = ["localhost","127.0.0.1","[::1]"].includes(location.hostname);
       const bundle = [
-      "assets/page/main.IECHNKIY.js",
-      "assets/page/chunk.2SQHPJQN.js",
-      "assets/page/chunk.3D7IWEOD.js",
-      "assets/page/chunk.3SPNM3EJ.js",
-      "assets/page/chunk.4YBQPTUJ.js",
-      "assets/page/chunk.6KEQWNVP.js",
-      "assets/page/chunk.6N2HNRDQ.js",
-      "assets/page/chunk.BR5RT35P.js",
-      "assets/page/chunk.C3YZBK2F.js",
-      "assets/page/chunk.C6DRYLGH.js",
-      "assets/page/chunk.CSPTVJT2.js",
-      "assets/page/chunk.GA4IEZPS.js",
-      "assets/page/chunk.MBLTCCPB.js",
-      "assets/page/chunk.MSCRO5WU.js",
-      "assets/page/chunk.NF4RLQ4U.js",
-      "assets/page/chunk.PTTYSQ3Z.js",
-      "assets/page/chunk.T3PFD7EH.js",
-      "assets/page/chunk.TQZ3TQFW.js",
-      "assets/page/chunk.UJ7NJ7TZ.js",
-      "assets/page/chunk.XBCGFB6O.js",
-      "assets/page/chunk.XHJ5L6NE.js",
-      "assets/page/chunk.YLP37KIQ.js",
-      "assets/page/chunk.Z536RFGH.js"
+      "assets/page/main.XT5EIOU3.js",
+      "assets/page/chunk.2E6VLGIT.js",
+      "assets/page/chunk.4RO35XQH.js",
+      "assets/page/chunk.4RPXNZAP.js",
+      "assets/page/chunk.527SZVAR.js",
+      "assets/page/chunk.5Z5A7CUC.js",
+      "assets/page/chunk.67HB5KIP.js",
+      "assets/page/chunk.7NEXTSVH.js",
+      "assets/page/chunk.AIHKJ5NY.js",
+      "assets/page/chunk.BLB2Q6XA.js",
+      "assets/page/chunk.D535WAAR.js",
+      "assets/page/chunk.DWZ76IIX.js",
+      "assets/page/chunk.I7JMCGHG.js",
+      "assets/page/chunk.IXWWWMZH.js",
+      "assets/page/chunk.J6VZ5QYM.js",
+      "assets/page/chunk.N6JFCHRH.js",
+      "assets/page/chunk.O6BW4YRR.js",
+      "assets/page/chunk.PWXV232R.js",
+      "assets/page/chunk.R3A3K4UN.js",
+      "assets/page/chunk.U3MXMPY4.js",
+      "assets/page/chunk.XB45ER7C.js",
+      "assets/page/chunk.YG5GM5R2.js",
+      "assets/page/chunk.YK63WDQK.js",
+      "assets/page/chunk.YZDSMKXI.js",
+      "assets/page/chunk.ZDRTNFOP.js"
       ];
       const entry = new URL(thisMachine ? "assets/js/app/main.js" : bundle[0], document.baseURI).href;
       if (!thisMachine) {
@@ -929,9 +1108,20 @@
           }, { once: true });
         }
       }
-      const start = () => import(entry).catch(error => {
-        window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry, error } }));
-      });
+      // The document is parsed only once its stylesheet is in (CELLUCID_STYLE_GATE,
+      // after the stylesheet link), so the code starts in a styled page. A
+      // stylesheet that did not load is reported like a file of the code that
+      // did not: nothing of the app can be shown without it.
+      const start = () => {
+        if (document.documentElement.dataset.styleLoadFailed === 'true') {
+          const stylesheet = document.querySelector('link[rel="stylesheet"]').href;
+          window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry: stylesheet, stylesheet: true } }));
+          return;
+        }
+        import(entry).catch(error => {
+          window.dispatchEvent(new CustomEvent('cellucid-code-load-failed', { detail: { entry, error } }));
+        });
+      };
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
       else start();
     })();
@@ -979,7 +1169,7 @@
     "applicationCategory": "ScientificApplication",
     "applicationSubCategory": "Single-cell data visualization",
     "operatingSystem": "Web browser",
-    "softwareVersion": "0.9.6",
+    "softwareVersion": "0.9.7",
     "browserRequirements": "Requires WebGL2",
     "isAccessibleForFree": true,
     "license": "https://opensource.org/licenses/BSD-3-Clause",
@@ -1018,6 +1208,9 @@
     ]
   }</script>
 
+  <!-- A relay approval link's connect code leaves the address before anything else runs. -->
+  <script src="assets/js/app/agent/bridge/connect-fragment.js?v=2f7256905918"></script>
+
   <!-- A GitHub sign-in's token leaves the address before anything else runs. -->
   <script src="assets/js/app/ui/core/auth-fragment-init.js?v=ffcded809c3c"></script>
 
@@ -1050,7 +1243,7 @@
   <!-- iOS only: stop the focus zoom into small field text (see the file). -->
   <script src="assets/js/app/ui/core/viewport-init.js?v=5ef0d5188516"></script>
   <!-- Reports a module that failed to download, which the module graph cannot -->
-  <script src="assets/js/app/ui/core/code-load-watch.js?v=3cf941400c3e"></script>
+  <script src="assets/js/app/ui/core/code-load-watch.js?v=3b33016efe1b"></script>
   <!-- A file dropped anywhere on the page never makes the browser leave it -->
   <script src="assets/js/app/ui/core/file-drop-guard.js?v=fcd259f48cea"></script>
 
@@ -1068,10 +1261,10 @@
   <link rel="preload" as="style" href="assets/css/tokens/_z-index.css?v=49ea8e1f4794" />
   <link rel="preload" as="style" href="assets/css/tokens/_opacity.css?v=fe39d4d76a31" />
   <link rel="preload" as="style" href="assets/css/tokens/_controls.css?v=c76f1763ff18" />
-  <link rel="preload" as="style" href="assets/css/themes/_index.css?v=4f6132404d9d" />
+  <link rel="preload" as="style" href="assets/css/themes/_index.css?v=939ab1c5d0ab" />
   <link rel="preload" as="style" href="assets/css/themes/_base.css?v=14df148c5e40" />
-  <link rel="preload" as="style" href="assets/css/themes/_light.css?v=bc4280018373" />
-  <link rel="preload" as="style" href="assets/css/themes/_dark.css?v=535975042aeb" />
+  <link rel="preload" as="style" href="assets/css/themes/_light.css?v=35b1bd9b3d6f" />
+  <link rel="preload" as="style" href="assets/css/themes/_dark.css?v=4c8355c7ac5d" />
   <link rel="preload" as="style" href="assets/css/base/_index.css?v=698a201a13bc" />
   <link rel="preload" as="style" href="assets/css/base/_reset.css?v=6a635a5bebe9" />
   <link rel="preload" as="style" href="assets/css/base/_fonts.css?v=cf252301d285" />
@@ -1084,20 +1277,20 @@
   <link rel="preload" as="style" href="assets/css/utilities/_colors.css?v=acf352de75e3" />
   <link rel="preload" as="style" href="assets/css/utilities/_display.css?v=deefe39a05c3" />
   <link rel="preload" as="style" href="assets/css/utilities/_interactive.css?v=b8ff8b68ddd1" />
-  <link rel="preload" as="style" href="assets/css/components/_index.css?v=51689fc079d8" />
+  <link rel="preload" as="style" href="assets/css/components/_index.css?v=d5ea13d9379b" />
   <link rel="preload" as="style" href="assets/css/components/_sidebar.css?v=4deea2c1e0f7" />
-  <link rel="preload" as="style" href="assets/css/components/_accordion.css?v=fd99ac4a43ce" />
-  <link rel="preload" as="style" href="assets/css/components/_controls.css?v=d42a12b41e2a" />
+  <link rel="preload" as="style" href="assets/css/components/_accordion.css?v=c29a08e5561b" />
+  <link rel="preload" as="style" href="assets/css/components/_controls.css?v=3e6fd5d5e867" />
   <link rel="preload" as="style" href="assets/css/components/_buttons.css?v=cbf92202f9ce" />
   <link rel="preload" as="style" href="assets/css/components/_forms.css?v=af19751d7d34" />
-  <link rel="preload" as="style" href="assets/css/components/_legend.css?v=7e56db2e710e" />
+  <link rel="preload" as="style" href="assets/css/components/_legend.css?v=b0e3e9c99d29" />
   <link rel="preload" as="style" href="assets/css/components/_filters.css?v=d142e353e6de" />
   <link rel="preload" as="style" href="assets/css/components/_select-bar.css?v=71c0470376b7" />
-  <link rel="preload" as="style" href="assets/css/components/_field-operations.css?v=5b24293e2e67" />
-  <link rel="preload" as="style" href="assets/css/components/_notifications.css?v=aaf2d50ac74a" />
+  <link rel="preload" as="style" href="assets/css/components/_field-operations.css?v=36a1bfa8044e" />
+  <link rel="preload" as="style" href="assets/css/components/_notifications.css?v=9e279f40106c" />
   <link rel="preload" as="style" href="assets/css/components/_modals.css?v=46ed7a42dee9" />
   <link rel="preload" as="style" href="assets/css/components/_welcome.css?v=ff5fab99eaab" />
-  <link rel="preload" as="style" href="assets/css/components/_community-annotations.css?v=029239697dcf" />
+  <link rel="preload" as="style" href="assets/css/components/_community-annotations.css?v=141ca6e82b21" />
   <link rel="preload" as="style" href="assets/css/components/_analysis.css?v=96dece8acc38" />
   <link rel="preload" as="style" href="assets/css/components/_analysis-windows.css?v=b93d4755b6c7" />
   <link rel="preload" as="style" href="assets/css/components/_jobs.css?v=567a52581505" />
@@ -1106,13 +1299,48 @@
   <link rel="preload" as="style" href="assets/css/components/_cell-info.css?v=24394af2e4d6" />
   <link rel="preload" as="style" href="assets/css/components/_dataset-drop.css?v=a47ed68237b0" />
   <link rel="preload" as="style" href="assets/css/components/_opening.css?v=1ad522c03279" />
-  <link rel="preload" as="style" href="assets/css/components/_session.css?v=856baf888037" />
+  <link rel="preload" as="style" href="assets/css/components/_session.css?v=c625e229fc45" />
+  <link rel="preload" as="style" href="assets/css/components/_state.css?v=313163feb6b8" />
+  <link rel="preload" as="style" href="assets/css/components/_library.css?v=73ca11a8c2f7" />
+  <link rel="preload" as="style" href="assets/css/components/_agents.css?v=89e5178ca5b6" />
   <link rel="preload" as="style" href="assets/css/layouts/_index.css?v=6e49b153eac7" />
   <link rel="preload" as="style" href="assets/css/layouts/_app.css?v=a6dd81b3d554" />
   <link rel="preload" as="style" href="assets/css/layouts/_page.css?v=467569f78436" />
   <link rel="preload" as="style" href="assets/css/layouts/_responsive.css?v=f62b5136c24c" />
   <link rel="preload" as="style" href="assets/css/layouts/_print.css?v=99e66148fc48" />
-  <link rel="stylesheet" href="assets/css/main.css?v=d1f43e529126" />
+  <link rel="stylesheet" href="assets/css/main.css?v=eac14b8406c6" />
+
+  <!--
+    CELLUCID_STYLE_GATE
+    -------------------
+    The parser stops at this script until the stylesheet above, and all it
+    imports, is in: a script waits for the stylesheets before it, in every
+    engine. So nothing of <body> exists in a page without its styles, and
+    DOMContentLoaded, the page boot's cue to start the code, comes after them.
+
+    Without it WebKit parses on and fires DOMContentLoaded while the
+    stylesheet is still on its way (measured with its response held 4 s: the
+    code started 0.3 s in, in a document where `class="welcome-modal hidden"`
+    was displayed and no design token had a value, and the analysis tools
+    then failed to load on a token that resolved to nothing). Chromium and
+    Firefox hold DOMContentLoaded for the stylesheet by themselves, through
+    the deferred scripts at the end of <body>.
+
+    A stylesheet that did not load leaves no rule to read (Chromium and WebKit
+    refuse its rules, Firefox has none). The page boot reports that instead
+    of starting the code in a page with no styles (code-load-watch.js).
+  -->
+  <script id="cellucid-style-gate">
+    (() => {
+      let styled = false;
+      try {
+        styled = document.querySelector('link[rel="stylesheet"]').sheet.cssRules.length > 0;
+      } catch {
+        // The rules of a stylesheet that did not load cannot be read.
+      }
+      if (!styled) document.documentElement.dataset.styleLoadFailed = 'true';
+    })();
+  </script>
 </head>
 <body>
   <!-- What Cellucid is, for search engines and screen readers (hidden
@@ -1210,6 +1438,21 @@
     </div>
   </div>
 
+  <!-- What agents may do without asking (assets/js/app/agent/presence/
+       permissions.js): the mode, each kind of action, and what was allowed
+       for one chat or connection; drawn by the presence. -->
+  <dialog id="agent-permissions-dialog" class="app-dialog" aria-labelledby="agent-permissions-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="agent-permissions-dialog-title">Agent permissions</h2>
+        <button type="button" id="agent-permissions-info-btn" class="info-btn" aria-label="About agent permissions" aria-controls="agent-permissions-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="agent-permissions-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-permissions-info-btn" tabindex="-1" data-info-tip="agent-permissions" hidden></div>
+    <div class="app-dialog-body agent-permissions-body" id="agent-permissions-body"></div>
+  </dialog>
+
   <!-- Cite Cellucid: filled at runtime from the deployed CITATION.cff
        (assets/js/app/ui/modules/cite-dialog.js). -->
   <dialog id="cite-dialog" class="app-dialog" aria-labelledby="cite-dialog-title">
@@ -1304,6 +1547,325 @@
         <dl id="kept-stores-where" class="fact-list"></dl>
         <button type="button" id="kept-stores-persist" class="btn btn-compact" hidden>Keep it when space is low</button>
       </section>
+    </div>
+  </dialog>
+
+  <!-- My datasets › All…: every dataset opened in this browser, where it
+       comes from, its saved states, and how it opens again
+       (assets/js/app/ui/modules/my-datasets/dialog.js). -->
+  <dialog id="my-datasets-dialog" class="app-dialog my-datasets-dialog" aria-labelledby="my-datasets-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="my-datasets-dialog-title">My datasets</h2>
+        <button type="button" id="my-datasets-dialog-info-btn" class="info-btn" aria-label="About My datasets" aria-controls="my-datasets-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="my-datasets-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="my-datasets-dialog-info-btn" tabindex="-1" data-info-tip="my-datasets" hidden></div>
+    <div class="app-dialog-body">
+      <!-- The filter, then Export… and Import… of a .cellucid-library file
+           (assets/js/app/library/library-file.js). -->
+      <div class="library-toolbar">
+        <input type="search" id="my-datasets-filter" class="obs-select" placeholder="Filter by name…" aria-label="Filter by name" autocomplete="off" spellcheck="false" />
+        <button type="button" id="my-datasets-export-btn" class="btn btn-compact" aria-expanded="false" aria-controls="my-datasets-export" title="Write datasets and saved states to a .cellucid-library file, for Cellucid in another browser">Export…</button>
+        <button type="button" id="my-datasets-import-btn" class="btn btn-compact" title="Add the datasets and saved states of a .cellucid-library file; nothing kept here is replaced">Import…</button>
+        <input type="file" id="my-datasets-import-input" accept=".cellucid-library" tabindex="-1" aria-hidden="true" hidden />
+      </div>
+      <p id="my-datasets-dialog-status" class="status-line" role="status" aria-live="polite" hidden></p>
+      <section id="my-datasets-export" class="library-export" aria-labelledby="my-datasets-export-title" hidden>
+        <p id="my-datasets-export-title" class="library-export-title">Export to a library file</p>
+        <p class="field-help">Each saved state ticked goes whole: its steps, notes, Recently deleted and conversations with agents. Conversations can be private: keep the file to yourself.</p>
+        <div class="library-export-list" role="group" aria-labelledby="my-datasets-export-title" data-export-list></div>
+        <p class="field-help" data-export-summary></p>
+        <div class="library-row-confirm-actions">
+          <button type="button" class="btn btn-compact" data-export-action="confirm">Export</button>
+          <button type="button" class="btn btn-compact" data-export-action="cancel">Cancel</button>
+        </div>
+      </section>
+      <div id="my-datasets-list" class="my-datasets-list" role="list" aria-labelledby="my-datasets-dialog-title"></div>
+      <p id="my-datasets-empty" class="empty-state" hidden>No dataset has been opened in this browser yet. Import… adds those of a library file.</p>
+    </div>
+  </dialog>
+
+  <!-- An agent asks to connect: who asks, where the answer goes, the code to
+       compare, Allow / Deny (assets/js/app/agent/connect/approval-dialog.js). -->
+  <dialog id="agent-approval-dialog" class="app-dialog agent-approval-dialog" aria-labelledby="agent-approval-title" aria-describedby="agent-approval-who">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="agent-approval-title">Connect an agent?</h2>
+        <button type="button" id="agent-approval-info-btn" class="info-btn" aria-label="About approving a connection" aria-controls="agent-approval-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+    </div>
+    <div id="agent-approval-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-approval-info-btn" tabindex="-1" data-info-tip="agent-approval" hidden></div>
+    <div class="app-dialog-body">
+      <p id="agent-approval-who" class="agent-approval-who"></p>
+      <p id="agent-approval-where" class="field-help"></p>
+      <ul id="agent-approval-warnings" class="agent-approval-warnings" hidden></ul>
+      <p class="agent-approval-code-row"><span class="field-label">Code</span> <span id="agent-approval-code" class="agent-approval-code"></span></p>
+      <p class="field-help">It matches the code on the page that asked.</p>
+      <p id="agent-approval-status" class="status-line" role="status" aria-live="polite" hidden></p>
+      <div class="app-dialog-actions">
+        <button type="button" id="agent-approval-deny" class="btn">Deny</button>
+        <button type="button" id="agent-approval-allow" class="btn btn-primary">Allow</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Agents › Manage…: the connections made through this browser, Remove,
+       and Forget this browser (assets/js/app/agent/connect/connections-dialog.js). -->
+  <dialog id="agent-connections-dialog" class="app-dialog agent-connections-dialog" aria-labelledby="agent-connections-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="agent-connections-title">Connected agents</h2>
+        <button type="button" id="agent-connections-info-btn" class="info-btn" aria-label="About connected agents" aria-controls="agent-connections-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="agent-connections-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-connections-info-btn" tabindex="-1" data-info-tip="agent-connect" hidden></div>
+    <div class="app-dialog-body">
+      <p id="agent-connections-status" class="status-line" role="status" aria-live="polite" hidden></p>
+      <ul id="agent-connections-list" class="agent-connections-list" aria-labelledby="agent-connections-title" hidden></ul>
+      <p id="agent-connections-empty" class="empty-state" hidden>No agent is connected through this browser.</p>
+      <section class="agent-forget" aria-labelledby="agent-forget-title">
+        <h3 class="section-title" id="agent-forget-title">This browser</h3>
+        <p class="field-help">Forget ends every connection made through this browser and disconnects its Cellucid tabs; agents are approved again to work here.</p>
+        <button type="button" id="agent-forget-btn" class="btn btn-compact">Forget this browser</button>
+        <div id="agent-forget-confirm" class="agent-forget-confirm" role="group" aria-label="Forget this browser" hidden>
+          <span class="agent-forget-question">End every connection?</span>
+          <button type="button" id="agent-forget-yes" class="btn btn-compact btn-danger">Forget</button>
+          <button type="button" id="agent-forget-no" class="btn btn-compact">Cancel</button>
+        </div>
+      </section>
+    </div>
+  </dialog>
+
+  <!-- Compare two steps of the history (assets/js/app/ui/modules/state/diff-dialog.js). -->
+  <dialog id="history-diff-dialog" class="app-dialog history-diff-dialog" aria-labelledby="history-diff-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-diff-dialog-title">Compare two steps</h2>
+        <button type="button" id="history-diff-info-btn" class="info-btn" aria-label="About comparing steps" aria-controls="history-diff-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-diff-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-diff-info-btn" tabindex="-1" data-info-tip="history-diff" hidden></div>
+    <div class="app-dialog-body">
+      <div class="history-diff-choose">
+        <div class="control-block">
+          <label for="history-diff-from">From</label>
+          <select id="history-diff-from" class="obs-select"></select>
+        </div>
+        <div class="control-block">
+          <label for="history-diff-to">To</label>
+          <select id="history-diff-to" class="obs-select"></select>
+        </div>
+      </div>
+      <p id="history-diff-status" class="status-line" role="status" aria-live="polite"></p>
+      <dl id="history-diff-list" class="fact-list history-diff-list" aria-labelledby="history-diff-status"></dl>
+    </div>
+  </dialog>
+
+  <!-- Load: a saved state of this browser or a session file, and the
+       history shown saved under a name
+       (assets/js/app/ui/modules/state/saved-states-dialog.js). -->
+  <dialog id="saved-states-dialog" class="app-dialog saved-states-dialog" aria-labelledby="saved-states-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="saved-states-dialog-title">Load</h2>
+        <button type="button" id="saved-states-dialog-info-btn" class="info-btn" aria-label="About loading" aria-controls="saved-states-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="saved-states-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="saved-states-dialog-info-btn" tabindex="-1" data-info-tip="saved-states" hidden></div>
+    <div class="app-dialog-body">
+      <h3 class="section-title" id="saved-states-list-title">Saved in this browser</h3>
+      <div id="saved-states-list" class="list-box saved-states-list" role="list" aria-labelledby="saved-states-list-title" hidden></div>
+      <p id="saved-states-empty" class="empty-state">No states are saved in this browser yet.</p>
+      <p id="saved-states-status" class="status-line" role="status" aria-live="polite" hidden></p>
+      <div class="app-dialog-actions saved-states-save">
+        <input type="text" id="saved-states-name" class="obs-select" aria-label="Name for the history shown" placeholder="Name for the history shown" autocomplete="off" spellcheck="false" disabled />
+        <select id="saved-states-content" class="obs-select" aria-label="What to keep" disabled>
+          <option value="history">History</option>
+          <option value="state">Current state only</option>
+          <option value="steps">Steps only</option>
+        </select>
+        <button type="button" id="saved-states-save-as" class="btn btn-compact" disabled>Save</button>
+      </div>
+      <h3 class="section-title">From a file</h3>
+      <div class="app-dialog-actions">
+        <button type="button" id="load-state-btn" class="btn btn-compact">Open a session file…</button>
+        <button type="button" id="saved-states-replay-file" class="btn btn-compact" hidden>Replay a session file here…</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Share this history: what the session file holds (History v2 §3.10,
+       §3.11, §3.15.3; assets/js/app/ui/modules/state/share-dialog.js). -->
+  <dialog id="history-share-dialog" class="app-dialog history-share-dialog" aria-labelledby="history-share-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-share-dialog-title">Share this history</h2>
+        <button type="button" id="history-share-dialog-info-btn" class="info-btn" aria-label="About sharing" aria-controls="history-share-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-share-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-share-dialog-info-btn" tabindex="-1" data-info-tip="history-share" hidden></div>
+    <div class="app-dialog-body">
+      <div class="history-share-options">
+        <div class="history-share-option">
+          <span class="field-label" aria-hidden="true">Share</span>
+          <div class="history-share-choice" data-share-choice="content"></div>
+        </div>
+      </div>
+      <p id="history-share-content-note" class="status-line" data-tone="muted"></p>
+      <div id="history-share-include" class="control-block history-share-include" role="group" aria-labelledby="history-share-include-label">
+        <span class="field-label" id="history-share-include-label">Include</span>
+        <div id="history-share-branches" class="list-box history-share-branches" role="group" aria-label="Trackers and branches"></div>
+        <label class="checkbox-inline"><input type="checkbox" id="history-share-notes" checked /> Notes and bookmarks</label>
+        <label class="checkbox-inline" id="history-share-chats-row"><input type="checkbox" id="history-share-chats" /> <span id="history-share-chats-label">Conversations</span></label>
+        <label class="checkbox-inline"><input type="checkbox" id="history-share-journal" /> Recently deleted</label>
+      </div>
+      <div class="history-share-options">
+        <div class="history-share-option">
+          <span class="field-label" aria-hidden="true">Results</span>
+          <div class="history-share-choice" data-share-choice="results"></div>
+        </div>
+        <div class="history-share-option">
+          <span class="field-label" aria-hidden="true">Times</span>
+          <div class="history-share-choice" data-share-choice="times"></div>
+        </div>
+        <div class="history-share-option">
+          <span class="field-label" aria-hidden="true">Dataset</span>
+          <div class="history-share-choice" data-share-choice="source"></div>
+        </div>
+      </div>
+      <p id="history-share-summary" class="status-line history-share-summary" role="status" aria-live="polite"></p>
+      <div id="history-share-inside" class="history-share-inside" hidden></div>
+      <div class="app-dialog-actions history-share-actions">
+        <button type="button" id="history-share-inside-btn" class="btn btn-compact" aria-expanded="false" aria-controls="history-share-inside">What’s inside</button>
+        <span class="history-share-spacer"></span>
+        <button type="button" class="btn btn-compact" data-dialog-close>Cancel</button>
+        <button type="button" id="history-share-save" class="btn btn-compact btn-primary">Save file</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Recently deleted and changed: the history's own edits, to undo
+       (assets/js/app/ui/modules/state/recently-deleted.js). -->
+  <dialog id="history-deleted-dialog" class="app-dialog history-deleted-dialog" aria-labelledby="history-deleted-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-deleted-dialog-title">Recently deleted</h2>
+        <button type="button" id="history-deleted-dialog-info-btn" class="info-btn" aria-label="About Recently deleted" aria-controls="history-deleted-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-deleted-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-deleted-dialog-info-btn" tabindex="-1" data-info-tip="history-deleted" hidden></div>
+    <div class="app-dialog-body">
+      <p id="history-deleted-status" class="status-line" role="status" aria-live="polite"></p>
+      <ul id="history-deleted-list" class="list-box history-deleted-list" aria-labelledby="history-deleted-dialog-title"></ul>
+      <div class="app-dialog-actions">
+        <button type="button" id="history-deleted-empty" class="btn btn-compact btn-danger">Empty…</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- The branch map: every branch as a lane graph and a table
+       (assets/js/app/ui/modules/state/branch-map-dialog.js). -->
+  <dialog id="history-map-dialog" class="app-dialog history-map-dialog" aria-labelledby="history-map-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-map-dialog-title">Branch map</h2>
+        <button type="button" id="history-map-dialog-info-btn" class="info-btn" aria-label="About the branch map" aria-controls="history-map-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-map-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-map-dialog-info-btn" tabindex="-1" data-info-tip="history-map" hidden></div>
+    <div class="app-dialog-body">
+      <div class="history-map-tools">
+        <input type="search" id="history-map-filter" class="obs-select" placeholder="Find a branch" aria-label="Find a branch" autocomplete="off" spellcheck="false" />
+        <label class="checkbox-inline"><input type="checkbox" id="history-map-archived" /> Archived</label>
+      </div>
+      <div class="history-map-body">
+        <div id="history-map-graph" class="history-graph history-map-graph" aria-label="Every branch"></div>
+        <table id="history-map-table" class="history-map-table" aria-labelledby="history-map-dialog-title">
+          <thead><tr>
+            <th scope="col"><input type="checkbox" id="history-map-all" aria-label="Choose every branch shown" /></th>
+            <th scope="col">Branch</th><th scope="col">From</th><th scope="col">Steps</th><th scope="col">Last change</th><th scope="col"><span class="sr-only">Actions</span></th>
+          </tr></thead>
+          <tbody id="history-map-rows"></tbody>
+        </table>
+      </div>
+      <p id="history-map-status" class="status-line" role="status" aria-live="polite"></p>
+      <div class="app-dialog-actions">
+        <button type="button" id="history-map-archive" class="btn btn-compact" disabled>Archive chosen</button>
+        <button type="button" id="history-map-delete" class="btn btn-compact btn-danger" disabled>Delete chosen…</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- A replay's report, with names to use instead
+       (assets/js/app/ui/modules/state/replay-report-dialog.js). -->
+  <dialog id="history-replay-dialog" class="app-dialog history-replay-dialog" aria-labelledby="history-replay-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-replay-dialog-title">Replay report</h2>
+        <button type="button" id="history-replay-dialog-info-btn" class="info-btn" aria-label="About the replay report" aria-controls="history-replay-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-replay-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-replay-dialog-info-btn" tabindex="-1" data-info-tip="history-replay" hidden></div>
+    <div class="app-dialog-body">
+      <p id="history-replay-summary" class="status-line" role="status" aria-live="polite"></p>
+      <ol id="history-replay-list" class="history-replay-list" aria-labelledby="history-replay-summary"></ol>
+      <div class="app-dialog-actions">
+        <button type="button" class="btn btn-compact" data-dialog-close>Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Where the history's memory goes, largest first
+       (assets/js/app/ui/modules/state/memory-dialog.js). -->
+  <dialog id="history-memory-dialog" class="app-dialog history-memory-dialog" aria-labelledby="history-memory-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-memory-dialog-title">History memory</h2>
+        <button type="button" id="history-memory-dialog-info-btn" class="info-btn" aria-label="About the history's memory" aria-controls="history-memory-dialog-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-memory-dialog-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-memory-dialog-info-btn" tabindex="-1" data-info-tip="history-memory" hidden></div>
+    <div class="app-dialog-body">
+      <p id="history-memory-status" class="status-line" role="status" aria-live="polite"></p>
+      <ol id="history-memory-list" class="history-memory-list" aria-labelledby="history-memory-status"></ol>
+      <div class="app-dialog-actions">
+        <button type="button" id="history-memory-deleted" class="btn btn-compact">Recently deleted…</button>
+        <button type="button" class="btn btn-compact" data-dialog-close>Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Print a report of the history: the steps that get a picture
+       (assets/js/app/ui/modules/state/share.js). Opened only where the page
+       can draw the views as a picture. -->
+  <dialog id="history-report-dialog" class="app-dialog history-report-dialog" aria-labelledby="history-report-dialog-title">
+    <div class="app-dialog-header">
+      <div class="app-dialog-title-row">
+        <h2 id="history-report-dialog-title">Print report</h2>
+        <button type="button" id="history-report-info-btn" class="info-btn" aria-label="About the report" aria-controls="history-report-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+      </div>
+      <button type="button" class="app-dialog-close" data-dialog-close aria-label="Close">&times;</button>
+    </div>
+    <div id="history-report-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-report-info-btn" tabindex="-1" data-info-tip="history-report" hidden></div>
+    <div class="app-dialog-body">
+      <label class="checkbox-inline">
+        <input type="checkbox" id="history-report-pictures" checked />
+        Pictures of the steps chosen
+      </label>
+      <div id="history-report-steps" class="list-box history-report-steps" role="group" aria-label="Steps with a picture"></div>
+      <div class="app-dialog-actions">
+        <button type="button" id="history-report-open" class="btn btn-compact btn-primary">Open report</button>
+      </div>
     </div>
   </dialog>
 
@@ -1410,6 +1972,98 @@
     </div>
   </section>
 
+  <!-- Agents (assets/js/app/agent/): the dock at the foot of the plot, above
+       the selection bar. The presence is what any agent acting in this tab
+       shows, from the chat bar or Claude and ChatGPT through the connector:
+       a card for an action it asks to take that the history cannot undo
+       (Allow, Deny), and which agent is acting with Stop and Undo turn
+       (presence/), and once per dataset what agents read is sent to their
+       provider (with the switch "Agents see names and summaries only").
+       Below it the chat bar: collapsed to its button, open to the
+       conversation, its settings (provider, API key, model) and the
+       message field (chat/). -->
+  <section id="agent-dock" class="agent-dock" aria-label="Agents" data-chat-open="false">
+    <div id="agent-presence" class="agent-presence" hidden></div>
+    <div id="agent-chat-panel" class="agent-chat-panel" role="region" aria-labelledby="agent-chat-title" hidden>
+      <div class="agent-chat-header">
+        <h2 class="agent-chat-title" id="agent-chat-title">Agent</h2>
+        <p id="agent-chat-status" class="status-line agent-chat-status" role="status" aria-live="polite" data-tone="muted"></p>
+        <button type="button" id="agent-chat-info-btn" class="info-btn" aria-label="About the chat" aria-controls="agent-chat-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+        <button type="button" id="agent-chat-new" class="icon-btn" aria-label="New chat" title="New chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M12 5v14M5 12h14"/></svg></button>
+        <button type="button" id="agent-chat-export" class="icon-btn" aria-label="Export the chat (Markdown)" title="Export the chat (Markdown)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></button>
+        <button type="button" id="agent-chat-settings-btn" class="icon-btn" aria-label="Chat settings" title="Chat settings" aria-controls="agent-chat-settings" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></button>
+        <button type="button" id="agent-chat-collapse" class="icon-btn" aria-label="Collapse the chat" title="Collapse the chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6"/></svg></button>
+      </div>
+      <div id="agent-chat-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-chat-info-btn" tabindex="-1" data-info-tip="agent-chat" hidden></div>
+      <div id="agent-chat-settings" class="control-box agent-chat-settings" hidden>
+        <div class="control-block">
+          <label for="agent-chat-provider">Provider</label>
+          <select id="agent-chat-provider" class="obs-select"></select>
+        </div>
+        <div class="control-block" id="agent-chat-key-row">
+          <div class="field-label-row">
+            <label for="agent-chat-key" id="agent-chat-key-label">API key</label>
+            <button type="button" id="agent-chat-key-info-btn" class="info-btn" aria-label="About the API key" aria-controls="agent-chat-key-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+            <a id="agent-chat-key-link" class="agent-chat-key-link" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer">Get a key</a>
+          </div>
+          <div id="agent-chat-key-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-chat-key-info-btn" tabindex="-1" data-info-tip="agent-chat-key" hidden></div>
+          <input type="password" id="agent-chat-key" class="obs-select" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore />
+          <div class="agent-chat-key-actions">
+            <label class="checkbox-inline">
+              <input type="checkbox" id="agent-chat-remember" />
+              Remember on this browser
+            </label>
+            <button type="button" id="agent-chat-forget" class="btn btn-compact">Forget</button>
+          </div>
+        </div>
+        <div class="control-block">
+          <label for="agent-chat-model">Model</label>
+          <select id="agent-chat-model" class="obs-select"></select>
+        </div>
+        <div class="control-block" id="agent-chat-effort-row">
+          <div class="field-label-row">
+            <label for="agent-chat-effort">Effort</label>
+            <button type="button" id="agent-chat-effort-info-btn" class="info-btn" aria-label="About the effort" aria-controls="agent-chat-effort-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+          </div>
+          <div id="agent-chat-effort-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-chat-effort-info-btn" tabindex="-1" data-info-tip="agent-chat-effort" hidden></div>
+          <select id="agent-chat-effort" class="obs-select"></select>
+        </div>
+        <p id="agent-chat-settings-status" class="status-line" role="status" aria-live="polite" data-tone="muted"></p>
+        <div class="control-block">
+          <div class="field-label-row">
+            <span class="field-label">Permissions</span>
+            <button type="button" id="agent-chat-permissions-info-btn" class="info-btn" aria-label="About agent permissions" aria-controls="agent-chat-permissions-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+          </div>
+          <div id="agent-chat-permissions-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-chat-permissions-info-btn" tabindex="-1" data-info-tip="agent-permissions" hidden></div>
+          <div class="agent-permissions-line">
+            <span id="agent-chat-permissions-summary" class="agent-permissions-summary"></span>
+            <button type="button" id="agent-chat-permissions-change" class="btn btn-compact" aria-haspopup="dialog" aria-controls="agent-permissions-dialog">Change…</button>
+          </div>
+        </div>
+        <div class="control-block">
+          <label for="agent-chat-instructions">Your instructions</label>
+          <textarea id="agent-chat-instructions" class="obs-select agent-chat-instructions" rows="2" placeholder="For example: I work on mouse pancreas; explain briefly." spellcheck="true"></textarea>
+        </div>
+        <div class="control-block">
+          <label for="agent-chat-budget">Token budget per chat</label>
+          <input type="number" id="agent-chat-budget" class="obs-select" min="1" step="1" inputmode="numeric" placeholder="None" />
+        </div>
+        <p id="agent-chat-usage" class="status-line" role="status" aria-live="polite" data-tone="muted"></p>
+      </div>
+      <div id="agent-chat-log" class="agent-chat-log" role="log" aria-label="Conversation" aria-relevant="additions" tabindex="0"></div>
+      <form id="agent-chat-form" class="agent-chat-composer">
+        <!-- Above the field (chat/index.js): a question's choices as buttons
+             (chat/ask.js) and the selection attached to the message
+             (chat/selection.js). -->
+        <div id="agent-chat-tray" class="agent-chat-tray" hidden></div>
+        <textarea id="agent-chat-input" class="obs-select agent-chat-input" rows="1" placeholder="Ask about this dataset…" aria-label="Message to the agent"></textarea>
+        <button type="submit" id="agent-chat-send" class="btn btn-compact btn-primary">Send</button>
+        <button type="button" id="agent-chat-stop" class="btn btn-compact" hidden>Stop</button>
+      </form>
+    </div>
+    <button type="button" id="agent-chat-toggle" class="agent-chat-toggle" aria-controls="agent-chat-panel" aria-expanded="false" aria-keyshortcuts="/" title="Open the chat (/)"><span class="agent-chat-toggle-mark" aria-hidden="true"></span><span id="agent-chat-toggle-label">Ask an agent</span></button>
+  </section>
+
 		  <div id="sidebar">
 		    <div id="sidebar-resize-handle" title="Drag to resize"></div>
 		    <div class="sidebar-scroll">
@@ -1481,6 +2135,22 @@
                 <option value="" disabled selected>Loading…</option>
               </select>
             </div>
+            <!-- My datasets: the datasets opened in this browser, the five most
+                 recent in a menu like the sample list's, every one in All… (a
+                 dialog): ui/modules/my-datasets/. Shown from its first drawing,
+                 empty too (All… alone, for Import…). -->
+            <div class="control-block relative" id="my-datasets-block" data-state-serializer-skip="true" role="group" aria-labelledby="my-datasets-title" hidden>
+              <div class="field-label-row">
+                <span class="field-label" id="my-datasets-title">My datasets</span>
+                <button type="button" id="my-datasets-info-btn" class="info-btn" aria-label="About My datasets" aria-controls="my-datasets-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="my-datasets-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="my-datasets-info-btn" tabindex="-1" data-info-tip="my-datasets" hidden></div>
+              <div class="open-menu">
+                <button type="button" id="my-datasets-btn" class="obs-select my-datasets-button" aria-haspopup="menu" aria-expanded="false" aria-controls="my-datasets-menu" aria-describedby="my-datasets-title">Choose a dataset…</button>
+                <div id="my-datasets-menu" class="open-menu-list my-datasets-menu" role="menu" aria-labelledby="my-datasets-title" hidden></div>
+              </div>
+              <p id="my-datasets-status" class="status-line" role="status" aria-live="polite" hidden></p>
+            </div>
             <div class="control-block relative" id="user-data-block" data-state-serializer-skip="true" role="group" aria-labelledby="user-data-title">
               <div class="field-label-row">
                 <span class="field-label" id="user-data-title">File or folder</span>
@@ -1546,18 +2216,6 @@
             <div class="kept-stores-row">
               <span id="kept-stores-text" class="kept-stores-summary"></span>
               <button type="button" id="kept-stores-manage-btn" class="btn btn-compact" aria-haspopup="dialog" aria-controls="kept-stores-dialog">Manage…</button>
-            </div>
-          </div>
-
-          <div class="control-block" id="session-state-controls" role="group" aria-labelledby="session-state-title">
-            <div class="control-group-header">
-              <h3 class="section-title" id="session-state-title">Session file</h3>
-              <button type="button" id="session-state-info-btn" class="info-btn" aria-label="About session files" aria-controls="session-state-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
-            </div>
-            <div id="session-state-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="session-state-info-btn" tabindex="-1" data-info-tip="session-file" hidden></div>
-            <div class="d-flex gap-2">
-              <button type="button" id="save-state-btn" class="btn flex-1">Save</button>
-              <button type="button" id="load-state-btn" class="btn flex-1">Load</button>
             </div>
           </div>
 
@@ -1688,6 +2346,131 @@
             <div id="data-mapping-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="data-mapping-info-btn" tabindex="-1" data-info-tip="data-mapping" hidden></div>
             <div class="disclosure-content" id="data-mapping-body" hidden>
               <div id="data-mapping-root" data-state-serializer-skip="true"></div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- State: the session (Share…, Load…) and the history of the dataset
+           shown as a branch graph (ui/modules/state/, drawn from
+           app/history/current.js; History v2 §3.10). Three header controls
+           and one status line; everything else opens on demand. Nothing
+           here is a session control. -->
+      <details class="accordion-section" id="state-section" data-state-serializer-skip="true" open>
+        <summary>State</summary>
+        <div class="accordion-content">
+          <div class="control-block" id="session-state-controls" role="group" aria-labelledby="session-state-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="session-state-title">Session</h3>
+              <button type="button" id="session-state-info-btn" class="info-btn" aria-label="About sharing and loading" aria-controls="session-state-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              <div class="control-group-action history-session-actions">
+                <button type="button" id="history-share-btn" class="btn btn-compact" aria-haspopup="dialog" aria-controls="history-share-dialog" disabled>Share…</button>
+                <button type="button" id="history-load-btn" class="btn btn-compact" aria-haspopup="dialog" aria-controls="saved-states-dialog">Load…</button>
+              </div>
+            </div>
+            <div id="session-state-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="session-state-info-btn" tabindex="-1" data-info-tip="session-file" hidden></div>
+          </div>
+
+          <div class="control-block" id="history-block" role="group" aria-labelledby="history-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="history-title">History</h3>
+              <button type="button" id="history-info-btn" class="info-btn" aria-label="About the history" aria-controls="history-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              <div class="history-actions control-group-action" role="group" aria-label="History">
+                <button type="button" id="history-search-btn" class="icon-btn" aria-label="Search the history" title="Search the history" aria-expanded="false" aria-controls="history-search" aria-keyshortcuts="/" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
+                <button type="button" id="history-undo-btn" class="icon-btn" aria-label="Undo" title="Undo" aria-keyshortcuts="Control+Z Meta+Z" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
+                <button type="button" id="history-redo-btn" class="icon-btn" aria-label="Redo" title="Redo" aria-keyshortcuts="Shift+Control+Z Shift+Meta+Z Control+Y" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
+                <button type="button" id="history-settings-btn" class="icon-btn" aria-label="History settings" title="History settings" aria-expanded="false" aria-controls="history-settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></button>
+                <div class="open-menu history-menu">
+                  <button type="button" id="history-menu-btn" class="icon-btn" aria-label="More: tour, compare, branch map, export" title="More: tour, compare, branch map, export" aria-haspopup="menu" aria-expanded="false" aria-controls="history-menu" disabled><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+                  <div id="history-menu" class="open-menu-list history-menu-list" role="menu" aria-labelledby="history-menu-btn" hidden>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="tour"><span class="open-menu-item-label">Play as a tour</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="diff"><span class="open-menu-item-label">Compare two steps…</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="map"><span class="open-menu-item-label">Branch map…</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="deleted"><span class="open-menu-item-label">Recently deleted…</span></button>
+                    <div class="open-menu-separator" role="separator"></div>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="pseudocode"><span class="open-menu-item-label">Copy pseudocode</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="methods"><span class="open-menu-item-label">Copy methods</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="report"><span class="open-menu-item-label">Print report…</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="anndata" title="A new .zarr.zip of the whole dataset with the labels, fields, highlights and gene sets shown; Python and R read it"><span class="open-menu-item-label">Save AnnData with this state…</span></button>
+                    <div class="open-menu-separator" role="separator"></div>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="replay"><span class="open-menu-item-label">Replay a saved history…</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="tracker"><span class="open-menu-item-label">Start another tracker…</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="at-time"><span class="open-menu-item-label">Show the state at…</span></button>
+                    <button type="button" class="open-menu-item" role="menuitem" tabindex="-1" data-history-command="clear"><span class="open-menu-item-label">Clear history, keep the state…</span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div id="history-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="history-info-btn" tabindex="-1" data-info-tip="history" hidden></div>
+            <!-- History settings (History v2 §3.15.5): what is recorded, in this browser. -->
+            <div id="history-settings" class="control-box history-settings" role="group" aria-labelledby="history-settings-title" hidden>
+              <p class="history-settings-title" id="history-settings-title">Record</p>
+              <!-- Its rows are built from HISTORY_SETTINGS (ui/modules/state/index.js). -->
+            </div>
+            <div id="history-search" class="history-search" role="search" aria-label="Search the history" hidden>
+              <input type="search" id="history-search-input" class="obs-select" placeholder="Steps, notes, bookmarks" aria-label="Search steps, notes and bookmarks" autocomplete="off" spellcheck="false" />
+              <button type="button" id="history-filter-btn" class="btn btn-compact" aria-haspopup="menu" aria-expanded="false">Filter</button>
+            </div>
+            <div class="history-status-row">
+              <button type="button" id="history-recording" class="history-recording" role="switch" aria-checked="true" aria-label="Recording" title="Pause or resume recording" disabled><span class="history-recording-dot" aria-hidden="true"></span><span class="history-recording-text">Recording</span></button>
+              <button type="button" id="history-branch-btn" class="history-branch-btn" aria-expanded="false" aria-controls="history-branches" disabled><span class="history-branch-name">Main</span><span class="history-branch-caret" aria-hidden="true">▾</span></button>
+              <p id="history-status" class="status-line history-status" role="status" aria-live="polite">History starts when a dataset is open.</p>
+              <p id="history-announce" class="sr-only" role="status" aria-live="polite"></p>
+              <button type="button" id="history-stale-btn" class="history-status-chip" aria-label="Stale results: show them" hidden></button>
+              <button type="button" id="history-memory-btn" class="history-status-chip history-memory-chip" aria-label="History memory: see where it goes" aria-haspopup="dialog" aria-controls="history-memory-dialog" hidden></button>
+              <button type="button" id="history-pending-cancel" class="history-status-chip" hidden>Cancel</button>
+            </div>
+            <!-- The branch picker (ui/modules/state/branch-picker.js). -->
+            <div id="history-branches" class="control-box history-branches" role="group" aria-label="Branches" hidden></div>
+            <!-- Where a shared, loaded or replayed tracker comes from (workflow-banner.js). -->
+            <div id="history-banner" class="history-banner" hidden></div>
+            <div id="history-graph" class="history-graph" aria-labelledby="history-title" hidden></div>
+            <button type="button" id="history-where" class="btn btn-compact history-where" aria-label="Scroll to the step shown" hidden></button>
+          </div>
+        </div>
+      </details>
+
+      <!-- Agents: Claude and ChatGPT working in this browser's Cellucid tabs
+           through the Cellucid relay (assets/js/app/agent/connect/). One
+           status line, the connector address, a code typed from another
+           device; Manage… lists the connections. Not a session control. -->
+      <details class="accordion-section" id="agents-section" data-state-serializer-skip="true">
+        <summary>Agents</summary>
+        <div class="accordion-content">
+          <div class="control-block" id="agent-connect-block" role="group" aria-labelledby="agent-connect-title">
+            <div class="control-group-header">
+              <h3 class="section-title" id="agent-connect-title">Claude and ChatGPT</h3>
+              <button type="button" id="agent-connect-info-btn" class="info-btn" aria-label="About connecting Claude and ChatGPT" aria-controls="agent-connect-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              <button type="button" id="agent-connections-open-btn" class="btn btn-compact control-group-action" aria-haspopup="dialog" aria-controls="agent-connections-dialog">Manage…</button>
+            </div>
+            <div id="agent-connect-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-connect-info-btn" tabindex="-1" data-info-tip="agent-connect" hidden></div>
+            <p id="agent-connect-status" class="status-line agent-connect-status" role="status" aria-live="polite">Starting…</p>
+            <div class="control-block">
+              <label for="agent-connector-address">Connector address</label>
+              <div class="address-row">
+                <input type="text" id="agent-connector-address" class="obs-select" readonly autocomplete="off" spellcheck="false" />
+                <button type="button" id="agent-connector-copy" class="btn btn-compact" aria-label="Copy the connector address">Copy</button>
+              </div>
+            </div>
+            <form class="control-block" id="agent-connect-code-form" novalidate>
+              <label for="agent-connect-code">Code from another device</label>
+              <div class="address-row">
+                <input type="text" id="agent-connect-code" class="obs-select" placeholder="ABCD-EFGH" autocomplete="off" spellcheck="false" autocapitalize="characters" enterkeyhint="go" maxlength="20" aria-describedby="agent-connect-code-status" />
+                <button type="submit" id="agent-connect-code-btn" class="btn btn-compact">Connect</button>
+              </div>
+              <p id="agent-connect-code-status" class="status-line" role="status" aria-live="polite" hidden></p>
+            </form>
+            <!-- The person's permissions govern these agents as they do the chat's (assets/js/app/agent/presence/). -->
+            <div class="control-block">
+              <div class="field-label-row">
+                <span class="field-label" id="agent-connect-permissions-label">Permissions</span>
+                <button type="button" id="agent-connect-permissions-info-btn" class="info-btn" aria-label="About agent permissions" aria-controls="agent-connect-permissions-info-tooltip" aria-haspopup="dialog" aria-expanded="false"><span aria-hidden="true">i</span></button>
+              </div>
+              <div id="agent-connect-permissions-info-tooltip" class="info-tooltip" role="dialog" aria-labelledby="agent-connect-permissions-info-btn" tabindex="-1" data-info-tip="agent-permissions" hidden></div>
+              <div class="agent-permissions-line" role="group" aria-labelledby="agent-connect-permissions-label">
+                <span id="agent-connect-permissions-summary" class="agent-permissions-summary"></span>
+                <button type="button" id="agent-connect-permissions-change" class="btn btn-compact" aria-haspopup="dialog" aria-controls="agent-permissions-dialog">Change…</button>
+              </div>
             </div>
           </div>
         </div>
@@ -2678,9 +3461,10 @@
             <!-- Select mode stands in for a held Alt key, so a touch screen can
                  select at all: while it is on a plain tap, click, or drag runs
                  the active tool, and the combine buttons stand in for Shift
-                 (Add) and Ctrl (Subtract). It is an input setting like holding
-                 Alt, not session state, so neither group carries
-                 data-state-serializer-pressed-group. The same switch and
+                 (Add) and Ctrl (Subtract). It is an input mode like holding
+                 Alt, as the Tool above is: page chrome, not state, so neither
+                 is a setting or a step (state-serializer/README.md). The same
+                 switch and
                  combine buttons sit in the selection bar over the plot
                  (#select-bar). -->
             <div class="control-block highlight-select-mode-row">
@@ -2839,6 +3623,8 @@
             <div class="shortcut-item"><span class="shortcut-desc" title="Shows that dimension's default embedding in the selected view; press again for its next embedding">1D, 2D, 3D embedding · again: next</span><span class="shortcut-keys"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd></span></div>
             <div class="shortcut-item"><span class="shortcut-desc">Navigation mode</span><span class="shortcut-keys"><kbd>O</kbd><kbd>P</kbd><kbd>G</kbd></span></div>
             <div class="shortcut-item"><span class="shortcut-desc">Show shortcuts</span><span class="shortcut-keys"><kbd>?</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Undo the last step</span><span class="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>Z</kbd></span></div>
+            <div class="shortcut-item"><span class="shortcut-desc">Redo</span><span class="shortcut-keys"><kbd>Shift</kbd>+<kbd>Ctrl</kbd>+<kbd>Z</kbd></span></div>
           </div>
           <!-- Every row here is checked against the handler that implements it
                by tests/keyboard-shortcut-panel-contract.test.mjs. A row that
@@ -3085,7 +3871,7 @@
     <div id="stats" class="sr-only">Loading data…</div>
 
       <div id="copyright">
-        <p>© <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">Kemal Inecik</a> · <a href="https://www.helmholtz-munich.de/en/icb/research-groups/theis-lab" target="_blank" rel="noopener noreferrer">Theis Lab</a></p>
+        <p>© <a href="https://kemalinecik.com" target="_blank" rel="noopener noreferrer">Kemal Inecik</a> · <a href="https://www.helmholtz-munich.de/en/icb/research-groups/theis-lab" target="_blank" rel="noopener noreferrer">Theis Lab</a> · <a href="mailto:hello@cellucid.com">Contact</a></p>
         <p><a href="https://docs.cellucid.com/en/latest/" target="_blank" rel="noopener noreferrer">Docs</a> · <a href="https://docs.cellucid.com/en/latest/citing.html" target="_blank" rel="noopener noreferrer" id="footer-cite-link" data-cite-open>Cite</a> · <a href="https://github.com/theislab/cellucid" target="_blank" rel="noopener noreferrer">GitHub</a> · <a href="privacy.html" target="_blank" rel="noopener">Privacy</a> · <a href="terms.html" target="_blank" rel="noopener">Terms</a></p>
         <p><a href="#" id="license-link">BSD 3-Clause license</a> · <a href="accessibility.html" target="_blank" rel="noopener">Accessibility</a></p>
         <p>Version <span id="web-version" aria-label="Cellucid version"></span> · Build <span id="web-build-version" aria-label="Website build version"></span></p>

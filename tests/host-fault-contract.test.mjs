@@ -338,13 +338,13 @@ test('a Retry-After on a successful answer is a budget header, never a wait (Zen
   const hosts = createHostBook({});
   const url = 'https://zenodo.org/api/records/13255338';
   const answer = () => new Response('{"id":13255338}', { status: 200, headers: { 'Retry-After': '60', 'Content-Type': 'application/json' } });
-  const started = Date.now();
+  const waits = [];
   for (let i = 0; i < 3; i++) {
-    const { response } = await fetchOnce(url, {}, { fetchImpl: async () => answer(), hosts, wantsBody: () => true });
+    const { response } = await fetchOnce(url, {}, { fetchImpl: async () => answer(), hosts, wantsBody: () => true, onWait: wait => waits.push(wait) });
     assert.equal(response.status, 200);
   }
   assert.equal(hosts.heldForMs(url), 0, 'the host is not held');
-  assert.ok(Date.now() - started < 1000, 'nothing waited');
+  assert.deepEqual(waits, [], 'nothing waited');
   // The same header on a 429 holds the host for what it names.
   await fetchOnce(url, {}, { fetchImpl: async () => new Response('', { status: 429, headers: { 'Retry-After': '60' } }), hosts, wantsBody: () => false });
   assert.ok(hosts.heldForMs(url) > 50_000, `held for ${hosts.heldForMs(url)} ms`);

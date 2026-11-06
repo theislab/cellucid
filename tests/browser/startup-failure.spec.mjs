@@ -71,7 +71,7 @@ test('a data link that does not open leaves Cellucid running and offers the ways
   page
 }) => {
   const missing = appUrl('/tests/browser/fixtures/missing-startup-link.h5ad');
-  await page.goto(`/?data=${encodeURIComponent(missing)}&dataset=x`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(missing)}&dataset=x`, { waitUntil: 'domcontentloaded' });
   // Not the startup failure screen: the app starts, and the failed opening
   // says why over the empty viewer.
   const failed = page.locator('.opening-overlay[data-state="failed"]');
@@ -96,7 +96,7 @@ test('a data link that does not open leaves Cellucid running and offers the ways
   // parameters and nothing else, and the app is there to use.
   await failed.getByRole('button', { name: 'Open without this link' }).click();
   await expect(page.locator('.opening-overlay')).toBeHidden();
-  expect(new URL(page.url()).search).toBe('');
+  expect([...new URL(page.url()).searchParams.keys()]).toEqual(['sampleCatalog']);
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expect(page.locator('#user-data-open-btn')).toBeEnabled();
 });
@@ -253,7 +253,7 @@ test('a stalled published default session ends startup naming its phase and URL'
 test('a successful startup publishes its phases and ends ready', async ({
   page
 }) => {
-  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
   await expect(page.locator('html')).toHaveAttribute(
     'data-startup-phase',
     'ready'
@@ -266,7 +266,7 @@ test('a failed opening stays in view above the sidebar, which open on a phone fi
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const missing = appUrl('/tests/browser/fixtures/missing-startup-link.h5ad');
-  await page.goto(`/?data=${encodeURIComponent(missing)}&dataset=x`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(missing)}&dataset=x`, { waitUntil: 'domcontentloaded' });
   const failed = page.locator('.opening-overlay[data-state="failed"]');
   await expect(failed).toBeVisible();
   const panel = failed.locator('.opening-panel');

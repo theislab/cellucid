@@ -70,6 +70,7 @@ import { beginCellsChangeOnceSettled } from '../data/open-cells-work.js';
 import { formatCount, formatCountOf } from '../utils/format-units.js';
 import { isCancellation, cancel } from '../utils/abort.js';
 import { failureText } from '../utils/errors.js';
+import { isChangedOnHost } from '../data/data-source.js';
 
 /**
  * Where each open cell of `after` was open in `before` (the same cells in
@@ -519,9 +520,10 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
         if (!isCancellation(error) && !stop.aborted) {
           console.error('[OpenCellsResize] Progressive opening stopped:', error);
           // The view is left incomplete: a warning, with the way to go on.
+          // A store changed on its host gives the same answer however often it is asked.
           notify(`Reading the rest of the cells stopped: ${failureText(error)}. ${formatCountOf(state.pointCount, 'cell')} are open.`, {
             level: 'warning',
-            action: { label: 'Read the rest', run: () => void grow(annData, signal) },
+            ...(isChangedOnHost(error) ? {} : { action: { label: 'Read the rest', run: () => void grow(annData, signal) } }),
           });
         }
       }
@@ -552,10 +554,10 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
 /**
  * What a resize could not keep as it was, in sentences, or ''.
  *
- * @param {{extended: string[], droppedGroups: string[], resetRanges: string[]}} outcome
+ * @param {{extended: string[], droppedGroups: string[], resetRanges: string[], resetFilters?: string[]}} outcome
  * @returns {string}
  */
-export function describeOutcome({ droppedGroups, resetRanges, extended }) {
+export function describeOutcome({ droppedGroups, resetRanges, resetFilters = [], extended }) {
   const parts = [];
   if (droppedGroups.length > 0) {
     parts.push(droppedGroups.length === 1
@@ -564,6 +566,9 @@ export function describeOutcome({ droppedGroups, resetRanges, extended }) {
   }
   if (resetRanges.length > 0) {
     parts.push(`No cell open now lies in ${resetRanges.join(', ')}: ${resetRanges.length === 1 ? 'it was' : 'they were'} reset.`);
+  }
+  if (resetFilters.length > 0) {
+    parts.push(`The filter of ${resetFilters.map(key => `"${key}"`).join(', ')} could not be kept on the cells added and shows every category again.`);
   }
   if (extended.length > 0) {
     parts.push(`The cells added hold categories ${extended.map(key => `"${key}"`).join(', ')} had not shown: shown beside the others, which keep their colours.`);

@@ -1,0 +1,46 @@
+{
+  "examples": [
+    {
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "threshold": 0
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "threshold": {
+        "maximum": 1,
+        "minimum": 0,
+        "type": "number"
+      }
+    },
+    "required": [
+      "field",
+      "threshold"
+    ],
+    "type": "object"
+  },
+  "type": "filter.outlier",
+  "version": 1
+}

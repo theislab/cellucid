@@ -222,6 +222,9 @@ test('a listing given up because another file failed leaves an opening of the sa
   let held = false;
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input instanceof Request ? input.url : input);
+    // The file that fails answers once the other is being read: answered first, the listing gives up
+    // before it asks for the other at all, and nothing here is ever reached.
+    if (url.endsWith('/missing.h5ad')) await reachedFile;
     if (url.endsWith('/ready.h5ad') && !held) {
       held = true;
       reached();
@@ -383,6 +386,7 @@ test('a listed file that changed on an ETag-less host after it was described fai
   // Larger than the head read beside the probe: opening reads past it.
   const bytes = new Uint8Array(readFileSync(new URL('./browser/fixtures/uint32-categories.h5ad', import.meta.url)));
   let modified = 'Mon, 26 Oct 2026 10:00:00 GMT';
+  let served = bytes;
   let probes = 0;
   const original = globalThis.fetch;
   globalThis.fetch = async (input, init = {}) => {
@@ -395,7 +399,7 @@ test('a listed file that changed on an ETag-less host after it was described fai
     }
     const [, start, end] = /bytes=(\d+)-(\d+)/.exec(init.headers?.Range ?? init.headers?.get?.('Range') ?? '');
     const last = Math.min(bytes.length - 1, Number(end));
-    return new Response(bytes.slice(Number(start), last + 1), { status: 206, headers: { ...headers, 'Content-Range': `bytes ${start}-${last}/${bytes.length}` } });
+    return new Response(served.slice(Number(start), last + 1), { status: 206, headers: { ...headers, 'Content-Range': `bytes ${start}-${last}/${bytes.length}` } });
   };
   undoLater(t, () => {
     globalThis.fetch = original;
@@ -412,12 +416,17 @@ test('a listed file that changed on an ETag-less host after it was described fai
   const changing = globalThis.fetch;
   globalThis.fetch = async (input, init = {}) => {
     const answer = await changing(input, init);
-    if ((init.method ?? 'GET') !== 'HEAD' && probes > 0) modified = 'Tue, 27 Oct 2026 10:00:00 GMT';
+    if ((init.method ?? 'GET') !== 'HEAD' && probes > 0) {
+      modified = 'Tue, 27 Oct 2026 10:00:00 GMT';
+      served = bytes.map(byte => byte ^ 0x5a);
+    }
     return answer;
   };
   await assert.rejects(owner.open('uint32-categories'), /changed on the host/);
   const described = probes;
   globalThis.fetch = changing;
+  // The new version, whole: what opening it again reads.
+  served = bytes;
   const { metadata } = await owner.open('uint32-categories');
   assert.equal(metadata.id, 'uint32-categories');
   assert.ok(probes > described, 'the file was described again');

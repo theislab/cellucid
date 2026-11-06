@@ -513,6 +513,8 @@ export class FieldOverlayInternalMethods {
       delete copy._originalCategories;
       delete copy.outlierQuantiles;
       delete copy._outlierThreshold;
+      // A limit names a category of the old definition (`category-cell-sample.js`).
+      delete copy._categoryCellLimits;
     });
     getFieldRegistry().invalidate();
   }
@@ -664,6 +666,21 @@ export class FieldOverlayInternalMethods {
     }
   }
 
+  /**
+   * Give `field` centroid tables labelled by its categories, after they
+   * changed from `previousCategories` (position for position).
+   *
+   * A field's centroid tables, like its category list, are never written in
+   * place: a kept view's field is a shallow copy (`_cloneFieldState`) that
+   * shares them, and a relabel written into the shared records changed the
+   * other view's centroids under its unchanged categories (an undo past
+   * `view.keep` after a category rename then found labels it did not hold).
+   * A relabel makes a new table of new records; positions stay shared with
+   * the field's `_normalizedLayouts`, which records their normalization.
+   *
+   * @param {object} field - A categorical field whose `categories` changed
+   * @param {Array<string|number|boolean>} previousCategories
+   */
   _syncCentroidCategoryLabels(field, previousCategories) {
     requireField(field, 'Centroid field');
     if (field.kind !== FieldKind.CATEGORY) {
@@ -699,7 +716,8 @@ export class FieldOverlayInternalMethods {
     if (!(byLayout instanceof Map)) {
       throw new TypeError('Category field centroidsByLayout must be a Map');
     }
-    const pendingUpdates = [];
+    const relabelled = new Map();
+    let changed = false;
     for (const [layoutKey, centroids] of byLayout) {
       if (typeof layoutKey !== 'string' || layoutKey.length === 0) {
         throw new TypeError(
@@ -712,6 +730,7 @@ export class FieldOverlayInternalMethods {
         );
       }
       const seenCategories = new Set();
+      const next = new Array(centroids.length);
       for (let centroidIndex = 0; centroidIndex < centroids.length; centroidIndex++) {
         const centroid = requireObjectRecord(
           centroids[centroidIndex],
@@ -729,15 +748,17 @@ export class FieldOverlayInternalMethods {
           );
         }
         seenCategories.add(centroid.category);
-        pendingUpdates.push([
-          centroid,
-          categoryMapping.get(centroid.category),
-        ]);
+        const category = categoryMapping.get(centroid.category);
+        if (category === centroid.category) {
+          next[centroidIndex] = centroid;
+        } else {
+          next[centroidIndex] = { ...centroid, category };
+          changed = true;
+        }
       }
+      relabelled.set(layoutKey, next);
     }
-    pendingUpdates.forEach(([centroid, category]) => {
-      centroid.category = category;
-    });
+    if (changed) field.centroidsByLayout = relabelled;
   }
 
   _refreshHighlightGroupsForField(source, fieldIndex) {

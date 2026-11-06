@@ -10,7 +10,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  holdShownCells,
   OPENING_COST_STORAGE_KEY,
   progressiveRequest,
   recordFirstFrame,
@@ -18,6 +17,7 @@ import {
   resetShownCells,
   shownMsPerCell,
 } from '../assets/js/data/opening-cost.js';
+import { holdMachine } from '../assets/js/utils/machine.js';
 
 /** Frames run by hand: `afterNextFrame` queues, `drawFrame` runs the queue. */
 function frames() {
@@ -163,9 +163,13 @@ test('the measure is kept under the key of its meaning; an earlier meaning is no
   }
 });
 
-test('a held measure is the measure, whatever the page records, until reset', async () => {
+test('a held measure is the measure, whatever the page records, until released', async t => {
   resetShownCells();
-  holdShownCells(null);
+  t.after(() => {
+    holdMachine(null);
+    resetShownCells();
+  });
+  holdMachine({ shownCellMs: null });
   recordShownCells(1000, 5000);
   const { afterNextFrame, drawFrame } = frames();
   const recorded = recordFirstFrame({ cells: 1000, startedAt: performance.now() - 500, afterNextFrame, drawn: () => true });
@@ -173,13 +177,14 @@ test('a held measure is the measure, whatever the page records, until reset', as
   assert.equal(typeof await recorded, 'number', 'the first frame is still timed');
   assert.equal(shownMsPerCell(), null, 'nothing measured, as held');
   assert.equal(progressiveRequest().msPerCell, null);
-  holdShownCells(2);
+  holdMachine({ shownCellMs: 2 });
   recordShownCells(1000, 1);
   assert.equal(shownMsPerCell(), 2);
-  assert.throws(() => holdShownCells(-1), RangeError);
-  assert.throws(() => holdShownCells(Number.NaN), RangeError);
-  resetShownCells();
+  assert.throws(() => holdMachine({ shownCellMs: -1 }), RangeError);
+  assert.throws(() => holdMachine({ shownCellMs: Number.NaN }), RangeError);
+  assert.equal(shownMsPerCell(), 2, 'a hold refused leaves the hold before it');
+  holdMachine(null);
+  assert.equal(shownMsPerCell(), null, 'released: nothing a held machine opened was recorded');
   recordShownCells(1000, 1);
   assert.equal(shownMsPerCell(), 0.001, 'released: records count again');
-  resetShownCells();
 });

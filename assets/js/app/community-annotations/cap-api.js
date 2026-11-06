@@ -12,14 +12,14 @@
 
 import { getGitHubWorkerOrigin } from './github-auth.js';
 import { parseExactJson } from './wire-contract.js';
+import { WORKER_CONTRACT_VERSION } from './worker-contract.js';
+import { defaultWorkerTransport, requestWorker } from './worker-request.js';
 import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
-import { cancelled, isCancellation, onAbort } from '../../utils/abort.js';
+import { cancelled, isCancellation } from '../../utils/abort.js';
+import { toCleanString } from '../../utils/clean-string.js';
 
-const CAP_DEFAULT_TIMEOUT_MS = 12_000;
-const CAP_WORKER_CONTRACT_VERSION = 2;
 const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
-const CAP_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024;
 /**
  * Results one lookup fetches (the worker's CAP_LOOKUP_LIMIT_MAX). The voting
  * modal asks for all of them, so every fetched result is shown; a term whose
@@ -29,8 +29,7 @@ export const CAP_LOOKUP_LIMIT = 25;
 const CAP_TERM_MAX_CODEPOINTS = 256;
 const CAP_MARKER_TERM_MAX_CODEPOINTS = (50 * 64) + 49;
 // A CAP result's strings and arrays have no length limit of their own: a
-// result is shown whole, and the whole response is bounded by
-// CAP_RESPONSE_BODY_MAX_BYTES.
+// result is shown whole.
 const CAP_RESULT_UNBOUNDED = Number.MAX_SAFE_INTEGER;
 // A gene a marker search may name: the worker accepts at most
 // CAP_MARKER_TERM_MAX_CODEPOINTS for the whole marker signature.
@@ -52,10 +51,6 @@ const LOOKUP_RESULT_KEYS = [
   'scores',
   'synonyms',
 ];
-
-function toCleanString(value) {
-  return String(value ?? '').trim();
-}
 
 function exceedsCodePointLimit(value, maximum) {
   if (value.length <= maximum) return false;
@@ -119,82 +114,9 @@ function assertAbortSignalOrNull(signal) {
   return signal;
 }
 
-function assertTimeoutMs(timeoutMs) {
-  if (
-    typeof timeoutMs !== 'number' ||
-    !Number.isSafeInteger(timeoutMs) ||
-    timeoutMs < 0
-  ) {
-    throw new Error('CAP timeoutMs must be a nonnegative safe integer');
-  }
-  return timeoutMs;
-}
-
 function ownerAbortReason(signal, defaultCause = undefined) {
   if (signal?.reason instanceof Error || isCancellation(signal?.reason)) return signal.reason;
   return cancelled('user', 'CAP request was cancelled.', defaultCause);
-}
-
-function createRequestAbortScope(signal, timeoutMs) {
-  const ownerSignal = assertAbortSignalOrNull(signal);
-  const ms = assertTimeoutMs(timeoutMs);
-  if (typeof AbortController !== 'function') {
-    throw new Error('AbortController is required for CAP requests');
-  }
-  const controller = new AbortController();
-  let abortCause = null;
-  const abort = (cause, reason = undefined) => {
-    if (abortCause !== null) return;
-    abortCause = cause;
-    controller.abort(reason);
-  };
-  const stopOwner = onAbort(ownerSignal, () => abort('owner', ownerSignal.reason));
-
-  /** @type {ReturnType<typeof setTimeout>|null} */
-  let timeout = null;
-  if (ms > 0) {
-    try {
-      timeout = setTimeout(() => {
-        abort('timeout', new DOMException(`CAP request timed out after ${ms}ms`, 'TimeoutError'));
-      }, ms);
-    } catch (error) {
-      stopOwner();
-      throw error;
-    }
-  }
-
-  return {
-    controller,
-    ownerSignal,
-    abortCause: () => abortCause,
-    cleanup() {
-      try {
-        if (timeout !== null) clearTimeout(timeout);
-      } catch {
-        // Request cleanup cannot replace its primary outcome.
-      }
-      stopOwner();
-    },
-  };
-}
-
-function throwIfRequestEnded(scope, cause = undefined) {
-  const abortCause = scope.abortCause();
-  if (abortCause === 'owner') {
-    throw ownerAbortReason(scope.ownerSignal, cause);
-  }
-  if (abortCause === 'timeout') {
-    const error = new Error('CAP request timed out');
-    error.code = 'CAP_REQUEST_TIMEOUT';
-    if (cause !== undefined) error.cause = cause;
-    throw error;
-  }
-}
-
-function isNetworkError(error) {
-  if (error instanceof TypeError) return true;
-  const message = toCleanString(error?.message);
-  return /failed to fetch|load failed|networkerror|fetch failed/i.test(message);
 }
 
 /** The worker's one CAP route: a fixed persisted cell-type lookup. */
@@ -226,213 +148,82 @@ function createCapError(message, code, cause = undefined) {
   return error;
 }
 
-async function cancelResponseBodyPreservingOutcome(response) {
-  if (response?.body && typeof response.body.cancel === 'function') {
-    try {
-      await response.body.cancel();
-    } catch {
-      // Preserve the authoritative response-boundary outcome.
-    }
-  }
-}
-
-function assertResponseContentLength(response) {
-  const raw = response?.headers?.get?.('content-length') ?? null;
-  if (raw === null || raw === '') return;
-  if (!/^\d+$/.test(raw)) return;
-  const byteLength = Number(raw);
-  if (
-    !Number.isSafeInteger(byteLength) ||
-    byteLength > CAP_RESPONSE_BODY_MAX_BYTES
-  ) {
-    throw createCapError(
-      `CAP proxy response exceeds ${CAP_RESPONSE_BODY_MAX_BYTES} bytes`,
-      'CAP_RESPONSE_TOO_LARGE'
-    );
-  }
-}
-
-async function readBoundedResponseText(response) {
-  try {
-    assertResponseContentLength(response);
-  } catch (error) {
-    await cancelResponseBodyPreservingOutcome(response);
-    throw error;
-  }
-
-  const body = response?.body;
-  if (body && typeof body.getReader === 'function') {
-    const reader = body.getReader();
-    // Preserve a UTF-8 BOM so the exact JSON boundary rejects it.
-    const decoder = new TextDecoder('utf-8', {
-      fatal: true,
-      ignoreBOM: true,
-    });
-    const chunks = [];
-    let byteLength = 0;
-    let streamDone = false;
-    let readerCancelled = false;
-    const cancelLiveReader = async () => {
-      if (streamDone || readerCancelled) return;
-      readerCancelled = true;
-      try {
-        await reader.cancel();
-      } catch {
-        // Preserve the authoritative response-boundary outcome.
-      }
-    };
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          streamDone = true;
-          break;
-        }
-        if (!(value instanceof Uint8Array)) {
-          throw createCapError(
-            'CAP proxy response stream returned a non-byte chunk',
-            'CAP_RESPONSE_INVALID'
-          );
-        }
-        byteLength += value.byteLength;
-        if (byteLength > CAP_RESPONSE_BODY_MAX_BYTES) {
-          const sizeError = createCapError(
-            `CAP proxy response exceeds ${CAP_RESPONSE_BODY_MAX_BYTES} bytes`,
-            'CAP_RESPONSE_TOO_LARGE'
-          );
-          await cancelLiveReader();
-          throw sizeError;
-        }
-        try {
-          chunks.push(decoder.decode(value, { stream: true }));
-        } catch (cause) {
-          throw createCapError(
-            'CAP proxy response is not valid UTF-8',
-            'CAP_RESPONSE_INVALID',
-            cause
-          );
-        }
-      }
-      try {
-        chunks.push(decoder.decode());
-      } catch (cause) {
-        throw createCapError(
-          'CAP proxy response is not valid UTF-8',
-          'CAP_RESPONSE_INVALID',
-          cause
-        );
-      }
-      return chunks.join('');
-    } catch (cause) {
-      await cancelLiveReader();
-      throw cause;
-    }
-  }
-
-  // Non-streaming path: the platform allocates response.text() before we can
-  // measure it. Content-Length is still preflighted and the decoded byte count
-  // is enforced, but streaming browsers take the bounded path above.
-  const text = await response.text();
-  const byteLength = new TextEncoder().encode(text).byteLength;
-  if (byteLength > CAP_RESPONSE_BODY_MAX_BYTES) {
-    throw createCapError(
-      `CAP proxy response exceeds ${CAP_RESPONSE_BODY_MAX_BYTES} bytes`,
-      'CAP_RESPONSE_TOO_LARGE'
-    );
-  }
-  return text;
-}
-
-async function executeLookupProxy(body, {
-  signal = null,
-  timeoutMs = CAP_DEFAULT_TIMEOUT_MS,
-} = {}) {
+/**
+ * One CAP lookup through the Worker, sent through the app's one transport
+ * (`worker-request.js`): a stall timeout from the measured link instead of a
+ * fixed deadline, the request budget the Worker states, and retries of busy
+ * answers. A request the Worker never answered throws its
+ * `GITHUB_WORKER_UNREACHABLE` failure; one the caller stopped throws the
+ * caller's reason.
+ */
+async function executeLookupProxy(body, { signal = null, transport = null } = {}) {
   requireExactObjectKeys(body, ['kind', 'term', 'limit'], 'CAP proxy request body');
-  const scope = createRequestAbortScope(signal, timeoutMs);
+  const ownerSignal = assertAbortSignalOrNull(signal);
+  if (ownerSignal?.aborted) throw ownerAbortReason(ownerSignal);
+  const requestBody = JSON.stringify(body);
+  if (new TextEncoder().encode(requestBody).byteLength > CAP_REQUEST_BODY_MAX_BYTES) {
+    throw createCapError(
+      `CAP proxy request exceeds ${CAP_REQUEST_BODY_MAX_BYTES} bytes`,
+      'CAP_REQUEST_TOO_LARGE'
+    );
+  }
+  const origin = getGitHubWorkerOrigin();
+  let answer;
   try {
-    throwIfRequestEnded(scope);
-    const requestBody = JSON.stringify(body);
-    if (
-      new TextEncoder().encode(requestBody).byteLength >
-      CAP_REQUEST_BODY_MAX_BYTES
-    ) {
-      throw createCapError(
-        `CAP proxy request exceeds ${CAP_REQUEST_BODY_MAX_BYTES} bytes`,
-        'CAP_REQUEST_TOO_LARGE'
-      );
-    }
-    const response = await fetch(`${getGitHubWorkerOrigin()}${CAP_LOOKUP_PATH}`, {
-      method: 'POST',
-      credentials: 'omit',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
+    answer = await requestWorker(
+      transport ?? defaultWorkerTransport(origin),
+      `${origin}${CAP_LOOKUP_PATH}`,
+      {
+        method: 'POST',
+        credentials: 'omit',
+        cache: 'no-store',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: requestBody,
       },
-      body: requestBody,
-      signal: scope.controller.signal,
-    });
-    throwIfRequestEnded(scope);
-
-    const text = await readBoundedResponseText(response);
-    throwIfRequestEnded(scope);
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        throw createCapError(
-          'CAP proxy route is unavailable; deploy the matching Cellucid Worker source',
-          'CAP_WORKER_INCOMPATIBLE'
-        );
-      }
-      let detail = `HTTP ${response.status}`;
-      if (text) {
-        try {
-          const errorDocument = parseExactJson(text, {
-            path: `CAP proxy ${CAP_LOOKUP_PATH} error response`,
-          });
-          const workerDetail = parseWorkerError(
-            errorDocument,
-            response.status
-          );
-          if (workerDetail !== detail) {
-            detail = `${detail}: ${workerDetail}`;
-          }
-        } catch {
-          // An untrusted non-success body cannot replace its HTTP outcome.
-        }
-      }
-      throw new Error(`CAP proxy error: ${detail}`);
-    }
-
-    let document;
-    try {
-      if (!text) throw new Error('empty response body');
-      document = parseExactJson(text, { path: `CAP proxy ${CAP_LOOKUP_PATH} response` });
-    } catch (cause) {
-      throw new Error(`CAP proxy returned invalid JSON: ${cause?.message || cause}`, {
-        cause,
-      });
-    }
-    return requireExactObjectKeys(
-      document,
-      ['contractVersion', 'results', 'omittedInvalidCount'],
-      `CAP proxy ${CAP_LOOKUP_PATH} response`
+      { signal: ownerSignal, label: `CAP lookup (${body.kind})`, origin }
     );
   } catch (error) {
-    throwIfRequestEnded(scope, error);
-    if (isCancellation(error)) {
+    if (ownerSignal?.aborted) throw ownerAbortReason(ownerSignal, error);
+    throw error;
+  }
+  const { response, text } = answer;
+
+  if (!response.ok) {
+    if (response.status === 404) {
       throw createCapError(
-        'CAP proxy request was independently aborted by fetch',
-        'CAP_FETCH_INTERRUPTED',
-        error
+        'CAP proxy route is unavailable; deploy the matching Cellucid Worker source',
+        'GITHUB_WORKER_INCOMPATIBLE'
       );
     }
-    if (isNetworkError(error)) {
-      throw new Error('CAP proxy unreachable (network error)', { cause: error });
+    let detail = `HTTP ${response.status}`;
+    if (text) {
+      try {
+        const errorDocument = parseExactJson(text, {
+          path: `CAP proxy ${CAP_LOOKUP_PATH} error response`,
+        });
+        const workerDetail = parseWorkerError(errorDocument, response.status);
+        if (workerDetail !== detail) detail = `${detail}: ${workerDetail}`;
+      } catch {
+        // An untrusted non-success body cannot replace its HTTP outcome.
+      }
     }
+    const error = new Error(`CAP proxy error: ${detail}`);
+    error.status = response.status;
     throw error;
-  } finally {
-    scope.cleanup();
   }
+
+  let document;
+  try {
+    if (!text) throw new Error('empty response body');
+    document = parseExactJson(text, { path: `CAP proxy ${CAP_LOOKUP_PATH} response` });
+  } catch (cause) {
+    throw createCapError(`CAP proxy returned invalid JSON: ${cause?.message || cause}`, 'CAP_RESPONSE_INVALID', cause);
+  }
+  return requireExactObjectKeys(
+    document,
+    ['contractVersion', 'results', 'omittedInvalidCount'],
+    `CAP proxy ${CAP_LOOKUP_PATH} response`
+  );
 }
 
 function validateLookupResult(value, index) {
@@ -478,11 +269,14 @@ function validateLookupResult(value, index) {
 }
 
 function validateEnvelope(document, validator, label, maxResults) {
-  if (document.contractVersion !== CAP_WORKER_CONTRACT_VERSION) {
+  if (document.contractVersion !== WORKER_CONTRACT_VERSION) {
+    const older = Number.isSafeInteger(document.contractVersion) && document.contractVersion < WORKER_CONTRACT_VERSION;
     throw createCapError(
-      `${label}.contractVersion does not match this Cellucid client; ` +
-      'deploy the matching Cellucid Worker source',
-      'CAP_WORKER_INCOMPATIBLE'
+      older
+        ? `The community-annotation service runs an older version (contract ${document.contractVersion}) ` +
+          `than this Cellucid (contract ${WORKER_CONTRACT_VERSION}); its owner must redeploy the Worker.`
+        : `${label}.contractVersion does not match this Cellucid client (contract ${WORKER_CONTRACT_VERSION}); reload Cellucid.`,
+      older ? 'GITHUB_WORKER_OUTDATED' : 'GITHUB_WORKER_INCOMPATIBLE'
     );
   }
   if (
@@ -742,7 +536,7 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
   const exactOptions = requireObjectKeys(
     options,
     [],
-    ['kind', 'markerGenes', 'signal', 'timeoutMs'],
+    ['kind', 'markerGenes', 'signal', 'transport'],
     'CAP search options'
   );
   const kind = assertLookupKind(exactOptions.kind ?? 'name');
@@ -753,7 +547,7 @@ export async function searchCellTypes(searchTerm, limit = 10, options = {}) {
     { kind, term, limit: CAP_LOOKUP_LIMIT },
     {
       signal: exactOptions.signal ?? null,
-      timeoutMs: exactOptions.timeoutMs ?? CAP_DEFAULT_TIMEOUT_MS,
+      transport: exactOptions.transport ?? null,
     }
   );
   const envelope = validateEnvelope(
@@ -772,7 +566,7 @@ export async function lookupByOntologyId(ontologyId, options = {}) {
   const exactOptions = requireObjectKeys(
     options,
     [],
-    ['signal', 'timeoutMs'],
+    ['signal', 'transport'],
     'CAP ontology lookup options'
   );
   const term = assertSearchTerm(ontologyId, 'ontology');

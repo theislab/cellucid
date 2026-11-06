@@ -18,10 +18,11 @@
  * checksums (`formats/io/page-checks.js`). A reader's journal is closed --
  * never appended to again, so another reader may read it -- once its reads
  * go quiet for the link's retransmission timeout, when the page is hidden
- * or left, and when the reader closes; the next piece begins a new one. A write is the
- * operating system's once it returns, so a visit of any length keeps what
- * it fetched: a tab closed at once, a worker ended, a browser that crashes
- * loses at most the piece being written; a machine that stops (power lost)
+ * or left, and when the reader closes; the next piece begins a new one. A read
+ * does not wait for its write, and a write is the operating system's once it
+ * returns, so a visit of any length keeps what it fetched: a tab closed at once,
+ * a worker ended, a browser that crashes loses at most the pieces still waiting
+ * to be written, which the next visit fetches again; a machine that stops (power lost)
  * may lose what the disk had not yet stored, whose records then do not read
  * whole or do not match their checksums, and are not used. The page asks
  * its reader workers to have the disk hold what they wrote when it is
@@ -38,7 +39,9 @@
  * server serves (`keptParts: false`): a copy spares no download, and a
  * served store made from an object in memory is named anew every run. The
  * bytes of a file a transcoder reads whole (an R object) are not kept as
- * parts: its converted store is what is kept of it. A store folder on a web
+ * parts: its converted store is what is kept of it; nor are bytes read once
+ * (a cell export's, a copy of the dataset's: `keepInMemory: false`), which
+ * no view reads again. A store folder on a web
  * host keeps its objects only under a version that names its content (the
  * commit a provider reads it at: `data/anndata/open.js`).
  *
@@ -750,7 +753,11 @@ export function withKeptParts(source, parts, { head = null } = {}) {
       if (error?.code === BYTE_SOURCE_FAILURES.CHANGED) parts.changed();
       throw error;
     }
-    parts.keep(offset, bytes);
+    // Bytes read once (a cell export's, a copy of the dataset's: `keepInMemory`
+    // false, `ReadActivity.readOnce`) are kept neither in the page's memory
+    // nor here: a whole-file pass would fill this browser's room with what
+    // no view reads again, and push out what views do.
+    if (options.keepInMemory !== false) parts.keep(offset, bytes);
     return bytes;
   };
   return Object.freeze({ ...source, read, kept: parts });

@@ -1,0 +1,108 @@
+{
+  "examples": [
+    {
+      "intersection_labels": [
+        {
+          "label": "T cells",
+          "pages": [
+            "x",
+            "x1"
+          ]
+        }
+      ],
+      "key": "x",
+      "overlap": "first",
+      "overlap_label": "Overlap",
+      "pages": [
+        {
+          "label": "T cells",
+          "page": "x"
+        }
+      ],
+      "uncovered_label": "Unassigned"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "intersection_labels": {
+        "default": [],
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "pages": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 2,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "pages",
+            "label"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "key": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "overlap": {
+        "default": "first",
+        "enum": [
+          "first",
+          "last",
+          "overlap-label",
+          "intersections"
+        ],
+        "type": "string"
+      },
+      "overlap_label": {
+        "default": "Overlap",
+        "type": "string"
+      },
+      "pages": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "page": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "page",
+            "label"
+          ],
+          "type": "object"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "uncovered_label": {
+        "default": "Unassigned",
+        "type": "string"
+      }
+    },
+    "required": [
+      "key",
+      "pages"
+    ],
+    "type": "object"
+  },
+  "type": "field.create-from-pages",
+  "version": 1
+}

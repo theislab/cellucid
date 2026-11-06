@@ -8,6 +8,7 @@
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { formatDecimal } from '../../../ui/components/display-format.js';
 import { createDecimalInput, readDecimalInput } from '../../../ui/components/controls.js';
+import { createDomId } from '../../../ui/components/dom-id.js';
 
 /**
  * Digits a readout needs to show every value a step can reach.
@@ -50,7 +51,6 @@ function createOptionLabel(text, controlId) {
 // PLOT OPTIONS RENDERING
 // =============================================================================
 
-let plotOptionsIdCounter = 0;
 
 /**
  * Ensure a stable, unique ID prefix for plot option inputs within a container.
@@ -80,8 +80,8 @@ function getOrCreatePlotOptionsIdPrefix(container, providedPrefix) {
     return existing;
   }
 
-  plotOptionsIdCounter += 1;
-  const next = `plotopts-${plotOptionsIdCounter}`;
+  // Minted by the page's one id generator, so ids made from it are known as this page's own.
+  const next = createDomId('plotopts');
   container.dataset.plotOptionsIdPrefix = next;
   return next;
 }

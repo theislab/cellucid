@@ -1,15 +1,31 @@
+import { goOffline } from './helpers/offline.mjs';
 import { expect, test } from './helpers/test.mjs';
 
 import { currentUiLike, listCatalogDatasets } from './helpers/catalog-datasets.mjs';
 import { APP_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
-import { WORKER_EXPOSED_RESPONSE_HEADERS } from './helpers/worker-exposed-headers.mjs';
+import {
+  AUTH_USER,
+  AUTH_USER_KEY,
+  WORKER_ORIGIN,
+  capability,
+  fulfillWorkerJson,
+} from './helpers/community-annotation-github.mjs';
+import {
+  blobsDocument,
+  contentsDocument,
+  restTreeDocument,
+  schemaFiles,
+  snapshotDocument,
+  treeOidOf,
+} from '../helpers/community-annotation-worker.mjs';
+import {
+  ANNOTATION_MERGES_FILE_VERSION,
+  ANNOTATION_USER_FILE_VERSION,
+} from '../../assets/js/app/community-annotations/wire-contract.js';
 
-const WORKER_ORIGIN = 'https://worker.example';
 const CATALOG_ROOT =
   `${APP_ORIGIN}/tests/browser/fixtures/catalog/`;
-const AUTH_USER = Object.freeze({ id: 4242, login: 'tester' });
-const AUTH_USER_KEY = `ghid_${AUTH_USER.id}`;
 const FIRST_DATASET_ID = 'current-ui';
 const SECOND_DATASET_ID = 'current-ui-alternate';
 const SECOND_DATASET_NAME = 'Current UI alternate fixture';
@@ -17,29 +33,59 @@ const SECOND_DATASET_OPTION =
   `dataset:local-demo:${SECOND_DATASET_ID}`;
 const FIRST_REPO = 'team/labels';
 const SECOND_REPO = 'team/new-labels';
-const EMPTY_USERS_SENTINEL_SHA =
-  '8b137891791fe96927ad78e64b0aad7bded08bdc';
 const OPERATION_ID_HEADER = 'x-cellucid-operation-id';
+// An outcome GitHub may or may not have applied is followed by a Pull (`pushToGitHub`).
 const UNKNOWN_PUBLICATION_GUIDANCE =
-  'GitHub may already have applied this change. Pull from the same annotation ' +
-  'repository before publishing again; do not retry until that Pull completes.';
+  'GitHub may already have applied this change; Cellucid pulls now to see.';
 
-function workerCapabilityDocument() {
-  return {
-    status: 'ok',
-    service: 'Cellucid GitHub Auth',
-    contractVersion: 2,
-    endpoints: [
-      '/auth/login',
-      '/auth/callback',
-      '/auth/revoke',
-      '/auth/user',
-      '/auth/installations',
-      '/auth/installation-repos',
-      '/cap/lookup-cells',
-      '/api/repos/*',
-    ],
-  };
+/** Requests to one Worker path, whatever its query (`?page=N` for a collection). */
+function workerRoute(path) {
+  return url => url.origin === WORKER_ORIGIN && url.pathname === path;
+}
+
+/**
+ * Damage the file cache of one scope as storage can: a completed-Pull
+ * marker of another shape, which the next Pull reads first and must treat
+ * as a corrupt cache. Answers whether the scope held a marker before.
+ */
+async function corruptPullMarker(page, scope) {
+  return page.evaluate(async ({ datasetId, repoRef, userId }) => {
+    const { toCacheScopeKey } = await import('/assets/js/app/community-annotations/cache-scope.js');
+    const scopeKey = toCacheScopeKey({ datasetId, repoRef, userId });
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open('cellucid_community_annotation_file_cache');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction(['pulls'], 'readwrite');
+        const store = tx.objectStore('pulls');
+        const read = store.get(scopeKey);
+        let existed = false;
+        read.onsuccess = () => {
+          existed = read.result !== undefined;
+          store.put({ scopeKey, annotationsOid: 'damaged' });
+        };
+        tx.oncomplete = () => {
+          db.close();
+          resolve(existed);
+        };
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error ?? new Error('Synthetic cache damage aborted'));
+      };
+    });
+  }, scope);
+}
+
+/** What the file cache keeps of one scope: its paths and whether a Pull completed there. */
+async function cachedScope(page, scope) {
+  return page.evaluate(async ({ datasetId, repoRef, userId }) => {
+    const { getCommunityAnnotationFileCache } = await import('/assets/js/app/community-annotations/file-cache.js');
+    const cache = getCommunityAnnotationFileCache();
+    const target = { datasetId, repoRef, userId };
+    const paths = [];
+    await cache.forEachRecord(target, record => paths.push(record.path));
+    return { paths, completed: (await cache.getPullMarker(target)) !== null };
+  }, scope);
 }
 
 function deferred() {
@@ -64,13 +110,12 @@ function observeProductErrors(page) {
 }
 
 async function installWorkerCapability(page, document = null) {
-  const capability =
-    document === null ? workerCapabilityDocument() : document;
+  const root = document === null ? capability() : document;
   await page.route(`${WORKER_ORIGIN}/`, async route => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(capability),
+      body: JSON.stringify(root),
     });
   });
 }
@@ -326,10 +371,10 @@ function configDocumentAtCanonicalBytes(targetBytes) {
   return document;
 }
 
-/** The contributor's file as the repository holds it (version 2). */
+/** The contributor's file as the repository holds it. */
 function userDocument() {
   return {
-    version: 2,
+    version: ANNOTATION_USER_FILE_VERSION,
     username: AUTH_USER_KEY,
     githubUserId: AUTH_USER.id,
     login: AUTH_USER.login,
@@ -339,30 +384,17 @@ function userDocument() {
   };
 }
 
-function schemaDocument(kind) {
-  const ids = {
-    user:
-      'https://cellucid.com/contracts/community-annotation/user-v2.schema.json',
-    config:
-      'https://cellucid.com/contracts/community-annotation/config-v1.schema.json',
-    merges:
-      'https://cellucid.com/contracts/community-annotation/merges-v2.schema.json',
-  };
-  return {
-    $schema: 'https://json-schema.org/draft/2020-12/schema',
-    $id: ids[kind],
-  };
-}
-
-function githubContent(document, shaCharacter) {
-  return {
-    type: 'file',
-    encoding: 'base64',
-    content: Buffer.from(JSON.stringify(document), 'utf8').toString('base64'),
-    sha: shaCharacter.repeat(40),
-  };
-}
-
+/**
+ * The stand-in Worker (contract 3) for one repository branch. Every route
+ * reads the same files (`resolveFile`), so the snapshot's blob ids, the
+ * users tree, `/graphql/blobs` and the Contents API agree: the config
+ * (`d` x 40), the merges file (`f` x 40) and the contributor's own file
+ * (`e` x 40), each overridable; the schemas are the template's, by blob id,
+ * and the users folder holds the template's `.gitkeep`. Every answer is
+ * built by the one in-memory GitHub's wire shapes
+ * (`tests/helpers/community-annotation-worker.mjs`), so this stand-in and
+ * the sync tests' mock cannot speak two protocols.
+ */
 async function installGitHubApi(
   page,
   resolveRepoInfo,
@@ -374,22 +406,92 @@ async function installGitHubApi(
   } = {},
 ) {
   const requests = [];
+  const userPath = `annotations/users/${AUTH_USER_KEY}.json`;
+  /** `{text, sha}` of an annotation file, or null when the repository has none. */
+  const resolveFile = async contentPath => {
+    if (typeof resolveContentFile === 'function') {
+      const resolved = await resolveContentFile(contentPath);
+      if (resolved !== undefined) {
+        if (
+          resolved !== null &&
+          (
+            !resolved ||
+            typeof resolved !== 'object' ||
+            typeof resolved.text !== 'string' ||
+            typeof resolved.sha !== 'string'
+          )
+        ) {
+          throw new Error('Synthetic GitHub content resolver returned an invalid file');
+        }
+        return resolved;
+      }
+    }
+    if (contentPath === 'annotations/config.json') {
+      return { text: JSON.stringify(configDocument()), sha: 'd'.repeat(40) };
+    }
+    if (contentPath === userPath) {
+      if (typeof resolveUserFile === 'function') {
+        const resolved = await resolveUserFile();
+        if (resolved !== null) {
+          if (
+            !resolved ||
+            typeof resolved !== 'object' ||
+            typeof resolved.text !== 'string' ||
+            typeof resolved.sha !== 'string'
+          ) {
+            throw new Error('Synthetic GitHub user-file resolver returned an invalid file');
+          }
+          return resolved;
+        }
+      }
+      if (!userFileExists) return null;
+      return { text: JSON.stringify(userDocument()), sha: 'e'.repeat(40) };
+    }
+    if (contentPath === 'annotations/moderation/merges.json') {
+      return {
+        text: JSON.stringify({
+          version: ANNOTATION_MERGES_FILE_VERSION,
+          updatedAt: '2026-07-29T00:00:00.000Z',
+          merges: [],
+        }),
+        sha: 'f'.repeat(40),
+      };
+    }
+    throw new Error(`Unexpected synthetic GitHub file: ${contentPath}`);
+  };
+  /** The branch's files now: path → text, or `{oid, text}` under the file's synthetic SHA. */
+  const branchFiles = async () => {
+    const files = new Map(Object.entries(schemaFiles()));
+    files.set('annotations/users/.gitkeep', '\n');
+    for (const path of ['annotations/config.json', 'annotations/moderation/merges.json', userPath]) {
+      const file = await resolveFile(path);
+      if (file !== null) files.set(path, { oid: file.sha, text: file.text });
+    }
+    return files;
+  };
+
   await page.route(`${WORKER_ORIGIN}/**`, async route => {
     const request = route.request();
     const url = new URL(request.url());
     const method = request.method();
     requests.push(url.pathname);
     if (method === 'GET' && url.pathname === '/') {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify(workerCapabilityDocument()),
-      });
+      await fulfillWorkerJson(route, capability());
       return;
     }
     // Sign out revokes the token at GitHub through the worker.
     if (method === 'POST' && url.pathname === '/auth/revoke') {
       await route.fulfill({ status: 204 });
+      return;
+    }
+    if (method === 'POST' && url.pathname === '/graphql/snapshot') {
+      await fulfillWorkerJson(route, snapshotDocument(await branchFiles()));
+      return;
+    }
+    if (method === 'POST' && url.pathname === '/graphql/blobs') {
+      const files = [...(await branchFiles()).values()];
+      const oids = JSON.parse(request.postData() ?? '{}').oids ?? [];
+      await fulfillWorkerJson(route, blobsDocument(oids, oid => files.find(value => typeof value === 'object' && value.oid === oid) ?? null));
       return;
     }
     if (method !== 'GET') {
@@ -402,11 +504,7 @@ async function installGitHubApi(
       return;
     }
     if (url.pathname === '/auth/user') {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify(AUTH_USER),
-      });
+      await fulfillWorkerJson(route, AUTH_USER);
       return;
     }
     const repoMatch = url.pathname.match(
@@ -416,158 +514,31 @@ async function installGitHubApi(
       const fullName =
         `${decodeURIComponent(repoMatch[1])}/${decodeURIComponent(repoMatch[2])}`;
       const response = await resolveRepoInfo(fullName);
-      await route.fulfill({
-        status: response.status ?? 200,
-        contentType: 'application/json',
-        headers: {
-          'access-control-expose-headers':
-            WORKER_EXPOSED_RESPONSE_HEADERS.join(', '),
-          ...response.headers,
-        },
-        body: JSON.stringify(response.body),
-      });
+      await fulfillWorkerJson(route, response.body, response.status ?? 200, response.headers ?? {});
       return;
     }
-    if (
-      /^\/api\/repos\/[^/]+\/[^/]+\/git\/trees\/[^/]+$/.test(
-        url.pathname,
-      )
-    ) {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          tree: [
-            {
-              type: 'tree',
-              path: 'annotations/users',
-              sha: 'd'.repeat(40),
-            },
-            {
-              type: 'blob',
-              path: 'annotations/users/.gitkeep',
-              sha: EMPTY_USERS_SENTINEL_SHA,
-              size: 1,
-            },
-          ],
-          truncated: false,
-        }),
-      });
+    const treeMatch = url.pathname.match(/^\/api\/repos\/[^/]+\/[^/]+\/git\/trees\/([0-9a-f]{40})$/);
+    if (treeMatch) {
+      const files = await branchFiles();
+      if (treeMatch[1] !== treeOidOf(files, 'annotations/users/')) {
+        await fulfillWorkerJson(route, { error: 'Not Found' }, 404);
+        return;
+      }
+      await fulfillWorkerJson(route, restTreeDocument(files, 'annotations/users/', { url: url.href }));
       return;
     }
-
     const contentPath = decodeURIComponent(
       url.pathname.replace(
         /^\/api\/repos\/[^/]+\/[^/]+\/contents\//,
         '',
       ),
     );
-    if (typeof resolveContentFile === 'function') {
-      const resolved = await resolveContentFile(contentPath);
-      if (resolved !== undefined) {
-        if (resolved === null) {
-          await route.fulfill({
-            status: 404,
-            contentType: 'application/json',
-            body: JSON.stringify({ error: 'Not Found' }),
-          });
-          return;
-        }
-        if (
-          !resolved ||
-          typeof resolved !== 'object' ||
-          typeof resolved.text !== 'string' ||
-          typeof resolved.sha !== 'string'
-        ) {
-          throw new Error(
-            'Synthetic GitHub content resolver returned an invalid file',
-          );
-        }
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            type: 'file',
-            encoding: 'base64',
-            content: Buffer.from(resolved.text, 'utf8').toString('base64'),
-            sha: resolved.sha,
-          }),
-        });
-        return;
-      }
+    const file = await resolveFile(contentPath);
+    if (file === null) {
+      await fulfillWorkerJson(route, { error: 'Not Found' }, 404);
+      return;
     }
-    let document;
-    let shaCharacter;
-    if (contentPath === 'annotations/schema.json') {
-      document = schemaDocument('user');
-      shaCharacter = 'a';
-    } else if (contentPath === 'annotations/config.schema.json') {
-      document = schemaDocument('config');
-      shaCharacter = 'b';
-    } else if (
-      contentPath === 'annotations/moderation/merges.schema.json'
-    ) {
-      document = schemaDocument('merges');
-      shaCharacter = 'c';
-    } else if (contentPath === 'annotations/config.json') {
-      document = configDocument();
-      shaCharacter = 'd';
-    } else if (
-      contentPath === `annotations/users/${AUTH_USER_KEY}.json`
-    ) {
-      if (typeof resolveUserFile === 'function') {
-        const resolved = await resolveUserFile();
-        if (resolved !== null) {
-          if (
-            !resolved ||
-            typeof resolved !== 'object' ||
-            typeof resolved.text !== 'string' ||
-            typeof resolved.sha !== 'string'
-          ) {
-            throw new Error(
-              'Synthetic GitHub user-file resolver returned an invalid file',
-            );
-          }
-          await route.fulfill({
-            status: 200,
-            contentType: 'application/json',
-            body: JSON.stringify({
-              type: 'file',
-              encoding: 'base64',
-              content: Buffer.from(resolved.text, 'utf8').toString('base64'),
-              sha: resolved.sha,
-            }),
-          });
-          return;
-        }
-      }
-      if (!userFileExists) {
-        await route.fulfill({
-          status: 404,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: 'Not Found' }),
-        });
-        return;
-      }
-      document = userDocument();
-      shaCharacter = 'e';
-    } else if (
-      contentPath === 'annotations/moderation/merges.json'
-    ) {
-      document = {
-        version: 2,
-        updatedAt: '2026-07-29T00:00:00.000Z',
-        merges: [],
-      };
-      shaCharacter = 'f';
-    } else {
-      throw new Error(`Unexpected synthetic GitHub request: ${url}`);
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify(githubContent(document, shaCharacter)),
-    });
+    await fulfillWorkerJson(route, contentsDocument({ oid: file.sha, text: file.text }));
   });
   return requests;
 }
@@ -789,7 +760,7 @@ async function runExactAuthorBaselineLifecycle(page, target) {
       paths.merges,
       {
         text: `${JSON.stringify({
-          version: 2,
+          version: ANNOTATION_MERGES_FILE_VERSION,
           updatedAt: '2026-07-29T00:00:00.000Z',
           merges: [],
         }, null, 2)}\n`,
@@ -838,9 +809,7 @@ async function runExactAuthorBaselineLifecycle(page, target) {
   );
 
   await openCatalogDeepLink(page);
-  await expect.poll(() => runtimeSnapshot(page), {
-    timeout: 10_000,
-  }).toMatchObject({
+  await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
     authenticated: true,
     role: 'author',
     currentRepo: `${FIRST_REPO}@main`,
@@ -905,9 +874,7 @@ async function runExactAuthorBaselineLifecycle(page, target) {
 
   const { modal, publish } = await startGitHubPublication(page);
   const status = modal.getByRole('status');
-  await expect(status).toHaveText('Publish complete.', {
-    timeout: 10_000,
-  });
+  await expect(status).toHaveText('Nothing new to publish: GitHub already has your changes.');
   expect(mutationRequests).toHaveLength(0);
   const baselineAfterNoOp = await page.evaluate(async path => {
     const { getCommunityAnnotationSession } =
@@ -933,8 +900,8 @@ async function runExactAuthorBaselineLifecycle(page, target) {
       merges: [
         {
           bucket: 'cell_type:Alpha',
-          fromSuggestionId: 'from-suggestion',
-          intoSuggestionId: 'into-suggestion',
+          fromSuggestionId: 'ghid_7_from-suggestion',
+          intoSuggestionId: 'ghid_8_into-suggestion',
           by: 'ghid_4242',
           at: '2026-07-29T00:00:01.000Z',
         },
@@ -955,16 +922,14 @@ async function runExactAuthorBaselineLifecycle(page, target) {
           : 'pending'
       );
     return secondOutcome;
-  }, { timeout: 10_000 }).not.toBe('pending');
+  }).not.toBe('pending');
 
   expect(
     baselineAfterNoOp,
     `${target} second publication outcome: ${secondOutcome}`,
   ).toBe(firstShas[target]);
   expect(mutationRequests).toHaveLength(1);
-  await expect(status).toHaveText('Publish complete.', {
-    timeout: 10_000,
-  });
+  await expect(status).toHaveText('Published.');
   expect(mutationRequests[0]).toMatchObject({
     method: 'PUT',
     path: `/api/repos/${FIRST_REPO}/contents/${paths[target]}`,
@@ -1000,9 +965,7 @@ test(
     await repoRequested.promise;
 
     try {
-      await expect.poll(() => runtimeSnapshot(page), {
-        timeout: 10_000,
-      }).toMatchObject({
+      await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
         authenticated: true,
         session: {
           datasetId: FIRST_DATASET_ID,
@@ -1021,9 +984,7 @@ test(
     } finally {
       releaseRepo.resolve();
     }
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       session: {
         datasetId: FIRST_DATASET_ID,
@@ -1081,7 +1042,7 @@ test(
       exact: true,
     }).click();
     await expect(modal.getByRole('status')).toContainText(
-      'not compatible with this Cellucid client'
+      'runs an older version (contract 2) than this Cellucid (contract 3); its owner must redeploy the Worker'
     );
     await expect(modal).toBeVisible();
     expect(page.url()).toBe(startingUrl);
@@ -1146,7 +1107,7 @@ test(
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
-          ...workerCapabilityDocument(),
+          ...capability(),
           contractVersion: 0,
         }),
       });
@@ -1166,11 +1127,14 @@ test(
     await expect(
       page.locator('.notification-error').last()
     ).toContainText(
-      'Deploy the matching Cellucid Worker, then retry GitHub sync.',
+      'its owner must redeploy the Worker',
     );
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect(
+      page.locator('.notification-error').last()
+    ).toContainText(
+      'The repository connection was preserved.',
+    );
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       currentRepo: `${FIRST_REPO}@main`,
       role: 'unknown',
@@ -1199,7 +1163,7 @@ test(
     const discoveryRequests = [];
 
     await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
+      workerRoute('/auth/installations'),
       async route => {
         discoveryRequests.push({
           method: route.request().method(),
@@ -1211,15 +1175,14 @@ test(
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            installations: [
+            items: [
               { id: 71, account: { login: 'team' } },
-            ],
-          }),
+            ], nextPage: null }),
         });
       },
     );
     await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
+      workerRoute('/auth/installation-repos'),
       async route => {
         discoveryRequests.push({
           method: route.request().method(),
@@ -1228,7 +1191,7 @@ test(
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
-          body: JSON.stringify({ repositories: [] }),
+          body: JSON.stringify({ items: [], nextPage: null }),
         });
       },
     );
@@ -1287,7 +1250,7 @@ test(
     const releaseInstallation = deferred();
     let repositoryRequests = 0;
     await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
+      workerRoute('/auth/installations'),
       async route => {
         installationEntered.resolve();
         await releaseInstallation.promise;
@@ -1295,21 +1258,20 @@ test(
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            installations: [
+            items: [
               { id: 72, account: { login: 'team' } },
-            ],
-          }),
+            ], nextPage: null }),
         });
       },
     );
     await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
+      workerRoute('/auth/installation-repos'),
       async route => {
         repositoryRequests += 1;
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
-          body: JSON.stringify({ repositories: [] }),
+          body: JSON.stringify({ items: [], nextPage: null }),
         });
       },
     );
@@ -1333,9 +1295,7 @@ test(
     await settleBrowserContinuations(page);
 
     expect(repositoryRequests).toBe(0);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       currentDatasetId: SECOND_DATASET_ID,
       session: {
         datasetId: SECOND_DATASET_ID,
@@ -1358,22 +1318,21 @@ test(
     const repositoryRequests = [];
 
     await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
+      workerRoute('/auth/installations'),
       async route => {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            installations: [
+            items: [
               { id: 81, account: { login: 'team-one' } },
               { id: 82, account: { login: 'team-two' } },
-            ],
-          }),
+            ], nextPage: null }),
         });
       },
     );
     await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
+      workerRoute('/auth/installation-repos'),
       async route => {
         const request = route.request();
         const body = JSON.parse(request.postData() ?? 'null');
@@ -1389,7 +1348,7 @@ test(
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
-          body: JSON.stringify({ repositories: [] }),
+          body: JSON.stringify({ items: [], nextPage: null }),
         });
       },
     );
@@ -1500,21 +1459,20 @@ test(
     await installStoredAuthentication(page);
     const repositoryRequests = [];
     await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
+      workerRoute('/auth/installations'),
       async route => {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            installations: [
+            items: [
               { id: 501, account: { login: 'large-team' } },
-            ],
-          }),
+            ], nextPage: null }),
         });
       },
     );
     await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
+      workerRoute('/auth/installation-repos'),
       async route => {
         const body = JSON.parse(route.request().postData() ?? 'null');
         repositoryRequests.push(body.installation_id);
@@ -1532,7 +1490,7 @@ test(
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
-          body: JSON.stringify({ repositories }),
+          body: JSON.stringify({ items: repositories, nextPage: null }),
         });
       },
     );
@@ -1555,8 +1513,7 @@ test(
     );
 
     await expect(step2Status).toHaveText(
-      'Showing 1–100 of 10,000 repositories. Page 1 of 100.',
-      { timeout: 15_000 }
+      'Showing 1–100 of 10,000 repositories. Page 1 of 100.'
     );
     await expect(
       step2Grid.locator('.community-annotation-repo-card')
@@ -1674,73 +1631,6 @@ test(
 );
 
 test(
-  'aggregate repository discovery rejects the 10001st item without truncation',
-  async ({ page }) => {
-    const productErrors = observeProductErrors(page);
-    await installStoredAuthentication(page);
-    const repositoryRequests = [];
-    await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
-      async route => {
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            installations: [
-              { id: 601, account: { login: 'first-team' } },
-              { id: 602, account: { login: 'second-team' } },
-            ],
-          }),
-        });
-      },
-    );
-    await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
-      async route => {
-        const body = JSON.parse(route.request().postData() ?? 'null');
-        repositoryRequests.push(body.installation_id);
-        const firstInstallation = body.installation_id === 601;
-        const count = firstInstallation ? 5_000 : 5_001;
-        const offset = firstInstallation ? 0 : 5_000;
-        const owner = firstInstallation ? 'first-team' : 'second-team';
-        const repositories = Array.from({ length: count }, (_, index) => ({
-          id: offset + index + 1,
-          full_name:
-            `${owner}/repo-${String(index).padStart(5, '0')}`,
-          private: false,
-        }));
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ repositories }),
-        });
-      },
-    );
-
-    await openCatalogWithoutAnnotationRepo(page);
-    const modal = await openGitHubSetupFromMainControls(page);
-    const status = modal.locator(
-      '.community-annotation-wizard-status'
-    );
-    await expect(status).toHaveText(
-      'Cellucid found more than 10,000 repositories across your GitHub ' +
-      'App installations, which it will not truncate. In GitHub App ' +
-      'settings, select fewer repositories, then click Reload.',
-      { timeout: 15_000 }
-    );
-    expect(repositoryRequests).toEqual([601, 602]);
-    await expect(
-      modal.locator('.community-annotation-repo-card')
-    ).toHaveCount(0);
-    await modal.getByRole('button', {
-      name: 'Close',
-      exact: true,
-    }).click();
-    expect(productErrors).toEqual([]);
-  },
-);
-
-test(
   'retired repository discovery ignores a deferred non-abort rejection',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
@@ -1820,67 +1710,6 @@ test(
 );
 
 test(
-  'GitHub discovery ceiling errors explain how to narrow installations and repositories',
-  async ({ page }) => {
-    await installStoredAuthentication(page);
-    let installationAttempt = 0;
-    await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
-      async route => {
-        installationAttempt += 1;
-        if (installationAttempt === 1) {
-          await route.fulfill({
-            status: 502,
-            contentType: 'application/json',
-            body: JSON.stringify({
-              error: 'GitHub installations total_count exceeds 10000',
-            }),
-          });
-          return;
-        }
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            installations: [
-              { id: 91, account: { login: 'large-team' } },
-            ],
-          }),
-        });
-      },
-    );
-    await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
-      async route => {
-        await route.fulfill({
-          status: 502,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            error: 'GitHub repositories total_count exceeds 10000',
-          }),
-        });
-      },
-    );
-
-    await openCatalogWithoutAnnotationRepo(page);
-    const modal = await openGitHubSetupFromMainControls(page);
-    const status = modal.getByRole('status');
-    await expect(status).toContainText(
-      'Reduce the Cellucid GitHub App installations available to this GitHub account, then click Reload.',
-    );
-
-    await modal.getByRole('button', {
-      name: 'Reload',
-      exact: true,
-    }).click();
-    await expect(status).toContainText(
-      'In GitHub App settings, select fewer repositories for that installation, then click Reload.',
-    );
-    expect(installationAttempt).toBe(2);
-  },
-);
-
-test(
   'transient role failure preserves connection and recovers while navigator stays online',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
@@ -1906,10 +1735,13 @@ test(
     });
 
     await openCatalogDeepLink(page);
-    await expect.poll(() => repoRequestCount, { timeout: 10_000 }).toBe(1);
+    // Each request is asked again while the Worker is busy (the transport's
+    // repeats); once they are spent, the connection is kept and the role is
+    // asked again after the shared back-off.
     await expect(page.locator('.notification-warning').last()).toContainText(
       'repository connection was preserved',
     );
+    expect(repoRequestCount).toBeGreaterThan(1);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'unknown',
@@ -1928,10 +1760,11 @@ test(
     });
     expect(withoutExpectedServiceUnavailableConsole(productErrors)).toEqual([]);
 
+    const failedRequests = repoRequestCount;
     reachable = true;
-    await expect.poll(() => repoRequestCount, { timeout: 10_000 }).toBe(2);
+    // No online event: the scheduled retry recovers on its own.
     await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
+      timeout: 60_000,
     }).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
@@ -1941,6 +1774,7 @@ test(
         userId: AUTH_USER.id,
       },
     });
+    expect(repoRequestCount).toBeGreaterThan(failedRequests);
     await expect(page.locator('.notification-error')).toHaveCount(0);
     expect(withoutExpectedServiceUnavailableConsole(productErrors)).toEqual([]);
   },
@@ -2099,14 +1933,11 @@ test(
 
     await pull.click();
     await expect(modal.getByRole('status')).toHaveText(
-      'Pulled latest annotations.',
-      { timeout: 10_000 }
+      'Pulled latest annotations.'
     );
     await expect(pull).toBeEnabled();
     await expect(publish).toBeDisabled();
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'annotator',
       currentRepo: `${FIRST_REPO}@main`,
@@ -2156,61 +1987,29 @@ test(
       exact: true,
     }).click();
     await expect(modal.getByRole('status')).toHaveText(
-      'Pulled latest annotations.',
-      { timeout: 10_000 }
+      'Pulled latest annotations.'
     );
     await modal.getByRole('button', {
       name: 'Close',
       exact: true,
     }).click();
 
-    const beforeCorruption = await page.evaluate(
-      async ({ datasetId, repoRef, userId }) => {
-        const {
-          toFileRecordKey,
-          toFileShaIndexKey,
-        } = await import(
-          '/assets/js/app/community-annotations/cache-scope.js'
-        );
-        const scope = { datasetId, repoRef, userId };
-        const path = 'annotations/moderation/merges.json';
-        const indexKey = toFileShaIndexKey(scope);
-        const advertised = JSON.parse(
-          localStorage.getItem(indexKey) ?? 'null'
-        );
-        const recordKey = toFileRecordKey(scope, path);
-        await new Promise((resolve, reject) => {
-          const open = indexedDB.open(
-            'cellucid_community_annotation_file_cache',
-            1
-          );
-          open.onerror = () => reject(open.error);
-          open.onsuccess = () => {
-            const db = open.result;
-            const tx = db.transaction(['files'], 'readwrite');
-            tx.objectStore('files').delete(recordKey);
-            tx.oncomplete = () => {
-              db.close();
-              resolve();
-            };
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () => reject(
-              tx.error ?? new Error('Synthetic cache deletion aborted')
-            );
-          };
-        });
-        return {
-          advertisedSha: advertised?.[path] ?? null,
-          indexKey,
-        };
-      },
-      {
-        datasetId: FIRST_DATASET_ID,
-        repoRef: `${FIRST_REPO}@main`,
-        userId: AUTH_USER.id,
-      }
-    );
-    expect(beforeCorruption.advertisedSha).toMatch(/^[0-9a-f]{40}$/);
+    const firstScope = {
+      datasetId: FIRST_DATASET_ID,
+      repoRef: `${FIRST_REPO}@main`,
+      userId: AUTH_USER.id,
+    };
+    expect(await corruptPullMarker(page, firstScope)).toBe(true);
+    // A Pull in this page whose repository did not change folds nothing
+    // again; the damage is met by the Pull after a reload.
+    await openCatalogDeepLink(page);
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
+      role: 'author',
+      currentRepo: `${FIRST_REPO}@main`,
+    });
+    if (!(await section.evaluate(element => element.open))) {
+      await section.locator(':scope > summary').click();
+    }
 
     await section.getByRole('button', {
       name: 'GitHub sync…',
@@ -2228,9 +2027,7 @@ test(
       page.locator('.notification-error').filter({
         hasText: 'exact local raw-file cache was cleared',
       });
-    await expect(cacheRecoveryNotifications).toHaveCount(1, {
-      timeout: 10_000,
-    });
+    await expect(cacheRecoveryNotifications).toHaveCount(1);
     await expect(cacheRecoveryNotifications).toBeVisible();
     await expect(modal).toHaveCount(0);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
@@ -2240,12 +2037,7 @@ test(
         userId: AUTH_USER.id,
       },
     });
-    expect(
-      await page.evaluate(
-        key => localStorage.getItem(key),
-        beforeCorruption.indexKey
-      )
-    ).toBeNull();
+    expect(await cachedScope(page, firstScope)).toEqual({ paths: [], completed: false });
 
     await page.evaluate(
       async ({ datasetId, repoRef, userKey }) => {
@@ -2270,9 +2062,7 @@ test(
         userKey: AUTH_USER_KEY,
       }
     );
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
     });
@@ -2289,33 +2079,15 @@ test(
       exact: true,
     }).click();
     await expect(modal.getByRole('status')).toHaveText(
-      'Pulled latest annotations.',
-      { timeout: 10_000 }
+      'Pulled latest annotations.'
     );
-    const recovered = await page.evaluate(
-      async ({ datasetId, repoRef, userId }) => {
-        const { getCommunityAnnotationFileCache } = await import(
-          '/assets/js/app/community-annotations/file-cache.js'
-        );
-        const paths = [];
-        await getCommunityAnnotationFileCache().forEachJsonForRepo({
-          datasetId,
-          repoRef,
-          userId,
-          prefixes: ['annotations/moderation/'],
-          onRecord: path => paths.push(path),
-        });
-        return paths;
-      },
-      {
-        datasetId: FIRST_DATASET_ID,
-        repoRef: `${FIRST_REPO}@main`,
-        userId: AUTH_USER.id,
-      }
-    );
-    expect(recovered).toEqual([
-      'annotations/moderation/merges.json',
-    ]);
+    expect(await cachedScope(page, firstScope)).toEqual({
+      paths: [
+        'annotations/moderation/merges.json',
+        `annotations/users/${AUTH_USER_KEY}.json`,
+      ],
+      completed: true,
+    });
     await modal.getByRole('button', {
       name: 'Close',
       exact: true,
@@ -2333,31 +2105,29 @@ test(
       body: repoInfo(fullName, { author: true }),
     }));
     await page.route(
-      `${WORKER_ORIGIN}/auth/installations`,
+      workerRoute('/auth/installations'),
       async route => {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            installations: [
+            items: [
               { id: 92, account: { login: 'team' } },
-            ],
-          }),
+            ], nextPage: null }),
         });
       },
     );
     await page.route(
-      `${WORKER_ORIGIN}/auth/installation-repos`,
+      workerRoute('/auth/installation-repos'),
       async route => {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            repositories: [
+            items: [
               { id: 9201, full_name: FIRST_REPO, private: false },
               { id: 9202, full_name: SECOND_REPO, private: false },
-            ],
-          }),
+            ], nextPage: null }),
         });
       },
     );
@@ -2367,59 +2137,12 @@ test(
       currentRepo: `${FIRST_REPO}@main`,
     });
 
-    const candidateIndexKey = await page.evaluate(
-      async ({ datasetId, repoRef, userId }) => {
-        const {
-          toFileRecordKey,
-          toFileShaIndexKey,
-        } = await import(
-          '/assets/js/app/community-annotations/cache-scope.js'
-        );
-        const { getCommunityAnnotationFileCache } = await import(
-          '/assets/js/app/community-annotations/file-cache.js'
-        );
-        const scope = { datasetId, repoRef, userId };
-        const path = 'annotations/moderation/merges.json';
-        await getCommunityAnnotationFileCache().setJson({
-          ...scope,
-          path,
-          sha: 'f'.repeat(40),
-          json: {
-            version: 1,
-            updatedAt: '2026-07-29T00:00:00.000Z',
-            merges: [],
-          },
-        });
-        const recordKey = toFileRecordKey(scope, path);
-        await new Promise((resolve, reject) => {
-          const open = indexedDB.open(
-            'cellucid_community_annotation_file_cache',
-            1
-          );
-          open.onerror = () => reject(open.error);
-          open.onsuccess = () => {
-            const db = open.result;
-            const tx = db.transaction(['files'], 'readwrite');
-            tx.objectStore('files').delete(recordKey);
-            tx.oncomplete = () => {
-              db.close();
-              resolve();
-            };
-            tx.onerror = () => reject(tx.error);
-            tx.onabort = () => reject(
-              tx.error ??
-                new Error('Synthetic candidate cache deletion aborted')
-            );
-          };
-        });
-        return toFileShaIndexKey(scope);
-      },
-      {
-        datasetId: FIRST_DATASET_ID,
-        repoRef: `${SECOND_REPO}@main`,
-        userId: AUTH_USER.id,
-      }
-    );
+    const candidateScope = {
+      datasetId: FIRST_DATASET_ID,
+      repoRef: `${SECOND_REPO}@main`,
+      userId: AUTH_USER.id,
+    };
+    expect(await corruptPullMarker(page, candidateScope)).toBe(false);
 
     const section = page.locator('#community-annotation-section');
     if (!(await section.evaluate(element => element.open))) {
@@ -2459,8 +2182,7 @@ test(
     });
     await switchRepo.click();
     await expect(status).toContainText(
-      /existing repository connection was preserved/i,
-      { timeout: 10_000 },
+      /existing repository connection was preserved/i
     );
     const candidateFailure = {
       errors: await page.locator('.notification-error').allTextContents(),
@@ -2488,18 +2210,11 @@ test(
         ),
       ],
     });
-    expect(
-      await page.evaluate(
-        key => localStorage.getItem(key),
-        candidateIndexKey
-      )
-    ).toBeNull();
+    expect(await cachedScope(page, candidateScope)).toEqual({ paths: [], completed: false });
 
     await switchRepo.click();
     await expect(modal).toHaveCount(0);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${SECOND_REPO}@main`,
       annotationParam: `${SECOND_REPO}@main`,
@@ -2560,7 +2275,7 @@ test(
       beforeSetupClose
     );
 
-    await context.setOffline(true);
+    await goOffline(context);
     await expect.poll(() => autoPullTimerSnapshot(page)).toMatchObject({
       active: 0,
     });
@@ -2598,7 +2313,7 @@ test(
       },
     });
 
-    await context.setOffline(true);
+    await goOffline(context);
     const connectRepo = section.getByRole('button', {
       name: 'Connect repo',
       exact: true,
@@ -2686,8 +2401,8 @@ test(
     const release = holdRepositoryInfo;
     holdRepositoryInfo = null;
     release.resolve();
-    await expect(pull).toBeEnabled({ timeout: 10_000 });
-    await expect(publish).toBeEnabled({ timeout: 10_000 });
+    await expect(pull).toBeEnabled();
+    await expect(publish).toBeEnabled();
     await expect(status).toHaveText('');
     await modal.getByRole('button', {
       name: 'Close',
@@ -3006,30 +2721,26 @@ test(
               probe.fired += 1;
             }
           };
-          return nativeSetTimeout.call(this, observed, delay, ...args);
+          // The back-off follows the measured link (about a second here):
+          // held to a fixed window so the Pull below surely starts first.
+          const heldMs = Math.max(Number(delay) || 0, 5000);
+          probe.dueAt = Date.now() + heldMs;
+          return nativeSetTimeout.call(this, observed, heldMs, ...args);
         }
         return nativeSetTimeout.call(this, callback, delay, ...args);
       };
       window.__cellucidRoleRetryTimerProbe = probe;
     });
-    const activePullEntered = deferred();
-    const releaseActivePull = deferred();
-    const retryAfterSeconds = 5;
     let repoRequestCount = 0;
-    let retryDueAt = 0;
+    let failing = true;
     await installGitHubApi(page, async fullName => {
       repoRequestCount += 1;
-      if (repoRequestCount === 1) {
-        retryDueAt = Date.now() + retryAfterSeconds * 1000;
+      if (failing) {
+        // Busy until the role resolution gives up and schedules its retry.
         return {
           status: 503,
-          headers: { 'retry-after': String(retryAfterSeconds) },
-          body: { error: 'synthetic retry before active pull' },
+          body: { error: 'synthetic busy Worker before the active pull' },
         };
-      }
-      if (repoRequestCount === 2) {
-        activePullEntered.resolve();
-        await releaseActivePull.promise;
       }
       return {
         body: repoInfo(fullName, { author: true }),
@@ -3040,6 +2751,30 @@ test(
     await expect(page.locator('.notification-warning').last()).toContainText(
       'repository connection was preserved',
     );
+    failing = false;
+    const requestsBeforePull = repoRequestCount;
+    // Hold the Pull in the page at its first step, before it reads the
+    // repository or writes the role: a request held open without bytes
+    // would be taken for stalled and asked again (the transport's stall
+    // timeout), so the hold is not a network one.
+    await page.evaluate(async () => {
+      const { getGitHubAuthSession } = await import(
+        '/assets/js/app/community-annotations/github-auth.js'
+      );
+      const auth = getGitHubAuthSession();
+      const original = auth.ensureWorkerCompatible;
+      const gate = { entered: false, release: null };
+      const released = new Promise(resolve => {
+        gate.release = resolve;
+      });
+      auth.ensureWorkerCompatible = async function heldPullWorkerCheck(...args) {
+        auth.ensureWorkerCompatible = original;
+        gate.entered = true;
+        await released;
+        return original.apply(auth, args);
+      };
+      window.__cellucidActivePullGate = gate;
+    });
     // The panel is drawn when its section opens (a closed panel defers its
     // render), so the section is opened and the drawn button awaited first.
     await page.evaluate(() => {
@@ -3078,8 +2813,10 @@ test(
       }
       pullLatest.click();
     });
-    await activePullEntered.promise;
-    expect(repoRequestCount).toBe(2);
+    await expect.poll(
+      () => page.evaluate(() => window.__cellucidActivePullGate.entered),
+    ).toBe(true);
+    expect(repoRequestCount).toBe(requestsBeforePull);
 
     // The owner retry is due while the explicit pull owns syncBusy. It must be
     // queued, not consumed into a null-timer state. Wait until it has really
@@ -3089,13 +2826,13 @@ test(
       () => window.__cellucidRoleRetryTimerProbe.armed,
     )).toBe(1);
     await expect.poll(
-      () => page.evaluate(() => window.__cellucidRoleRetryTimerProbe.fired),
-      { timeout: retryAfterSeconds * 1000 + 30_000 },
+      () => page.evaluate(() => window.__cellucidRoleRetryTimerProbe.fired)
     ).toBe(1);
+    const retryDueAt = await page.evaluate(() => window.__cellucidRoleRetryTimerProbe.dueAt);
     await page.waitForTimeout(
       Math.max(0, retryDueAt + 400 - Date.now()),
     );
-    expect(repoRequestCount).toBe(2);
+    expect(repoRequestCount).toBe(requestsBeforePull);
     await page.evaluate(async () => {
       const { getCommunityAnnotationAccessStore } = await import(
         '/assets/js/app/community-annotations/access-store.js'
@@ -3117,12 +2854,10 @@ test(
         return 'annotator';
       };
     });
-    releaseActivePull.resolve();
+    await page.evaluate(() => window.__cellucidActivePullGate.release());
 
-    await expect.poll(() => repoRequestCount, { timeout: 10_000 }).toBe(3);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => repoRequestCount).toBe(requestsBeforePull + 2);
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
       session: {
@@ -3172,7 +2907,7 @@ test(
     await settleBrowserContinuations(page);
     releaseFirstRequest.resolve();
 
-    await expect.poll(() => repoRequestCount, { timeout: 10_000 }).toBe(2);
+    await expect.poll(() => repoRequestCount).toBe(2);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
@@ -3216,8 +2951,7 @@ test(
 
     await openCatalogDeepLink(page);
     await expect.poll(
-      () => requestedRepos,
-      { timeout: 10_000 },
+      () => requestedRepos
     ).toContain(FIRST_REPO);
     const staleRepoRequestFailed =
       waitForRepoRequestFailure(page, FIRST_REPO);
@@ -3237,12 +2971,9 @@ test(
     await settleBrowserContinuations(page);
 
     await expect.poll(
-      () => requestedRepos,
-      { timeout: 10_000 },
+      () => requestedRepos
     ).toContain(SECOND_REPO);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: SECOND_DATASET_ID,
       currentRepo: `${SECOND_REPO}@main`,
@@ -3330,9 +3061,7 @@ test(
     await expect(page.locator('#dataset-name')).toHaveText(
       SECOND_DATASET_NAME,
     );
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: SECOND_DATASET_ID,
       currentRepo: `${SECOND_REPO}@main`,
@@ -3590,8 +3319,7 @@ test(
 
     await openCatalogDeepLink(page);
     await expect.poll(
-      () => repoRequested,
-      { timeout: 10_000 },
+      () => repoRequested
     ).toBe(true);
     const staleRepoRequestFailed =
       waitForRepoRequestFailure(page, FIRST_REPO);
@@ -3604,9 +3332,7 @@ test(
     await staleRepoRequestFailed;
     await settleBrowserContinuations(page);
 
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: false,
       role: 'unknown',
       currentDatasetId: FIRST_DATASET_ID,
@@ -3697,7 +3423,7 @@ test(
     }
 
     const terminalError = page.locator('.notification-error').last();
-    await expect(terminalError).toBeVisible({ timeout: 10_000 });
+    await expect(terminalError).toBeVisible();
     await expect(terminalError).toContainText(
       UNKNOWN_PUBLICATION_GUIDANCE,
     );
@@ -3705,9 +3431,7 @@ test(
       await page.locator('.notification-success').allTextContents(),
     ).not.toContain('Cancelled.');
     expect(mutationRequests).toHaveLength(1);
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: false,
       role: 'unknown',
       currentRepo: null,
@@ -3777,7 +3501,7 @@ test(
     await repoRequestFailed;
 
     const terminalError = page.locator('.notification-error').last();
-    await expect(terminalError).toBeVisible({ timeout: 10_000 });
+    await expect(terminalError).toBeVisible();
     await expect(terminalError).toContainText(
       'Annotation dataset, repository, or authenticated user changed.',
     );
@@ -3879,9 +3603,7 @@ test(
 
     const { modal, publish } = await startGitHubPublication(page);
     const status = modal.getByRole('status');
-    await expect(status).toHaveText('Publish complete.', {
-      timeout: 10_000,
-    });
+    await expect(status).toHaveText('Nothing new to publish: GitHub already has your changes.');
     expect(mutationRequests).toHaveLength(0);
     const baselineAfterNoOp = await page.evaluate(async path => {
       const { getCommunityAnnotationSession } =
@@ -3912,16 +3634,14 @@ test(
             : 'pending'
         );
       return secondOutcome;
-    }, { timeout: 10_000 }).not.toBe('pending');
+    }).not.toBe('pending');
 
     expect(
       baselineAfterNoOp,
       `second publication outcome: ${secondOutcome}`,
     ).toBe(firstRemoteSha);
     expect(mutationRequests).toHaveLength(1);
-    await expect(status).toHaveText('Publish complete.', {
-      timeout: 10_000,
-    });
+    await expect(status).toHaveText('Published.');
 
     expect(mutationRequests[0]).toMatchObject({
       method: 'PUT',
@@ -4011,11 +3731,9 @@ test(
       `${WORKER_ORIGIN}/api/repos/${FIRST_REPO}/contents/` +
         'annotations/config.json**',
       async route => {
+        // A Pull reads the config by blob id; the publication reads it once
+        // through the Contents API, for the SHA it replaces.
         publicationConfigReads += 1;
-        if (publicationConfigReads === 1) {
-          await route.fallback();
-          return;
-        }
         await route.fulfill({
           status: 413,
           contentType: 'application/json',
@@ -4029,7 +3747,7 @@ test(
     await startGitHubPublication(page);
 
     const terminalError = page.locator('.notification-error').last();
-    await expect(terminalError).toBeVisible({ timeout: 10_000 });
+    await expect(terminalError).toBeVisible();
     await expect(terminalError).toContainText(
       'Publication was only partially completed.',
     );
@@ -4044,7 +3762,7 @@ test(
       method: 'PUT',
       path: `/api/repos/${FIRST_REPO}/contents/${userPath}`,
     }]);
-    expect(publicationConfigReads).toBe(2);
+    expect(publicationConfigReads).toBe(1);
     const baseline = await page.evaluate(async path => {
       const { getCommunityAnnotationSession } =
         await import('/assets/js/app/community-annotations/session.js');
@@ -4092,8 +3810,8 @@ test(
         updatedAt: '2026-07-29T00:00:00.000Z',
         merges: Array.from({ length: 1000 }, (_, index) => ({
           bucket: `cell_type:${'x'.repeat(985)}${index}`,
-          fromSuggestionId: `from-${index}`,
-          intoSuggestionId: `into-${index}`,
+          fromSuggestionId: `ghid_7_from-${index}`,
+          intoSuggestionId: `ghid_8_into-${index}`,
           by: 'ghid_4242',
           at: '2026-07-29T00:00:00.000Z',
           note: 'n'.repeat(512),
@@ -4109,7 +3827,7 @@ test(
     await startGitHubPublication(page);
 
     const terminalError = page.locator('.notification-error').last();
-    await expect(terminalError).toBeVisible({ timeout: 10_000 });
+    await expect(terminalError).toBeVisible();
     await expect(terminalError).toContainText(
       'annotations/moderation/merges.json is',
     );
@@ -4176,7 +3894,7 @@ test(
     await startGitHubPublication(page);
 
     const terminalError = page.locator('.notification-error').last();
-    await expect(terminalError).toBeVisible({ timeout: 10_000 });
+    await expect(terminalError).toBeVisible();
     await expect(terminalError).toContainText(
       'annotations/config.json is 1000002 UTF-8 bytes',
     );
@@ -4224,8 +3942,7 @@ test(
       'Current UI fixture',
     );
     await expect.poll(
-      () => firstRepoRequestCount,
-      { timeout: 10_000 },
+      () => firstRepoRequestCount
     ).toBe(1);
     const staleDefaultBranchRequestFailed =
       waitForRepoRequestFailure(page, FIRST_REPO);
@@ -4246,9 +3963,7 @@ test(
     await staleDefaultBranchRequestFailed;
     await settleBrowserContinuations(page);
 
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentDatasetId: SECOND_DATASET_ID,
       currentRepo: `${SECOND_REPO}@main`,
@@ -4288,9 +4003,7 @@ test(
         await import('/assets/js/app/community-annotations/github-auth.js');
       getGitHubAuthSession().signOut();
     });
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: false,
       role: 'unknown',
       currentRepo: null,
@@ -4318,9 +4031,7 @@ test(
       });
     });
 
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 10_000,
-    }).toMatchObject({
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: true,
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,

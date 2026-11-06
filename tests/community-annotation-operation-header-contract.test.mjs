@@ -5,6 +5,13 @@ import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import { CommunityAnnotationGitHubSync } from '../assets/js/app/community-annotations/github-sync.js';
 import { parseExactJson } from '../assets/js/app/community-annotations/wire-contract.js';
 import { WORKER_EXPOSED_RESPONSE_HEADERS } from './browser/helpers/worker-exposed-headers.mjs';
+import {
+  configFor,
+  createVirtualTime,
+  MockAnnotationGitHub,
+  virtualTransport,
+  WORKER_ORIGIN,
+} from './helpers/community-annotation-worker.mjs';
 
 const ENV = Object.freeze({
   ALLOWED_ORIGINS: 'https://app.example',
@@ -72,9 +79,16 @@ function commaSeparatedHeaderSet(response, name) {
   );
 }
 
+// A write bound to its caller (a user file, a contribution branch, a Pull
+// Request) first asks GitHub who the token belongs to: user 42, researcher.
+const CALLER = Object.freeze({ id: 42, login: 'researcher' });
+
 async function withGlobalFetch(fetchImpl, operation) {
   const previousFetch = globalThis.fetch;
-  globalThis.fetch = fetchImpl;
+  globalThis.fetch = (url, options) =>
+    String(url) === 'https://api.github.com/user'
+      ? Promise.resolve(new Response(JSON.stringify(CALLER), { status: 200 }))
+      : fetchImpl(url, options);
   try {
     return await operation();
   } finally {
@@ -110,22 +124,6 @@ async function withDeterministicRandomUuid(uuid, operation) {
   }
 }
 
-function validRepoInfo() {
-  return {
-    full_name: 'owner/repo',
-    default_branch: 'main',
-    private: false,
-    allow_forking: true,
-    permissions: {
-      pull: true,
-      triage: false,
-      push: true,
-      maintain: false,
-      admin: false,
-    },
-  };
-}
-
 function validUserDocument() {
   return {
     version: 1,
@@ -138,14 +136,41 @@ function validUserDocument() {
   };
 }
 
-function createDirectSync() {
-  return new CommunityAnnotationGitHubSync({
+/** A direct-mode sync on virtual time over `fetchImpl`: `{sync, run}`. */
+function createDirectSync(fetchImpl, time = createVirtualTime()) {
+  const { transport } = virtualTransport(fetchImpl, time);
+  const sync = new CommunityAnnotationGitHubSync({
     datasetId: 'synthetic',
     owner: 'owner',
     repo: 'repo',
     token: 'test-token',
     branch: 'main',
-    workerOrigin: 'https://worker.example',
+    workerOrigin: WORKER_ORIGIN,
+    transport,
+  });
+  return { sync, time, run: (promise) => time.run(promise) };
+}
+
+/** Run `operation(sync)` on a fresh direct sync over `fetchImpl`, on virtual time. */
+function runDirect(fetchImpl, operation) {
+  const { sync, run } = createDirectSync(fetchImpl);
+  return run(operation(sync));
+}
+
+/** An error and its causes, outermost first. */
+function causeChain(error) {
+  const chain = [];
+  for (let at = error; at !== undefined && at !== null && chain.length < 10; at = at.cause) chain.push(at);
+  return chain;
+}
+
+/** Everything but the mutation answered by the shared in-memory GitHub (contract 3). */
+function directRepository() {
+  return new MockAnnotationGitHub({
+    files: {
+      'annotations/config.json': configFor('synthetic', ['cell_type']),
+      'annotations/users/.gitkeep': '\n',
+    },
   });
 }
 
@@ -157,25 +182,11 @@ function createDirectBrowserFetch({
   mutationError = null,
   capture,
 }) {
+  const repository = directRepository();
   return async (rawUrl, options = {}) => {
     const url = new URL(rawUrl);
     const method = options.method ?? 'GET';
 
-    if (method === 'GET' && url.pathname === '/auth/user') {
-      return new Response('{"id":42,"login":"researcher"}', {
-        status: 200,
-      });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname ===
-        '/api/repos/owner/repo/contents/annotations/users/ghid_42.json'
-    ) {
-      return new Response('{"error":"Not Found"}', { status: 404 });
-    }
-    if (method === 'GET' && url.pathname === '/api/repos/owner/repo') {
-      return new Response(JSON.stringify(validRepoInfo()), { status: 200 });
-    }
     if (
       method === 'PUT' &&
       url.pathname ===
@@ -195,10 +206,17 @@ function createDirectBrowserFetch({
       if (outcome !== null) {
         responseHeaders[OPERATION_OUTCOME_HEADER] = outcome;
       }
-      return new Response(JSON.stringify(mutationDocument), {
+      // As the Worker answers: JSON with its length.
+      const text = JSON.stringify(mutationDocument);
+      responseHeaders['Content-Type'] = 'application/json';
+      responseHeaders['Content-Length'] = String(Buffer.byteLength(text));
+      return new Response(text, {
         status: mutationStatus,
         headers: responseHeaders,
       });
+    }
+    if (method === 'GET' || url.pathname.startsWith('/graphql/')) {
+      return repository.fetch(rawUrl, options);
     }
     throw new Error(`Unexpected browser request: ${method} ${url.pathname}`);
   };
@@ -208,41 +226,6 @@ function syntheticAbortError(message = 'Synthetic transport abort') {
   const error = new Error(message);
   error.name = 'AbortError';
   return error;
-}
-
-async function withControlledTimeouts(operation) {
-  const previousSetTimeout = globalThis.setTimeout;
-  const previousClearTimeout = globalThis.clearTimeout;
-  const scheduled = [];
-  globalThis.setTimeout = (callback, delay) => {
-    const handle = {
-      callback,
-      cleared: false,
-      delay,
-      fired: false,
-    };
-    scheduled.push(handle);
-    return handle;
-  };
-  globalThis.clearTimeout = handle => {
-    if (handle && typeof handle === 'object') handle.cleared = true;
-  };
-  try {
-    return await operation({
-      fire(index) {
-        const handle = scheduled[index];
-        assert.ok(handle, `timeout ${index} must exist`);
-        assert.equal(handle.cleared, false);
-        assert.equal(handle.fired, false);
-        handle.fired = true;
-        handle.callback();
-      },
-      scheduled,
-    });
-  } finally {
-    globalThis.setTimeout = previousSetTimeout;
-    globalThis.clearTimeout = previousClearTimeout;
-  }
 }
 
 test(
@@ -271,6 +254,7 @@ test(
       new Set([
         'authorization',
         'content-type',
+        'if-none-match',
         'x-cellucid-operation-id',
       ]),
     );
@@ -295,7 +279,7 @@ test(
 );
 
 test(
-  'actual cross-origin responses expose only the operation and safe retry metadata headers',
+  'actual cross-origin responses expose only the operation, conditional-request and rate-limit headers',
   { concurrency: false },
   async () => {
     await withGlobalFetch(
@@ -309,11 +293,16 @@ test(
         assert.deepEqual(
           exposed,
           new Set([
+            'etag',
             'retry-after',
+            'x-ratelimit-limit',
+            'x-ratelimit-remaining',
+            'x-ratelimit-reset',
+            'x-ratelimit-used',
+            'x-ratelimit-resource',
+            'x-github-request-id',
             'x-cellucid-operation-id',
             'x-cellucid-operation-outcome',
-            'x-github-request-id',
-            'x-ratelimit-reset',
           ]),
         );
         // The browser specs' stand-in worker must expose exactly the same
@@ -422,7 +411,7 @@ test(
       },
       {
         label: 'git ref POST',
-        path: '/api/repos/owner/repo/git/refs',
+        path: '/api/repos/researcher/repo/git/refs',
         method: 'POST',
         requestDocument: {
           ref: 'refs/heads/cellucid-annotations/ghid_42/exact',
@@ -437,24 +426,17 @@ test(
         expectedDocument: {},
       },
       {
-        label: 'fork POST',
-        path: '/api/repos/owner/repo/forks',
-        method: 'POST',
-        requestDocument: {},
-        upstreamStatus: 202,
+        label: 'git ref PATCH',
+        path: '/api/repos/researcher/repo/git/refs/heads/cellucid-annotations/ghid_42/exact',
+        method: 'PATCH',
+        requestDocument: { sha: SHA_B, force: true },
+        upstreamStatus: 200,
         upstreamDocument: {
-          full_name: 'researcher/repo',
-          name: 'repo',
-          owner: { login: 'researcher' },
-          parent: { full_name: 'owner/repo' },
+          ref: 'refs/heads/cellucid-annotations/ghid_42/exact',
+          object: { sha: SHA_B, type: 'commit' },
         },
-        expectedStatus: 202,
-        expectedDocument: {
-          full_name: 'researcher/repo',
-          name: 'repo',
-          owner: { login: 'researcher' },
-          parent: { full_name: 'owner/repo' },
-        },
+        expectedStatus: 200,
+        expectedDocument: { object: { sha: SHA_B } },
       },
       {
         label: 'pull request POST',
@@ -704,74 +686,42 @@ test(
 );
 
 test(
-  'browser GitHub requests preserve the first timeout or caller-abort cause',
+  'a caller abort is a cancellation carrying its reason; a silent Worker is stalled, never a total deadline',
   { concurrency: false },
-  async t => {
-    const schedules = [
-      {
-        label: 'timeout then caller remains TIMEOUT',
-        expectedCode: 'TIMEOUT',
-        run(clock, owner) {
-          clock.fire(0);
-          owner.abort(new Error('later caller cancellation'));
-        },
+  async () => {
+    // Every request hangs until its own signal ends it.
+    const hanging = async (_rawUrl, options = {}) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal.reason));
+    });
+
+    const caller = createDirectSync(hanging);
+    const owner = new AbortController();
+    const callerReason = new Error('first caller cancellation');
+    caller.time.after(500, () => owner.abort(callerReason));
+    await assert.rejects(
+      caller.run(caller.sync.validateAndLoadConfig({ signal: owner.signal })),
+      error => {
+        assert.equal(error?.name, 'AbortError');
+        assert.equal(error?.cause, callerReason);
+        return true;
       },
-      {
-        label: 'caller then timeout remains a cancellation',
-        expectedCode: 'cancelled',
-        run(clock, owner, callerReason) {
-          owner.abort(callerReason);
-          clock.fire(0);
-        },
+    );
+    assert.equal(caller.time.now(), 500, 'cancelled at once, not after a timeout');
+
+    const stalled = createDirectSync(hanging);
+    await assert.rejects(
+      stalled.run(stalled.sync.validateAndLoadConfig({})),
+      error => {
+        assert.notEqual(error?.name, 'AbortError');
+        assert.equal(error?.code, 'GITHUB_WORKER_UNREACHABLE');
+        assert.equal(error?.answeredBefore, false);
+        assert.match(error.message, /no answer for/);
+        return true;
       },
-    ];
-
-    for (const schedule of schedules) {
-      await t.test(schedule.label, async () => {
-        let rejectFetch;
-        let markStarted;
-        const started = new Promise(resolve => {
-          markStarted = resolve;
-        });
-        const owner = new AbortController();
-        const callerReason = new Error('first caller cancellation');
-
-        await withControlledTimeouts(clock =>
-          withGlobalFetch(
-            async () => {
-              markStarted();
-              return new Promise((_resolve, reject) => {
-                rejectFetch = reject;
-              });
-            },
-            async () => {
-              const pending = createDirectSync().validateAndLoadConfig({
-                signal: owner.signal,
-              });
-              await started;
-              assert.equal(clock.scheduled.length, 1);
-              assert.equal(clock.scheduled[0].delay, 20_000);
-
-              const rejection = assert.rejects(
-                pending,
-                error => {
-                  if (schedule.expectedCode === 'cancelled') {
-                    assert.equal(error?.name, 'AbortError');
-                    assert.equal(error?.cause, callerReason);
-                  } else {
-                    assert.equal(error?.code, schedule.expectedCode);
-                  }
-                  return true;
-                },
-              );
-              schedule.run(clock, owner, callerReason);
-              rejectFetch(syntheticAbortError());
-              await rejection;
-            },
-          ),
-        );
-      });
-    }
+    );
+    // Stalls are asked again for RFC 1122's patience (at least 100 s), with
+    // no 20 s total deadline anywhere.
+    assert.ok(stalled.time.now() >= 100_000, `gave up after ${stalled.time.now()} ms`);
   },
 );
 
@@ -790,25 +740,22 @@ test(
 
     await withDeterministicRandomUuid(
       OPERATION_ID,
-      () => withGlobalFetch(
-        fetchImpl,
-        () => assert.rejects(
-          createDirectSync().pushMyUserFile({
-            userDoc: validUserDocument(),
-            publicationMode: 'direct',
-          }),
-          error => {
-            assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
-            assert.notEqual(error?.name, 'AbortError');
-            assert.equal(error?.cause, transportError);
-            assert.deepEqual(error?.operation, {
-              id: OPERATION_ID,
-              kind: 'contents-put',
-              outcome: 'unknown',
-            });
-            return true;
-          },
-        ),
+      () => assert.rejects(
+        runDirect(fetchImpl, (sync) => sync.pushMyUserFile({
+          userDoc: validUserDocument(),
+          publicationMode: 'direct',
+        })),
+        error => {
+          assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
+          assert.notEqual(error?.name, 'AbortError');
+          assert.ok(causeChain(error).includes(transportError), 'the transport failure is its cause');
+          assert.deepEqual(error?.operation, {
+            id: OPERATION_ID,
+            kind: 'contents-put',
+            outcome: 'unknown',
+          });
+          return true;
+        },
       ),
     );
     assert.equal(capture.operationId, OPERATION_ID);
@@ -823,13 +770,10 @@ test(
     const fetchImpl = createDirectBrowserFetch({ capture });
     const { calls, value: result } = await withDeterministicRandomUuid(
       OPERATION_ID,
-      () => withGlobalFetch(
-        fetchImpl,
-        () => createDirectSync().pushMyUserFile({
-          userDoc: validUserDocument(),
-          publicationMode: 'direct',
-        }),
-      ),
+      () => runDirect(fetchImpl, (sync) => sync.pushMyUserFile({
+        userDoc: validUserDocument(),
+        publicationMode: 'direct',
+      })),
     );
 
     assert.equal(calls, 1);
@@ -839,12 +783,16 @@ test(
       ['branch', 'content', 'message'],
     );
     assert.equal(Object.hasOwn(capture.body, 'operation'), false);
-    assert.deepEqual(result, {
+    // The view written comes back with it (what this browser keeps as published).
+    const { view, ...written } = result;
+    assert.deepEqual(written, {
       mode: 'direct',
       sha: SHA_B,
+      branch: 'main',
       path: 'annotations/users/ghid_42.json',
       remoteUpdatedAt: null,
     });
+    assert.equal(view.username, 'ghid_42');
   },
 );
 
@@ -860,24 +808,21 @@ test(
 
     await withDeterministicRandomUuid(
       OPERATION_ID,
-      () => withGlobalFetch(
-        fetchImpl,
-        () => assert.rejects(
-          createDirectSync().pushMyUserFile({
-            userDoc: validUserDocument(),
-            publicationMode: 'direct',
-          }),
-          error => {
-            assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
-            assert.match(error?.message ?? '', /operation.*mismatch/i);
-            assert.deepEqual(error?.operation, {
-              id: OPERATION_ID,
-              kind: 'contents-put',
-              outcome: 'unknown',
-            });
-            return true;
-          },
-        ),
+      () => assert.rejects(
+        runDirect(fetchImpl, (sync) => sync.pushMyUserFile({
+          userDoc: validUserDocument(),
+          publicationMode: 'direct',
+        })),
+        error => {
+          assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
+          assert.match(error?.message ?? '', /operation.*mismatch/i);
+          assert.deepEqual(error?.operation, {
+            id: OPERATION_ID,
+            kind: 'contents-put',
+            outcome: 'unknown',
+          });
+          return true;
+        },
       ),
     );
     assert.equal(capture.operationId, OPERATION_ID);
@@ -896,24 +841,21 @@ test(
 
     await withDeterministicRandomUuid(
       OPERATION_ID,
-      () => withGlobalFetch(
-        fetchImpl,
-        () => assert.rejects(
-          createDirectSync().pushMyUserFile({
-            userDoc: validUserDocument(),
-            publicationMode: 'direct',
-          }),
-          error => {
-            assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
-            assert.match(error?.message ?? '', /operation.*outcome/i);
-            assert.deepEqual(error?.operation, {
-              id: OPERATION_ID,
-              kind: 'contents-put',
-              outcome: 'unknown',
-            });
-            return true;
-          },
-        ),
+      () => assert.rejects(
+        runDirect(fetchImpl, (sync) => sync.pushMyUserFile({
+          userDoc: validUserDocument(),
+          publicationMode: 'direct',
+        })),
+        error => {
+          assert.equal(error?.code, 'GITHUB_MUTATION_OUTCOME_UNKNOWN');
+          assert.match(error?.message ?? '', /operation.*outcome/i);
+          assert.deepEqual(error?.operation, {
+            id: OPERATION_ID,
+            kind: 'contents-put',
+            outcome: 'unknown',
+          });
+          return true;
+        },
       ),
     );
     assert.equal(capture.operationId, OPERATION_ID);
@@ -934,24 +876,21 @@ test(
 
     await withDeterministicRandomUuid(
       OPERATION_ID,
-      () => withGlobalFetch(
-        fetchImpl,
-        () => assert.rejects(
-          createDirectSync().pushMyUserFile({
-            userDoc: validUserDocument(),
-            publicationMode: 'direct',
-          }),
-          error => {
-            assert.equal(error?.message, 'upstream unavailable');
-            assert.equal(error?.status, 503);
-            assert.deepEqual(error?.operation, {
-              id: OPERATION_ID,
-              kind: 'contents-put',
-              outcome: 'unknown',
-            });
-            return true;
-          },
-        ),
+      () => assert.rejects(
+        runDirect(fetchImpl, (sync) => sync.pushMyUserFile({
+          userDoc: validUserDocument(),
+          publicationMode: 'direct',
+        })),
+        error => {
+          assert.equal(error?.message, 'upstream unavailable');
+          assert.equal(error?.status, 503);
+          assert.deepEqual(error?.operation, {
+            id: OPERATION_ID,
+            kind: 'contents-put',
+            outcome: 'unknown',
+          });
+          return true;
+        },
       ),
     );
     assert.equal(capture.operationId, OPERATION_ID);

@@ -594,25 +594,6 @@ export class DataStateViewMethods {
   }
 
   /**
-   * Show the representation a saved session names in a view. A session
-   * records what each view showed, not whether it was chosen, so a view that
-   * shows its dimension's default follows that default again.
-   *
-   * @param {string} viewId
-   * @param {{key: string, columns: number[]|null}} ref
-   * @returns {Promise<string>} The layout key now shown.
-   */
-  async restoreViewEmbedding(viewId, ref) {
-    requireMethod(this.dimensionManager, 'resolveRepresentation', 'Dimension manager');
-    const layoutKey = this.dimensionManager.resolveRepresentation(ref);
-    const dimension = this.dimensionManager.getLayout(layoutKey).dimension;
-    await this.setViewRepresentation(viewId, layoutKey, {
-      followsDefault: this.dimensionManager.getDefaultLayout(dimension) === layoutKey,
-    });
-    return layoutKey;
-  }
-
-  /**
    * Set the representation one view shows, as one transaction: coordinates
    * and centroids are staged first, then the renderer, the dimension manager
    * and the viewer publish the new layout, and any failure restores all of

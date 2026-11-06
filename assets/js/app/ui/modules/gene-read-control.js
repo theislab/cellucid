@@ -21,7 +21,9 @@
  * It applies to every gene read: the colouring, analyses and exports. What
  * shows a gene's sample elsewhere links here (`createGeneReadLink`: the
  * gene's legend, an analysis's result) through `revealGeneReadControl`;
- * nothing else changes it. A session records the sample read
+ * nothing else changes it. Read is the action `cells.read-genes` (a step;
+ * its implementation is here, whoever asks); Stop ends it, and what was read
+ * is the step. A session records the sample read
  * (`session/cell-subset-record.js`, `genes`).
  *
  * @module ui/modules/gene-read-control
@@ -35,6 +37,7 @@ import { formatCompactCount } from '../components/display-format.js';
 import { isCancellation, onAbort } from '../../../utils/abort.js';
 import { revealSidebar } from './sidebar-controls.js';
 import { expandSessionSection } from './session-sections.js';
+import { getActions } from '../../actions/index.js';
 
 /** The shares of the open cells the slider offers above the sample (percent). */
 export const GENE_READ_STEPS = Object.freeze([1, 5, 10, 25, 50, 100]);
@@ -148,6 +151,7 @@ export function geneReadStatus(sample, { chosen, cost = null, noRoom = null, gro
  * @param {number} target
  * @param {string|null} cost - The cost as said before it ran (`geneSampleCostText`)
  * @param {string} [what]
+ * @returns {Promise<{ended: 'read'|'stopped'|'failed', error: Error|null}>} How it ended (said already)
  */
 export async function readGenesForMoreCellsSaid(state, target, cost = null, what = 'every open cell') {
   const notifications = getNotificationCenter();
@@ -168,12 +172,14 @@ export async function readGenesForMoreCellsSaid(state, target, cost = null, what
       },
     });
     notifications.complete(id, said());
+    return { ended: 'read', error: null };
   } catch (error) {
     if (isCancellation(error)) {
       notifications.complete(id, `Stopped. ${said()}`);
-      return;
+      return { ended: 'stopped', error: null };
     }
     notifications.fail(id, `Reading genes for ${what} failed: ${error?.message ?? String(error)}`);
+    return { ended: 'failed', error: error instanceof Error ? error : new Error(String(error)) };
   }
 }
 
@@ -277,14 +283,38 @@ export function createGeneReadLink(state, signal) {
 /**
  * Genes read for, in Session › Open data.
  *
- * @param {{dom: {root: HTMLElement, slider: HTMLInputElement, percent: HTMLInputElement, status: HTMLElement, actions: HTMLElement, action: HTMLButtonElement}, state: Object}} options
- * @returns {{refresh: () => void, destroy: () => void}}
+ * The count of open cells genes were asked to be read for (the action
+ * `cells.read-genes`) is kept here with the open cells it was asked on
+ * (`openCellsKey`): the `cells` state domain reads and restores it
+ * (`genesAsked`, `setGenesAsked`; `app/state/domains/cells.js`).
+ *
+ * @param {{dom: {root: HTMLElement, slider: HTMLInputElement, percent: HTMLInputElement, status: HTMLElement, actions: HTMLElement, action: HTMLButtonElement}, state: Object,
+ *   openCellsKey: () => string}} options - `openCellsKey`: the open cells now (`cells.js` `openCellsKey`)
+ * @returns {{refresh: () => void, destroy: () => void, genesAsked: () => (number|null), setGenesAsked: (cells: number|null) => void}}
  */
-export function initGeneReadControl({ dom, state }) {
+export function initGeneReadControl({ dom, state, openCellsKey }) {
   for (const key of DOM_KEYS) {
     if (!dom?.[key]) throw new TypeError(`Genes read for needs its ${key}.`);
   }
+  if (typeof openCellsKey !== 'function') throw new TypeError('Genes read for needs openCellsKey().');
+  /** The genes asked for: a count of open cells, on the open cells keyed `key`. */
+  let asked = null;
+  // Reading genes for more cells, whoever asks, is this control's (`readGenesAction`);
+  // provided first, so a second control on the page fails before it starts anything.
+  const unprovide = getActions().provide('cells.read-genes', (params, context) => readGenesAction(params, context));
+  // What reading genes for more cells would take, priced at the link as measured now (the agent presence's heavy work).
+  const unestimate = getActions().provideEstimate('cells.read-genes', async ({ cells }) => {
+    const sample = sampleNow();
+    if (sample === null) return null;
+    const target = Math.min(cells, sample.of);
+    if (target <= sample.cells) return null;
+    const priced = await Promise.resolve(state.geneSampleCost(target)).catch(() => null);
+    if (priced === null) return null;
+    return { ms: priced.ms ?? null, bytes: priced.bytes ?? null, what: `Reads genes for ${formatCountOf(target, 'cell')} (${geneSampleCostText(priced)})` };
+  });
   const lifecycle = new AbortController();
+  onAbort(lifecycle.signal, unprovide);
+  onAbort(lifecycle.signal, unestimate);
   const on = (element, event, handler) => element.addEventListener(event, handler, { signal: lifecycle.signal });
   // The sample the steps were made for, the steps, and the one chosen.
   let pricedFor = null;
@@ -459,28 +489,51 @@ export function initGeneReadControl({ dom, state }) {
   };
   on(dom.percent, 'change', commitPercent);
   on(dom.percent, 'keydown', event => { if (event.key === 'Enter') commitPercent(); });
+  /**
+   * The action `cells.read-genes`: read genes for the first `cells` open
+   * cells (never past what the gene index is kept for here), said while it
+   * runs. Stopped, what was read is the step; a failure that read nothing is
+   * refused (it was said).
+   */
+  async function readGenesAction({ cells }, { signal }) {
+    const sample = sampleNow();
+    if (sample === null) return null;
+    // Priced now, at the link as measured now.
+    const priced = await Promise.resolve(state.geneSampleCost(Math.min(cells, sample.of))).catch(() => null);
+    const fits = priced?.index?.refusal == null ? Infinity : priced.index.fits;
+    const target = Math.min(cells, sample.of, fits);
+    if (target <= sample.cells || growthNow() !== null) return null;
+    const what = target >= sample.of ? 'every open cell' : `${geneReadPercentText(target, sample.of)} % of the open cells (${formatCountOf(target, 'cell')})`;
+    const said = priced === null || target !== cells ? null : geneSampleCostText(priced);
+    // Stopping the action stops the reading; what is read stays.
+    const remove = onAbort(signal, () => state.stopReadingGenesForMoreCells());
+    let ended;
+    try {
+      ended = await readGenesForMoreCellsSaid(state, target, said, what);
+    } finally {
+      remove();
+    }
+    const now = sampleNow();
+    const read = now === null ? sample.of : now.cells;
+    if (ended.ended === 'failed' && read <= sample.cells) throw ended.error;
+    // What was read is what the step asked for (the `cells` state domain).
+    asked = { cells: read, key: openCellsKey() };
+    return { cells: read, stopped: read < target };
+  }
+
   on(dom.action, 'click', () => {
     if (growthNow() !== null) {
+      // Ends the action reading them (`readGenesAction`): what is read stays.
       state.stopReadingGenesForMoreCells();
       return;
     }
     const sample = sampleNow();
     if (sample === null || chosen <= sample.cells) return;
     dom.action.disabled = true;
-    void (async () => {
-      // Priced now, at the link as measured now, and never past what the
-      // gene index is kept for here.
-      const priced = await Promise.resolve(state.geneSampleCost(chosen)).catch(() => null);
-      const fits = priced?.index?.refusal == null ? Infinity : priced.index.fits;
-      const target = Math.min(chosen, fits);
-      if (lifecycle.signal.aborted || growthNow() !== null || target <= sample.cells) {
-        render();
-        return;
-      }
-      const what = target >= sample.of ? 'every open cell' : `${geneReadPercentText(target, sample.of)} % of the open cells (${formatCountOf(target, 'cell')})`;
-      const said = priced === null || target !== chosen ? null : geneSampleCostText(priced);
-      await readGenesForMoreCellsSaid(state, target, said, what);
-    })();
+    // Its notification says how it went, a failure included.
+    void getActions().dispatch('cells.read-genes', { cells: chosen }).catch(() => {}).finally(() => {
+      if (!lifecycle.signal.aborted) render();
+    });
   });
 
   // The chosen step priced again while it is shown: its time follows the
@@ -498,6 +551,13 @@ export function initGeneReadControl({ dom, state }) {
   sync();
   return {
     refresh: sync,
+    /** The count of open cells genes were asked to be read for, on the cells open now; null when not asked on them. */
+    genesAsked: () => (asked !== null && asked.key === openCellsKey() ? asked.cells : null),
+    /** Put back a count asked for (a history step shown), for the cells open now. */
+    setGenesAsked(cells) {
+      if (cells !== null && (!Number.isSafeInteger(cells) || cells < 1)) throw new RangeError('Genes are asked for a whole number of cells.');
+      asked = cells === null ? null : { cells, key: openCellsKey() };
+    },
     destroy() {
       lifecycle.abort();
     },

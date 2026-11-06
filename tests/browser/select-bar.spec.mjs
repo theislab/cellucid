@@ -12,6 +12,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openPhoneSheet } from './helpers/panels.mjs';
+import { readyForGesture } from './helpers/selection-gesture.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -86,23 +87,11 @@ async function findEmptyPoint(page) {
   return point;
 }
 
-const GESTURE_LANDING_TIMEOUT_MS = 3_000;
-
-/** Tap until the tool reports a step: a tap can land before a frame settles. */
-async function tapUntilSelected(page, point) {
-  const steps = page.locator('#select-bar-steps');
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await page.touchscreen.tap(point.x, point.y);
-    const shown = await steps.waitFor({
-      state: 'visible',
-      timeout: GESTURE_LANDING_TIMEOUT_MS,
-    }).then(() => true, error => {
-      if (error?.name !== 'TimeoutError') throw error;
-      return false;
-    });
-    if (shown) return;
-  }
-  await expect(steps).toBeVisible();
+/** Tap a cell once the page can take the gesture; the tool then reports a step. */
+async function tapToSelect(page, point) {
+  await readyForGesture(page);
+  await page.touchscreen.tap(point.x, point.y);
+  await expect(page.locator('#select-bar-steps')).toBeVisible();
 }
 
 const groupsOf = page => page.evaluate(
@@ -140,7 +129,7 @@ test.describe('on a phone', () => {
 
     // A tap selects; the bar says how much and offers the tool's own steps.
     const point = await findCellPoint(page);
-    await tapUntilSelected(page, point);
+    await tapToSelect(page, point);
     const selected = await unifiedState(page);
     expect(selected.inProgress).toBe(true);
     await expect(page.locator('#select-bar-selection'))
@@ -155,7 +144,7 @@ test.describe('on a phone', () => {
     await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
 
     // Select again and confirm it onto the page.
-    await tapUntilSelected(page, point);
+    await tapToSelect(page, point);
     await page.locator('#select-bar-confirm').tap();
     await expect(page.locator('#select-bar-steps')).toBeHidden();
     expect(await groupsOf(page)).toBe(1);
@@ -165,7 +154,7 @@ test.describe('on a phone', () => {
 
     // Clear empties the page exactly as the panel's Clear does.
     await page.locator('#select-bar-clear').tap();
-    expect(await groupsOf(page)).toBe(0);
+    await expect.poll(() => groupsOf(page)).toBe(0);
     await expect(page.locator('#select-bar-page')).toBeHidden();
     await expect(page.locator('#highlight-count')).toHaveText('No cells highlighted');
     await expect(page.locator('#clear-all-highlights')).toBeHidden();
@@ -195,7 +184,7 @@ test.describe('on a phone', () => {
     expect(await groupsOf(page)).toBe(0);
 
     // The next real selection replaces the notice.
-    await tapUntilSelected(page, await findCellPoint(page));
+    await tapToSelect(page, await findCellPoint(page));
     await expect(notice).toBeHidden();
     expect(productErrors).toEqual([]);
   });

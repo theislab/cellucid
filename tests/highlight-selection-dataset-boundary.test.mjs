@@ -14,11 +14,14 @@ import {
   requireCompletedSelectionEvent,
   requireContinuousPreviewEvent,
   requireHighlightGroup,
-  requireSavedHighlightGroup,
   requireSelectionStepEvent,
   requireUnifiedSelectionState
 } from '../assets/js/app/ui/modules/highlight/exact-contract.js';
 import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
+import { provideStubHighlightActions, settleActions, withHighlightPage } from './helpers/highlight-state-pages.mjs';
+import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
+import { getActionCatalog } from '../assets/js/app/actions/index.js';
+import { provideHighlightActions } from '../assets/js/app/ui/modules/highlight/highlight-actions.js';
 
 const MAIN_SOURCE_URL = new URL(
   '../assets/js/app/main.js',
@@ -95,7 +98,7 @@ test(
     ];
     for (const [startNeedle, endNeedle, sceneNeedle] of commits) {
       const commit = sliceSource(mainSource, startNeedle, endNeedle);
-      const retireIndex = commit.indexOf('retireDatasetInteractions();');
+      const retireIndex = commit.search(/retireDatasetInteractions\((?:\{ keepHistory \})?\);/);
       const sceneIndex = commit.indexOf(sceneNeedle);
       assert.ok(
         retireIndex >= 0,
@@ -409,7 +412,7 @@ function createUnifiedCandidateViewer() {
  */
 function createHighlightStateStub(pointCount) {
   let highlightIdCounter = 0;
-  return {
+  return withHighlightPage({
     pointCount,
     savedGroups: [],
     previewIndices: null,
@@ -463,7 +466,7 @@ function createHighlightStateStub(pointCount) {
     setPreviewHighlightFromIndices(cellIndices) {
       this.previewIndices = [...cellIndices];
     }
-  };
+  });
 }
 
 const DATASET_A_POINT_COUNT = 100_000;
@@ -475,12 +478,23 @@ const DATASET_B_CANDIDATES = Object.freeze([1, 2, 3, 4500]);
 
 /**
  * Lasso step 1 on dataset A (never confirmed), dataset replacement, then one
- * lasso gesture on dataset B, confirmed.
+ * lasso gesture on dataset B, confirmed (its `highlight.cells` step applied).
  */
-function runCrossDatasetLasso(retirements) {
+async function runCrossDatasetLasso(retirements) {
   const { documentStub, modeDescription } = createHighlightDom();
   const viewer = createUnifiedCandidateViewer();
   const state = createHighlightStateStub(DATASET_A_POINT_COUNT);
+  const removeProvided = provideStubHighlightActions(state);
+  try {
+    const ran = runCrossDatasetLassoIn(documentStub, modeDescription, viewer, state, retirements);
+    await settleActions();
+    return ran;
+  } finally {
+    removeProvided();
+  }
+}
+
+function runCrossDatasetLassoIn(documentStub, modeDescription, viewer, state, retirements) {
   const buttons = [
     createModeButton('annotation', true),
     createModeButton('knn', false),
@@ -518,8 +532,8 @@ function runCrossDatasetLasso(retirements) {
 test(
   'an unretired lasso step from the previous dataset silently rewrites the '
   + 'next selection',
-  () => {
-    const { state } = runCrossDatasetLasso([]);
+  async () => {
+    const { state } = await runCrossDatasetLasso([]);
 
     // CEL-AUDIT-0026 exactly: the renderer intersects dataset-B hits with
     // dataset-A rows, every survivor is inside dataset B's bounds, and a
@@ -538,7 +552,7 @@ test(
       await readFile(MAIN_SOURCE_URL, 'utf8')
     );
     const { state, viewer, selectionState } =
-      runCrossDatasetLasso(retirements);
+      await runCrossDatasetLasso(retirements);
 
     const fresh = createHighlightSelectionState();
     fresh.activeMode = selectionState.activeMode;
@@ -594,39 +608,24 @@ test(
 test(
   'a saved highlight group that preserves the count but not the rows is '
   + 'rejected',
-  () => {
-    const { documentStub, modeDescription } = createHighlightDom();
-    const viewer = createUnifiedCandidateViewer();
+  async () => {
     const state = createHighlightStateStub(5000);
     // A defect that permutes, offsets, or substitutes indices while keeping
     // the length is exactly what a count-only round-trip check cannot see.
-    state.addHighlightDirect = ({ type, label, cellIndices }) => {
-      const group = {
-        id: 'highlight_1',
-        type,
-        label,
-        enabled: true,
-        cellIndices: cellIndices.map(cellIndex => cellIndex + 1),
-        cellCount: cellIndices.length
-      };
-      state.savedGroups.push(group);
-      return group;
-    };
-
-    withDocument(documentStub, () => {
-      initLassoSelection({
-        state,
-        viewer,
-        viewerHostSource: null,
-        selectionState: createHighlightSelectionState(),
-        ui: { modeDescriptionEl: modeDescription }
-      });
-      viewer.restoreUnifiedState(Uint32Array.of(1, 2, 3), 1);
-      assert.throws(
-        () => viewer.confirmLassoSelection(),
-        /saved lasso highlight group cellIndices must be exactly the completed selection/i
-      );
+    state.addHighlightDirect = ({ type, label, cellIndices }) => ({
+      id: 'highlight_1',
+      type,
+      label,
+      enabled: true,
+      cellIndices: cellIndices.map(cellIndex => cellIndex + 1),
+      cellCount: cellIndices.length
     });
+    const actions = createActionDispatcher({ catalog: getActionCatalog() });
+    provideHighlightActions({ state, actions });
+    await assert.rejects(
+      actions.dispatch('highlight.cells', { cells: [1, 2, 3], label: 'Lasso (3 cells)', tool: 'lasso' }),
+      /does not hold exactly the cells it was made of/
+    );
   }
 );
 
@@ -728,44 +727,3 @@ test('cell index contracts are bounded by the current dataset', () => {
     /Highlight group cellIndices must be inside the current dataset of 5 cells/
   );
 });
-
-test(
-  'the saved highlight round trip is verified by cell identity, not by count',
-  () => {
-    const label = 'Saved lasso highlight group';
-    const savedGroup = {
-      id: 'highlight_1',
-      type: 'lasso',
-      label: 'Lasso (3 cells)',
-      enabled: true,
-      cellIndices: Uint32Array.of(1, 2, 3),
-      cellCount: 3
-    };
-    assert.equal(
-      requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2, 3), label, 5),
-      savedGroup
-    );
-    assert.throws(
-      () => requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2, 4), label, 5),
-      /cellIndices must be exactly the completed selection/
-    );
-    assert.throws(
-      () => requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2), label, 5),
-      /cellCount must match the completed selection/
-    );
-    assert.throws(
-      () => requireSavedHighlightGroup(
-        savedGroup,
-        'lasso',
-        Uint32Array.of(1, 2, 3, 4),
-        label,
-        5
-      ),
-      /cellCount must match the completed selection/
-    );
-    assert.throws(
-      () => requireSavedHighlightGroup(savedGroup, 'lasso', Uint32Array.of(1, 2, 3), label, 3),
-      /cellIndices must be inside the current dataset of 3 cells/
-    );
-  }
-);

@@ -66,14 +66,23 @@
  * of a shard read before), and an object the host answered as absent
  * before is not asked for again; what they do not hold is fetched, and
  * kept with the validator its host answered it with (an absent answer
- * kept as such). An
- * object fetched again whose validator is not the one kept with it is a
- * store rewritten under the same metadata: the read is refused as changed,
- * and every kept copy of the store forgotten. What this cannot see: an
+ * kept as such). What this cannot see: an
  * object rewritten without its metadata, on a host that answers it from
  * what is kept (not fetched again), is not noticed until it is fetched; a
  * writer of AnnData or `prepare()` writes the metadata again with any
  * write.
+ *
+ * An object answered with another validator than before, or one never read
+ * that says it was written after the store was opened, may be a store written
+ * again or only a site deployed again: GitHub Pages gives every file new
+ * validators at every deployment although its bytes are the same. What must
+ * not happen is a read that mixes two versions, so the bytes decide
+ * (`io/read-witness.js`): the object's own earlier read, its consolidated
+ * metadata and one read of each array read so far are compared, once per
+ * deployment of the metadata. The same bytes read on, silently. Any other
+ * bytes, another size or an object gone are the store rewritten: the read is
+ * refused as changed, every kept copy of the store forgotten, and every later
+ * read of this store refused too.
  *
  * Requests go through `routedFetch`: a store of a notebook widget's host
  * (`EMBEDDED_HOST_ORIGIN`) is read through the page that embeds the viewer.
@@ -84,9 +93,10 @@
  *
  * `version()` is the store's version as opened: the validators (`ETag` and
  * `Last-Modified`, each the host names) of its consolidated metadata;
- * `unchanged()` asks them again with one `HEAD`. A store read again with
+ * `unchanged()` asks them again with one `HEAD`, and when they moved compares
+ * what was read (above). A store read again with
  * other cells is taken over (its structure, chunk indexes and decoded
- * chunks kept) only while they are unchanged (`anndata-reader-worker.js`,
+ * chunks kept) only while it is unchanged (`anndata-reader-worker.js`,
  * `sourceKey`). What that requires: every writer of a Zarr store writes its
  * consolidated metadata again when it writes the store, so its write time
  * (`Last-Modified`), or a tag the host makes from it (`cellucid serve`'s
@@ -100,6 +110,7 @@
  * @module formats/zarr/stores/http
  */
 
+import { ReadWitness, witnessHolds } from '../../io/read-witness.js';
 import {
   ByteSourceError,
   BYTE_SOURCE_FAILURES,
@@ -159,6 +170,12 @@ function validatorOf(response) {
   const modified = response?.headers?.get?.('Last-Modified') ?? null;
   if (modified !== null && modified !== '') parts.push(`modified:${modified}`);
   return parts.length === 0 ? null : parts.join(' ');
+}
+
+/** The object's whole size as a range's answer states it (`Content-Range`), or null. */
+function totalOfAnswer(response) {
+  const stated = /\/(\d+)\s*$/.exec(response?.headers?.get?.('Content-Range') ?? '');
+  return stated === null ? null : Number(stated[1]);
 }
 
 export function httpStore(baseUrl, {
@@ -259,23 +276,134 @@ export function httpStore(baseUrl, {
     }
     return kept ?? Promise.resolve(null);
   };
-  /** The validator each object was answered with while the store is open: one answered with another is another version. */
+  /** The validator each object was answered with while the store is open. */
   const answered = new Map();
+  /** What was read, to compare when a validator moves. */
+  const witness = new ReadWitness();
+  /** Why every read of this store is refused, once it was found rewritten: nothing mixes two versions. */
+  let rewritten = null;
+  /** An object written later than this asks whether the store is still what was read. */
+  let knownWrittenBy = Date.now();
+  /** The metadata's validator when the store was last found to hold what was read: another deployment than that is asked again. */
+  let provenAt = null;
+  let proving = null;
+
+  const metadataKey = () => [...METADATA_KEYS].find(key => validators.has(key)) ?? null;
+
+  /** Refuse `key`'s read: the store was rewritten. Every later read is refused too. */
+  const refuseRewritten = (parts, key) => {
+    rewritten = `${storeName} changed on the host while it was open ('${key}' is not what was read before); open it again to read the new version.`;
+    if (parts !== null) parts.changed();
+    return new ByteSourceError(BYTE_SOURCE_FAILURES.CHANGED, rewritten);
+  };
+
+  /** A witness's bytes as the host holds them now, or null when it holds no such object. */
+  const askWitness = async ({ key, start, length }, signal) => {
+    const result = await request(key, { signal, range: `bytes=${start}-${start + length - 1}` });
+    if (result === null) return null;
+    // A host that ignored the range sent the whole object.
+    return result.response.status === 200 ? result.bytes.subarray(start, start + length) : result.bytes;
+  };
+
   /**
-   * Check what was fetched of `key` against what was answered of it before
-   * (while the store is open, or kept with it) and keep it (unless it is the
-   * metadata, read anew every time). An object answered with another
-   * validator than before is the store rewritten under its metadata: the
-   * read is refused as changed, and what is kept of the store forgotten.
+   * Whether the store still holds what was read: its consolidated metadata
+   * compared whole, and one read of each array read. Asked once per
+   * deployment of the metadata (one `HEAD` tells it is known); concurrent
+   * reads share one asking.
+   *
+   * @param {string|null|undefined} [answered] - The metadata's validator when the caller just asked it
+   * @returns {Promise<boolean>}
    */
-  const keepFetched = (parts, key, start, result, { whole = false } = {}) => {
+  const storeHoldsWhatWasRead = answered => {
+    // Shared by every read waiting on it, so no one read's Stop ends it.
+    proving ??= (async () => {
+      const key = metadataKey();
+      let now = null;
+      if (key !== null) {
+        if (answered === undefined) {
+          const head = await request(key, { method: 'HEAD' });
+          if (head === null) return false;
+          now = validatorOf(head.response);
+        } else {
+          now = answered;
+        }
+        if (now !== null && now === provenAt) return true;
+        const metadata = await request(key, {});
+        if (metadata === null || witness.compare(normalizeKey(key), 0, metadata.bytes) === 'different' || witness.sizeDiffers(normalizeKey(key), metadata.bytes.length)) return false;
+      }
+      const asked = witness.witnessesOfArrays().filter(each => !METADATA_KEYS.has(each.key));
+      const holds = await Promise.all(asked.map(async each => witnessHolds(each, await askWitness(each, null))));
+      if (holds.includes(false)) return false;
+      provenAt = now;
+      return true;
+    })().finally(() => {
+      proving = null;
+    });
+    return proving;
+  };
+
+  /** Whether what was fetched of `key`, under a validator that moved, is what was read of it before. */
+  const sameObject = async (parts, key, start, result, size, signal) => {
+    const id = normalizeKey(key);
+    if (witness.sizeDiffers(id, size)) return false;
+    const held = parts?.objectInfo(key)?.size ?? null;
+    if (held !== null && size !== null && held !== size) return false;
+    // Its own bytes first: the same range read before, what is kept of it, or a read of it before.
+    let own = start === null ? 'unknown' : witness.compare(id, start, result.bytes);
+    if (own === 'unknown' && start !== null) {
+      const local = await fromKept(parts, key, start, start + result.bytes.length);
+      if (local !== null) own = local.every((byte, at) => byte === result.bytes[at]) ? 'same' : 'different';
+    }
+    if (own === 'unknown') {
+      const read = witness.witnessOf(id);
+      if (read !== null) own = witnessHolds(read, await askWitness(read, signal)) ? 'same' : 'different';
+    }
+    // Nothing of its own to compare proves nothing of it.
+    return own === 'same' && await storeHoldsWhatWasRead();
+  };
+
+  /** Refuse every read once the store was found rewritten, whatever is held of it: nothing mixes two versions. */
+  const requireNotRewritten = () => {
+    if (rewritten !== null) throw new ByteSourceError(BYTE_SOURCE_FAILURES.CHANGED, rewritten);
+  };
+
+  /** The host answered `key` as absent: an object read before and gone is a store rewritten; otherwise it is only absent. */
+  const requireNotGone = async (key) => {
+    if (witness.has(normalizeKey(key))) throw refuseRewritten(await keptParts(), key);
+  };
+
+  /**
+   * Check what was fetched of `key` against what was read of the store before
+   * (module doc). `start` null: where it lies is not known (a suffix whose
+   * host does not show its `Content-Range`), so it is compared by its object's
+   * earlier reads and is no witness itself.
+   */
+  const checkFetched = async (parts, key, start, result, { whole = false, signal = null } = {}) => {
+    requireNotRewritten();
     const validator = validatorOf(result.response);
     const before = answered.get(key) ?? parts?.objectInfo(key)?.validator ?? null;
+    const size = whole ? result.bytes.length : totalOfAnswer(result.response);
     if (before !== null && validator !== null && before !== validator) {
-      if (parts !== null) parts.changed();
-      throw new ByteSourceError(BYTE_SOURCE_FAILURES.CHANGED, `${storeName} changed on the host while it was open ('${key}' is not what was read before); open it again to read the new version.`);
+      if (!await sameObject(parts, key, start, result, size, signal)) throw refuseRewritten(parts, key);
+    } else {
+      const written = Date.parse(result.response?.headers?.get?.('Last-Modified') ?? '');
+      if (written > knownWrittenBy) {
+        if (!await storeHoldsWhatWasRead()) throw refuseRewritten(parts, key);
+        knownWrittenBy = Math.max(written, Date.now());
+      }
     }
-    if (validator !== null) answered.set(key, validator);
+    requireNotRewritten();
+    if (validator !== null) {
+      answered.set(key, validator);
+      if (start !== null) witness.note(normalizeKey(key), start, result.bytes);
+      witness.noteSize(normalizeKey(key), size);
+    }
+    return validator;
+  };
+
+  /** `checkFetched`, then keep it (unless it is the metadata, read anew every time). */
+  const keepFetched = async (parts, key, start, result, { whole = false, signal = null } = {}) => {
+    const validator = await checkFetched(parts, key, start, result, { whole, signal });
     parts?.keep(start, result.bytes, key, { size: whole ? result.bytes.length : null, validator });
   };
   /** The kept bytes `[start, end)` of `key`, or null when they are not all kept (or a kept page is damaged). */
@@ -305,6 +433,13 @@ export function httpStore(baseUrl, {
     try {
       if (chosen === 0) return await requestFrom(0, key, options);
       return await requestOfMirror(chosen, key, options);
+    } catch (error) {
+      // The host answered another size: every later read is refused too.
+      if (error?.code === BYTE_SOURCE_FAILURES.CHANGED && rewritten === null) {
+        rewritten = error.message;
+        held?.changed();
+      }
+      throw error;
     } finally {
       addresses.release(chosen);
     }
@@ -439,6 +574,7 @@ export function httpStore(baseUrl, {
   }
 
   async function get(key, { signal = null, activity = null } = {}) {
+    requireNotRewritten();
     const metadata = METADATA_KEYS.has(normalizeKey(key));
     const parts = await keptParts();
     // Answered absent before, under a version naming the store's content: absent still.
@@ -448,7 +584,11 @@ export function httpStore(baseUrl, {
     if (local !== null) {
       sizes.set(key, local.length);
       // The metadata as read before: its validator then is the store's version now.
-      if (metadata) validators.set(normalizeKey(key), parts.objectInfo(key)?.validator ?? null);
+      if (metadata) {
+        validators.set(normalizeKey(key), parts.objectInfo(key)?.validator ?? null);
+        witness.note(normalizeKey(key), 0, local);
+        witness.noteSize(normalizeKey(key), local.length);
+      }
       return local;
     }
     // Fetched before in this tab (by this reader, or another opening of the
@@ -461,12 +601,13 @@ export function httpStore(baseUrl, {
     }
     const result = await request(key, { signal, activity });
     if (result === null) {
+      await requireNotGone(key);
       parts?.keepAbsent(key);
       return null;
     }
     sizes.set(key, result.bytes.length);
     if (metadata) validators.set(normalizeKey(key), validatorOf(result.response));
-    keepFetched(parts, key, 0, result, { whole: true });
+    await keepFetched(parts, key, 0, result, { whole: true, signal });
     objects?.keepWhole(key, result.bytes);
     return result.bytes;
   }
@@ -519,9 +660,12 @@ export function httpStore(baseUrl, {
     for (const key of METADATA_KEYS) {
       if (!validators.has(key)) continue;
       const opened = validators.get(key);
-      if (opened === null) return false;
+      if (opened === null || rewritten !== null) return false;
       const result = await request(key, { method: 'HEAD', signal });
-      return result !== null && validatorOf(result.response) === opened;
+      if (result === null) return false;
+      const now = validatorOf(result.response);
+      // Another validator is a deployment or a rewrite: what was read decides.
+      return now === opened || now === provenAt || await storeHoldsWhatWasRead(now);
     }
     return false;
   }
@@ -555,6 +699,7 @@ export function httpStore(baseUrl, {
    * read knows how much is left before they arrive.
    */
   async function rangeOf(key, start, end, options) {
+    requireNotRewritten();
     const whole = fromWhole(key);
     if (whole !== undefined) return whole.subarray(start, Math.min(end, whole.length));
     const parts = await keptParts();
@@ -576,26 +721,28 @@ export function httpStore(baseUrl, {
     }
     if (result === null) {
       activity?.planned?.(-(end - start));
+      await requireNotGone(key);
       parts?.keepAbsent(key);
       return null;
     }
     if (result.response.status === 200) {
-      // The host ignored the range and sent the whole object.
+      // The host ignored the range and sent the whole object: held once it is checked.
+      await keepFetched(parts, key, 0, result, { whole: true, signal: options.signal ?? null });
       sizes.set(key, result.bytes.length);
       keepWhole(key, result.bytes);
-      keepFetched(parts, key, 0, result, { whole: true });
       objects?.keepWhole(key, result.bytes);
       return result.bytes.subarray(start, end);
     }
     if (result.bytes.length !== end - start) {
       throw new ByteSourceError(BYTE_SOURCE_FAILURES.SHORT_READ, `${urlOf(key)}: asked for ${formatCountOf(end - start, 'byte')}, received ${result.bytes.length}.`);
     }
-    keepFetched(parts, key, start, result);
+    await keepFetched(parts, key, start, result, { signal: options.signal ?? null });
     objects?.keepRange(key, start, result.bytes);
     return result.bytes;
   }
 
   async function suffixOf(key, length, options) {
+    requireNotRewritten();
     const whole = fromWhole(key);
     if (whole !== undefined) return whole.subarray(Math.max(0, whole.length - length));
     // An object whose size is kept: its last bytes are a range.
@@ -607,11 +754,19 @@ export function httpStore(baseUrl, {
     if (!sizes.has(key) && suffixRanges) {
       try {
         const result = await request(key, { ...options, range: `bytes=-${length}`, retryNetwork: false });
-        if (result === null) return null;
+        if (result === null) {
+          await requireNotGone(key);
+          return null;
+        }
+        const parts = await keptParts();
         if (result.response.status === 200) {
+          await checkFetched(parts, key, 0, result, { whole: true, signal: options.signal ?? null });
           sizes.set(key, result.bytes.length);
           keepWhole(key, result.bytes);
           objects?.keepWhole(key, result.bytes);
+        } else {
+          const total = totalOfAnswer(result.response);
+          await checkFetched(parts, key, total === null ? null : total - result.bytes.length, result, { signal: options.signal ?? null });
         }
         const last = result.response.status === 200 ? result.bytes.subarray(Math.max(0, result.bytes.length - length)) : result.bytes;
         if (last.length === length) objects?.keepSuffix(key, last);

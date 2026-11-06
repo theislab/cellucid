@@ -555,10 +555,11 @@ test('a page with a boot script starts its sources on this machine and its bundl
 
   // Run in a page of either kind: what it preloads, what it imports, and the
   // code cache it registers once the page has loaded.
-  const run = hostname => {
+  const run = (hostname, { styleLoadFailed = false } = {}) => {
     const appended = [];
     const imported = [];
     const registered = [];
+    const failures = [];
     const listeners = new Map();
     const windowListeners = new Map();
     const scope = {
@@ -566,12 +567,16 @@ test('a page with a boot script starts its sources on this machine and its bundl
       document: {
         baseURI: `https://${hostname}/`,
         readyState: 'loading',
+        // What the style gate leaves on the root when the stylesheet did not load.
+        documentElement: { dataset: styleLoadFailed ? { styleLoadFailed: 'true' } : {} },
         createElement: () => ({}),
         head: { append: element => appended.push(element) },
         addEventListener: (type, listener) => listeners.set(type, listener),
-        querySelector: () => ({ content: '2026-10-29.0123abcd' }),
+        querySelector: selector => (selector === 'link[rel="stylesheet"]'
+          ? { href: `https://${hostname}/assets/css/main.css` }
+          : { content: '2026-10-29.0123abcd' }),
       },
-      window: { dispatchEvent() {}, addEventListener: (type, listener) => windowListeners.set(type, listener) },
+      window: { dispatchEvent: event => failures.push(event), addEventListener: (type, listener) => windowListeners.set(type, listener) },
       navigator: {
         serviceWorker: {
           register: url => {
@@ -582,7 +587,12 @@ test('a page with a boot script starts its sources on this machine and its bundl
       },
       performance: { getEntriesByType: () => [] },
       URL,
-      CustomEvent: class {},
+      CustomEvent: class {
+        constructor(type, { detail }) {
+          this.type = type;
+          this.detail = detail;
+        }
+      },
       importModule: url => {
         imported.push(url);
         return Promise.resolve();
@@ -592,18 +602,27 @@ test('a page with a boot script starts its sources on this machine and its bundl
     assert.deepEqual(imported, [], 'nothing is imported before the document is parsed');
     listeners.get('DOMContentLoaded')();
     windowListeners.get('load')?.();
-    return { preloaded: appended.map(link => `${link.rel} ${link.href}`), imported, registered };
+    return { preloaded: appended.map(link => `${link.rel} ${link.href}`), imported, registered, failures };
   };
   assert.deepEqual(run('localhost'), {
     preloaded: [],
     imported: ['https://localhost/assets/js/app/main.js'],
     registered: [],
+    failures: [],
   });
   assert.deepEqual(run('www.cellucid.com'), {
     preloaded: ['modulepreload assets/page/main.ABCDEFGH.js', 'modulepreload assets/page/chunk.IJKLMNOP.js'],
     imported: ['https://www.cellucid.com/assets/page/main.ABCDEFGH.js'],
     registered: ['service-worker.js?build=2026-10-29.0123abcd'],
+    failures: [],
   });
+  // A page whose stylesheet did not load starts no code: it reports the stylesheet.
+  const unstyled = run('www.cellucid.com', { styleLoadFailed: true });
+  assert.deepEqual(unstyled.imported, []);
+  assert.deepEqual(
+    unstyled.failures.map(event => [event.type, event.detail]),
+    [['cellucid-code-load-failed', { entry: 'https://www.cellucid.com/assets/css/main.css', stylesheet: true }]],
+  );
 });
 
 test('only a worker or page bundle names its bytes by its file name', () => {

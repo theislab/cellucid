@@ -26,6 +26,7 @@
 
 import { codecsWasm } from '../../../workers/scripts.js';
 import { indexedDbKeyValueStore } from '../../utils/indexed-db-store.js';
+import { reportedCores } from '../../utils/machine.js';
 import { DECODERS } from './decoder-choice.js';
 
 /** The database the record is kept in, and its object store. */
@@ -46,7 +47,7 @@ export function decoderMemoryVersion(environment = globalThis) {
     module: codecsWasm().searchParams.get('v'),
     decoders: DECODERS,
     agent: String(navigator.userAgent ?? ''),
-    cores: Number(navigator.hardwareConcurrency) || 0,
+    cores: reportedCores(environment) ?? 0,
   });
 }
 

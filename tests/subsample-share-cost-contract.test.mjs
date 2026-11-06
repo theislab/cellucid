@@ -14,6 +14,8 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 
 import { gatheredArray, planBoxes, runsOfPositions } from '../assets/js/data/anndata/views/cell-subset.js';
 import { cellShareReadShare } from '../assets/js/data/anndata/subsample-plan.js';

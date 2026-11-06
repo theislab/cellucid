@@ -18,8 +18,7 @@ function normalizeDatasetId(datasetId) {
   if (
     typeof datasetId !== 'string' ||
     !/\S/.test(datasetId) ||
-    /^\s|\s$/.test(datasetId) ||
-    Array.from(datasetId).length > 256
+    /^\s|\s$/.test(datasetId)
   ) {
     throw new Error('Annotation repository dataset id must be an exact nonblank string');
   }
@@ -32,7 +31,6 @@ function normalizeUsername(username) {
     (
       typeof username !== 'string' ||
       !/^ghid_[1-9][0-9]*$/.test(username) ||
-      Array.from(username).length > 64 ||
       !Number.isSafeInteger(Number(username.slice(5))) ||
       Number(username.slice(5)) < 1 ||
       username !== `ghid_${Number(username.slice(5))}`

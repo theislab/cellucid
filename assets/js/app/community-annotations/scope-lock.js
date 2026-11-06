@@ -33,7 +33,11 @@ const UUID_PATTERN =
 const UTC_INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-function assertExactString(value, label, { max = 2048 } = {}) {
+/**
+ * A nonblank string with no edge whitespace; `max` only for a fixed-length
+ * format (a UUID, a UTC instant): free text has no length limit of its own.
+ */
+function assertExactString(value, label, { max = Number.POSITIVE_INFINITY } = {}) {
   if (
     typeof value !== 'string' ||
     !value ||
@@ -136,7 +140,7 @@ function removeLocalItem(key) {
 
 function normalizeScopeKey(scopeKey) {
   if (scopeKey === null || scopeKey === undefined || scopeKey === '') return null;
-  return assertExactString(scopeKey, 'Annotation lock scope key', { max: 4096 });
+  return assertExactString(scopeKey, 'Annotation lock scope key');
 }
 
 function lockStorageKey(scopeKey) {
@@ -292,6 +296,38 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
         scopeKey: nextScopeKey ?? null,
         message: `Unable to establish the exact annotation scope lock: ${cause?.message || cause}`,
         cause,
+      };
+    }
+  }
+
+  /**
+   * Take the lock of `scopeKey` over from the tab that holds it (the
+   * person's "Use here" in a tab where annotation is paused). The other tab
+   * sees its record replaced (its storage listener) and pauses its own
+   * annotation (`lost`); what it had was already saved, because a tab writes
+   * its pending save when it is hidden.
+   *
+   * @param {string} scopeKey
+   * @returns {{ok: true, scopeKey: string}|{ok: false, code: string, scopeKey: string|null, message: string}}
+   */
+  takeOver(scopeKey) {
+    let key = null;
+    try {
+      key = normalizeScopeKey(scopeKey);
+      if (!key) throw new Error('A lock is taken over by its exact scope key');
+      this.release();
+      writeLocalItem(lockStorageKey(key), JSON.stringify({
+        owner: this.getTabId(),
+        acquiredAt: nowIso(),
+        expiresAtMs: nowMs() + this._leaseMs,
+      }));
+      return this._acquire(key);
+    } catch (cause) {
+      return {
+        ok: false,
+        code: cause?.code || 'LOCK_RECORD_INVALID',
+        scopeKey: key,
+        message: `Unable to take over the annotation scope lock: ${cause?.message || cause}`,
       };
     }
   }

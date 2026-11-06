@@ -1,0 +1,1355 @@
+/* components/_state.css
+   The State panel (ui/modules/state/; History v2 §3.10): the History header
+   and its settings box, the status line with the recording switch and the
+   branch picker, the branch graph (rows, lanes, details), the workflow
+   banner, and the history's dialogs (share, load, ask, Recently deleted,
+   branch map, replay report, compare, report) and the guided tour's bar.
+   Controls inside keep the shared look of _controls.css and _buttons.css.
+   Nothing here truncates: long names wrap and rows grow. */
+
+/* ------------------------------------------------------------------------
+   Header: search, undo, redo, settings and the menu; the session's actions
+   --------------------------------------------------------------------- */
+
+.history-actions,
+.history-session-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.history-menu {
+  position: relative;
+}
+
+.history-menu-list {
+  left: auto;
+  right: 0;
+  min-width: max-content;
+}
+
+.history-settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.history-settings[hidden],
+.history-search[hidden],
+.history-branches[hidden],
+.history-banner[hidden],
+.history-graph[hidden],
+.history-where[hidden],
+.history-setting-row[hidden] {
+  display: none;
+}
+
+.history-settings-title {
+  margin: 0;
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.history-settings-rule {
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.history-setting-name {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.history-search {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.history-search > .obs-select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------------
+   Status line: [● Recording] Main ▾ · 14 steps · ⚠ 2 stale
+   --------------------------------------------------------------------- */
+
+.history-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-1-5);
+  min-width: 0;
+}
+
+.history-status-row > .history-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.history-recording,
+.history-branch-btn,
+.history-status-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: max(var(--control-compact-height), var(--control-target-min));
+  padding: 0 var(--space-1-5);
+  border: var(--border-width-1) solid var(--color-border-light);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: var(--type-hint);
+  line-height: var(--leading-tight);
+  text-align: start;
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.history-recording[hidden],
+.history-status-chip[hidden] {
+  display: none;
+}
+
+.history-recording:hover:not(:disabled),
+.history-branch-btn:hover:not(:disabled),
+.history-status-chip:hover {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.history-recording:disabled,
+.history-branch-btn:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.history-recording-dot {
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-danger);
+}
+
+.history-recording[data-state="paused"] {
+  border-color: color-mix(in srgb, var(--color-warning) 50%, var(--color-border-light));
+  background: var(--color-warning-soft);
+  color: var(--color-warning-text);
+}
+
+.history-recording[data-state="paused"] .history-recording-dot {
+  border-radius: 0;
+  width: var(--space-1-5);
+  background: none;
+  border-left: var(--border-width-2) solid currentColor;
+  border-right: var(--border-width-2) solid currentColor;
+}
+
+.history-branch-btn {
+  border-radius: var(--radius-none);
+  overflow-wrap: anywhere;
+}
+
+.history-branch-caret {
+  color: var(--color-text-tertiary);
+}
+
+.history-status-chip {
+  border-radius: var(--radius-none);
+  color: var(--color-warning-text);
+}
+
+#history-pending-cancel {
+  color: var(--color-text-primary);
+}
+
+/* ------------------------------------------------------------------------
+   Branch picker (a box under the status line)
+   --------------------------------------------------------------------- */
+
+.history-branches {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.history-branches-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.history-branches-title {
+  flex: 1;
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.history-tracker-btn {
+  overflow-wrap: anywhere;
+}
+
+.history-branches-search[hidden],
+.history-branches-archived[hidden] {
+  display: none;
+}
+
+.history-branch-list {
+  display: flex;
+  flex-direction: column;
+  max-height: min(50vh, calc(12 * var(--space-7)));
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.history-branch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.history-branch-pick {
+  flex: 1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: var(--space-1-5);
+  align-items: baseline;
+  min-width: 0;
+  min-height: max(var(--space-7), var(--control-row-min));
+  padding: var(--space-0-5) var(--space-1);
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: start;
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+.history-branch-pick:hover {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.history-branch-pick[aria-current="true"] {
+  font-weight: var(--font-weight-medium);
+  background: var(--color-surface-tertiary);
+}
+
+.history-branch[data-archived="true"] .history-branch-pick {
+  color: var(--color-text-tertiary);
+}
+
+.history-branch-dot {
+  grid-row: span 2;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--lane-color);
+}
+
+.history-branch-name {
+  overflow-wrap: anywhere;
+}
+
+.history-branch-meta {
+  grid-column: 2;
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+}
+
+/* ------------------------------------------------------------------------
+   Lanes: each element names its slot, the token gives its colour
+   --------------------------------------------------------------------- */
+
+.lane-0 { --lane-color: var(--history-lane-0); }
+.lane-1 { --lane-color: var(--history-lane-1); }
+.lane-2 { --lane-color: var(--history-lane-2); }
+.lane-3 { --lane-color: var(--history-lane-3); }
+.lane-4 { --lane-color: var(--history-lane-4); }
+.lane-5 { --lane-color: var(--history-lane-5); }
+.lane-6 { --lane-color: var(--history-lane-6); }
+.lane-7 { --lane-color: var(--history-lane-7); }
+
+/* ------------------------------------------------------------------------
+   The graph: a virtualised tree; rows are absolutely placed in a sizer
+   --------------------------------------------------------------------- */
+
+.history-graph {
+  --hg-row-height: var(--space-7);
+  --hg-lane: var(--space-3-5);
+  --hg-mid: calc(var(--hg-row-height) / 2);
+  position: relative;
+  max-height: min(60vh, 560px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  contain: strict;
+  /* The height is the rows' (--hg-total), its top border drawn outside it:
+     inside it (border-box) the rows overflowed by the border's 1px, the list
+     scrolled by 1px, and WebKit's overlay-scrollbar strip took the clicks of
+     the Details buttons at the row's end. */
+  box-sizing: content-box;
+  height: min(var(--hg-total, 0px), min(60vh, 560px));
+  border-top: var(--border-width-1) solid var(--color-border-light);
+  /* The strip at the end of a scrolling list that an overlay scrollbar takes:
+     WebKit's (macOS) hit-tests 17px at the edge once it has shown, whether
+     or not it is drawn, and 'scrollbar-gutter' reserves nothing for an
+     overlay scrollbar. */
+  --hg-scrollbar-strip: calc(var(--space-4) + var(--space-0-5));
+}
+
+/* While the list scrolls (graph.js sets it), every row (its tools and its
+   details) ends clear of that strip, so its buttons take their own clicks. */
+.history-graph[data-overflows] .hg-row {
+  right: var(--hg-scrollbar-strip);
+}
+
+@media (pointer: coarse) {
+  .history-graph {
+    --hg-row-height: var(--space-11);
+  }
+
+  /* A row's tools are drawn at the touch size (32px), centred in the taller row. */
+  .history-graph .hg-tool {
+    min-width: var(--space-8);
+    height: var(--space-8);
+  }
+
+  .history-graph .hg-tools {
+    padding-top: calc((var(--hg-row-height) - var(--space-8)) / 2);
+  }
+}
+
+.history-graph[aria-busy="true"] .hg-row {
+  cursor: progress;
+}
+
+.hg-sizer {
+  position: relative;
+  height: var(--hg-total, 0px);
+}
+
+.hg-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  transform: translateY(var(--hg-top, 0px));
+  box-sizing: border-box;
+  min-height: var(--hg-row-height);
+  color: var(--color-text-primary);
+  font-size: var(--type-body);
+  line-height: var(--leading-tight);
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.hg-row:focus-visible {
+  outline: var(--border-width-2) solid var(--color-border-focus);
+  outline-offset: calc(-1 * var(--border-width-2));
+}
+
+.hg-row[aria-selected="true"] > .hg-line {
+  background: var(--color-accent-soft);
+}
+
+.hg-row[aria-current="step"] > .hg-line {
+  font-weight: var(--font-weight-semibold);
+}
+
+.hg-row[data-dim="true"] > .hg-line {
+  color: var(--color-text-tertiary);
+}
+
+.hg-line {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-height: var(--hg-row-height);
+  padding: 0 var(--space-0-5) 0 calc((var(--hg-row-column) + 1) * var(--hg-lane) + var(--space-1) + var(--hg-indent) * var(--space-3));
+  box-sizing: border-box;
+}
+
+.hg-line:hover {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.hg-line > * {
+  padding-top: calc((var(--hg-row-height) - 1.25em) / 2);
+}
+
+/* The rail: line segments and the node, in the row's lane columns. */
+.hg-rail {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: calc((var(--hg-row-column) + 1) * var(--hg-lane));
+  padding: 0;
+  pointer-events: none;
+}
+
+.hg-seg {
+  position: absolute;
+  left: calc(var(--hg-column) * var(--hg-lane) + var(--hg-lane) / 2 - var(--border-width-1));
+  width: var(--border-width-2);
+  background: var(--lane-color);
+}
+
+.hg-seg.is-faded,
+.hg-node.is-faded {
+  opacity: var(--opacity-50);
+}
+
+.hg-seg-all { top: 0; bottom: 0; }
+.hg-seg-top { top: 0; height: var(--hg-mid); }
+.hg-seg-bottom { top: var(--hg-mid); bottom: 0; }
+
+.hg-elbow {
+  position: absolute;
+  top: 0;
+  left: calc(var(--hg-column) * var(--hg-lane) + var(--hg-lane) / 2 - var(--border-width-1));
+  width: calc(var(--hg-elbow-span) * var(--hg-lane) - var(--space-1));
+  height: var(--hg-mid);
+  border-left: var(--border-width-2) solid var(--lane-color);
+  border-bottom: var(--border-width-2) solid var(--lane-color);
+  border-bottom-left-radius: var(--space-2);
+  box-sizing: border-box;
+}
+
+.hg-node {
+  position: absolute;
+  top: var(--hg-mid);
+  left: calc(var(--hg-column) * var(--hg-lane) + var(--hg-lane) / 2);
+  transform: translate(-50%, -50%);
+  font-size: var(--type-body);
+  line-height: 1;
+  color: var(--lane-color);
+  background: var(--color-surface-primary);
+  padding: 0;
+}
+
+.hg-toggle {
+  flex: none;
+  width: var(--space-2-5);
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+}
+
+.hg-toggle:not([data-toggle="true"]) {
+  cursor: default;
+}
+
+.hg-flags {
+  flex: none;
+  color: var(--color-warning-text);
+}
+
+.hg-flags[hidden],
+.hg-meta[hidden],
+.hg-time[hidden],
+.hg-line > .history-badge[hidden] {
+  display: none;
+}
+
+.hg-label {
+  flex: 1 1 0;
+  min-width: min(100%, var(--space-24));
+  overflow-wrap: anywhere;
+}
+
+/* Counts, badges and times are short: they keep their words whole. The label
+   keeps a readable width; when the row is too narrow for both, what follows
+   it (count, badge, time, tools) moves to a line of its own under it. */
+.hg-meta,
+.hg-time,
+.hg-line > .history-badge {
+  flex: none;
+  white-space: nowrap;
+}
+
+.hg-meta,
+.hg-time {
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+  font-weight: var(--font-weight-regular);
+  font-variant-numeric: tabular-nums;
+}
+
+.hg-row[data-kind="fork"] .hg-label,
+.hg-row[data-kind="turn"] .hg-label,
+.hg-row[data-kind="group"] .hg-label {
+  font-weight: var(--font-weight-medium);
+}
+
+.hg-row[data-kind="run"] .hg-label,
+.hg-row[data-kind="paused"] .hg-label {
+  color: var(--color-text-secondary);
+}
+
+.hg-row[data-kind="paused"] > .hg-line {
+  color: var(--color-warning-text);
+  border-top: var(--border-width-1) dashed color-mix(in srgb, var(--color-warning) 60%, transparent);
+}
+
+.hg-row[data-kind="paused"] .hg-label {
+  color: var(--color-warning-text);
+}
+
+.hg-tools {
+  flex: none;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--space-0-5);
+  padding-top: calc((var(--hg-row-height) - var(--space-6)) / 2);
+}
+
+.hg-tool {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--space-6);
+  height: var(--space-6);
+  padding: 0 var(--space-1);
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.hg-tool:hover:not(:disabled) {
+  background: var(--color-interactive-secondary-hover);
+  color: var(--color-text-primary);
+}
+
+.hg-tool:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: default;
+}
+
+.hg-tool svg {
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+}
+
+.hg-details-btn[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+
+/* A row's details: under its line, inside the row (its height is measured). */
+.hg-details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 var(--space-1) var(--space-1) calc((var(--hg-row-column) + 1) * var(--hg-lane) + var(--space-1));
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  border: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-secondary);
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-regular);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+  cursor: auto;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.history-detail-fact {
+  display: grid;
+  grid-template-columns: var(--space-16) minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: baseline;
+}
+
+.history-detail-term {
+  color: var(--color-text-tertiary);
+}
+
+.history-detail-value {
+  min-width: 0;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.history-detail-value code {
+  overflow-wrap: anywhere;
+}
+
+.history-detail-line,
+.history-detail-hint {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.history-detail-warning {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin: 0;
+  color: var(--color-warning-text);
+}
+
+.history-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding-top: var(--space-1);
+}
+
+.history-notes {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.history-note-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.history-note-list[hidden] {
+  display: none;
+}
+
+.history-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1);
+}
+
+.history-note-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.history-note-meta {
+  color: var(--color-text-tertiary);
+}
+
+.history-note-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-self: stretch;
+}
+
+.history-note-add[hidden] {
+  display: none;
+}
+
+/* The hover hint (a fine pointer) and "Shown: step 12 ↑". */
+.hg-hint {
+  position: absolute;
+  left: var(--space-6);
+  right: var(--space-2);
+  top: var(--hg-hint-top, 0px);
+  z-index: var(--z-dropdown);
+  padding: var(--space-1) var(--space-2);
+  border: var(--border-width-1) solid var(--color-border-light);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  pointer-events: none;
+  overflow-wrap: anywhere;
+}
+
+.hg-hint[hidden] {
+  display: none;
+}
+
+#history-block {
+  position: relative;
+}
+
+.history-where {
+  align-self: center;
+}
+
+/* ------------------------------------------------------------------------
+   Workflow banner: one line above the graph
+   --------------------------------------------------------------------- */
+
+.history-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-1-5);
+  border-left: var(--border-width-2) solid var(--color-info);
+  background: var(--color-info-soft);
+  font-size: var(--type-hint);
+}
+
+.history-banner[data-tone="warning"] {
+  border-left-color: var(--color-warning);
+  background: var(--color-warning-soft);
+}
+
+.history-banner[data-tone="success"] {
+  border-left-color: var(--color-success);
+  background: var(--color-success-soft);
+}
+
+.history-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.history-banner > .btn[hidden] {
+  display: none;
+}
+
+/* A menu opened at a row or a button (menu.js). */
+.history-popup-menu {
+  position: fixed;
+  left: var(--history-menu-left, 0px);
+  right: auto;
+  top: var(--history-menu-top, 0px);
+  width: max-content;
+  z-index: var(--z-popover);
+  min-width: max-content;
+  max-width: calc(100vw - var(--space-4));
+}
+
+.history-popup-menu .open-menu-item.is-danger .open-menu-item-label {
+  color: var(--color-danger-text);
+}
+
+.history-popup-menu .open-menu-item[aria-disabled="true"] {
+  opacity: var(--control-disabled-opacity);
+}
+
+.history-popup-menu .open-menu-item[role="menuitemcheckbox"][aria-checked="true"] .open-menu-item-label::before {
+  content: '✓ ';
+}
+
+/* Who took a step, when it was not the person; one quiet badge per origin. */
+.history-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-1);
+  font-size: var(--type-compact);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-normal);
+  border: var(--border-width-1) solid var(--color-border-light);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-tertiary);
+  color: var(--color-text-secondary);
+}
+
+.history-badge[data-origin="claude"],
+.history-badge[data-origin="agent"] {
+  background: var(--color-accent-soft);
+  border-color: var(--color-accent-soft);
+  color: var(--color-accent-text);
+}
+
+.history-badge[data-origin="chatgpt"] {
+  background: var(--color-success-soft);
+  border-color: var(--color-success-soft);
+  color: var(--color-success-text);
+}
+
+.history-badge[data-origin="python"],
+.history-badge[data-origin="r"],
+.history-badge[data-origin="host"] {
+  background: var(--color-info-soft);
+  border-color: var(--color-info-soft);
+  color: var(--color-info-text);
+}
+
+.history-badge[data-origin="outside"] {
+  background: var(--color-warning-soft);
+  border-color: var(--color-warning-soft);
+  color: var(--color-warning-text);
+}
+
+/* ------------------------------------------------------------------------
+   Dialogs: ask, share, Recently deleted, branch map, replay report
+   --------------------------------------------------------------------- */
+
+.history-share-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.history-share-option {
+  display: grid;
+  grid-template-columns: var(--space-16) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.history-share-include[hidden],
+.history-share-inside[hidden],
+#history-share-chats-row[hidden] {
+  display: none;
+}
+
+.history-share-include {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+}
+
+.history-share-branches {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: min(30vh, calc(8 * var(--space-7)));
+  overflow-y: auto;
+  padding: var(--space-1) var(--space-2);
+}
+
+.history-share-branch-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  padding-left: var(--space-5);
+}
+
+.history-share-actions {
+  align-items: center;
+}
+
+.history-share-spacer {
+  flex: 1;
+}
+
+.history-share-inside-table,
+.history-map-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--type-hint);
+}
+
+.history-share-inside-table th,
+.history-share-inside-table td,
+.history-map-table th,
+.history-map-table td {
+  padding: var(--space-1) var(--space-1-5);
+  border-bottom: var(--border-width-1) solid var(--color-border-light);
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.history-share-inside-table th {
+  width: 40%;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+.history-deleted-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: min(60vh, calc(10 * var(--space-12)));
+  margin: 0;
+  padding: var(--space-1);
+  overflow-y: auto;
+  list-style: none;
+}
+
+.history-deleted-list:empty {
+  display: none;
+}
+
+.history-deleted-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.history-deleted-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.history-deleted-label {
+  overflow-wrap: anywhere;
+}
+
+.history-deleted-meta {
+  font-size: var(--type-hint);
+  color: var(--color-text-tertiary);
+}
+
+.history-map-dialog {
+  width: min(1040px, calc(100vw - 2 * var(--space-4)));
+}
+
+.history-map-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.history-map-tools > .obs-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-map-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.history-map-graph.history-graph {
+  max-height: min(60vh, 640px);
+  height: min(var(--hg-total, 0px), min(60vh, 640px));
+}
+
+.history-map-table tr[aria-current="true"] .history-map-name {
+  font-weight: var(--font-weight-semibold);
+}
+
+.history-map-table tr[data-archived="true"] {
+  color: var(--color-text-tertiary);
+}
+
+.history-map-name {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.history-map-name::before {
+  content: '';
+  display: inline-block;
+  width: var(--space-2);
+  height: var(--space-2);
+  margin-right: var(--space-1-5);
+  border-radius: var(--radius-full);
+  background: var(--lane-color);
+}
+
+@media (max-width: 720px) {
+  .history-map-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .history-map-graph.history-graph {
+    display: none;
+  }
+}
+
+.history-replay-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+}
+
+.history-replay-item {
+  display: grid;
+  grid-template-columns: var(--space-4) minmax(0, 1fr);
+  column-gap: var(--space-1);
+}
+
+.history-replay-item[data-outcome="unmatched"] .history-replay-mark {
+  color: var(--color-danger-text);
+}
+
+.history-replay-item[data-outcome="applied"] .history-replay-mark {
+  color: var(--color-success-text);
+}
+
+.history-replay-step {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--color-text-primary);
+  text-align: start;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+button.history-replay-step:hover {
+  color: var(--color-text-link);
+}
+
+.history-replay-reason {
+  grid-column: 2;
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* "Use instead ▾": a name this dataset has, for one that did not match. */
+.history-replay-instead {
+  grid-column: 2;
+  display: flex;
+  margin-top: var(--space-0-5);
+}
+
+.history-replay-instead > select,
+.history-replay-instead > input {
+  width: 100%;
+  min-width: 0;
+}
+
+.history-replay-again-why {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-tertiary);
+}
+
+/* Where the history's memory goes: a part, its size, Show. */
+.history-memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+}
+
+.history-memory-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: var(--space-2);
+}
+
+.history-memory-part {
+  overflow-wrap: anywhere;
+}
+
+.history-memory-bytes {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.history-memory-chip {
+  color: var(--color-warning-text);
+}
+
+/* The History (i) tip's link to History settings. */
+.history-tip-settings-link {
+  position: relative;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.history-tip-settings-link:hover {
+  color: var(--color-text-link-hover);
+  text-decoration-color: currentColor;
+}
+
+.history-tip-settings-link::after {
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--control-hit-extend)) 0;
+}
+
+/* ------------------------------------------------------------------------
+   Dialogs: compare two steps, load (saved states), report
+   --------------------------------------------------------------------- */
+
+.history-diff-choose {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--control-block-gap);
+}
+
+.history-diff-choose > .control-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+  min-width: 0;
+}
+
+.history-diff-list:empty {
+  display: none;
+}
+
+.saved-states-list {
+  max-height: min(60vh, calc(10 * var(--space-12)));
+  overflow-y: auto;
+}
+
+.saved-states-list[hidden] {
+  display: none;
+}
+
+.saved-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+}
+
+.saved-state[data-current="true"] {
+  border-color: var(--color-border-strong);
+}
+
+.saved-state-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  flex: 1;
+  min-width: 0;
+}
+
+.saved-state-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.saved-state-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-control);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.saved-state-size {
+  flex: none;
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+}
+
+.saved-state-meta {
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.saved-state-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.history-report-steps {
+  max-height: min(50vh, calc(10 * var(--space-8)));
+  overflow-y: auto;
+}
+
+.history-report-steps[hidden] {
+  display: none;
+}
+
+.history-report-step > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------------
+   Guided tour: a caption bar over the top of the viewer
+   --------------------------------------------------------------------- */
+
+.history-tour-bar {
+  position: fixed;
+  top: var(--space-2-5);
+  left: calc(var(--sidebar-width) + var(--space-2-5) + var(--space-8));
+  right: var(--space-8);
+  z-index: var(--z-overlay);
+  pointer-events: none;
+}
+
+body:has(#sidebar.hidden) .history-tour-bar {
+  left: var(--space-8);
+}
+
+/* The bar covers the top edge of the plot, where each view centres its title. */
+body.history-touring #view-title-layer {
+  transform: translateY(var(--space-14));
+}
+
+.history-tour-inner {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  width: min(100%, 720px);
+  margin: 0 auto;
+  padding: var(--control-box-padding-y) var(--control-box-padding-x);
+  box-sizing: border-box;
+  pointer-events: auto;
+  background: color-mix(in srgb, var(--color-surface-elevated) 92%, transparent);
+  border: var(--border-default);
+  border-radius: var(--radius-none);
+  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(var(--space-2));
+  -webkit-backdrop-filter: blur(var(--space-2));
+}
+
+.history-tour-btn {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-icon-button-size);
+  height: var(--control-icon-button-size);
+  padding: 0;
+  border: var(--border-control);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+
+.history-tour-btn:hover:not(:disabled) {
+  background: var(--color-interactive-secondary-hover);
+}
+
+.history-tour-btn:disabled {
+  opacity: var(--control-disabled-opacity);
+  cursor: not-allowed;
+}
+
+.history-tour-btn svg {
+  width: var(--space-3-5);
+  height: var(--space-3-5);
+  pointer-events: none;
+}
+
+.history-tour-count {
+  flex: none;
+  min-width: var(--space-10);
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--color-text-tertiary);
+}
+
+.history-tour-caption {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.history-tour-progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: var(--border-width-2);
+  width: calc(var(--history-tour-progress, 0) * 100%);
+  background: var(--color-text-primary);
+  pointer-events: none;
+}
+
+@media (max-width: 720px) {
+  .history-tour-bar,
+  body:has(#sidebar.hidden) .history-tour-bar {
+    left: var(--space-2);
+    right: var(--space-2);
+  }
+}
+
+/* Deleting a saved state is asked in its row: the dialog is modal. */
+.saved-state-actions[hidden],
+.saved-state-confirm[hidden] {
+  display: none;
+}
+
+.saved-state-confirm {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.saved-state-question {
+  font-size: var(--type-hint);
+  color: var(--color-danger-text);
+  white-space: nowrap;
+}
+
+.saved-states-save {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.saved-states-save > .obs-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-tour-chapter {
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+}
+
+.history-tour-note {
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-secondary);
+}
+
+.history-tour-chapter[hidden],
+.history-tour-note[hidden] {
+  display: none;
+}
+
+.saved-states-save > select.obs-select {
+  flex: none;
+  width: auto;
+}

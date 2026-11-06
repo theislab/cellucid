@@ -571,9 +571,39 @@ export const highlightStateMethods = {
     return written;
   },
 
+  /**
+   * `base` when no page is called that, else the first of `base (2)`,
+   * `base (3)`, … that is free: pages are named by their names (the actions,
+   * an agent, a replay), so two pages never share one.
+   *
+   * @param {string} base
+   * @returns {string}
+   */
+  freeHighlightPageName(base) {
+    const taken = new Set(this.highlightPages.map(page => page.name));
+    if (!taken.has(base)) return base;
+    for (let suffix = 2; ; suffix++) {
+      const candidate = `${base} (${suffix})`;
+      if (!taken.has(candidate)) return candidate;
+    }
+  },
+
+  /**
+   * The name a new page gets when none is given: "Page N", N the number of
+   * pages it makes, or the first larger N that is free.
+   *
+   * @returns {string}
+   */
+  defaultHighlightPageName() {
+    const taken = new Set(this.highlightPages.map(page => page.name));
+    for (let number = this.highlightPages.length + 1; ; number++) {
+      if (!taken.has(`Page ${number}`)) return `Page ${number}`;
+    }
+  },
+
   createHighlightPage(name = null) {
     const id = `page_${++this._highlightPageIdCounter}`;
-    const pageName = name || `Page ${this.highlightPages.length + 1}`;
+    const pageName = name || this.defaultHighlightPageName();
     const page = {
       id,
       name: pageName,
@@ -620,42 +650,6 @@ export const highlightStateMethods = {
       this._notifyHighlightChange();
     }
 
-    this._notifyHighlightPageChange();
-    return true;
-  },
-
-  /**
-   * What deleting a page takes away, for Undo (`restoreHighlightPage`): the
-   * page itself (its groups and their cell lists), its place among the
-   * pages, whether it was the active one, and the open cells its lists name.
-   *
-   * @param {string} pageId
-   * @returns {{page: Object, index: number, active: boolean, cells: Object|null}|null}
-   */
-  highlightPageRecord(pageId) {
-    const index = this.highlightPages.findIndex((p) => p.id === pageId);
-    if (index === -1) return null;
-    return { page: this.highlightPages[index], index, active: this.activePageId === pageId, cells: this.cellIdentity ?? null };
-  },
-
-  /**
-   * Put a deleted page back where it was (Undo). Refused when the open cells
-   * changed since (its cell lists name other cells) or a page of its id
-   * exists again.
-   *
-   * @param {{page: Object, index: number, active: boolean, cells: Object|null}} record
-   * @returns {boolean}
-   */
-  restoreHighlightPage(record) {
-    const { page, index, active, cells } = record;
-    if ((this.cellIdentity ?? null) !== cells) return false;
-    if (this.highlightPages.some((p) => p.id === page.id)) return false;
-    this.highlightPages.splice(Math.min(index, this.highlightPages.length), 0, page);
-    if (active) {
-      this.activePageId = page.id;
-      this._recomputeHighlightArray();
-      this._notifyHighlightChange();
-    }
     this._notifyHighlightPageChange();
     return true;
   },
@@ -708,9 +702,11 @@ export const highlightStateMethods = {
    * @param {string} pageId1 - First page ID
    * @param {string} pageId2 - Second page ID
    * @param {'intersection' | 'union'} operation - The set operation to perform
+   * @param {string|null} [name] - The new page's name; null names it "A ∩ B"
+   *   or "A ∪ B" (made unique, `freeHighlightPageName`)
    * @returns {Object|null} The newly created page, or null if failed
    */
-  combineHighlightPages(pageId1, pageId2, operation) {
+  combineHighlightPages(pageId1, pageId2, operation, name = null) {
     const page1 = this.highlightPages.find((p) => p.id === pageId1);
     const page2 = this.highlightPages.find((p) => p.id === pageId2);
     if (!page1 || !page2) return null;
@@ -772,8 +768,8 @@ export const highlightStateMethods = {
     }
     const resultIndices = combined.toUint32Array();
 
-    // Create the new page with derived name
-    const newName = `${page1.name} ${operationSymbol} ${page2.name}`;
+    // Create the new page with the given or derived name
+    const newName = name ?? this.freeHighlightPageName(`${page1.name} ${operationSymbol} ${page2.name}`);
     const newPage = this.createHighlightPage(newName);
 
     // Add a single combined group if there are results
@@ -1185,63 +1181,87 @@ export const highlightStateMethods = {
     return group;
   },
 
-  removeHighlightGroup(groupId) {
-    const idx = this.highlightedGroups.findIndex((g) => g.id === groupId);
-    if (idx === -1) return false;
-    this.highlightedGroups.splice(idx, 1);
-    this._recomputeHighlightArray();
-    this._notifyHighlightChange();
-    return true;
+  /**
+   * The page `pageId` names (the active page by default), or null.
+   * @param {string|null} pageId
+   * @returns {Object|null}
+   */
+  _highlightPageOf(pageId) {
+    return this.highlightPages.find((p) => p.id === pageId) || null;
   },
 
   /**
-   * What removing a group of the active page takes away, for Undo
-   * (`restoreHighlightGroup`): the group, its page and place there, and the
-   * open cells its list names.
-   *
-   * @param {string} groupId
-   * @returns {{group: Object, pageId: string, index: number, cells: Object|null}|null}
+   * Publish a change to the groups of `page`: the active page repaints the
+   * highlight; any other page only changes what the page list counts.
    */
-  highlightGroupRecord(groupId) {
-    const page = this._getActivePage();
-    const index = page === null ? -1 : page.highlightedGroups.findIndex((g) => g.id === groupId);
-    if (index === -1) return null;
-    return { group: page.highlightedGroups[index], pageId: page.id, index, cells: this.cellIdentity ?? null };
-  },
-
-  /**
-   * Put a removed group back on its page, where it was (Undo). Refused when
-   * the open cells changed since, its page is gone, or a group of its id is
-   * there again.
-   *
-   * @param {{group: Object, pageId: string, index: number, cells: Object|null}} record
-   * @returns {boolean}
-   */
-  restoreHighlightGroup(record) {
-    const { group, pageId, index, cells } = record;
-    if ((this.cellIdentity ?? null) !== cells) return false;
-    const page = this.highlightPages.find((p) => p.id === pageId);
-    if (!page || page.highlightedGroups.some((g) => g.id === group.id)) return false;
-    // A new list: the analyses' page memberships see the change.
-    const groups = [...page.highlightedGroups];
-    groups.splice(Math.min(index, groups.length), 0, group);
-    page.highlightedGroups = groups;
-    if (pageId === this.activePageId) {
+  _publishHighlightPageGroups(page) {
+    if (page.id === this.activePageId) {
       this._recomputeHighlightArray();
       this._notifyHighlightChange();
     } else {
       this._notifyHighlightPageChange();
     }
+  },
+
+  /**
+   * Remove one group from a page (the active page by default).
+   *
+   * @param {string} groupId
+   * @param {string} [pageId]
+   * @returns {boolean} Whether a group was removed
+   */
+  removeHighlightGroup(groupId, pageId = this.activePageId) {
+    const page = this._highlightPageOf(pageId);
+    const idx = page === null ? -1 : page.highlightedGroups.findIndex((g) => g.id === groupId);
+    if (idx === -1) return false;
+    // A new list: the analyses' page memberships see the change.
+    page.highlightedGroups = page.highlightedGroups.filter((g) => g.id !== groupId);
+    this._publishHighlightPageGroups(page);
     return true;
   },
 
-  toggleHighlightEnabled(groupId, enabled) {
-    const group = this.highlightedGroups.find((g) => g.id === groupId);
+  /**
+   * Turn one group of a page (the active page by default) on or off.
+   *
+   * @param {string} groupId
+   * @param {boolean} enabled
+   * @param {string} [pageId]
+   * @returns {boolean} Whether the group was found
+   */
+  toggleHighlightEnabled(groupId, enabled, pageId = this.activePageId) {
+    const page = this._highlightPageOf(pageId);
+    const group = page === null ? undefined : page.highlightedGroups.find((g) => g.id === groupId);
     if (!group) return false;
     group.enabled = enabled;
-    this._recomputeHighlightArray();
-    this._notifyHighlightChange();
+    this._publishHighlightPageGroups(page);
     return true;
+  },
+
+  /**
+   * Give one group of a page (the active page by default) other cells, in
+   * its place on the page, with its id, label and on/off kept: a category or
+   * range group brought up to the cells its view shows now
+   * (`highlight.category` and `highlight.range` on a page that has the
+   * group already, the history's Run again of a stale step). The group and
+   * the page's list are new objects, so a value the history captured before
+   * keeps the old cells.
+   *
+   * @param {string} groupId
+   * @param {Uint32Array} cellIndices - the new cells (copied; not empty)
+   * @param {string} [pageId]
+   * @returns {Object|null} The new group, or null when the page has no such group
+   */
+  replaceHighlightGroupCells(groupId, cellIndices, pageId = this.activePageId) {
+    requireCellList(cellIndices, this.pointCount, 'Highlight group cellIndices');
+    if (cellIndices.length === 0) throw new TypeError('Highlight group cellIndices must not be empty.');
+    const page = this._highlightPageOf(pageId);
+    const old = page === null ? undefined : page.highlightedGroups.find((g) => g.id === groupId);
+    if (old === undefined) return null;
+    const copy = copyCellList(cellIndices);
+    const group = { ...old, cellIndices: copy, cellCount: copy.length };
+    page.highlightedGroups = page.highlightedGroups.map((g) => (g.id === groupId ? group : g));
+    this._publishHighlightPageGroups(page);
+    return group;
   },
 
   /**
@@ -1272,6 +1292,23 @@ export const highlightStateMethods = {
     page.highlightedGroups = [];
     this._recomputeHighlightArray();
     this._notifyHighlightChange();
+    return removed;
+  },
+
+  /**
+   * Remove every group of one page; the page stays. The active page's Clear
+   * is `clearActivePageHighlights`.
+   *
+   * @param {string} pageId
+   * @returns {number} Groups removed, or -1 when there is no such page
+   */
+  clearHighlightPage(pageId) {
+    if (pageId === this.activePageId) return this.clearActivePageHighlights();
+    const page = this._highlightPageOf(pageId);
+    if (page === null) return -1;
+    const removed = page.highlightedGroups.length;
+    page.highlightedGroups = [];
+    this._notifyHighlightPageChange();
     return removed;
   },
 

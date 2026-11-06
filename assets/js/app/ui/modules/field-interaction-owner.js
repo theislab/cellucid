@@ -15,7 +15,7 @@
  * @module ui/modules/field-interaction-owner
  */
 
-import { cancelled, cancellationKind, isCancellation } from '../../../utils/abort.js';
+import { cancelled, cancellationKind, isCancellation, onAbort } from '../../../utils/abort.js';
 
 const tokenControllers = new WeakMap();
 const intentOwners = new WeakMap();
@@ -155,7 +155,14 @@ class FieldInteractionOwner {
     throw cancelled('superseded', 'Field interaction was superseded by a newer intent.');
   }
 
-  run(operation) {
+  /**
+   * Run the latest choice: an older one is aborted. `signal` is the choice's
+   * own (the action that made it): aborted, the choice is superseded too.
+   *
+   * @param {(token: {revision: number, signal: AbortSignal}) => unknown} operation
+   * @param {{signal?: AbortSignal|null}} [options]
+   */
+  run(operation, { signal = null } = {}) {
     requireOperation(operation);
     if (this._destroyed) {
       throw new Error('Field interaction owner has been destroyed.');
@@ -172,6 +179,11 @@ class FieldInteractionOwner {
     });
     tokenControllers.set(token, controller);
     this._currentToken = token;
+    const removeOuter = onAbort(signal, () => {
+      if (!controller.signal.aborted) {
+        controller.abort(cancelled('superseded', 'Field interaction was superseded by a newer intent.'));
+      }
+    });
 
     let operationResult;
     try {
@@ -180,6 +192,7 @@ class FieldInteractionOwner {
       operationResult = Promise.reject(error);
     }
     const task = Promise.resolve(operationResult);
+    void task.then(removeOuter, removeOuter);
     this._currentTask = task;
     this._track(task, true);
     return task;

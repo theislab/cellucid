@@ -252,7 +252,8 @@ export class DotplotUI extends FormBasedAnalysisUI {
       groupsFor: (_entry, record) => this._fieldGroups.groups(record.groupBy),
       getGenes: () => this._geneNames(),
       getGeneIdentities: () => geneIdentities(this.dataLayer.state?.varData),
-      getMarkerSets: () => this.comparisonModule.getUI('genesPanel').getMarkerGeneSets(),
+      // Marker genes made in the panel, read without making its analysis (a read makes no state).
+      getMarkerSets: () => this.comparisonModule.getUIManager().peekUI('genesPanel')?.getMarkerGeneSets() ?? null,
       getNotebookSets: () => notebookGeneSets(this.dataLayer.state),
       expressionMatrices: this.dataLayer.getExpressionMatrices()
     };
@@ -599,12 +600,37 @@ export class DotplotUI extends FormBasedAnalysisUI {
     container.innerHTML = '<p class="empty-state">Dot color: mean expression in the group. Dot size: share of the group\'s cells expressing the gene.</p>';
   }
 
+  /** The long table, unscaled: one row per group and gene (the CSV, the agent's read). */
+  _longTable(result) {
+    const data = dotplotPlotData(result.summary, { ...this._requireOptions(), scale: 'none', meanOnlyExpressing: false, groupOrder: 'field' }, 1);
+    return PlotRegistry.get('dotplot').exportCSV(data);
+  }
+
+  /**
+   * Each group's top `top` genes by mean expression, from the long table,
+   * as an agent reads the result (`describeResult`).
+   * @override
+   */
+  _resultTable(result, top) {
+    const { columns, rows } = this._longTable(result);
+    const byGroup = new Map();
+    for (const row of rows) {
+      if (!byGroup.has(row.group)) byGroup.set(row.group, []);
+      byGroup.get(row.group).push(row);
+    }
+    const mean = row => (Number.isFinite(row.mean) ? row.mean : -Infinity);
+    const chosen = [...byGroup.values()].flatMap(group => [...group].sort((a, b) => mean(b) - mean(a)).slice(0, top));
+    return {
+      columns,
+      rows: chosen.map(row => columns.map(column => (typeof row[column] === 'number' && !Number.isFinite(row[column]) ? null : row[column]))),
+      total: rows.length
+    };
+  }
+
   _exportModalCSV() {
     const result = this._lastResult;
     if (!result) return;
-    // The long table, unscaled: one row per group and gene.
-    const data = dotplotPlotData(result.summary, { ...this._requireOptions(), scale: 'none', meanOnlyExpressing: false, groupOrder: 'field' }, 1);
-    const csv = PlotRegistry.get('dotplot').exportCSV(data);
+    const csv = this._longTable(result);
     const cell = value => {
       const text = typeof value === 'number' ? (Number.isFinite(value) ? String(value) : 'NA') : String(value);
       return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -666,7 +692,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
     if (this.dataLayer.getVariableInfo('categorical_obs', summary.groupBy) === null) {
       throw new Error(`The dot plot result groups by "${summary.groupBy}", which this dataset lacks`);
     }
-    await this._restoreAnalysisResult(result);
+    await this._restoreAnalysisResult(result, envelope.provenance);
   }
 }
 

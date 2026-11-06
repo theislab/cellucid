@@ -20,10 +20,12 @@ import {
   getCommunityAnnotationCacheContext,
   syncCommunityAnnotationCacheContext
 } from '../../community-annotations/runtime-context.js';
+import { annotationCategories, annotationFieldKey } from '../../community-annotations/field-names.js';
 import {
   claimCommunityAnnotationModal
 } from './community-annotation-modal-owner.js';
-import { el, toCleanString } from './community-annotation/dom.js';
+import { el } from './community-annotation/dom.js';
+import { toCleanString } from '../../../utils/clean-string.js';
 import { createDomId } from '../components/dom-id.js';
 import { createInfoTip } from '../components/controls.js';
 import { cancel, cancelled, onAbort } from '../../../utils/abort.js';
@@ -319,10 +321,6 @@ export function buildMergeTraversal(input) {
   }
 
   return { targetSuggestionId, steps };
-}
-
-function normalizeLabelForCompare(value) {
-  return toCleanString(value).toLowerCase().replace(/\s+/g, ' ');
 }
 
 function compareCodeUnitText(left, right) {
@@ -1251,16 +1249,15 @@ function renderComment({
         className: 'obs-select community-annotation-textarea',
         'aria-label': 'Edit comment',
         placeholder: 'Edit comment…',
-        maxlength: '500'
       });
       ownModalFocusKey(input, `${commentFocusPrefix}:edit-input`, {
         restoreKey: editFocusKey
       });
       input.value = text;
 
-      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${input.value.length}/500` });
+      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${formatCountOf(input.value.length, 'character')}` });
       input.addEventListener('input', () => {
-        charCounter.textContent = `${input.value.length}/500`;
+        charCounter.textContent = `${formatCountOf(input.value.length, 'character')}`;
         inlineEdits.set(editFocusKey, 'text', input.value);
       });
 
@@ -1736,7 +1733,6 @@ function renderMergeRow({
       const inputWrap = el('div', { className: 'community-annotation-comment-bar-wrap community-annotation-comment-bar-wrap--edit' });
       const input = el('textarea', {
         className: 'community-annotation-comment-bar community-annotation-comment-bar--edit',
-        maxlength: '512',
         rows: '1',
         'aria-label': 'Merge note',
         placeholder: 'Merge note (optional)…',
@@ -1750,7 +1746,7 @@ function renderMergeRow({
 
       const charCounter = el('div', {
         className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-        text: `${input.value.length}/512`
+        text: `${formatCountOf(input.value.length, 'character')}`
       });
 
       const resize = () => {
@@ -1777,7 +1773,7 @@ function renderMergeRow({
       };
 
       input.addEventListener('input', () => {
-        charCounter.textContent = `${input.value.length}/512`;
+        charCounter.textContent = `${formatCountOf(input.value.length, 'character')}`;
         inlineEdits.set(editFocusKey, 'note', input.value);
         resize();
       });
@@ -2370,7 +2366,6 @@ function openMergedSuggestionsModal({
           inlineEdits,
           lifecycle,
           canInteract,
-          duplicateLabelKeys: null,
           variant: 'full',
           showMergedBundleRow: false,
           allowModerationDrag: false,
@@ -2409,7 +2404,6 @@ function renderSuggestionCard({
   mergeTargets = [],
   lifecycle = null,
   canInteract = true,
-  duplicateLabelKeys = null,
   variant = 'full',
   showMergedBundleRow = true,
   allowModerationDrag = true,
@@ -2449,9 +2443,6 @@ function renderSuggestionCard({
   );
 
   const card = el('div', { className: 'community-annotation-suggestion-card' });
-  const labelKey = normalizeLabelForCompare(suggestion?.label || '');
-  const isDuplicate = Boolean(labelKey && duplicateLabelKeys && duplicateLabelKeys.has(labelKey));
-  if (isDuplicate) card.classList.add('is-duplicate-label');
   const top = el('div', { className: 'community-annotation-suggestion-top' });
   top.appendChild(el('div', { className: 'community-annotation-suggestion-label', text: suggestion?.label || '' }));
   top.appendChild(el('div', { className: 'community-annotation-suggestion-net', text: `net ${net}` }));
@@ -2464,13 +2455,6 @@ function renderSuggestionCard({
     card.appendChild(el('div', {
       className: `community-annotation-delegated-vote ${isDelegationTie ? 'delegated-tie' : `delegated-${myVote}`}`,
       text: `${icon} ${label}${detail}`
-    }));
-  }
-
-  if (isDuplicate) {
-    card.appendChild(el('div', {
-      className: 'community-annotation-dup-note',
-      text: canModerate ? 'Duplicate label (use Merge… to combine if needed).' : 'Duplicate label (votes may be split).'
     }));
   }
 
@@ -2598,10 +2582,10 @@ function renderSuggestionCard({
     editBox.appendChild(el('div', { className: 'community-annotation-new-title', text: 'Edit suggestion' }));
 
     const editForm = el('div', { className: 'community-annotation-new community-annotation-new-vertical' });
-    const labelInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Label', placeholder: 'Label (required)', maxlength: '120' });
-    const ontInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Ontology id', placeholder: 'Ontology id (optional)', title: 'Ontology id, such as CL:0000625', maxlength: '64' });
+    const labelInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Label', placeholder: 'Label (required)' });
+    const ontInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Ontology id', placeholder: 'Ontology id (optional)', title: 'Ontology id, such as CL:0000625' });
     const markerGenesInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Marker genes', placeholder: 'Marker genes (optional)', title: 'Marker genes, separated by commas' });
-    const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', 'aria-label': 'Evidence', placeholder: 'Evidence (optional)', maxlength: '2000' });
+    const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', 'aria-label': 'Evidence', placeholder: 'Evidence (optional)' });
     ownModalFocusKey(labelInput, `${suggestionFocusPrefix}:edit-label`);
     ownModalFocusKey(
       ontInput,
@@ -2841,7 +2825,6 @@ function renderSuggestionCard({
         className: 'obs-select community-annotation-textarea',
         'aria-label': 'Merge note',
         placeholder: 'Optional merge note',
-        maxlength: '512',
         rows: '2'
       });
       ownModalFocusKey(
@@ -3000,7 +2983,6 @@ function renderSuggestionCard({
       className: 'community-annotation-comment-bar',
       'aria-label': 'Comment',
       placeholder: canInteract ? 'Write a comment and press Enter…' : 'Comments are disabled (closed by author).',
-      maxlength: '500',
       rows: '1',
       disabled: !canInteract
     });
@@ -3009,7 +2991,7 @@ function renderSuggestionCard({
     );
     const charCounter = el('div', {
       className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-      text: `${input.value.length}/500`
+      text: `${formatCountOf(input.value.length, 'character')}`
     });
     const resizeInput = () => {
       const cs = getComputedStyle(input);
@@ -3018,7 +3000,7 @@ function renderSuggestionCard({
       autoSizeTextarea(input, { minHeightPx: minHeight, maxHeightPx: maxHeight });
     };
     input.addEventListener('input', () => {
-      charCounter.textContent = `${input.value.length}/500`;
+      charCounter.textContent = `${formatCountOf(input.value.length, 'character')}`;
       resizeInput();
     });
     input.addEventListener('keydown', (e) => {
@@ -3030,7 +3012,7 @@ function renderSuggestionCard({
       const id = session.addComment?.(fieldKey, catIdx, suggestion.id, text);
       if (id) {
         input.value = '';
-        charCounter.textContent = '0/500';
+        charCounter.textContent = formatCountOf(0, 'character');
         resizeInput();
         getNotificationCenter().success('Comment added', { category: 'annotation', duration: 1200 });
       } else {
@@ -3117,7 +3099,6 @@ function renderSuggestionCard({
           className: 'community-annotation-comment-bar community-annotation-comment-bar--edit',
           'aria-label': 'Edit comment',
           placeholder: 'Edit comment…',
-          maxlength: '500',
           rows: '1',
           'data-esc-cancel': 'true',
           title: 'Enter to save • Esc to cancel'
@@ -3128,7 +3109,7 @@ function renderSuggestionCard({
         input.value = text;
         const counter = el('div', {
           className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-          text: `${input.value.length}/500`
+          text: `${formatCountOf(input.value.length, 'character')}`
         });
 
         const resize = () => {
@@ -3158,7 +3139,7 @@ function renderSuggestionCard({
         };
 
         input.addEventListener('input', () => {
-          counter.textContent = `${input.value.length}/500`;
+          counter.textContent = `${formatCountOf(input.value.length, 'character')}`;
           inlineEdits.set(editFocusKey, 'text', input.value);
           resize();
         });
@@ -3325,7 +3306,7 @@ function renderSuggestionCard({
           `Votes will be combined (1 per user). Comments stay separate and can be reviewed via “View merged”.`,
         inputLabel: 'Optional merge note',
         inputPlaceholder: 'Why are these equivalent? (optional)',
-        inputMaxLength: 512,
+        inputMaxLength: null,
         confirmText: 'Merge',
         onConfirm: (note) => {
           try {
@@ -3424,31 +3405,6 @@ function buildVotingDetail({
       (a, b) =>
         ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0))
     );
-  if (suggestions.length > 200) {
-    throw new Error('Community suggestions exceed the 200-item contract');
-  }
-
-  // Detect duplicate labels (multi-user/offline): votes/comments can be split across duplicate suggestions.
-  const labelCounts = new Map();
-  for (const s of suggestions) {
-    const key = normalizeLabelForCompare(s?.label || '');
-    if (!key) continue;
-    labelCounts.set(key, (labelCounts.get(key) || 0) + 1);
-  }
-  const duplicateLabelKeys = new Set();
-  for (const [k, count] of labelCounts.entries()) {
-    if (count > 1) duplicateLabelKeys.add(k);
-  }
-  if (duplicateLabelKeys.size) {
-    const dupSuggestionCount = suggestions.filter((s) => duplicateLabelKeys.has(normalizeLabelForCompare(s?.label || ''))).length;
-    panel.appendChild(el('div', {
-      className: 'status-line',
-      text: access.isAuthor()
-        ? `${dupSuggestionCount} duplicate labels: Merge… combines them.`
-        : `${dupSuggestionCount} duplicate labels: votes may be split.`
-    }));
-  }
-
   const suggestionPageSize = 25;
   const suggestionPageCount = Math.max(
     1,
@@ -3508,8 +3464,7 @@ function buildVotingDetail({
           inlineEdits,
           mergeTargets: suggestions,
           lifecycle,
-          canInteract,
-          duplicateLabelKeys
+          canInteract
         });
         card.setAttribute('role', 'listitem');
         list.appendChild(card);
@@ -3574,7 +3529,7 @@ function buildVotingDetail({
   );
 
   const labelRow = el('div', { className: 'community-annotation-label-row' });
-  const labelInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Label', placeholder: 'Label (required)', maxlength: '120', disabled: !canInteract });
+  const labelInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Label', placeholder: 'Label (required)', disabled: !canInteract });
   const searchCapBtn = el('button', {
     type: 'button',
     className: 'btn btn-compact cap-btn',
@@ -3590,7 +3545,7 @@ function buildVotingDetail({
   labelRow.appendChild(searchCapBtn);
 
   const ontRow = el('div', { className: 'community-annotation-label-row' });
-  const ontInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Ontology id', placeholder: 'Ontology id (optional)', title: 'Ontology id, such as CL:0000625', maxlength: '64', disabled: !canInteract });
+  const ontInput = el('input', { type: 'text', className: 'obs-select', 'aria-label': 'Ontology id', placeholder: 'Ontology id (optional)', title: 'Ontology id, such as CL:0000625', disabled: !canInteract });
   const searchOntBtn = el('button', {
     type: 'button',
     className: 'btn btn-compact cap-btn',
@@ -3630,7 +3585,7 @@ function buildVotingDetail({
   markerGenesRow.appendChild(markerGenesInput);
   markerGenesRow.appendChild(searchMarkersBtn);
 
-  const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', 'aria-label': 'Evidence', placeholder: 'Evidence (optional)', maxlength: '2000', disabled: !canInteract });
+  const evidenceInput = el('textarea', { className: 'obs-select community-annotation-textarea', 'aria-label': 'Evidence', placeholder: 'Evidence (optional)', disabled: !canInteract });
   ownModalDraft(ownModalFocusKey(evidenceInput, `${newSuggestionFocusPrefix}:evidence`));
   const capStatus = el('div', {
     className: 'cap-import-status',
@@ -4126,8 +4081,10 @@ export function openCommunityAnnotationVotingModal({
           status.textContent = 'Loading…';
         }
 
+        // The field and its categories by their names in the repository (the
+        // dataset's): a local rename is shown, never voted under.
         const fields = state.getFields?.() || [];
-        const fieldIndex = fields.findIndex((f) => f && f._isDeleted !== true && f.kind === 'category' && toCleanString(f.key) === focusField);
+        const fieldIndex = fields.findIndex((f) => f && f._isDeleted !== true && f.kind === 'category' && annotationFieldKey(f) === focusField);
         if (fieldIndex < 0) {
           replaceContentWithStatus('Field not found in current dataset.');
           return;
@@ -4163,7 +4120,8 @@ export function openCommunityAnnotationVotingModal({
 
         const field = state.getFields?.()?.[fieldIndex] || null;
         if (field !== fieldOwner) return;
-        const categories = Array.isArray(field?.categories) ? field.categories : [];
+        const categories = annotationCategories(field);
+        const shownCategories = Array.isArray(field?.categories) ? field.categories : [];
         if (focusCatIdx >= categories.length) {
           replaceContentWithStatus(
             'Category not found in current dataset.'
@@ -4205,7 +4163,12 @@ export function openCommunityAnnotationVotingModal({
         const newContent = document.createDocumentFragment();
         viewState.inlineEdits.beginRebuild();
         try {
-          newContent.appendChild(el('div', { className: 'community-annotation-inline-help', text: `${focusField} • ${catLabel}` }));
+          const shownLabel = String(shownCategories[focusCatIdx]);
+          const renamed = field.key !== focusField || shownLabel !== catLabel;
+          newContent.appendChild(el('div', {
+            className: 'community-annotation-inline-help',
+            text: `${field.key} • ${shownLabel}${renamed ? ` (in the repository: ${focusField} • ${catLabel})` : ''}`,
+          }));
           newContent.appendChild(buildVotingDetail({
             session,
             fieldKey: focusField,

@@ -4,9 +4,17 @@
  * Wires the "Camera path" accordion: the save-position button, a unified
  * scrollable keyframe + timing list, playback settings, and the viewport
  * transport bar. Navigation itself lives in the Navigation panel; a keyframe
- * goto, playback and a restore move the mode through that panel's
- * `syncNavigationMode`, and the navigation settings a path records are read
- * and restored through its `exportSettings` / `restoreSettings`.
+ * goto and playback move the mode through that panel's `syncNavigationMode`.
+ * The path's own state (its keyframes and how it plays them, `exportPath`) is
+ * the `camera-path` state domain's value; the navigation mode is the camera's
+ * and the navigation settings are settings.
+ *
+ * Every change to the path is a camera path action
+ * (`app/actions/definitions/camera.js`): the controls dispatch them, and this
+ * module provides their implementations while it lives. A keyframe is named
+ * by its label, so labels are unique. Playing, pausing and seeking change
+ * nothing but the camera, whose resting place the camera observation records
+ * (`camera-controls.js`); going to a keyframe is a `camera.set`.
  *
  * Follows the same factory-function pattern as camera-controls.js.
  *
@@ -18,17 +26,14 @@ import {
   createKeyframeStore,
   isCameraPathReady,
   isValidCameraKeyframe,
+  isValidCameraState,
   MIN_TRANSITION_DURATION_SECONDS
 } from './keyframe-store.js';
-import {
-  createPlaybackController,
-  prefersReducedMotion
-} from './playback-controller.js';
+import { createPlaybackController } from './playback-controller.js';
 import { createTransportBar } from './transport-bar.js';
 import { assertCameraPathOptions } from './interpolation-engine.js';
 import { getNotificationCenter } from '../../../notification-center.js';
 import {
-  assertCameraState,
   assertNavigationMode,
   cloneCameraState
 } from '../../../../rendering/camera-state-contract.js';
@@ -38,6 +43,12 @@ import {
 } from '../../core/numeric-input-contract.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 import { ICONS, readDecimalInput } from '../../components/controls.js';
+import { getActions } from '../../../actions/index.js';
+import { ActionRefused } from '../../../actions/dispatcher.js';
+import { dispatchFromControl } from '../../../actions/control-dispatch.js';
+import { viewNameOf } from '../../../actions/targets/views.js';
+import { formatCountOf } from '../../../../utils/format-units.js';
+import { plainSentence, quoteName } from '../../../actions/targets/names.js';
 
 // Keyframe action glyphs. They are drawn at the shared icon-button size
 // (`.icon-btn svg`); delete uses the one shared delete glyph.
@@ -46,28 +57,19 @@ const SVG_DOWN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 const SVG_GOTO = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
 const SVG_DELETE = ICONS.delete.replace('<svg ', '<svg aria-hidden="true" ');
 const LOOP_BACK_LABEL = '\u21A9 Return to start';
-const CAMERA_PATH_SESSION_KEYS = [
+const NOTICE_CATEGORY = 'cinematic';
+/** The parts of the Camera Path's own state (`exportPath`), sorted. */
+const CAMERA_PATH_KEYS = Object.freeze([
   'autoplay',
   'defaultSpeed',
   'easing',
-  'invertLook',
   'keyframes',
-  'lookSensitivity',
   'loopBackKeyframeId',
   'loopPlayback',
-  'moveSpeed',
-  'navigationMode',
   'nextIndex',
-  'orbitKeySpeed',
-  'orbitReverse',
-  'planarInvertAxes',
-  'planarPanSpeed',
-  'planarZoomToCursor',
   'positionMethod',
   'rotationMethod',
-  'showOrbitAnchor'
-];
-const PLAYBACK_SNAPSHOT_KEYS = ['camera', 'globalT', 'state'];
+]);
 const REQUIRED_DOM_KEYS = [
   'saveBtn',
   'keyframeList',
@@ -115,69 +117,46 @@ function sliderToAutoPaceSpeed(raw) {
   return 0.1 * Math.pow(40, v / 100);
 }
 
-export function assertCameraPathSessionState(data) {
+/**
+ * Check the Camera Path's own state (`exportPath`'s shape): exactly its
+ * keyframes, the number the next keyframe takes, the keyframe a loop
+ * returns to, and how it plays them.
+ *
+ * @param {object} data
+ * @returns {object} the same state
+ */
+export function assertCameraPathState(data) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new TypeError('Camera Path session state must be an object.');
+    throw new TypeError('Camera Path state must be an object.');
   }
   const keys = Object.keys(data).sort();
   if (
-    keys.length !== CAMERA_PATH_SESSION_KEYS.length ||
-    keys.some((key, index) => key !== CAMERA_PATH_SESSION_KEYS[index])
+    keys.length !== CAMERA_PATH_KEYS.length ||
+    keys.some((key, index) => key !== CAMERA_PATH_KEYS[index])
   ) {
     throw new TypeError(
-      `Camera Path session state must contain exactly ${CAMERA_PATH_SESSION_KEYS.join(', ')}.`
+      `Camera Path state must contain exactly ${CAMERA_PATH_KEYS.join(', ')}.`
     );
   }
   if (
     !Array.isArray(data.keyframes) ||
     !data.keyframes.every(isValidCameraKeyframe)
   ) {
-    throw new TypeError('Camera Path session state contains invalid keyframes.');
+    throw new TypeError('Camera Path state contains invalid keyframes.');
   }
   const ids = new Set(data.keyframes.map(({ id }) => id));
   if (ids.size !== data.keyframes.length) {
-    throw new TypeError('Camera Path session keyframe ids must be unique.');
+    throw new TypeError('Camera Path keyframe ids must be unique.');
   }
   if (!Number.isInteger(data.nextIndex) || data.nextIndex <= 0) {
-    throw new TypeError('Camera Path session nextIndex must be a positive integer.');
+    throw new TypeError('Camera Path nextIndex must be a positive integer.');
   }
   if (typeof data.defaultSpeed !== 'string') {
-    throw new TypeError('Camera Path session defaultSpeed must be a range-input string.');
+    throw new TypeError('Camera Path defaultSpeed must be a range-input string.');
   }
   if (typeof data.autoplay !== 'boolean') {
-    throw new TypeError('Camera Path session autoplay must be boolean.');
+    throw new TypeError('Camera Path autoplay must be boolean.');
   }
-  for (const booleanKey of [
-    'invertLook',
-    'orbitReverse',
-    'planarInvertAxes',
-    'planarZoomToCursor',
-    'showOrbitAnchor'
-  ]) {
-    if (typeof data[booleanKey] !== 'boolean') {
-      throw new TypeError(`Camera Path session ${booleanKey} must be boolean.`);
-    }
-  }
-  parseRangeInput(data.orbitKeySpeed, {
-    minimum: 1,
-    maximum: 100,
-    label: 'Camera Path session orbit keyboard speed'
-  });
-  parseRangeInput(data.planarPanSpeed, {
-    minimum: 1,
-    maximum: 100,
-    label: 'Camera Path session planar keyboard speed'
-  });
-  parseRangeInput(data.lookSensitivity, {
-    minimum: 1,
-    maximum: 30,
-    label: 'Camera Path session look sensitivity'
-  });
-  parseRangeInput(data.moveSpeed, {
-    minimum: 1,
-    maximum: 500,
-    label: 'Camera Path session move speed'
-  });
   assertCameraPathOptions({
     positionMethod: data.positionMethod,
     rotationMethod: data.rotationMethod,
@@ -185,8 +164,6 @@ export function assertCameraPathSessionState(data) {
     loop: data.loopPlayback,
     autoPaceSpeed: sliderToAutoPaceSpeed(data.defaultSpeed)
   });
-  assertNavigationMode(data.navigationMode);
-
   if (data.loopBackKeyframeId !== null) {
     if (
       typeof data.loopBackKeyframeId !== 'string' ||
@@ -194,49 +171,11 @@ export function assertCameraPathSessionState(data) {
       data.keyframes[data.keyframes.length - 1].id !== data.loopBackKeyframeId
     ) {
       throw new TypeError(
-        'Camera Path session loopBackKeyframeId must be null or identify the final keyframe of a complete loop.'
+        'Camera Path loopBackKeyframeId must be null or identify the final keyframe of a complete loop.'
       );
     }
   }
   return data;
-}
-
-export function assertCameraPathPlaybackSnapshot(value) {
-  if (
-    value === null
-    || typeof value !== 'object'
-    || Array.isArray(value)
-  ) {
-    throw new TypeError('Camera Path playback snapshot must be an object.');
-  }
-  const keys = Object.keys(value).sort();
-  if (
-    keys.length !== PLAYBACK_SNAPSHOT_KEYS.length
-    || keys.some((key, index) => key !== PLAYBACK_SNAPSHOT_KEYS[index])
-  ) {
-    throw new TypeError(
-      'Camera Path playback snapshot must contain exact camera, globalT, and state keys.'
-    );
-  }
-  if (
-    value.state !== 'STOPPED'
-    && value.state !== 'PLAYING'
-    && value.state !== 'PAUSED'
-  ) {
-    throw new TypeError('Camera Path playback snapshot state is invalid.');
-  }
-  if (
-    !Number.isFinite(value.globalT)
-    || value.globalT < 0
-    || value.globalT > 1
-    || (value.state === 'STOPPED' && value.globalT !== 0)
-  ) {
-    throw new RangeError(
-      'Camera Path playback snapshot globalT must match its exact playback state.'
-    );
-  }
-  assertCameraState(value.camera, 'Camera Path playback snapshot camera');
-  return value;
 }
 
 /**
@@ -244,7 +183,7 @@ export function assertCameraPathPlaybackSnapshot(value) {
  * @param {Object} options.viewer   Viewer API.
  * @param {Object} options.dom      Cached DOM references (cinematicCamera block).
  * @param {Object} options.navigation The Navigation panel (camera-controls.js):
- *   `syncNavigationMode`, `exportSettings`, `restoreSettings`.
+ *   `syncNavigationMode`.
  * @param {Object} options.dataSourceManager Dataset lifecycle source.
  */
 export function initCinematicCamera({
@@ -262,10 +201,8 @@ export function initCinematicCamera({
   if (!dom || typeof dom !== 'object' || Array.isArray(dom)) {
     throw new TypeError('Camera Path requires a DOM reference object.');
   }
-  for (const method of ['syncNavigationMode', 'exportSettings', 'restoreSettings']) {
-    if (typeof navigation?.[method] !== 'function') {
-      throw new TypeError(`Camera Path requires the Navigation panel's ${method}().`);
-    }
+  if (typeof navigation?.syncNavigationMode !== 'function') {
+    throw new TypeError('Camera Path requires the Navigation panel\'s syncNavigationMode().');
   }
   for (const key of REQUIRED_DOM_KEYS) {
     if (!dom[key]) {
@@ -388,7 +325,18 @@ export function initCinematicCamera({
   }
 
   updateDefaultSpeedDisplay();
-  listen(dom.defaultSpeedInput, 'input', updateDefaultSpeedDisplay);
+  // The label follows the slider at once; the setting is a step, recorded by
+  // observation (`recordPlayback`; a drag is one, the definition coalesces it).
+  listen(dom.defaultSpeedInput, 'input', () => {
+    updateDefaultSpeedDisplay();
+    recordPlayback({
+      speed: parseRangeInput(dom.defaultSpeedInput.value, {
+        minimum: 1,
+        maximum: 100,
+        label: 'Camera path default speed'
+      })
+    });
+  });
 
   // =========================================================================
   // Interpolation options reader
@@ -472,78 +420,67 @@ export function initCinematicCamera({
     return true;
   }
 
-  function stopAutoplay() {
-    if (destroyed) return;
-    if (playbackController.getState() !== 'STOPPED') {
-      playbackController.stop({ resetCamera: false });
+
+
+  // =========================================================================
+  // Playback settings: each control is one setting of camera-path.playback.set
+  // =========================================================================
+
+  /**
+   * A playback setting a person changed on its control. The controls are the
+   * settings (`exportPath` reads them, the `camera-path` domain's value), so
+   * the person's change is already made when its event arrives: it is
+   * recorded as its `camera-path.playback.set` step by observation,
+   * synchronously from that event, the way the settings controls are
+   * (`settings-actions.js`). A dispatch here would find the control already
+   * at the value and leave the change to be kept as "Changed outside the
+   * history". An agent's, a notebook's or a replay's step sets the controls
+   * through the action (`PLAYBACK_CONTROLS`).
+   */
+  function recordPlayback(params) {
+    try {
+      getActions()
+        .recordObserved('camera-path.playback.set', params)
+        .catch(error => console.error('[CinematicCamera] A playback setting could not be recorded.', error));
+    } catch (error) {
+      console.error('[CinematicCamera] A playback setting could not be recorded.', error);
     }
   }
 
-  function capturePlaybackSnapshot() {
-    requireCinematicActive('capture playback');
-    if (typeof viewer.getCameraState !== 'function') {
-      throw new TypeError(
-        'Camera Path playback snapshot requires viewer.getCameraState().'
-      );
-    }
-    return {
-      state: playbackController.getState(),
-      globalT: playbackController.getProgress(),
-      camera: cloneCameraState(
-        viewer.getCameraState(),
-        'Camera Path playback snapshot camera'
-      )
-    };
-  }
-
-  function restorePlaybackSnapshot(snapshot) {
-    if (destroyed) return;
-    const exact = assertCameraPathPlaybackSnapshot(snapshot);
-    stopAutoplay();
-    // A reduced-motion preference completes a path instead of animating it, so
-    // playback is never live and there is no transport state to resume. The
-    // exact saved camera is still published below.
-    if (exact.state !== 'STOPPED' && !prefersReducedMotion()) {
-      if (!isCameraPathReady(keyframeStore.getAll())) {
-        throw new Error(
-          'Camera Path playback restore requires a complete path.'
-        );
-      }
-      transportBar.updateVisibility({ reveal: true });
-      playbackController.play();
-      playbackController.seekTo(exact.globalT);
-      if (exact.state === 'PAUSED') playbackController.pause();
-    }
-    viewer.setCameraState(
-      cloneCameraState(
-        exact.camera,
-        'Camera Path playback restore camera'
-      )
-    );
-  }
-
-  listen(dom.autoplayCheckbox, 'change', () => {
-    if (dom.autoplayCheckbox.checked) {
-      startAutoplay();
-    }
+  listen(dom.positionInterp, 'change', () => {
+    recordPlayback({ position_interpolation: dom.positionInterp.value });
   });
+  listen(dom.rotationInterp, 'change', () => {
+    recordPlayback({ rotation_interpolation: dom.rotationInterp.value });
+  });
+  listen(dom.easingSelect, 'change', () => {
+    recordPlayback({ easing: dom.easingSelect.value });
+  });
+  listen(dom.loopCheckbox, 'change', () => {
+    recordPlayback({ loop: dom.loopCheckbox.checked });
+  });
+  listen(dom.autoplayCheckbox, 'change', () => {
+    recordPlayback({ autoplay: dom.autoplayCheckbox.checked });
+    // Turned on with a path ready, it plays, as the action's does.
+    if (dom.autoplayCheckbox.checked) startAutoplay();
+  });
+
+  /** Dispatch a camera path action from one of its controls. */
+  function dispatchPath(type, params, failure) {
+    return dispatchFromControl(type, params, { failure, category: NOTICE_CATEGORY });
+  }
 
   // =========================================================================
   // Save Position
   // =========================================================================
 
   listen(dom.saveBtn, 'click', () => {
-    const loopBackWasActive = hasLoopBackKeyframe();
-
-    // Capture the viewer's current camera state (uses whatever mode is active)
-    const newId = keyframeStore.add(
-      viewer.getCameraState(),
-      undefined,
-      focusedRepresentation()?.ref ?? null
-    );
-    if (loopBackWasActive && newId) {
-      keyframeStore.reorder(newId, -1);
-    }
+    // The camera and embedding of now are the step's own, so a replay saves
+    // the same keyframe.
+    void dispatchPath('camera-path.keyframe.add', {
+      camera: cloneCameraState(viewer.getCameraState(), 'Camera path saved camera'),
+      embedding: focusedRepresentation()?.ref ?? null
+    }, 'Saving the camera position failed');
   });
 
   // =========================================================================
@@ -552,8 +489,7 @@ export function initCinematicCamera({
 
   listen(dom.clearBtn, 'click', () => {
     if (keyframeStore.getCount() === 0) return;
-    playbackController.stop({ resetCamera: true });
-    keyframeStore.clear();
+    void dispatchPath('camera-path.clear', {}, 'Clearing the camera path failed');
   });
 
   // =========================================================================
@@ -597,7 +533,11 @@ export function initCinematicCamera({
   listen(dom.setAllBtn, 'click', () => {
     const duration = readTransitionDurationInput(dom.setAllDuration, '');
     if (!duration.valid) return;
-    keyframeStore.setAllDurations(duration.value);
+    void dispatchPath(
+      'camera-path.duration.set',
+      { seconds: duration.value },
+      'Setting every transition time failed'
+    );
   });
 
   // =========================================================================
@@ -732,32 +672,25 @@ export function initCinematicCamera({
       if (!actionEl) return;
       const action = actionEl.dataset.action;
       const isLoopBack = hasLoopBackKeyframe() && id === loopBackKeyframeId;
+      const kf = keyframeStore.getById(id);
+      if (!kf) return;
 
       if (action === 'delete') {
         if (isLoopBack) return;
-        keyframeStore.remove(id);
-      } else if (action === 'up') {
-        if (isLoopBack) return;
-        keyframeStore.reorder(id, -1);
-      } else if (action === 'down') {
-        if (isLoopBack) return;
-        const all = keyframeStore.getAll();
-        const idx = all.findIndex((kf) => kf.id === id);
-        const maxDownIndex = all.length - 1 - (hasLoopBackKeyframe() ? 1 : 0);
-        if (idx >= maxDownIndex) return;
-        keyframeStore.reorder(id, 1);
+        void dispatchPath(
+          'camera-path.keyframe.remove',
+          { keyframe: kf.label },
+          'Deleting the keyframe failed'
+        );
+      } else if (action === 'up' || action === 'down') {
+        if (isLoopBack || !canMove(kf, action)) return;
+        void dispatchPath(
+          'camera-path.keyframe.move',
+          { keyframe: kf.label, direction: action },
+          'Moving the keyframe failed'
+        );
       } else if (action === 'goto') {
-        const kf = keyframeStore.getById(id);
-        if (kf) {
-          viewer.setCameraState({
-            navigationMode: kf.navigationMode,
-            orbit: kf.orbit,
-            freefly: kf.freefly
-          });
-          // Keep the navigation dropdown and sub-panels in sync with the
-          // keyframe's mode so the user sees the correct controls after goto.
-          syncNavigationMode(kf.navigationMode);
-        }
+        void gotoKeyframe(kf);
       } else if (action === 'rename') {
         if (isLoopBack) return;
         startInlineRename(item, id, actionEl);
@@ -768,10 +701,14 @@ export function initCinematicCamera({
     listen(dom.keyframeList, 'change', (e) => {
       const loopBackToggle = e.target.closest('.cinematic-loopback-list-toggle');
       if (loopBackToggle) {
-        setLoopBackEnabled(loopBackToggle.checked);
-        // keyframeStore.add emits before loopBackKeyframeId is assigned, so force
-        // a final render here to avoid the "double click to activate" behavior.
-        renderKeyframeList();
+        void dispatchPath(
+          'camera-path.loop-back.set',
+          { enabled: loopBackToggle.checked },
+          'Changing the return to start failed'
+        ).then(result => {
+          // A refusal leaves the path as it was: the toggle says so again.
+          if (result === null) renderKeyframeList();
+        });
         return;
       }
       const input = e.target.closest('.cinematic-duration-input');
@@ -781,13 +718,21 @@ export function initCinematicCamera({
         maximum: Math.max(0, keyframeStore.getCount() - 2),
         label: 'Camera Path keyframe pair index'
       });
-      const stored = keyframeStore.getAll()[pairIndex]?.transitionDuration;
+      const from = keyframeStore.getAll()[pairIndex];
+      const stored = from?.transitionDuration;
       const duration = readTransitionDurationInput(
         input,
         stored == null ? '' : String(stored)
       );
-      if (!duration.valid) return;
-      keyframeStore.setDuration(pairIndex, duration.value);
+      if (!duration.valid || from === undefined) return;
+      void dispatchPath(
+        'camera-path.duration.set',
+        { keyframe: from.label, seconds: duration.value },
+        'Setting the transition time failed'
+      ).then(result => {
+        // A refusal shows the stored time again.
+        if (result === null) renderKeyframeList();
+      });
     });
 
     listen(dom.keyframeList, 'input', (e) => {
@@ -818,40 +763,253 @@ export function initCinematicCamera({
     input.focus();
     input.select();
 
-    // A committed rename rebuilds the list while the input still holds focus,
-    // so the rebuild returns focus to the renamed keyframe's label. Every
-    // other ending puts focus back on the label explicitly.
-    const commit = ({ focusLabel }) => {
-      const newLabel = input.value.trim();
-      if (newLabel && newLabel !== kf.label) {
-        keyframeStore.rename(kfId, newLabel);
-        return;
-      }
+    const finish = ({ focusLabel }) => {
       labelEl.hidden = false;
       if (focusLabel) labelEl.focus({ preventScroll: true });
       input.remove();
     };
+    // A committed rename rebuilds the list while the input still holds focus,
+    // so the rebuild returns focus to the renamed keyframe's label. Every
+    // other ending puts focus back on the label explicitly. A label another
+    // keyframe has is said on the input, which stays open.
+    const commit = ({ focusLabel }) => {
+      const current = keyframeStore.getById(kfId);
+      const newLabel = input.value.trim();
+      if (current === undefined || !newLabel || newLabel === current.label) {
+        finish({ focusLabel });
+        return true;
+      }
+      const problem = keyframeLabelProblem(newLabel, kfId);
+      if (problem !== null) {
+        input.setCustomValidity(plainSentence(problem));
+        input.reportValidity();
+        return false;
+      }
+      input.setCustomValidity('');
+      void dispatchPath(
+        'camera-path.keyframe.rename',
+        { keyframe: current.label, label: newLabel },
+        'Renaming the keyframe failed'
+      ).then(result => {
+        if (result === null && input.isConnected) finish({ focusLabel });
+      });
+      return true;
+    };
 
-    const ownedCommit = listen(
-      input,
-      'blur',
-      () => commit({ focusLabel: false }),
-      { once: true }
-    );
+    let ownedCommit = null;
+    const armBlurCommit = () => {
+      ownedCommit = listen(
+        input,
+        'blur',
+        () => {
+          if (!commit({ focusLabel: false })) armBlurCommit();
+        },
+        { once: true }
+      );
+    };
+    armBlurCommit();
+    listen(input, 'input', () => input.setCustomValidity(''));
     listen(input, 'keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
         input.removeEventListener('blur', ownedCommit);
-        commit({ focusLabel: true });
+        if (!commit({ focusLabel: true })) armBlurCommit();
       } else if (e.key === 'Escape') {
         e.preventDefault();
         input.removeEventListener('blur', ownedCommit);
-        labelEl.hidden = false;
-        labelEl.focus({ preventScroll: true });
-        input.remove();
+        finish({ focusLabel: true });
       }
     });
   }
+
+  // =========================================================================
+  // Keyframes by label, and the camera path actions
+  // =========================================================================
+
+  /** Whether `kf` can move one place `direction` ('up' or 'down'). */
+  function canMove(kf, direction) {
+    const all = keyframeStore.getAll();
+    const index = all.findIndex(candidate => candidate.id === kf.id);
+    if (direction === 'up') return index > 0;
+    // The return to start stays last: nothing moves past it.
+    return index >= 0 && index < all.length - 1 - (hasLoopBackKeyframe() ? 1 : 0);
+  }
+
+  function listKeyframes() {
+    const labels = keyframeStore.getAll().map(kf => `${quoteName(kf.label)}`);
+    if (labels.length === 0) return 'the camera path has no keyframes';
+    return `its keyframes are ${labels.length === 1 ? labels[0] : `${labels.slice(0, -1).join(', ')} and ${labels.at(-1)}`}`;
+  }
+
+  /** Why `label` cannot be a keyframe's (other than `exceptId`'s), or null. */
+  function keyframeLabelProblem(label, exceptId) {
+    if (label === LOOP_BACK_LABEL) {
+      return `${quoteName(LOOP_BACK_LABEL)} names the return to the first keyframe; choose another label.`;
+    }
+    if (keyframeStore.getAll().some(kf => kf.label === label && kf.id !== exceptId)) {
+      return `A keyframe is labelled ${quoteName(label)} already; choose another label.`;
+    }
+    return null;
+  }
+
+  function refuseLabel(label, exceptId) {
+    const problem = keyframeLabelProblem(label, exceptId);
+    if (problem !== null) throw new ActionRefused(problem, { code: 'refused' });
+  }
+
+  /** The keyframe labelled `label`, or a refusal that names the keyframes there are. */
+  function keyframeNamed(label) {
+    const matches = keyframeStore.getAll().filter(kf => kf.label === label);
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw new ActionRefused(
+        `${formatCountOf(matches.length, 'keyframe')} are labelled ${quoteName(label)}; rename all but one first.`,
+        { code: 'ambiguous' }
+      );
+    }
+    throw new ActionRefused(`There is no keyframe ${quoteName(label)}; ${listKeyframes()}.`, { code: 'no-target' });
+  }
+
+  /** A keyframe a person edits: never the return to start, which follows its toggle. */
+  function editableKeyframeNamed(label, verb) {
+    const kf = keyframeNamed(label);
+    if (hasLoopBackKeyframe() && kf.id === loopBackKeyframeId) {
+      throw new ActionRefused(
+        `The return to the first keyframe cannot be ${verb}; turn it off with "End with a return to the first keyframe".`,
+        { code: 'refused' }
+      );
+    }
+    return kf;
+  }
+
+  async function gotoKeyframe(kf) {
+    const result = await dispatchPath('camera.set', {
+      view: viewNameOf(viewer, viewer.getFocusedViewId()),
+      camera: cloneCameraState({
+        navigationMode: kf.navigationMode,
+        orbit: kf.orbit,
+        freefly: kf.freefly
+      }, 'Camera path keyframe')
+    }, 'Going to the keyframe failed');
+    // Keep the navigation dropdown and sub-panels in sync with the
+    // keyframe's mode so the user sees the correct controls after goto.
+    if (result !== null && !destroyed) syncNavigationMode(kf.navigationMode);
+  }
+
+  const PLAYBACK_CONTROLS = Object.freeze({
+    position_interpolation: value => { dom.positionInterp.value = value; },
+    rotation_interpolation: value => { dom.rotationInterp.value = value; },
+    easing: value => { dom.easingSelect.value = value; },
+    speed: value => {
+      dom.defaultSpeedInput.value = String(value);
+      updateDefaultSpeedDisplay();
+    },
+    loop: value => { dom.loopCheckbox.checked = value; },
+    autoplay: value => {
+      dom.autoplayCheckbox.checked = value;
+      if (value) startAutoplay();
+    }
+  });
+
+  const handlers = {
+    'camera-path.keyframe.add': (params) => {
+      const camera = params.camera === undefined ? viewer.getCameraState() : params.camera;
+      if (!isValidCameraState(camera)) {
+        throw new ActionRefused(
+          'A keyframe needs a complete camera: a radius above 0 and finite angles and positions.',
+          { code: 'refused' }
+        );
+      }
+      if (params.label !== undefined) refuseLabel(params.label, null);
+      const embedding = params.embedding === undefined
+        ? (focusedRepresentation()?.ref ?? null)
+        : params.embedding;
+      const loopBackWasActive = hasLoopBackKeyframe();
+      const id = keyframeStore.add(
+        cloneCameraState(camera, 'Camera path keyframe camera'),
+        params.label,
+        embedding
+      );
+      // A new keyframe goes before the return to start.
+      if (loopBackWasActive) keyframeStore.reorder(id, -1);
+      return { keyframe: keyframeStore.getById(id).label };
+    },
+    'camera-path.keyframe.remove': (params) => {
+      const kf = editableKeyframeNamed(params.keyframe, 'deleted');
+      keyframeStore.remove(kf.id);
+      return { keyframe: kf.label };
+    },
+    'camera-path.keyframe.move': (params) => {
+      const kf = editableKeyframeNamed(params.keyframe, 'moved');
+      if (!canMove(kf, params.direction)) {
+        throw new ActionRefused(
+          params.direction === 'up'
+            ? `${quoteName(kf.label)} is the first keyframe already.`
+            : `${quoteName(kf.label)} is the last keyframe${hasLoopBackKeyframe() ? ' before the return to start' : ''} already.`,
+          { code: 'refused' }
+        );
+      }
+      keyframeStore.reorder(kf.id, params.direction === 'up' ? -1 : 1);
+      return { keyframe: kf.label };
+    },
+    'camera-path.keyframe.rename': (params) => {
+      const kf = editableKeyframeNamed(params.keyframe, 'renamed');
+      if (params.label === kf.label) return null;
+      refuseLabel(params.label, kf.id);
+      keyframeStore.rename(kf.id, params.label);
+      return { keyframe: params.label };
+    },
+    'camera-path.duration.set': (params) => {
+      const all = keyframeStore.getAll();
+      if (params.keyframe === undefined) {
+        if (all.length < 2) {
+          throw new ActionRefused(
+            'A transition needs two keyframes; save another camera position first.',
+            { code: 'refused' }
+          );
+        }
+        keyframeStore.setAllDurations(params.seconds);
+        return { keyframes: all.length };
+      }
+      const kf = keyframeNamed(params.keyframe);
+      const index = all.findIndex(candidate => candidate.id === kf.id);
+      if (index === all.length - 1) {
+        throw new ActionRefused(
+          `No transition starts at ${quoteName(kf.label)}: it is the last keyframe.`,
+          { code: 'refused' }
+        );
+      }
+      keyframeStore.setDuration(index, params.seconds);
+      return { keyframe: kf.label };
+    },
+    'camera-path.loop-back.set': (params) => {
+      if (params.enabled && !hasLoopBackKeyframe() && getNonLoopBackCount() < 2) {
+        throw new ActionRefused(
+          'A return to the first keyframe needs two keyframes; save another camera position first.',
+          { code: 'refused' }
+        );
+      }
+      setLoopBackEnabled(params.enabled);
+      // keyframeStore.add emits before loopBackKeyframeId is assigned, so the
+      // list is drawn once more with the toggle as it is now.
+      renderKeyframeList();
+      return null;
+    },
+    'camera-path.clear': () => {
+      const count = keyframeStore.getCount();
+      if (count === 0) return null;
+      // Playback stops where the camera is: clearing the path is not a
+      // camera move.
+      playbackController.stop({ resetCamera: false });
+      keyframeStore.clear();
+      return { keyframes: count };
+    },
+    'camera-path.playback.set': (params) => {
+      for (const [key, value] of Object.entries(params)) PLAYBACK_CONTROLS[key](value);
+      return null;
+    }
+  };
+
 
   // =========================================================================
   // React to keyframe store changes
@@ -906,35 +1064,34 @@ export function initCinematicCamera({
   // =========================================================================
 
   /**
-   * Export all cinematic camera state for session serialization.
+   * The Camera Path's own state: its keyframes and how it plays them (the
+   * `camera-path` state domain's value). The navigation mode is the
+   * camera's, the navigation settings are settings.
    * @returns {object}
    */
-  function exportSessionState() {
-    requireCinematicActive('export session state');
+  function exportPath() {
+    requireCinematicActive('export its path');
     return {
       ...keyframeStore.exportAll(),
       loopBackKeyframeId,
-      // Interpolation & playback settings
       autoplay: dom.autoplayCheckbox.checked,
       loopPlayback: dom.loopCheckbox.checked,
       positionMethod: dom.positionInterp.value,
       rotationMethod: dom.rotationInterp.value,
       easing: dom.easingSelect.value,
       defaultSpeed: dom.defaultSpeedInput.value,
-      // Navigation interaction settings
-      ...navigation.exportSettings(),
-      // Navigation mode
-      navigationMode: viewer.getNavigationMode()
     };
   }
 
   /**
-   * Restore cinematic camera state from a session snapshot.
+   * Put the Camera Path's own state back (`exportPath`'s shape). Playback
+   * stops; autoplay is a setting here, never a start (`startAutoplay` starts
+   * a ready path once a session is loaded).
    * @param {object} data
    */
-  function restoreSessionState(data) {
+  function restorePath(data) {
     if (destroyed) return;
-    assertCameraPathSessionState(data);
+    assertCameraPathState(data);
     playbackController.stop({ resetCamera: false });
 
     suppressTransportReveal = true;
@@ -945,7 +1102,7 @@ export function initCinematicCamera({
         nextIndex: data.nextIndex
       });
       if (!imported) {
-        throw new TypeError('Camera Path session keyframes failed exact import.');
+        throw new TypeError('Camera Path keyframes failed exact import.');
       }
       loopBackKeyframeId = data.loopBackKeyframeId;
 
@@ -953,19 +1110,14 @@ export function initCinematicCamera({
       dom.rotationInterp.value = data.rotationMethod;
       dom.easingSelect.value = data.easing;
       dom.defaultSpeedInput.value = data.defaultSpeed;
-      dom.defaultSpeedInput.dispatchEvent(new Event('input', { bubbles: true }));
+      // Not through the slider's own event: that one is a person's step.
+      updateDefaultSpeedDisplay();
       dom.loopCheckbox.checked = data.loopPlayback;
       dom.autoplayCheckbox.checked = data.autoplay;
-      viewer.setNavigationMode(data.navigationMode);
-      syncNavigationMode(data.navigationMode);
-
-      navigation.restoreSettings(data);
 
       syncLoopBackState();
       renderKeyframeList();
       pathWasReady = isCameraPathReady(keyframeStore.getAll());
-      // The session transaction starts enabled autoplay only after every
-      // session chunk has restored successfully.
       transportBar.updateVisibility({ reveal: false });
     } finally {
       suppressTransportReveal = false;
@@ -984,6 +1136,7 @@ export function initCinematicCamera({
       }
     };
     cleanup(() => lifecycleController.abort());
+    for (const remove of unprovideActions) cleanup(remove);
     for (const frameId of renderFrameIds) {
       cleanup(() => cancelAnimationFrame(frameId));
     }
@@ -1003,6 +1156,19 @@ export function initCinematicCamera({
     }
   }
 
+  // The camera path actions are this module's while it lives; provided last,
+  // so a start that failed leaves none behind.
+  const actions = getActions();
+  const unprovideActions = [];
+  try {
+    for (const [type, handler] of Object.entries(handlers)) {
+      unprovideActions.push(actions.provide(type, handler));
+    }
+  } catch (error) {
+    for (const remove of unprovideActions) remove();
+    throw error;
+  }
+
   return {
     getKeyframeStore: () => {
       requireCinematicActive('publish its keyframe store');
@@ -1012,16 +1178,13 @@ export function initCinematicCamera({
       requireCinematicActive('publish its playback controller');
       return playbackController;
     },
-    exportSessionState,
-    capturePlaybackSnapshot,
+    exportPath,
     getNavigationMode: () => {
       requireCinematicActive('read navigation mode');
       return viewer.getNavigationMode();
     },
-    restoreSessionState,
-    restorePlaybackSnapshot,
+    restorePath,
     startAutoplay,
-    stopAutoplay,
     resetCameraPath,
     destroy
   };

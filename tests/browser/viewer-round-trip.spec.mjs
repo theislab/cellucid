@@ -9,7 +9,7 @@
  *
  * The page runs the viewer's own modules: the viewer channel
  * (`data/viewer-host-source.js`), the state, the command handler and the
- * results publisher (`app/viewer-host-results.js`).
+ * results publisher (`app/viewer-host/results.js`).
  *
  * Needs CELLUCID_PYTHON set to an interpreter that has cellucid's
  * dependencies; without it the file is skipped, as the other live-server specs
@@ -62,12 +62,15 @@ host, port = server._server.server_address
 try:
     say({"url": f"http://{host}:{port}", "viewerId": viewer._viewer_id, "viewerToken": viewer._viewer_token})
     ready = viewer.wait_for_event("ready", timeout=60)
-    # Sent at once; the viewer's answers arrive as results (this thread may
-    # wait for them: a browser-tab viewer answers on the server's threads).
-    viewer.push(adata.obs["leiden"], key="leiden_nb")
+    # Actions, sent at once; the viewer answers each request, and what they
+    # made arrives as results (this thread may wait for them: a browser-tab
+    # viewer answers on the server's threads).
+    pushed = viewer.push(adata.obs["leiden"], key="leiden_nb")
     viewer.push(pd.Series([1.5, 2.5], index=["c4", "c1"], name="score"))
-    viewer.push_gene_set("T", ["CD3E", "CD3D", "CD3E"])
-    viewer.highlight_cells(pd.Index(["c5", "c0", "c2"]), color="#00ff00", label="From Python")
+    viewer.gene_set_save(name="T", genes=["CD3E", "CD3D"])
+    highlighted = viewer.highlight_cells(cells=pd.Index(["c5", "c0", "c2"]), color="#00ff00", label="From Python")
+    pushed_outcome = pushed.result(timeout=60)
+    highlighted.result(timeout=60)
 
     def held(kind, name):
         deadline = time.monotonic() + 60
@@ -89,6 +92,8 @@ try:
         "leiden": {"cells": leiden.cells.tolist(), "values": leiden.values.tolist(), "categories": leiden.meta["categories"]},
         "score": {"cells": score.cells.tolist(), "values": plain(score.values.tolist())},
         "genes": genes.meta["genes"],
+        "pushed": {"name": pushed_outcome["name"], "kind": pushed_outcome["kind"]},
+        "step": highlighted.step,
     })
     sys.stdin.readline()
     # What the person made reaches Python as it is made (a notebook's next
@@ -137,8 +142,12 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       const { ViewerHostDataSource } = await import('/assets/js/data/viewer-host-source.js');
       const { DataState } = await import('/assets/js/app/state/core/data-state.js');
       const { createCellIdentity } = await import('/assets/js/data/cell-identity.js');
-      const { createViewerHostResults } = await import('/assets/js/app/viewer-host-results.js');
-      const { createViewerHostCommandHandlers } = await import('/assets/js/app/viewer-host-command-handler.js');
+      const { createViewerHostResults } = await import('/assets/js/app/viewer-host/results.js');
+      const { createViewerHostCommandHandlers } = await import('/assets/js/app/viewer-host/command-handler.js');
+      const { createActionDispatcher } = await import('/assets/js/app/actions/dispatcher.js');
+      const { getActionCatalog } = await import('/assets/js/app/actions/index.js');
+      const { provideHighlightActions } = await import('/assets/js/app/ui/modules/highlight/highlight-actions.js');
+      const { installFieldActions } = await import('/assets/js/app/state/actions/field-actions.js');
       // A subsample: rows 0, 1, 2, 4 and 5 of 6 are open; row 3 is not.
       const identity = createCellIdentity({ nObs: 6, kept: Uint32Array.of(0, 1, 2, 4, 5) });
       const state = new DataState({}, null);
@@ -149,9 +158,27 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       state.cellVisibilityMask = new Uint8Array(5).fill(1);
       state.obsData = { fields: [] };
       state.varData = { fields: [] };
-      // No embedding is drawn here: a label field has no centroid to place.
-      state.dimensionManager = { getRegisteredLayouts: () => [], getResidentPositions: () => null };
+      // No embedding is drawn here: a label field has no centroid to place,
+      // and the page's memory budget finds no positions held for this state.
+      state.dimensionManager = {
+        getRegisteredLayouts: () => [], getResidentPositions: () => null, unshownBytes: () => 0, trimUnshown: () => null,
+      };
+      state.cellIdentity = identity;
       state.ensureHighlightPage();
+      // This state's own actions (the page's are the app's own state's): the
+      // host's highlight, pushed columns and gene set are actions applied
+      // here, each kept as a step by a recorder that labels it as the
+      // history does.
+      const actions = createActionDispatcher({ catalog: getActionCatalog() });
+      provideHighlightActions({ state, actions });
+      installFieldActions({ state, actions });
+      let steps = 0;
+      actions.setRecorder({
+        before: token => token,
+        after: ({ definition, params }, outcome) => ({ id: `s${++steps}`, label: definition.describe(params, outcome) }),
+        failed: () => {},
+        observed: async () => null,
+      });
       const source = new ViewerHostDataSource({
         serverUrl: config.url,
         viewerId: config.viewerId,
@@ -163,17 +190,14 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       source.setShownDatasetProvider(() => 'round-trip');
       const results = createViewerHostResults({ state, viewerHostSource: source, getCellIdentity: () => identity });
       const handlers = createViewerHostCommandHandlers({
-        state,
-        viewer: {},
-        refreshUi() {},
-        reportDataMapping: async () => false,
-        getCellIdentity: () => identity,
         getShownHostDataset: () => source.getShownHostDataset(),
-        results,
         getHostLabel: () => source.getHostLabel(),
+        getHostLanguage: () => source.getHostLanguage(),
+        actions,
+        // No session is pushed in this round trip.
+        loadSession: async () => { throw new Error('No session is loaded here.'); },
       });
-      source.onHighlight(handlers.handleHighlight);
-      source.onMessage(handlers.handleMessage);
+      source.onAction(handlers.handleAction);
       source.acceptCommands();
       await source.notifyReady({ dimensions: 2 });
       await results.resync();
@@ -187,6 +211,10 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       leiden: { cells: [0, 1, 2, 4, 5], values: [0, 1, 0, 1, 0], categories: ['0', '1', '2'] },
       score: { cells: [0, 1, 2, 4, 5], values: [null, 2.5, null, 1.5, null] },
       genes: ['CD3E', 'CD3D'],
+      // Each action's request is answered: the field's outcome, the highlight's step.
+      pushed: { name: 'leiden_nb', kind: 'categorical' },
+      // One of the four steps (the actions on disjoint state may finish in any order).
+      step: { id: expect.stringMatching(/^s[1-4]$/), label: 'Highlighted 3 cells as "From Python" on page "Page 2"' },
     });
 
     // A person lassos two cells and labels the open cells.

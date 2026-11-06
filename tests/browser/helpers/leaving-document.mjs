@@ -7,7 +7,8 @@
  * failure of that document, in its own wording ("Cannot load <url> due to
  * access control checks.", "Fetch API cannot load <url> due to access control
  * checks.", "Importing a module script failed."), and Playwright's WebKit
- * passes the fetch's as a page error even where the page caught it. Chromium
+ * passes the fetch's, and a read of a file through a blob, as a page error
+ * even where the page caught it. Chromium
  * and Firefox say nothing. They are not errors of the page: a person may
  * leave a page at any moment, and it was the test that left.
  *
@@ -63,6 +64,24 @@ async function leaveDocument(page, navigation) {
   }
 }
 
+/**
+ * What a page error says: its message, and the first line of its stack.
+ * Playwright's WebKit takes the text before a sentence's first colon for
+ * the error's name and drops two characters after it, so a stopped load of
+ * a `blob:` address ("Cannot load blob:http://… due to access control
+ * checks.") arrives with the name "Cannot load blob" and the message
+ * "ttp://… due to access control checks.", which no wording above matches;
+ * the stack's first line is the sentence as WebKit said it. A page left
+ * while its Stored listing read a kept file through a blob reported so
+ * (`kept-gene-index.spec.mjs`, WebKit, 3 of 120 runs with one worker, on
+ * main as well; 1,169 reports from 40 navigations of a page that reads such
+ * files, each a page error).
+ */
+function saidBy(error) {
+  const first = typeof error?.stack === 'string' ? error.stack.split('\n', 1)[0] : null;
+  return first === null ? [error.message] : [error.message, first];
+}
+
 function stoppedByLeaving(page, text) {
   return leaving.has(page) && STOPPED_BY_LEAVING.some(pattern => pattern.test(text));
 }
@@ -83,7 +102,7 @@ function preparePage(page) {
   const emit = page.emit.bind(page);
   page.emit = (event, ...args) => {
     if (event === 'console' && args[0].type() === 'error' && stoppedByLeaving(page, args[0].text())) return false;
-    if (event === 'pageerror' && stoppedByLeaving(page, args[0].message)) return false;
+    if (event === 'pageerror' && saidBy(args[0]).some(text => stoppedByLeaving(page, text))) return false;
     return emit(event, ...args);
   };
 }

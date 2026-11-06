@@ -1,0 +1,25 @@
+{
+  "examples": [
+    {
+      "theme": "light"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "theme": {
+        "enum": [
+          "light",
+          "dark"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "theme"
+    ],
+    "type": "object"
+  },
+  "type": "layout.theme.set",
+  "version": 1
+}

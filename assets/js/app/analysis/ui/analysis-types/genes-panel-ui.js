@@ -29,6 +29,8 @@ import { DEFAULTS } from '../../genes-panel/constants.js';
 import { MARKER_OPTIONS } from '../../options/marker-options.js';
 import { defineOptions } from '../../options/option-schema.js';
 import { renderOptionsForm } from '../../options/render-options-form.js';
+import { HEATMAP_VIEW_CHOICES, HEATMAP_VIEW_KEYS, HEATMAP_VIEW_SWITCHES, MARKER_SHOW_CHOICES } from '../../options/analysis-views.js';
+import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
 import { countGeneFamilies, formatGmt, geneIdentities } from '../../shared/gene-sets.js';
 import { createSegmented } from '../../../ui/components/controls.js';
 import {
@@ -59,7 +61,6 @@ const METHOD_NAMES = Object.freeze({
   ttest_overestim_var: 't-test (overestimated variance)'
 });
 const CORRECTION_NAMES = Object.freeze({ bh: 'BH', bonferroni: 'Bonferroni' });
-const SHOW_CHOICES = Object.freeze(['list', 'heatmap', 'clustered']);
 
 /** The display options, as their own small form for the expanded view. */
 const DISPLAY_OPTIONS = defineOptions({
@@ -104,6 +105,10 @@ export function describeSkippedGroups(metadata, minCells) {
       `Read genes for more cells (${GENES_READ_PLACE}), then run again to test them on more cells.`;
   return { text, title };
 }
+
+
+/** A finite number, or null (JSON has no NaN). */
+const finiteOrNull = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
 
 export class GenesPanelUI extends FormBasedAnalysisUI {
   static getRequirements() {
@@ -217,7 +222,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _groupKey(record) {
     const revision = record.cells === 'all'
       ? ''
-      : record.cells === 'visible' ? `v${this._visibleCellsDigest()}` : this._highlightRevision;
+      : record.cells === 'visible' ? `v${this._visibleCellsRevision()}` : this._highlightRevision;
     return `${record.groupBy}|${record.cells}|${revision}`;
   }
 
@@ -231,7 +236,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (this._groupState.key === key && this._groupState.error != null) return;
     this._groupState = { key, described: null, pending: key };
     const controller = this._ensureController();
-    void Promise.resolve()
+    this._groupRead = Promise.resolve()
       .then(() => controller.describeGroups(record.groupBy, controller.scopeOf(record.cells)))
       .then(described => {
         if (this._isDestroyed || this._groupState.pending !== key) return;
@@ -253,6 +258,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _handleOptionsChanged(key) {
     if (this._groupState.error != null) this._groupState = { key: null, described: null, pending: null };
     super._handleOptionsChanged(key);
+  }
+
+  /** @override */
+  _runInputsRead() {
+    return this._groupState.pending === null ? null : this._groupRead;
   }
 
   _getRunBlocker(options) {
@@ -496,6 +506,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       value: this._show,
       onChange: next => {
         this._show = next;
+        this._recordPersonChange('view', { view: { show: next } });
         this._trackInteractiveTask(this._redrawForDisplay(), 'Marker genes view');
       }
     });
@@ -574,14 +585,9 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** Show every tested gene ranked by score: the filters that hid them relaxed. */
   _relaxFilters() {
-    this._setOptions({
-      ...this._options,
-      direction: 'both',
-      maxAdjP: 1,
-      minLog2FC: 0,
-      minPctIn: 0,
-      maxPctRef: 100
-    });
+    const before = this._requireOptions();
+    this._setOptions({ ...this._options, direction: 'both', maxAdjP: 1, minLog2FC: 0, minPctIn: 0, maxPctRef: 100 });
+    this._recordOptionsChange(before);
   }
 
   // ===========================================================================
@@ -591,17 +597,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   async _renderModalPlot(container, { isCurrent = () => true, modal = this._modal, result = this._lastResult } = {}) {
     if (!result) return null;
     const slot = this._ensureModalPlotSlot(modal);
-    if (result.data.matrix === null) {
-      return slot.render({
-        render: candidate => {
-          const empty = candidate.ownerDocument.createElement('p');
-          empty.className = 'empty-state';
-          empty.textContent = 'No genes pass the filters.';
-          candidate.replaceChildren(empty);
-          return null;
-        }
-      }, { isCurrent });
-    }
+    // The heatmap draws a result with no matrix as its empty state itself.
     await import('../../plots/types/gene-heatmap.js');
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) throw new RangeError(`Unknown plot type: ${result.plotType}`);
@@ -621,9 +617,12 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       value: markerDisplayOf(this._options),
       context: {},
       onChange: (record, key) => {
+        const before = this._requireOptions();
         this._options = { ...this._options, ...record };
         this._optionsForm?.setValue(this._options);
         this._handleOptionsChanged(key);
+        // The display options are the analysis's options: a step, as in the panel.
+        this._recordOptionsChange(before);
       }
     });
     form.root.classList.add('marker-modal-display');
@@ -632,13 +631,20 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** Heatmap options; clustering ones re-cluster, the rest re-draw. */
   _handlePlotOptionChange(key, value) {
-    if (['transform', 'colorscale', 'clusterRows', 'clusterCols', 'distance', 'linkage'].includes(key)) {
-      this._heatmap = { ...this._heatmap, [key]: value };
-    }
+    // Every other plot option is recorded as the expanded view's `plot` (the base).
+    if (!HEATMAP_VIEW_KEYS.includes(key)) return super._handlePlotOptionChange(key, value);
+    const task = this._applyPlotOptionChange(key, value);
+    // The heatmap's look is part of how the result is shown: a step (`analysis.view.set`).
+    this._recordPersonChange('view', { view: { heatmap: { [key]: value } } });
+    return task;
+  }
+
+  _applyPlotOptionChange(key, value) {
+    if (HEATMAP_VIEW_KEYS.includes(key)) this._heatmap = { ...this._heatmap, [key]: value };
     if (['transform', 'clusterRows', 'clusterCols', 'distance', 'linkage'].includes(key)) {
       return this._trackInteractiveTask(this._redrawForDisplay(), 'Marker heatmap update');
     }
-    return super._handlePlotOptionChange(key, value);
+    return super._applyPlotOptionChange(key, value);
   }
 
   _renderModalStats(container) {
@@ -679,9 +685,10 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const { stats } = result;
     const testedGroups = stats.groups.filter(group => group.tested);
     if (testedGroups.length === 0) return;
-    if (!testedGroups.some(group => group.groupId === this._selectedGroupId)) {
-      this._selectedGroupId = testedGroups[0].groupId;
-    }
+    // The group listed: the one chosen, else the first tested (drawing it chooses nothing).
+    const listedId = testedGroups.some(group => group.groupId === this._selectedGroupId)
+      ? this._selectedGroupId
+      : testedGroups[0].groupId;
     const header = document.createElement('div');
     header.className = 'de-modal-genes-header';
     const groupSelect = document.createElement('select');
@@ -691,15 +698,16 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       const option = document.createElement('option');
       option.value = group.groupId;
       option.textContent = String(group.groupName);
-      option.selected = group.groupId === this._selectedGroupId;
+      option.selected = group.groupId === listedId;
       groupSelect.appendChild(option);
     }
     groupSelect.addEventListener('change', () => {
       this._selectedGroupId = groupSelect.value;
+      this._recordPersonChange('view', { view: { group: this._groupNameOf(groupSelect.value) } });
       this._renderModalAnnotations(container);
     });
     header.appendChild(groupSelect);
-    const groupIndex = stats.groups.findIndex(group => group.groupId === this._selectedGroupId);
+    const groupIndex = stats.groups.findIndex(group => group.groupId === listedId);
     const order = rankGroupGenes(stats, groupIndex, markerDisplayOf(this._options));
     const shown = Array.from(order.subarray(0, Math.min(order.length, this._options.topN)));
 
@@ -721,7 +729,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     gmt.className = 'analysis-link-btn';
     gmt.textContent = 'GMT';
     gmt.title = 'The shown markers of each group as gene sets';
-    gmt.addEventListener('click', () => this._exportGMT());
+    gmt.addEventListener('click', () => this._trackInteractiveTask(this._exportGMT(), 'GMT export'));
     header.append(copy, allCsv, gmt);
     container.appendChild(header);
 
@@ -833,7 +841,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
   /** Every gene of every group (long), written by the analysis workers. */
   async _exportAllGenesCSV() {
-    if (this._refuseStaleExport('CSV')) return;
+    if (await this._refuseStaleExport('CSV')) return;
     const stats = this._lastResult?.stats;
     if (!stats) return;
     try {
@@ -870,8 +878,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   }
 
   /** The shown markers of each group as a GMT file. */
-  _exportGMT() {
-    if (this._refuseStaleExport('GMT')) return;
+  async _exportGMT() {
+    if (await this._refuseStaleExport('GMT')) return;
     const sets = this.getMarkerGeneSets();
     // Genes leave by their identifier (the var index), as every boundary names them.
     const { idOf } = geneIdentities(this.dataLayer.state?.varData);
@@ -983,7 +991,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (keys !== 'heatmap,selectedGroupId,show') {
       throw new TypeError('Marker genes view must hold exactly show, selectedGroupId and heatmap');
     }
-    if (!SHOW_CHOICES.includes(view.show)) throw new TypeError(`Marker genes view show "${view.show}" is unknown`);
+    if (!MARKER_SHOW_CHOICES.includes(view.show)) throw new TypeError(`Marker genes view show "${view.show}" is unknown`);
     if (view.selectedGroupId !== null && typeof view.selectedGroupId !== 'string') {
       throw new TypeError('Marker genes view selectedGroupId must be a string or null');
     }
@@ -999,11 +1007,106 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     this._heatmap = { ...heatmap };
   }
 
+  /** A group of the result by its id, named as the result names it (null when there is none). */
+  _groupNameOf(groupId) {
+    if (groupId === null) return null;
+    const group = this._lastResult?.stats?.groups?.find(candidate => candidate.groupId === groupId);
+    return group === undefined ? null : String(group.groupName);
+  }
+
+  /** What the result shows, by name: list or heatmap, the group listed, the heatmap's look. @override */
+  _viewParams() {
+    return { show: this._show, group: this._groupNameOf(this._selectedGroupId), heatmap: { ...this._heatmap } };
+  }
+
+  /** @override */
+  _prepareViewParams(rest) {
+    for (const key of Object.keys(rest)) {
+      if (!['show', 'group', 'heatmap'].includes(key)) {
+        throw new TypeError(`Marker genes has no view "${key}"; it takes "more", "groups", "plot", "show", "group" and "heatmap".`);
+      }
+    }
+    if (rest.show !== undefined && !MARKER_SHOW_CHOICES.includes(rest.show)) {
+      throw namedError(RangeError, `Marker genes shows ${listNames(MARKER_SHOW_CHOICES)}, not ${quoteName(rest.show)}.`);
+    }
+    let groupId;
+    if (rest.group !== undefined && rest.group !== null) {
+      const tested = this._lastResult?.stats?.groups?.filter(group => group.tested) ?? null;
+      if (tested === null) throw new RangeError('Marker genes has no result yet: run it, then choose the group its table lists.');
+      const match = tested.find(group => String(group.groupName) === rest.group);
+      if (match === undefined) {
+        throw namedError(RangeError, `There is no tested group ${quoteName(rest.group)} in the marker genes result; its groups are ${listNames(tested.map(group => String(group.groupName)))}.`);
+      }
+      groupId = match.groupId;
+    } else if (rest.group === null) {
+      groupId = null;
+    }
+    if (rest.heatmap !== undefined) {
+      for (const [key, value] of Object.entries(rest.heatmap)) {
+        if (HEATMAP_VIEW_SWITCHES.includes(key)) {
+          if (typeof value !== 'boolean') throw new TypeError(`The marker heatmap's "${key}" is true or false.`);
+        } else if (Object.hasOwn(HEATMAP_VIEW_CHOICES, key)) {
+          if (!HEATMAP_VIEW_CHOICES[key].includes(value)) {
+            throw namedError(RangeError, `The marker heatmap's ${key} is one of ${listNames(HEATMAP_VIEW_CHOICES[key])}, not ${quoteName(value)}.`);
+          }
+        } else {
+          throw namedError(TypeError, `The marker heatmap has no ${quoteName(key)}; it takes ${listNames(HEATMAP_VIEW_KEYS)}.`);
+        }
+      }
+    }
+    return () => {
+      let changed = false;
+      let redraw = false;
+      if (rest.show !== undefined && rest.show !== this._show) {
+        this._show = rest.show;
+        changed = redraw = true;
+      }
+      if (rest.group !== undefined && groupId !== this._selectedGroupId) {
+        this._selectedGroupId = groupId;
+        changed = true;
+        if (this._modal?._annotationsContent) this._renderModalAnnotations(this._modal._annotationsContent);
+      }
+      if (rest.heatmap !== undefined) {
+        const next = { ...this._heatmap, ...rest.heatmap };
+        if (JSON.stringify(next) !== JSON.stringify(this._heatmap)) {
+          this._heatmap = next;
+          changed = redraw = true;
+        }
+      }
+      if (redraw) void this._trackInteractiveTask(this._redrawForDisplay(), 'Marker genes view');
+      return changed;
+    };
+  }
+
   /**
    * The shown result for a session: the run's full statistics (typed
    * columns), its groups named by category value, and its metadata. The
    * shown markers, heatmap and clustering are rebuilt from them.
    */
+  /**
+   * The top `top` markers of each group, as an agent reads the result
+   * (`describeResult`).
+   * @override
+   */
+  _resultTable(result, top) {
+    const groups = result?.selection?.groups ?? [];
+    const rows = [];
+    let total = 0;
+    for (const { group, markers } of groups) {
+      total += markers.length;
+      for (const marker of markers.slice(0, top)) {
+        rows.push([String(group.groupName), marker.rank, marker.gene, finiteOrNull(marker.score),
+          finiteOrNull(marker.log2FoldChange), finiteOrNull(marker.adjustedPValue),
+          finiteOrNull(marker.percentInGroup), finiteOrNull(marker.percentOutGroup), finiteOrNull(marker.auroc)]);
+      }
+    }
+    return {
+      columns: ['group', 'rank', 'gene', 'score', 'log2_fold_change', 'p_adjusted', 'percent_in_group', 'percent_rest', 'auroc'],
+      rows,
+      total
+    };
+  }
+
   _exportResult() {
     const result = this._lastResult;
     if (!result?.stats) return null;
@@ -1052,7 +1155,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     }
     await requireDatasetGenes(this.dataLayer, stats.genes, 'The marker genes result', metadata.matrix);
     const result = await this._buildResult(stats, metadata, this._requireOptions());
-    await this._restoreAnalysisResult(result);
+    await this._restoreAnalysisResult(result, envelope.provenance);
   }
 
   // ===========================================================================

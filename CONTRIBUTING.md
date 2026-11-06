@@ -136,9 +136,12 @@ High-level map:
 - `cellucid/index.html`: app shell (sidebar DOM + canvas + boot scripts)
 - `cellucid/assets/js/app/`: app layer (state + UI + sessions + analysis)
   - `app/main.js`: bootstrap orchestrator
-  - `app/state/`: `DataState` + managers (fields/filters/colors/highlights/views)
+  - `app/state/`: `DataState` + managers (fields/filters/colors/highlights/views); `app/state/domains/`: the state domains (what a step captures and puts back)
+  - `app/actions/`: the action catalogue and dispatcher: every change a control, an agent or a Python/R host makes is one action (see `app/actions/README.md` before adding a control)
+  - `app/history/`: the action history (trackers, steps, undo/redo, the autosave in this browser, pseudocode/methods/report)
   - `app/ui/`: UI coordinator + sidebar modules
-  - `app/session/`: `.cellucid-session` save/load bundles
+  - `app/session/`: `.cellucid-session` files (session format 4: the history)
+  - `app/library/`: My datasets and the kept handles of local files
   - `app/ui/modules/figure-export/`: figure export
   - `app/community-annotations/`: GitHub-backed community annotation sync/auth
 - `cellucid/assets/js/data/`: data sources + loaders (AnnData `.h5ad`/Zarr/`.zarr.zip` files, links and catalogs, `cellucid serve`, Jupyter)
@@ -192,7 +195,7 @@ node scripts/validate-tokens.js
 
 Node.js 22.15 or newer is required (`package.json` sets `engines.node`): the
 Zstandard contracts compress their inputs with `node:zlib`'s Zstandard encoder,
-which Node.js 20 does not have. Install the exact dependencies once, then run
+which earlier releases do not have. CI runs Node.js 22, 24 and 26. Install the exact dependencies once, then run
 the suites:
 
 ```bash
@@ -307,7 +310,7 @@ surface. Run through this checklist for any change a user can see:
 - apply filters and confirm visibility updates
 - create highlights and switch highlight pages
 - create a snapshot view (“Keep view”) and confirm multiview works
-- save and load a `.cellucid-session`
+- undo and redo a few steps in **State › History**, and save and load a `.cellucid-session`
 - run at least one analysis plot
 - export a PNG and an SVG
 

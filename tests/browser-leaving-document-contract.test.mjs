@@ -115,6 +115,45 @@ test('a navigation from a document sets aside only the stopped-load wordings, on
   ]);
 });
 
+test('a stopped read of a file through a blob is set aside by the sentence WebKit said, whatever Playwright made of its name', async () => {
+  // Playwright's WebKit splits the sentence at its first colon, the one of
+  // `blob:`: the name "Cannot load blob", the message without its first two
+  // characters, the whole sentence on the stack's first line.
+  const sentence = 'Cannot load blob:http://127.0.0.1:4173/342644d1-5742-4486-bd86-361276286fe0 due to access control checks.';
+  const asPassed = () => {
+    const error = new Error('ttp://127.0.0.1:4173/342644d1-5742-4486-bd86-361276286fe0 due to access control checks.');
+    error.name = 'Cannot load blob';
+    error.stack = `${sentence}\n    at lastUsedOf (http://127.0.0.1:4173/assets/js/data/anndata/transcode/space.js:384:94)`;
+    return error;
+  };
+  // A real error whose stack begins with a sentence that is none of the wordings, or with none at all.
+  const real = () => {
+    const error = new Error('ttp://127.0.0.1:4173/x is not a function');
+    error.stack = `TypeError: http://127.0.0.1:4173/x is not a function\n    at run (http://127.0.0.1:4173/a.js:1:1)`;
+    return error;
+  };
+  const bare = () => {
+    const error = new Error('a real failure');
+    error.stack = undefined;
+    return error;
+  };
+  const context = new FakeContext([new FakePage('http://127.0.0.1:4173/')]);
+  setAsideLeavingReports(context);
+  const [page] = context.pages();
+  const errors = heard(page);
+  page.during = leaving => {
+    leaving.emit('pageerror', asPassed());
+    leaving.emit('pageerror', real());
+    leaving.emit('pageerror', bare());
+  };
+  await page.goto('http://127.0.0.1:4173/?later');
+  assert.deepEqual(errors, ['page: ttp://127.0.0.1:4173/x is not a function', 'page: a real failure']);
+  // After the navigation returned, the same report is the page's error.
+  errors.length = 0;
+  page.emit('pageerror', asPassed());
+  assert.equal(errors.length, 1);
+});
+
 test('a first navigation, from about:blank, leaves nothing and sets nothing aside', async () => {
   const context = new FakeContext();
   setAsideLeavingReports(context);

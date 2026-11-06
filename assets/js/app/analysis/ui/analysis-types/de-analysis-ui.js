@@ -55,6 +55,10 @@ const DISPLAY_OPTIONS = defineOptions({
     .map(entry => ({ ...entry, group: 'essentials' }))
 });
 
+
+/** A finite number, or null (JSON has no NaN). */
+const finiteOrNull = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
 export class DEAnalysisUI extends FormBasedAnalysisUI {
   static getRequirements() {
     return {
@@ -71,6 +75,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     this._plotContainerIdBase = this._instanceId ? `${this._instanceId}-de-analysis-plot` : 'de-analysis-plot';
     /** Category groups of the fields A/B and Within read (by field). */
     this._fieldGroups = new Map();
+    /** The reads of a field's categories under way. */
+    this._fieldReads = new Set();
     /** Fields whose categories could not be read, with the error. */
     this._fieldGroupFailures = new Map();
     /** The last `_resolveGroups` answer and what it was resolved from. */
@@ -127,7 +133,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     if (!this._pendingFields.has(field) && !this._fieldGroupFailures.has(field)) {
       this._pendingFields.add(field);
       const cells = this._openCells();
-      void this._helperController().describeGroups(field, null).then(value => {
+      const read = this._helperController().describeGroups(field, null).then(value => {
         // Described for cells no longer open: read again when next asked for.
         if (this._isDestroyed || cells !== this._openCells()) return;
         this._pendingFields.delete(field);
@@ -139,9 +145,15 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         this._fieldGroupFailures.set(field, error);
         this._notifications.error(`Differential expression groups: ${failureText(error)}`, { category: 'analysis' });
         this._refreshOptionsContext();
-      });
+      }).finally(() => this._fieldReads.delete(read));
+      this._fieldReads.add(read);
     }
     return [];
+  }
+
+  /** @override */
+  _runInputsRead() {
+    return this._fieldReads.size === 0 ? null : Promise.all(this._fieldReads);
   }
 
   /**
@@ -239,7 +251,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       options.categoriesA, options.categoriesB,
       options.within, options.withinField, options.withinCategories,
       this._highlightRevision,
-      options.within === 'visible' ? this._visibleCellsDigest() : null,
+      options.within === 'visible' ? this._visibleCellsRevision() : null,
     ]);
     // What the fields it reads hold: their categories, or why they have none.
     const field = this._fieldGroups.get(options.field) ?? this._fieldGroupFailures.get(options.field);
@@ -360,9 +372,11 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     swap.textContent = 'Swap A and B';
     swap.addEventListener('click', () => {
       const options = this._options;
+      const before = this._requireOptions();
       this._setOptions(options.compare === 'pages'
         ? { ...options, pageA: options.pageB, pageB: options.pageA }
         : { ...options, categoriesA: options.categoriesB, categoriesB: options.categoriesA });
+      this._recordOptionsChange(before);
     });
     essentials.appendChild(swap);
   }
@@ -515,9 +529,12 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       value: Object.fromEntries(DE_DISPLAY_KEYS.map(key => [key, this._options[key]])),
       context: {},
       onChange: (record, key) => {
+        const before = this._requireOptions();
         this._options = { ...this._options, ...record };
         this._optionsForm?.setValue(this._options);
         this._handleOptionsChanged(key);
+        // The display options are the analysis's options: a step, as in the panel.
+        this._recordOptionsChange(before);
       }
     });
     container.prepend(form.root);
@@ -655,6 +672,25 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   // Sessions
   // ===========================================================================
 
+  /**
+   * The genes most up in group A, then the most up in group B (top `top`
+   * each), as an agent reads the result (`describeResult`).
+   * @override
+   */
+  _resultTable(result, top) {
+    const rows = [...(result?.full?.results ?? [])].filter(row => Number.isFinite(row.score));
+    rows.sort((a, b) => b.score - a.score);
+    const row = (entry, direction) => [direction, entry.gene, finiteOrNull(entry.score), finiteOrNull(entry.log2FoldChange),
+      finiteOrNull(entry.adjustedPValue), finiteOrNull(entry.pctA), finiteOrNull(entry.pctB), finiteOrNull(entry.auroc)];
+    const up = rows.slice(0, top).filter(entry => entry.score > 0);
+    const down = rows.slice(-top).reverse().filter(entry => entry.score < 0);
+    return {
+      columns: ['higher_in', 'gene', 'score', 'log2_fold_change', 'p_adjusted', 'percent_a', 'percent_b', 'auroc'],
+      rows: [...up.map(entry => row(entry, 'A')), ...down.map(entry => row(entry, 'B'))],
+      total: rows.length
+    };
+  }
+
   _exportResult() {
     const full = this._lastResult?.full;
     if (!full) return null;
@@ -679,7 +715,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     await requireDatasetGenes(
       this.dataLayer, full.results.map(row => row?.gene), 'The differential expression result', full.summary.matrix
     );
-    await this._restoreAnalysisResult(this._buildResult(full, this._requireOptions()));
+    await this._restoreAnalysisResult(this._buildResult(full, this._requireOptions()), envelope.provenance);
   }
 
   destroy() {

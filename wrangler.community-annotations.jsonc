@@ -3,6 +3,7 @@
   "main": "assets/js/app/community-annotations/_worker-code.js",
   "compatibility_date": "2026-07-25",
   "compatibility_flags": ["enable_request_signal"],
-  "workers_dev": true,
+  "workers_dev": false,
+  "routes": [{ "pattern": "api.cellucid.com", "custom_domain": true }],
   "preview_urls": false
 }

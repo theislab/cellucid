@@ -1,0 +1,59 @@
+{
+  "examples": [
+    {
+      "categorical": [
+        "x"
+      ],
+      "continuous": [
+        "x"
+      ],
+      "in": "panel"
+    },
+    {
+      "categorical": [
+        "x"
+      ],
+      "continuous": [
+        "x"
+      ],
+      "in": "panel"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "categorical": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array",
+        "uniqueItems": true
+      },
+      "continuous": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array",
+        "uniqueItems": true
+      },
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "type": "analysis.quick.set",
+  "version": 1
+}

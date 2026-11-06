@@ -9,6 +9,12 @@ import {
   initGeneExpressionSelector,
 } from '../../assets/js/app/ui/modules/field-selector-gene-expression.js';
 import { FieldSource } from '../../assets/js/app/utils/field-constants.js';
+import { getActions } from '../../assets/js/app/actions/index.js';
+import { abortReason, cancelled, onAbort } from '../../assets/js/utils/abort.js';
+import { resolveField } from '../../assets/js/app/actions/targets/fields.js';
+
+/** The `color.by` implementation of the selector mounted last (the field selector's, for a gene). */
+let removeColorBy = null;
 
 /* ---------------------------------------------------------------------------
    Minimal exact DOM stand-in.
@@ -286,8 +292,11 @@ export function mountGeneSelector(varFields, {
       if (onLoad === null) throw new Error('not exercised');
       const answer = onLoad(index, options);
       // Held pending unless answered: a test may assert only which gene was
-      // chosen, not the load.
-      return answer instanceof Promise ? answer : new Promise(() => {});
+      // chosen, not the load. Like every load, it ends when its signal aborts
+      // (a newer choice, the action superseded).
+      return answer instanceof Promise
+        ? answer
+        : new Promise((_resolve, reject) => onAbort(options.signal, () => reject(abortReason(options.signal))));
     },
     getDatasetGeneration: generation,
     // The gene list of a dataset just shown is read after its first view
@@ -318,12 +327,23 @@ export function mountGeneSelector(varFields, {
     },
     ...stateOverrides,
   };
+  // As the field interaction owner: the latest choice is current, and the
+  // action's signal, aborted, supersedes it.
+  let current = null;
   const interactionOwner = ownerOverride ?? {
-    assertCurrent() {},
-    isCurrent: () => true,
+    assertCurrent(token) {
+      if (token !== current || token.signal.aborted) throw cancelled('superseded', 'Field interaction was superseded by a newer intent.');
+    },
+    isCurrent: token => token === current && !token.signal.aborted,
     isSuspended: () => false,
     retirementOf: () => null,
-    run: worker => worker({ signal: new AbortController().signal }),
+    run: (worker, { signal = null } = {}) => {
+      const controller = new AbortController();
+      onAbort(signal, () => controller.abort(cancelled('superseded', 'Field interaction was superseded by a newer intent.')));
+      const token = { signal: controller.signal };
+      current = token;
+      return worker(token);
+    },
     suspensionReason: () => null,
     track() {},
   };
@@ -341,7 +361,17 @@ export function mountGeneSelector(varFields, {
       onActivateField: async () => null,
       onAdoptDatasetGeneration: () => state.getDatasetGeneration(),
       onChooseGeneNames() { chooseGeneNames.count++; },
+      onDuplicateField() {},
+      onClearColoring() {},
     },
+  });
+  // A gene chosen here is the action color.by, implemented as the field
+  // selector implements it for a gene: the gene by name, then this choice.
+  removeColorBy?.();
+  removeColorBy = getActions().provide('color.by', async ({ field }, { signal }) => {
+    if (field === null) return null;
+    const info = await api.selectGene(resolveField(state, field).index, { signal });
+    return info === null ? null : { field: field.key, source: field.source, kind: 'continuous' };
   });
   api.initGeneExpressionDropdown();
   return { api, dom, obsDom, listing, chooseGeneNames, state, shown };

@@ -23,6 +23,7 @@ import { closeContextWithApplicationRetirement, expect, test } from './helpers/t
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -107,7 +108,7 @@ async function highlightAndSave(page, testInfo, name) {
   });
   const picked = await highlightedOriginals(page);
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   // A save that fails says so at once; the test says why instead of waiting.
   const failed = page.waitForFunction(() => window.__publishedNotifications.some(node => /Failed to save/.test(node.textContent)), null, { timeout: 0 })
     .then(() => { throw new Error('Saving the session failed (see the console).'); });
@@ -130,7 +131,7 @@ function highlightedOriginals(page) {
 async function loadAndExpectRestored(page, bytes, cells, picked) {
   await openCollapsedPanels(page);
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles({ name: 'grown.cellucid-session', mimeType: 'application/octet-stream', buffer: bytes });
   await expect.poll(() => messages(page), { timeout: 120_000 }).toContain(RESTORED);
   expect((await messages(page)).filter(text => /not the one this session was saved on/.test(text))).toEqual([]);

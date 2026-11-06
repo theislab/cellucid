@@ -228,9 +228,9 @@ test('a recolour of an ordered live store holds the new colours in draw order', 
     const gl = viewer.getGLContext();
     const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
     viewer.setAdaptiveLOD(true);
-    for (let i = 0; i < 240 && renderer._liveOrder === null; i++) {
-      await frame();
-    }
+    // The tree is built in a worker and its order adopted over frames: as
+    // long as the machine takes (240 frames were four seconds).
+    while (renderer._liveOrder === null) await frame();
     const record = renderer._liveOrder;
     if (record === null) return { ordered: false };
     const count = renderer.pointCount;

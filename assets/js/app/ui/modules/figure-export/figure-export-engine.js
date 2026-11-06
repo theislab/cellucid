@@ -717,7 +717,18 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     }
   }
 
-  async function runExport(options, jobs) {
+  /**
+   * Snapshot the views and render one file per job: the one renderer behind
+   * a download (`runExport`) and a picture returned to its caller
+   * (`renderFigure`). `viewId` draws that view instead of the active one
+   * (never a grid); `progress` hears the rendering start, after the
+   * snapshot, and each job.
+   *
+   * @param {object} options An exact request (`assertFigureExportSingleRequest` / `…BatchRequest`)
+   * @param {Array<{format: FigureExportFormat, dpi: number|null}>} jobs
+   * @param {{viewId?: string|null, progress?: {start: () => void, job: (index: number, format: string) => void}|null}} [how]
+   */
+  async function renderStaged(options, jobs, { viewId: requestedViewId = null, progress = null } = {}) {
     const signal = options.signal;
     throwIfFigureExportAborted(signal);
     const width = options.width;
@@ -750,7 +761,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     throwIfFigureExportAborted(signal);
     const activeViewId = state.getActiveViewId();
     throwIfFigureExportAborted(signal);
-    const viewId = assertFigureExportViewId(activeViewId);
+    const viewId = assertFigureExportViewId(requestedViewId ?? activeViewId);
     const liveViewLabel = viewer.getLiveViewLabel();
     throwIfFigureExportAborted(signal);
     assertFigureExportViewId(liveViewLabel, 'Figure export live view label');
@@ -784,7 +795,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
 
     const viewLayout = viewer.getViewLayout();
     throwIfFigureExportAborted(signal);
-    const wantsGrid = exportAllViews && viewLayout.mode === 'grid';
+    const wantsGrid = requestedViewId === null && exportAllViews && viewLayout.mode === 'grid';
 
     const views = wantsGrid
       ? [
@@ -888,7 +899,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     throwIfFigureExportAborted(signal);
     if (
       finalDatasetGeneration !== datasetGeneration ||
-      finalViewId !== viewId ||
+      finalViewId !== activeViewId ||
       finalStatePointCount !== finalViewerPointCount
     ) {
       throw new Error(
@@ -947,111 +958,128 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     };
 
     throwIfFigureExportAborted(signal);
+    progress?.start();
+    const ts = formatTimestampForFilename();
+    const needsMultiplePng = jobs.filter((j) => j.format === 'png').length > 1;
+    const fileViewLabel = wantsGrid ? 'multiview' : views[0].label;
+
+    /** @type {{ renderFigureToSvgBlob?: Function } | null} */
+    let svgRenderer = null;
+    /** @type {{ renderFigureToPngBlob?: Function } | null} */
+    let pngRenderer = null;
+    /** @type {{ blob: Blob; filename: string; result: { format: FigureExportFormat; filename: string; metadata: any } }[]} */
+    const staged = [];
+
+    for (let idx = 0; idx < jobs.length; idx++) {
+      const job = jobs[idx];
+      const format = job.format;
+      const dpi = job.dpi;
+      progress?.job(idx, format);
+
+      const payload = {
+        ...payloadBase,
+        format,
+        dpi,
+        options: createFigureExportPayloadOptions(options, format),
+      };
+      assertFigureExportPayload(payload);
+      throwIfFigureExportAborted(signal);
+
+      if (format === 'svg') {
+        if (!svgRenderer) {
+          svgRenderer = await awaitFigureExportAbortable(
+            signal,
+            loadAppCode(() => import('./renderers/svg-renderer.js'))
+          );
+          throwIfFigureExportAborted(signal);
+        }
+        const blob = await awaitFigureExportAbortable(
+          signal,
+          svgRenderer.renderFigureToSvgBlob({ payload, signal })
+        );
+        throwIfFigureExportAborted(signal);
+        if (!(blob instanceof Blob) || blob.type !== 'image/svg+xml') {
+          throw new TypeError(
+            'SVG renderer must publish exactly one image/svg+xml Blob.'
+          );
+        }
+        const filename = buildExportFilename({
+          datasetName,
+          fieldKey: filenameFieldKey,
+          viewLabel: fileViewLabel,
+          variant: null,
+          ext: 'svg',
+          timestamp: ts
+        });
+        staged.push({
+          blob,
+          filename,
+          result: { format: 'svg', filename, metadata: payloadBase.meta },
+        });
+      } else {
+        if (!pngRenderer) {
+          pngRenderer = await awaitFigureExportAbortable(
+            signal,
+            loadAppCode(() => import('./renderers/png-renderer.js'))
+          );
+          throwIfFigureExportAborted(signal);
+        }
+        const blob = await awaitFigureExportAbortable(
+          signal,
+          pngRenderer.renderFigureToPngBlob({ payload, signal })
+        );
+        throwIfFigureExportAborted(signal);
+        if (!(blob instanceof Blob) || blob.type !== 'image/png') {
+          throw new TypeError(
+            'PNG renderer must publish exactly one image/png Blob.'
+          );
+        }
+        const variant = needsMultiplePng ? `dpi${dpi}` : null;
+        const filename = buildExportFilename({
+          datasetName,
+          fieldKey: filenameFieldKey,
+          viewLabel: fileViewLabel,
+          variant,
+          ext: 'png',
+          timestamp: ts
+        });
+        staged.push({
+          blob,
+          filename,
+          result: { format: 'png', filename, metadata: payloadBase.meta },
+        });
+      }
+    }
+    return { staged, datasetName, filenameFieldKey, viewLabel: fileViewLabel, timestamp: ts };
+  }
+
+  /** Render the jobs and download them: one file, or several in one ZIP archive. */
+  async function runExport(options, jobs) {
+    const signal = options.signal;
     const notifications = getNotificationCenter();
     const countLabel = jobs.length === 1
       ? jobs[0].format.toUpperCase()
       : `${formatCountOf(jobs.length, 'export')}`;
-    const notifId = notifications.startCalculation(`Preparing ${countLabel}…`, 'render');
-    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    const ts = formatTimestampForFilename();
-
-    const results = [];
-    try {
-      throwIfFigureExportAborted(signal);
-      const needsMultiplePng = jobs.filter((j) => j.format === 'png').length > 1;
-
-      /** @type {{ renderFigureToSvgBlob?: Function } | null} */
-      let svgRenderer = null;
-      /** @type {{ renderFigureToPngBlob?: Function } | null} */
-      let pngRenderer = null;
-      /** @type {{ blob: Blob; filename: string; result: { format: FigureExportFormat; filename: string; metadata: any } }[]} */
-      const stagedDownloads = [];
-
-      for (let idx = 0; idx < jobs.length; idx++) {
-        const job = jobs[idx];
-        const format = job.format;
-        const dpi = job.dpi;
-
+    // Set once the snapshot is taken and rendering starts: a failure before
+    // that is reported by the caller (`exportFigure`), as one of the request.
+    let notifId = null;
+    let t0 = 0;
+    const progress = {
+      start: () => {
+        notifId = notifications.startCalculation(`Preparing ${countLabel}…`, 'render');
+        t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      },
+      job: (idx, format) => {
         notifications.show({
           id: notifId,
           message: `Rendering ${idx + 1}/${jobs.length}: ${format.toUpperCase()}…`
         });
+      },
+    };
 
-        const payload = {
-          ...payloadBase,
-          format,
-          dpi,
-          options: createFigureExportPayloadOptions(options, format),
-        };
-        assertFigureExportPayload(payload);
-        throwIfFigureExportAborted(signal);
-
-        if (format === 'svg') {
-          if (!svgRenderer) {
-            svgRenderer = await awaitFigureExportAbortable(
-              signal,
-              loadAppCode(() => import('./renderers/svg-renderer.js'))
-            );
-            throwIfFigureExportAborted(signal);
-          }
-          const blob = await awaitFigureExportAbortable(
-            signal,
-            svgRenderer.renderFigureToSvgBlob({ payload, signal })
-          );
-          throwIfFigureExportAborted(signal);
-          if (!(blob instanceof Blob) || blob.type !== 'image/svg+xml') {
-            throw new TypeError(
-              'SVG renderer must publish exactly one image/svg+xml Blob.'
-            );
-          }
-          const filename = buildExportFilename({
-            datasetName,
-            fieldKey: filenameFieldKey,
-            viewLabel: wantsGrid ? 'multiview' : views[0].label,
-            variant: null,
-            ext: 'svg',
-            timestamp: ts
-          });
-          stagedDownloads.push({
-            blob,
-            filename,
-            result: { format: 'svg', filename, metadata: payloadBase.meta },
-          });
-        } else {
-          if (!pngRenderer) {
-            pngRenderer = await awaitFigureExportAbortable(
-              signal,
-              loadAppCode(() => import('./renderers/png-renderer.js'))
-            );
-            throwIfFigureExportAborted(signal);
-          }
-          const blob = await awaitFigureExportAbortable(
-            signal,
-            pngRenderer.renderFigureToPngBlob({ payload, signal })
-          );
-          throwIfFigureExportAborted(signal);
-          if (!(blob instanceof Blob) || blob.type !== 'image/png') {
-            throw new TypeError(
-              'PNG renderer must publish exactly one image/png Blob.'
-            );
-          }
-          const variant = needsMultiplePng ? `dpi${dpi}` : null;
-          const filename = buildExportFilename({
-            datasetName,
-            fieldKey: filenameFieldKey,
-            viewLabel: wantsGrid ? 'multiview' : views[0].label,
-            variant,
-            ext: 'png',
-            timestamp: ts
-          });
-          stagedDownloads.push({
-            blob,
-            filename,
-            result: { format: 'png', filename, metadata: payloadBase.meta },
-          });
-        }
-      }
-
+    try {
+      const { staged: stagedDownloads, datasetName, filenameFieldKey, viewLabel, timestamp } = await renderStaged(options, jobs, { progress });
+      const results = [];
       let deliveryBlob;
       let deliveryFilename;
       if (stagedDownloads.length === 1) {
@@ -1059,9 +1087,9 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         deliveryFilename = stagedDownloads[0].filename;
       } else {
         deliveryBlob = await createFigureExportZip(
-          stagedDownloads.map(staged => ({
-            filename: staged.filename,
-            blob: staged.blob,
+          stagedDownloads.map(entry => ({
+            filename: entry.filename,
+            blob: entry.blob,
           })),
           { signal }
         );
@@ -1074,15 +1102,15 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         deliveryFilename = buildExportFilename({
           datasetName,
           fieldKey: filenameFieldKey,
-          viewLabel: wantsGrid ? 'multiview' : views[0].label,
+          viewLabel,
           variant: 'batch',
           ext: 'zip',
-          timestamp: ts
+          timestamp
         });
       }
       throwIfFigureExportAborted(signal);
       downloadBlob(deliveryBlob, deliveryFilename, { signal });
-      results.push(...stagedDownloads.map(staged => staged.result));
+      results.push(...stagedDownloads.map(entry => entry.result));
 
       const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
       notifications.completeCalculation(notifId, 'Export complete', t1 - t0);
@@ -1094,6 +1122,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       );
       return results;
     } catch (err) {
+      if (notifId === null) throw err;
       if (isFigureExportSignalAborted(signal)) {
         notifications.dismiss(notifId);
         throw err;
@@ -1105,5 +1134,24 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     }
   }
 
-  return { exportFigure, exportFigures };
+  /**
+   * Render one figure and return it, without downloading it or telling the
+   * person: a picture an agent reads, a step's picture in a report. The
+   * same snapshot and renderer as a download.
+   *
+   * @param {FigureExportOptions} options An exact single request
+   * @param {{viewId?: string|null}} [how] The view to draw (default: the active one)
+   * @returns {Promise<{ blob: Blob; filename: string; metadata: any }>}
+   */
+  async function renderFigure(options, { viewId = null } = {}) {
+    const exactOptions = assertFigureExportSingleRequest(options);
+    const { staged } = await renderStaged(
+      exactOptions,
+      [{ format: exactOptions.format, dpi: exactOptions.dpi }],
+      { viewId }
+    );
+    return { blob: staged[0].blob, filename: staged[0].filename, metadata: staged[0].result.metadata };
+  }
+
+  return { exportFigure, exportFigures, renderFigure };
 }

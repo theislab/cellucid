@@ -48,6 +48,7 @@ import { allocateTypedArray } from '../sparse-column-index.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { orderByKey, sortByKeyWithValues } from '../../utils/radix-order.js';
 import { abortReason, onAbort, throwIfAborted } from '../../utils/abort.js';
+import { measureOf } from '../../utils/machine.js';
 
 /** Entries of one slab of the index's work (`RowMajorColumnIndex`'s default; a scheduling choice). */
 const SLAB_ENTRIES = 1024 * 1024;
@@ -333,6 +334,10 @@ export class PassRates {
           : kind === 'placeOwn' ? this._place.own
             : null;
     if (rate === null) throw new TypeError(`Unknown pass rate '${String(kind)}'`);
+    // The machine's `indexPassMs` (`utils/machine.js`): held, each rate is
+    // the held one, and not measured where the hold names none.
+    const held = measureOf('indexPassMs', () => undefined);
+    if (held !== undefined) return held?.[kind] ?? null;
     return rate.entries > 0 && rate.ms > 0 ? rate.ms / rate.entries : null;
   }
 }

@@ -31,10 +31,6 @@ export function el(tag, props = {}, children = []) {
   return node;
 }
 
-export function toCleanString(value) {
-  return String(value ?? '').trim();
-}
-
 export function hasAtLeastUnicodeCodePoints(value, minimum) {
   let count = 0;
   for (const _codePoint of value) {

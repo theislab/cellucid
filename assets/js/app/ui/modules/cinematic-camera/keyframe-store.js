@@ -228,7 +228,9 @@ export function isCameraPathReady(keyframes) {
  */
 
 /**
- * Create a new keyframe store.
+ * Create a new keyframe store. Labels are unique: `add` and `rename` refuse a
+ * label another keyframe has (a session restored with two equal labels is
+ * kept as it is; a camera path action naming such a label is refused).
  *
  * @returns {{ add, remove, rename, reorder, setDuration, setAllDurations,
  *             getAll, getCount, getById, clear, on, off }}
@@ -265,6 +267,11 @@ export function createKeyframeStore() {
     listeners.delete(fn);
   }
 
+  /** Whether a keyframe other than `exceptId` has `label`. */
+  function labelInUse(label, exceptId) {
+    return keyframes.some((keyframe) => keyframe.label === label && keyframe.id !== exceptId);
+  }
+
   // ---- Public API ----
 
   /**
@@ -285,13 +292,21 @@ export function createKeyframeStore() {
     // brings its own label must not consume one. The return-to-start keyframe
     // is such a caller: letting it advance the counter made every later "KF n"
     // skip a number, and toggling it repeatedly walked the numbering away from
-    // the list the user is looking at.
+    // the list the user is looking at. A default label someone already gave a
+    // keyframe is skipped: a keyframe is named by its label (camera path
+    // actions, `app/actions/definitions/camera.js`), so labels are unique.
     const usesDefaultLabel = label === undefined;
+    if (usesDefaultLabel) {
+      while (labelInUse(`KF ${nextIndex}`, null)) nextIndex++;
+    }
     const exactLabel = usesDefaultLabel ? `KF ${nextIndex}` : label;
     if (!isExactKeyframeLabel(exactLabel)) {
       throw new TypeError(
         'Camera path keyframe label must be a trimmed non-empty string.'
       );
+    }
+    if (labelInUse(exactLabel, null)) {
+      throw new RangeError(`A camera path keyframe is labelled "${exactLabel}" already.`);
     }
     if (!isValidKeyframeRepresentation(representation)) {
       throw new TypeError(
@@ -335,6 +350,9 @@ export function createKeyframeStore() {
       throw new TypeError(
         'Camera path keyframe label must be a trimmed non-empty string.'
       );
+    }
+    if (labelInUse(newLabel, id)) {
+      throw new RangeError(`A camera path keyframe is labelled "${newLabel}" already.`);
     }
     keyframes[index] = createStoredKeyframe({
       ...keyframes[index],

@@ -9,20 +9,13 @@
  * | 0      | sorted-delta   | uvarint count, then `count` uvarint deltas (first = index)  |
  * | 1      | bitset         | ceil(cellCount / 8) bytes; cell i is bit (i & 7) of byte i>>3 |
  * | 2      | runs           | uvarint runCount, then runCount × (uvarint gap, uvarint length); gap counts from the end of the previous run (from 0 for the first) |
- * | 3      | reference-mask | uvarint referenceCount, u32 LE referenceDigest, then ceil(referenceCount / 8) bytes: bit k marks the k-th reference cell (ascending) |
- * | 4      | reference-all  | uvarint referenceCount, u32 LE referenceDigest              |
  *
- * A reference is a set both sides can derive from the dataset: the cells of
- * one category of one observation field (a category highlight). Encodings 3
- * and 4 store the selection relative to it, so a whole category costs a few
- * bytes instead of one per cell. The reference count and digest
- * ({@link digestCellSet}) are checked when decoding, so a dataset whose
- * category no longer holds the same cells is refused instead of silently
- * selecting other cells.
+ * Any other first byte is refused. A set is always stored on its own, never
+ * relative to another set (the Python and R readers decode these three).
  *
  * Measured on Suo (562k cells, 22 highlight groups of 5–170k cells): the
  * per-set choice among 0–2 stores 188 KB where sorted-delta alone stored
- * 197 KB (both gzipped); a whole category stores 9 bytes.
+ * 197 KB (both gzipped).
  *
  * @module session/codecs/cell-set
  */
@@ -35,31 +28,9 @@ import { throwIfAborted } from '../../../utils/abort.js';
 export const CELL_SET_SORTED_DELTA = 0;
 export const CELL_SET_BITSET = 1;
 export const CELL_SET_RUNS = 2;
-export const CELL_SET_REFERENCE_MASK = 3;
-export const CELL_SET_REFERENCE_ALL = 4;
 
 /** Cells decoded between yields to the interface. */
 const COOPERATIVE_DECODE_BUDGET = 64 * 1024;
-
-/**
- * Order-independent 32-bit digest of a set of cell indices: the sum, modulo
- * 2^32, of one avalanche-mixed word per index. Python computes the same value
- * vectorized (`session_codecs.digest_cell_set`).
- *
- * @param {Uint32Array} indices
- * @returns {number} Unsigned 32-bit digest.
- */
-export function digestCellSet(indices) {
-  let sum = 0;
-  for (let i = 0; i < indices.length; i++) {
-    let x = indices[i];
-    x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
-    x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
-    x ^= x >>> 16;
-    sum = (sum + (x >>> 0)) >>> 0;
-  }
-  return sum >>> 0;
-}
 
 /**
  * The indices as one strictly increasing Uint32Array, validated against the
@@ -131,83 +102,18 @@ function measureEncodings(sorted) {
 }
 
 /**
- * Positions of `sorted` inside `reference`, or null when `sorted` is not a
- * subset of it.
- */
-function referencePositions(sorted, reference) {
-  const positions = new Uint32Array(sorted.length);
-  let r = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const cell = sorted[i];
-    while (r < reference.length && reference[r] < cell) r++;
-    if (r === reference.length || reference[r] !== cell) return null;
-    positions[i] = r;
-  }
-  return positions;
-}
-
-function writeU32(out, offset, value) {
-  out[offset] = value & 0xff;
-  out[offset + 1] = (value >>> 8) & 0xff;
-  out[offset + 2] = (value >>> 16) & 0xff;
-  out[offset + 3] = (value >>> 24) & 0xff;
-  return offset + 4;
-}
-
-function readU32(bytes, offset) {
-  if (offset + 4 > bytes.byteLength) {
-    throw new Error('Cell set is truncated.');
-  }
-  return (
-    bytes[offset]
-    | (bytes[offset + 1] << 8)
-    | (bytes[offset + 2] << 16)
-    | (bytes[offset + 3] << 24)
-  ) >>> 0;
-}
-
-/**
  * Encode one cell set in its smallest encoding.
  *
  * @param {ArrayLike<number>} indices
- * @param {{ cellCount: number, reference: Uint32Array|null }} options -
- *   `reference` is the sorted set the selection may be stored relative to.
+ * @param {{ cellCount: number }} options
  * @returns {Uint8Array}
  */
-export function encodeCellSet(indices, { cellCount, reference }) {
+export function encodeCellSet(indices, { cellCount }) {
   if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
     throw new TypeError('Cell-set cellCount must be a non-negative safe integer.');
   }
   const sorted = toSortedCellIndices(indices, cellCount);
 
-  if (reference !== null) {
-    if (!(reference instanceof Uint32Array)) {
-      throw new TypeError('Cell-set reference must be a sorted Uint32Array.');
-    }
-    const positions = referencePositions(sorted, reference);
-    if (positions !== null) {
-      const digest = digestCellSet(reference);
-      const head = 1 + uvarintLength(reference.length) + 4;
-      if (positions.length === reference.length) {
-        const out = new Uint8Array(head);
-        out[0] = CELL_SET_REFERENCE_ALL;
-        writeU32(out, writeUvarint(out, 1, reference.length), digest);
-        return out;
-      }
-      const maskBytes = Math.ceil(reference.length / 8);
-      const sizes = measureEncodings(sorted);
-      if (head + maskBytes < 1 + Math.min(sizes.deltaLength, sizes.runsLength, Math.ceil(cellCount / 8))) {
-        const out = new Uint8Array(head + maskBytes);
-        out[0] = CELL_SET_REFERENCE_MASK;
-        const body = writeU32(out, writeUvarint(out, 1, reference.length), digest);
-        for (let i = 0; i < positions.length; i++) {
-          const k = positions[i];
-          out[body + (k >>> 3)] |= 1 << (k & 7);
-        }
-        return out;
-      }
-    }
-  }
 
   const { deltaLength, runsLength, runCount } = measureEncodings(sorted);
   const bitsetLength = Math.ceil(cellCount / 8);
@@ -250,26 +156,13 @@ export function encodeCellSet(indices, { cellCount, reference }) {
 }
 
 /**
- * Whether a payload stores its cells relative to a reference set, so the
- * caller has to derive that reference before decoding.
- * @param {Uint8Array} bytes
- * @returns {boolean}
- */
-export function cellSetNeedsReference(bytes) {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
-    throw new TypeError('Cell set must be a non-empty Uint8Array.');
-  }
-  return bytes[0] === CELL_SET_REFERENCE_MASK || bytes[0] === CELL_SET_REFERENCE_ALL;
-}
-
-/**
  * Decode one cell set into a strictly increasing Uint32Array.
  *
  * @param {Uint8Array} bytes
- * @param {{ cellCount: number, reference: Uint32Array|null, signal: AbortSignal|null }} options
+ * @param {{ cellCount: number, signal: AbortSignal|null }} options
  * @returns {Promise<Uint32Array>}
  */
-export async function decodeCellSet(bytes, { cellCount, reference, signal }) {
+export async function decodeCellSet(bytes, { cellCount, signal }) {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
     throw new TypeError('Cell set must be a non-empty Uint8Array.');
   }
@@ -282,39 +175,6 @@ export async function decodeCellSet(bytes, { cellCount, reference, signal }) {
   throwIfAborted(signal);
   const encoding = bytes[0];
 
-  if (encoding === CELL_SET_REFERENCE_MASK || encoding === CELL_SET_REFERENCE_ALL) {
-    if (!(reference instanceof Uint32Array)) {
-      throw new TypeError('This cell set is stored relative to a category; its cells are required.');
-    }
-    const { value: referenceCount, nextOffset } = decodeUvarint(bytes, 1);
-    const digest = readU32(bytes, nextOffset);
-    if (referenceCount !== reference.length || digest !== digestCellSet(reference)) {
-      throw new RangeError(
-        'The category this selection was saved relative to no longer holds the same cells.'
-      );
-    }
-    const body = nextOffset + 4;
-    if (encoding === CELL_SET_REFERENCE_ALL) {
-      if (body !== bytes.byteLength) throw new Error('Cell set has trailing bytes.');
-      return reference.slice();
-    }
-    if (body + Math.ceil(referenceCount / 8) !== bytes.byteLength) {
-      throw new Error('Cell-set reference mask has the wrong length.');
-    }
-    let count = 0;
-    for (let k = 0; k < referenceCount; k++) {
-      if (bytes[body + (k >>> 3)] & (1 << (k & 7))) count++;
-    }
-    if (referenceCount % 8 !== 0 && (bytes[bytes.byteLength - 1] >>> (referenceCount % 8)) !== 0) {
-      throw new Error('Cell-set reference mask sets bits past its reference.');
-    }
-    const out = new Uint32Array(count);
-    let n = 0;
-    for (let k = 0; k < referenceCount; k++) {
-      if (bytes[body + (k >>> 3)] & (1 << (k & 7))) out[n++] = reference[k];
-    }
-    return out;
-  }
 
   if (encoding === CELL_SET_BITSET) {
     const bitsetLength = Math.ceil(cellCount / 8);

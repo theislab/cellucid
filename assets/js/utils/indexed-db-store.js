@@ -1,9 +1,10 @@
 /**
  * @fileoverview One object store of this browser's IndexedDB as a key-value
- * store: the per-viewer records the app keeps in IndexedDB (the drafts of
- * unsaved highlights, `app/highlight-draft.js`; the handles of files opened
- * from this computer, `app/local-file-handles.js`; the decoders the probe
- * decided on, `formats/io/decoder-memory.js`), each in a database of its own.
+ * store: the per-viewer records the app keeps in IndexedDB (the handles of
+ * files opened from this computer, `app/library/local-file-handles.js`; the
+ * decoders the probe decided on, `formats/io/decoder-memory.js`), each in a
+ * database of its own. Several object stores written together in one
+ * transaction (the history's saved states) are `indexed-db-database.js`.
  *
  * @module utils/indexed-db-store
  */

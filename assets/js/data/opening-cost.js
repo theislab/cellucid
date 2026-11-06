@@ -36,6 +36,7 @@
  */
 
 import { onAbort } from '../utils/abort.js';
+import { isHeld, measureOf } from '../utils/machine.js';
 
 /**
  * How soon a first view should show: the response time below which a
@@ -59,8 +60,6 @@ export const OPENING_COST_STORAGE_KEY = 'cellucid:opening-cost:v2';
  */
 let sums = null;
 let loaded = false;
-/** Whether the measure is held (`holdShownCells`): records leave it as it is. */
-let held = false;
 const SUM_KEYS = ['w', 'x', 'y', 'xx', 'xy'];
 
 function storage() {
@@ -96,7 +95,8 @@ function load() {
  * @param {number} ms
  */
 export function recordShownCells(cells, ms) {
-  if (held || !(cells > 0) || !(ms >= 0) || !Number.isFinite(ms)) return;
+  // A machine whose measure is held (`utils/machine.js` `shownCellMs`) records nothing: its openings are no evidence of it.
+  if (isHeld('shownCellMs') || !(cells > 0) || !(ms >= 0) || !Number.isFinite(ms)) return;
   const earlier = load();
   const record = { w: 1, x: cells, y: ms, xx: cells * cells, xy: cells * ms };
   sums = Object.fromEntries(SUM_KEYS.map(key => [key, (earlier === null ? 0 : earlier[key] / 2) + record[key]]));
@@ -145,38 +145,27 @@ export function recordFirstFrame({ cells, startedAt, afterNextFrame, drawn, sign
   });
 }
 
-/** Forget every record, and any hold (tests). */
+/** Forget every record (tests). */
 export function resetShownCells() {
   sums = null;
   loaded = true;
-  held = false;
-}
-
-/**
- * Hold the measure at `msPerCell` milliseconds a shown cell, or at nothing
- * measured (null), for the rest of the page: this browser's storage is not
- * read, and the page's own records (`recordFirstFrame`) leave it as it is
- * (tests: a device's measure fixed, `tests/browser/helpers/device.mjs`; on
- * a runner whose software GL draws a first frame slowly, the page's own
- * record of its start dataset made a later opening progressive, at a time
- * the runner decided, Web contracts run 41307458156).
- *
- * @param {number|null} msPerCell
- */
-export function holdShownCells(msPerCell) {
-  if (msPerCell !== null && !(Number.isFinite(msPerCell) && msPerCell >= 0)) {
-    throw new RangeError('A held opening cost is a finite number of milliseconds a cell, or null.');
-  }
-  sums = msPerCell === null ? null : { w: 1, x: 1, y: msPerCell, xx: 1, xy: msPerCell };
-  loaded = true;
-  held = true;
 }
 
 /**
  * The measured milliseconds a shown cell adds to an opening (module doc),
- * or null before any measure.
+ * or null before any measure. The machine's `shownCellMs`
+ * (`utils/machine.js`): held, it is the held cost (null: nothing measured),
+ * this browser's storage is not read and the page's own records
+ * (`recordFirstFrame`) are not made -- on a runner whose software GL draws a
+ * first frame slowly, the page's own record of its start dataset made a
+ * later opening progressive, at a time the runner decided (Web contracts
+ * run 41307458156).
  */
 export function shownMsPerCell() {
+  return measureOf('shownCellMs', measuredMsPerCell);
+}
+
+function measuredMsPerCell() {
   const m = load();
   if (m === null) return null;
   // The spread of the records' sizes; nothing beside rounding when they are

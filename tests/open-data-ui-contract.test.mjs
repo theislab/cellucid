@@ -14,6 +14,7 @@ import test from 'node:test';
 import { collectDOMReferences } from '../assets/js/app/ui/core/dom-cache.js';
 import {
   describeHiddenMetadataProblem,
+  filePickerTypes,
   shortAddress,
 } from '../assets/js/app/ui/modules/dataset-connections.js';
 import { localFileLayout } from '../assets/js/app/ui/modules/dataset-drop.js';
@@ -52,7 +53,7 @@ test('one Open… button opens a File… / Folder… menu, the same in every bro
   // control is wired, so the list has one source.
   assert.doesNotMatch(fileInput, /\baccept=/);
   assert.match(connectionSource, /userDataFileInput\.accept = filePickerAccept\(\);/);
-  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
+  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.cellucid-library,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
   assert.doesNotMatch(fileInput, /\b(?:webkitdirectory|directory|multiple)\b/);
   const folderInput = tag(/<input\b[^>]*id="user-data-folder-input"[^>]*>/, 'folder input');
   assert.match(folderInput, /\bwebkitdirectory\b/);
@@ -62,6 +63,18 @@ test('one Open… button opens a File… / Folder… menu, the same in every bro
   assert.doesNotMatch(connectionSource, /navigator\.(?:userAgent|userAgentData|vendor)/);
   // One row: the button spans the sidebar.
   assert.match(sessionCss, /\.open-menu-button\s*\{[^}]*width:\s*100%/);
+});
+
+test('the browser\'s own picker is offered only endings it accepts; a library file stays choosable through All files', () => {
+  // Chromium refuses showOpenFilePicker whole over one ending with a character outside [A-Za-z0-9+.] or
+  // longer than 16 characters: '.cellucid-library' made File… fail outright.
+  const [types] = [filePickerTypes(filePickerAccept())];
+  assert.equal(types.length, 1);
+  const endings = types[0].accept['application/octet-stream'];
+  assert.deepEqual(endings, filePickerAccept().split(',').filter(ending => ending !== '.cellucid-library'));
+  for (const ending of endings) assert.match(ending, /^\.[A-Za-z0-9+.]{1,15}$/);
+  assert.match(connectionSource, /showOpenFilePicker\(\{ types: filePickerTypes\(filePickerAccept\(\)\) \}\)/);
+  assert.doesNotMatch(connectionSource, /excludeAcceptAllOption/);
 });
 
 test('a picked file is read by what it is', () => {

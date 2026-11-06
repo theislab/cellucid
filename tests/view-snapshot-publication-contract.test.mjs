@@ -10,18 +10,16 @@ import {
   publishSnapshotView,
   retireSnapshotView,
 } from '../assets/js/app/view-snapshot-publication.js';
-import {
-  restoreMultiview,
-} from '../assets/js/app/state-serializer/multiview.js';
+import { createViewsDomain } from '../assets/js/app/state/domains/views.js';
+import { createCameraDomain } from '../assets/js/app/state/domains/camera.js';
 
-// Layouts are embedding ids, every one enabled. Each dimension's default is
-// the embedding the identity's `defaults` names; X_tsne is a second 2D
-// embedding a view shows when it is chosen for it.
-const DEFAULT_LAYOUTS = Object.freeze({ 2: 'X_umap', 3: 'X_umap_3d' });
+// Layouts are embedding ids, every one enabled, none named by an obsm array
+// (a views value names each as `{layout}`). X_tsne is a second 2D embedding a
+// view shows when it is chosen for it.
 const LAYOUT_DIMENSIONS = Object.freeze({ X_tsne: 2, X_umap: 2, X_umap_3d: 3 });
-const TSNE = Object.freeze({ key: 'X_tsne', columns: null });
-const UMAP = Object.freeze({ key: 'X_umap', columns: null });
-const UMAP_3D = Object.freeze({ key: 'X_umap_3d', columns: null });
+const TSNE = Object.freeze({ layout: 'X_tsne' });
+const UMAP = Object.freeze({ layout: 'X_umap' });
+const UMAP_3D = Object.freeze({ layout: 'X_umap_3d' });
 
 function createOwners() {
   const dimensionManager = {
@@ -232,6 +230,16 @@ function createRestoreOwners() {
     getCamerasLocked() {
       return camerasLocked;
     },
+    getCentroidFlags(viewId) {
+      return { points: false, labels: false, ...centroidFlags.get(viewId) };
+    },
+    getFocusedViewId() {
+      return layout.activeId;
+    },
+    getViewLayout() {
+      return { ...layout };
+    },
+    setNavigationMode() {},
     getViewCameraState(viewId) {
       const camera = viewCameras.get(viewId);
       if (camera === undefined) {
@@ -247,6 +255,9 @@ function createRestoreOwners() {
     },
     setLiveViewHidden(value) {
       layout.liveViewHidden = value;
+    },
+    getLiveViewHidden() {
+      return layout.liveViewHidden;
     },
     setViewCameraState(viewId, camera) {
       viewCameras.set(viewId, structuredClone(camera));
@@ -269,14 +280,21 @@ function createRestoreOwners() {
   const transparency = Uint8Array.from([0, 1]);
   const centroids = Float32Array.from([0.5, -0.25, 0]);
   const centroidColors = Uint8Array.from([50, 60, 70, 255]);
+  // The dimension manager as the views domain reads it: the layout each
+  // view shows, and each layout's record.
+  Object.defineProperty(owners.dimensionManager, 'viewLayouts', {
+    get() {
+      return this.layouts;
+    },
+  });
+  owners.dimensionManager.getLayout = layoutKey => {
+    const dimension = LAYOUT_DIMENSIONS[layoutKey];
+    if (dimension === undefined) {
+      throw new RangeError(`Layout "${layoutKey}" is not registered.`);
+    }
+    return { layoutKey, dimension, provenance: null };
+  };
   Object.assign(state, {
-    batchDepth: 0,
-    beginBatch() {
-      this.batchDepth++;
-    },
-    endBatch() {
-      this.batchDepth--;
-    },
     clearActiveField() {},
     getActiveViewId() {
       return this.activeViewId;
@@ -311,33 +329,19 @@ function createRestoreOwners() {
       }
       return context.followsDefault === true;
     },
-    // The session schema names what a view shows by its embedding reference;
-    // this resolves it to the layout (an export embedding id) and follows the
-    // dimension's default when it is that default.
-    async restoreViewEmbedding(viewId, ref) {
-      const layoutKey = ref.key;
-      if (!Object.hasOwn(LAYOUT_DIMENSIONS, layoutKey)) {
-        throw new RangeError(`This dataset has no embedding "${layoutKey}".`);
-      }
-      const dimension = LAYOUT_DIMENSIONS[layoutKey];
-      await this.setViewRepresentation(viewId, layoutKey, {
-        followsDefault: DEFAULT_LAYOUTS[dimension] === layoutKey,
-      });
-      return layoutKey;
-    },
-    // The one representation transaction: a layout, whose dimension is its own.
+    // The one representation transaction of any view: a layout, whose
+    // dimension is its own.
     async setViewRepresentation(viewId, layoutKey, { followsDefault }) {
-      assert.equal(viewId, 'live');
       const dimension = LAYOUT_DIMENSIONS[layoutKey];
       if (dimension === undefined) {
         throw new RangeError(`Layout "${layoutKey}" is not registered.`);
       }
-      embeddingSwitches.push({ layoutKey, followsDefault });
-      this.viewContexts.get('live').followsDefault = followsDefault;
-      this.dimensionManager.dimensions.set('live', dimension);
-      this.dimensionManager.layouts.set('live', layoutKey);
-      viewer.setViewEmbedding('live', { dimension, layoutKey });
-      viewer.setViewCameraState('live', cameraState(10 + dimension));
+      embeddingSwitches.push({ viewId, layoutKey, followsDefault });
+      this.viewContexts.get(viewId).followsDefault = followsDefault;
+      this.dimensionManager.dimensions.set(viewId, dimension);
+      this.dimensionManager.layouts.set(viewId, layoutKey);
+      viewer.setViewEmbedding(viewId, { dimension, layoutKey });
+      viewer.setViewCameraState(viewId, cameraState(10 + dimension));
     },
   });
 
@@ -353,41 +357,42 @@ function createRestoreOwners() {
   };
 }
 
-function multiviewSnapshot(overrides = {}) {
-  const snapshot = {
-    activeFields: {
-      activeFieldKey: null,
-      activeFieldSource: null,
-    },
-    cameraState: cameraState(),
-    centroids: { points: false, labels: false },
-    embedding: UMAP,
-    filters: {},
-    id: 'snap_9',
-    ...overrides,
+/**
+ * The views and camera domains over the restore owners (`state/domains/`),
+ * on a page with no layout picker to show the layout in.
+ */
+function viewDomainsOf(t, { state, viewer }) {
+  const previous = {
+    document: globalThis.document,
+    HTMLSelectElement: globalThis.HTMLSelectElement,
   };
+  globalThis.document = { getElementById: () => null };
+  globalThis.HTMLSelectElement = class HTMLSelectElement {};
+  t.after(() => {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete globalThis[name];
+      else globalThis[name] = value;
+    }
+  });
   return {
-    camerasLocked: false,
-    layout: {
-      activeId: snapshot.id,
-      liveViewHidden: false,
-      mode: 'grid',
-    },
-    live: {
-      cameraState: cameraState(),
-      centroids: { points: true, labels: false },
-    },
-    snapshots: [snapshot],
+    views: createViewsDomain({ state, viewer, refreshUi() {} }),
+    camera: createCameraDomain({ viewer, refreshUi() {} }),
   };
 }
 
-/** The live view's own saved state, applied after the kept views. */
-function liveViewState(embedding = UMAP) {
+/** A view of a views value: what it shows, and its centroid toggles. */
+function viewRecord(embedding, overrides = {}) {
   return {
     embedding,
-    filters: {},
-    activeFields: { activeFieldKey: null, activeFieldSource: null },
+    followsDefault: embedding.layout !== 'X_tsne',
+    centroids: { points: false, labels: false },
+    ...overrides,
   };
+}
+
+/** A views value: the live view and kept views, every view shown, one focused. */
+function viewsValue(views, focus = 1) {
+  return { layout: 'grid', focus, liveHidden: false, camerasLinked: false, views };
 }
 
 test('snapshot publication installs exact renderer attributes in every owner', () => {
@@ -674,45 +679,33 @@ test('complete snapshot clearing retires contexts and dimension mappings', () =>
   assert.deepEqual([...dimensionManager.dimensions.keys()], ['live']);
 });
 
-test('multiview same-dimension restore publishes every exact snapshot owner', async () => {
+test('a views restore publishes every kept view in every owner', async t => {
+  const owners = createRestoreOwners();
   const {
     centroidFlags,
     dimensionManager,
     publishedConfigs,
     state,
     viewer,
-  } = createRestoreOwners();
-  const saved = multiviewSnapshot({ centroids: { points: true, labels: true } });
-  const replayed = [];
-
-  await restoreMultiview({
-    state,
-    viewer,
-    async restoreActiveFields() {
-      replayed.push(['activeFields', state.batchDepth]);
-    },
-    async restoreFilters() {
-      replayed.push(['filters', state.batchDepth]);
-    },
-  }, saved, liveViewState());
-
-  // Each view's filters and active field are replayed inside one batch, so
-  // its visibility is computed once, when the batch ends.
-  assert.deepEqual(replayed, [
-    ['filters', 1], ['activeFields', 1],
-    ['filters', 1], ['activeFields', 1],
+  } = owners;
+  const { views } = viewDomainsOf(t, owners);
+  const saved = viewsValue([
+    viewRecord(UMAP, { centroids: { points: true, labels: false } }),
+    viewRecord(UMAP, { centroids: { points: true, labels: true } }),
   ]);
-  assert.equal(state.batchDepth, 0);
 
-  // The label is the state's own, recomputed from the restored field and
-  // filters; the session does not store it.
+  await views.restore(saved);
+
+  // The label is the state's own, recomputed from the live view's field and
+  // filters; a views value does not hold it.
   assert.deepEqual(viewer.getSnapshotViews(), [{
     id: 'snap_1',
     label: 'All cells',
   }]);
-  // Centroid toggles are restored per view.
+  // Centroid toggles are restored per view, each set only where it differs.
   assert.deepEqual(centroidFlags.get('snap_1'), { points: true, labels: true });
-  assert.deepEqual(centroidFlags.get('live'), { points: true, labels: false });
+  assert.deepEqual(centroidFlags.get('live'), { points: true });
+  assert.deepEqual(viewer.getCentroidFlags('live'), { points: true, labels: false });
   assert.equal(dimensionManager.getViewDimension('snap_1'), 2);
   assert.equal(dimensionManager.getViewLayout('snap_1'), 'X_umap');
   assert.equal(viewer.getViewLayoutKey('snap_1'), 'X_umap');
@@ -728,90 +721,31 @@ test('multiview same-dimension restore publishes every exact snapshot owner', as
     Array.from(state.viewContexts.get('snap_1').categoryTransparency),
     [0, 1],
   );
+  assert.deepEqual(views.capture(), saved);
 });
 
-test('multiview restore rolls back the whole graph after a later publication fails', async () => {
-  const {
-    dimensionManager,
-    snapshots,
-    state,
-    viewer,
-  } = createRestoreOwners();
-  const saved = multiviewSnapshot();
-  saved.snapshots.push({
-    ...saved.snapshots[0],
-    activeFields: { ...saved.snapshots[0].activeFields },
-    cameraState: cameraState(8),
-    filters: {},
-    id: 'snap_10',
-  });
-  saved.layout.activeId = 'snap_10';
-
-  const publicationFailure =
-    new Error('second restored snapshot publication failed');
-  const applySnapshotConfigToView =
-    state.applySnapshotConfigToView;
-  state.applySnapshotConfigToView = function(viewId, config) {
-    applySnapshotConfigToView.call(this, viewId, config);
-    if (viewId === 'snap_2') throw publicationFailure;
-  };
-
-  await assert.rejects(
-    restoreMultiview({
-      state,
-      viewer,
-      async restoreActiveFields() {},
-      async restoreFilters() {},
-    }, saved, liveViewState()),
-    error => error === publicationFailure,
-  );
-  assert.deepEqual(snapshots, []);
-  assert.deepEqual([...state.viewContexts.keys()], ['live']);
-  assert.deepEqual([...dimensionManager.dimensions.keys()], ['live']);
-  assert.equal(state.activeViewId, 'live');
-  assert.equal(dimensionManager.getViewDimension('live'), 2);
-  assert.equal(viewer.getViewDimension('live'), 2);
-  assert.deepEqual(
-    viewer.getViewCameraState('live'),
-    saved.live.cameraState,
-  );
-});
-
-test('multiview restore replays every snapshot on its own embedding and returns the live view to its own', async () => {
+test('a views restore shows each kept view on its own embedding and leaves the live view on its own', async t => {
+  const owners = createRestoreOwners();
   const {
     dimensionManager,
     embeddingSwitches,
     publishedConfigs,
     state,
     viewer,
-  } = createRestoreOwners();
+  } = owners;
+  const { views } = viewDomainsOf(t, owners);
   // The live view shows the second 2D embedding, chosen for it, when restore
-  // begins, and the session saved it showing that embedding too.
+  // begins, and the value names it showing that embedding too.
   await state.setViewRepresentation('live', 'X_tsne', { followsDefault: false });
   embeddingSwitches.length = 0;
 
-  const saved = multiviewSnapshot({ embedding: TSNE });
-  saved.snapshots.push(
-    {
-      ...saved.snapshots[0],
-      activeFields: { ...saved.snapshots[0].activeFields },
-      embedding: UMAP,
-      id: 'snap_10',
-      },
-    {
-      ...saved.snapshots[0],
-      activeFields: { ...saved.snapshots[0].activeFields },
-      embedding: UMAP_3D,
-      id: 'snap_11',
-      },
-  );
-
-  await restoreMultiview({
-    state,
-    viewer,
-    async restoreActiveFields() {},
-    async restoreFilters() {},
-  }, saved, liveViewState(TSNE));
+  const saved = viewsValue([
+    viewRecord(TSNE),
+    viewRecord(TSNE),
+    viewRecord(UMAP),
+    viewRecord(UMAP_3D),
+  ]);
+  await views.restore(saved);
 
   // Each kept view shows the layout its record names, in every owner, and
   // follows its dimension's default exactly when it shows that default.
@@ -827,152 +761,44 @@ test('multiview restore replays every snapshot on its own embedding and returns 
       ['X_umap_3d', 'X_umap_3d', true],
     ],
   );
+  // Each is kept from the live view as it stands, as Keep view does.
   assert.deepEqual(
     publishedConfigs.map(config => config.dimensionLevel),
-    [2, 2, 3],
+    [2, 2, 2],
   );
   // The live view shows the embedding its own record names, not the 2D
   // default.
   assert.equal(dimensionManager.getViewLayout('live'), 'X_tsne');
   assert.equal(viewer.getViewLayoutKey('live'), 'X_tsne');
   assert.equal(state.viewContexts.get('live').followsDefault, false);
-  // Every switch went through the one representation transaction, once per
-  // view: each kept view, then the live view. Nothing is reset to a base
-  // state between views.
-  assert.deepEqual(
-    embeddingSwitches.map(entry => entry.layoutKey),
-    ['X_tsne', 'X_umap', 'X_umap_3d', 'X_tsne'],
-  );
+  // Every switch went through the one representation transaction, once for
+  // each view that shows another embedding than it was kept with; the live
+  // view, already showing its own, is not switched.
+  assert.deepEqual(embeddingSwitches, [
+    { viewId: 'snap_2', layoutKey: 'X_umap', followsDefault: true },
+    { viewId: 'snap_3', layoutKey: 'X_umap_3d', followsDefault: true },
+  ]);
+  assert.deepEqual(views.capture(), saved);
 });
 
-test('a snapshot naming an embedding this dataset does not have rolls back', async () => {
-  const {
-    dimensionManager,
-    snapshots,
-    state,
-    viewer,
-  } = createRestoreOwners();
-  const saved = multiviewSnapshot({
-    embedding: { key: 'X_phate', columns: null },
-  });
-
-  await assert.rejects(
-    restoreMultiview({
-      state,
-      viewer,
-      async restoreActiveFields() {},
-      async restoreFilters() {},
-    }, saved, liveViewState()),
-    /no embedding "X_phate"/,
-  );
-  assert.deepEqual(snapshots, []);
-  assert.deepEqual([...state.viewContexts.keys()], ['live']);
-  assert.equal(dimensionManager.getViewLayout('live'), 'X_umap');
-  assert.equal(viewer.getViewLayoutKey('live'), 'X_umap');
-  assert.equal(state.viewContexts.get('live').followsDefault, true);
-});
-
-test('a replay whose owner silently shows another embedding is refused and rolled back', async () => {
-  const {
-    dimensionManager,
-    snapshots,
-    state,
-    viewer,
-  } = createRestoreOwners();
-  // An owner that shows the dimension's default whatever embedding it is
-  // given: the dimension is right, the geometry is not.
-  const restoreViewEmbedding = state.restoreViewEmbedding;
-  state.restoreViewEmbedding = function(viewId, ref) {
-    return restoreViewEmbedding.call(this, viewId, {
-      key: DEFAULT_LAYOUTS[LAYOUT_DIMENSIONS[ref.key]],
-      columns: null,
-    });
-  };
-
-  await assert.rejects(
-    restoreMultiview({
-      state,
-      viewer,
-      async restoreActiveFields() {},
-      async restoreFilters() {},
-    }, multiviewSnapshot({ embedding: TSNE }), liveViewState()),
-    /Replayed snapshot "snap_9" did not restore its exact embedding/,
-  );
-  assert.deepEqual(snapshots, []);
-  assert.deepEqual([...state.viewContexts.keys()], ['live']);
-  assert.equal(dimensionManager.getViewLayout('live'), 'X_umap');
-});
-
-test('mixed-dimension restore reapplies distinct unlocked live and snapshot cameras', async () => {
+test('mixed-dimension restore reapplies distinct unlocked live and kept-view cameras', async t => {
+  const owners = createRestoreOwners();
   const {
     activeCamera,
     dimensionManager,
-    state,
     viewCamera,
-    viewer,
-  } = createRestoreOwners();
-  const saved = multiviewSnapshot({
-    cameraState: cameraState(7),
-    embedding: UMAP_3D,
-  });
-  saved.live.cameraState = cameraState(4);
-
-  await restoreMultiview({
-    state,
-    viewer,
-    async restoreActiveFields() {},
-    async restoreFilters() {},
-  }, saved, liveViewState());
+  } = owners;
+  const { views, camera } = viewDomainsOf(t, owners);
+  await views.restore(viewsValue([viewRecord(UMAP), viewRecord(UMAP_3D)]));
+  // The cameras are restored after the views (domain order).
+  await camera.restore({ views: [cameraState(4), cameraState(7)] });
 
   assert.equal(dimensionManager.getViewDimension('live'), 2);
   assert.equal(dimensionManager.getViewDimension('snap_1'), 3);
   assert.deepEqual(viewCamera('live'), cameraState(4));
   assert.deepEqual(viewCamera('snap_1'), cameraState(7));
   assert.deepEqual(activeCamera(), cameraState(7));
-});
-
-test('final multiview failure rolls back every snapshot and returns the live camera it found', async () => {
-  const {
-    dimensionManager,
-    snapshots,
-    state,
-    viewer,
-  } = createRestoreOwners();
-  const saved = multiviewSnapshot({
-    cameraState: cameraState(7),
-    embedding: UMAP_3D,
-  });
-  saved.live.cameraState = cameraState(4);
-  const layoutFailure =
-    new Error('synthetic final live-view visibility failure');
-  viewer.setLiveViewHidden = () => {
-    throw layoutFailure;
-  };
-
-  await assert.rejects(
-    restoreMultiview({
-      state,
-      viewer,
-      async restoreActiveFields() {},
-      async restoreFilters() {},
-    }, saved, liveViewState()),
-    error => error === layoutFailure,
-  );
-
-  assert.deepEqual(snapshots, []);
-  assert.deepEqual([...state.viewContexts.keys()], ['live']);
-  assert.deepEqual([...dimensionManager.dimensions.keys()], ['live']);
-  assert.equal(state.activeViewId, 'live');
-  assert.equal(state.getViewDimensionLevel('live'), 2);
-  assert.equal(dimensionManager.getViewDimension('live'), 2);
-  assert.equal(viewer.getViewDimension('live'), 2);
-  // The graph rollback restores the pose this restore started from, which
-  // the viewer reported and so can reach, not the saved one it was replaying.
-  assert.deepEqual(
-    viewer.getViewCameraState('live'),
-    cameraState(),
-  );
-  assert.equal(viewer.getCamerasLocked(), false);
+  assert.deepEqual(camera.capture(), { views: [cameraState(4), cameraState(7)] });
 });
 
 /**
@@ -995,75 +821,24 @@ function deriveFreeflyLikeAnotherEngine(camera) {
   return derived;
 }
 
-test('a live camera saved by another engine restores: derived free-fly bits are not compared', async () => {
+test('a live camera saved by another engine restores: derived free-fly bits are not compared', async t => {
+  const owners = createRestoreOwners();
   const {
     snapshots,
     state,
     viewer,
-  } = createRestoreOwners();
+  } = owners;
+  const { views, camera } = viewDomainsOf(t, owners);
   const setViewCameraState = viewer.setViewCameraState;
-  viewer.setViewCameraState = (viewId, camera) =>
-    setViewCameraState(viewId, deriveFreeflyLikeAnotherEngine(camera));
-  const saved = multiviewSnapshot({
-    cameraState: cameraState(7),
-    embedding: UMAP_3D,
-  });
-  saved.live.cameraState = cameraState(4);
-  saved.live.cameraState.freefly.pitch = -0.16539816339745403;
+  viewer.setViewCameraState = (viewId, value) =>
+    setViewCameraState(viewId, deriveFreeflyLikeAnotherEngine(value));
+  const live = cameraState(4);
+  live.freefly.pitch = -0.16539816339745403;
 
-  await restoreMultiview({
-    state,
-    viewer,
-    async restoreActiveFields() {},
-    async restoreFilters() {},
-  }, saved, liveViewState());
+  await views.restore(viewsValue([viewRecord(UMAP), viewRecord(UMAP_3D)]));
+  await camera.restore({ views: [live, cameraState(7)] });
 
   assert.deepEqual(snapshots.map(snapshot => snapshot.id), ['snap_1']);
   assert.equal(state.activeViewId, 'snap_1');
-  assert.deepEqual(
-    viewer.getViewCameraState('live').orbit,
-    saved.live.cameraState.orbit,
-  );
-});
-
-test('a live camera the viewer cannot hold fails once and rolls back completely', async () => {
-  const {
-    dimensionManager,
-    snapshots,
-    state,
-    viewer,
-  } = createRestoreOwners();
-  // A viewer that clamps the orbit radius cannot reproduce this saved pose.
-  const setViewCameraState = viewer.setViewCameraState;
-  viewer.setViewCameraState = (viewId, camera) => {
-    const held = structuredClone(camera);
-    held.orbit.radius = Math.min(held.orbit.radius, 50);
-    held.orbit.targetRadius = Math.min(held.orbit.targetRadius, 50);
-    setViewCameraState(viewId, held);
-  };
-  const saved = multiviewSnapshot();
-  saved.live.cameraState = cameraState(80);
-
-  let failure = null;
-  await assert.rejects(
-    restoreMultiview({
-      state,
-      viewer,
-      async restoreActiveFields() {},
-      async restoreFilters() {},
-    }, saved, liveViewState()),
-    error => {
-      failure = error;
-      return true;
-    },
-  );
-  // The replay failure itself, not "rollback was incomplete": the rollback
-  // no longer re-asserts the very pose that was just proven unreachable.
-  assert.ok(!(failure instanceof AggregateError), String(failure));
-  assert.match(failure.message, /did not preserve the exact saved live camera/);
-  assert.deepEqual(snapshots, []);
-  assert.deepEqual([...state.viewContexts.keys()], ['live']);
-  assert.deepEqual([...dimensionManager.dimensions.keys()], ['live']);
-  assert.equal(state.activeViewId, 'live');
-  assert.deepEqual(viewer.getViewCameraState('live'), cameraState());
+  assert.deepEqual(viewer.getViewCameraState('live').orbit, live.orbit);
 });

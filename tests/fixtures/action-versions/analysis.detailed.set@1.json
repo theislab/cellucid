@@ -1,0 +1,120 @@
+{
+  "examples": [
+    {
+      "in": "panel",
+      "plot": "x",
+      "plot_options": [
+        {
+          "option": "x",
+          "value": "x"
+        }
+      ],
+      "variable": null
+    },
+    {
+      "in": "panel",
+      "plot": "x",
+      "plot_options": [
+        {
+          "option": "x",
+          "value": "x"
+        }
+      ],
+      "variable": null
+    },
+    {
+      "in": "panel",
+      "plot": "x",
+      "plot_options": [
+        {
+          "option": "x",
+          "value": "x"
+        }
+      ],
+      "variable": {
+        "key": "x",
+        "type": "categorical_obs"
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "plot": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "plot_options": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "option": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "option",
+            "value"
+          ],
+          "type": "object"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "variable": {
+        "oneOf": [
+          {
+            "type": "null"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "categorical_obs",
+                  "continuous_obs",
+                  "gene_expression"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "key"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "type": "analysis.detailed.set",
+  "version": 1
+}

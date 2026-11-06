@@ -8,12 +8,12 @@
 // something other than the user (a dataset's advertised starting state, the
 // Reset Camera button) does not silently end the coupling.
 //
-// The published-state spec builds its bundle with the application's own writer
-// rather than a hand-assembled one, so the fixture cannot drift away from the
-// format the reader accepts.
+// The published-state spec builds its starting view with the application's
+// own writer and publish step (`helpers/session-files.mjs`) rather than a
+// hand-assembled file, so the fixture cannot drift away from the format the
+// reader accepts.
 
-import { PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE } from '../../assets/js/app/session/published-default.js';
-import { SESSION_BUNDLE_MAGIC_BYTES } from '../../assets/js/app/session/bundle/format.js';
+import { startingViewBytes } from './helpers/session-files.mjs';
 import { readFile } from 'node:fs/promises';
 
 import {
@@ -26,6 +26,7 @@ import { serveSyntheticCatalog } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { clickSaveSession } from './helpers/session-buttons.mjs';
 
 const FIXTURE_ROOT = appUrl('/tests/browser/fixtures/generated-dimensions/');
 const DATASET_ID = 'deterministic-dimensions';
@@ -55,73 +56,6 @@ function positions(dimension) {
     { length: CELL_COUNT * dimension },
     (unused, index) => POINTS[Math.floor(index / dimension)][index % dimension],
   );
-}
-
-const BUNDLE_MAGIC = new TextDecoder().decode(SESSION_BUNDLE_MAGIC_BYTES);
-
-// The exact static profile a dataset may advertise as its starting state, in
-// order (PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE). An interactive Save State
-// writes these plus chunks a published default must not carry (a camera
-// path), so the fixture keeps exactly this set.
-const PUBLISHED_DEFAULT_CHUNK_IDS = Object.freeze(
-  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.map(profile => profile.id),
-);
-
-/**
- * Turn an interactive session bundle into the narrower published-default
- * profile a dataset may advertise.
- *
- * The bytes still come from the application's own writer; only chunks outside
- * the published profile are dropped, and the container is re-framed with the
- * documented `[magic][u32 manifest length][manifest][u32 length + chunk]…`
- * layout.
- *
- * @param {Buffer} bundle
- * @returns {Buffer}
- */
-function toPublishedDefault(bundle) {
-  expect(bundle.subarray(0, BUNDLE_MAGIC.length).toString('utf8'))
-    .toBe(BUNDLE_MAGIC);
-  let offset = BUNDLE_MAGIC.length;
-  const manifestLength = bundle.readUInt32LE(offset);
-  offset += 4;
-  const manifest = JSON.parse(
-    bundle.subarray(offset, offset + manifestLength).toString('utf8'),
-  );
-  offset += manifestLength;
-
-  const kept = [];
-  const keptChunks = [];
-  for (const entry of manifest.chunks) {
-    const chunkLength = bundle.readUInt32LE(offset);
-    offset += 4;
-    const chunk = bundle.subarray(offset, offset + chunkLength);
-    offset += chunkLength;
-    if (!PUBLISHED_DEFAULT_CHUNK_IDS.includes(entry.id)) {
-      continue;
-    }
-    kept.push(entry);
-    keptChunks.push(chunk);
-  }
-  expect(offset).toBe(bundle.byteLength);
-  expect(kept.map(entry => entry.id)).toEqual(PUBLISHED_DEFAULT_CHUNK_IDS);
-
-  // A published default is applied to the sample it ships beside, so it
-  // records no source.
-  const manifestBytes = Buffer.from(
-    JSON.stringify({ ...manifest, source: null, chunks: kept }),
-    'utf8',
-  );
-  const parts = [Buffer.from(BUNDLE_MAGIC, 'utf8')];
-  const manifestHeader = Buffer.alloc(4);
-  manifestHeader.writeUInt32LE(manifestBytes.byteLength, 0);
-  parts.push(manifestHeader, manifestBytes);
-  for (const chunk of keptChunks) {
-    const header = Buffer.alloc(4);
-    header.writeUInt32LE(chunk.byteLength, 0);
-    parts.push(header, chunk);
-  }
-  return Buffer.concat(parts);
 }
 
 /**
@@ -197,8 +131,8 @@ test('the dimension rule keeps re-selecting a mode nobody chose', async ({
 
   // A restore publishing the mode the dimension already implies is not a user
   // choice, so it must not take navigation away from the dimension rule. This
-  // is exactly what a dataset's advertised starting state does through
-  // `app/session/contributors/core-state.js`.
+  // is exactly what a dataset's starting view does through the `camera` state
+  // domain (`app/state/domains/camera.js`).
   await page.evaluate(() => {
     window._cellucidViewer.setNavigationMode('orbit');
   });
@@ -288,9 +222,9 @@ test('a published starting state reports its field and leaves the dimension rule
 
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    page.click('#save-state-btn'),
+    clickSaveSession(page),
   ]);
-  const bundle = toPublishedDefault(await readFile(await download.path()));
+  const bundle = await startingViewBytes(await readFile(await download.path()));
   expect(bundle.byteLength).toBeGreaterThan(0);
   await closePageWithApplicationRetirement(page);
 

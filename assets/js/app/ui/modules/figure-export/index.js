@@ -26,6 +26,8 @@ export function initFigureExport({ state, viewer, dom, dataSourceManager = null 
   const engine = createFigureExportEngine({ state, viewer, dataSourceManager });
   const ui = initFigureExportUI({ state, viewer, container, engine });
 
-  return { ...ui, exportFigure: engine.exportFigure };
+  // `renderFigure`: the same figure, returned instead of downloaded (a
+  // picture an agent reads, `app/reads/views.js`).
+  return { ...ui, exportFigure: engine.exportFigure, renderFigure: engine.renderFigure };
 }
 

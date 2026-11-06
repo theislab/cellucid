@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { getActions } from '../assets/js/app/actions/index.js';
 import {
   initRepresentationControls,
   representationOptionText,
@@ -30,11 +31,29 @@ function createDeferred() {
 }
 
 const REPRESENTATIONS = Object.freeze([
-  Object.freeze({ layoutKey: 'X_umap_3d', dimension: 3, name: 'UMAP', label: 'UMAP', isDefault: true }),
-  Object.freeze({ layoutKey: 'X_pca', dimension: 2, name: 'PCA (unintegrated)', label: 'PCA (unintegrated)', isDefault: false }),
-  Object.freeze({ layoutKey: 'X_umap_2d', dimension: 2, name: 'UMAP', label: 'UMAP', isDefault: true }),
-  Object.freeze({ layoutKey: 'X_tsne', dimension: 2, name: 't-SNE', label: 't-SNE', isDefault: false }),
+  Object.freeze({ layoutKey: 'X_umap_3d', dimension: 3, name: 'UMAP', label: 'UMAP', isDefault: true, ref: { key: 'X_umap', columns: [0, 1, 2] } }),
+  Object.freeze({ layoutKey: 'X_pca', dimension: 2, name: 'PCA (unintegrated)', label: 'PCA (unintegrated)', isDefault: false, ref: { key: 'X_pca', columns: [0, 1] } }),
+  Object.freeze({ layoutKey: 'X_umap_2d', dimension: 2, name: 'UMAP', label: 'UMAP', isDefault: true, ref: { key: 'X_umap', columns: [0, 1] } }),
+  Object.freeze({ layoutKey: 'X_tsne', dimension: 2, name: 't-SNE', label: 't-SNE', isDefault: false, ref: { key: 'X_tsne', columns: [0, 1] } }),
 ]);
+
+/** Views as the viewer lists them: the live view and one kept view (View 2). */
+const VIEWER = Object.freeze({
+  getLiveViewHidden: () => false,
+  getSnapshotViews: () => [{ id: 'snap_1' }],
+});
+
+/** Every action dispatched in a test, with its exact params. */
+function recordDispatches(t) {
+  const events = [];
+  const stop = getActions().subscribe(event => {
+    if (event.kind === 'start') events.push([event.type, event.params]);
+  });
+  t.after(stop);
+  return events;
+}
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
 
 function installDom(t) {
   const previous = {
@@ -151,10 +170,21 @@ function createState({ layoutKey = 'X_umap_2d', representations = REPRESENTATION
       listeners.set(name, listener);
       return () => listeners.delete(name);
     },
-    async setViewRepresentation(viewId, nextLayoutKey, options) {
-      calls.push(['setViewRepresentation', viewId, nextLayoutKey, options]);
+    async setViewEmbeddingRef(viewId, ref) {
+      calls.push(['setViewEmbeddingRef', viewId, ref]);
       if (this.pending !== null) await this.pending;
-      this.layouts.set(viewId, nextLayoutKey);
+      const shown = this.representations.find(item => (
+        item.ref.key === ref.key && item.ref.columns.join() === ref.columns.join()
+      ));
+      if (shown === undefined) throw new RangeError(`This dataset cannot plot obsm['${ref.key}'].`);
+      this.layouts.set(viewId, shown.layoutKey);
+      return shown.layoutKey;
+    },
+    async showDefaultRepresentation(viewId, dimension) {
+      calls.push(['showDefaultRepresentation', viewId, dimension]);
+      const shown = this.representations.find(item => item.dimension === dimension && item.isDefault);
+      this.layouts.set(viewId, shown.layoutKey);
+      return shown.layoutKey;
     },
     async cycleRepresentation(viewId, dimension) {
       calls.push(['cycleRepresentation', viewId, dimension]);
@@ -197,6 +227,7 @@ test('the picker lists every enabled representation by dimension and names the v
   const { state } = createState();
   const controls = initRepresentationControls({
     state,
+    viewer: VIEWER,
     dom,
     callbacks: {
       viewLabel: viewId => (viewId === 'snap_1' ? 'View 2' : null),
@@ -232,13 +263,15 @@ test('the picker lists every enabled representation by dimension and names the v
   assert.equal(dom.controls.hidden, true);
 });
 
-test('choosing a representation switches the selected view as an explicit choice', async t => {
+test('choosing a representation is the view.embedding.set action of the selected view', async t => {
   const { dom, fireChange } = installDom(t);
   const events = captureNotifications(t);
+  const dispatched = recordDispatches(t);
   const { calls, state } = createState();
   let badgeCalls = 0;
   const controls = initRepresentationControls({
     state,
+    viewer: VIEWER,
     dom,
     callbacks: {
       viewLabel: () => 'View 2',
@@ -252,14 +285,18 @@ test('choosing a representation switches the selected view as an explicit choice
   const switching = createDeferred();
   state.pending = switching.promise;
   fireChange('X_tsne');
-  assert.deepEqual(calls, [
-    ['setViewRepresentation', 'snap_1', 'X_tsne', { followsDefault: false }],
-  ]);
   // While the view loads, the picker cannot start a second switch.
   assert.equal(dom.select.disabled, true);
   assert.equal(dom.select.title, 'Switching…');
+  await settle();
+  assert.deepEqual(dispatched, [
+    ['view.embedding.set', { view: 'View 2', embedding: { key: 'X_tsne', columns: [0, 1] } }],
+  ]);
+  assert.deepEqual(calls, [
+    ['setViewEmbeddingRef', 'snap_1', { key: 'X_tsne', columns: [0, 1] }],
+  ]);
   switching.resolve();
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await settle();
   assert.equal(dom.select.disabled, false);
   assert.equal(dom.select.value, 'X_tsne');
   assert.equal(badgeCalls, 1);
@@ -267,11 +304,11 @@ test('choosing a representation switches the selected view as an explicit choice
 
   // A refused switch says why and shows what the view still shows.
   state.pending = null;
-  state.setViewRepresentation = async () => {
-    throw new Error('X_pca is not enabled for this dataset.');
+  state.setViewEmbeddingRef = async () => {
+    throw new RangeError('X_pca is not enabled for this dataset.');
   };
   fireChange('X_pca');
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await settle();
   assert.deepEqual(events, [
     ['error', 'X_pca is not enabled for this dataset.', { category: 'dimension' }],
   ]);
@@ -279,11 +316,84 @@ test('choosing a representation switches the selected view as an explicit choice
   assert.equal(badgeCalls, 1);
 });
 
+test('an embedding without a data mapping name is chosen by its dimension when it is the default, else refused', async t => {
+  const { dom, fireChange } = installDom(t);
+  const events = captureNotifications(t);
+  const dispatched = recordDispatches(t);
+  const unnamed = [
+    { layoutKey: '2d', dimension: 2, name: 'Generated', label: 'Generated', isDefault: true, ref: null },
+    { layoutKey: 'extra', dimension: 2, name: 'Extra', label: 'Extra', isDefault: false, ref: null },
+  ];
+  const { calls, state } = createState({ layoutKey: 'extra', representations: unnamed });
+  const controls = initRepresentationControls({
+    state,
+    viewer: VIEWER,
+    dom,
+    callbacks: { viewLabel: () => 'View 2', onViewBadgesMaybeChanged() {} },
+  });
+  t.after(() => controls.destroy());
+
+  fireChange('2d');
+  await settle();
+  assert.deepEqual(dispatched, [['view.embedding.default', { view: 'View 2', dimension: 2 }]]);
+  assert.deepEqual(calls, [['showDefaultRepresentation', 'snap_1', 2]]);
+  assert.deepEqual(events, []);
+
+  fireChange('extra');
+  await settle();
+  assert.equal(dispatched.length, 1, 'nothing is dispatched for an embedding a step cannot name');
+  assert.deepEqual(events, [[
+    'error',
+    'Extra has no data mapping name a step could record; the 2 key steps through it.',
+    { category: 'dimension' },
+  ]]);
+  assert.equal(dom.select.value, '2d');
+});
+
+test('agents and replays name the view and the embedding; unknown names are refused with a sentence', async t => {
+  const { dom } = installDom(t);
+  captureNotifications(t);
+  const { calls, state } = createState();
+  const controls = initRepresentationControls({
+    state,
+    viewer: VIEWER,
+    dom,
+    callbacks: { viewLabel: () => 'View 2', onViewBadgesMaybeChanged() {} },
+  });
+  t.after(() => controls.destroy());
+  const actions = getActions();
+
+  const set = await actions.dispatch('view.embedding.set', { view: 'View 1', embedding: { key: 'X_pca', columns: [0, 1] } });
+  assert.deepEqual(set.outcome, { view: 'View 1' });
+  assert.equal(state.layouts.get('live'), 'X_pca');
+  const shown = await actions.dispatch('view.embedding.default', { view: 'View 2', dimension: 3 });
+  assert.deepEqual(shown.outcome, { view: 'View 2', embedding: 'UMAP' });
+  assert.equal(state.layouts.get('snap_1'), 'X_umap_3d');
+  const cycled = await actions.dispatch('view.embedding.cycle', { view: 'View 2', dimension: 2 });
+  assert.deepEqual(cycled.outcome, { view: 'View 2', embedding: 'UMAP', position: 2, count: 3 });
+  assert.deepEqual(calls.map(call => call[0]), ['setViewEmbeddingRef', 'showDefaultRepresentation', 'cycleRepresentation']);
+
+  await assert.rejects(
+    actions.dispatch('view.embedding.set', { view: 'View 3', embedding: { key: 'X_pca', columns: [0, 1] } }),
+    { name: 'ActionRefused', message: 'There is no View 3: 2 views are open (View 1 and View 2).' }
+  );
+  await assert.rejects(
+    actions.dispatch('view.embedding.set', { view: 'View 1', embedding: { key: 'X_nope', columns: [0, 1] } }),
+    { name: 'ActionRefused', message: "This dataset cannot plot obsm['X_nope']." }
+  );
+  await assert.rejects(
+    actions.dispatch('view.embedding.cycle', { view: 'View 1', dimension: 1 }),
+    { name: 'ActionRefused', message: 'No 1D embedding is on. Turn one on in Session › Data mapping.' }
+  );
+  assert.equal(calls.length, 4, 'only the refused embedding reached the state');
+});
+
 test('one enabled representation is named, not offered as a choice', t => {
   const { dom } = installDom(t);
   const { state } = createState({ representations: [REPRESENTATIONS[2]] });
   const controls = initRepresentationControls({
     state,
+    viewer: VIEWER,
     dom,
     callbacks: { viewLabel: () => null, onViewBadgesMaybeChanged() {} },
   });
@@ -296,10 +406,12 @@ test('one enabled representation is named, not offered as a choice', t => {
 test('keys 1, 2 and 3 step through a dimension and say where they are in the cycle', async t => {
   const { dom } = installDom(t);
   const events = captureNotifications(t);
+  const dispatched = recordDispatches(t);
   const { calls, state } = createState();
   let badgeCalls = 0;
   const controls = initRepresentationControls({
     state,
+    viewer: VIEWER,
     dom,
     callbacks: {
       viewLabel: () => 'View 2',
@@ -318,6 +430,11 @@ test('keys 1, 2 and 3 step through a dimension and say where they are in the cyc
     ['cycleRepresentation', 'snap_1', 2],
     ['cycleRepresentation', 'snap_1', 3],
   ]);
+  assert.deepEqual(dispatched, [
+    ['view.embedding.cycle', { view: 'View 2', dimension: 2 }],
+    ['view.embedding.cycle', { view: 'View 2', dimension: 2 }],
+    ['view.embedding.cycle', { view: 'View 2', dimension: 3 }],
+  ]);
   // Each notice replaces the one before it, so a burst of key presses leaves
   // one notice naming where the view is now.
   assert.deepEqual(events, [
@@ -335,6 +452,7 @@ test('keys 1, 2 and 3 step through a dimension and say where they are in the cyc
   events.length = 0;
   await controls.cycle(1);
   assert.equal(calls.length, 3);
+  assert.equal(dispatched.length, 3);
   assert.deepEqual(events, [[
     'info',
     'No 1D embedding is on. Turn one on in Session › Data mapping.',
@@ -347,6 +465,7 @@ test('the picker follows every representation change and mapping change', t => {
   const { listeners, state } = createState();
   const controls = initRepresentationControls({
     state,
+    viewer: VIEWER,
     dom,
     callbacks: { viewLabel: () => 'View 2', onViewBadgesMaybeChanged() {} },
   });
@@ -369,6 +488,7 @@ test('teardown removes every listener and fences a switch still settling', async
   let badgeCalls = 0;
   const controls = initRepresentationControls({
     state,
+    viewer: VIEWER,
     dom,
     callbacks: {
       viewLabel: () => 'View 2',
@@ -380,6 +500,8 @@ test('teardown removes every listener and fences a switch still settling', async
   const switching = createDeferred();
   state.pending = switching.promise;
   fireChange('X_tsne');
+  // The action reached the state, which is still switching.
+  await settle();
 
   controls.destroy();
   assert.equal(domListeners.every(({ signal }) => signal.aborted), true);
@@ -394,9 +516,13 @@ test('teardown removes every listener and fences a switch still settling', async
   assert.deepEqual(events, []);
   assert.equal(dom.select.value, valueAtTeardown);
 
-  // Nothing after teardown reaches the state.
+  // Nothing after teardown reaches the state, and the actions are no longer
+  // provided by the closed picker.
   const before = state.layouts.get('snap_1');
   await controls.cycle(2);
   fireChange('X_pca');
   assert.equal(state.layouts.get('snap_1'), before);
+  for (const type of ['view.embedding.set', 'view.embedding.default', 'view.embedding.cycle']) {
+    assert.equal(getActions().provided(type), false, type);
+  }
 });

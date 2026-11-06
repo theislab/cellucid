@@ -1,1693 +1,715 @@
 /**
- * @fileoverview Session bundle orchestrator.
+ * @fileoverview Session files of the open dataset: saving its history as a
+ * `.cellucid-session` (format 4, `history-file.js`), loading one back into
+ * the history, and putting a dataset's published starting view back.
  *
- * Responsibilities:
- * - enumerate contributors in a fixed order
- * - capture chunks + write a single-file `.cellucid-session` bundle
- * - load manifest and apply eager/lazy chunks in one awaited restore operation
- * - integrate NotificationCenter progress tracking
- * - own cancellation (AbortController) and isolate failures
+ * - **Save and Share** write what the person chose of the open dataset's
+ *   history (`share-scope.js`: the whole history, the current state only, or
+ *   its steps only; which trackers and branches; notes, conversations,
+ *   Recently deleted, times, the dataset's source, analysis results), stamped
+ *   with what wrote it (`app-stamp.js`). Changes made while recording was
+ *   paused are made one step first (`history.settlePaused`), and a change
+ *   made outside an action one too (`history.reconcile`), so what is shown is
+ *   what is written. The dataset part (fingerprint, source, the cells and
+ *   genes it was saved on, the fields the shown state uses) is taken with
+ *   the open cells in use (`useOpenCells`), so a growth step or Apply waits
+ *   until it is written, and a dataset replaced meanwhile is refused.
+ * - **Load** verifies the file against the open dataset before anything is
+ *   applied (its identity, data mapping and cell order,
+ *   `verifySessionFingerprint`; the fields it uses), then adds its trackers
+ *   beside the person's own (`history.importTrackers`, History v2 Q2): the
+ *   file's active head is shown as soon as the eager chunks are read, the
+ *   rest is read while it is shown, and a failure anywhere puts back what was
+ *   shown before. A file of steps only opens as a replay plan
+ *   (`history.replay`). The autosave's saved states (`app/history/autosave.js`)
+ *   replace the history (`loadSavedHistory`, `history.load`): continuing one
+ *   is continuing that work. Once either is shown, each analysis result it
+ *   left out (Share › Results: compute again on open) is run again as a step
+ *   (`recompute-results.js`).
+ * - **A starting view** (`published-default.js`: one tracker of one root) is
+ *   put back without a step, before the dataset's first tracker starts
+ *   (`history.showValues`), and applies to any subsample of its dataset.
  *
- * The orchestrator deliberately does NOT know feature internals.
+ * Every load is one owned operation: a newer one cancels it and waits for it
+ * to settle; Cancel on its progress cancels it.
  *
  * @module session/session-serializer
  */
 
-import { readBundle } from './bundle/reader.js';
-import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
+import { NO_PAGE_CHROME, openHistoryFile, readHistoryFileManifest } from './history-file.js';
+import { SAVE_DEFAULTS, writeSharedHistory } from './share-scope.js';
+import { readReplayPlan } from '../history/replay.js';
+import { recomputeLeftOutResults, recomputeSentences } from './recompute-results.js';
+import { getActionCatalog } from '../actions/index.js';
+import { createOpaqueId } from '../utils/opaque-id.js';
+import { pageVersion } from '../utils/page-version.js';
+import { assertPublishedDefaultProfile, assertPublishedDefaultRoot } from './published-default.js';
+import { captureDatasetSourceRecord } from './dataset-source-record.js';
 import {
-  assertDatasetSourceRecord,
-  captureDatasetSourceRecord,
-} from './dataset-source-record.js';
-import { captureCellSubsetRecord, captureGeneSampleRecord, decodeCellSubsetRecord, decodeGeneSampleRecord } from './cell-subset-record.js';
-import { writeBundle } from './bundle/writer.js';
-import { downloadBlob } from '../utils/download.js';
+  captureCellSubsetRecord, captureGeneSampleRecord, decodeCellSubsetRecord, decodeGeneSampleRecord,
+} from './cell-subset-record.js';
 import {
-  MAX_FRAME_BYTES
-} from './bundle/format.js';
-import { gzipCompress, gzipDecompress } from './codecs/gzip.js';
-import {
-  CURRENT_GENERIC_STATIC_CHUNK_PROFILES,
-  PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE,
-  STATIC_CHUNK_PROFILE_KEYS,
-  assertPublishedDefaultChunkProfile
-} from './published-default.js';
-import {
-  assertDatasetFingerprint,
-  assertSessionRequires,
-  buildSessionContext,
-  collectRequiredFields,
-  describeMissingRequiredFields,
-  createSessionRestoreTransaction,
-  datasetFingerprintStillCurrent,
-  getDatasetFingerprint,
+  collectRequiredFields, datasetFingerprintStillCurrent, describeMissingRequiredFields, getDatasetFingerprint,
   verifySessionFingerprint,
-  registerSessionRestoreSnapshots,
-  restoreSessionDataMapping
 } from './session-context.js';
-import {
-  assertArray,
-  assertBoolean,
-  assertNonEmptyString,
-  assertSafeInteger,
-  requireMethod,
-} from './schema-contract.js';
-import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
-import { formatCountOf } from '../../utils/format-units.js';
+import { assertNonEmptyString, assertSafeInteger, requireMethod } from './schema-contract.js';
+import { downloadBlob } from '../utils/download.js';
+import { sameJson } from '../utils/same-json.js';
+import { getNotificationCenter } from '../notification-center.js';
 import { useOpenCells } from '../../data/open-cells-work.js';
-import { throwIfAborted, isCancellation, cancelled, cancellationKind, abortReason, onAbort } from '../../utils/abort.js';
-import { markReported } from '../../utils/errors.js';
+import { requireExactKeys } from '../../utils/exact-record.js';
+import { abortReason, cancellationKind, cancelled, isCancellation, onAbort, throwIfAborted } from '../../utils/abort.js';
+import { failureText, markReported } from '../../utils/errors.js';
+import { heldCategoriesOf } from '../state/managers/field/pending-categories.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 /**
- * @typedef {'eager'|'lazy'} ChunkPriority
- * @typedef {'json'|'binary'} ChunkKind
- * @typedef {'none'|'gzip'} ChunkCodec
- *
- * @typedef {object} SessionChunk
- * @property {string} id
- * @property {string} contributorId
- * @property {ChunkPriority} priority
- * @property {ChunkKind} kind
- * @property {ChunkCodec} codec
- * @property {string} label
- * @property {boolean} datasetDependent
- * @property {object|Uint8Array} payload
+ * @typedef {object} SavedHistorySource
+ * What a saved history is read from (a session file, a saved state of the
+ * autosave): its dataset part, then its chunks or records in two stages.
+ * @property {object} header - createdAt, datasetFingerprint, source, requires, cells?, genes?
+ * @property {'history'|'state'|'steps'} content - what it holds: a history (or a state) to show, or steps only to replay
+ * @property {{pressed: Record<string, string>}} chrome - the page chrome it carries outside its history
+ * @property {{app: {version: string, catalog: string}, actions: Array<object>|null}} stamps - what wrote it:
+ *   a file's manifest stamps; a saved state of this browser, its app and null actions (compare by `app.catalog`)
+ * @property {() => Promise<{history: object, values: Map<string, unknown>}>} readEager
+ * @property {() => Promise<{values: Map<string, unknown>, chats: Array<object>, journals: Array<object>,
+ *   params: Array<object>}>} readRest - `history-file.js` `openHistoryFile`
+ * @property {(reason: unknown) => Promise<void>} cancel
  */
-
-/**
- * @typedef {object} SessionContributor
- * @property {string} id
- * @property {(ctx: any) => Promise<SessionChunk[]|void>|SessionChunk[]|void} capture
- * @property {(ctx: any, chunkMeta: any, payload: any) => Promise<void>|void} restore
- */
-
-const BUILT_IN_STATIC_CHUNK_PROFILES = Object.freeze([
-  ...CURRENT_GENERIC_STATIC_CHUNK_PROFILES
-]);
-const STATIC_PROFILE_BY_ID = new Map(
-  BUILT_IN_STATIC_CHUNK_PROFILES.map(profile => [profile.id, profile])
-);
-const STATIC_PROFILE_BY_CONTRIBUTOR = new Map(
-  BUILT_IN_STATIC_CHUNK_PROFILES.map(
-    profile => [profile.contributorId, profile]
-  )
-);
-
-function validateBuiltInStaticChunkProfile(entry, context) {
-  const idProfile = STATIC_PROFILE_BY_ID.get(entry.id);
-  const contributorProfile =
-    STATIC_PROFILE_BY_CONTRIBUTOR.get(entry.contributorId);
-  if (
-    idProfile !== undefined
-    && contributorProfile !== undefined
-    && idProfile !== contributorProfile
-  ) {
-    throw new TypeError(
-      `${context} mixes two canonical built-in chunk identities.`
-    );
-  }
-  const expected = idProfile ?? contributorProfile;
-  if (expected === undefined) return;
-  for (const key of STATIC_CHUNK_PROFILE_KEYS) {
-    if (entry[key] !== expected[key]) {
-      throw new TypeError(
-        `${context} must match canonical built-in chunk "${expected.id}".`
-      );
-    }
-  }
-}
-
-function isExpectedRestoreDismissal(error, signal) {
-  return (
-    cancellationKind(error) === 'superseded'
-    || cancellationKind(error) === 'user'
-    || cancellationKind(signal.reason) === 'superseded'
-    || cancellationKind(signal.reason) === 'user'
-  );
-}
-
-/**
- * What a session says about the dataset it is saved on, read once, at the
- * start of the capture: its fingerprint (whose cell-order digest the reader
- * worker answers), and then, in the same turn as the guard's record, the
- * cells it was saved on (`cells`), where it was opened from (`source`) and
- * the fields its state uses (`requires`). The capture runs with the open
- * cells in use (`useOpenCells`), so no growth step or Apply changes them
- * under it; the guard catches a dataset replaced meanwhile.
- *
- * @param {object} ctx
- * @param {object} base - The serializer's base context
- */
-async function captureSessionDatasetOwner(ctx, base) {
-  const fingerprint = Object.freeze(await getDatasetFingerprint(ctx));
-  const state = ctx.state;
-  const getGeneration = requireMethod(
-    state,
-    'getDatasetGeneration',
-    'Session capture DataState'
-  );
-  const owner = Object.freeze({
-    fingerprint,
-    generation: assertSafeInteger(
-      getGeneration.call(state),
-      'Session capture dataset generation'
-    ),
-    cellIdentity: state.cellIdentity ?? null,
-    obsData: state.obsData,
-    obsFields: state.obsData?.fields,
-    positionsArray: state.positionsArray,
-    state,
-    varData: state.varData,
-    varFields: state.varData?.fields,
-    cells: captureCellSubsetRecord(base.dataSourceManager),
-    genes: captureGeneSampleRecord(base.dataSourceManager),
-    source: captureDatasetSourceRecord(base.dataSourceManager),
-    requires: collectRequiredFields(base.state)
-  });
-  assertSessionDatasetOwner(ctx, owner);
-  return owner;
-}
-
-function assertSessionDatasetOwner(ctx, owner) {
-  const state = ctx.state;
-  const getGeneration = requireMethod(
-    state,
-    'getDatasetGeneration',
-    'Session capture DataState'
-  );
-  const generation = assertSafeInteger(
-    getGeneration.call(state),
-    'Session capture dataset generation'
-  );
-  if (
-    state !== owner.state
-    || generation !== owner.generation
-    || (state.cellIdentity ?? null) !== owner.cellIdentity
-    || state.obsData !== owner.obsData
-    || state.obsData?.fields !== owner.obsFields
-    || state.positionsArray !== owner.positionsArray
-    || state.varData !== owner.varData
-    || state.varData?.fields !== owner.varFields
-    || !datasetFingerprintStillCurrent(ctx, owner.fingerprint)
-  ) {
-    const error = new Error(
-      'The dataset changed while the session was being saved (another dataset, '
-      + 'its data mapping or the cells shown). Save the session again.'
-    );
-    error.code = 'SESSION_CAPTURE_DATASET_CHANGED';
-    throw error;
-  }
-}
-
-
-/**
- * Basic manifest shape validation (untrusted input).
- * @param {any} manifest
- */
-function validateManifest(manifest, contributorById, manifestProfile) {
-  if (
-    manifestProfile !== null
-    && manifestProfile !== 'published-default'
-  ) {
-    throw new TypeError('Session manifest profile is invalid.');
-  }
-  // `cells` is present only for a session saved on a subsample
-  // (`cell-subset-record.js`); without it the session was saved on every
-  // cell. `genes` only for one saved while genes were read for a sample of
-  // the open cells.
-  requireExactKeys(
-    manifest,
-    [
-      'createdAt', 'datasetFingerprint', 'source', 'requires', 'chunks',
-      ...(Object.hasOwn(manifest ?? {}, 'cells') ? ['cells'] : []),
-      ...(Object.hasOwn(manifest ?? {}, 'genes') ? ['genes'] : []),
-    ],
-    'Session manifest'
-  );
-  if (
-    typeof manifest.createdAt !== 'string'
-    || new Date(manifest.createdAt).toISOString() !== manifest.createdAt
-  ) {
-    throw new TypeError('Session manifest createdAt must be a canonical ISO timestamp.');
-  }
-  assertDatasetFingerprint(
-    manifest.datasetFingerprint,
-    'Session manifest datasetFingerprint'
-  );
-  assertDatasetSourceRecord(manifest.source, 'Session manifest source');
-  if (Object.hasOwn(manifest, 'cells')) {
-    const cells = decodeCellSubsetRecord(manifest.cells, 'Session manifest cells');
-    if (cells.spec.k !== manifest.datasetFingerprint.cellCount) {
-      throw new TypeError('Session manifest cells must keep exactly the fingerprint cell count.');
-    }
-  }
-  if (Object.hasOwn(manifest, 'genes')) {
-    decodeGeneSampleRecord(manifest.genes, manifest.datasetFingerprint.cellCount, 'Session manifest genes');
-  }
-  assertSessionRequires(manifest.requires, 'Session manifest requires');
-  if (manifestProfile === 'published-default' && manifest.source !== null) {
-    throw new TypeError(
-      'A published default is applied to the sample it ships beside; its source must be null.'
-    );
-  }
-  assertArray(manifest.chunks, 'Session manifest chunks');
-  const chunkIds = new Set();
-  const contributorOrder = new Map(
-    [...contributorById.keys()].map(
-      (contributorId, index) => [contributorId, index]
-    )
-  );
-  let fieldOverlaysAvailable = false;
-  let sawLazy = false;
-  let lastEagerContributorIndex = -1;
-  let lastLazyContributorIndex = -1;
-  for (let index = 0; index < manifest.chunks.length; index++) {
-    const entry = manifest.chunks[index];
-    const context = `Session manifest chunk ${index}`;
-    requireExactKeys(
-      entry,
-      [
-        'id',
-        'contributorId',
-        'priority',
-        'kind',
-        'codec',
-        'label',
-        'datasetDependent',
-        'storedBytes',
-        'uncompressedBytes'
-      ],
-      context
-    );
-    const chunkId = assertNonEmptyString(entry.id, `${context} id`);
-    if (chunkIds.has(chunkId)) {
-      throw new TypeError(`Session manifest chunk id "${chunkId}" is duplicated.`);
-    }
-    chunkIds.add(chunkId);
-    const contributorId = assertNonEmptyString(
-      entry.contributorId,
-      `${context} contributorId`
-    );
-    if (!contributorById.has(contributorId)) {
-      throw new Error(
-        `Session contributor "${contributorId}" is not registered for chunk "${chunkId}".`
-      );
-    }
-    if (
-      chunkId === 'core/field-overlays'
-      && contributorId === 'field-overlays'
-    ) {
-      fieldOverlaysAvailable = true;
-    }
-    if (
-      contributorId === 'user-defined-codes'
-      && !fieldOverlaysAvailable
-    ) {
-      throw new TypeError(
-        'User-defined code chunks require the prior field-overlays chunk.'
-      );
-    }
-    if (entry.priority !== 'eager' && entry.priority !== 'lazy') {
-      throw new TypeError(`${context} priority must be eager or lazy.`);
-    }
-    if (entry.priority === 'lazy') {
-      sawLazy = true;
-    } else if (sawLazy) {
-      throw new TypeError('Session manifest eager chunks must precede lazy chunks.');
-    }
-    if (manifestProfile === null) {
-      const currentContributorIndex = contributorOrder.get(contributorId);
-      const previousContributorIndex = entry.priority === 'eager'
-        ? lastEagerContributorIndex
-        : lastLazyContributorIndex;
-      if (currentContributorIndex < previousContributorIndex) {
-        throw new TypeError(
-          `Session manifest ${entry.priority} contributor groups must ` +
-          'match their registered order.'
-        );
-      }
-      if (entry.priority === 'eager') {
-        lastEagerContributorIndex = currentContributorIndex;
-      } else {
-        lastLazyContributorIndex = currentContributorIndex;
-      }
-    }
-    if (entry.kind !== 'json' && entry.kind !== 'binary') {
-      throw new TypeError(`${context} kind must be json or binary.`);
-    }
-    if (entry.codec !== 'none' && entry.codec !== 'gzip') {
-      throw new TypeError(`${context} codec must be none or gzip.`);
-    }
-    assertNonEmptyString(entry.label, `${context} label`);
-    assertBoolean(entry.datasetDependent, `${context} datasetDependent`);
-    validateBuiltInStaticChunkProfile(entry, context);
-    assertSafeInteger(entry.storedBytes, `${context} storedBytes`, {
-      maximum: MAX_FRAME_BYTES
-    });
-    assertSafeInteger(entry.uncompressedBytes, `${context} uncompressedBytes`);
-  }
-  if (manifestProfile === null) {
-    for (const expected of CURRENT_GENERIC_STATIC_CHUNK_PROFILES) {
-      if (
-        contributorById.has(expected.contributorId)
-        && !chunkIds.has(expected.id)
-      ) {
-        throw new TypeError(
-          `Current session manifests require singleton chunk "${expected.id}".`
-        );
-      }
-    }
-  }
-  return manifest;
-}
-
-/**
- * Published official defaults are intentionally much narrower than an
- * interactive user-authored session. Validate the complete static profile
- * before the chunk iterator can dispatch even its first contributor.
- *
- * @param {any} manifest
- */
-function validatePublishedDefaultManifest(manifest) {
-  if (manifest === null || typeof manifest !== 'object') {
-    throw new TypeError(
-      'Published default session must match the exact static profile.'
-    );
-  }
-
-  // Which chunks are accepted, and in what order, is decided by
-  // `published-default.js` — the same function the publish step runs, so the
-  // rule the reader enforces and the rule the publisher obeys cannot drift.
-  assertPublishedDefaultChunkProfile(manifest.chunks);
-
-  // Each chunk's declared size bounds its own inflate; a published default
-  // has no size limit of its own.
-  for (const actual of manifest.chunks) {
-    assertSafeInteger(
-      actual.uncompressedBytes,
-      `Published default chunk "${actual.id}" uncompressedBytes`
-    );
-  }
-  return manifest;
-}
-
-function assertJsonValue(value, context, ancestors = new Set()) {
-  if (
-    value === null
-    || typeof value === 'string'
-    || typeof value === 'boolean'
-  ) {
-    return value;
-  }
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new TypeError(`${context} JSON numbers must be finite.`);
-    }
-    return value;
-  }
-  if (typeof value !== 'object') {
-    throw new TypeError(`${context} must contain only exact JSON values.`);
-  }
-  if (ancestors.has(value)) {
-    throw new TypeError(`${context} must not contain cyclic references.`);
-  }
-  ancestors.add(value);
-  if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index++) {
-      if (!Object.hasOwn(value, index)) {
-        throw new TypeError(`${context} arrays must not contain holes.`);
-      }
-      assertJsonValue(value[index], `${context}[${index}]`, ancestors);
-    }
-  } else {
-    requirePlainRecord(value, context);
-    for (const [key, child] of Object.entries(value)) {
-      assertNonEmptyString(key, `${context} property name`);
-      assertJsonValue(child, `${context}.${key}`, ancestors);
-    }
-  }
-  ancestors.delete(value);
-  return value;
-}
-
-/**
- * Encode a JSON payload into UTF-8 bytes.
- * @param {any} value
- * @returns {Uint8Array}
- */
-function encodeJsonBytes(value) {
-  assertJsonValue(value, 'Session JSON payload');
-  return new TextEncoder().encode(JSON.stringify(value));
-}
-
-/**
- * Decode UTF-8 JSON bytes.
- * @param {Uint8Array} bytes
- * @returns {any}
- */
-function decodeJsonBytes(bytes) {
-  if (!(bytes instanceof Uint8Array)) {
-    throw new TypeError('Session JSON bytes must be a Uint8Array.');
-  }
-  const value = JSON.parse(
-    new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-  );
-  return assertJsonValue(value, 'Decoded session JSON payload');
-}
-
-function assertOwner(value, context) {
-  if (value === null || typeof value !== 'object') {
-    throw new TypeError(`${context} must be an object.`);
-  }
-  return value;
-}
-
-function assertNullableOwner(value, context) {
-  if (value === null) return value;
-  return assertOwner(value, context);
-}
-
-function assertAbortController(value, context) {
-  assertOwner(value, context);
-  requireMethod(value, 'abort', context);
-  if (
-    value.signal === null
-    || typeof value.signal !== 'object'
-    || typeof value.signal.aborted !== 'boolean'
-  ) {
-    throw new TypeError(`${context} must expose an AbortSignal.`);
-  }
-  return value;
-}
-
-function assertAbortSignal(value, context) {
-  assertOwner(value, context);
-  if (typeof value.aborted !== 'boolean') {
-    throw new TypeError(`${context} must expose an aborted boolean.`);
-  }
-  requireMethod(value, 'addEventListener', context);
-  requireMethod(value, 'removeEventListener', context);
-  return value;
-}
-
-function assertNotifications(value) {
-  assertOwner(value, 'Session notification owner');
-  for (const methodName of [
-    'startDownload',
-    'updateDownload',
-    'completeDownload',
-    'dismissDownload',
-    'failDownload',
-    'info'
-  ]) {
-    requireMethod(value, methodName, 'Session notification owner');
-  }
-  return value;
-}
-
-function assertCapturedChunk(chunk, contributorId, chunkIds) {
-  const context = `Session contributor "${contributorId}" chunk`;
-  requireExactKeys(
-    chunk,
-    [
-      'id',
-      'contributorId',
-      'priority',
-      'kind',
-      'codec',
-      'label',
-      'datasetDependent',
-      'payload'
-    ],
-    context
-  );
-  const chunkId = assertNonEmptyString(chunk.id, `${context} id`);
-  if (chunkIds.has(chunkId)) {
-    throw new TypeError(`Session chunk id "${chunkId}" is duplicated.`);
-  }
-  chunkIds.add(chunkId);
-  if (chunk.contributorId !== contributorId) {
-    throw new TypeError(
-      `${context} contributorId must equal its current contributor id.`
-    );
-  }
-  if (chunk.priority !== 'eager' && chunk.priority !== 'lazy') {
-    throw new TypeError(`${context} priority must be eager or lazy.`);
-  }
-  if (chunk.kind !== 'json' && chunk.kind !== 'binary') {
-    throw new TypeError(`${context} kind must be json or binary.`);
-  }
-  if (chunk.codec !== 'none' && chunk.codec !== 'gzip') {
-    throw new TypeError(`${context} codec must be none or gzip.`);
-  }
-  assertNonEmptyString(chunk.label, `${context} label`);
-  assertBoolean(chunk.datasetDependent, `${context} datasetDependent`);
-  if (chunk.kind === 'json') {
-    assertJsonValue(chunk.payload, `${context} payload`);
-  } else if (!(chunk.payload instanceof Uint8Array)) {
-    throw new TypeError(`${context} binary payload must be a Uint8Array.`);
-  }
-  return chunk;
-}
-
-async function captureRestoreSnapshots(
-  ctx,
-  contributorById,
-  manifest,
-  manifestProfile
-) {
-  const snapshots = new Map();
-  const capturedIds = new Set();
-  const incomingChunkIds = new Set(
-    manifest.chunks.map(chunk => chunk.id)
-  );
-  const requiredProfiles = manifestProfile === 'published-default'
-    ? PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE
-    : PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE.filter(
-      profile => incomingChunkIds.has(profile.id)
-    );
-  for (const expected of requiredProfiles) {
-    const contributor = contributorById.get(expected.contributorId);
-    if (contributor === undefined) {
-      throw new Error(
-        `Session rollback contributor "${expected.contributorId}" is not registered.`
-      );
-    }
-    const produced = await contributor.capture(ctx);
-    if (!Array.isArray(produced) || produced.length !== 1) {
-      throw new TypeError(
-        `Session rollback contributor "${expected.contributorId}" must capture exactly one chunk.`
-      );
-    }
-    const chunk = assertCapturedChunk(
-      produced[0],
-      expected.contributorId,
-      capturedIds
-    );
-    for (const key of STATIC_CHUNK_PROFILE_KEYS) {
-      if (chunk[key] !== expected[key]) {
-        throw new TypeError(
-          `Session rollback chunk "${expected.id}" does not match its current profile.`
-        );
-      }
-    }
-    snapshots.set(expected.id, structuredClone(chunk.payload));
-  }
-  return snapshots;
-}
 
 function failureMessage(error) {
-  if (!(error instanceof Error)) {
-    return 'Session operation threw a non-Error value.';
-  }
-  if (typeof error.message !== 'string' || error.message.length === 0) {
-    return error.name;
-  }
-  return error.message;
+  if (!(error instanceof Error)) return 'The session could not be loaded.';
+  return error.message.length > 0 ? error.message : error.name;
 }
 
-function preserveRestoreRollbackFailure(error, rollbackError) {
-  if (error instanceof Error && error.cause === undefined) {
-    error.cause = rollbackError;
+function isDismissal(error, signal) {
+  return ['superseded', 'user'].includes(cancellationKind(error))
+    || ['superseded', 'user'].includes(cancellationKind(signal.reason));
+}
+
+/**
+ * The refusal naming every field a saved state uses that the open dataset
+ * lacks, or null. Genes are named by the mapping's gene names, so they are
+ * compared only when the saved mapping names them the way the open one does
+ * (the same modality and gene-name column); otherwise the history names a
+ * missing gene itself when its value is put back.
+ */
+function describeMissingFields(state, header) {
+  const saved = header.datasetFingerprint.dataMapping;
+  const current = state.getDataMapping();
+  const sameGeneNames = current !== null
+    && sameJson(current.geneNames ?? null, saved.geneNames ?? null)
+    && sameJson(current.modality ?? null, saved.modality ?? null);
+  return describeMissingRequiredFields(state, {
+    obs: header.requires.obs,
+    var: sameGeneNames ? header.requires.var : [],
+  });
+}
+
+/**
+ * What the person is told of a field the loaded state names categories of
+ * that no open cell holds (a text or boolean column on a subsample: its
+ * categories are those its open cells hold): their filters and colours are
+ * held by label and applied when cells holding them open
+ * (`state/managers/field/pending-categories.js`).
+ *
+ * @param {string} fieldKey
+ * @param {number} count - How many categories are held
+ * @param {string} what - What was loaded ("Session file", "Starting view", "Saved state")
+ */
+export function heldCategoriesNotice(fieldKey, count, what) {
+  return `${formatCountOf(count, 'category', 'categories')} of "${fieldKey}" in this ${what.toLowerCase()} `
+    + `${count === 1 ? "isn't" : "aren't"} among the open cells; `
+    + `${count === 1 ? 'its settings apply' : 'their settings apply'} when those cells open.`;
+}
+
+/** Tell once per field, after a load, which categories it holds for cells not open. */
+function tellHeldCategories(state, what, notifications) {
+  for (const { key, labels } of heldCategoriesOf(state)) {
+    notifications.info(heldCategoriesNotice(key, labels.length, what), { category: 'session' });
   }
 }
 
 export class SessionSerializer {
   /**
-   * @param {object} options
-   * @param {import('../state/core/data-state.js').DataState} options.state
-   * @param {object} options.viewer
-   * @param {HTMLElement|null} [options.sidebar]
-   * @param {import('../../data/data-source-manager.js').DataSourceManager|null} [options.dataSourceManager]
-   * @param {any|null} [options.comparisonModule]
-   * @param {any|null} [options.analysisWindowManager]
-  * @param {SessionContributor[]} options.contributors
+   * @param {{
+   *   state: import('../state/core/data-state.js').DataState,
+   *   dataSourceManager: object|null,
+   *   getHistory: () => (ReturnType<typeof import('../history/history.js').createHistory>|null),
+   *   dispatcher: {idle: () => Promise<void>},
+   *   onLoaded: () => void,
+   *   catalog?: object,
+   *   version?: () => string,
+   *   chrome?: {capture: () => {pressed: Record<string, string>}, plan: (chrome: {pressed: Record<string, string>}) => {notes: string[], apply: () => void}},
+   * }} options - `getHistory`: the open dataset's history, or null while none is
+   *   open; `onLoaded`: a session file, saved state or starting view is shown (the
+   *   camera path saved with Autoplay on starts, `cinematic-camera` `startAutoplay`);
+   *   `catalog`: the action catalogue files are stamped with (the page's);
+   *   `version`: the Cellucid version that writes (the page's `<meta name="cellucid-version">`);
+   *   `chrome`: the page chrome sessions carry outside the history (the pressed selection tool,
+   *   CEL-0249): taken at a save, put back once a load shows its head
    */
   constructor(options) {
-    requireExactKeys(
-      options,
-      [
-        'state',
-        'viewer',
-        'sidebar',
-        'dataSourceManager',
-        'comparisonModule',
-        'analysisWindowManager',
-        'cinematicCamera',
-        'figureExport',
-        'contributors'
-      ],
-      'SessionSerializer options'
-    );
-    this._base = {
-      state: assertOwner(options.state, 'SessionSerializer state'),
-      viewer: assertOwner(options.viewer, 'SessionSerializer viewer'),
-      sidebar: assertOwner(options.sidebar, 'SessionSerializer sidebar'),
-      dataSourceManager: assertNullableOwner(
-        options.dataSourceManager,
-        'SessionSerializer dataSourceManager'
-      ),
-      comparisonModule: assertNullableOwner(
-        options.comparisonModule,
-        'SessionSerializer comparisonModule'
-      ),
-      analysisWindowManager: assertNullableOwner(
-        options.analysisWindowManager,
-        'SessionSerializer analysisWindowManager'
-      ),
-      cinematicCamera: assertNullableOwner(
-        options.cinematicCamera,
-        'SessionSerializer cinematicCamera'
-      ),
-      figureExport: assertNullableOwner(
-        options.figureExport,
-        'SessionSerializer figureExport'
-      )
-    };
-
-    /** @type {SessionContributor[]} */
-    this._contributors = assertArray(
-      options.contributors,
-      'SessionSerializer contributors'
-    );
-
-    /** @type {Map<string, SessionContributor>} */
-    this._contributorById = new Map();
-    for (let index = 0; index < this._contributors.length; index++) {
-      const contributor = assertOwner(
-        this._contributors[index],
-        `Session contributor ${index}`
-      );
-      const contributorId = assertNonEmptyString(
-        contributor.id,
-        `Session contributor ${index} id`
-      );
-      requireMethod(contributor, 'capture', `Session contributor "${contributorId}"`);
-      requireMethod(contributor, 'restore', `Session contributor "${contributorId}"`);
-      if (this._contributorById.has(contributorId)) {
-        throw new TypeError(`Session contributor id "${contributorId}" is duplicated.`);
-      }
-      this._contributorById.set(contributorId, contributor);
-    }
-
+    const keys = ['state', 'dataSourceManager', 'getHistory', 'dispatcher', 'onLoaded'];
+    requireExactKeys(options, [...keys, ...['catalog', 'version', 'chrome'].filter(key => Object.hasOwn(options ?? {}, key))], 'SessionSerializer options');
+    if (options.state === null || typeof options.state !== 'object') throw new TypeError('SessionSerializer needs the DataState.');
+    if (typeof options.getHistory !== 'function') throw new TypeError('SessionSerializer needs getHistory().');
+    if (typeof options.onLoaded !== 'function') throw new TypeError('SessionSerializer needs onLoaded().');
+    requireMethod(options.dispatcher, 'idle', 'SessionSerializer dispatcher');
+    this._state = options.state;
+    this._dataSourceManager = options.dataSourceManager;
+    this._getHistory = options.getHistory;
+    this._dispatcher = options.dispatcher;
+    this._onLoaded = options.onLoaded;
+    this._catalog = options.catalog ?? getActionCatalog();
+    this._version = options.version ?? writingVersion;
+    this._chrome = options.chrome ?? null;
     /** @type {AbortController|null} */
     this._activeRestoreAbort = null;
     /** @type {Promise<void>|null} */
     this._activeRestoreTask = null;
-    /** @type {(() => Promise<void>|void)|null} */
-    this._captureSettlement = null;
-    /** @type {(() => Promise<void>|void)|null} */
-    this._restoreSettlement = null;
-    /** @type {{saving: () => (() => Promise<void>|void), restored: () => Promise<void>|void}|null} */
-    this._sessionFileObserver = null;
     /** @type {Promise<void>} */
-    this._stateOperationTail = Promise.resolve();
-    /** The analysis module's arrival (`setAnalysisRefs`). @type {Promise<void>} */
-    this._analysisReady = Promise.resolve();
+    this._operationTail = Promise.resolve();
+    /** @type {(() => Promise<(() => Promise<void>|void)|void>)|null} */
+    this._captureSettlement = null;
+    /** @type {(() => Promise<(() => Promise<void>|void)|void>)|null} */
+    this._restoreSettlement = null;
+    /** The progress of the session file being read, while one is. @type {((loaded: number) => void)|null} */
+    this._progress = null;
   }
 
   /**
-   * The analysis module, which the page imports on demand (`main.js`): its
-   * references once it has started, or null when its code could not load.
-   * Session capture and restore wait for it, so a session's analysis parts
-   * are taken and given only once it exists; when it never started, there is
-   * nothing of it to take, and a session's analysis parts are refused with
-   * that reason (the analysis contributors).
-   *
-   * @param {Promise<{ comparisonModule: object, analysisWindowManager: object }|null>} ready
-   */
-  setAnalysisRefs(ready) {
-    if (typeof ready?.then !== 'function') {
-      throw new TypeError('Session analysis references must arrive as a promise.');
-    }
-    this._analysisReady = Promise.resolve(ready).then(refs => {
-      if (refs === null) return;
-      requireExactKeys(
-        refs,
-        ['comparisonModule', 'analysisWindowManager'],
-        'Session analysis references'
-      );
-      this._base.comparisonModule = assertOwner(
-        refs.comparisonModule,
-        'Session comparisonModule'
-      );
-      this._base.analysisWindowManager = assertOwner(
-        refs.analysisWindowManager,
-        'Session analysisWindowManager'
-      );
-    });
-  }
-
-  /**
-   * What a reading of the same dataset with other cells keeps (Open data ›
-   * Cells to open, `ui/modules/subsample-control.js`): every view with its
-   * camera, layout and embedding, each view's active field and filters, the
-   * sidebar controls, and the floating analysis windows — the session's own
-   * `core-state` and `analysis-windows` records, taken in memory. Nothing per
-   * cell: highlights and labels are carried by original cell position
-   * (`cell-subset-carry.js`).
-   *
-   * @returns {{core: object, windows: Uint8Array|null}}
-   */
-  captureViewCarry() {
-    const ctx = { ...this._base };
-    const take = id => this._contributorById.get(id).capture(ctx)[0].payload;
-    return {
-      core: take('core-state'),
-      windows: this._base.analysisWindowManager === null ? null : take('analysis-windows'),
-    };
-  }
-
-  /**
-   * Give a `captureViewCarry` record back to the dataset read again. Each
-   * part is applied on its own: a part the new reading cannot take (a filter
-   * on a category none of its cells has) is skipped and named, the rest
-   * applied.
-   *
-   * @param {{core: object, windows: Uint8Array|null}} carry
-   * @returns {Promise<string[]>} The parts that could not be kept, and why
-   */
-  async restoreViewCarry(carry) {
-    const ctx = { ...this._base, abortSignal: null, restoreTransaction: null };
-    const failures = [];
-    const give = async (id, payload, label) => {
-      if (payload === null) return;
-      try {
-        await this._contributorById.get(id).restore(ctx, null, payload);
-      } catch (error) {
-        failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    };
-    await give('core-state', carry.core, 'views, fields and filters');
-    await give('analysis-windows', carry.windows, 'analysis windows');
-    return failures;
-  }
-
-  /**
-   * Set the cinematic camera reference once the UI is initialized.
-   * @param {object} cinematicCamera
-   */
-  setCinematicCameraRef(cinematicCamera) {
-    this._base.cinematicCamera = assertOwner(
-      cinematicCamera,
-      'Session cinematic camera'
-    );
-  }
-
-  /**
-   * Set the figure-export panel once the UI is initialized.
-   * @param {object} figureExport
-   */
-  setFigureExportRef(figureExport) {
-    this._base.figureExport = assertOwner(
-      figureExport,
-      'Session figure export'
-    );
-  }
-
-  /**
-   * Bind the exact UI-mutation settlement required before contributors read
-   * session state. The UI owner is installed once after bootstrap.
-   *
-   * @param {() => Promise<void>|void} settle
+   * Bind what a save waits for before it reads the open dataset (its genes
+   * listed; no field interaction under way). Installed once.
+   * @param {() => Promise<(() => Promise<void>|void)|void>} settle - may return its release
    */
   setCaptureSettlement(settle) {
-    if (typeof settle !== 'function') {
-      throw new TypeError(
-        'Session capture settlement must be a function.'
-      );
-    }
-    if (
-      this._captureSettlement !== null
-      && this._captureSettlement !== settle
-    ) {
-      throw new Error(
-        'Session capture settlement is already owned.'
-      );
-    }
+    if (typeof settle !== 'function') throw new TypeError('Session capture settlement must be a function.');
+    if (this._captureSettlement !== null && this._captureSettlement !== settle) throw new Error('Session capture settlement is already owned.');
     this._captureSettlement = settle;
   }
 
   /**
-   * Bind synchronous invalidation plus drainage required before any restore
-   * contributor snapshots or replaces current UI-backed state.
-   *
-   * @param {() => Promise<void>|void} settle
+   * Bind what a load waits for before it puts state back. Installed once.
+   * @param {() => Promise<(() => Promise<void>|void)|void>} settle - may return its release
    */
   setRestoreSettlement(settle) {
-    if (typeof settle !== 'function') {
-      throw new TypeError(
-        'Session restore settlement must be a function.'
-      );
-    }
-    if (
-      this._restoreSettlement !== null
-      && this._restoreSettlement !== settle
-    ) {
-      throw new Error(
-        'Session restore settlement is already owned.'
-      );
-    }
+    if (typeof settle !== 'function') throw new TypeError('Session restore settlement must be a function.');
+    if (this._restoreSettlement !== null && this._restoreSettlement !== settle) throw new Error('Session restore settlement is already owned.');
     this._restoreSettlement = settle;
   }
 
-  /**
-   * Hear when a session file comes to hold what is shown: `saving()` as a
-   * session is saved (its result is called once the file is written), and
-   * `restored()` once a session file is restored. The page's highlight
-   * draft (`app/highlight-draft.js`) is installed once after bootstrap.
-   *
-   * @param {{saving: () => (() => Promise<void>|void), restored: () => Promise<void>|void}} observer
-   */
-  setSessionFileObserver(observer) {
-    requireExactKeys(observer, ['saving', 'restored'], 'Session file observer');
-    requireMethod(observer, 'saving', 'Session file observer');
-    requireMethod(observer, 'restored', 'Session file observer');
-    if (this._sessionFileObserver !== null) {
-      throw new Error('Session file observer is already installed.');
-    }
-    this._sessionFileObserver = observer;
-  }
-
-  /**
-   * Serialize every operation that reads or mutates contributor-backed state.
-   * The public task preserves the exact operation outcome while the internal
-   * tail always settles so one failure cannot poison later work.
-   *
-   * @template T
-   * @param {() => Promise<T>|T} operation
-   * @returns {Promise<T>}
-   */
-  _runExclusiveStateOperation(operation) {
-    if (typeof operation !== 'function') {
-      throw new TypeError(
-        'Session state operation must be a function.'
-      );
-    }
-    const task = this._stateOperationTail.then(operation);
-    this._stateOperationTail = task.then(
-      () => {},
-      () => {}
-    );
+  /** One operation on the session at a time; a failure does not stop the next. */
+  _exclusive(operation) {
+    const task = this._operationTail.then(operation);
+    this._operationTail = task.then(() => {}, () => {});
     return task;
   }
 
-  async _runSettlementLease(settle, label, operation) {
-    let release = null;
-    let failure = null;
-    let value;
+  async _withSettlement(settle, operation) {
+    const release = settle === null ? undefined : await settle();
+    if (release !== undefined && typeof release !== 'function') {
+      throw new TypeError('A session settlement must return its release function or nothing.');
+    }
     try {
-      if (settle !== null) {
-        const candidate = await settle();
-        if (
-          candidate !== undefined
-          && typeof candidate !== 'function'
-        ) {
-          throw new TypeError(
-            `${label} must return a release function or undefined.`
-          );
-        }
-        release = candidate ?? null;
-      }
-      value = await operation();
-    } catch (error) {
-      failure = error;
+      return await operation();
+    } finally {
+      if (typeof release === 'function') await release();
     }
-    if (release !== null) {
-      try {
-        await release();
-      } catch (releaseError) {
-        failure = failure === null
-          ? releaseError
-          : new AggregateError(
-              [failure, releaseError],
-              `${label} operation and release both failed.`
-            );
-      }
+  }
+
+  _requireHistory() {
+    const history = this._getHistory();
+    if (history === null || history.active === null) {
+      throw new Error('There is no history to save: open a dataset first.');
     }
-    if (failure !== null) throw failure;
-    return value;
+    return history;
   }
 
   /**
-   * Cancel any in-flight restore and return an awaitable settlement boundary.
+   * What a session says about the dataset it is saved on: its fingerprint,
+   * where it opens from, the cells and genes it was saved on, and the
+   * fields the shown state uses, taken together with the open cells in use.
+   * A dataset replaced, remapped or resized while it is taken is refused.
    *
-   * Aborting remains synchronous for existing UI callers. Awaiting the returned
-   * promise guarantees that no contributor from the canceled restore is still
-   * running.
-   *
-   * @returns {Promise<void>}
+   * @returns {Promise<{createdAt: string, datasetFingerprint: object, source: object|null,
+   *   requires: {obs: string[], var: string[]}, cells?: object, genes?: object}>}
    */
-  cancelRestore() {
-    if (this._activeRestoreAbort !== null) {
-      this._activeRestoreAbort.abort(
-        cancelled('user', 'Session restore was canceled by the user.')
-      );
-    }
-    const activeTask = this._activeRestoreTask;
-    if (activeTask === null) return Promise.resolve();
-    return activeTask.then(
-      () => {},
-      () => {}
-    );
-  }
-
-  /**
-   * Explicitly cancel and await the owned restore operation.
-   *
-   * @returns {Promise<void>}
-   */
-  async cancelRestoreAndWait() {
-    await this.cancelRestore();
-  }
-
-  /**
-   * Serialize restore ownership. A replacement aborts the current owner, waits
-   * for every contributor in that operation to settle, and only then starts.
-   *
-   * @param {(abortController: AbortController) => Promise<void>} operation
-   * @param {{ signal: AbortSignal|null }} options
-   * @returns {Promise<void>}
-   */
-  _runOwnedRestore(operation, options) {
-    if (typeof operation !== 'function') {
-      throw new TypeError('Session restore operation must be a function.');
-    }
-    requireExactKeys(options, ['signal'], 'Owned session restore options');
-    const callerSignal = options.signal === null
-      ? null
-      : assertAbortSignal(
-        options.signal,
-        'Owned session restore caller signal'
-      );
-
-    const previousTask = this._activeRestoreTask;
-    if (this._activeRestoreAbort !== null) {
-      this._activeRestoreAbort.abort(
-        cancelled('superseded', 'Session restore was superseded by a newer restore.')
-      );
-    }
-
-    const abortController = new AbortController();
-    const detachCallerAbort = onAbort(callerSignal, () => abortController.abort(abortReason(callerSignal)));
-
-    const ownedTask = this._runExclusiveStateOperation(async () => {
-      if (previousTask !== null) {
-        try {
-          await previousTask;
-        } catch {
-          // The prior caller owns its result. Replacement only needs settlement.
-        }
+  captureSessionHeader() {
+    const state = this._state;
+    const dataSourceManager = this._dataSourceManager;
+    return useOpenCells(async () => {
+      const ctx = { state, dataSourceManager };
+      const generation = state.getDatasetGeneration();
+      const owner = { cellIdentity: state.cellIdentity ?? null, obsData: state.obsData, varData: state.varData, positionsArray: state.positionsArray };
+      const datasetFingerprint = await getDatasetFingerprint(ctx);
+      if (
+        state.getDatasetGeneration() !== generation
+        || (state.cellIdentity ?? null) !== owner.cellIdentity
+        || state.obsData !== owner.obsData
+        || state.varData !== owner.varData
+        || state.positionsArray !== owner.positionsArray
+        || !datasetFingerprintStillCurrent(ctx, datasetFingerprint)
+      ) {
+        const error = new Error(
+          'The dataset changed while the session was being saved (another dataset, '
+          + 'its data mapping or the cells shown). Save the session again.'
+        );
+        error.code = 'SESSION_CAPTURE_DATASET_CHANGED';
+        throw error;
       }
-      throwIfAborted(abortController.signal);
-      let releaseSettlement = null;
-      let failure = null;
-      try {
-        if (this._restoreSettlement !== null) {
-          const release = await this._restoreSettlement();
-          if (release !== undefined && typeof release !== 'function') {
-            throw new TypeError(
-              'Session restore settlement must return a release function or undefined.'
-            );
-          }
-          releaseSettlement = release ?? null;
-          throwIfAborted(abortController.signal);
-        }
-        await operation(abortController);
-      } catch (error) {
-        if (
-          abortController.signal.aborted
-          && (
-            cancellationKind(
-              abortController.signal.reason
-            ) === 'superseded'
-            || cancellationKind(
-              abortController.signal.reason
-            ) === 'user'
-          )
-        ) {
-          failure = abortController.signal.reason;
-        } else {
-          failure = error;
-        }
-      }
-      if (releaseSettlement !== null) {
-        try {
-          await releaseSettlement();
-        } catch (releaseError) {
-          failure = failure === null
-            ? releaseError
-            : new AggregateError(
-                [failure, releaseError],
-                'Session restore and UI settlement release both failed.'
-              );
-        }
-      }
-      if (failure !== null) throw failure;
+      const cells = captureCellSubsetRecord(dataSourceManager);
+      const genes = captureGeneSampleRecord(dataSourceManager);
+      return {
+        createdAt: new Date().toISOString(),
+        datasetFingerprint,
+        source: captureDatasetSourceRecord(dataSourceManager),
+        requires: collectRequiredFields(state),
+        ...(cells === null ? {} : { cells }),
+        ...(genes === null ? {} : { genes }),
+      };
     });
-
-    this._activeRestoreAbort = abortController;
-    this._activeRestoreTask = ownedTask;
-
-    const releaseOwnership = () => {
-      detachCallerAbort();
-      if (this._activeRestoreTask === ownedTask) {
-        this._activeRestoreTask = null;
-        this._activeRestoreAbort = null;
-      }
-    };
-    ownedTask.then(releaseOwnership, releaseOwnership);
-    return ownedTask;
   }
 
   /**
-   * Create a `.cellucid-session` bundle Blob.
+   * What the person chose of the open dataset's history as a
+   * `.cellucid-session` file (`share-scope.js`). Actions under way finish
+   * first; changes made while recording was paused become one step, and a
+   * change made outside an action one too; the history's records and values
+   * are then taken in one turn.
+   *
+   * @param {{choice?: object}} [options] - a `share-scope.js` choice
+   *   (`SAVE_DEFAULTS`, `SHARE_DEFAULTS`, `STATE_DEFAULTS` or one made from them)
    * @returns {Promise<Blob>}
    */
-  createSessionBundle() {
-    return this._runExclusiveStateOperation(
-      () => this._createSessionBundle()
-    );
-  }
-
-  async _createSessionBundle() {
-    return this._runSettlementLease(
-      this._captureSettlement,
-      'Session capture settlement',
-      () => this._captureSessionBundlePayload()
-    );
+  createSessionBundle({ choice = SAVE_DEFAULTS } = {}) {
+    return this.writeShare({ choice }).then(({ blob }) => blob);
   }
 
   /**
-   * Capture with the open cells in use (`useOpenCells`): a growth step or
-   * Apply waits until the bundle is written, so every chunk, the
-   * fingerprint and the cell record describe the same cells. @private
+   * `createSessionBundle`, with what the file holds (`share-scope.js`
+   * `shareHistory`'s answer: its trackers and scope), for `history.share`.
+   *
+   * @param {{choice?: object}} [options]
+   * @returns {Promise<{blob: Blob, shared: object}>}
    */
-  _captureSessionBundlePayload() {
-    return useOpenCells(() => this._captureSessionBundleOnOpenCells());
-  }
-
-  async _captureSessionBundleOnOpenCells() {
-    // The analysis module's parts are taken once it has started.
-    await this._analysisReady;
-    const ctx = buildSessionContext(this._base, {
-      abortSignal: null,
-      restoreTransaction: null
-    });
-    const datasetOwner = await captureSessionDatasetOwner(ctx, this._base);
-
-    /** @type {SessionChunk[]} */
-    const emittedChunks = [];
-    const emittedChunkIds = new Set();
-    for (const contributor of this._contributors) {
-      assertSessionDatasetOwner(ctx, datasetOwner);
-      const produced = await contributor.capture(ctx);
-      assertSessionDatasetOwner(ctx, datasetOwner);
-      if (!Array.isArray(produced)) {
-        throw new TypeError(
-          `Session contributor "${contributor.id}" capture() must return an array`
-        );
+  writeShare({ choice = SAVE_DEFAULTS } = {}) {
+    return this._exclusive(() => this._withSettlement(this._captureSettlement, async () => {
+      await this._dispatcher.idle();
+      const history = this._requireHistory();
+      // What is shown is what is saved: a paused period's changes and a change made outside an action become steps.
+      await history.settlePaused({ origin: 'session' });
+      await history.reconcile();
+      const header = await this.captureSessionHeader();
+      // The values read across awaits stay readable while they are read (`value-pool.js` hold).
+      const unhold = history.pool.hold();
+      try {
+        return await writeSharedHistory({
+          snapshot: history.snapshot(),
+          shown: history.shownHashes(),
+          valueOf: hash => history.pool.get(hash),
+          choice,
+          header,
+          catalog: this._catalog,
+          version: this._version(),
+          newTrackerId: () => `t-${createOpaqueId()}`,
+          now: Date.now(),
+          chrome: this._chrome?.capture() ?? NO_PAGE_CHROME,
+        });
+      } finally {
+        unhold();
       }
-      for (const chunk of produced) {
-        emittedChunks.push(
-          assertCapturedChunk(chunk, contributor.id, emittedChunkIds)
-        );
-      }
-    }
-
-    // Writer invariant: all eager chunks must appear before any lazy chunks.
-    // Preserve contributor-relative ordering within each priority bucket.
-    /** @type {SessionChunk[]} */
-    const eagerChunks = [];
-    /** @type {SessionChunk[]} */
-    const lazyChunks = [];
-    for (const chunk of emittedChunks) {
-      if (chunk.priority === 'lazy') lazyChunks.push(chunk);
-      else eagerChunks.push(chunk);
-    }
-    const orderedChunks = [...eagerChunks, ...lazyChunks];
-
-    // Encode and (optionally) gzip each chunk payload into stored bytes.
-    /** @type {any[]} */
-    const manifestChunks = [];
-    /** @type {Uint8Array[]} */
-    const storedChunks = [];
-
-    for (const chunk of orderedChunks) {
-      // Serialize payload to bytes.
-      const uncompressedBytes =
-        chunk.kind === 'json'
-          ? encodeJsonBytes(chunk.payload)
-          : chunk.payload;
-      // Apply codec.
-      const storedBytes = chunk.codec === 'gzip'
-        ? await gzipCompress(uncompressedBytes, { signal: null })
-        : uncompressedBytes;
-      if (storedBytes.byteLength > MAX_FRAME_BYTES) {
-        throw new RangeError(
-          `Session chunk "${chunk.id}" holds ${formatCountOf(storedBytes.byteLength, 'byte')}; ` +
-          'a session chunk frame holds at most 4 GiB − 1 (its length is a u32).'
-        );
-      }
-
-      storedChunks.push(storedBytes);
-
-      manifestChunks.push({
-        id: chunk.id,
-        contributorId: chunk.contributorId,
-        priority: chunk.priority,
-        kind: chunk.kind,
-        codec: chunk.codec,
-        label: chunk.label,
-        datasetDependent: chunk.datasetDependent,
-        storedBytes: storedBytes.byteLength,
-        uncompressedBytes: uncompressedBytes.byteLength
-      });
-    }
-
-    // The chunks were compressed over several turns: the dataset they
-    // describe is still the one open.
-    assertSessionDatasetOwner(ctx, datasetOwner);
-    const { cells, genes } = datasetOwner;
-    const manifest = {
-      createdAt: new Date().toISOString(),
-      datasetFingerprint: datasetOwner.fingerprint,
-      source: datasetOwner.source,
-      requires: datasetOwner.requires,
-      chunks: manifestChunks,
-      ...(cells === null ? {} : { cells }),
-      ...(genes === null ? {} : { genes })
-    };
-
-    validateManifest(manifest, this._contributorById, null);
-    return writeBundle({ manifest, chunks: storedChunks });
+    }));
   }
 
   /**
-   * Download a `.cellucid-session` bundle.
+   * Download what the person chose of the open dataset's history as a `.cellucid-session` file.
    * @param {string} filename
+   * @param {{choice?: object}} [options]
    */
-  async downloadSession(filename) {
+  async downloadSession(filename, options = {}) {
     assertNonEmptyString(filename, 'Session download filename');
-    const saved = this._sessionFileObserver?.saving() ?? null;
-    const blob = await this.createSessionBundle();
-    downloadBlob(blob, filename);
-    if (saved !== null) await saved();
+    downloadBlob(await this.createSessionBundle(options), filename);
   }
 
   /**
-   * Show a file picker and progressively restore a session bundle.
+   * Read only a session file's manifest and say which dataset it belongs to
+   * and where that dataset opens from. Nothing is applied.
    *
-   * Resolves only after every selected session chunk has been restored.
-   *
-   * `beforeRestore` runs once a file has been chosen and before anything is
-   * read from it; resolving `false` abandons the restore. The session controls
-   * use it to wait for a dataset still loading, since a session is restored
-   * onto the dataset it was saved from.
+   * @param {Blob} blob
+   * @returns {Promise<{datasetId: string|null, name: string|null, source: object|null,
+   *   cells: {spec: object, kept: Uint32Array, digest: string}|null,
+   *   genes: {cells: number, order: object|null, digest: string}|null}>}
+   */
+  async readSessionDataset(blob) {
+    if (!(blob instanceof Blob)) throw new TypeError('Session source must be a Blob or File.');
+    return describeSessionDataset(await readHistoryFileManifest(blob));
+  }
+
+  /**
+   * Show a file picker and load the chosen session file into the history.
+   * `beforeRestore(file)` runs once a file is chosen, before anything is
+   * read from it; resolving false abandons the load (the session controls
+   * open the session's dataset there first).
    *
    * @param {{beforeRestore: (file: File) => Promise<boolean>}} options
-   * @returns {Promise<boolean>} True if a file was selected and restored.
+   * @returns {Promise<boolean>} whether a file was chosen and loaded
    */
   async loadSessionFromFile(options) {
-    requireExactKeys(
-      options,
-      ['beforeRestore'],
-      'Session file load options'
-    );
-    if (typeof options.beforeRestore !== 'function') {
-      throw new TypeError(
-        'Session file load beforeRestore must be a function.'
-      );
-    }
-    const file = await this._pickSessionFile();
+    requireExactKeys(options, ['beforeRestore'], 'Session file load options');
+    if (typeof options.beforeRestore !== 'function') throw new TypeError('Session file load beforeRestore must be a function.');
+    const file = await this.pickSessionFile();
     if (file === null) return false;
     const proceed = await options.beforeRestore(file);
-    if (typeof proceed !== 'boolean') {
-      throw new TypeError(
-        'Session file load beforeRestore must resolve a boolean.'
-      );
-    }
+    if (typeof proceed !== 'boolean') throw new TypeError('Session file load beforeRestore must resolve a boolean.');
     if (!proceed) return false;
     try {
       await this.restoreFromBlob(file);
       return true;
     } catch (error) {
-      if (
-        cancellationKind(error) === 'user'
-        || cancellationKind(error) === 'superseded'
-      ) {
-        return false;
-      }
+      if (['user', 'superseded'].includes(cancellationKind(error))) return false;
       throw error;
     }
   }
 
   /**
-   * Read only a session file's manifest (its header) and say which dataset
-   * it belongs to and where that dataset can be opened from. Nothing is
-   * applied, and no chunk is read.
-   *
-   * @param {Blob} blob
-   * @returns {Promise<{datasetId: string, name: string|null, source: object|null,
-   *   cells: {spec: object, kept: Uint32Array, digest: string}|null,
-   *   genes: {cells: number, order: Object|null, digest: string}|null}>}
-   *   `cells`: the subsample it was saved on, null for every cell; `genes`:
-   *   the open cells genes were read for, null for every open cell
+   * Load a session file into the open dataset's history: its trackers are
+   * added beside the person's own (named after the file), and its active
+   * head is shown. A file of steps only is replayed on the dataset shown.
+   * @param {Blob} blob - a File keeps its name with the trackers it adds
+   * @returns {Promise<void>}
    */
-  async readSessionDataset(blob) {
-    if (!(blob instanceof Blob)) {
-      throw new TypeError('Session source must be a Blob or File.');
-    }
-    const bundle = await readBundle(blob, { signal: null, onProgress: null });
-    try {
-      validateManifest(bundle.manifest, this._contributorById, null);
-      return Object.freeze({
-        datasetId: bundle.manifest.datasetFingerprint.datasetId,
-        name: bundle.manifest.datasetFingerprint.name,
-        source: bundle.manifest.source,
-        cells: Object.hasOwn(bundle.manifest, 'cells')
-          ? decodeCellSubsetRecord(bundle.manifest.cells, 'Session manifest cells')
-          : null,
-        genes: Object.hasOwn(bundle.manifest, 'genes')
-          ? decodeGeneSampleRecord(bundle.manifest.genes, bundle.manifest.datasetFingerprint.cellCount, 'Session manifest genes')
-          : null
+  restoreFromBlob(blob) {
+    if (!(blob instanceof Blob)) throw new TypeError('Session restore source must be a Blob or File.');
+    const totalBytes = assertSafeInteger(blob.size, 'Session restore Blob size');
+    const file = typeof blob.name === 'string' && blob.name.length > 0 ? blob.name : 'session file';
+    return this._runOwnedRestore(async controller => {
+      const opened = await openHistoryFile(blob, {
+        signal: controller.signal,
+        onProgress: loaded => this._progress?.(loaded),
       });
-    } finally {
-      await bundle.cancel('Only the session manifest was needed.');
-    }
+      return { ...opened, ...sourceFacts(opened.manifest) };
+    }, { label: 'Session file', totalBytes, signal: null, importFile: file });
   }
 
   /**
-   * Restore a session from a Blob/File.
-   * Resolves only after every selected session chunk has been restored.
+   * Load a saved history that is not a file (a saved state of the
+   * autosave) into the open dataset's history, verified like a file.
+   *
+   * @param {() => Promise<SavedHistorySource>} open
+   * @param {{label: string, signal?: AbortSignal|null}} options
+   * @returns {Promise<void>}
+   */
+  loadSavedHistory(open, { label, signal = null }) {
+    assertNonEmptyString(label, 'Saved history label');
+    return this._runOwnedRestore(() => open(), { label, totalBytes: null, signal });
+  }
+
+  /**
+   * Put a dataset's published starting view back (`published-default.js`):
+   * its one root's values, without a step, before the dataset's first
+   * tracker starts. It applies to any subsample of its dataset.
    *
    * @param {Blob} blob
+   * @param {{signal: AbortSignal, refreshUi: (options: {phase: 'commit'|'rollback'}) => Promise<void>|void}} options
    * @returns {Promise<void>}
    */
-  async restoreFromBlob(blob) {
-    if (!(blob instanceof Blob)) {
-      throw new TypeError('Session restore source must be a Blob or File.');
-    }
-    const totalBytes = assertSafeInteger(
-      blob.size,
-      'Session restore Blob size'
-    );
-    await this._runOwnedRestore(
-      (abortController) => this._restoreFromBundleSource(blob, {
-        totalBytes,
-        notifications: null,
-        downloadId: null,
-        abortController,
-        manifestProfile: null,
-        refreshUi: null
-      }),
-      { signal: null }
-    );
-    await this._sessionFileObserver?.restored();
-  }
-
-  /**
-   * Restore the one official static default published with a dataset.
-   *
-   * This path is deliberately distinct from arbitrary user session restore:
-   * the transport is bounded and its manifest must match the exact static
-   * profile before any contributor can mutate application state.
-   *
-   * @param {Blob} blob
-   * @param {{ signal: AbortSignal, refreshUi: (options: {phase: 'commit'|'rollback'}) => Promise<void>|void }} options
-   * @returns {Promise<void>}
-   */
-  async restorePublishedDefaultState(blob, options) {
-    if (!(blob instanceof Blob)) {
-      throw new TypeError(
-        'Published default session restore source must be a Blob.'
-      );
-    }
-    requireExactKeys(
-      options,
-      ['signal', 'refreshUi'],
-      'Published default session restore options'
-    );
-    const callerSignal = assertAbortSignal(
-      options.signal,
-      'Published default session restore signal'
-    );
-    throwIfAborted(callerSignal);
-    if (typeof options.refreshUi !== 'function') {
-      throw new TypeError(
-        'Published default session restore refreshUi must be a function.'
-      );
-    }
-    const totalBytes = assertSafeInteger(
-      blob.size,
-      'Published default session Blob size'
-    );
-
-    await this._runOwnedRestore(
-      (abortController) => this._restoreFromBundleSource(blob, {
-        totalBytes,
-        notifications: null,
-        downloadId: null,
-        abortController,
-        manifestProfile: 'published-default',
-        refreshUi: options.refreshUi
-      }),
-      { signal: callerSignal }
-    );
-  }
-
-  /**
-   * Shared restore implementation for any bundle source (Blob/File or a
-   * Blob-like `{ size, stream() }` object).
-   *
-   * @param {any} source
-   * @param {{ totalBytes: number|null, notifications: object|null, downloadId: string|null, abortController: AbortController, manifestProfile: 'published-default'|null, refreshUi: (() => Promise<void>|void)|null }} options
-   * @returns {Promise<void>}
-   */
-  async _restoreFromBundleSource(source, options) {
-    requireExactKeys(
-      options,
-      [
-        'totalBytes',
-        'notifications',
-        'downloadId',
-        'abortController',
-        'manifestProfile',
-        'refreshUi'
-      ],
-      'Session restore options'
-    );
-    const totalBytes = options.totalBytes === null
-      ? null
-      : assertSafeInteger(options.totalBytes, 'Session restore totalBytes');
-    const providedNotifications = options.notifications === null
-      ? null
-      : assertNotifications(options.notifications);
-    const providedDownloadId = options.downloadId === null
-      ? null
-      : assertNonEmptyString(options.downloadId, 'Session download notification id');
-    const abortController = assertAbortController(
-      options.abortController,
-      'Session restore AbortController'
-    );
-    if (
-      options.manifestProfile !== null
-      && options.manifestProfile !== 'published-default'
-    ) {
-      throw new TypeError('Session restore manifest profile is invalid.');
-    }
-    const manifestProfile = options.manifestProfile;
-    const refreshUi = options.refreshUi === null
-      ? null
-      : options.refreshUi;
-    if (
-      (manifestProfile === 'published-default')
-      !== (typeof refreshUi === 'function')
-    ) {
-      throw new TypeError(
-        'Published default restore requires exactly one refreshUi function.'
-      );
-    }
-
-    await this._analysisReady;
-    const restoreTransaction = createSessionRestoreTransaction();
-    if (refreshUi !== null) {
-      restoreTransaction.register(
-        'published-default/ui-rollback-refresh',
-        {
-          value: null,
-          prepare() {},
-          commit() {},
-          rollback() {
-            return refreshUi({ phase: 'rollback' });
-          }
-        }
-      );
-    }
-    const restoreSnapshots = new Map();
-    registerSessionRestoreSnapshots(
-      restoreTransaction,
-      restoreSnapshots
-    );
-    const ctx = buildSessionContext(this._base, {
-      abortSignal: abortController.signal,
-      restoreTransaction
-    });
-    const notifications = providedNotifications === null
-      ? assertNotifications(ctx.notifications)
-      : providedNotifications;
-
-    // Progress UI: treat the session file as a "download" so we can reuse the
-    // existing progress + speed UI in NotificationCenter.
-    const downloadId = providedDownloadId === null
-      ? assertNonEmptyString(
-        notifications.startDownload('Session file', totalBytes, {
-          onCancel: () => abortController.abort(
-            cancelled('user', 'Session restore was canceled by the user.')
-          )
-        }),
-        'Session download notification id'
-      )
-      : providedDownloadId;
-
-    let bundle = null;
-    try {
-      bundle = await readBundle(source, {
-        signal: abortController.signal,
-        onProgress: (loaded) =>
-          notifications.updateDownload(downloadId, loaded, totalBytes)
-      });
-      const { manifest, chunkStream } = bundle;
-
-      if (manifestProfile === 'published-default') {
-        validatePublishedDefaultManifest(manifest);
-      }
-      validateManifest(
-        manifest,
-        this._contributorById,
-        manifestProfile
-      );
-
-      // Verify, then apply: the dataset, its data mapping and the cell order
-      // of the layout the session names are all checked before any chunk
-      // touches state.
-      const mismatch = await verifySessionFingerprint(
-        ctx,
-        manifest.datasetFingerprint,
-        { profile: manifestProfile }
-      );
-      throwIfAborted(abortController.signal);
-      if (mismatch !== null) {
-        throw new RangeError(mismatch);
-      }
-      const capturedSnapshots = await captureRestoreSnapshots(
-        ctx,
-        this._contributorById,
-        manifest,
-        manifestProfile
-      );
-      throwIfAborted(abortController.signal);
-      for (const [chunkId, payload] of capturedSnapshots) {
-        restoreSnapshots.set(chunkId, payload);
-      }
-      // The embeddings the session names are restored before its views.
-      await restoreSessionDataMapping(
-        ctx,
-        manifest.datasetFingerprint.dataMapping
-      );
-      throwIfAborted(abortController.signal);
-      // Under the session's own mapping (its gene names), every field it
-      // uses has to exist before any chunk is applied.
-      const missingFields = describeMissingRequiredFields(
-        ctx.state,
-        manifest.requires
-      );
-      if (missingFields !== null) {
-        throw new RangeError(missingFields);
-      }
-      // Phase split: apply eager chunks now, then continue lazy in the background.
-      const iterator = chunkStream[Symbol.asyncIterator]();
-
-      // Helper that decodes a chunk payload and dispatches to its contributor.
-      const applyChunk = async (meta, storedBytes) => {
-        throwIfAborted(abortController.signal);
-        requirePlainRecord(meta, 'Session restore chunk metadata');
-        if (!(storedBytes instanceof Uint8Array)) {
-          throw new TypeError('Session restore chunk bytes must be a Uint8Array.');
-        }
-
-        const contributor = this._contributorById.get(meta.contributorId);
-        if (contributor === undefined) {
-          throw new Error(
-            `Session contributor "${meta.contributorId}" is not registered ` +
-            `for chunk "${meta.id}"`
-          );
-        }
-
-        let decodedBytes;
-        if (meta.codec === 'gzip') {
-          decodedBytes = await gzipDecompress(storedBytes, {
-            maxOutputBytes: meta.uncompressedBytes,
-            signal: abortController.signal
-          });
-        } else {
-          decodedBytes = storedBytes;
-        }
-        if (decodedBytes.byteLength !== meta.uncompressedBytes) {
-          throw new Error(
-            `Session chunk "${meta.id}" uncompressed byte length does not match its manifest.`
-          );
-        }
-
-        // Decode kind.
-        const payload = meta.kind === 'json' ? decodeJsonBytes(decodedBytes) : decodedBytes;
-
-        await contributor.restore(ctx, meta, payload);
-      };
-
-      // EAGER stage: process until the first lazy chunk (or EOF).
-      let firstLazy = null;
-      while (true) {
-        throwIfAborted(abortController.signal);
-        const { value, done } = await iterator.next();
-        if (done) break;
-        requireExactKeys(
-          value,
-          ['index', 'meta', 'bytes'],
-          'Session streamed chunk'
-        );
-        assertSafeInteger(value.index, 'Session streamed chunk index');
-        if (value.meta.priority === 'lazy') {
-          firstLazy = value;
-          break;
-        }
-        await applyChunk(value.meta, value.bytes);
-      }
-
-      // Apply the lazy stage in the same public restore operation. Yielding
-      // between chunks keeps the browser responsive without creating a second
-      // failure channel after restoreFromBlob() has resolved.
-      if (firstLazy) {
-        await applyChunk(firstLazy.meta, firstLazy.bytes);
-        while (true) {
-          throwIfAborted(abortController.signal);
-          const { value, done } = await iterator.next();
-          if (done) break;
-          // A macrotask, not an animation frame: frames do not run in a
-          // background tab or an off-screen notebook iframe, and a restore
-          // there has to finish all the same.
-          await yieldToMacrotask();
-          requireExactKeys(
-            value,
-            ['index', 'meta', 'bytes'],
-            'Session streamed chunk'
-          );
-          assertSafeInteger(value.index, 'Session streamed chunk index');
-          await applyChunk(value.meta, value.bytes);
-        }
-      }
-
-      if (refreshUi !== null) {
-        restoreTransaction.register(
-          'published-default/ui-commit-refresh',
-          {
-            value: null,
-            prepare() {},
-            commit() {
-              return refreshUi({ phase: 'commit' });
-            },
-            rollback() {}
-          }
-        );
-      }
-      await restoreTransaction.commit();
-      // The restore's own progress notification is the one place its outcome
-      // is published, success and failure alike. A second toast for the same
-      // event put "Session fully restored." on screen twice. A sample's own
-      // view (`published-default`) is part of opening it, which the person
-      // did not ask for as a session: it restores without a word.
-      if (manifestProfile === 'published-default') notifications.dismissDownload(downloadId);
-      else notifications.completeDownload(downloadId, 'Session fully restored.');
-    } catch (err) {
-      // A restore that stops before the bundle's end releases its source.
-      if (bundle !== null) await bundle.cancel(err);
+  restorePublishedDefaultState(blob, options) {
+    if (!(blob instanceof Blob)) throw new TypeError('Published default session restore source must be a Blob.');
+    requireExactKeys(options, ['signal', 'refreshUi'], 'Published default session restore options');
+    if (!(options.signal instanceof AbortSignal)) throw new TypeError('Published default session restore signal must be an AbortSignal.');
+    throwIfAborted(options.signal);
+    if (typeof options.refreshUi !== 'function') throw new TypeError('Published default session restore refreshUi must be a function.');
+    return this._runOwnedRestore(async controller => {
+      const file = await openHistoryFile(blob, { signal: controller.signal, onProgress: null });
       try {
-        await restoreTransaction.rollback();
-      } catch (rollbackError) {
-        preserveRestoreRollbackFailure(err, rollbackError);
+        assertPublishedDefaultProfile(file.manifest);
+      } catch (error) {
+        await file.cancel(error);
+        throw error;
       }
-      const isAbortFailure =
-        isCancellation(err);
-      const isSilentReplacement =
-        isExpectedRestoreDismissal(err, abortController.signal)
-        || (
-          manifestProfile === 'published-default'
-          && isAbortFailure
-          && abortController.signal.aborted
-        );
-      if (isSilentReplacement) {
+      return { ...file, ...sourceFacts(file.manifest) };
+    }, {
+      label: 'Starting view', totalBytes: blob.size, signal: options.signal, startingView: true, refreshUi: options.refreshUi,
+    });
+  }
+
+  /**
+   * Cancel the load under way and resolve once it has settled.
+   * @returns {Promise<void>}
+   */
+  cancelRestore() {
+    this._activeRestoreAbort?.abort(cancelled('user', 'Session restore was canceled by the user.'));
+    const task = this._activeRestoreTask;
+    return task === null ? Promise.resolve() : task.then(() => {}, () => {});
+  }
+
+  async cancelRestoreAndWait() {
+    await this.cancelRestore();
+  }
+
+  /**
+   * A file picker for `.cellucid-session` files: one hidden file input, the
+   * same in every browser; null when the person cancels it. Call it
+   * synchronously from the click that asks for it (a browser opens a picker
+   * only then): Load, and Replay a session file in the State panel.
+   * @returns {Promise<File|null>}
+   */
+  pickSessionFile() {
+    return pickSessionFile();
+  }
+
+  /**
+   * A session file as a saved history to replay (`app/history/replay.js`):
+   * its manifest, then its chunks, each checked as the file format requires.
+   * It is not compared with the dataset shown: a replay applies its steps by
+   * name, on this dataset or another, and never its values.
+   *
+   * @param {Blob} blob
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<SavedHistorySource>}
+   */
+  async openSessionFile(blob, { signal = null } = {}) {
+    if (!(blob instanceof Blob)) throw new TypeError('A session file to replay must be a Blob or File.');
+    const file = await openHistoryFile(blob, { signal, onProgress: null });
+    return { ...file, ...sourceFacts(file.manifest) };
+  }
+
+  /**
+   * One load: replaces (cancels and awaits) the one under way, holds the
+   * restore settlement, shows its progress, verifies, loads, and reports.
+   * @private
+   */
+  _runOwnedRestore(openSource, { label, totalBytes, signal, startingView = false, refreshUi = null, importFile = null }) {
+    const previous = this._activeRestoreTask;
+    this._activeRestoreAbort?.abort(cancelled('superseded', 'Session restore was superseded by a newer restore.'));
+    const controller = new AbortController();
+    const detach = onAbort(signal, () => controller.abort(abortReason(signal)));
+    const task = this._exclusive(async () => {
+      if (previous !== null) await previous.catch(() => {});
+      throwIfAborted(controller.signal);
+      await this._withSettlement(this._restoreSettlement, () => this._restore(openSource, {
+        label, totalBytes, controller, startingView, refreshUi, importFile,
+      }));
+    });
+    this._activeRestoreAbort = controller;
+    this._activeRestoreTask = task;
+    const release = () => {
+      detach();
+      if (this._activeRestoreTask === task) {
+        this._activeRestoreTask = null;
+        this._activeRestoreAbort = null;
+      }
+    };
+    task.then(release, release);
+    return task;
+  }
+
+  /**
+   * After trackers were loaded beside the person's: one notice whose Undo
+   * removes them to Recently deleted (each load is journaled, `load`; undoing
+   * it is `history.journal.undo`, so it is undoable and restorable as any edit).
+   * @private
+   */
+  _offerUndoLoad(added, file) {
+    const undoable = added.filter(tracker => tracker.journal !== null);
+    // Only beside trackers of the person's: the only trackers cannot be removed.
+    const own = this._getHistory()?.trackers().filter(tracker => !undoable.some(each => each.id === tracker.id)).length ?? 0;
+    if (undoable.length === 0 || own === 0 || !this._dispatcher) return;
+    const notifications = getNotificationCenter();
+    const what = undoable.length === 1 ? `"${undoable[0].name}"` : formatCountOf(undoable.length, 'tracker');
+    const id = notifications.show({
+      type: 'success',
+      category: 'session',
+      message: `Loaded ${what} from ${file} beside yours.`,
+      duration: 10_000,
+      action: {
+        label: 'Undo',
+        run: () => {
+          notifications.dismiss(id);
+          void (async () => {
+            for (const tracker of undoable) {
+              await this._dispatcher.dispatch('history.journal.undo', { tracker: tracker.id, entry: tracker.journal }, { origin: 'user' });
+            }
+          })().catch(error => notifications.error(`The load could not be undone: ${failureText(error)}`, { category: 'session' }));
+        },
+      },
+    });
+  }
+
+  /** @private */
+  async _restore(openSource, { label, totalBytes, controller, startingView, refreshUi, importFile }) {
+    const notifications = getNotificationCenter();
+    const downloadId = notifications.startDownload(label, totalBytes, {
+      onCancel: () => controller.abort(cancelled('user', 'Session restore was canceled by the user.')),
+    });
+    this._progress = loaded => notifications.updateDownload(downloadId, loaded, totalBytes);
+    let source = null;
+    let applied = false;
+    try {
+      // The file's header is read before anything else is refused: with no
+      // dataset open, the refusal names the dataset it was saved on
+      // (`verifySessionFingerprint`), which only the header knows.
+      source = await openSource(controller);
+      throwIfAborted(controller.signal);
+      const ctx = { state: this._state, dataSourceManager: this._dataSourceManager };
+      const mismatch = await verifySessionFingerprint(ctx, source.header.datasetFingerprint, {
+        profile: startingView ? 'published-default' : null,
+      });
+      throwIfAborted(controller.signal);
+      if (mismatch !== null) throw new RangeError(mismatch);
+      const history = this._getHistory();
+      if (history === null) throw new Error('No dataset is open. Open the dataset the session was saved on, then load the session again.');
+      const missing = describeMissingFields(this._state, source.header);
+      if (missing !== null) throw new RangeError(missing);
+      // The page chrome it carries (its selection tool, CEL-0249): checked against this page
+      // before anything is replaced, put back once the head is shown, what this page lacks said.
+      const chrome = source.chrome === undefined || this._chrome === null ? null : this._chrome.plan(source.chrome);
+      if (!startingView && source.content === 'steps') {
+        // Steps only: no values to show, a plan to replay here (its fingerprint matched: the same dataset).
+        const plan = await readReplayPlan(source, { signal: controller.signal });
+        await history.settlePaused({ origin: 'session' });
+        await history.replay(plan, { signal: controller.signal });
+        chrome?.apply();
+        notifications.completeDownload(downloadId, 'Session steps replayed.');
+        for (const note of chrome?.notes ?? []) notifications.info(note);
+        this._onLoaded();
+        return;
+      }
+      const eager = await source.readEager();
+      throwIfAborted(controller.signal);
+      if (startingView) {
+        await source.readRest();
+        const [tracker] = eager.history.trackers;
+        const [root] = tracker.steps;
+        assertPublishedDefaultRoot(root);
+        const values = Object.fromEntries(Object.entries(root.after).map(([id, hash]) => [id, eager.values.get(hash)]));
+        await history.showValues(values);
+        // The starting view's page chrome (its selection tool, CEL-0249).
+        chrome?.apply();
+        applied = true;
+        throwIfAborted(controller.signal);
+        await refreshUi({ phase: 'commit' });
         notifications.dismissDownload(downloadId);
-      } else if (manifestProfile === 'published-default' && !isAbortFailure) {
-        // A published default fails after its dataset has already loaded.
-        // Only the caller knows that, and it publishes the one notification
-        // that says so ("Sample view unavailable"); failing this progress
-        // entry as well announced the same error twice.
+        tellHeldCategories(this._state, label, notifications);
+        this._onLoaded();
+        return;
+      }
+      const rest = async () => {
+        throwIfAborted(controller.signal);
+        const more = await source.readRest();
+        throwIfAborted(controller.signal);
+        return more;
+      };
+      // Changes made while recording was paused are kept as one step before anything else is shown.
+      await history.settlePaused({ origin: 'session' });
+      let loaded = null;
+      if (importFile === null) {
+        await history.load(eager.history, { values: eager.values, signal: controller.signal, rest });
+      } else {
+        loaded = await history.importTrackers(eager.history, { file: importFile, values: eager.values, signal: controller.signal, rest });
+      }
+      chrome?.apply();
+      notifications.completeDownload(downloadId, 'Session fully restored.');
+      if (loaded !== null) this._offerUndoLoad(loaded.trackers, importFile);
+      for (const note of chrome?.notes ?? []) notifications.info(note);
+      // Analysis results the file left out are computed again, as steps (`recompute-results.js`).
+      const recomputed = await recomputeLeftOutResults({ history, dispatcher: this._dispatcher, signal: controller.signal });
+      for (const { tone, text } of recomputeSentences(recomputed)) notifications[tone](text, { category: 'session' });
+      tellHeldCategories(this._state, label, notifications);
+      this._onLoaded();
+    } catch (err) {
+      if (source !== null) await source.cancel(err).catch(() => {});
+      if (startingView && applied) {
+        // The starting view was put back, then its dataset changed or its
+        // interface did not follow: the interface is shown again from what is
+        // there (a replaced dataset retires this history anyway).
+        try { await refreshUi({ phase: 'rollback' }); } catch { /* the failure above is the one reported */ }
+      }
+      if (isDismissal(err, controller.signal) || (startingView && isCancellation(err) && controller.signal.aborted)) {
         notifications.dismissDownload(downloadId);
-      } else if (isAbortFailure) {
+      } else if (startingView && !isCancellation(err)) {
+        // Its caller says that the sample view could not be applied.
+        notifications.dismissDownload(downloadId);
+      } else if (isCancellation(err)) {
         notifications.failDownload(downloadId, 'Session restore canceled.');
         markReported(err);
       } else {
         notifications.failDownload(downloadId, failureMessage(err));
         markReported(err);
       }
-      throw err;
+      throw controller.signal.aborted && isDismissal(err, controller.signal) ? controller.signal.reason : err;
+    } finally {
+      this._progress = null;
     }
   }
+}
 
-  /**
-   * Open a file picker for `.cellucid-session` files.
-   * @returns {Promise<File|null>}
-   */
-  async _pickSessionFile() {
-    return new Promise((resolve, reject) => {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.multiple = false;
-      input.accept = '.cellucid-session,application/octet-stream';
-      input.style.position = 'fixed';
-      input.style.left = '-10000px';
-      input.style.top = '0';
-      input.style.opacity = '0';
-      document.body.appendChild(input);
+/** What a session file says beside its history, as a `SavedHistorySource` gives it. */
+function sourceFacts(manifest) {
+  return {
+    header: manifest, content: manifest.scope.content, chrome: manifest.chrome,
+    stamps: { app: manifest.app, actions: manifest.actions },
+  };
+}
 
-      let settled = false;
-      const cleanup = () => {
-        input.remove();
-      };
+/** The Cellucid version this page names (`utils/page-version.js`); a session file says what wrote it. */
+function writingVersion() {
+  const version = pageVersion();
+  if (version === null) throw new Error('This page names no Cellucid version, so a session file cannot say what wrote it.');
+  return version;
+}
 
-      const settle = (file, error = null) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (error !== null) reject(error);
-        else resolve(file);
-      };
+/**
+ * Which dataset a session manifest (or a saved state's header) belongs to,
+ * and where it opens from.
+ *
+ * @param {object} header
+ */
+export function describeSessionDataset(header) {
+  return Object.freeze({
+    datasetId: header.datasetFingerprint.datasetId,
+    name: header.datasetFingerprint.name,
+    source: header.source,
+    cells: Object.hasOwn(header, 'cells') ? decodeCellSubsetRecord(header.cells, 'Session manifest cells') : null,
+    genes: Object.hasOwn(header, 'genes')
+      ? decodeGeneSampleRecord(header.genes, header.datasetFingerprint.cellCount, 'Session manifest genes')
+      : null,
+  });
+}
 
-      input.addEventListener('change', () => {
-        if (input.files === null) {
-          settle(null, new TypeError('Session file input did not publish a FileList.'));
-          return;
-        }
-        if (input.files.length > 1) {
-          settle(null, new TypeError('Session file input published more than one file.'));
-          return;
-        }
-        settle(input.files.length === 1 ? input.files[0] : null);
-      }, { once: true });
-
-      input.addEventListener('cancel', () => settle(null), { once: true });
-
-      input.click();
-    });
-  }
+/**
+ * Open a file picker for `.cellucid-session` files.
+ * @returns {Promise<File|null>}
+ */
+function pickSessionFile() {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = false;
+    input.accept = '.cellucid-session,application/octet-stream';
+    input.style.position = 'fixed';
+    input.style.left = '-10000px';
+    input.style.top = '0';
+    input.style.opacity = '0';
+    document.body.appendChild(input);
+    let settled = false;
+    const settle = (file, error = null) => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      if (error !== null) reject(error);
+      else resolve(file);
+    };
+    input.addEventListener('change', () => {
+      if (input.files === null) {
+        settle(null, new TypeError('Session file input did not publish a FileList.'));
+        return;
+      }
+      settle(input.files.length === 1 ? input.files[0] : null);
+    }, { once: true });
+    input.addEventListener('cancel', () => settle(null), { once: true });
+    input.click();
+  });
 }

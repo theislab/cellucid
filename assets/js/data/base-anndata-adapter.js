@@ -2411,6 +2411,44 @@ export class BaseAnnDataAdapter {
   }
 
   /**
+   * What a copy of the whole dataset is planned against
+   * (`AnnDataReaderClient.readCopyTarget`): the stored obs columns, the
+   * values of those `names` lists over every cell by original position, and
+   * `uns['cellucid']`. A dataset replaced meanwhile fails it.
+   *
+   * @param {string[]} names
+   * @param {{signal?: AbortSignal|null, owner?: string|null, varModality?: string|null}} [options]
+   */
+  async readCopyTarget(names, { signal = null, owner = null, varModality = null } = {}) {
+    const generation = this._captureLifecycleGeneration();
+    const target = await this._loader.readCopyTarget(names, { signal, owner, varModality });
+    this._assertLifecycleGeneration(generation);
+    return target;
+  }
+
+  /**
+   * A copy of the whole dataset as a Cellucid-ready AnnData `.zarr.zip`
+   * with `changes`, its bytes handed to `sink` as they are written
+   * (`AnnDataReaderClient.writeAnnDataCopy`, `anndata/write/copy.js`), one
+   * `Blob` a batch; its progress is its read activity's, of the job `owner`.
+   * The dataset's id and name are the copy's where its file names none. A
+   * dataset replaced meanwhile fails the copy. On a failure the caller
+   * aborts its writable (never closes it) and removes its spool.
+   *
+   * @param {Object} changes
+   * @param {{sink: {write: (part: Blob) => (void|Promise<void>)}, signal?: AbortSignal|null,
+   *   owner?: string|null}} options
+   */
+  async writeAnnDataCopy(changes, { sink, signal = null, owner = null }) {
+    const generation = this._captureLifecycleGeneration();
+    // The copy names the dataset it copies (where its file names none): opened again, it is the same dataset.
+    const dataset = { id: this._metadata?.id ?? null, name: this._metadata?.name ?? null };
+    const result = await this._loader.writeAnnDataCopy(changes, { sink, signal, owner, dataset });
+    this._assertLifecycleGeneration(generation);
+    return result;
+  }
+
+  /**
    * The rows of open cells of the expression matrix one gene payload path
    * reads (`getGeneValues`), handed to `onPart` part by part as they arrive
    * (`AnnDataReader.readMatrixRows`): each cell's non-zero genes, by

@@ -1410,6 +1410,86 @@ export class AnnDataReaderClient {
   }
 
   /**
+   * What a copy of the whole dataset is planned against
+   * (`anndata/write/copy-target.js`): the stored obs columns, the values of
+   * those `names` lists over every cell by original position, and
+   * `uns['cellucid']`; its reads of the job `owner`.
+   *
+   * @param {string[]} names
+   * @param {{signal?: AbortSignal|null, owner?: string|null, varModality?: string|null}} [options]
+   * @returns {Promise<{nObs: number, obsColumns: string[], modalityColumns: string[], varColumns: string[],
+   *   columns: Record<string, Object>, cellucid: Object|null}>}
+   */
+  readCopyTarget(names, { signal = null, owner = null, varModality = null } = {}) {
+    this._requireOpen();
+    return this._callWith({ signal }, 'readCopyTarget', [...names], owner, varModality);
+  }
+
+  /**
+   * Write a copy of the whole open dataset (every cell, whichever are open)
+   * as a Cellucid-ready AnnData `.zarr.zip`, with `changes`
+   * (`anndata/write/copy.js` `CopyChanges`: obs columns by original
+   * position, var columns, `uns` and `uns['cellucid']` keys) and `dataset`
+   * (the open dataset's id and name, written where the source names none).
+   *
+   * The archive's bytes arrive in order, a batch at a time (about 4 MB), and
+   * each batch goes to `sink.write` as one `Blob` (a File System Access
+   * writable and a spool both take one; nothing is copied to make it), each
+   * answered to the worker once written, so no more than a few batches are
+   * in flight (`anndata/write/acknowledged-sink.js`). How far it is shows as
+   * its read activity (kind `cells`, of the job `owner`). Resolves with the
+   * copy's result once every byte is written.
+   *
+   * A sink that fails fails the copy with its own error, once every batch
+   * already handed to it is settled. The caller owns what it wrote to: on a
+   * failure it aborts its File System Access writable (never closes it,
+   * which would leave a partial file under the chosen name) and removes the
+   * spool's files.
+   *
+   * @param {Object} changes
+   * @param {{sink: {write: (part: Blob) => (void|Promise<void>)}, signal?: AbortSignal|null,
+   *   owner?: string|null, dataset?: {id?: string|null, name?: string|null}|null}} options
+   * @returns {Promise<{bytes: number, entries: number, zip64: boolean, chunks: number,
+   *   layout: 'anndata'|'mudata', nObs: number, priorityOrder: boolean, notes: string[]}>}
+   */
+  async writeAnnDataCopy(changes, { sink, signal = null, owner = null, dataset = null }) {
+    this._requireOpen();
+    if (sink === null || typeof sink !== 'object' || typeof sink.write !== 'function') {
+      throw new TypeError('A copy is written to a sink with write(part).');
+    }
+    let writing = Promise.resolve();
+    let failed = null;
+    try {
+      return await this._callWith({
+        signal,
+        onPartial: message => {
+          if (message.copy === undefined) return;
+          const worker = this._worker;
+          const answer = error => worker?.postMessage(error === null
+            ? { copyWritten: message.copy }
+            : { copyWritten: message.copy, error: { name: error?.name ?? 'Error', message: error?.message ?? String(error) } });
+          // Batches are written in order, each one Blob of its parts, each answered once written.
+          writing = writing.then(async () => {
+            if (failed === null) {
+              try {
+                await sink.write(new Blob(message.parts));
+              } catch (error) {
+                failed = error;
+              }
+            }
+            answer(failed);
+          });
+        },
+      }, 'writeAnnDataCopy', changes, owner, dataset);
+    } catch (error) {
+      // The worker fails the copy with the sink's words; the sink's own error is the one thrown.
+      throw failed ?? error;
+    } finally {
+      await writing;
+    }
+  }
+
+  /**
    * The non-zero genes of many cells of one matrix, handed to `onPart` part
    * by part as each arrives (`AnnDataReader.readMatrixRows`): one read for
    * every cell, the next part read while this one is handed out.

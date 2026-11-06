@@ -5,8 +5,23 @@ import {
   fetchOrcidExpandedSearch,
   fetchOrcidPerson,
   ORCID_RESPONSE_MAX_UTF8_BYTES,
-  readBoundedOrcidJson,
 } from '../assets/js/app/community-annotations/orcid-client.js';
+import { createHostBook } from '../assets/js/formats/io/hosts.js';
+import { ResponseClock } from '../assets/js/formats/io/link.js';
+import { virtualTime } from './helpers/virtual-time.mjs';
+
+/** A transport on virtual time: retries and stall timeouts run their real logic, every wait instant. */
+function virtualTransport(fetchImpl) {
+  const time = virtualTime();
+  return {
+    time,
+    transport: {
+      fetch: fetchImpl,
+      hosts: createHostBook({ now: time.now, after: time.after }),
+      clock: new ResponseClock({ clock: time.now, after: time.after }),
+    },
+  };
+}
 
 async function withFetch(fetchImpl, operation) {
   const previousFetch = globalThis.fetch;
@@ -55,7 +70,8 @@ test('expanded ORCID search sends the exact private bounded request and projecti
   assert.deepEqual(request.options.headers, {
     Accept: 'application/vnd.orcid+json',
   });
-  assert.equal(request.options.signal, controller.signal);
+  // The request runs on its own signal, which the caller's ends.
+  assert.ok(request.options.signal instanceof AbortSignal);
   assert.equal(request.options.cache, 'no-store');
   assert.equal(request.options.credentials, 'omit');
   assert.equal(request.options.mode, 'cors');
@@ -121,206 +137,68 @@ test('ORCID search rejects more than eight projected records', async () => {
   );
 });
 
-test('known oversized ORCID response cancels before opening its reader', async () => {
-  let cancelled = false;
-  let readerOpened = false;
-  const response = {
-    headers: {
-      get(name) {
-        return name.toLowerCase() === 'content-length'
-          ? String(ORCID_RESPONSE_MAX_UTF8_BYTES + 1)
-          : null;
-      },
-    },
-    body: {
-      async cancel() {
-        cancelled = true;
-      },
-      getReader() {
-        readerOpened = true;
-        throw new Error('reader must not open');
-      },
-    },
-  };
-
+test('an ORCID response above the ceiling is refused', async () => {
+  const { transport } = virtualTransport(async () => new Response(
+    new Uint8Array(ORCID_RESPONSE_MAX_UTF8_BYTES + 1).fill(0x20),
+    { status: 200 }
+  ));
   await assert.rejects(
-    () => readBoundedOrcidJson(response, {
-      label: 'ORCID synthetic response',
-    }),
+    () => fetchOrcidExpandedSearch('oversized', { transport }),
     error => error?.code === 'ORCID_RESPONSE_TOO_LARGE'
   );
-  assert.equal(cancelled, true);
-  assert.equal(readerOpened, false);
 });
 
-test('streaming ORCID overrun and invalid UTF-8 cancel the live reader', async (t) => {
-  await t.test('overrun', async () => {
-    let reads = 0;
-    let cancelled = false;
-    const response = {
-      headers: { get: () => null },
-      body: {
-        getReader() {
-          return {
-            async read() {
-              reads += 1;
-              return {
-                done: false,
-                value: new Uint8Array(
-                  reads === 1 ? ORCID_RESPONSE_MAX_UTF8_BYTES : 1
-                ),
-              };
-            },
-            async cancel() {
-              cancelled = true;
-            },
-          };
-        },
-      },
-    };
+test('invalid UTF-8 and a UTF-8 BOM are refused, not decoded leniently', async () => {
+  for (const bytes of [
+    new Uint8Array([0x7b, 0xff, 0x7d]),
+    new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode('{"expanded-result":[]}')]),
+  ]) {
+    const { transport } = virtualTransport(async () => new Response(bytes, { status: 200 }));
     await assert.rejects(
-      () => readBoundedOrcidJson(response, {
-        label: 'ORCID synthetic response',
-      }),
-      error => error?.code === 'ORCID_RESPONSE_TOO_LARGE'
-    );
-    assert.equal(cancelled, true);
-  });
-
-  await t.test('invalid UTF-8', async () => {
-    let cancelled = false;
-    const response = {
-      headers: { get: () => null },
-      body: {
-        getReader() {
-          return {
-            async read() {
-              return {
-                done: false,
-                value: new Uint8Array([0xc3, 0x28]),
-              };
-            },
-            async cancel() {
-              cancelled = true;
-            },
-          };
-        },
-      },
-    };
-    await assert.rejects(
-      () => readBoundedOrcidJson(response, {
-        label: 'ORCID synthetic response',
-      }),
+      () => fetchOrcidExpandedSearch('bad bytes', { transport }),
       error => error?.code === 'ORCID_RESPONSE_INVALID'
     );
-    assert.equal(cancelled, true);
+  }
+});
+
+test('a busy ORCID is asked again; a refusal is reported once', async () => {
+  const answers = [
+    () => new Response('', { status: 503 }),
+    () => new Response(JSON.stringify({ 'expanded-result': [] }), { status: 200 }),
+  ];
+  const busy = virtualTransport(async () => answers.shift()());
+  assert.deepEqual(await fetchOrcidExpandedSearch('busy', { transport: busy.transport }), []);
+  assert.equal(answers.length, 0);
+
+  let calls = 0;
+  const refusing = virtualTransport(async () => {
+    calls += 1;
+    return new Response('', { status: 404 });
   });
-});
-
-test('owner abort remains the exact first cause and cancels a failed live reader', async () => {
-  const controller = new AbortController();
-  const reason = new DOMException(
-    'Synthetic ORCID modal was superseded',
-    'AbortError'
-  );
-  let cancelled = false;
-  const transportFailure = new Error('synthetic reader failure');
-  const response = {
-    headers: { get: () => null },
-    body: {
-      getReader() {
-        return {
-          async read() {
-            controller.abort(reason);
-            throw transportFailure;
-          },
-          async cancel() {
-            cancelled = true;
-          },
-        };
-      },
-    },
-  };
-
   await assert.rejects(
-    () => readBoundedOrcidJson(response, {
-      label: 'ORCID synthetic response',
-      signal: controller.signal,
-    }),
-    error => error === reason
+    () => fetchOrcidPerson('0000-0001-5109-3700', { transport: refusing.transport }),
+    /ORCID lookup failed \(HTTP 404\)/
   );
-  assert.equal(cancelled, true);
+  assert.equal(calls, 1);
 });
 
-test('a pre-aborted bounded read cancels its owned response before opening a reader', async () => {
-  const controller = new AbortController();
-  const reason = new DOMException(
-    'Synthetic ORCID owner already closed',
-    'AbortError'
+test("a silent ORCID stalls instead of hanging; the caller's abort is exact", async () => {
+  const silent = virtualTransport((_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+  }));
+  await assert.rejects(
+    () => fetchOrcidExpandedSearch('silent', { transport: silent.transport }),
+    error => error?.code === 'stalled' || error?.code === 'network' || /no answer/.test(error?.message ?? '')
   );
+
+  const controller = new AbortController();
+  const reason = new Error('superseded ORCID search');
+  reason.name = 'AbortError';
+  const hanging = virtualTransport((_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  }));
+  const pending = fetchOrcidExpandedSearch('abort me', { signal: controller.signal, transport: hanging.transport });
+  await new Promise(resolve => setImmediate(resolve));
   controller.abort(reason);
-  let cancelled = false;
-  let readerOpened = false;
-  const response = {
-    headers: { get: () => null },
-    body: {
-      async cancel() {
-        cancelled = true;
-      },
-      getReader() {
-        readerOpened = true;
-        throw new Error('reader must not open after owner cancellation');
-      },
-    },
-  };
-
-  await assert.rejects(
-    () => readBoundedOrcidJson(response, {
-      label: 'ORCID synthetic response',
-      signal: controller.signal,
-    }),
-    error => error === reason
-  );
-  assert.equal(cancelled, true);
-  assert.equal(readerOpened, false);
-});
-
-test('an abort after fetch settlement cancels the response before its reader opens', async () => {
-  const controller = new AbortController();
-  const reason = new DOMException(
-    'Synthetic ORCID fetch owner closed',
-    'AbortError'
-  );
-  let cancelled = false;
-  let readerOpened = false;
-  const response = {
-    ok: true,
-    status: 200,
-    headers: { get: () => null },
-    body: {
-      async cancel() {
-        cancelled = true;
-      },
-      getReader() {
-        readerOpened = true;
-        throw new Error('reader must not open after fetch owner cancellation');
-      },
-    },
-  };
-
-  await withFetch(
-    async () => {
-      controller.abort(reason);
-      return response;
-    },
-    () => assert.rejects(
-      () => fetchOrcidExpandedSearch(
-        'Synthetic pre-reader cancellation',
-        { signal: controller.signal }
-      ),
-      error => error === reason
-    )
-  );
-  assert.equal(cancelled, true);
-  assert.equal(readerOpened, false);
+  await assert.rejects(pending, error => error === reason);
 });

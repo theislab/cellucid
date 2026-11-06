@@ -41,18 +41,24 @@ test('the shown mode is brought up to date; every other built mode records the c
   assert.deepEqual(hidden.calls, ['hidden:highlight', 'hidden:cell-visibility']);
 });
 
-function deUi(options) {
+async function deUi(options) {
   const ui = Object.create(DEAnalysisUI.prototype);
   let refreshes = 0;
-  const state = { categoryTransparency: Uint8Array.from([1, 1, 0, 1, 1, 1, 0, 1, 1]), _transparencyEpoch: 1 };
+  // One highlight page, the result's: a change of its cells is a change of input.
+  const page = { id: 'page_1', name: 'Page 1', highlightedGroups: [{ id: 'g1', enabled: true, cellIndices: Uint32Array.of(0, 1) }] };
+  const state = {
+    categoryTransparency: Uint8Array.from([1, 1, 0, 1, 1, 1, 0, 1, 1]),
+    _transparencyEpoch: 1,
+    getHighlightPages: () => [page],
+    getHighlightedCellCountForPage: () => page.highlightedGroups[0].cellIndices.length,
+  };
   Object.assign(ui, {
     dataLayer: { state },
     _options: options,
     _lastResult: {},
-    _selectedPages: new Set(),
+    _selectedPages: new Set(['page_1']),
     _highlightRevision: 0,
-    _seenVisibleDigest: null,
-    _visibleDigestCache: null,
+    _seenVisibleRevision: null,
     _missedInputChange: false,
     _publishedStale: false,
     _cellsSeen: null,
@@ -60,9 +66,9 @@ function deUi(options) {
     _updateStale: () => {},
     _updatePageSelectorCounts: () => {},
   });
-  ui._resultInputs = { options, pages: [], highlightRevision: 0, visibleDigest: ui._visibleCellsDigest(), cells: null };
-  ui._seenVisibleDigest = ui._visibleCellsDigest();
-  return { ui, state, refreshes: () => refreshes };
+  ui._resultInputs = { options, provenance: await ui._currentProvenance(options, ['page_1'], null) };
+  ui._seenVisibleRevision = ui._visibleCellsRevision();
+  return { ui, state, page, refreshes: () => refreshes };
 }
 
 const DE_OPTIONS = Object.freeze({
@@ -78,30 +84,40 @@ function visibilityPass(state, changed = []) {
   state._transparencyEpoch += 1;
 }
 
-test('only a change of the visible cells makes stale a result scoped to them', () => {
-  const visible = deUi({ ...DE_OPTIONS, within: 'visible' });
+/** Whether the shown result is stale. */
+async function isStale(ui) {
+  return (await ui.getStaleReasons()).length > 0;
+}
+
+test('only a change of the visible cells makes stale a result scoped to them', async () => {
+  const visible = await deUi({ ...DE_OPTIONS, within: 'visible' });
   // A recolour runs a visibility pass that shows the same cells.
   visibilityPass(visible.state);
   visible.ui.onCellVisibilityChanged();
-  assert.equal(visible.ui._isResultStale(), false);
+  assert.equal(await isStale(visible.ui), false);
   assert.equal(visible.refreshes(), 0, 'the groups are not read again');
   // A filter hides a cell.
   visibilityPass(visible.state, [4]);
   visible.ui.onCellVisibilityChanged();
-  assert.equal(visible.ui._isResultStale(), true);
+  assert.equal(await isStale(visible.ui), true);
   assert.equal(visible.refreshes(), 1, 'the groups are read again');
 
-  const all = deUi({ ...DE_OPTIONS });
+  const all = await deUi({ ...DE_OPTIONS });
   visibilityPass(all.state, [4]);
   all.ui.onCellVisibilityChanged();
-  assert.equal(all.ui._isResultStale(), false);
+  assert.equal(await isStale(all.ui), false);
   assert.equal(all.refreshes(), 0);
 });
 
-test('a mode not shown catches up when shown, and its result is stale meanwhile', () => {
-  const { ui, refreshes } = deUi({ ...DE_OPTIONS });
+test('a mode not shown catches up when shown, and its result is stale meanwhile', async () => {
+  const { ui, page, refreshes } = await deUi({ ...DE_OPTIONS });
+  // A highlight change that leaves the result's page as it was is no change of its input.
   ui.noteHiddenChange('highlight');
-  assert.equal(ui._isResultStale(), true);
+  assert.equal(await isStale(ui), false);
+  // Its page's cells change.
+  page.highlightedGroups = [{ id: 'g1', enabled: true, cellIndices: Uint32Array.of(0, 1, 2) }];
+  ui.noteHiddenChange('highlight');
+  assert.deepEqual(await ui.getStaleReasons(), ['The cells of Page 1 changed since this result.']);
   assert.equal(refreshes(), 0, 'nothing is redrawn while hidden');
   ui.onShown();
   ui.onShown();

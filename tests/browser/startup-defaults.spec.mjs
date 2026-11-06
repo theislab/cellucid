@@ -1,5 +1,6 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { dismissWelcome, expectWelcomeShown } from './helpers/welcome.mjs';
 
 const DEFAULT_STARTUP_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&acceptance=startup-defaults-ci`;
@@ -12,7 +13,7 @@ test('every startup shows onboarding and adopts the catalog default with exact U
   });
   await page.goto(DEFAULT_STARTUP_URL, { waitUntil: 'domcontentloaded' });
 
-  await expect(page.locator('#welcome-modal')).toBeVisible();
+  await expectWelcomeShown(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#dataset-select')).toHaveValue(
     'dataset:local-demo:current-ui',
@@ -43,7 +44,7 @@ test('every startup shows onboarding and adopts the catalog default with exact U
   await page.keyboard.press('Escape');
   await expect(page.locator('#welcome-modal')).toBeHidden();
   await page.reload({ waitUntil: 'domcontentloaded' });
-  await expect(page.locator('#welcome-modal')).toBeVisible();
+  await expectWelcomeShown(page);
 });
 
 test('the default light studio publishes stable light framebuffer pixels', async ({
@@ -68,7 +69,7 @@ test('the default light studio publishes stable light framebuffer pixels', async
     localStorage.removeItem('cellucid_viewer_background');
   });
   await page.goto(DEFAULT_STARTUP_URL, { waitUntil: 'domcontentloaded' });
-  await page.keyboard.press('Escape');
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );

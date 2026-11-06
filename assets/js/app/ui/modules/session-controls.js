@@ -1,16 +1,20 @@
 /**
- * @fileoverview Session save/load UI wiring.
+ * @fileoverview Loading a session file, and the opening of a saved state.
  *
- * Wires the session buttons to the new `.cellucid-session` bundle system and
- * surfaces success/error status via `NotificationCenter`.
+ * Writing one is the history's action (`history.share`, the State panel's
+ * Share dialog: `ui/modules/state/share-dialog.js`). Load (Load… › Open a
+ * session file…), and opening a saved
+ * state of this browser (`openSavedState`: the State section's list, the
+ * Continue offer), take one path: the session's own dataset is opened first
+ * (its source, its cells), then its history is loaded. Outcomes are said on
+ * `NotificationCenter`.
  *
  * @module ui/modules/session-controls
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { beginOpening } from '../../../data/opening-progress.js';
-import {
-} from '../../session/session-serializer.js';
+import { describeSessionDataset } from '../../session/session-serializer.js';
 import {
   describeDatasetSourceRecord
 } from '../../session/dataset-source-record.js';
@@ -38,7 +42,7 @@ import { isReported } from '../../../utils/errors.js';
  * @param {{kept: (datasetId: string) => Promise<{name: string, kind: string, granted: boolean}|null>,
  *   reopen: (datasetId: string) => Promise<boolean>}} options.localFiles
  *   A dataset opened from this computer, by the handle this browser kept of
- *   it (`app/local-file-handles.js`): what is kept, and its reopen, which
+ *   it (`app/library/local-file-handles.js`): what is kept, and its reopen, which
  *   asks the person for leave to read it unless given (inside a click).
  * @param {() => ({digest: string, isSubset: boolean}|null)} options.currentCellIdentity
  *   The open dataset's cells (`data/cell-identity.js`), or null.
@@ -49,6 +53,10 @@ import { isReported } from '../../../utils/errors.js';
  * @param {((genes: {cells: number, order: Object|null, digest: string}|null) => Promise<void>)|undefined} options.restoreGeneSample
  *   Reads genes for the open cells a session read them for (its `genes`,
  *   `session/cell-subset-record.js`), once its cells are open.
+ * @param {{read: (id: string) => Promise<object>, load: (source: object) => Promise<void>}|null} [options.savedStates]
+ *   The saved states of this browser (`app/history/dataset-history.js`):
+ *   a saved state's source (`autosave.js` `openSavedState`), and its load
+ *   into the shown history.
  * @param {(() => Promise<void>|void)|undefined} options.onAfterLoad
  */
 export function initSessionControls({
@@ -61,7 +69,8 @@ export function initSessionControls({
   currentCellIdentity,
   reopenDataset,
   restoreGeneSample = async () => {},
-  onAfterLoad
+  savedStates = null,
+  onAfterLoad,
 }) {
   if (
     datasetChanges === null ||
@@ -86,7 +95,7 @@ export function initSessionControls({
       'Session controls require the dataset identity and opener.'
     );
   }
-  const { saveBtn: saveStateBtn, loadBtn: loadStateBtn } = dom || {};
+  const { loadBtn: loadStateBtn } = dom || {};
   const lifecycleController = new AbortController();
   const activeOperations = new Set();
   let destroyed = false;
@@ -132,25 +141,6 @@ export function initSessionControls({
     }
   }
 
-  if (saveStateBtn && sessionSerializer) {
-    listen(saveStateBtn, 'click', () => {
-      const operationGeneration = generation;
-      const operation = (async () => {
-      try {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        await sessionSerializer.downloadSession(`cellucid-session-${timestamp}.cellucid-session`);
-        if (!ownsOperation(operationGeneration)) return;
-        showSessionStatus('Session saved successfully');
-      } catch (err) {
-        if (!ownsOperation(operationGeneration)) return;
-        console.error(`Failed to save state: ${err instanceof Error ? err.message : String(err)}`, err);
-        showSessionStatus('Failed to save session', true);
-      }
-      })();
-      return trackOperation(operation);
-    });
-  }
-
   /**
    * Hold a chosen session file until no dataset change is in flight. The wait
    * is announced, so a session chosen during a load is visibly queued rather
@@ -188,18 +178,21 @@ export function initSessionControls({
    * saved in a notebook, it is applied to whatever is open, and the restore
    * names the dataset (and file) it needs.
    *
-   * @param {File} file
+   * @param {{describe: () => Promise<{datasetId: string|null, source: object|null,
+   *   cells: object|null, genes: object|null}>, load: () => Promise<void>}} session -
+   *   a session file, or a saved state of this browser: which dataset it is
+   *   of, and its load into the history
    * @param {number} operationGeneration
    * @param {number} sessionLoad
-   * @returns {Promise<boolean>} Whether this file is still the one to restore.
+   * @returns {Promise<boolean>} Whether this session is still the one to restore.
    */
-  async function prepareDatasetForSession(file, operationGeneration, sessionLoad) {
+  async function prepareDatasetForSession(session, operationGeneration, sessionLoad) {
     const current = () =>
       ownsOperation(operationGeneration) && sessionLoad === loadGeneration;
     if (!await awaitDatasetForSession(operationGeneration, sessionLoad)) {
       return false;
     }
-    const { datasetId, source, cells, genes } = await sessionSerializer.readSessionDataset(file);
+    const { datasetId, source, cells, genes } = await session.describe();
     if (!current()) return false;
     if (source?.kind === 'file' && currentDatasetIdentityId() !== datasetId) {
       const kept = await localFiles.kept(source.dataset);
@@ -209,7 +202,7 @@ export function initSessionControls({
         return opened && current() && openSessionCells(datasetId, cells, genes, current);
       }
       if (kept !== null) {
-        offerLocalReopen(file, source.dataset, kept, operationGeneration, sessionLoad);
+        offerLocalReopen(session, source.dataset, kept, operationGeneration, sessionLoad);
         return false;
       }
     }
@@ -299,10 +292,10 @@ export function initSessionControls({
    * Offer *Reopen <name>* for the file or folder a session was saved on,
    * whose handle is kept but which the browser lets be read only once the
    * person allows it, in a click. The click reopens it, then applies the
-   * session file; until then nothing is applied, and a session file chosen
-   * after this one (`sessionLoad`) retires the offer.
+   * session; until then nothing is applied, and a session chosen after this
+   * one (`sessionLoad`) retires the offer.
    */
-  function offerLocalReopen(file, datasetId, kept, operationGeneration, sessionLoad) {
+  function offerLocalReopen(session, datasetId, kept, operationGeneration, sessionLoad) {
     localReopenOffer = getNotificationCenter().show({
       type: 'info',
       category: 'session',
@@ -319,8 +312,8 @@ export function initSessionControls({
               // Opened another way since the offer: only the session is left.
               if (currentDatasetIdentityId() !== datasetId && !await localFiles.reopen(datasetId)) return;
               if (!ownsOperation(operationGeneration) || reopenLoad !== loadGeneration) return;
-              if (!await prepareDatasetForSession(file, operationGeneration, reopenLoad)) return;
-              await sessionSerializer.restoreFromBlob(file);
+              if (!await prepareDatasetForSession(session, operationGeneration, reopenLoad)) return;
+              await session.load();
               if (!ownsOperation(operationGeneration)) return;
               if (typeof onAfterLoad === 'function') await onAfterLoad();
             } catch (err) {
@@ -349,7 +342,7 @@ export function initSessionControls({
       try {
         const picked = await sessionSerializer.loadSessionFromFile({
           beforeRestore: file => prepareDatasetForSession(
-            file,
+            sessionFile(file),
             operationGeneration,
             ++loadGeneration
           )
@@ -369,6 +362,52 @@ export function initSessionControls({
     });
   }
 
+  /** A session file as a session to open: its dataset from its manifest, its load. */
+  function sessionFile(file) {
+    return {
+      describe: () => sessionSerializer.readSessionDataset(file),
+      load: () => sessionSerializer.restoreFromBlob(file),
+    };
+  }
+
+  /**
+   * Open a saved state of this browser (the State section's list, the
+   * Continue offer): its dataset first, as a session file's (its source, its
+   * cells), then its history. Resolves whether it was opened; a failure is
+   * said once.
+   *
+   * @param {string} id
+   * @returns {Promise<boolean>}
+   */
+  function openSavedState(id) {
+    if (savedStates === null) return Promise.reject(new Error('Saved states are not available on this page.'));
+    const operationGeneration = generation;
+    if (localReopenOffer !== null) {
+      getNotificationCenter().dismiss(localReopenOffer);
+      localReopenOffer = null;
+    }
+    const sessionLoad = ++loadGeneration;
+    return trackOperation((async () => {
+      try {
+        const source = await savedStates.read(id);
+        const session = {
+          describe: async () => describeSessionDataset(source.header),
+          load: () => savedStates.load(source),
+        };
+        if (!await prepareDatasetForSession(session, operationGeneration, sessionLoad)) return false;
+        await session.load();
+        if (!ownsOperation(operationGeneration)) return false;
+        if (typeof onAfterLoad === 'function') await onAfterLoad();
+        return true;
+      } catch (err) {
+        if (!ownsOperation(operationGeneration)) return false;
+        if (cancellationKind(err) === 'user' || cancellationKind(err) === 'superseded') return false;
+        reportLoadFailure(err);
+        return false;
+      }
+    })());
+  }
+
   function destroy() {
     if (destructionPromise !== null) return destructionPromise;
     destroyed = true;
@@ -379,22 +418,5 @@ export function initSessionControls({
     return destructionPromise;
   }
 
-  /**
-   * A session records the state of a dataset's cells, so Save follows the
-   * runtime. Load stays available: with nothing open it names the dataset the
-   * session needs.
-   *
-   * @param {boolean} present
-   */
-  function setCellsPresent(present) {
-    if (typeof present !== 'boolean') {
-      throw new TypeError('Session-control cell presence must be one boolean.');
-    }
-    if (destroyed || !saveStateBtn) return;
-    saveStateBtn.disabled = !present;
-    saveStateBtn.title = present ? '' : 'Load a dataset to save a session';
-  }
-  setCellsPresent(false);
-
-  return { showSessionStatus, setCellsPresent, destroy };
+  return { showSessionStatus, openSavedState, destroy };
 }

@@ -299,9 +299,6 @@ function makeSidebar(renderer) {
         return controls.filter(control => control.tagName === 'SELECT');
       }
       if (selector === 'details.accordion-section') return [];
-      // The renderer controls are inputs and selects only; this fixture holds
-      // no pressed-button group.
-      if (selector === '[data-state-serializer-pressed-group]') return [];
       throw new Error(`Unexpected sidebar selector ${selector}`);
     },
   };

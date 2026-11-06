@@ -6,17 +6,20 @@
  * themselves when the snapshot inventory empties — `view-context-core.js`
  * returns the active view to `live` (`removeView`, `syncSnapshotContexts`), and
  * `viewer.js` returns focus to the live view and un-hides it
- * (`clearSnapshotViews`) — and neither tells the UI module. A session restore
- * empties the inventory as its first act (`state-serializer/multiview.js`), so
- * the very next badge render read a view that no longer existed and threw.
+ * (`clearSnapshotViews`) — and neither tells the UI module. Clearing the views
+ * (`clearPublishedSnapshotViews`, which Clear views and a dataset change run)
+ * and putting back a views value with fewer kept views (the `views` state
+ * domain, `state/domains/views.js`, retires the views past its count) empty the
+ * inventory, so the very next badge render read a view that no longer existed
+ * and threw.
  *
  * The throw arrived on an animation frame the same rebuild scheduled, which is
  * why it was only ever seen as an uncaught `RangeError` in a browser log. These
  * tests do not wait for a frame: they call the exact function that frame calls
  * (`renderSplitViewBadges`, scheduled at `ui-coordinator.js`
  * `scheduleVisibilityUiUpdate`) at the exact point the inventory moved, and the
- * end-to-end case drives the frame explicitly through the real
- * `restoreMultiview`. Nothing here depends on timing.
+ * end-to-end case drives the frames explicitly through the real `views` domain
+ * restore. Nothing here depends on timing.
  */
 
 import assert from 'node:assert/strict';
@@ -28,8 +31,8 @@ import { initViewControls } from
   '../assets/js/app/ui/modules/view-controls.js';
 import { clearPublishedSnapshotViews } from
   '../assets/js/app/view-snapshot-publication.js';
-import { restoreMultiview } from
-  '../assets/js/app/state-serializer/multiview.js';
+import { createViewsDomain } from
+  '../assets/js/app/state/domains/views.js';
 
 /* ------------------------------------------------------------------ *
  * A DOM small enough to read and complete enough to drive the module. *
@@ -253,6 +256,8 @@ function createOwners() {
         },
       ]]),
       clearActiveField() {},
+      // filter-manager.js `setCellVisibility()`: the cells hidden one by one.
+      setCellVisibility() {},
       getAvailableDimensions() {
         return [2, 3];
       },
@@ -342,16 +347,6 @@ function createOwners() {
         owners.viewer.setViewEmbedding('live', { dimension, layoutKey });
         await new Promise(resolve => setTimeout(resolve, 0));
       },
-      beginBatch() {},
-      endBatch() {},
-      // The restore entry of the session schema: an embedding reference.
-      async restoreViewEmbedding(viewId, ref) {
-        assert.equal(ref.columns, null);
-        await this.setViewRepresentation(viewId, ref.key, {
-          followsDefault: ref.key !== 'X_tsne',
-        });
-        return ref.key;
-      },
       onVisibilityChanged(listener) {
         visibilityListeners.push(listener);
       },
@@ -398,8 +393,11 @@ function createOwners() {
     getCamerasLocked() {
       return camerasLocked;
     },
-    // viewer.js per-view centroid toggles, which a session restores per view.
+    // viewer.js per-view centroid toggles, which the views domain holds per view.
     centroidFlags: new Map(),
+    getCentroidFlags(viewId) {
+      return { points: false, labels: false, ...this.centroidFlags.get(viewId) };
+    },
     setShowCentroidPoints(show, viewId) {
       this.centroidFlags.set(viewId, { ...this.centroidFlags.get(viewId), points: show });
     },
@@ -429,6 +427,10 @@ function createOwners() {
     },
     getLiveViewHidden() {
       return liveViewHidden;
+    },
+    // viewer.js `getViewLayout()`: the viewer owns the layout mode.
+    getViewLayout() {
+      return { mode: layoutMode, activeId: focusedViewId, liveViewHidden };
     },
     getLiveViewLabel() {
       return 'Live';
@@ -532,6 +534,8 @@ function mountViewControls(t, owners) {
       onNavigationUiSyncRequested() {},
     },
   });
+  // The actions it implements are provided while it is mounted.
+  t.after(() => controls.destroy());
   // `ui-coordinator.js` `publishCellPresence()`: these owners carry cells.
   controls.setCellsPresent(true);
 
@@ -555,8 +559,13 @@ function mountViewControls(t, owners) {
   return { activeViewNotifications, controls, dom, frameErrors, renderDom };
 }
 
-function keepView(dom) {
+/** Wait until a control's dispatched action has run. */
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+/** Press Keep view: the `view.keep` action. */
+async function keepView(dom) {
   dom.keepViewBtn.fire('click');
+  await settle();
 }
 
 test('Keep view is offered only while the runtime has cells', t => {
@@ -573,11 +582,11 @@ test('Keep view is offered only while the runtime has cells', t => {
   assert.equal(dom.keepViewBtn.disabled, false);
 });
 
-test('a cleared inventory leaves no kept view named by the badge renderer', t => {
+test('a cleared inventory leaves no kept view named by the badge renderer', async t => {
   const owners = createOwners();
   const { controls, dom } = mountViewControls(t, owners);
 
-  keepView(dom);
+  await keepView(dom);
   assert.deepEqual(
     owners.viewer.getSnapshotViews().map(snapshot => snapshot.id),
     ['snap_1'],
@@ -590,7 +599,7 @@ test('a cleared inventory leaves no kept view named by the badge renderer', t =>
     'with two views open, Navigation names the view it drives',
   );
 
-  // The first act of every multiview restore (state-serializer/multiview.js).
+  // What Clear views and a dataset change do (`clearPublishedSnapshotViews`).
   clearPublishedSnapshotViews({ state: owners.state, viewer: owners.viewer });
   assert.equal(
     owners.state.getActiveViewId(),
@@ -610,12 +619,12 @@ test('a cleared inventory leaves no kept view named by the badge renderer', t =>
   );
 });
 
-test('a cleared inventory leaves no hidden live view in the badge renderer', t => {
+test('a cleared inventory leaves no hidden live view in the badge renderer', async t => {
   const owners = createOwners();
   const { controls, dom } = mountViewControls(t, owners);
 
-  keepView(dom);
-  keepView(dom);
+  await keepView(dom);
+  await keepView(dom);
   assert.deepEqual(
     owners.viewer.getSnapshotViews().map(snapshot => snapshot.id),
     ['snap_1', 'snap_2'],
@@ -625,6 +634,7 @@ test('a cleared inventory leaves no hidden live view in the badge renderer', t =
   const liveBadge = dom.badgesList.children[0];
   const liveRemove = liveBadge.children.find(child => child.className === 'split-badge-remove');
   liveRemove.fire('click');
+  await settle();
   assert.equal(
     owners.viewer.getLiveViewHidden(),
     true,
@@ -645,43 +655,37 @@ test('a cleared inventory leaves no hidden live view in the badge renderer', t =
   );
 });
 
-test('a multiview restore raises nothing on the frames it schedules', async t => {
+test('a views restore raises nothing on the frames it schedules', async t => {
   const owners = createOwners();
   const { controls, dom, frameErrors } = mountViewControls(t, owners);
+  // The views domain names the layout picker it shows the layout in; this
+  // page has none to find.
+  const previousDocument = globalThis.document;
+  globalThis.document = { getElementById: () => null };
+  t.after(() => {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  });
+  const views = createViewsDomain({ state: owners.state, viewer: owners.viewer, refreshUi() {} });
 
-  keepView(dom);
+  await keepView(dom);
   const savedActiveId = owners.state.getActiveViewId();
   assert.equal(savedActiveId, 'snap_1');
+  const saved = views.capture();
+  assert.equal(saved.views.length, 2);
+  assert.equal(saved.focus, 1);
 
-  const saved = {
-    camerasLocked: false,
-    layout: { activeId: 'snap_1', liveViewHidden: false, mode: 'grid' },
-    live: { cameraState: cameraState(), centroids: { points: false, labels: false } },
-    snapshots: [{
-      activeFields: { activeFieldKey: null, activeFieldSource: null },
-      cameraState: cameraState(),
-      centroids: { points: false, labels: false },
-      embedding: { key: 'X_umap', columns: null },
-      filters: {},
-      id: 'snap_1',
-    }],
-  };
+  // Back to the live view alone: the kept view is retired while it is focused.
+  const liveOnly = { ...saved, focus: 0, views: saved.views.slice(0, 1) };
+  await views.restore(liveOnly);
+  // The per-view domains are restored after the views, each awaiting its
+  // field loads: the frames the retirement scheduled run in between.
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(owners.viewer.getSnapshotViews(), []);
+  assert.equal(owners.state.getActiveViewId(), 'live');
 
-  await restoreMultiview({
-    state: owners.state,
-    viewer: owners.viewer,
-    async restoreActiveFields() {
-      await new Promise(resolve => setTimeout(resolve, 0));
-    },
-    async restoreFilters() {
-      await new Promise(resolve => setTimeout(resolve, 0));
-    },
-  }, saved, {
-    embedding: { key: 'X_umap', columns: null },
-    filters: {},
-    activeFields: { activeFieldKey: null, activeFieldSource: null },
-  });
-
+  // And forward again: one view kept from the live view, focused.
+  await views.restore(saved);
   // Drain any frame the restore's last publication scheduled.
   await new Promise(resolve => setTimeout(resolve, 0));
 
@@ -697,6 +701,7 @@ test('a multiview restore raises nothing on the frames it schedules', async t =>
     ['All cells'],
   );
   assert.equal(owners.state.getActiveViewId(), 'snap_2');
+  assert.deepEqual(views.capture(), saved, 'the views value is put back exactly');
   assert.doesNotThrow(() => controls.renderSplitViewBadges());
 });
 
@@ -712,11 +717,11 @@ function rowText(badge) {
   };
 }
 
-test('each row names what its view shows, with the colouring field under it', t => {
+test('each row names what its view shows, with the colouring field under it', async t => {
   const owners = createOwners();
   const { dom } = mountViewControls(t, owners);
 
-  keepView(dom);
+  await keepView(dom);
   assert.deepEqual(
     dom.badgesList.children.map(rowText),
     [
@@ -753,7 +758,7 @@ test('Link cameras is offered only between views that show one representation', 
   assert.match(dom.cameraLockBtn.title, /Keep a view first/);
 
   // Two views of one representation: linkable, and the linked rows say so.
-  keepView(dom);
+  await keepView(dom);
   owners.viewer.setCamerasLocked(true);
   controls.renderSplitViewBadges();
   assert.equal(dom.cameraLockBtn.disabled, false);

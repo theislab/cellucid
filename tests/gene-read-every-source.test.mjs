@@ -32,6 +32,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';

@@ -47,7 +47,10 @@ test('every key is read as it is stored, and a single text may be a one-element 
     citation: { text: ['Doe 2026'], url: 'https://doi.org/10.1/x' },
     source: { name: 'Lab' },
     defaults: { embedding2d: ['X_umap'], obsKeys: ['cell_type'], embedding3d: { key: 'X_pca', columns: [0, 1, 2] } },
-    session: { anything: 'is never read' },
+    // The packages' own records, kept on the data a person works with: never read.
+    history_applied: '[{"step": "s4"}]',
+    gene_sets: { Markers: { genes: ['CD3E'] } },
+    pulled: { cellucid_highlight__highlight_1: { kind: 'highlight' } },
     priority: { seed: 7, specVersion: 1, nObs: 5, levels: [1, 2, 3] },
   }, 'h5ad');
   assert.equal(CELLUCID_UNS_SCHEMA, 1);
@@ -63,6 +66,8 @@ test('every key is read as it is stored, and a single text may be a one-element 
   });
   // Every key is optional.
   assert.equal(requireCellucidFileMetadata({}, 'h5ad').id, null);
+  // A key no writer writes refuses the file.
+  assert.throws(() => requireCellucidFileMetadata({ session: {} }, 'h5ad'), /session/);
 });
 
 test('a priority record is never refused here: the reader verifies it against the cells', () => {

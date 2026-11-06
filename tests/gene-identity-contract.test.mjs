@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DataState } from '../assets/js/app/state/core/data-state.js';
-import { createViewerHostResults } from '../assets/js/app/viewer-host-results.js';
+import { createViewerHostResults } from '../assets/js/app/viewer-host/results.js';
 import { createGeneIndex, geneIdentities, resolveGenes } from '../assets/js/app/analysis/shared/gene-sets.js';
 import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import { decodeViewerResult, encodeViewerBinaryFrame, encodeViewerResult } from '../assets/js/data/viewer-protocol.js';

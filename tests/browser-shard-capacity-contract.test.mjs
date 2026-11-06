@@ -79,7 +79,10 @@ function listedTests(report, testDir) {
   return tests.sort();
 }
 
-test('every browser shard of the CI matrix fits its runner\'s bounded processes', async () => {
+// Playwright lists every spec five times here, each a process of its own: 17 to 35 s on hosted
+// runners, past the suite's fence for a hung test on a machine at work. Nothing here waits for
+// anything but those processes, so this fence is only for one of them hanging.
+test('every browser shard of the CI matrix fits its runner\'s bounded processes', { timeout: 600_000 }, async () => {
   const workflow = await readFile(new URL('../.github/workflows/test.yml', import.meta.url), 'utf8');
   const matrixShards = workflow.match(/^\s+shard: (\[[^\]\n]+\])$/m);
   assert.ok(matrixShards, 'the browser matrix lists its shards');

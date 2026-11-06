@@ -176,7 +176,7 @@ function readPublicSampleCatalog() {
  * label, value or text is never read, because those carry dataset content.
  */
 const CLICK_CONTROLS = Object.freeze({
-  'save-state-btn': ['session_save'],
+  'history-share-save': ['session_save'],
   'load-state-btn': ['session_load'],
   'figure-export-btn': ['figure_export'],
   'add-highlight-page': ['highlight_page', 'add'],

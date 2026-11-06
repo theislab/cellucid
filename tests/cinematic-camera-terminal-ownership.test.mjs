@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { initCinematicCamera } from '../assets/js/app/ui/modules/cinematic-camera/index.js';
+import { getActions } from '../assets/js/app/actions/index.js';
+
+const CAMERA_PATH_ACTIONS = getActions().catalog.list()
+  .map(definition => definition.type)
+  .filter(type => type.startsWith('camera-path.'));
 
 function createControl({ checked = false, value = '' } = {}) {
   const listeners = new Map();
@@ -105,44 +110,8 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
       getNavigationMode() {
         return 'orbit';
       },
-      setInvertLookX(value) {
-        viewerCalls.push(['setInvertLookX', value]);
-      },
-      setInvertLookY(value) {
-        viewerCalls.push(['setInvertLookY', value]);
-      },
       setCameraState(value) {
         viewerCalls.push(['setCameraState', value]);
-      },
-      setLookSensitivity(value) {
-        viewerCalls.push(['setLookSensitivity', value]);
-      },
-      setMoveSpeed(value) {
-        viewerCalls.push(['setMoveSpeed', value]);
-      },
-      setNavigationMode(value) {
-        viewerCalls.push(['setNavigationMode', value]);
-      },
-      setOrbitInvertRotation(value) {
-        viewerCalls.push(['setOrbitInvertRotation', value]);
-      },
-      setOrbitKeySpeed(value) {
-        viewerCalls.push(['setOrbitKeySpeed', value]);
-      },
-      setPlanarInvertAxes(value) {
-        viewerCalls.push(['setPlanarInvertAxes', value]);
-      },
-      setPlanarPanSpeed(value) {
-        viewerCalls.push(['setPlanarPanSpeed', value]);
-      },
-      setPlanarZoomToCursor(value) {
-        viewerCalls.push(['setPlanarZoomToCursor', value]);
-      },
-      setPointerLockEnabled(value) {
-        viewerCalls.push(['setPointerLockEnabled', value]);
-      },
-      setShowOrbitAnchor(value) {
-        viewerCalls.push(['setShowOrbitAnchor', value]);
       }
     };
     const datasetListeners = new Set();
@@ -158,13 +127,6 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
     const navigation = {
       syncNavigationMode(mode) {
         navigationCalls.push(['syncNavigationMode', mode]);
-      },
-      exportSettings() {
-        navigationCalls.push(['exportSettings']);
-        return {};
-      },
-      restoreSettings(data) {
-        navigationCalls.push(['restoreSettings', data]);
       }
     };
     const camera = initCinematicCamera({
@@ -174,6 +136,11 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
       dataSourceManager,
       focusedRepresentation: () => null,
     });
+    // Its actions are provided while it lives.
+    assert.equal(CAMERA_PATH_ACTIONS.length, 8);
+    for (const type of CAMERA_PATH_ACTIONS) {
+      assert.equal(getActions().provided(type), true, `${type} is provided`);
+    }
     const retainedPlaybackController = camera.getPlaybackController();
     camera.getKeyframeStore().add({
       navigationMode: 'orbit',
@@ -197,6 +164,9 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
     camera.destroy();
     camera.destroy();
 
+    for (const type of CAMERA_PATH_ACTIONS) {
+      assert.equal(getActions().provided(type), false, `${type} is withdrawn with the module`);
+    }
     assert.deepEqual(cancelledFrames, [frameId]);
     assert.equal(datasetListeners.size, 0);
     assert.equal(dom.saveBtn.listeners('click').length, 0);
@@ -206,8 +176,7 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
     );
     assert.throws(() => camera.getPlaybackController(), /after destruction/i);
     assert.throws(() => camera.getKeyframeStore(), /after destruction/i);
-    assert.throws(() => camera.capturePlaybackSnapshot(), /after destruction/i);
-    assert.throws(() => camera.exportSessionState(), /after destruction/i);
+    assert.throws(() => camera.exportPath(), /after destruction/i);
     assert.throws(() => camera.getNavigationMode(), /after destruction/i);
 
     navigationCalls.length = 0;
@@ -219,6 +188,19 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
     assert.deepEqual(viewerCalls, []);
     assert.equal(dom.keyframeList.classList.toggles, 0);
     assert.deepEqual(navigationCalls, []);
+
+    // A module started again (a viewer retired and rebuilt) provides them again.
+    const again = initCinematicCamera({
+      viewer,
+      dom: createDom(),
+      navigation,
+      dataSourceManager,
+      focusedRepresentation: () => null,
+    });
+    for (const type of CAMERA_PATH_ACTIONS) {
+      assert.equal(getActions().provided(type), true, `${type} is provided again`);
+    }
+    again.destroy();
   } finally {
     globalThis.document = previousDocument;
     globalThis.requestAnimationFrame = previousRequestAnimationFrame;

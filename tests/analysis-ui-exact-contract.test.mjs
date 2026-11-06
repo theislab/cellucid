@@ -22,18 +22,7 @@ import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gen
 import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
 import { createRequestIdTracker } from '../assets/js/app/jobs/cancellable-job.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
-import {
-  capture as captureAnalysisWindows,
-  restore as restoreAnalysisWindows,
-} from '../assets/js/app/session/contributors/analysis-windows.js';
-import { SessionSerializer } from '../assets/js/app/session/session-serializer.js';
-import { encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
-import {
-  createInMemoryAnnDataDimensionManager,
-  describeOwnVarCount,
-  inMemoryAnnDataMapping,
-} from './helpers/in-memory-anndata.mjs';
-import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { createAnalysisDomain } from '../assets/js/app/state/domains/analysis.js';
 import { ComparisonModule } from '../assets/js/app/analysis/comparison-module.js';
 import {
   deResultsToCSV,
@@ -274,8 +263,10 @@ test('ComparisonModule never publishes a zero-cell page as selected', () => {
     getCurrentPages() {
       return ['page_1'];
     },
-    onPageSelectionChange(pageIds) {
-      publishedPages = [...pageIds];
+    // A page change that leaves no page with cells publishes the module's
+    // default (none), not a choice of none.
+    seedCurrentPages(pageIds, options) {
+      publishedPages = [[...pageIds], options];
     },
   };
   comparison._analysisWindowManager = {
@@ -285,7 +276,7 @@ test('ComparisonModule never publishes a zero-cell page as selected', () => {
   comparison.onPagesChanged();
 
   assert.deepEqual(comparison.currentConfig.pages, []);
-  assert.deepEqual(publishedPages, []);
+  assert.deepEqual(publishedPages, [[], { notifyActiveUI: true }]);
 });
 
 test('AnalysisUIManager rejects an explicit zero-cell page selection', () => {
@@ -819,6 +810,7 @@ test('AnalysisWindowManager propagates dockable registration failure and rolls b
       float() {
         floatCalls += 1;
       },
+      place() {},
       unregister() {},
       panelFrame() {
         return null;
@@ -873,82 +865,49 @@ test('AnalysisWindowManager removes zero-cell selections before highlight propag
   assert.equal(highlightCalls, 1);
 });
 
-test('analysis-window session capture requires the exact manager API', () => {
-  assert.throws(
-    () => captureAnalysisWindows({}),
-    /analysisWindowManager.*exportSessionWindows/i,
-  );
-  assert.throws(
-    () => captureAnalysisWindows({
-      analysisWindowManager: {
-        exportSessionWindows() {
-          return {};
+test('the analysis domain restore is terminal on an invalid value and on window manager failures', async () => {
+  const NOTHING_DOCKED = { openMode: null, modes: {} };
+  function analysisOver(manager) {
+    return createAnalysisDomain({
+      analysis: async () => ({
+        comparisonModule: {
+          exportSessionState: () => structuredClone(NOTHING_DOCKED),
+          async importSessionState() {
+            throw new Error('the docked panel is unchanged');
+          },
         },
-        exportViewSizes() {
-          return { window: {}, expandedView: {} };
+        analysisWindowManager: {
+          exportSessionWindows: () => [],
+          exportWindowPlaces: () => [],
+          ...manager,
         },
-      },
-    }),
-    /exportSessionWindows.*array/i,
-  );
-});
+      }),
+    });
+  }
 
-test('analysis-window session restore is terminal on invalid boundaries and manager failures', async () => {
+  let closeCalls = 0;
   await assert.rejects(
-    restoreAnalysisWindows({}, {}, { windows: [] }),
-    /analysisWindowManager.*closeAll.*createFromSessionDescriptor.*importViewSizes/i,
-  );
-  const exactManager = {
-    closeAll() {},
-    createFromSessionDescriptor() {},
-    importViewSizes() {},
-  };
-  const NO_SIZES = { window: {}, expandedView: {} };
-  await assert.rejects(
-    restoreAnalysisWindows(
-      { analysisWindowManager: exactManager },
-      {},
-      { windows: [] },
-    ),
-    /payload must be typed JSON bytes/i,
-    'the windows chunk is binary typed JSON, never a decoded object',
+    analysisOver({ closeAll() { closeCalls += 1; } }).restore({ docked: NOTHING_DOCKED }),
+    /analyses to restore must be exactly their windows and the docked analysis/,
   );
   await assert.rejects(
-    restoreAnalysisWindows(
-      { analysisWindowManager: exactManager },
-      {},
-      encodeTypedJson({}),
-    ),
-    /payload.*exactly.*sizes, windows/i,
+    analysisOver({ closeAll() { closeCalls += 1; } }).restore({ windows: [], sizes: null, docked: NOTHING_DOCKED }),
+    /analyses to restore must be exactly their windows and the docked analysis/,
+    'the sizes remembered per analysis are the layout\'s now: a value holding them is refused, not migrated',
   );
-  await assert.rejects(
-    restoreAnalysisWindows(
-      { analysisWindowManager: exactManager },
-      {},
-      encodeTypedJson({ windows: [] }),
-    ),
-    /payload.*exactly.*sizes, windows/i,
-    'a payload without remembered sizes is refused, not migrated',
-  );
+  assert.equal(closeCalls, 0);
 
   const closeError = new Error('close failed');
   let restoreCalls = 0;
   await assert.rejects(
-    restoreAnalysisWindows(
-      {
-        analysisWindowManager: {
-          closeAll() {
-            throw closeError;
-          },
-          createFromSessionDescriptor() {
-            restoreCalls += 1;
-          },
-          importViewSizes() {},
-        },
+    analysisOver({
+      closeAll() {
+        throw closeError;
       },
-      {},
-      encodeTypedJson({ windows: [{}], sizes: NO_SIZES }),
-    ),
+      createFromSessionDescriptor() {
+        restoreCalls += 1;
+      },
+    }).restore({ windows: [{}], docked: NOTHING_DOCKED }),
     error => error === closeError,
   );
   assert.equal(restoreCalls, 0);
@@ -956,242 +915,16 @@ test('analysis-window session restore is terminal on invalid boundaries and mana
   const restoreError = new Error('restore failed');
   restoreCalls = 0;
   await assert.rejects(
-    restoreAnalysisWindows(
-      {
-        analysisWindowManager: {
-          closeAll() {},
-          createFromSessionDescriptor() {
-            restoreCalls += 1;
-            throw restoreError;
-          },
-          importViewSizes() {},
-        },
+    analysisOver({
+      closeAll() {},
+      createFromSessionDescriptor() {
+        restoreCalls += 1;
+        throw restoreError;
       },
-      {},
-      encodeTypedJson({ windows: [{ modeId: 'first' }, { modeId: 'second' }], sizes: NO_SIZES }),
-    ),
+    }).restore({ windows: [{ modeId: 'first' }, { modeId: 'second' }], docked: NOTHING_DOCKED }),
     error => error === restoreError,
   );
   assert.equal(restoreCalls, 1, 'restore must stop at the first failed descriptor');
-});
-
-/**
- * The smallest DataState a session fingerprint can be taken from: one
- * in-memory 3D layout (keyed "3d", named obsm['X_umap']), shown by the live
- * view, and the data mapping that shows it.
- */
-function createFingerprintState() {
-  const positionsArray = new Float32Array(9);
-  const dimensionManager = createInMemoryAnnDataDimensionManager({
-    positions: positionsArray,
-    dimension: 3,
-  });
-  const dataMapping = Object.freeze(inMemoryAnnDataMapping());
-  return {
-    getDatasetGeneration: () => 0,
-    obsData: { fields: [] },
-    pointCount: 3,
-    dimensionManager,
-    getDataMapping: () => dataMapping,
-    getDataMappingOrigin: () => 'default',
-    describeEmbeddingRefusal: () => null,
-    describeMappingChoiceRefusal: () => null,
-    describeMappingVarCount: describeOwnVarCount,
-    applyDataMapping: async () => {
-      throw new Error('A session on the same mapping applies no mapping.');
-    },
-    getViewDimensionLevel: () => 3,
-    getViewLayoutKey: () => dimensionManager.getViewLayout('live'),
-    getActiveViewId: () => 'live',
-    positionsArray,
-    varData: { fields: [] },
-  };
-}
-
-function createSessionSerializer(contributors) {
-  return new SessionSerializer({
-    state: createFingerprintState(),
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: null,
-    comparisonModule: null,
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    figureExport: null,
-    contributors,
-  });
-}
-
-function sessionChunk(contributorId, id, priority = 'eager') {
-  return {
-    id,
-    contributorId,
-    priority,
-    kind: 'json',
-    codec: 'none',
-    label: id,
-    datasetDependent: false,
-    payload: { id },
-  };
-}
-
-async function withSessionNotificationHarness(run) {
-  const notifications = getNotificationCenter();
-  const methodNames = [
-    'completeDownload',
-    'dismissDownload',
-    'failDownload',
-    'info',
-    'startDownload',
-    'updateDownload',
-    'warning',
-  ];
-  const originals = new Map(
-    methodNames.map(name => [name, notifications[name]]),
-  );
-  notifications.startDownload = () => 'session-test-download';
-  notifications.updateDownload = () => {};
-  notifications.completeDownload = () => {};
-  notifications.dismissDownload = () => {};
-  notifications.failDownload = () => {};
-  notifications.info = () => {};
-  notifications.warning = () => {};
-  try {
-    return await run();
-  } finally {
-    for (const [name, method] of originals) {
-      notifications[name] = method;
-    }
-  }
-}
-
-test('SessionSerializer capture stops at and propagates the first contributor failure', async () => {
-  const captureError = new Error('capture failed');
-  let laterCaptureCalls = 0;
-  const serializer = createSessionSerializer([
-    {
-      id: 'failing-capture',
-      capture() {
-        throw captureError;
-      },
-      restore() {},
-    },
-    {
-      id: 'later-capture',
-      capture() {
-        laterCaptureCalls += 1;
-        return [];
-      },
-      restore() {},
-    },
-  ]);
-
-  await assert.rejects(
-    serializer.createSessionBundle(),
-    error => error === captureError,
-  );
-  assert.equal(laterCaptureCalls, 0);
-});
-
-test('SessionSerializer rejects invalid captured chunks instead of omitting them', async () => {
-  const serializer = createSessionSerializer([{
-    id: 'invalid-chunk-contributor',
-    capture() {
-      return [null];
-    },
-    restore() {},
-  }]);
-
-  await assert.rejects(
-    serializer.createSessionBundle(),
-    /session contributor.*chunk.*object/i,
-  );
-});
-
-test('SessionSerializer restore stops at and propagates eager contributor failure', async () => {
-  const contributorId = 'failing-eager-restore';
-  const bundle = await createSessionSerializer([{
-    id: contributorId,
-    capture() {
-      return [
-        sessionChunk(contributorId, 'test/eager-first'),
-        sessionChunk(contributorId, 'test/eager-second'),
-      ];
-    },
-    restore() {},
-  }]).createSessionBundle();
-
-  const restoreError = new Error('eager restore failed');
-  let restoreCalls = 0;
-  const serializer = createSessionSerializer([{
-    id: contributorId,
-    capture() {
-      return [];
-    },
-    restore() {
-      restoreCalls += 1;
-      throw restoreError;
-    },
-  }]);
-
-  await withSessionNotificationHarness(async () => {
-    await assert.rejects(
-      serializer.restoreFromBlob(bundle),
-      error => error === restoreError,
-    );
-  });
-  assert.equal(restoreCalls, 1);
-});
-
-test('SessionSerializer public restore promise propagates lazy contributor failure', async () => {
-  const contributorId = 'failing-lazy-restore';
-  const bundle = await createSessionSerializer([{
-    id: contributorId,
-    capture() {
-      return [sessionChunk(contributorId, 'test/lazy', 'lazy')];
-    },
-    restore() {},
-  }]).createSessionBundle();
-
-  const restoreError = new Error('lazy restore failed');
-  const serializer = createSessionSerializer([{
-    id: contributorId,
-    capture() {
-      return [];
-    },
-    restore() {
-      throw restoreError;
-    },
-  }]);
-
-  let outcome;
-  await withSessionNotificationHarness(async () => {
-    outcome = await serializer.restoreFromBlob(bundle).then(
-      () => ({ status: 'resolved' }),
-      error => ({ status: 'rejected', error }),
-    );
-  });
-  assert.equal(outcome.status, 'rejected');
-  assert.equal(outcome.error, restoreError);
-});
-
-test('SessionSerializer rejects a current bundle whose contributor is not registered', async () => {
-  const contributorId = 'required-current-contributor';
-  const bundle = await createSessionSerializer([{
-    id: contributorId,
-    capture() {
-      return [sessionChunk(contributorId, 'test/required-contributor')];
-    },
-    restore() {},
-  }]).createSessionBundle();
-  const serializer = createSessionSerializer([]);
-
-  await withSessionNotificationHarness(async () => {
-    await assert.rejects(
-      serializer.restoreFromBlob(bundle),
-      /session contributor.*required-current-contributor.*not registered/i,
-    );
-  });
 });
 
 test('correlation UI awaits each selected variable readiness before one compute execution', async () => {

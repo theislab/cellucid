@@ -1,0 +1,52 @@
+{
+  "examples": [
+    {
+      "autoplay": false,
+      "easing": "linear",
+      "loop": false,
+      "position_interpolation": "catmull-rom",
+      "rotation_interpolation": "slerp",
+      "speed": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "autoplay": {
+        "type": "boolean"
+      },
+      "easing": {
+        "enum": [
+          "linear",
+          "ease-in-out",
+          "ease-in",
+          "ease-out"
+        ]
+      },
+      "loop": {
+        "type": "boolean"
+      },
+      "position_interpolation": {
+        "enum": [
+          "catmull-rom",
+          "linear",
+          "bezier"
+        ]
+      },
+      "rotation_interpolation": {
+        "enum": [
+          "slerp",
+          "linear"
+        ]
+      },
+      "speed": {
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "type": "camera-path.playback.set",
+  "version": 1
+}

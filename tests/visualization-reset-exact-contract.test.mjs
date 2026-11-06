@@ -3,6 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { initVisualizationReset } from '../assets/js/app/ui/modules/visualization-reset.js';
+import { getActions } from '../assets/js/app/actions/index.js';
 import {
   POINT_SIZE_SLIDER_MINIMUM,
   pointSizeSliderPositionForCellCount,
@@ -127,7 +128,10 @@ function createHarness() {
     getViewDimension(viewId) {
       calls.push(['viewer', 'getViewDimension', viewId]);
       return this.viewDimension;
-    }
+    },
+    // The open views a step names a view among (`app/actions/targets/views.js`).
+    getLiveViewHidden: () => false,
+    getSnapshotViews: () => [],
   };
   for (const method of [
     'resetCamera',
@@ -269,7 +273,7 @@ test('visualization reset requires its exact dependency and DOM ownership graph'
   }
 });
 
-test('visualization reset restores every captured value without defaults or coercion', () => {
+test('visualization reset restores every captured value without defaults or coercion', async t => {
   const documentListeners = new Map();
   const previousDocument = globalThis.document;
   globalThis.document = {
@@ -287,6 +291,17 @@ test('visualization reset restores every captured value without defaults or coer
       renderControls: harness.renderControls,
       cameraControls: harness.cameraControls
     });
+    t.after(() => reset.destroy());
+    // R is the focused view's `camera.reset`, which the camera controls
+    // implement; here it records what it was asked.
+    t.after(getActions().provide('camera.reset', params => {
+      harness.calls.push(['action', 'camera.reset', params]);
+      return null;
+    }));
+    const dispatched = [];
+    t.after(getActions().subscribe(event => {
+      if (event.kind === 'start') dispatched.push([event.type, event.params]);
+    }));
 
     mutateControls(harness);
     reset.resetVisualizationToDefaults();
@@ -366,17 +381,30 @@ test('visualization reset restores every captured value without defaults or coer
       ['render', 'applyRenderMode', 'smoke']
     ]);
 
+    // The button is the `display.reset` action: everything above, as one step.
     harness.calls.length = 0;
     harness.cameraDom.resetBtn.dispatch('click');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(dispatched, [['display.reset', {}]]);
     assert.equal(harness.calls[0][1], 'resetCamera');
 
+    // R resets the focused view's camera only.
     harness.calls.length = 0;
+    dispatched.length = 0;
     documentListeners.get('keydown')({ key: 'r', target: { tagName: 'DIV' } });
-    assert.deepEqual(harness.calls, [['viewer', 'resetCamera']]);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(dispatched, [['camera.reset', { view: 'View 1' }]]);
+    assert.deepEqual(harness.calls, [
+      ['viewer', 'getFocusedViewId'],
+      ['action', 'camera.reset', { view: 'View 1' }],
+    ]);
 
     harness.calls.length = 0;
+    dispatched.length = 0;
     documentListeners.get('keydown')({ key: 'R', target: { tagName: 'INPUT' } });
+    await new Promise(resolve => setTimeout(resolve, 0));
     assert.deepEqual(harness.calls, []);
+    assert.deepEqual(dispatched, []);
   } finally {
     globalThis.document = previousDocument;
   }
@@ -401,10 +429,14 @@ test('capturing invalid reset state fails visibly instead of repairing it', () =
     const invalidDimensionReset = initVisualizationReset(
       resetOptions(invalidDimensionHarness)
     );
-    assert.throws(
-      () => invalidDimensionReset.resetVisualizationToDefaults(),
-      /exactly 1, 2, or 3/i
-    );
+    try {
+      assert.throws(
+        () => invalidDimensionReset.resetVisualizationToDefaults(),
+        /exactly 1, 2, or 3/i
+      );
+    } finally {
+      invalidDimensionReset.destroy();
+    }
 
     const nonBooleanHarness = createHarness();
     nonBooleanHarness.cameraDom.invertLookCheckbox.checked = 1;
@@ -460,6 +492,7 @@ test('visualization reset destruction detaches and fences retained reset intents
     assert.deepEqual(harness.calls, []);
     assert.equal(harness.renderDom.backgroundSelect.value, 'black');
     assert.equal(harness.cameraDom.navigationModeSelect.value, 'planar');
+    assert.equal(getActions().provided('display.reset'), false, 'a closed reset implements no action');
   } finally {
     globalThis.document = previousDocument;
   }
@@ -486,6 +519,7 @@ test('reset applies the navigation mode the focused dimension implies', () => {
       harness.cameraDom.navigationModeSelect.value = 'free';
       harness.calls.length = 0;
       reset.resetVisualizationToDefaults();
+      reset.destroy();
 
       assert.equal(
         harness.cameraDom.navigationModeSelect.value,
@@ -555,9 +589,10 @@ test('a large dataset opens at a negative slider position and is still captured'
   );
   assert.ok(openingPosition >= POINT_SIZE_SLIDER_MINIMUM);
 
+  let reset = null;
   try {
     harness.renderDom.pointSizeInput.value = String(openingPosition);
-    const reset = initVisualizationReset(resetOptions(harness));
+    reset = initVisualizationReset(resetOptions(harness));
     reset.captureInitialState();
 
     harness.renderDom.pointSizeInput.value = '42.5';
@@ -577,6 +612,7 @@ test('a large dataset opens at a negative slider position and is still captured'
       assert.equal(harness.renderDom.pointSizeInput.value, String(position));
     }
   } finally {
+    reset?.destroy();
     globalThis.document = previousDocument;
   }
 });

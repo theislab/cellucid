@@ -25,7 +25,7 @@ function otherUserDocument(votes = {}) {
     updatedAt: '2026-07-30T01:02:03.456Z',
     suggestions: {
       'cell_type:Alpha': [{
-        id: 'remote-suggestion',
+        id: 'ghid_7_remote-suggestion',
         label: 'T cell',
         proposedBy: 'ghid_7',
         proposedAt: '2026-07-30T01:02:03.456Z',
@@ -78,20 +78,20 @@ test('a vote retracted after Publish stays retracted across the next Pull', (t) 
   const session = createSession();
   t.after(() => dispose(session));
 
-  session.vote('cell_type', 0, 'remote-suggestion', 'up');
+  session.vote('cell_type', 0, 'ghid_7_remote-suggestion', 'up');
   const published = publish(session, SHA_A);
-  assert.deepEqual(published.votes, { 'remote-suggestion': 'up' });
+  assert.deepEqual(published.votes, { 'ghid_7_remote-suggestion': 'up' });
 
   // Clicking the same arrow again removes the vote.
-  session.vote('cell_type', 0, 'remote-suggestion', 'up');
-  assert.equal(session.getMyVote('cell_type', 0, 'remote-suggestion'), null);
+  session.vote('cell_type', 0, 'ghid_7_remote-suggestion', 'up');
+  assert.equal(session.getMyVote('cell_type', 0, 'ghid_7_remote-suggestion'), null);
 
   pull(session, [otherUserDocument(), published], {
     [OTHER_PATH]: SHA_OTHER,
     [MY_PATH]: SHA_A,
   });
 
-  assert.equal(session.getMyVote('cell_type', 0, 'remote-suggestion'), null);
+  assert.equal(session.getMyVote('cell_type', 0, 'ghid_7_remote-suggestion'), null);
   assert.deepEqual(session.getSuggestions('cell_type', 0)[0].upvotes, []);
   assert.deepEqual(
     session.buildUserFileDocument({ githubUserId: 42 }).votes,
@@ -106,20 +106,20 @@ test('a comment deleted after Publish stays deleted across the next Pull', (t) =
   const created = session.addComment(
     'cell_type',
     0,
-    'remote-suggestion',
+    'ghid_7_remote-suggestion',
     'oops, wrong cluster'
   );
   const commentId = typeof created === 'string' ? created : created.id;
   const published = publish(session, SHA_A);
   assert.equal(Object.keys(published.comments).length, 1);
 
-  session.deleteComment('cell_type', 0, 'remote-suggestion', commentId);
+  session.deleteComment('cell_type', 0, 'ghid_7_remote-suggestion', commentId);
   pull(session, [otherUserDocument(), published], {
     [OTHER_PATH]: SHA_OTHER,
     [MY_PATH]: SHA_A,
   });
 
-  assert.deepEqual(session.getComments('cell_type', 0, 'remote-suggestion'), []);
+  assert.deepEqual(session.getComments('cell_type', 0, 'ghid_7_remote-suggestion'), []);
   assert.deepEqual(
     session.buildUserFileDocument({ githubUserId: 42 }).comments,
     {}
@@ -129,7 +129,7 @@ test('a comment deleted after Publish stays deleted across the next Pull', (t) =
 test('a file published from another device still hydrates this device', (t) => {
   const elsewhere = createSession();
   t.after(() => dispose(elsewhere));
-  elsewhere.vote('cell_type', 0, 'remote-suggestion', 'down');
+  elsewhere.vote('cell_type', 0, 'ghid_7_remote-suggestion', 'down');
   const publishedElsewhere = publish(elsewhere, SHA_B);
 
   const session = createSession();
@@ -138,15 +138,15 @@ test('a file published from another device still hydrates this device', (t) => {
     [OTHER_PATH]: SHA_OTHER,
     [MY_PATH]: SHA_B,
   });
-  assert.equal(session.getMyVote('cell_type', 0, 'remote-suggestion'), 'down');
+  assert.equal(session.getMyVote('cell_type', 0, 'ghid_7_remote-suggestion'), 'down');
 
   // Once seen, that same file is no longer a source of new intent.
-  session.vote('cell_type', 0, 'remote-suggestion', 'down');
+  session.vote('cell_type', 0, 'ghid_7_remote-suggestion', 'down');
   pull(session, [otherUserDocument(), publishedElsewhere], {
     [OTHER_PATH]: SHA_OTHER,
     [MY_PATH]: SHA_B,
   });
-  assert.equal(session.getMyVote('cell_type', 0, 'remote-suggestion'), null);
+  assert.equal(session.getMyVote('cell_type', 0, 'ghid_7_remote-suggestion'), null);
 });
 
 test('reloading the profile file applies the same own-file hydration gate', async () => {

@@ -1,0 +1,56 @@
+{
+  "examples": [
+    {
+      "cells": [
+        0
+      ],
+      "color": "#e41a1c",
+      "label": "x",
+      "page": "Page 1",
+      "tool": "annotation"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "cells": {
+        "items": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minItems": 1,
+        "type": "array",
+        "x-cells": true
+      },
+      "color": {
+        "pattern": "^#[0-9a-fA-F]{6}$",
+        "type": "string"
+      },
+      "label": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "tool": {
+        "default": "annotation",
+        "enum": [
+          "annotation",
+          "lasso",
+          "proximity",
+          "knn"
+        ]
+      }
+    },
+    "required": [
+      "cells"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.cells",
+  "version": 1
+}

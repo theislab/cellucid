@@ -118,7 +118,7 @@ test('selection modules hold no cell-keyed Set or Map', async () => {
     'app/ui/modules/highlight/annotation-selection.js',
     'app/ui/modules/highlight/continuous-selection-preview.js',
     'app/ui/modules/highlight/selection-state.js',
-    'app/viewer-host-command-handler.js',
+    'app/viewer-host/command-handler.js',
     'rendering/selection-gesture-queries.js',
   ];
   for (const path of modules) {

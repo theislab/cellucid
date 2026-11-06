@@ -15,11 +15,12 @@
  */
 
 import { downloadBlob } from './utils/download.js';
+import { SAVE_DEFAULTS } from './session/share-scope.js';
 
 /**
  * @param {object} options
  * @param {{onGraphicsReset: Function, setGraphicsResetSessionSaver: Function}} options.viewer
- * @param {{createSessionBundle: () => Promise<Blob>}} options.sessionSerializer
+ * @param {{createSessionBundle: (options: {choice: object}) => Promise<Blob>}} options.sessionSerializer
  * @param {{error: Function, info: Function}} options.notifications
  * @returns {() => void} Stop following the viewer.
  */
@@ -42,7 +43,8 @@ export function keepSessionThroughGraphicsReset({ viewer, sessionSerializer, not
   const unsubscribe = viewer.onGraphicsReset(phase => {
     if (phase === 'lost') {
       written = false;
-      captured = sessionSerializer.createSessionBundle().catch(error => {
+      // Everything, conversations included: the person's own work, kept for a reload.
+      captured = sessionSerializer.createSessionBundle({ choice: { ...SAVE_DEFAULTS, chats: true } }).catch(error => {
         console.error('[GraphicsReset] The session could not be captured at the graphics reset.', error);
         notifications.error(
           `The session could not be captured when the graphics were reset: ${error instanceof Error ? error.message : String(error)}`,

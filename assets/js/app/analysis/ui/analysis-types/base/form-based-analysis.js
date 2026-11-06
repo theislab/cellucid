@@ -11,13 +11,18 @@
  * (`this._options`); sessions save `{options, selectedPages, view}`. Typing
  * never runs anything. An option change re-applies a display option to the
  * shown result, or marks the result stale (dimmed, with a "Stale · Run"
- * chip) until the next run. So do another set of open cells (Apply in place,
- * a progressive opening's step: `state.cellIdentity` is replaced), a
- * highlight change and, for an analysis of the visible cells, a filter. A
- * stale result is never passed on as current: it is not saved in a session
- * (`exportResult` gives null), not exported (CSV, PNG, SVG, GMT refuse and
- * say why) and not published to the derived results a notebook reads (its
- * scores and gene sets are withdrawn while it is stale).
+ * chip) until the next run. A result records what it was computed on, by
+ * content (`shared/result-provenance.js`: the dataset, the open cells, the
+ * genes read for, the data mapping, the pages' cells, the visible cells for
+ * an analysis of them, the deciding settings), and is stale exactly when
+ * that differs from the page now: another set of open cells (Apply in
+ * place, a progressive opening's step), genes read for more cells, a
+ * mapping change, a change of its pages' cells and, for an analysis of the
+ * visible cells, a filter. A stale result is never passed on as current: a
+ * session (and the history) keeps it with its provenance, so it comes back
+ * stale; it is not exported (CSV, PNG, SVG, GMT refuse and say why) and not
+ * published to the derived results a notebook reads (its scores and gene
+ * sets are withdrawn while it is stale).
  *
  * Subclasses implement:
  * - static getRequirements() - { minPages, maxPages, description }
@@ -68,10 +73,19 @@ import { loadPlotly, downloadImage } from '../../../plots/plotly-loader.js';
 import { PlotRegistry } from '../../../shared/plot-registry-utils.js';
 import { PlotlyRenderSlot } from '../../../shared/plotly-render-slot.js';
 import { isPlainRecord, requireExactKeys } from '../../../../../utils/exact-record.js';
-import { analysisCostKind, runProgressively } from '../../../shared/progressive-cells.js';
+import { listNames, namedError, quoteName } from '../../../../actions/targets/names.js';
+import { analysisCostKind, getAnalysisCostModel, runProgressively } from '../../../shared/progressive-cells.js';
 import { formatCountOf } from '../../../../../utils/format-units.js';
 import { cellsSteady } from '../../../../../data/open-cells-work.js';
 import { failureText } from '../../../../../utils/errors.js';
+import { isLeftOutResult } from '../../../shared/analysis-result-session.js';
+import { awaitWithSignal, onAbort } from '../../../../../utils/abort.js';
+import {
+  captureProvenance,
+  requireProvenance,
+  staleReasons,
+  visibleCellsNow
+} from '../../../shared/result-provenance.js';
 
 function requirePageIds(pageIds) {
   if (!Array.isArray(pageIds)) {
@@ -206,23 +220,34 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._disclosures = { more: false, groups: [] };
     /** @type {ReturnType<typeof renderOptionsForm>|null} */
     this._optionsForm = null;
-    /** The options, pages and open cells the shown result was computed with. */
+    /**
+     * The shown result's inputs: `options`, the options it is drawn with
+     * (display options follow the form), and `provenance`, what it was
+     * computed on (`shared/result-provenance.js`).
+     */
     this._resultInputs = null;
+    /**
+     * The record of a result a shared session left out
+     * (`importLeftOutResult`), given back by `exportResult` until the
+     * analysis has a result again or loses it; null otherwise.
+     */
+    this._leftOutResult = null;
     /** Whether the shown result's derived results were withdrawn as stale. */
     this._publishedStale = false;
     /** The open cells what the analysis keeps of the data describes (`_onOpenCellsChanged`). */
     this._cellsSeen = this._openCells();
-    /** Highlight changes since the shown result was computed. */
+    /** Highlight changes heard (a key of what the analysis keeps of the groups). */
     this._highlightRevision = 0;
     /**
-     * The visible cells' digest (`_visibleCellsDigest`) the form was last
-     * brought up to date for: the input of an analysis scoped to "Visible
-     * cells" (`_scopesByVisibleCells`), which moves only when the set of
-     * visible cells does, not on every visibility pass (a recolour runs one).
+     * The revision of the visible cells (`visibleCellsNow`) the form was
+     * last brought up to date for: the input of an analysis scoped to
+     * "Visible cells" (`_scopesByVisibleCells`), which moves only when the
+     * set of visible cells does, not on every visibility pass (a recolour
+     * runs one).
      */
-    this._seenVisibleDigest = null;
-    /** `_visibleCellsDigest`'s last answer and what it read. */
-    this._visibleDigestCache = null;
+    this._seenVisibleRevision = null;
+    /** The latest staleness check (`_updateStale`): only its answer is shown. */
+    this._staleCheck = 0;
     /** Changes recorded while another mode was shown (`noteHiddenChange`). */
     this._missedInputChange = false;
     /** Display redraws: the latest one's token is current. */
@@ -232,7 +257,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     /** The gene loader last asked for highly variable genes, and its answer. */
     this._highlyVariable = { loader: null, marked: false };
     // Genes read for more of the open cells (Genes read for): a result
-    // that read genes for fewer is stale (`_isResultStale`).
+    // that read genes for fewer is stale (`getStaleReasons`).
     const geneSampleState = this.dataLayer?.state ?? null;
     const onGeneSample = () => {
       if (!this._isDestroyed) this._updateStale();
@@ -398,6 +423,26 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     return null;
   }
 
+  /**
+   * What Run's reason is waiting for: the reads under way that it names
+   * ("Reading the groups…"), to be awaited, or null when no read is under way.
+   * A person sees that reason on the Run row until it goes; a caller who runs
+   * right after setting the options waits for it (`runNow`). @protected
+   */
+  _runInputsRead() {
+    return null;
+  }
+
+  /** Why these options cannot run, once what is being read for them has been read. @private */
+  async _runBlockerOnceRead(signal) {
+    for (;;) {
+      const blocker = this._getRunBlocker(this._requireOptions());
+      const reading = blocker === null ? null : this._runInputsRead();
+      if (reading === null) return blocker;
+      await awaitWithSignal(reading, signal);
+    }
+  }
+
   /** Run's accessible name is "Run <noun>". @protected */
   _getRunNoun() {
     return this._getTitle().toLowerCase();
@@ -518,57 +563,71 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._updateRunRow();
   }
 
-  /** Whether the shown result was computed on other open cells than the ones open now. */
-  _resultCellsChanged() {
-    return this._lastResult !== null && this._resultInputs !== null && this._resultInputs.cells !== this._openCells();
+  /**
+   * What a result computed now would be computed on
+   * (`shared/result-provenance.js`), with `genesReadFor` the gene sample it
+   * read genes for. The inputs are taken when it is called; their digests
+   * follow (SHA-256, the history's).
+   *
+   * @param {Object} options
+   * @param {string[]} pageIds
+   * @param {{cells: number, of: number}|null} genesReadFor
+   * @returns {Promise<Object>}
+   * @protected
+   */
+  _currentProvenance(options, pageIds, genesReadFor) {
+    const schema = this._getOptionsSchema();
+    const deciding = {};
+    for (const key of schema.keys) if (!this._isDisplayOption(key)) deciding[key] = options[key];
+    const state = this.dataLayer?.state ?? null;
+    return captureProvenance({
+      state,
+      dataset: this.comparisonModule?.describeOpenDataset?.() ?? null,
+      pageIds: [...pageIds],
+      options: deciding,
+      genesReadFor,
+      visible: this._scopesByVisibleCells(options) ? visibleCellsNow(state)?.cells ?? null : null
+    });
   }
 
-  /** Whether the shown result was computed from other inputs than the form's. */
-  _isResultStale() {
-    if (this._lastResult === null || this._resultInputs === null) return false;
-    const { options, pages, highlightRevision, visibleDigest, cells } = this._resultInputs;
-    if (cells !== this._openCells()) return true;
-    if (this._resultGeneCellsChanged()) return true;
-    if (highlightRevision !== this._highlightRevision) return true;
-    if (this._scopesByVisibleCells(options) && visibleDigest !== this._visibleCellsDigest()) return true;
-    if (!sameOptionValue(pages, [...this._selectedPages])) return true;
-    const schema = this._getOptionsSchema();
-    return schema.keys.some(key => !this._isDisplayOption(key) && !sameOptionValue(options[key], this._options[key]));
+  /** The shown result's provenance (null without a result). */
+  getResultProvenance() {
+    return this._lastResult === null || this._resultInputs === null ? null : this._resultInputs.provenance;
   }
 
   /**
-   * Whether the shown result read genes for a sample of the open cells and
-   * genes are read for more of them now (`gene-sample.js`). @private
+   * Why the shown result is stale, one sentence each: what differs between
+   * what it was computed on and the page now. Empty when it is current (or
+   * there is none).
+   * @returns {Promise<string[]>}
    */
-  _resultGeneCellsChanged() {
-    const then = this._resultInputs?.geneCells ?? null;
-    return then !== null && (this.dataLayer?.state?.getGeneSample?.()?.cells ?? null) !== then;
+  async getStaleReasons() {
+    if (this._lastResult === null || this._resultInputs === null) return [];
+    const recorded = this._resultInputs.provenance;
+    const sample = this.dataLayer?.state?.getGeneSample?.() ?? null;
+    const now = await this._currentProvenance(
+      this._requireOptions(),
+      [...this._selectedPages],
+      sample === null ? null : { cells: sample.cells, of: sample.of }
+    );
+    return staleReasons(recorded, now);
   }
 
-  /** Why the shown result is stale, in one sentence. @private */
-  _staleReason() {
-    if (this._resultGeneCellsChanged()) {
-      const now = this.dataLayer?.state?.getGeneSample?.() ?? null;
-      return `Genes are read for more cells since this result (${formatCountOf(this._resultInputs.geneCells, 'cell')} then, ${now === null ? 'every open cell' : formatCountOf(now.cells, 'cell')} now).`;
-    }
-    if (this._resultCellsChanged()) {
-      const then = this._resultInputs.cells;
-      const now = this._openCells();
-      return then !== null && now !== null && then.n !== now.n
-        ? `The open cells changed since this result (${formatCountOf(then.n, 'cell')} then, ${formatCountOf(now.n, 'cell')} now).`
-        : 'The open cells changed since this result.';
-    }
-    return 'The settings, pages or cells changed since this result.';
+  /** Why the shown result is stale, in one line. @private */
+  _staleReasonOf(reasons) {
+    return reasons.join(' ') || 'The settings, pages or cells changed since this result.';
   }
 
   /**
    * Refuse to export a stale result, saying why: an export is read as the
    * result of the settings and cells shown now. True when refused.
+   * @returns {Promise<boolean>}
    * @protected
    */
-  _refuseStaleExport(format) {
-    if (!this._isResultStale()) return false;
-    this._notifications.warning(`${format} not exported. ${this._staleReason()} Run it again to export it.`, { category: 'download' });
+  async _refuseStaleExport(format) {
+    const reasons = await this.getStaleReasons();
+    if (reasons.length === 0) return false;
+    this._notifications.warning(`${format} not exported. ${this._staleReasonOf(reasons)} Run it again to export it.`, { category: 'download' });
     return true;
   }
 
@@ -583,9 +642,24 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     this._publishDerivedResultsSafely(stale ? null : this._lastResult);
   }
 
-  /** Dim the shown result and offer a run when it no longer matches the form. @private */
-  _updateStale() {
-    const stale = this._isResultStale();
+  /**
+   * Dim the shown result and offer a run when it no longer matches the form,
+   * and withdraw a stale result from the derived results. Asked again before
+   * an answer arrives, only the latest answer is applied.
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _updateStale() {
+    const check = ++this._staleCheck;
+    let reasons;
+    try {
+      reasons = await this.getStaleReasons();
+    } catch (error) {
+      console.error(`[Analysis] ${this._getTitle()}: whether the result is stale could not be checked:`, error);
+      return;
+    }
+    if (check !== this._staleCheck || this._isDestroyed) return;
+    const stale = reasons.length > 0;
     this._syncStalePublication(stale);
     const container = this._resultContainer;
     if (!(container instanceof HTMLElement)) return;
@@ -603,18 +677,38 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       chip.addEventListener('click', () => this._runAgain());
       container.prepend(chip);
     }
-    chip.title = `${this._staleReason()} Run again.`;
+    chip.title = `${this._staleReasonOf(reasons)} Run again.`;
   }
 
   /**
-   * The shown result for a session, or null when there is none or it is
-   * stale: a session restores it as the result of the settings and cells it
-   * saves, which a stale result is not. Subclasses encode it
-   * (`_exportResult`).
-   * @returns {null|{kind: string, version: number, payload: unknown}}
+   * The shown result for a session or the history, with what it was
+   * computed on; without one, the record of a result a shared session left
+   * out (`importLeftOutResult`), or null. A stale one is kept too: its
+   * provenance makes it stale again where it is restored. Subclasses encode
+   * the result (`_exportResult`).
+   * @returns {null|{kind: string, version: number, payload: unknown, provenance: Object}|{kind: string, leftOut: true, provenance: Object|null}}
    */
   exportResult() {
-    return this._isResultStale() ? null : this._exportResult();
+    if (this._lastResult === null || this._resultInputs === null) {
+      return this._leftOutResult === null ? null : structuredClone(this._leftOutResult);
+    }
+    const envelope = this._exportResult();
+    return envelope === null ? null : { ...envelope, provenance: structuredClone(this._resultInputs.provenance) };
+  }
+
+  /**
+   * Restore the record of a result a shared session left out
+   * (`shared/analysis-result-session.js`): no result is shown, and the
+   * record is what the analysis gives a session and the history until it
+   * has a result again, so the state restored is the state shown. Opening
+   * the file runs it again (`session/recompute-results.js`).
+   * @param {{kind: string, leftOut: true, provenance: Object|null}} record
+   * @returns {Promise<void>}
+   */
+  async importLeftOutResult(record) {
+    if (!isLeftOutResult(record)) throw new TypeError(`${this._getTitle()}: a result left out must be {kind, leftOut: true, provenance}`);
+    await this._discardFormResult();
+    this._leftOutResult = structuredClone(record);
   }
 
   /** The shown, current result as a session envelope, or null. @protected */
@@ -761,6 +855,144 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       selectedPages: state.selectedPages,
       customColors: colors
     });
+  }
+
+  /**
+   * A person's change of the options made outside the options form (Swap A
+   * and B, Relax filters, the expanded view's display options): one step
+   * (`analysis.<name>.set`) of the options that differ from `before`, as a
+   * change in the form is.
+   * @param {Object} before - The options before the change
+   * @protected
+   */
+  _recordOptionsChange(before) {
+    const after = this._requireOptions();
+    const changed = Object.keys(after).filter(key => !sameOptionValue(before[key], after[key]));
+    if (changed.length === 0) return;
+    this._recordPersonChange('set', { options: Object.fromEntries(changed.map(key => [key, structuredClone(after[key])])) });
+  }
+
+  /**
+   * How this analysis is shown, named as `analysis.view.set` names it
+   * (`analysis/options/analysis-views.js`): the open disclosures of its
+   * options (`more`, the option `groups` open, in the schema's order) and
+   * what a subclass's result shows (`_viewParams`).
+   * @returns {Object}
+   */
+  getView() {
+    const disclosures = this._optionsForm?.getView() ?? this._disclosures;
+    return { more: disclosures.more, groups: [...disclosures.groups], ...this._viewParams() };
+  }
+
+  /**
+   * Change how this analysis is shown (`analysis.view.set`): only the keys
+   * given. The whole of `partial` is checked before anything changes; a key
+   * this analysis does not take, or a value it does not offer, is refused
+   * with a TypeError or RangeError naming it. Nothing runs.
+   *
+   * @param {Object} partial
+   * @returns {boolean} whether anything changed
+   */
+  setView(partial) {
+    return this.prepareView(partial)();
+  }
+
+  /**
+   * Check a `setView` whole and return what applies it (resolving whether
+   * anything changed), so a caller can refuse for another reason (the
+   * analysis is not shown) after the view is checked and before anything
+   * changes.
+   *
+   * @param {Object} partial
+   * @returns {() => boolean}
+   */
+  prepareView(partial) {
+    if (!isPlainRecord(partial)) throw new TypeError(`${this._getTitle()} view must be an object`);
+    const { more, groups, plot, ...rest } = partial;
+    const applyPlot = this._preparePlotView(plot);
+    const schema = this._getOptionsSchema();
+    const groupIds = schema.groups.map(group => group.id);
+    if (more !== undefined && typeof more !== 'boolean') throw new TypeError(`${this._getTitle()}'s "more" must be true or false`);
+    if (groups !== undefined) {
+      if (!Array.isArray(groups)) throw new TypeError(`${this._getTitle()}'s "groups" must be a list of option groups`);
+      for (const id of groups) {
+        if (!groupIds.includes(id)) {
+          throw namedError(RangeError, `${this._getTitle()} has no option group ${quoteName(id)}; its groups are ${listNames(groupIds)}.`);
+        }
+      }
+    }
+    const applyRest = this._prepareViewParams(rest);
+    return () => {
+      const current = this._optionsForm?.getView() ?? this._disclosures;
+      const next = {
+        more: more ?? current.more,
+        groups: groups === undefined ? [...current.groups] : groupIds.filter(id => groups.includes(id)),
+      };
+      const disclosuresChanged = next.more !== current.more || JSON.stringify(next.groups) !== JSON.stringify(current.groups);
+      this._disclosures = next;
+      this._optionsForm?.setView(next);
+      const restChanged = applyRest();
+      const plotChanged = applyPlot();
+      return disclosuresChanged || restChanged || plotChanged;
+    };
+  }
+
+  /**
+   * Check the `plot` part of a `setView` (options of the plot the expanded
+   * view draws, by name) against the shown result's plot, and return what
+   * applies it. An option the plot does not have, or a value it does not
+   * take, is refused naming the options it has.
+   * @protected
+   * @param {Array<{option: string, value: unknown}>|undefined} plot
+   * @returns {() => boolean}
+   */
+  _preparePlotView(plot) {
+    if (plot === undefined) return () => false;
+    const result = this._lastResult;
+    if (!result?.plotType) throw new RangeError(`${this._getTitle()} has no result whose plot could be changed yet; run it first.`);
+    const definition = PlotRegistry.get(result.plotType);
+    const schema = definition?.optionSchema ?? {};
+    const names = Object.keys(schema);
+    if (!Array.isArray(plot) || plot.length === 0) throw new TypeError(`${this._getTitle()}'s "plot" must list options`);
+    for (const { option, value } of plot) {
+      const entry = schema[option];
+      if (entry === undefined) {
+        throw namedError(RangeError, `The plot of ${this._getTitle()} has no option ${quoteName(option)}; its options are ${listNames(names)}.`);
+      }
+      if (entry.type === 'checkbox' && typeof value !== 'boolean') throw new TypeError(`The plot option "${option}" is on or off (true or false)`);
+      if (entry.type === 'range' && (typeof value !== 'number' || !Number.isFinite(value))) throw new TypeError(`The plot option "${option}" is a number`);
+      if (entry.type === 'select' && Array.isArray(entry.options) && !entry.options.some(choice => choice.value === value)) {
+        throw namedError(RangeError, `The plot option ${quoteName(option)} has no choice ${JSON.stringify(value)}; its choices are ${listNames(entry.options.map(choice => String(choice.value)))}.`);
+      }
+    }
+    return () => {
+      const before = JSON.stringify(this._requestedPlotOptions ?? result.options ?? {});
+      for (const { option, value } of plot) void this._applyPlotOptionChange(option, value);
+      return JSON.stringify(this._requestedPlotOptions ?? result.options ?? {}) !== before;
+    };
+  }
+
+  /**
+   * A subclass's part of `getView()` (what its result shows), by name. @protected
+   * @returns {Object}
+   */
+  _viewParams() {
+    return {};
+  }
+
+  /**
+   * Check a subclass's part of a `setView` (every key but `more` and
+   * `groups`) and return what applies it (resolving whether anything
+   * changed). A key the analysis does not take is refused here. @protected
+   * @param {Object} rest
+   * @returns {() => boolean}
+   */
+  _prepareViewParams(rest) {
+    const keys = Object.keys(rest);
+    if (keys.length > 0) {
+      throw new TypeError(`${this._getTitle()} has no view "${keys[0]}"; it takes "more", "groups" and "plot".`);
+    }
+    return () => false;
   }
 
   /**
@@ -1179,7 +1411,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
         'SVG export'
       ),
       onExportCSV: () => this._trackInteractiveTask(
-        Promise.resolve().then(() => (this._refuseStaleExport('CSV') ? undefined : this._exportModalCSV())),
+        this._refuseStaleExport('CSV').then(refused => (refused ? undefined : this._exportModalCSV())),
         'CSV export'
       )
     });
@@ -1293,16 +1525,20 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    *
    * @param {Object} result - The decoded result, shaped as `_runAnalysisImpl`
    *   returns it.
+   * @param {Object} provenance - What it was computed on, as saved with it
+   *   (`shared/result-provenance.js`): compared with the page now, it says
+   *   whether the restored result is current.
    * @returns {Promise<void>}
    * @protected
    */
-  async _restoreAnalysisResult(result) {
+  async _restoreAnalysisResult(result, provenance) {
     if (this._isDestroyed) {
       throw new Error(`${this.constructor.name} was destroyed before its result was restored`);
     }
     if (!isPlainRecord(result) || !Object.hasOwn(result, 'data')) {
       throw new TypeError('A restored analysis result must be an object with data');
     }
+    requireProvenance(provenance);
     await this._discardFormResult();
     const requestId = this._startAnalysisRequest();
     if (requestId === null) {
@@ -1313,15 +1549,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     try {
       drawing = this._showResult(result, requestId);
       await this._publishAnalysisResult(result, requestId);
-      // A restored result was computed from the options restored with it,
-      // on the cells the session opened.
+      // A restored result is drawn with the options restored with it, and
+      // is current exactly when what it was computed on is the page's now.
       this._resultInputs = {
         options: structuredClone(this._requireOptions()),
-        pages: [...this._selectedPages],
-        highlightRevision: this._highlightRevision,
-        visibleDigest: this._visibleCellsDigest(),
-        cells: this._openCells(),
-        geneCells: this._resultGeneSample(result)?.cells ?? null
+        provenance: structuredClone(provenance)
       };
       this._updateStale();
       if (this.onResultChange !== null && this.onResultChange !== undefined) {
@@ -1369,6 +1601,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   async _publishAnalysisResult(result, requestId = null) {
     this._lastResult = result;
+    this._leftOutResult = null;
     this._publishedStale = false;
     // Every result is of the open cells: say how they were chosen, and on
     // which of them genes were read (`_resultGeneSample`).
@@ -1585,6 +1818,23 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @returns {Promise<void>|undefined}
    */
   _handlePlotOptionChange(key, value) {
+    const task = this._applyPlotOptionChange(key, value);
+    // An option of the plot the expanded view draws is part of how the result
+    // is shown: a step (`analysis.view.set` with `plot`), recorded once it settles.
+    this._recordPersonChange('view', { view: { plot: [{ option: key, value }] } });
+    return task;
+  }
+
+  /**
+   * Apply one option of the expanded view's plot and draw again, recording
+   * nothing (a person's change records through `_handlePlotOptionChange`,
+   * an action's through the dispatcher).
+   * @protected
+   * @param {string} key
+   * @param {*} value
+   * @returns {Promise<void>|undefined}
+   */
+  _applyPlotOptionChange(key, value) {
     const prepared = this._preparePlotOptionChange(key, value);
     if (prepared === null || prepared === undefined) return;
     return this._trackInteractiveTask(
@@ -1748,7 +1998,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Export modal plot as PNG
    */
   async _exportModalPNG() {
-    if (this._refuseStaleExport('PNG')) return;
+    if (await this._refuseStaleExport('PNG')) return;
     const modal = this._modal;
     const slot = modal?._analysisPlotSlot ?? null;
     if (!(modal?._plotContainer instanceof HTMLElement) || slot === null) {
@@ -1774,7 +2024,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Export modal plot as SVG
    */
   async _exportModalSVG() {
-    if (this._refuseStaleExport('SVG')) return;
+    if (await this._refuseStaleExport('SVG')) return;
     const modal = this._modal;
     const slot = modal?._analysisPlotSlot ?? null;
     if (!(modal?._plotContainer instanceof HTMLElement) || slot === null) {
@@ -1904,9 +2154,18 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       onChange: (record, key) => {
         this._options = record;
         this._handleOptionsChanged(key);
+        this._recordPersonChange('set', {
+          options: key === null ? structuredClone(record) : { [key]: structuredClone(record[key]) }
+        });
       },
       onViewChange: view => {
+        // A disclosure the person opened or closed: a step (`analysis.view.set`), the keys that changed.
+        const before = this._disclosures;
         this._disclosures = view;
+        const changed = {};
+        if (before.more !== view.more) changed.more = view.more;
+        if (JSON.stringify(before.groups) !== JSON.stringify(view.groups)) changed.groups = [...view.groups];
+        if (Object.keys(changed).length > 0) this._recordPersonChange('view', { view: changed });
       }
     });
     wrapper.appendChild(this._optionsForm.root);
@@ -1921,7 +2180,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       label: 'Run',
       variant: 'primary',
       className: 'analysis-run-btn',
-      onClick: () => this._runAnalysis()
+      onClick: () => this._runFromPerson()
     });
     button.setAttribute('aria-label', `Run ${this._getRunNoun()}`);
     runRow.append(reason, button);
@@ -1939,7 +2198,99 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    */
   _runAgain() {
     if (this._isDestroyed) return;
-    this._trackInteractiveTask(this._runAnalysis(), this._getTitle());
+    this._trackInteractiveTask(this._runFromPerson(), this._getTitle());
+  }
+
+  /**
+   * A run the person started (Run, Stale · Run, Run again): a step once it
+   * leaves a result (`_recordPersonChange`).
+   * @private
+   */
+  async _runFromPerson() {
+    const before = this._lastResult;
+    await this._runAnalysis();
+    if (this._lastResult !== null && this._lastResult !== before) this._recordPersonChange('run', {});
+  }
+
+  // ===========================================================================
+  // Actions (`analysis/actions.js`): what an agent, a notebook or a replay does
+  // ===========================================================================
+
+  /** The options record (a copy). */
+  getOptions() {
+    return structuredClone(this._requireOptions());
+  }
+
+  /**
+   * Set some options, as the form would: the record with `partial` over it
+   * is checked by the schema (a TypeError naming every refusal), shown in
+   * the form; a display option redraws the result, any other leaves it
+   * stale. Nothing runs.
+   * @param {Object} partial
+   */
+  setOptions(partial) {
+    const schema = this._getOptionsSchema();
+    for (const key of Object.keys(partial)) schema.entry(key);
+    this._setOptions({ ...structuredClone(this._requireOptions()), ...structuredClone(partial) });
+  }
+
+  /**
+   * How long a run would take on the open cells now, from what runs of this
+   * analysis measured on this device (`AnalysisCostModel`), or null before
+   * any was measured or when it reads no cells: `{ms, bytes: null, what}`.
+   * The agent presence judges heavy work by it.
+   * @returns {{ms: number, bytes: null, what: string}|null}
+   */
+  estimateRun() {
+    if (this._options === null || this._options === undefined || !this._takesCellSample()) return null;
+    const cells = this.dataLayer?.state?.pointCount ?? 0;
+    const cost = getAnalysisCostModel().cost(analysisCostKind(this._getTitle()), this._getRunUnits(this._options));
+    if (cost === null || !(cells > 0)) return null;
+    return { ms: cost.fixedMs + cost.perCellMs * cells, bytes: null, what: `${this._getTitle()} on ${formatCountOf(cells, 'open cell')}` };
+  }
+
+  /**
+   * Run now, as Run does, and wait for it to end. Throws what stops it from
+   * running (Run's own reason) or why it failed; a cancel (Cancel, or
+   * `signal`) ends it with what was shown before.
+   * @param {{signal?: AbortSignal|null}} [how]
+   * @returns {Promise<boolean>} Whether it left a new result
+   */
+  async runNow({ signal = null } = {}) {
+    const blocker = await this._runBlockerOnceRead(signal);
+    if (blocker !== null) throw new RangeError(blocker);
+    const before = this._lastResult;
+    const stop = onAbort(signal, () => this.cancelRun());
+    try {
+      await this._runAnalysis();
+    } finally {
+      stop();
+    }
+    const job = this._shownJob ?? null;
+    if (job !== null && job.state === 'failed') throw new Error(job.message);
+    return this._lastResult !== null && this._lastResult !== before;
+  }
+
+  /**
+   * The shown result as a table an agent reads: the top `top` rows (per
+   * group where the result has groups), with the number of rows in all.
+   * Null without a result.
+   * @param {number} top
+   * @returns {{columns: string[], rows: Array<Array<string|number|boolean|null>>, total: number}|null}
+   */
+  describeResult(top) {
+    if (this._lastResult === null || this._lastResult === undefined) return null;
+    return this._resultTable(this._lastResult, top);
+  }
+
+  /**
+   * The result's table (`describeResult`). Every analysis with a Run button
+   * implements it.
+   * @abstract
+   * @protected
+   */
+  _resultTable(_result, _top) {
+    throw new Error(`${this.constructor.name} must implement _resultTable()`);
   }
 
   /** @override */
@@ -2005,9 +2356,10 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       if (this._isDestroyed) return;
     }
     const pages = [...this._selectedPages];
-    const highlightRevision = this._highlightRevision;
-    const visibleDigest = this._visibleCellsDigest();
     const cells = this._openCells();
+    // What the run is computed on, taken as it starts (its digests follow):
+    // a change while it runs leaves its result stale.
+    const computedOn = this._currentProvenance(options, pages, null);
 
     const requestId = this._startAnalysisRequest();
     if (requestId === null) return;
@@ -2071,7 +2423,11 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
 
       // Publish result/data only after the owned render transaction commits.
       await this._publishAnalysisResult(result, requestId);
-      this._resultInputs = { options, pages, highlightRevision, visibleDigest, cells, geneCells: this._resultGeneSample(result)?.cells ?? null };
+      const genesReadFor = this._resultGeneSample(result);
+      const provenance = await computedOn;
+      if (!this._isCurrentAnalysisRequest(requestId)) return;
+      provenance.genesReadFor = genesReadFor === null ? null : { cells: genesReadFor.cells, of: genesReadFor.of };
+      this._resultInputs = { options, provenance };
       // Display options changed while the run went: drawn now, once.
       const schema = this._getOptionsSchema();
       const displayChanged = schema.keys.filter(name =>
@@ -2180,6 +2536,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
       }
     }
     this._lastResult = null;
+    this._leftOutResult = null;
     this._publishDerivedResultsSafely(null);
     this._currentPageData = null;
     this._requestedPlotOptions = null;
@@ -2199,15 +2556,15 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * Update when page selection changes: the shown result is kept and marked
    * stale; nothing runs.
    * @param {string[]} pageIds - Selected page IDs
+   * @param {{given?: boolean}} [options] - As `BaseAnalysisUI.onPageSelectionChange`.
    */
-  onPageSelectionChange(pageIds) {
+  onPageSelectionChange(pageIds, { given = true } = {}) {
     requirePageIds(pageIds);
     this._requireAvailableSelectedPages(
       pageIds,
       'Form-based analysis selectedPages'
     );
-    this._selectedPages = [...pageIds];
-    this._currentConfig.pages = this._selectedPages;
+    this._assignPages(pageIds, { given });
     this._renderControls();
     this._updateStale();
   }
@@ -2235,30 +2592,13 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
   }
 
   /**
-   * A digest of which cells the view shows (its transparency, one byte a
-   * cell), or null without one. Kept while the transparency array and its
-   * write count are the same, so asking costs a pass over the cells only
-   * after a visibility write.
+   * The revision of the cells the view shows (`visibleCellsNow`): it moves
+   * exactly when the set of visible cells does. A key of what an analysis
+   * scoped to them keeps. Null without a view.
    * @protected
    */
-  _visibleCellsDigest() {
-    const state = this.dataLayer?.state;
-    const transparency = state?.categoryTransparency;
-    if (!(transparency instanceof Uint8Array)) return null;
-    const epoch = state._transparencyEpoch ?? 0;
-    const kept = this._visibleDigestCache;
-    if (kept !== null && kept.array === transparency && kept.epoch === epoch) return kept.digest;
-    // FNV-1a over the bytes, four at a time where the array is aligned.
-    let hash = 0x811c9dc5;
-    const whole = transparency.byteOffset % 4 === 0 ? transparency.length >>> 2 : 0;
-    const words = new Uint32Array(transparency.buffer, transparency.byteOffset, whole);
-    for (let index = 0; index < whole; index++) hash = Math.imul(hash ^ words[index], 0x01000193);
-    for (let index = whole * 4; index < transparency.length; index++) {
-      hash = Math.imul(hash ^ transparency[index], 0x01000193);
-    }
-    const digest = `${transparency.length}:${(hash >>> 0).toString(16)}`;
-    this._visibleDigestCache = { array: transparency, epoch, digest };
-    return digest;
+  _visibleCellsRevision() {
+    return visibleCellsNow(this.dataLayer?.state ?? null)?.revision ?? null;
   }
 
   /**
@@ -2267,9 +2607,9 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
    * @private
    */
   _syncVisibleCells() {
-    const digest = this._visibleCellsDigest();
-    if (digest === this._seenVisibleDigest) return false;
-    this._seenVisibleDigest = digest;
+    const revision = this._visibleCellsRevision();
+    if (revision === this._seenVisibleRevision) return false;
+    this._seenVisibleRevision = revision;
     return true;
   }
 
@@ -2296,7 +2636,7 @@ export class FormBasedAnalysisUI extends BaseAnalysisUI {
     else if (kind !== 'cell-visibility') throw new RangeError(`Unknown analysis input change: ${String(kind)}`);
     this._missedInputChange = true;
     // Hidden, a result made stale is withdrawn at once all the same.
-    if (kind === 'highlight') this._syncStalePublication(this._isResultStale());
+    if (kind === 'highlight') this._updateStale();
   }
 
   /**

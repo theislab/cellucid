@@ -1,10 +1,12 @@
 /**
  * Floating analysis windows resize from any edge or corner — by mouse, by
  * finger and by keyboard — snap to the lines around them, maximize, move by
- * Alt+Arrow, remember the size per analysis, and round-trip their box, open
- * state and layer through the session (`app/dockable-accordions/*`,
- * `analysis/ui/analysis-window-manager.js`,
- * `session/contributors/analysis-windows.js`). No fabricated cap: a window
+ * Alt+Arrow, remember the size per analysis, and round-trip their box and
+ * open state through the session (`app/dockable-accordions/*`,
+ * `analysis/ui/analysis-window-manager.js`): what a window shows is the
+ * `analysis` state domain's (`state/domains/analysis.js`), its box, its fold
+ * and the sizes remembered per analysis are the `layout` domain's
+ * (`layout.analysis`, `state/domains/layout.js`). No fabricated cap: a window
  * grows to the viewport.
  */
 
@@ -17,7 +19,23 @@ const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
   + '&dataset=current-ui&acceptance=analysis-window-resize-ci';
 const WINDOW = '#floating-panels-root > .accordion-panel.analysis-window-frame';
-const CONTRIBUTOR_URL = '/assets/js/app/session/contributors/analysis-windows.js';
+const ACTIONS_URL = '/assets/js/app/actions/index.js';
+const VALUE_PARTS_URL = '/assets/js/app/history/value-parts.js';
+
+/**
+ * A state domain's value (`analysis`, `layout`) as a session file keeps it:
+ * its JSON skeleton and its arrays (`app/history/value-parts.js`), read back.
+ */
+function storedDomain(page, domain) {
+  return page.evaluate(async ({ urls, domain: id }) => {
+    const { getStateDomains } = await import(urls.actions);
+    const { joinValue, splitValue } = await import(urls.parts);
+    const arrays = new Map();
+    const value = await getStateDomains().owner(id).capture();
+    const skeleton = JSON.parse(JSON.stringify(await splitValue(value, arrays)));
+    return joinValue(skeleton, digest => arrays.get(digest));
+  }, { urls: { actions: ACTIONS_URL, parts: VALUE_PARTS_URL }, domain });
+}
 
 function observeProductErrors(page) {
   const errors = [];
@@ -201,7 +219,7 @@ test('an edge snaps to another window and shows a guide; maximize and restore', 
   expect(full.left + full.width).toBe(viewport.width - 8);
   expect(full.height).toBe(viewport.height - 16);
   await maximize.click();
-  expect(await box(first)).toEqual(snapped);
+  await expect.poll(() => box(first)).toEqual(snapped);
   // A double-click on the header does the same.
   await first.locator('> details > summary').dblclick();
   await expect(maximize).toHaveAttribute('aria-pressed', 'true');
@@ -211,7 +229,8 @@ test('an edge snaps to another window and shows a guide; maximize and restore', 
   expect(errors).toEqual([]);
 });
 
-test('a new window opens at the size the last one of its analysis was given; sessions keep box, open state, layer and sizes', async ({ page }) => {
+test('a new window opens at the size the last one of its analysis was given; sessions keep box, open state and sizes, in the order the windows opened', async ({ page }) => {
+  // What each window shows is the analysis domain's; its place and the sizes, the layout's.
   const errors = observeProductErrors(page);
   await openDataset(page);
   const first = await copyWindow(page);
@@ -221,22 +240,24 @@ test('a new window opens at the size the last one of its analysis was given; ses
   const opened = await box(second);
   expect([opened.width, opened.height]).toEqual([given.width, given.height]);
 
-  // Collapse the first and raise it; then save.
+  // Collapse the first (a press also raises it); then save.
   await first.locator('> details > summary').click();
   await expect(first.locator('> details')).not.toHaveAttribute('open', '');
-  const saved = await page.evaluate(async url => {
-    const contributor = await import(url);
-    const { decodeTypedJson } = await import('/assets/js/app/session/codecs/typed-json.js');
-    const ctx = { analysisWindowManager: window._comparisonModule.getAnalysisWindowManager() };
-    return decodeTypedJson(contributor.capture(ctx)[0].payload);
-  }, CONTRIBUTOR_URL);
-  expect(Object.keys(saved).sort()).toEqual(['sizes', 'windows']);
-  expect(saved.sizes.window.simple).toEqual({ width: given.width, height: given.height });
+  const saved = await storedDomain(page, 'analysis');
+  expect(Object.keys(saved).sort()).toEqual(['docked', 'windows']);
   expect(saved.windows).toHaveLength(2);
-  const collapsed = saved.windows.find(entry => entry.open === false);
+  expect(saved.windows.every(entry => !Object.hasOwn(entry, 'rect') && !Object.hasOwn(entry, 'open'))).toBe(true);
+  const layout = await storedDomain(page, 'layout');
+  const places = layout.analysis;
+  expect(Object.keys(places).sort()).toEqual(['sizes', 'windows']);
+  expect(places.sizes.window.simple).toEqual({ width: given.width, height: given.height });
+  expect(places.windows).toHaveLength(2);
+  const collapsed = places.windows.find(entry => entry.open === false);
   // The saved box is the window's own, not the header-high box it draws.
   expect(collapsed.rect).toEqual(given);
-  expect(saved.windows.map(entry => entry.z)).toEqual([...saved.windows.map(entry => entry.z)].sort((p, q) => p - q));
+  // In the order they opened; which is in front is not state (a press raises a window).
+  expect(places.windows.map(entry => entry.open)).toEqual([false, true]);
+  expect(places.windows.every(entry => Object.keys(entry).sort().join() === 'open,rect')).toBe(true);
 
   // Close everything, forget the sizes, restore.
   await page.evaluate(async () => {
@@ -245,21 +266,14 @@ test('a new window opens at the size the last one of its analysis was given; ses
     manager.importViewSizes({ window: {}, expandedView: {} });
   });
   await expect(page.locator(WINDOW)).toHaveCount(0);
-  await page.evaluate(async ({ url, value }) => {
-    const contributor = await import(url);
-    const { encodeTypedJson } = await import('/assets/js/app/session/codecs/typed-json.js');
-    const ctx = { analysisWindowManager: window._comparisonModule.getAnalysisWindowManager() };
-    await contributor.restore(ctx, { id: 'analysis/windows' }, encodeTypedJson(value));
-  }, { url: CONTRIBUTOR_URL, value: saved });
+  // As the history restores them: the analyses first, then the layout puts each window back.
+  await page.evaluate(async ({ url, analysis, layout: arranged }) => {
+    const { getStateDomains } = await import(url);
+    await getStateDomains().owner('analysis').restore(analysis);
+    await getStateDomains().owner('layout').restore(arranged);
+  }, { url: ACTIONS_URL, analysis: saved, layout });
   await expect(page.locator(WINDOW)).toHaveCount(2);
-  const again = await page.evaluate(async url => {
-    const contributor = await import(url);
-    const { decodeTypedJson } = await import('/assets/js/app/session/codecs/typed-json.js');
-    const ctx = { analysisWindowManager: window._comparisonModule.getAnalysisWindowManager() };
-    return decodeTypedJson(contributor.capture(ctx)[0].payload);
-  }, CONTRIBUTOR_URL);
-  expect(again.sizes).toEqual(saved.sizes);
-  expect(again.windows.map(({ open, rect, z, modeId }) => ({ open, rect, z, modeId })))
-    .toEqual(saved.windows.map(({ open, rect, z, modeId }) => ({ open, rect, z, modeId })));
+  expect((await storedDomain(page, 'analysis')).windows.map(({ modeId }) => modeId)).toEqual(saved.windows.map(({ modeId }) => modeId));
+  expect((await storedDomain(page, 'layout')).analysis).toEqual(places);
   expect(errors).toEqual([]);
 });

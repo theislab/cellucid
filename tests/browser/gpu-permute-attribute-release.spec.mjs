@@ -209,13 +209,9 @@ test('a deferred check waits for nothing, and reports a failed pass in a later f
     const errors = [];
     const onError = error => errors.push(error.message);
     // Frames until a deferred check reports (its fence passes when the GPU
-    // has run the pass, however many frames that takes); by the clock, a
-    // failure after a minute.
+    // has run the pass, however many frames that takes).
     const reported = async () => {
-      for (const deadline = performance.now() + 60_000; errors.length === 0;) {
-        if (performance.now() > deadline) throw new Error('No deferred check reported within a minute.');
-        await frames(1);
-      }
+      while (errors.length === 0) await frames(1);
     };
     const write = () => permuter.writeHighlightWords(store, count, order, highlight, visible, 1, { onError });
     const expected = slot => ((count - 1 - slot) % 3 === 0 ? 0xc8ffffff : 0);

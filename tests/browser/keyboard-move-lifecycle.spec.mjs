@@ -107,7 +107,7 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
   expect(await liveRegionText(page)).toContain('is now a floating window');
 
   await page.keyboard.press('Enter');
-  expect(await panelFloatingState(page)).toEqual({
+  await expect.poll(() => panelFloatingState(page)).toEqual({
     floating: false,
     parentId: '',
   });
@@ -115,17 +115,36 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
   expect(await liveRegionText(page)).toContain('docked in the sidebar again');
 
   /* The pointer path this replaced still tears the panel off and puts it
-     back. */
-  const dockedBox = await summary.boundingBox();
-  if (dockedBox === null) throw new Error('Docked summary has no box');
-  await page.mouse.move(dockedBox.x + 40, dockedBox.y + dockedBox.height / 2);
-  await page.mouse.down();
-  await page.mouse.move(
-    dockedBox.x + 540,
-    dockedBox.y + dockedBox.height / 2 - 150,
-    { steps: 12 }
-  );
+     back. The press is made where the summary is when it is pressed: every
+     step taken above is drawn into the State panel's history as it is
+     recorded, which moves the panels under it. With the summary's place
+     read first and pressed two seconds later (hosted macOS Firefox, Web
+     contracts run 42202865024) the press landed on the Agents panel, which
+     had moved there, and that panel was torn off instead. So the steps are
+     recorded first, the pointer is moved onto the summary itself, and the
+     press is checked to have landed on it before the drag goes on; a
+     press that still met a moving layout is let go and made again. */
+  await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    await getActions().idle();
+    await window._cellucidHistories.current()?.idle();
+  });
+  for (;;) {
+    await summary.hover({ position: { x: 40, y: 12 } });
+    await page.evaluate(() => {
+      window.__pressedOn = null;
+      window.addEventListener('pointerdown', event => { window.__pressedOn = event.target; }, { capture: true, once: true });
+    });
+    await page.mouse.down();
+    if (await summary.evaluate(element => window.__pressedOn instanceof Node && element.contains(window.__pressedOn))) break;
+    await page.mouse.up();
+  }
+  const pressed = await summary.boundingBox();
+  if (pressed === null) throw new Error('Docked summary has no box');
+  await page.mouse.move(pressed.x + 540, pressed.y + 12 - 150, { steps: 12 });
   await page.mouse.up();
+  /* The release floats the panel in the same task (`setupDockedDrag`): it is
+     floating once the release has been answered. */
   expect(await panelFloatingState(page)).toEqual({
     floating: true,
     parentId: 'floating-panels-root',
@@ -251,12 +270,12 @@ test('the category builder can be filled, reordered and confirmed from the keybo
   await expect(handles.first()).toHaveAttribute('aria-label', 'Move Page 1');
   await handles.first().focus();
   await page.keyboard.press('Enter');
-  expect(await liveRegionText(page)).toContain('Page 1 picked up');
+  await expect.poll(() => liveRegionText(page)).toContain('Page 1 picked up');
   expect(await liveRegionText(page)).toContain('position 2, Page 2');
   await page.keyboard.press('ArrowDown');
-  expect(await liveRegionText(page)).toContain('position 3, Page 3');
+  await expect.poll(() => liveRegionText(page)).toContain('position 3, Page 3');
   await page.keyboard.press('Enter');
-  expect(await droppedLabels(page)).toEqual(['Page 2', 'Page 3', 'Page 1']);
+  await expect.poll(() => droppedLabels(page)).toEqual(['Page 2', 'Page 3', 'Page 1']);
   expect(await liveRegionText(page)).toContain('moved to position 3 of 3');
 
   /* Escape puts it back exactly where it was. */
@@ -264,7 +283,7 @@ test('the category builder can be filled, reordered and confirmed from the keybo
   await page.keyboard.press('Enter');
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('Escape');
-  expect(await droppedLabels(page)).toEqual(['Page 2', 'Page 3', 'Page 1']);
+  await expect.poll(() => droppedLabels(page)).toEqual(['Page 2', 'Page 3', 'Page 1']);
   expect(await liveRegionText(page)).toContain('Move cancelled');
   expect(
     await page.evaluate(() =>
@@ -357,7 +376,7 @@ test('a legend category merges into another from the keyboard, and still by drag
   await labels.first().focus();
   await expect(labels.first()).toBeFocused();
   await page.keyboard.press('Enter');
-  expect(await liveRegionText(page)).toContain('alpha picked up');
+  await expect.poll(() => liveRegionText(page)).toContain('alpha picked up');
   expect(await liveRegionText(page)).toContain('Destination 1 of 2: beta');
   /* Aiming paints the row with the class the pointer path paints on
      `dragenter`, so both inputs mark the destination the same way. */
@@ -367,10 +386,10 @@ test('a legend category merges into another from the keyboard, and still by drag
     )
   ).toBe(1);
   await page.keyboard.press('ArrowDown');
-  expect(await liveRegionText(page)).toContain('Destination 2 of 2: gamma');
+  await expect.poll(() => liveRegionText(page)).toContain('Destination 2 of 2: gamma');
 
   await page.keyboard.press('Escape');
-  expect(await liveRegionText(page)).toContain('Move cancelled');
+  await expect.poll(() => liveRegionText(page)).toContain('Move cancelled');
   expect(
     await page.evaluate(() =>
       document.querySelectorAll(
@@ -387,7 +406,8 @@ test('a legend category merges into another from the keyboard, and still by drag
   const dialog = page.locator('.confirm-dialog');
   await expect(dialog).toContainText('Merge category "alpha" into "beta"?');
   await page.getByRole('button', { name: 'Merge', exact: true }).click();
-  expect(await legendCategoryNames(page)).toEqual([
+  /* The merge is an action: the legend is drawn again when it has run. */
+  await expect.poll(() => legendCategoryNames(page)).toEqual([
     'gamma',
     'merged alpha + beta'
   ]);

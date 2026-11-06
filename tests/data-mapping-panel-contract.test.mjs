@@ -24,6 +24,7 @@ import {
   describeBestGuess,
   initDataMappingControls,
 } from '../assets/js/app/ui/modules/data-mapping-controls.js';
+import { installFieldActions } from '../assets/js/app/state/actions/field-actions.js';
 import {
   DIMENSIONAL_UMAP_KEYS,
   UMAP_KEYS,
@@ -594,6 +595,10 @@ function mountPanel(t, options) {
     applied.push(structuredClone(next));
     return realApply(next, applyOptions);
   };
+  // Apply is the action mapping.set (`state/actions/field-actions.js`): the
+  // state's own implementation, installed for this panel.
+  const removeActions = installFieldActions({ state: scene.state });
+  t.after(removeActions);
   const controls = initDataMappingControls({ state: scene.state, root });
   t.after(() => controls.destroy());
   // Every checklist row in document order, wherever the list places it.
@@ -983,11 +988,14 @@ test('the data mapping sits at the bottom of the Session panel and stays out of 
     html.indexOf('</details>', html.indexOf('id="session-section"'))
   );
   // Its own collapsible section (collapsed by default, a summary in its
-  // header), after Session file and Subsampling, last in the panel.
-  const sessionFile = session.indexOf('id="session-state-controls"');
+  // header), after Subsampling, last in the panel. The session file is the
+  // State panel's.
   const subsampling = session.indexOf('id="reading-section"');
   const mapping = session.indexOf('id="data-mapping-controls"');
-  assert.ok(sessionFile >= 0 && subsampling > sessionFile && mapping > subsampling, 'Data mapping follows Session file and Subsampling');
+  assert.ok(subsampling >= 0 && mapping > subsampling, 'Data mapping follows Subsampling');
+  assert.equal(session.indexOf('id="session-state-controls"'), -1, 'the session file is not in the Session panel');
+  const statePanel = html.slice(html.indexOf('id="state-section"'), html.indexOf('</details>', html.indexOf('id="state-section"')));
+  assert.ok(statePanel.includes('id="session-state-controls"'), 'the session file is in the State panel');
   assert.match(
     session.slice(mapping),
     /<h3 class="section-title session-disclosure-heading">\s*<button type="button" class="disclosure-header" id="data-mapping-toggle" aria-expanded="false" aria-controls="data-mapping-body">\s*<span class="disclosure-title" id="data-mapping-title">Data mapping<\/span>\s*<span class="disclosure-desc" id="data-mapping-summary"><\/span>[\s\S]*data-info-tip="data-mapping"[\s\S]*<div class="disclosure-content" id="data-mapping-body" hidden>\s*<div id="data-mapping-root" data-state-serializer-skip="true"><\/div>\s*<\/div>\s*<\/div>\s*<\/div>\s*$/

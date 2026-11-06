@@ -25,6 +25,13 @@ import { isCategoricalCodes, missingCategoryCode } from '../../../data/categoric
 import { requireOutlierQuantiles } from './color-outliers.js';
 import { formatBound } from '../../../utils/format-units.js';
 import { categoryRgbAt, hiddenCategoryCount, withCategoriesVisible, withCategoryChanges, withCategoryColor, withCategoryVisibility } from '../../utils/category-state.js';
+import {
+  categoryCellLimitsOf,
+  cellSampleFilterOf,
+  withCategoryCellLimit,
+  withoutCategoryCellLimits,
+} from './category-cell-sample.js';
+import { setWorkingSet } from '../../../data/memory-budget.js';
 
 function requireCategoryFieldAndIndex(field, index) {
   if (
@@ -112,6 +119,21 @@ export function outlierThresholdOf(field) {
  * @param {object} field
  * @returns {boolean}
  */
+/**
+ * Whether a categorical field's filter narrows its cells, switched on or off:
+ * a category hidden, the cells without a category hidden (`_missingVisible`),
+ * or a category that keeps only some of its cells. All of them read its
+ * codes, so its codes stay resident (`field/residency.js`). A field whose
+ * every category is shown, however often it was coloured, filters nothing.
+ *
+ * @param {object} field
+ * @returns {boolean}
+ */
+export function hasCategoryFilter(field) {
+  if (field._missingVisible === false || categoryCellLimitsOf(field).length > 0) return true;
+  return field._categoryVisible !== undefined && hiddenCategoryCount(field._categoryVisible) > 0;
+}
+
 export function hasOutlierFilter(field) {
   return Boolean(
     field
@@ -239,10 +261,20 @@ export function collectViewFilters(view, { geneSampled = false } = {}) {
       }
       // Cells without a category, hidden by the legend's Missing row.
       if (field._missingVisible === false) hiddenNames.push(MISSING_LABEL);
-      if (hiddenNames.length > 0) {
+      // Categories shown that keep only some of their cells (the legend's count).
+      const limits = categoryCellLimitsOf(field).filter(limit => visible === undefined || visible[limit.category] !== 0);
+      if (hiddenNames.length > 0 || limits.length > 0) {
         const enabled = field._categoryFilterEnabled !== false; // default true
-        const preview = hiddenNames.slice(0, 4).join(', ');
-        const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
+        const parts = [];
+        if (hiddenNames.length > 0) {
+          const preview = hiddenNames.slice(0, 4).join(', ');
+          const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
+          parts.push(`hiding ${preview}${extra}`);
+        }
+        if (limits.length > 0) {
+          const kept = limits.slice(0, 2).map(limit => `${limit.count} of ${String(categories[limit.category])}`).join(', ');
+          parts.push(`keeping ${kept}${limits.length > 2 ? ` +${limits.length - 2} more` : ''}`);
+        }
         filters.push({
           id: `obs-category-${fi}`,
           type: 'category',
@@ -251,7 +283,7 @@ export function collectViewFilters(view, { geneSampled = false } = {}) {
           fieldKey: key,
           enabled: enabled,
           hiddenCount: hiddenNames.length,
-          text: `${key}: hiding ${preview}${extra}${disabled(enabled)}`
+          text: `${key}: ${parts.join('; ')}${disabled(enabled)}`
         });
       }
 
@@ -373,6 +405,7 @@ function publishOutlierVisibility(mask, outliers, threshold, transparency, point
 function publishFilteredVisibility(
   mask,
   categoryFilters,
+  sampleFilters,
   continuousFilters,
   outlierFilters,
   transparency,
@@ -392,6 +425,16 @@ function publishFilteredVisibility(
           ? filter.visibleByCode[code] === 0
           : filter.missingVisible === 0
       ) {
+        visible = false;
+      }
+    }
+
+    // Categories that keep only some of their cells: a cell of one is shown
+    // when its bit is set (`category-cell-sample.js`).
+    for (let sf = 0; visible && sf < sampleFilters.length; sf++) {
+      const filter = sampleFilters[sf];
+      const code = filter.codes[i];
+      if (code < filter.limited.length && filter.limited[code] === 1 && (filter.bits[i >>> 3] & (1 << (i & 7))) === 0) {
         visible = false;
       }
     }
@@ -439,6 +482,7 @@ function sameVisibilityInputs(a, b) {
     a.mask !== b.mask
     || a.maskWrites !== b.maskWrites
     || a.categoryFilters.length !== b.categoryFilters.length
+    || a.sampleFilters.length !== b.sampleFilters.length
     || a.continuousFilters.length !== b.continuousFilters.length
     || a.outlierFilters.length !== b.outlierFilters.length
   ) {
@@ -462,6 +506,11 @@ function sameVisibilityInputs(a, b) {
     for (let code = 0; code < x.visibleByCode.length; code++) {
       if (x.visibleByCode[code] !== y.visibleByCode[code]) return false;
     }
+  }
+  // A sample filter is immutable once made (`cellSampleFilterOf`): the same
+  // object is the same cells.
+  for (let f = 0; f < a.sampleFilters.length; f++) {
+    if (a.sampleFilters[f] !== b.sampleFilters[f]) return false;
   }
   for (let f = 0; f < a.continuousFilters.length; f++) {
     const x = a.continuousFilters[f];
@@ -532,6 +581,7 @@ export function recordUnfilteredVisibility(transparency, mask) {
     mask,
     maskWrites: cellVisibilityMaskWrites(mask),
     categoryFilters: [],
+    sampleFilters: [],
     continuousFilters: [],
     outlierFilters: [],
   }, mask.length);
@@ -600,6 +650,8 @@ export class DataStateFilterMethods {
     requireBinaryCellVisibilityMask(this.cellVisibilityMask);
 
     const categoryFilters = [];
+    // Categories of a field that keep only some of their cells.
+    const sampleFilters = [];
     const continuousFilters = [];
     // Every categorical field's outlier filter, whatever is coloured.
     const outlierFilters = [];
@@ -611,7 +663,12 @@ export class DataStateFilterMethods {
       }
       if (field._isDeleted === true) continue;
 
-      if (field.kind === 'category' && field._categoryVisible !== undefined) {
+      // A field released from memory (`loaded: false`: `field/residency.js`)
+      // keeps what was set on it (its colours, every category shown, a full
+      // range) and holds no array: it is read again when used, and its filter
+      // needs its array only when it narrows, which keeps the array resident.
+      // A narrowing filter on a field not read is refused below.
+      if (field.kind === 'category' && field._categoryVisible !== undefined && (field.loaded !== false || hasCategoryFilter(field))) {
         this.ensureCategoryMetadata(field);
         if (
           !isCategoricalCodes(field.codes)
@@ -651,6 +708,8 @@ export class DataStateFilterMethods {
               spansDtype
             });
           }
+          const sample = cellSampleFilterOf(field, this.cellIdentity);
+          if (sample !== null) sampleFilters.push(sample);
         }
       } else if (
         field.kind === 'continuous'
@@ -658,6 +717,7 @@ export class DataStateFilterMethods {
           field._continuousStats !== undefined
           || field._continuousFilter !== undefined
         )
+        && (field.loaded !== false || hasRangeFilter(field))
       ) {
         const metadata = this.ensureContinuousMetadata(field);
         if (field._filterEnabled) {
@@ -708,8 +768,12 @@ export class DataStateFilterMethods {
       });
     }
 
+    // The kept cells' bits grow with the open cells: the working set's.
+    setWorkingSet('category cell samples', sampleFilters.reduce((sum, filter) => sum + filter.bytes, 0));
+
     const hasAnyFilter =
       categoryFilters.length > 0 ||
+      sampleFilters.length > 0 ||
       continuousFilters.length > 0 ||
       outlierFilters.length > 0;
 
@@ -718,6 +782,7 @@ export class DataStateFilterMethods {
       mask: cellVisibilityMask,
       maskWrites: cellVisibilityMaskWrites(cellVisibilityMask),
       categoryFilters,
+      sampleFilters,
       continuousFilters,
       outlierFilters,
     };
@@ -747,6 +812,7 @@ export class DataStateFilterMethods {
         shown = publishMaskVisibility(cellVisibilityMask, transparency, pointCount);
       } else if (
         categoryFilters.length === 1 &&
+        sampleFilters.length === 0 &&
         continuousFilters.length === 0 &&
         outlierFilters.length === 0
       ) {
@@ -760,6 +826,7 @@ export class DataStateFilterMethods {
           );
       } else if (
         categoryFilters.length === 0 &&
+        sampleFilters.length === 0 &&
         continuousFilters.length === 0 &&
         outlierFilters.length === 1
       ) {
@@ -775,6 +842,7 @@ export class DataStateFilterMethods {
         shown = publishFilteredVisibility(
           cellVisibilityMask,
           categoryFilters,
+          sampleFilters,
           continuousFilters,
           outlierFilters,
           transparency,
@@ -871,6 +939,7 @@ export class DataStateFilterMethods {
     } else if (type === 'category') {
       this.ensureCategoryMetadata(field);
       withCategoriesVisible(field, true);
+      withoutCategoryCellLimits(field);
       field._missingVisible = true;
       field._categoryFilterEnabled = true;
       this._reapplyCategoryColorsNoRecompute(field);
@@ -962,7 +1031,9 @@ export class DataStateFilterMethods {
     } else {
       this.reapplyCategoryColors(field);
     }
+    this._notifyColorChange(field);
   }
+
 
   setVisibilityForCategory(field, idx, visible) {
     requireCategoryFieldAndIndex(field, idx);
@@ -1002,6 +1073,7 @@ export class DataStateFilterMethods {
     } else {
       this.reapplyCategoryColors(field);
     }
+    if (changes.colors.length > 0) this._notifyColorChange(field);
   }
 
   setCellVisibility(cellIndices, visible) {
@@ -1115,6 +1187,28 @@ export class DataStateFilterMethods {
     }
   }
 
+  /**
+   * Keep only `limit.count` of the cells of one category shown, a sample
+   * drawn with `limit.seed` (`category-cell-sample.js`); null shows all its
+   * cells again. A filter like a hidden category: listed in Active filters,
+   * turned off with the field's category filter, kept in sessions.
+   *
+   * @param {object} field - A categorical field
+   * @param {number} categoryIndex
+   * @param {{count: number, seed: number}|null} limit
+   */
+  setCategoryCellLimit(field, categoryIndex, limit) {
+    requireCategoryFieldAndIndex(field, categoryIndex);
+    this.ensureCategoryMetadata(field);
+    withCategoryCellLimit(field, categoryIndex, limit);
+    if (this._batchMode) {
+      this._batchDirty.visibility = true;
+      this._batchDirty.affectedFields.add(field);
+    } else {
+      this.computeGlobalVisibility();
+    }
+  }
+
   showAllCategories(field, { onlyAvailable = false } = {}) {
     if (typeof onlyAvailable !== 'boolean') {
       throw new TypeError('onlyAvailable must be exactly true or false.');
@@ -1136,6 +1230,8 @@ export class DataStateFilterMethods {
       throw new TypeError('Available category counts must exactly match the category inventory.');
     }
     withCategoriesVisible(field, true, available === null ? null : index => available[index] !== 0);
+    // Every cell of every category: none keeps only some.
+    withoutCategoryCellLimits(field);
     field._missingVisible = true;
     this.reapplyCategoryColors(field);
   }
@@ -1161,6 +1257,7 @@ export class DataStateFilterMethods {
       throw new TypeError('Available category counts must exactly match the category inventory.');
     }
     withCategoriesVisible(field, false, available === null ? null : index => available[index] !== 0);
+    withoutCategoryCellLimits(field);
     field._missingVisible = false;
     this.reapplyCategoryColors(field);
   }

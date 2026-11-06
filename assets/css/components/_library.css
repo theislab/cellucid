@@ -1,0 +1,266 @@
+/* components/_library.css
+   My datasets (ui/modules/my-datasets/): the line between its five most
+   recent and All… in its menu (the Open… menu's look, _session.css), and
+   All…'s rows: a toggle (name, kind, when; one line under it) that opens
+   the facts behind it, Open, Continue and Forget, and the question Forget
+   asks in the row; Export… and Import… of a library file, and the export's
+   choice of datasets and saved states. */
+
+/* ------------------------------------------------------------------------
+   The menu
+   --------------------------------------------------------------------- */
+
+.open-menu-separator {
+  height: 0;
+  margin: var(--space-1) 0;
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+/* The dataset open now: listed, marked, not offered again. */
+.open-menu-item[aria-disabled="true"] {
+  cursor: default;
+}
+
+.open-menu-item[aria-disabled="true"]:hover {
+  background: transparent;
+}
+
+.open-menu-item[aria-current="true"] > .open-menu-item-label {
+  font-weight: var(--font-weight-medium);
+}
+
+/* A dataset's item: its name over where it comes from and when, so the
+   name takes the menu's whole width; a name longer still is cut, its whole
+   text the item's title. */
+.my-datasets-menu .open-menu-item {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+
+.my-datasets-menu .open-menu-item-label,
+.my-datasets-menu .open-menu-item-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+/* ------------------------------------------------------------------------
+   All…
+   --------------------------------------------------------------------- */
+
+.my-datasets-dialog {
+  width: min(560px, calc(100vw - 2 * var(--space-4)));
+}
+
+.my-datasets-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: min(60dvh, 560px);
+  overflow-y: auto;
+}
+
+.my-datasets-list[hidden],
+.my-datasets-dialog input[type="search"][hidden],
+.library-export[hidden] {
+  display: none;
+}
+
+/* The filter takes the row; Export… and Import… at its right. */
+.library-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.library-toolbar > input[type="search"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.library-toolbar > .btn {
+  flex: none;
+}
+
+/* Export: the datasets ticked, each with its saved states under it. */
+.library-export {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  background: var(--color-surface-elevated);
+}
+
+.library-export-title {
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.library-export-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  max-height: min(45dvh, 420px);
+  overflow-y: auto;
+}
+
+.library-export-group {
+  margin-top: var(--space-1);
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+}
+
+.library-export-states {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  padding-left: var(--space-4);
+}
+
+.library-export-list .checkbox-inline {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.library-export-list .checkbox-inline > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-1-5) var(--space-2);
+  border: var(--border-light);
+  border-radius: var(--radius-none);
+  background: var(--color-surface-elevated);
+}
+
+.library-row[data-current="true"] {
+  border-color: var(--color-border-strong);
+}
+
+/* The name and the line under it: one button that opens the facts. */
+.library-row-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+}
+
+.library-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.library-row-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--type-control);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-row-toggle:hover .library-row-name {
+  text-decoration: underline;
+}
+
+.library-row-when {
+  flex: none;
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.library-row-head > .disclosure-chevron {
+  margin-left: 0;
+}
+
+.library-row-toggle[aria-expanded="true"] .disclosure-chevron {
+  transform: rotate(180deg);
+  opacity: var(--opacity-80);
+}
+
+.library-row-meta {
+  font-size: var(--type-hint);
+  line-height: var(--leading-normal);
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.library-row-details,
+.library-row-confirm {
+  grid-column: 1 / -1;
+}
+
+.library-row-actions[hidden],
+.library-row-details[hidden],
+.library-row-confirm[hidden] {
+  display: none;
+}
+
+.library-row-details {
+  padding-top: var(--space-1);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+/* Forget is asked in the row: what goes, what stays, then the answers. */
+.library-row-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+  padding-top: var(--space-1);
+  border-top: var(--border-width-1) solid var(--color-border-light);
+}
+
+.library-row-question {
+  font-size: var(--type-hint);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-danger-text);
+}
+
+.library-row-confirm-actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+/* A phone: the actions go under the name, at its right. */
+@media (max-width: 480px) {
+  .library-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .library-row-actions {
+    justify-content: flex-end;
+  }
+}

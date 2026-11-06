@@ -19,12 +19,19 @@
  *   GPU stores to their first frame); Apply in place records nothing.
  *
  * Fixture: a synthetic `.zarr.zip` of 2,400 cells with a categorical field
- * and a text column.
+ * and a text column (`helpers/share-dataset.mjs`).
+ *
+ * Every test runs on the fixture's device (`helpers/device.mjs`): the link,
+ * the decoding rate and the order time the reader plans from are held, so
+ * genes are read for every open cell and a share opens in its own priority
+ * order on any runner. What a slow link does to Apply (genes read for a
+ * sample, the share read anew) is `held-machine.spec.mjs`'s.
  */
 
 import { closeContextWithApplicationRetirement, expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
-import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
+import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
+import { SHARE_CELLS as CELLS, shareDataset as dataset } from './helpers/share-dataset.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 
@@ -34,35 +41,7 @@ test.beforeEach(async ({ page }) => {
   await openSessionSectionsOnLoad(page);
 });
 
-const CELLS = 2400;
-const GENES = 40;
 const URL_OF_FILE = `${SAMPLE_ORIGIN}/open-cells-in-place/cells.zarr.zip`;
-
-function dataset() {
-  const perCell = 8;
-  const data = new Float32Array(CELLS * perCell);
-  const indices = new Int32Array(CELLS * perCell);
-  const indptr = new Int32Array(CELLS + 1);
-  for (let cell = 0; cell < CELLS; cell++) {
-    const genes = Array.from({ length: perCell }, (_, j) => (cell * 7 + j * 3) % GENES).filter((gene, j, all) => all.indexOf(gene) === j).sort((a, b) => a - b);
-    genes.forEach((gene, j) => {
-      indices[indptr[cell] + j] = gene;
-      data[indptr[cell] + j] = 1 + ((cell + gene) % 9);
-    });
-    indptr[cell + 1] = indptr[cell] + genes.length;
-  }
-  const end = indptr[CELLS];
-  return anndataZarrZip({
-    cells: CELLS,
-    genes: Array.from({ length: GENES }, (_, g) => `g${g}`),
-    X: { data: data.slice(0, end), indices: indices.slice(0, end), indptr },
-    obs: {
-      cluster: { categories: ['alpha', 'beta', 'gamma', 'delta'], codes: Int8Array.from({ length: CELLS }, (_, i) => (i * 13) % 4) },
-      note: Array.from({ length: CELLS }, (_, i) => ['low', 'mid', 'high'][(i * 7) % 3]),
-    },
-    obsm: { X_umap: { data: Float32Array.from({ length: CELLS * 2 }, (_, i) => Math.sin(i * 0.37) * 10 + (i % 2) * 3), columns: 2 } },
-  });
-}
 
 function collectBrowserErrors(page) {
   const errors = [];
@@ -98,14 +77,14 @@ async function act(page, field = 'cluster') {
   }, field);
 }
 
-async function settle(page) {
-  await page.evaluate(async () => {
-    const viewer = window._cellucidViewer;
-    for (let i = 0; i < 600 && !viewer.getFrameScheduleState().settled; i++) {
-      await new Promise(resolve => requestAnimationFrame(resolve));
-    }
-  });
-}
+/**
+ * At rest: nothing but the highlight pulse asks for frames (`waitForPageAtRest`).
+ * Waiting for `settled` here never ended: these pages hold a highlight, whose
+ * pulse draws every frame, and the loop ran out only after its 600 frames: 22 to
+ * 50 s a time on Windows Firefox's software GL, and the whole test's budget on
+ * macOS Firefox's (nightly runs 41382954122 to 41961273971).
+ */
+const settle = page => waitForPageAtRest(page);
 
 /**
  * Wait until the opening's work is over: a progressive opening has stopped
@@ -318,7 +297,7 @@ test('a share over a link with round trips opens in one step, every cell asked f
   });
   await open(page, '&cells=2000&sample=uniform&seed=3');
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 120_000 }).toBe(2000);
-  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 5_000 }).toBe(2000);
+  await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0)).toBe(2000);
   const counts = await page.evaluate(() => window.__counts);
   // A share over a link whose round trips cost anything opens whole
   // (`data/anndata/progressive-open.js`, `planProgressiveOpening`): growing
@@ -383,7 +362,7 @@ test('an opening records what showing a cell costs here; Apply in place records 
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount ?? 0), { timeout: 60_000 }).toBe(600);
   // The opening's cells, from their GPU stores to their first frame
   // (`data/opening-cost.js`): one record, of the 600 cells.
-  await expect.poll(recorded, { timeout: 30_000 }).not.toBeNull();
+  await expect.poll(recorded).not.toBeNull();
   const opened = await recorded();
   expect(opened.w).toBe(1);
   expect(opened.x).toBe(600);

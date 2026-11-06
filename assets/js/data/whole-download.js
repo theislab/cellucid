@@ -21,6 +21,11 @@
  * its arrays from it (an uncompressed R file). A dataset catalog's listing
  * only reads what was kept (`keptCopyOf`): it never downloads a file whole.
  *
+ * Before a download starts (nothing of it kept), the page's download gate
+ * is asked (`setWholeDownloadGate`): the app asks the person there when an
+ * agent opened the dataset (`app/ui/modules/dataset-open-action.js`), and a
+ * refusal ends the opening as cancelled, so what was open stays open.
+ *
  * @module data/whole-download
  */
 
@@ -31,6 +36,32 @@ import { getTransferLog } from './transfer-log.js';
 import { inputFormat, isInputFormatId } from './input-formats.js';
 import { compressedCopyNote, wholeDownloadNote } from './whole-read-notice.js';
 import { formatBytes, formatCountOf } from '../utils/format-units.js';
+
+/**
+ * Who is asked before a whole download starts, or null: `gate({name, url,
+ * bytes, why, signal})` resolves to let it start, and throws (a
+ * cancellation) to stop the opening. Bytes are null when the host sends the
+ * file content-coded (its size is not known before it arrives).
+ *
+ * @type {((download: {name: string, url: string, bytes: number|null, why: string, signal: AbortSignal|null}) => Promise<void>)|null}
+ */
+let downloadGate = null;
+
+/**
+ * Set who is asked before a whole download starts (one at a time); returns
+ * the remover, which removes only this gate.
+ *
+ * @param {(download: {name: string, url: string, bytes: number|null, why: string, signal: AbortSignal|null}) => Promise<void>} gate
+ * @returns {() => void}
+ */
+export function setWholeDownloadGate(gate) {
+  if (typeof gate !== 'function') throw new TypeError('A whole download gate is a function.');
+  if (downloadGate !== null) throw new Error('A whole download gate is set already.');
+  downloadGate = gate;
+  return () => {
+    if (downloadGate === gate) downloadGate = null;
+  };
+}
 
 /** Why a remote file is downloaded whole (`transport: 'download'`), in a few words. */
 export function downloadReason(resource, host = new URL(resource.url).host) {
@@ -85,6 +116,9 @@ export async function wholeFileOf(resource, { format = null, signal = null, open
   const step = text => (opening?.step ?? (value => getOpeningProgress().step(value)))(text);
   const host = new URL(resource.url).host;
   const size = resource.contentCoded === true ? null : resource.size;
+  if (downloadGate !== null) {
+    await downloadGate({ name: resource.name, url: resource.url, bytes: size, why: downloadReason(resource, host), signal });
+  }
   step(`Downloading the whole file${size === null ? '' : ` (${formatBytes(size)})`}: ${downloadReason(resource)}`);
   const where = await keptWhere(identity);
   notice(resource.compression !== undefined

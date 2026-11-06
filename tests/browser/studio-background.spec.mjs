@@ -20,6 +20,7 @@ import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 import { installMultiDimensionFixture } from './helpers/multi-dimension-fixture.mjs';
 import { VIEWER_BACKGROUNDS } from '../../assets/js/rendering/viewer-backgrounds.js';
 import { STUDIO_PALETTES } from '../../assets/js/rendering/studio-backdrop.js';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Each test draws many frames, some in a multiview grid; the macOS Firefox
 // runners render in software, so the file carries its own budget, as the
@@ -373,7 +374,7 @@ test('switching through every background in a grid is stable and the scene goes 
 
 async function saveSession(page, testInfo, name) {
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath(name);
   await download.saveAs(sessionPath);
@@ -382,7 +383,7 @@ async function saveSession(page, testInfo, name) {
 
 async function loadSession(page, sessionPath) {
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 }

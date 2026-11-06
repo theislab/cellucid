@@ -2,8 +2,9 @@
  * Playback-time and round-trip contracts for cinematic camera paths.
  *
  * `camera-path-contract.test.mjs` covers the schema and lifecycle boundaries —
- * what a session chunk is allowed to contain. This file covers what the module
- * actually does with one: that a saved path comes back identical, that the
+ * what the path's state (`exportPath`, the `camera-path` state domain's value)
+ * is allowed to contain. This file covers what the module actually does with
+ * one: that a saved path comes back identical, that the
  * transport's displayed position is the position `play()` uses, that a live
  * pace change moves the clock the transport shows, and that neither the frame
  * loop nor the pointer-activity path re-derives the whole path on every event.
@@ -23,9 +24,11 @@ const { resolveSegmentDurations } = await import(
 const { createTransportBar } = await import(
   '../assets/js/app/ui/modules/cinematic-camera/transport-bar.js'
 );
-const { initCinematicCamera } = await import(
-  '../assets/js/app/ui/modules/cinematic-camera/index.js'
-);
+const {
+  destroyMounted,
+  installModuleEnvironment,
+  mountCinematicCamera
+} = await import('./helpers/cinematic-camera-harness.mjs');
 
 function keyframe(index, transitionDuration = 1) {
   return {
@@ -443,262 +446,6 @@ test('pointer activity keeps the transport alive without re-deriving the path', 
 // Whole-module round trip
 // ---------------------------------------------------------------------------
 
-const CINEMATIC_DOM_KEYS = [
-  'saveBtn', 'keyframeList', 'clearBtn', 'timingActions', 'setAllDuration', 'setAllBtn',
-  'defaultSpeedInput', 'defaultSpeedDisplay', 'positionInterp',
-  'rotationInterp', 'easingSelect', 'loopCheckbox', 'autoplayCheckbox'
-];
-
-function createStubElement({ checked = false, value = '' } = {}) {
-  const handlers = new Map();
-  const names = new Set();
-  const children = new Map();
-  return {
-    checked,
-    disabled: false,
-    inert: false,
-    value,
-    innerHTML: '',
-    textContent: '',
-    clientHeight: 100,
-    scrollHeight: 50,
-    style: {},
-    dataset: {},
-    classList: {
-      add: name => names.add(name),
-      remove: name => names.delete(name),
-      contains: name => names.has(name),
-      toggle: (name, force) => {
-        const on = force === undefined ? !names.has(name) : force;
-        if (on) names.add(name);
-        else names.delete(name);
-        return on;
-      }
-    },
-    appendChild() {},
-    remove() {},
-    blur() {},
-    focus() {},
-    select() {},
-    contains() {
-      return false;
-    },
-    setAttribute() {},
-    getAttribute() {
-      return null;
-    },
-    querySelectorAll() {
-      return [];
-    },
-    querySelector(selector) {
-      if (!children.has(selector)) children.set(selector, createStubElement());
-      return children.get(selector);
-    },
-    addEventListener(type, listener, options = {}) {
-      if (!handlers.has(type)) handlers.set(type, []);
-      handlers.get(type).push(listener);
-      options.signal?.addEventListener(
-        'abort',
-        () => {
-          handlers.set(
-            type,
-            handlers.get(type).filter(entry => entry !== listener)
-          );
-        },
-        { once: true }
-      );
-    },
-    removeEventListener(type, listener) {
-      handlers.set(
-        type,
-        (handlers.get(type) ?? []).filter(entry => entry !== listener)
-      );
-    },
-    dispatchEvent(event) {
-      for (const listener of [...(handlers.get(event.type) ?? [])]) {
-        listener(event);
-      }
-      return true;
-    },
-    listeners(type) {
-      return [...(handlers.get(type) ?? [])];
-    }
-  };
-}
-
-function createCinematicDom() {
-  const seeds = {
-    defaultSpeedInput: { value: '30' },
-    positionInterp: { value: 'catmull-rom' },
-    rotationInterp: { value: 'slerp' },
-    easingSelect: { value: 'linear' },
-    setAllDuration: { value: '' }
-  };
-  const dom = {};
-  for (const key of CINEMATIC_DOM_KEYS) dom[key] = createStubElement(seeds[key]);
-  return dom;
-}
-
-function installModuleEnvironment() {
-  const previous = {
-    document: globalThis.document,
-    Event: globalThis.Event,
-    MutationObserver: globalThis.MutationObserver,
-    requestAnimationFrame: globalThis.requestAnimationFrame,
-    cancelAnimationFrame: globalThis.cancelAnimationFrame
-  };
-  const scheduled = new Map();
-  let nextFrameId = 1;
-  globalThis.requestAnimationFrame = callback => {
-    const id = nextFrameId++;
-    scheduled.set(id, callback);
-    return id;
-  };
-  globalThis.cancelAnimationFrame = id => {
-    scheduled.delete(id);
-  };
-  if (typeof globalThis.Event !== 'function') {
-    globalThis.Event = class StubEvent {
-      constructor(type) {
-        this.type = type;
-      }
-    };
-  }
-  globalThis.MutationObserver = class {
-    observe() {}
-    disconnect() {}
-  };
-  const sidebar = createStubElement();
-  globalThis.document = {
-    activeElement: null,
-    body: { appendChild() {} },
-    createElement: () => createStubElement(),
-    getElementById: id => (id === 'sidebar' ? sidebar : null),
-    addEventListener() {},
-    removeEventListener() {}
-  };
-  return {
-    drainFrames() {
-      const pending = [...scheduled];
-      scheduled.clear();
-      for (const [, callback] of pending) callback(0);
-    },
-    restore() {
-      for (const [key, value] of Object.entries(previous)) {
-        if (value === undefined) delete globalThis[key];
-        else globalThis[key] = value;
-      }
-    }
-  };
-}
-
-function createStubViewer(initialMode = 'orbit') {
-  let mode = initialMode;
-  const camera = {
-    navigationMode: initialMode,
-    orbit: {
-      radius: 3, targetRadius: 3, theta: 0.25, phi: 0.75, target: [0, 0, 0]
-    },
-    freefly: { position: [0, 0, 3], yaw: -Math.PI / 2, pitch: 0 }
-  };
-  const pointerLock = { enabled: false };
-  return {
-    pointerLock,
-    place(index, navigationMode) {
-      mode = navigationMode;
-      camera.navigationMode = navigationMode;
-      camera.orbit = {
-        radius: 3 + index,
-        targetRadius: 3 + index,
-        theta: 0.25 * index,
-        phi: 0.75,
-        target: [index, 0, 0]
-      };
-      camera.freefly = {
-        position: [index, 0, 3 + index],
-        yaw: -Math.PI / 2 + index,
-        pitch: 0.1 * index
-      };
-    },
-    getNavigationMode: () => mode,
-    setNavigationMode(next) {
-      mode = next;
-    },
-    getCameraState: () => structuredClone(camera),
-    setCameraState(value) {
-      mode = value.navigationMode;
-      camera.navigationMode = value.navigationMode;
-      camera.orbit = structuredClone(value.orbit);
-      camera.freefly = structuredClone(value.freefly);
-    },
-    setPointerLockEnabled(value) {
-      pointerLock.enabled = value;
-    },
-    setInvertLookX() {}, setInvertLookY() {}, setLookSensitivity() {},
-    setMoveSpeed() {}, setOrbitInvertRotation() {}, setOrbitKeySpeed() {},
-    setPlanarInvertAxes() {}, setPlanarPanSpeed() {},
-    setPlanarZoomToCursor() {}, setShowOrbitAnchor() {}
-  };
-}
-
-function createStubDatasetSource() {
-  const listeners = new Set();
-  return {
-    onDatasetChange: listener => listeners.add(listener),
-    offDatasetChange: listener => listeners.delete(listener),
-    announce() {
-      for (const listener of [...listeners]) listener();
-    }
-  };
-}
-
-/**
- * The Navigation panel as Camera Path sees it: it records every mode it is
- * asked to show, and holds the navigation settings a path saves and restores.
- */
-function createStubNavigation() {
-  let settings = {
-    invertLook: false,
-    lookSensitivity: '5',
-    moveSpeed: '100',
-    orbitKeySpeed: '40',
-    orbitReverse: true,
-    planarInvertAxes: false,
-    planarPanSpeed: '100',
-    planarZoomToCursor: true,
-    showOrbitAnchor: true
-  };
-  const modes = [];
-  return {
-    modes,
-    syncNavigationMode(mode) {
-      modes.push(mode);
-    },
-    exportSettings: () => ({ ...settings }),
-    restoreSettings(data) {
-      settings = Object.fromEntries(Object.keys(settings).map(key => [key, data[key]]));
-    },
-    setSetting(key, value) {
-      settings[key] = value;
-    }
-  };
-}
-
-function mountCinematicCamera() {
-  const dom = createCinematicDom();
-  const viewer = createStubViewer();
-  const navigation = createStubNavigation();
-  const dataSourceManager = createStubDatasetSource();
-  const camera = initCinematicCamera({
-    viewer,
-    dom,
-    navigation,
-    dataSourceManager,
-    focusedRepresentation: () => null,
-  });
-  return { camera, dom, viewer, navigation, dataSourceManager };
-}
-
 test('a recorded path survives save and restore field for field', () => {
   const environment = installModuleEnvironment();
   try {
@@ -725,25 +472,24 @@ test('a recorded path survives save and restore field for field', () => {
     source.dom.positionInterp.value = 'bezier';
     source.dom.rotationInterp.value = 'linear';
     source.dom.easingSelect.value = 'ease-in-out';
-    source.navigation.setSetting('orbitKeySpeed', '63');
-    source.navigation.setSetting('planarInvertAxes', true);
     source.dom.defaultSpeedInput.value = '77';
     source.dom.defaultSpeedInput.dispatchEvent(new globalThis.Event('input'));
     environment.drainFrames();
 
-    const saved = structuredClone(source.camera.exportSessionState());
+    const saved = structuredClone(source.camera.exportPath());
     assert.deepEqual(
       saved.keyframes.map(({ label }) => label),
       ['KF 1', 'KF 3', 'Middle stop'],
       'the exported path must carry the edited order and labels'
     );
 
-    // A session load restores into a module that was built from scratch.
+    // A session load restores into a module that was built from scratch
+    // (mounting it retires the one that recorded the path).
     const restored = mountCinematicCamera();
-    restored.camera.restoreSessionState(structuredClone(saved));
+    restored.camera.restorePath(structuredClone(saved));
     environment.drainFrames();
     assert.deepEqual(
-      structuredClone(restored.camera.exportSessionState()),
+      structuredClone(restored.camera.exportPath()),
       saved,
       'every restored field must equal the field that was saved'
     );
@@ -756,10 +502,10 @@ test('a recorded path survives save and restore field for field', () => {
       dirty.camera.getKeyframeStore().add(dirty.viewer.getCameraState(), undefined, null);
     }
     environment.drainFrames();
-    dirty.camera.restoreSessionState(structuredClone(saved));
+    dirty.camera.restorePath(structuredClone(saved));
     environment.drainFrames();
     assert.deepEqual(
-      structuredClone(dirty.camera.exportSessionState()),
+      structuredClone(dirty.camera.exportPath()),
       saved,
       'restoring over an existing path must replace it exactly, not merge with it'
     );
@@ -773,15 +519,13 @@ test('a recorded path survives save and restore field for field', () => {
       `KF ${saved.nextIndex}`
     );
 
-    source.camera.destroy();
-    restored.camera.destroy();
-    dirty.camera.destroy();
   } finally {
+    destroyMounted();
     environment.restore();
   }
 });
 
-test('the return-to-start keyframe does not consume a user keyframe number', () => {
+test('the return-to-start keyframe does not consume a user keyframe number', async () => {
   const environment = installModuleEnvironment();
   try {
     const module = mountCinematicCamera();
@@ -793,6 +537,7 @@ test('the return-to-start keyframe does not consume a user keyframe number', () 
     environment.drainFrames();
 
     // The list renders a "Return to Start" toggle once two keyframes exist.
+    // Turning it on is a camera path action, applied once it is dispatched.
     const [onListChange] = module.dom.keyframeList.listeners('change');
     const toggle = { checked: true };
     onListChange({
@@ -801,9 +546,10 @@ test('the return-to-start keyframe does not consume a user keyframe number', () 
           (selector === '.cinematic-loopback-list-toggle' ? toggle : null)
       }
     });
+    await new Promise(resolve => setTimeout(resolve, 0));
     environment.drainFrames();
 
-    const withLoopBack = module.camera.exportSessionState();
+    const withLoopBack = module.camera.exportPath();
     assert.equal(withLoopBack.keyframes.length, 3);
     assert.equal(
       withLoopBack.loopBackKeyframeId,
@@ -818,17 +564,16 @@ test('the return-to-start keyframe does not consume a user keyframe number', () 
       ['KF 1', 'KF 2', 'KF 3'],
       `the loop-back keyframe must not advance the user numbering; got ${JSON.stringify(labels)}`
     );
-
-    module.camera.destroy();
   } finally {
+    destroyMounted();
     environment.restore();
   }
 });
 
-test('Camera Path moves the mode through the Navigation panel', () => {
-  // Navigation lives in one panel. A keyframe goto, playback stopping, and a
-  // restore change the mode, and each must show it there rather than in a
-  // second copy of the controls.
+test('a path restore moves neither the camera nor its navigation mode', () => {
+  // The navigation mode and the camera are the camera domain's; a restored
+  // path is only keyframes and how they play. Restoring one recorded in
+  // other modes leaves the viewer, and the Navigation panel, as they are.
   const environment = installModuleEnvironment();
   try {
     const module = mountCinematicCamera();
@@ -837,18 +582,20 @@ test('Camera Path moves the mode through the Navigation panel', () => {
     store.add(module.viewer.getCameraState(), undefined, null);
     module.viewer.place(1, 'planar');
     store.add(module.viewer.getCameraState(), undefined, null);
-    const saved = structuredClone(module.camera.exportSessionState());
+    const saved = structuredClone(module.camera.exportPath());
 
     module.viewer.place(2, 'orbit');
+    const camera = module.viewer.getCameraState();
     module.navigation.modes.length = 0;
-    module.camera.restoreSessionState(saved);
-    assert.equal(module.viewer.getNavigationMode(), 'planar');
-    // Stopping playback first shows the mode the viewer had; the restored
-    // mode is the last one the panel is asked to show.
-    assert.equal(module.navigation.modes.at(-1), saved.navigationMode);
-
-    module.camera.destroy();
+    module.camera.restorePath(saved);
+    environment.drainFrames();
+    assert.equal(module.viewer.getNavigationMode(), 'orbit');
+    assert.deepEqual(module.viewer.getCameraState(), camera);
+    // Stopping playback shows the mode the viewer has; the path names none.
+    assert.deepEqual(module.navigation.modes, ['orbit']);
+    assert.deepEqual(structuredClone(module.camera.exportPath()), saved);
   } finally {
+    destroyMounted();
     environment.restore();
   }
 });

@@ -265,7 +265,9 @@ export async function checkCorpusEntry(access, corpus, name, expected) {
     }
     if (expected.uns?.cellucid) {
       for (const [key, value] of Object.entries(expected.uns.cellucid)) {
-        assert.equal(await root.get(`uns/cellucid/${key}`).read(), value, `uns['cellucid']['${key}']`);
+        // A whole number is an int64 scalar (as prepare() writes one): read as a BigInt.
+        const stored = await root.get(`uns/cellucid/${key}`).read();
+        assert.equal(typeof stored === 'bigint' ? Number(stored) : stored, value, `uns['cellucid']['${key}']`);
       }
     }
     // A subsample under the store's seed opens as its prefix (the store is

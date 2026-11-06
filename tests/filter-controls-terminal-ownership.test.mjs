@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { initFilterControls } from '../assets/js/app/ui/modules/filter-controls.js';
+import { getActions } from '../assets/js/app/actions/index.js';
+
+const settle = () => new Promise(resolve => setImmediate(resolve));
 
 function createElement(tagName = 'div') {
   const listeners = new Map();
@@ -70,17 +73,29 @@ function createElement(tagName = 'div') {
   return element;
 }
 
-test('filter-control destroy detaches and fences the delegated list listeners', () => {
+test('filter-control destroy detaches and fences the delegated list listeners', async () => {
   const previousDocument = globalThis.document;
   globalThis.document = { createElement };
+  const mutations = [];
+  // A row's toggle and remove are the actions filter.enable and filter.remove,
+  // naming the filter by its field and kind.
+  const unprovide = [
+    getActions().provide('filter.enable', ({ field, kind, enabled }) => {
+      mutations.push(['toggle', `${field.source}:${field.key}:${kind}`, enabled]);
+      return { enabled };
+    }),
+    getActions().provide('filter.remove', ({ field, kind }) => {
+      mutations.push(['remove', `${field.source}:${field.key}:${kind}`]);
+      return null;
+    }),
+  ];
   try {
     const countEl = createElement();
     const activeFiltersEl = createElement();
-    const mutations = [];
     const controls = initFilterControls({
       state: {
         getActiveFiltersStructured() {
-          return [{ id: 'filter-1', text: 'Current filter', enabled: true }];
+          return [{ id: 'obs-category-0', source: 'obs', fieldKey: 'cell_type', type: 'category', text: 'Current filter', enabled: true }];
         },
         getFilterCellCounts() {
           return { visible: 1, available: 2 };
@@ -113,7 +128,7 @@ test('filter-control destroy detaches and fences the delegated list listeners', 
     controls.render();
     assert.equal(countEl.textContent, 'Showing 1 of 2 cells');
     const renderedItem = activeFiltersEl.children[0];
-    assert.equal(renderedItem.dataset.filterId, 'filter-1');
+    assert.equal(renderedItem.dataset.filterId, 'obs-category-0');
     const checkbox = renderedItem.children[0];
     const removeButton = renderedItem.children[2];
     // Rows carry no listeners: the list delegates both interactions.
@@ -125,7 +140,8 @@ test('filter-control destroy detaches and fences the delegated list listeners', 
     mutations.length = 0;
     checkbox.checked = false;
     retainedChange({ target: checkbox });
-    assert.deepEqual(mutations.slice(0, 2), [['toggle', 'filter-1', false], ['changed']]);
+    await settle();
+    assert.deepEqual(mutations.slice(0, 2), [['toggle', 'obs:cell_type:category', false], ['changed']]);
     mutations.length = 0;
 
     controls.destroy();
@@ -136,8 +152,10 @@ test('filter-control destroy detaches and fences the delegated list listeners', 
     retainedChange({ target: checkbox });
     retainedClick({ target: removeButton, stopPropagation() {} });
     controls.render();
+    await settle();
     assert.deepEqual(mutations, []);
   } finally {
     globalThis.document = previousDocument;
+    for (const remove of unprovide) remove();
   }
 });

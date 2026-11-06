@@ -6,6 +6,8 @@ __pycache__/
 
 # Virtual envs
 .env*
+# The template of the developer secrets file is kept; the file itself never is.
+!.env.example
 .dev.vars*
 .venv
 env/

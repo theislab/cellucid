@@ -7,8 +7,10 @@
  * (`pip install cellucid`) or R (`install.packages("cellucid")`).
  *
  * This module exports only pointers to the real entry points, so that
- * `import ... from "cellucid"` resolves instead of throwing. If a local-serving
- * CLI ships later, it will replace this file.
+ * `import ... from "cellucid"` resolves instead of throwing. It is released
+ * under the same version as each Cellucid release (the web app and the Python
+ * and R packages). If a local-serving CLI ships later, it will replace this
+ * file.
  */
 
 /** Hosted application. */

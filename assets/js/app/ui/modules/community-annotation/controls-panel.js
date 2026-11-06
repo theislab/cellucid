@@ -18,7 +18,8 @@
  * @module ui/modules/community-annotation/controls-panel
  */
 
-import { annotationDatasetIdOf } from '../../../community-annotations/runtime-context.js';
+import { ANNOTATION_PAUSED_HERE, annotationDatasetIdOf } from '../../../community-annotations/runtime-context.js';
+import { annotationFieldKey } from '../../../community-annotations/field-names.js';
 import {
   getAnnotationRepoForDataset,
 } from '../../../community-annotations/repo-store.js';
@@ -31,8 +32,8 @@ import {
   createStatusRow,
   downloadJsonAsFile,
   el,
-  toCleanString,
 } from './dom.js';
+import { toCleanString } from '../../../../utils/clean-string.js';
 import { createDomId } from '../../components/dom-id.js';
 import {
   createButton,
@@ -45,25 +46,38 @@ import {
 import { confirmAsync } from './modal-shell.js';
 import { assertExactGitHubLogin } from './identity-assertions.js';
 import {
-  clampInt,
+  minAnnotatorsFromInput,
   formatPctSigned11,
   sliderValueToThreshold,
   thresholdToSliderValue,
 } from './consensus-math.js';
 import { copyTextToClipboard } from './browser-integration.js';
 import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
+import { pendingDetail, pendingLine } from './published-baseline.js';
 import { PLACES } from '../../place-names.js';
 import { onAbort } from '../../../../utils/abort.js';
+import { fieldByAnnotationKey } from '../../../community-annotations/field-names.js';
+import {
+  consensusColumnStatus,
+  defaultConsensusColumnKey,
+  repositoryConsensusSettings,
+} from './consensus-column.js';
 
 const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
+
 
 /**
  * Members the panel needs from the community annotation controls.
  */
 const REQUIRED_CONTROLLER_MEMBERS = Object.freeze([
   'isContextDestroyed',
+  'getAnnotationPause',
+  'useAnnotationHere',
+  'pendingChanges',
+  'publishNow',
   'isSyncBusy',
   'getSyncError',
+  'getSyncErrorLink',
   'applyConsensusColumn',
   'connectRepoFlow',
   'editIdentityFlow',
@@ -142,11 +156,13 @@ export function createControlsPanel(controller) {
   }
 
   let selectedFieldKey = null;
-  // Derived consensus column (manual, optional).
-  let consensusColumnThreshold = 0.5;
-  let consensusColumnMinAnnotators = 1;
-  let consensusColumnKey = 'community_cell_type';
+  // Derived consensus column (manual, optional): the annotated column (its
+  // dataset key, `field-names.js`), and what the person changed of its
+  // defaults, per column. The defaults are the column's repository rule
+  // and the key `community_<column>` (`consensus-column.js`).
   let consensusSourceFieldKey = null;
+  /** @type {Map<string, {key?: string, minAnnotators?: number, threshold?: number}>} */
+  const consensusEdits = new Map();
   // Community annotation collapsibles: closed by default; only one may be open at a time.
   /** @type {'consensus-column'|'manage'|'exports-cache'|null} */
   let openAccordionKey = null;
@@ -212,14 +228,43 @@ export function createControlsPanel(controller) {
       : null;
   }
 
-  function readConsensusColumnSettings() {
+  /** The consensus column's settings for the annotated column `fieldKey`: its defaults, with the person's edits. */
+  function consensusChoiceOf(fieldKey) {
+    const found = fieldKey === null ? null : fieldByAnnotationKey(state, fieldKey);
+    const rule = fieldKey === null ? { minAnnotators: 1, threshold: 0.5 } : repositoryConsensusSettings(session, fieldKey);
+    const edits = (fieldKey === null ? null : consensusEdits.get(fieldKey)) ?? {};
     return {
-      consensusSourceFieldKey,
-      selectedFieldKey,
-      consensusColumnKey,
-      consensusColumnMinAnnotators,
-      consensusColumnThreshold,
+      key: edits.key ?? (found === null ? '' : defaultConsensusColumnKey(found.field)),
+      minAnnotators: edits.minAnnotators ?? rule.minAnnotators,
+      threshold: edits.threshold ?? rule.threshold,
     };
+  }
+
+  function editConsensusChoice(fieldKey, edit) {
+    if (fieldKey === null) return;
+    consensusEdits.set(fieldKey, { ...(consensusEdits.get(fieldKey) ?? {}), ...edit });
+  }
+
+  function readConsensusColumnSettings() {
+    const choice = consensusChoiceOf(consensusSourceFieldKey);
+    return {
+      sourceFieldKey: consensusSourceFieldKey,
+      columnKey: choice.key,
+      minAnnotators: choice.minAnnotators,
+      threshold: choice.threshold,
+    };
+  }
+
+  /** Build a stale consensus column again under its name, from its column, with the rule it was built with. */
+  function rebuildConsensusColumn(column) {
+    const built = (state.getFields?.() ?? []).find((field) => field?.key === column.key && field._isDeleted !== true);
+    const settings = built?._operation?.settings ?? repositoryConsensusSettings(session, column.fieldKey);
+    return applyConsensusColumn(() => ({
+      sourceFieldKey: column.fieldKey,
+      columnKey: column.key,
+      minAnnotators: settings.minAnnotators,
+      threshold: settings.threshold,
+    }));
   }
 
   function render() {
@@ -245,6 +290,11 @@ export function createControlsPanel(controller) {
       const introInfo = createInfoTooltip('About community annotation', 'community-intro');
       const introBlock = createInfoGroup('Repository', introInfo);
       introBlock.appendChild(el('p', { className: 'status-line', text: 'Not connected.' }));
+      // Why it is not connected now (a sign-in GitHub refused), in one line.
+      const introError = controller.getSyncError();
+      if (introError) {
+        introBlock.appendChild(createStatusLine({ tone: 'danger', text: String(introError).split('\n')[0].trim() }).root);
+      }
 
       const actions = el('div', { className: 'community-annotation-suggestion-actions' });
       // A repository is connected per dataset, so None has nothing to
@@ -316,12 +366,16 @@ export function createControlsPanel(controller) {
     })();
 
     const statusList = el('div', { className: 'control-box community-annotation-status-list community-annotation-status-panel' });
-    statusList.appendChild(createStatusRow({
+    // The dataset by its name; its id (what the repository files it under) on hover.
+    const datasetName = toCleanString(dataSourceManager?.getCurrentMetadata?.()?.name) || datasetId;
+    const datasetRow = createStatusRow({
       icon: 'dataset',
       tone: datasetId ? 'ok' : 'warn',
       key: 'Dataset',
-      value: datasetId ? ` ${datasetId}` : ' —',
-    }).row);
+      value: datasetId ? ` ${datasetName}` : ' —',
+    }).row;
+    if (datasetId && datasetName !== datasetId) datasetRow.title = `Dataset id in the repository: ${datasetId}`;
+    statusList.appendChild(datasetRow);
     statusList.appendChild(createStatusRow({
       icon: 'github',
       tone: isAuthed ? 'ok' : 'warn',
@@ -345,20 +399,67 @@ export function createControlsPanel(controller) {
       }).root);
     }
 
+    // Another tab annotates this dataset and repository: one line, and Use here.
+    const pause = controller.getAnnotationPause();
+    if (pause !== null) {
+      const pauseRow = el('div', { className: 'community-annotation-pause', role: 'group', 'aria-label': 'Annotation paused' });
+      pauseRow.appendChild(createStatusLine({ tone: 'warning', text: ANNOTATION_PAUSED_HERE }).root);
+      const useHere = createButton({
+        label: 'Use here',
+        title: 'Annotate in this tab: the other tab pauses (what it has is kept).',
+      });
+      useHere.dataset.communityAnnotationAction = 'use-here';
+      useHere.addEventListener('click', () => controller.useAnnotationHere());
+      pauseRow.appendChild(useHere);
+      syncBlock.appendChild(pauseRow);
+      container.appendChild(syncBlock);
+      return;
+    }
+
+    // A failure in one plain line; GitHub's own words behind Details.
     const currentSyncError = controller.getSyncError();
     if (currentSyncError) {
-      syncBlock.appendChild(createStatusLine({
-        tone: 'danger',
-        text: currentSyncError,
-      }).root);
+      const [headline, ...rest] = String(currentSyncError).split('\n').map(line => line.trim()).filter(Boolean);
+      syncBlock.appendChild(createStatusLine({ tone: 'danger', text: headline ?? String(currentSyncError) }).root);
+      const errorLink = controller.getSyncErrorLink();
+      if (errorLink !== null) {
+        syncBlock.appendChild(el('a', {
+          className: 'community-annotation-error-link',
+          href: errorLink.url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          text: errorLink.label,
+          'data-community-annotation-action': 'sync-error-link',
+        }));
+      }
+      if (rest.length > 0) {
+        const details = createDisclosure({ title: 'Details', className: 'disclosure-inline details-disclosure community-annotation-error-details' });
+        details.content.appendChild(el('p', { className: 'field-help', text: rest.join('\n') }));
+        syncBlock.appendChild(details.root);
+      }
+    }
+
+    // What of the person's own work is not published yet, with Publish.
+    const pending = isAuthed ? controller.pendingChanges() : null;
+    const pendingText = pendingLine(pending);
+    if (pendingText !== null) {
+      const pendingRow = el('div', { className: 'community-annotation-pending', role: 'group', 'aria-label': 'Not published' });
+      const line = createStatusLine({ tone: 'info', text: pendingText }).root;
+      line.title = `Not published yet: ${pendingDetail(pending)}.`;
+      pendingRow.appendChild(line);
+      const publishBtn = createButton({ label: 'Publish', title: `Publish ${pendingDetail(pending)} to ${storedRepoName}` });
+      publishBtn.dataset.communityAnnotationAction = 'publish';
+      publishBtn.disabled = controller.isSyncBusy() || !online;
+      publishBtn.addEventListener('click', () => controller.publishNow());
+      pendingRow.appendChild(publishBtn);
+      syncBlock.appendChild(pendingRow);
     }
 
     const syncActions = el('div', { className: 'community-annotation-sync-actions' });
-    const openBtnText = !isAuthed ? 'Connect GitHub…' : (!repo ? 'Choose repo…' : 'GitHub sync…');
     const openSyncBtn = el('button', {
       type: 'button',
       className: 'btn',
-      text: openBtnText,
+      text: 'GitHub sync…',
       'data-community-annotation-action': 'github-connection',
     });
     openSyncBtn.disabled = controller.isSyncBusy() || !online;
@@ -404,12 +505,15 @@ export function createControlsPanel(controller) {
 
     container.appendChild(syncBlock);
 
-    const catFieldsForConsensus = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
-    const allKeysForConsensus = catFieldsForConsensus.map((f) => f.key).filter(Boolean);
-    const annotatableKeysForConsensus = session.getAnnotatedFields().filter((k) => allKeysForConsensus.includes(k));
+    // The annotated columns shown, by their dataset key; each shown by its name here.
+    const annotatedForConsensus = session.getAnnotatedFields()
+      .map((fieldKey) => ({ fieldKey, found: fieldByAnnotationKey(state, fieldKey) }))
+      .filter(({ found }) => found !== null && found.field.kind === 'category');
+    const annotatableKeysForConsensus = annotatedForConsensus.map(({ fieldKey }) => fieldKey);
     if (!consensusSourceFieldKey || !annotatableKeysForConsensus.includes(consensusSourceFieldKey)) {
       consensusSourceFieldKey = annotatableKeysForConsensus[0] || null;
     }
+    const consensusChoice = consensusChoiceOf(consensusSourceFieldKey);
 
     const consensusDisclosure = createPeerDisclosure(
       'consensus-column',
@@ -417,6 +521,29 @@ export function createControlsPanel(controller) {
       'community-consensus-column'
     );
     const content = consensusDisclosure.content;
+
+    // The consensus columns built here whose consensus changed since (a Pull, a vote): one line each.
+    for (const column of consensusColumnStatus(state, session)) {
+      if (!column.stale) continue;
+      const line = el('div', { className: 'community-annotation-consensus-stale' });
+      line.appendChild(createStatusLine({
+        tone: 'warning',
+        text: `${column.key}: consensus changed since built (${column.changed} ${column.changed === 1 ? 'category' : 'categories'})`,
+      }).root);
+      const rebuild = createButton({
+        label: 'Rebuild',
+        title: `Build ${column.key} again from the consensus now, with the rule it was built with`,
+        onClick: () => {
+          startBackgroundTask(
+            () => rebuildConsensusColumn(column),
+            { label: 'Unable to rebuild the community consensus column' },
+          );
+        },
+      });
+      rebuild.disabled = controller.isSyncBusy();
+      line.appendChild(rebuild);
+      content.appendChild(line);
+    }
 
     // Source annotatable column selector
     const srcWrap = el('div', { className: 'control-block' });
@@ -430,10 +557,14 @@ export function createControlsPanel(controller) {
       srcSelect.appendChild(el('option', { value: '', text: '(no annotatable columns)' }));
       srcSelect.disabled = true;
     } else {
-      for (const k of annotatableKeysForConsensus) srcSelect.appendChild(el('option', { value: k, text: k }));
+      for (const { fieldKey, found } of annotatedForConsensus) {
+        srcSelect.appendChild(el('option', { value: fieldKey, text: found.field.key }));
+      }
       srcSelect.value = consensusSourceFieldKey || annotatableKeysForConsensus[0];
       srcSelect.addEventListener('change', () => {
         consensusSourceFieldKey = toCleanString(srcSelect.value) || null;
+        // Its own key and rule are shown.
+        render();
       });
     }
     srcWrap.appendChild(srcSelect);
@@ -452,26 +583,26 @@ export function createControlsPanel(controller) {
       id: consensusKeyInputId,
       type: 'text',
       className: 'obs-select',
-      placeholder: 'community_cell_type'
+      placeholder: consensusSourceFieldKey === null ? 'community_<column>' : consensusChoice.key
     });
-    consensusKeyInput.value = consensusColumnKey;
+    consensusKeyInput.value = consensusChoice.key;
     consensusKeyInput.addEventListener('change', () => {
-      consensusColumnKey = String(consensusKeyInput.value || '').trim();
+      editConsensusChoice(consensusSourceFieldKey, { key: String(consensusKeyInput.value || '').trim() });
     });
     consensusKeyWrap.appendChild(consensusKeyInput);
     content.appendChild(consensusKeyWrap);
 
-    // Consensus threshold + min annotators
+    // Consensus threshold + min annotators: the column's repository rule unless changed here.
     const consensusSettings = el('div', { className: 'community-annotation-settings' });
     const threshold = createSliderField({
       label: 'Consensus threshold',
       min: -100,
       max: 100,
       step: 1,
-      value: Number(thresholdToSliderValue(consensusColumnThreshold)),
+      value: Number(thresholdToSliderValue(consensusChoice.threshold)),
       format: (value) => formatPctSigned11(sliderValueToThreshold(value)),
       onInput: (value) => {
-        consensusColumnThreshold = sliderValueToThreshold(value);
+        editConsensusChoice(consensusSourceFieldKey, { threshold: sliderValueToThreshold(value) });
       },
     });
     consensusSettings.appendChild(threshold.root);
@@ -486,14 +617,17 @@ export function createControlsPanel(controller) {
       id: minInputId,
       type: 'number',
       className: 'obs-select',
-      value: String(consensusColumnMinAnnotators),
+      value: String(consensusChoice.minAnnotators),
       min: '0',
-      max: '50',
       step: '1'
     });
     minInput.addEventListener('change', () => {
-      consensusColumnMinAnnotators = clampInt(Number(minInput.value), 0, 50);
+      const consensusColumnMinAnnotators = minAnnotatorsFromInput(
+        minInput.value,
+        consensusChoiceOf(consensusSourceFieldKey).minAnnotators,
+      );
       minInput.value = String(consensusColumnMinAnnotators);
+      editConsensusChoice(consensusSourceFieldKey, { minAnnotators: consensusColumnMinAnnotators });
     });
     minWrap.appendChild(minInput);
     consensusSettings.appendChild(minWrap);
@@ -603,12 +737,14 @@ export function createControlsPanel(controller) {
     // ─────────────────────────────────────────────────────────────────────────
     // MANAGE ANNOTATION - author-only when connected to a repo
     // ─────────────────────────────────────────────────────────────────────────
+    // Fields by their keys in the repository (the dataset's), shown by their local names.
     const annotated = session.getAnnotatedFields();
     const catFields = (state.getFields?.() || []).filter((f) => f?.kind === 'category' && f?._isDeleted !== true);
-    const allKeys = catFields.map((f) => f.key).filter(Boolean);
+    const shownNameOf = new Map(catFields.map((f) => [annotationFieldKey(f), f.key]));
+    const allKeys = [...shownNameOf.keys()].filter(Boolean);
     if (!selectedFieldKey || !allKeys.includes(selectedFieldKey)) {
       const active = state.getActiveField?.() || null;
-      selectedFieldKey = active?.kind === 'category' && active?.key ? active.key : (allKeys[0] || null);
+      selectedFieldKey = active?.kind === 'category' && active?.key ? annotationFieldKey(active) : (allKeys[0] || null);
     }
 
     const hasSelection = Boolean(selectedFieldKey);
@@ -647,7 +783,9 @@ export function createControlsPanel(controller) {
       const enabled = annotated.includes(key);
       const closed = enabled ? Boolean(session.isFieldClosed(key)) : false;
       const prefix = enabled ? (closed ? '🗳️🏁 ' : '🗳️ ') : '';
-      fieldSelect.appendChild(el('option', { value: key, text: prefix ? `${prefix}${key}` : key }));
+      const shown = shownNameOf.get(key);
+      const name = shown === key ? key : `${shown} (${key} in the repository)`;
+      fieldSelect.appendChild(el('option', { value: key, text: `${prefix}${name}` }));
     }
     if (selectedFieldKey) fieldSelect.value = selectedFieldKey;
     fieldSelect.addEventListener('change', () => {
@@ -771,13 +909,12 @@ export function createControlsPanel(controller) {
         className: 'obs-select',
         value: String(draft.minAnnotators),
         min: '0',
-        max: '50',
         step: '1',
         disabled: !canEditSettings
       });
       minInput.addEventListener('change', () => {
         if (!canEditSettings) return;
-        const nextMin = clampInt(Number(minInput.value), 0, 50);
+        const nextMin = minAnnotatorsFromInput(minInput.value, draft.minAnnotators);
         minInput.value = String(nextMin);
         annotatableSettingsDraft[selectedFieldKey] = { ...annotatableSettingsDraft[selectedFieldKey], minAnnotators: nextMin };
         annotatableSettingsDirty.add(selectedFieldKey);

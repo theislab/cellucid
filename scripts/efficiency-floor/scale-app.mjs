@@ -941,14 +941,16 @@ try {
   await step('session', async () => {
     const download = page.waitForEvent('download', { timeout: 1_800_000 });
     const t0 = performance.now();
-    await (await reveal('#save-state-btn')).click();
+    await (await reveal('#history-share-btn')).click();
+    await page.locator('#history-share-save').click();
     const file = await download;
     const sessionPath = path.join(downloads, 'session.cellucid-session');
     await file.saveAs(sessionPath);
     const saveMs = Math.round(performance.now() - t0);
     const chooser = page.waitForEvent('filechooser');
     const t1 = performance.now();
-    await (await reveal('#load-state-btn')).click();
+    await (await reveal('#history-load-btn')).click();
+    await page.locator('#load-state-btn').click();
     await (await chooser).setFiles(sessionPath);
     await page.waitForTimeout(1000);
     await settled();

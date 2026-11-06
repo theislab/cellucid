@@ -311,7 +311,7 @@ export class LocalUserDirDataSource {
   /**
    * Local files cannot be reopened from saved state by the source: the
    * person chooses them again, or, where the browser kept a handle of one,
-   * reopens it with a click (`app/local-file-handles.js`).
+   * reopens it with a click (`app/library/local-file-handles.js`).
    * @returns {boolean}
    */
   requiresManualReconnect() {

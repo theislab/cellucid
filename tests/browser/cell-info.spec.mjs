@@ -240,7 +240,7 @@ test('no pick runs while the camera is dragged or the pointer sweeps; one runs o
   }), cell);
   expect(sweep.duringMoves).toBe(0);
   expect(sweep.frames).toBe(3);
-  await expect.poll(async () => (await picks()) - start, { timeout: 5_000 }).toBe(1);
+  await expect.poll(async () => (await picks()) - start).toBe(1);
 });
 
 /** What selecting the cell's category in its pane would pick. */
@@ -491,7 +491,7 @@ test('on a view of 250,000 cells or more the lookup is built off the main thread
   await page.mouse.move(x, y, { steps: 3 });
   const card = page.locator('#cell-info-card');
   await expect.poll(hasTree, { timeout: 60_000 }).toBe(true);
-  await expect(card.locator('.cell-info-value')).not.toHaveText('Preparing cell lookup…', { timeout: 30_000 });
+  await expect(card.locator('.cell-info-value')).not.toHaveText('Preparing cell lookup…');
   // Until the tree landed the card said only that the lookup was being
   // prepared (whether a frame found it not landed yet is the worker's
   // speed); then it named the cell.

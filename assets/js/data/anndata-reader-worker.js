@@ -86,6 +86,23 @@
  *   genes, owner, delivery, runGenes)` reads a cell subset and posts each run of genes
  *   to its worker. Each answers only the bytes it sent (`{bytes}`, one
  *   number per gene for columns): the genes never reach the page.
+ * - `{id, method: 'readCopyTarget', args: [names, owner, varModality]}` answers
+ *   what a copy is planned against (`anndata/write/copy-target.js`): the
+ *   stored obs columns, the values of those `names` lists over every cell
+ *   by original position, the var columns a copy's var changes go to, and
+ *   `uns['cellucid']`.
+ * - `{id, method: 'writeAnnDataCopy', args: [changes, owner, dataset]}` writes a copy of
+ *   the whole dataset (every cell, whichever are open) as a Cellucid-ready
+ *   AnnData `.zarr.zip` (`anndata/write/copy.js`, `changes` its
+ *   `CopyChanges`): its bytes go to the page in batches,
+ *   `{event: 'partial', id, copy, parts}` (`parts` transferred), each
+ *   answered `{copyWritten: copy}` once the page wrote it, or
+ *   `{copyWritten: copy, error}` (the copy then fails); at most a few
+ *   batches are unanswered at once (`anndata/write/acknowledged-sink.js`).
+ *   How far it is is its read activity's (`{event: 'activity'}`, kind
+ *   `cells`, of the job `owner`: values copied of all). The reply
+ *   (`{bytes, entries, zip64, chunks, layout, nObs, priorityOrder, notes}`)
+ *   comes once the page has written every byte.
  * - `{id, method, args}` for every other reader method; the reply is
  *   `{id, result}` with typed arrays transferred, or `{id, error}`. Every
  *   typed array of a reply owns its whole buffer (a view is copied out
@@ -186,7 +203,13 @@ import { realmHosts } from '../formats/io/hosts.js';
 import { adoptRangeCachePort, endRangeCachePort, rangeCacheChannel, rangeCacheKey } from '../formats/io/range-cache.js';
 import { flushKeptParts } from '../formats/io/kept-parts.js';
 import { LatentOutlierReader } from './latent-outliers-stream.js';
-import { noteMemoryChanged, receiveMemoryMessage, registerResidentHolder, residencyBudgetBytes, setMemoryReporter } from './memory-budget.js';
+import { writeAnnDataCopy } from './anndata/write/copy.js';
+import { readCopyTarget } from './anndata/write/copy-target.js';
+import { COPY_BATCH_BYTES, COPY_WINDOW_BYTES, createAcknowledgedSink } from './anndata/write/acknowledged-sink.js';
+import { WHOLE_CHUNK } from './anndata/write/layout.js';
+import { SLAB_BYTES } from './anndata/values.js';
+import { encodeInFlight, poolEncoder } from './anndata/write/pool-encoder.js';
+import { noteMemoryChanged, receiveMemoryMessage, registerResidentHolder, residencyBudgetBytes, setMemoryReporter, setWorkingSet } from './memory-budget.js';
 import { configureDecodePool, decodePoolStats, decodeWorkersHeldBytes, trimDecodeWorkers, warmDecodePool } from '../formats/io/decode-pool.js';
 import { heldDecodedBytes, trimDecodedChunks } from '../formats/io/decoded-budget.js';
 import { configureByteReaders, heldReaderBytes, trimReaderBytes } from '../formats/io/byte-reader.js';
@@ -398,6 +421,25 @@ function openingSourceKey(source, opening) {
   return file === null ? null : JSON.stringify(['opening', opening, file]);
 }
 
+/**
+ * The cells an opening reads (its request `cellSubset`) once its source is
+ * opened. A progressive opening grows in place: each step reads the same
+ * bytes again (`open`, `reuse`: a source by its key, a store folder by its
+ * version). A source no later reading can tell to be the same bytes (a
+ * store folder whose host names no version, `key` null) would read each
+ * step anew, other cells than those shown, and its growth stop at the
+ * first view: it opens every cell asked for at once.
+ *
+ * @param {Object|null} cellSubset - the request (`progressive`: a first view may be planned)
+ * @param {{key: string|null, folder: {version: string|null}|null}} source - `sourceKey`/`openingSourceKey`, and `open`'s folder
+ * @returns {Object|null}
+ */
+export function cellsToOpen(cellSubset, { key, folder }) {
+  if (cellSubset?.progressive == null || key !== null || (folder !== null && folder.version !== null)) return cellSubset;
+  const { progressive: _planned, ...atOnce } = cellSubset;
+  return atOnce;
+}
+
 /** A store folder source's URL as its store names it (ending in `/`), or null. */
 function folderUrlOf(source) {
   if (typeof source?.url !== 'string' || source.file !== undefined) return null;
@@ -565,6 +607,9 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
   };
   // The page's answers to `choose` events, by request.
   const choices = new Map();
+  /** Copies being written (`writeAnnDataCopy`), by ticket: what the page's `{copyWritten}` answers. */
+  const copies = new Map();
+  let nextCopy = 1;
   let nextChoice = 1;
   /** Complete kept directories the page is to hold, by name: what resolves when it says it does (`{storeHeld}`). */
   const heldByPage = new Map();
@@ -896,7 +941,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
             decodedBudget: opened.decodedBudget,
             link: opened.link,
             activity,
-            cellSubset,
+            cellSubset: cellsToOpen(cellSubset, { key, folder: opened.folder ?? null }),
             // The same bytes opened again with other cells: what the open
             // reader read that the new cells keep is taken over, not read
             // again (`AnnDataReader.open`, `carry`).
@@ -1086,6 +1131,66 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     // `{cells, entries}`.
     readMatrixRows: ({ signal, partial }, element, cells) => reader.readMatrixRows(element, cells, { signal, onPart: part => partial(part) }),
     matrixRowsCost: (_context, element, cells) => reader.matrixRowsCost(element, cells),
+    // A copy of the whole dataset as a Cellucid-ready AnnData `.zarr.zip`
+    // (`anndata/write/copy.js`), its bytes posted to the page in batches the
+    // page answers once written (`anndata/write/acknowledged-sink.js`:
+    // `{event: 'partial', id, copy, parts}`, answered `{copyWritten: copy}`),
+    // its progress its read activity's (kind `cells`, of the job `owner`);
+    // the reply is the copy's result, once the page has written every byte.
+    // What a copy is planned against (`anndata/write/copy-target.js`): the
+    // stored obs columns, the values of those the plan reads (every cell, by
+    // original position) and `uns['cellucid']`; its reads of the job `owner`.
+    readCopyTarget: async ({ signal }, names = [], owner = null, varModality = null) => {
+      const activity = createActivity({ kind: 'cells', label: 'the columns a copy of the dataset changes', owner });
+      try {
+        const target = await readCopyTarget(reader.storedRoot(), names, { signal, activity }, { varModality });
+        activity.finish();
+        return target;
+      } catch (error) {
+        activity.finish(error);
+        throw error;
+      }
+    },
+    writeAnnDataCopy: async ({ signal, partial }, changes = {}, owner = null, dataset = null) => {
+      const root = reader.storedRoot();
+      const ticket = nextCopy++;
+      const acknowledged = createAcknowledgedSink(message => partial(message), { ticket, signal });
+      copies.set(ticket, acknowledged);
+      // A transposition's block (or a dense matrix's band) is a gene index of
+      // the copy's own: it takes that share.
+      const budgetBytes = residencyBudgetBytes('columnIndex');
+      const inFlight = encodeInFlight();
+      // What the copy holds while it runs, counted in the working set under a
+      // part of its own: the block, two slabs (one read, the next one coming),
+      // the chunks being encoded (at most `WHOLE_CHUNK` values of 8 bytes,
+      // twice: values and output) and the batches posted to the page.
+      const workingPart = `anndata copy ${ticket}`;
+      setWorkingSet(workingPart, budgetBytes + 2 * SLAB_BYTES + inFlight * 2 * 8 * WHOLE_CHUNK + COPY_WINDOW_BYTES + COPY_BATCH_BYTES);
+      // Its reads in the read activity log, as a cell export's are.
+      const activity = createActivity({ kind: 'cells', label: 'a copy of the dataset', owner });
+      try {
+        const result = await writeAnnDataCopy(root, acknowledged.sink, {
+          changes,
+          dataset,
+          budgetBytes,
+          // Deflated on every core the decode pool runs, put in order.
+          encode: poolEncoder({ signal }),
+          inFlight,
+          // Its progress is the activity's (values copied of all), the one channel reads are shown by.
+          readOptions: { signal, activity },
+        });
+        await acknowledged.drain();
+        activity.finish();
+        return result;
+      } catch (error) {
+        acknowledged.release();
+        activity.finish(error);
+        throw error;
+      } finally {
+        copies.delete(ticket);
+        setWorkingSet(workingPart, 0);
+      }
+    },
     getMatrixCellSubset: ({ signal }, element, cells, genes, owner = null, runGenes = null) =>
       reader.getMatrixCellSubset(element, cells, genes, { signal, owner, runGenes }),
     openRoute(_context, id, ports) {
@@ -1210,6 +1315,10 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         if (message.error === undefined) waiting.resolve(message.index);
         else waiting.reject(accessError(message.error));
       }
+      return null;
+    }
+    if (message?.copyWritten !== undefined) {
+      copies.get(message.copyWritten)?.acknowledge(message.error === undefined ? null : accessError(message.error));
       return null;
     }
     if (message?.sourceAccess !== undefined) {

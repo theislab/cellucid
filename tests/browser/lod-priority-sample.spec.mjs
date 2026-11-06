@@ -39,12 +39,9 @@ test('every reduced level is the priority prefix and draws the population; full 
       const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
       requestAnimationFrame(step);
     });
+    // Frame by frame, as long as the renderer takes: the test's timeout is the fence.
     const settled = async () => {
-      for (let attempt = 0; attempt < 900; attempt += 1) {
-        if (viewer.getFrameScheduleState().settled) return;
-        await frames(1);
-      }
-      throw new Error(`Scene never settled: ${JSON.stringify(viewer.getFrameScheduleState())}`);
+      while (!viewer.getFrameScheduleState().settled) await frames(1);
     };
     const capture = async () => {
       await frames(4);
@@ -57,13 +54,9 @@ test('every reduced level is the priority prefix and draws the population; full 
     viewer.setFrustumCulling(false);
     viewer.setAdaptiveLOD(true);
     const dimension = state.positionsDimension;
-    for (let attempt = 0; attempt < 900; attempt += 1) {
-      const index = renderer.spatialIndices.get(dimension);
-      if (index && index.lodLevels.length > 0) break;
-      await frames(1);
-    }
+    // The levels are built in a worker: as long as it takes.
+    while (!(renderer.spatialIndices.get(dimension)?.lodLevels.length > 0)) await frames(1);
     const index = renderer.spatialIndices.get(dimension);
-    if (!index || index.lodLevels.length === 0) throw new Error('No LOD levels were built.');
 
     // What each level should hold, and what the whole cloud holds: an 8 x 8
     // grid over the first two axes, and six colour buckets.

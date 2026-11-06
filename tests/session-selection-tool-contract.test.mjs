@@ -1,47 +1,38 @@
 /**
- * The active selection tool is part of a saved session (CEL-0249).
+ * The active selection tool is page chrome kept in sessions and saved
+ * states, outside the history (CEL-0249, restored by the lead's decision of
+ * 2026-11-04; History v2 §3.3.8).
  *
- * The highlight toolbelt — Annotation based / KNN drag / Proximity drag /
- * Lasso — is the mode every drag on the canvas is interpreted in. It is not
- * in-progress interaction state: it is a standing choice that decides what the
- * pointer does, and switching it publishes `setLassoEnabled`,
- * `setProximityEnabled`, and `setKnnEnabled` to the viewer. Saving a session in
- * Lasso and reopening it in Annotation means the next drag does something the
- * user did not ask for.
+ * The highlight toolbelt (Annotation based / KNN drag / Proximity drag /
+ * Lasso) is the mode every drag on the canvas is read in: switching it
+ * publishes `setLassoEnabled`, `setProximityEnabled` and `setKnnEnabled` to
+ * the viewer. Saving in Lasso and reopening in Annotation would make the next
+ * drag do something the person did not ask for, so a save and the autosave
+ * keep it (`capturePageChrome`) and a load or Continue put it back after the
+ * head is shown (`applyPageChrome`). It is never a history step: no action
+ * sets it, no domain holds it (the settings inventory leaves the group out),
+ * and undo or a jump leave it alone.
  *
- * It was invisible to the session because `state-serializer/ui-controls.js`
- * derived its inventory from `input[id]`, `select[id]`, and
- * `details.accordion-section`, and the toolbelt is a group of `<button>`s. That
- * is the recurring defect in this subsystem in a new place: the state that is
- * republished is whatever the derivation happens to reach, and a control shaped
- * differently from the three shapes it reaches is simply lost.
- *
- * The correction adds a fourth *derivation*, not a fourth list: any element
- * carrying `data-state-serializer-pressed-group` with a stable id is
- * inventoried, its value is the id of its one `aria-pressed="true"` button, and
- * it is restored the way every other control is — by dispatching the event its
- * owner already listens for, here a `click`. A second toolbelt marked the same
- * way is carried the day it lands, with no edit here and none in the serializer.
- *
- * These tests hold three separate things, because each fails on its own:
- *  - the markup declares the toolbelt as a serialized group;
- *  - the serializer's own collector inventories such a group and refuses a
- *    malformed one;
- *  - a restored group reaches the highlight-mode owner and the viewer, proven
- *    against the real `initHighlightModeUI` rather than a mock of it.
+ * These tests hold four things, each failing on its own:
+ *  - the markup declares the toolbelt a pressed group with stable ids;
+ *  - `capturePageChrome` reads it and refuses a malformed group;
+ *  - `applyPageChrome` reaches the real `initHighlightModeUI` owner and the
+ *    viewer, and refuses a malformed record before changing anything;
+ *  - the history neither records a switch nor moves the tool.
  */
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
-import {
-  initHighlightModeUI,
-} from '../assets/js/app/ui/modules/highlight/mode-ui.js';
-import {
-  createHighlightSelectionState,
-} from '../assets/js/app/ui/modules/highlight/selection-state.js';
+import { applyPageChrome, capturePageChrome, createUiControlSerializer } from '../assets/js/app/state-serializer/ui-controls.js';
+import { initHighlightModeUI } from '../assets/js/app/ui/modules/highlight/mode-ui.js';
+import { createHighlightSelectionState } from '../assets/js/app/ui/modules/highlight/selection-state.js';
+import { createActionCatalog, defineAction } from '../assets/js/app/actions/catalog.js';
+import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
+import { createDomainRegistry } from '../assets/js/app/actions/domains.js';
+import { historyActions } from '../assets/js/app/actions/definitions/history.js';
+import { createHistory } from '../assets/js/app/history/history.js';
 import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
 
 const INDEX_URL = new URL('../index.html', import.meta.url);
@@ -119,7 +110,8 @@ class FakeGroup {
   }
 }
 
-class FakeSidebar {
+/** The page: its marked groups, and no input, select or section (the settings inventory finds nothing). */
+class FakePage {
   constructor(groups) {
     this.groups = groups;
   }
@@ -130,9 +122,7 @@ class FakeSidebar {
     if (selector === '[data-state-serializer-pressed-group]') {
       return this.groups.filter(group => group.marked);
     }
-    throw new Error(
-      `Unexpected sidebar query ${JSON.stringify(selector)}`,
-    );
+    throw new Error(`Unexpected page query ${JSON.stringify(selector)}`);
   }
 }
 
@@ -148,14 +138,12 @@ function makeToolbelt({ pressedMode = 'annotation', ...options } = {}) {
   };
 }
 
-function installDocument(sidebar) {
+
+function installDocument(page) {
   const previousDocument = globalThis.document;
   const previousEvent = globalThis.Event;
   globalThis.document = {
-    getElementById(id) {
-      if (id === 'floating-panels-root') return null;
-      return null;
-    },
+    getElementById: () => null,
     activeElement: null,
     addEventListener() {},
     removeEventListener() {},
@@ -168,7 +156,7 @@ function installDocument(sidebar) {
     }
   };
   return {
-    sidebar,
+    page,
     restore() {
       if (previousDocument === undefined) delete globalThis.document;
       else globalThis.document = previousDocument;
@@ -177,178 +165,6 @@ function installDocument(sidebar) {
     },
   };
 }
-
-/* ------------------------------------------------------------------ *
- * 1. The markup declares the toolbelt as a serialized pressed group.
- * ------------------------------------------------------------------ */
-
-test('the highlight toolbelt is declared a serialized pressed-button group', () => {
-  const groupMatch =
-    /<div[^>]*class="highlight-mode-buttons"[^>]*>/.exec(indexHtml);
-  assert.ok(
-    groupMatch !== null,
-    'index.html must still carry the highlight toolbelt container, or this '
-      + 'file is measuring markup that no longer exists',
-  );
-  const groupTag = groupMatch[0];
-
-  assert.match(
-    groupTag,
-    /\bdata-state-serializer-pressed-group\b/,
-    'the highlight toolbelt must declare itself a serialized pressed group, or '
-      + 'the active selection tool is silently dropped from every saved session',
-  );
-  assert.match(
-    groupTag,
-    /\bid="[^"]+"/,
-    'a serialized pressed group needs a stable DOM id: it is the session key',
-  );
-
-  // Each mode button needs a stable id, because the group's serialized value is
-  // the id of the pressed one. A missing id would make the saved value name a
-  // button that cannot be found on restore.
-  const buttonTags = [...indexHtml.matchAll(
-    /<button[^>]*class="[^"]*highlight-mode-btn[^"]*"[^>]*>/g,
-  )].map(match => match[0]);
-  assert.equal(
-    buttonTags.length,
-    TOOLBELT_MODES.length,
-    'the toolbelt must still hold exactly one button per selection mode',
-  );
-  for (const tag of buttonTags) {
-    const mode = /\bdata-mode="([^"]+)"/.exec(tag)?.[1] ?? '(none)';
-    assert.match(
-      tag,
-      /\bid="[^"]+"/,
-      `the "${mode}" toolbelt button must carry a stable DOM id, because the `
-        + 'session records the pressed button by id',
-    );
-  }
-
-  const pressed = buttonTags.filter(
-    tag => /\baria-pressed="true"/.test(tag),
-  );
-  assert.equal(
-    pressed.length,
-    1,
-    'exactly one toolbelt button starts pressed; the serializer refuses a '
-      + 'group with none or several, so the markup has to agree',
-  );
-});
-
-/* ------------------------------------------------------------------ *
- * 2. The serializer's own collector inventories the group.
- * ------------------------------------------------------------------ */
-
-test('the session control inventory carries the active selection tool', () => {
-  const { group } = makeToolbelt({ pressedMode: 'lasso' });
-  const fixture = installDocument(new FakeSidebar([group]));
-  try {
-    const controls = createUiControlSerializer({ sidebar: fixture.sidebar })
-      .collectUIControls();
-    assert.deepEqual(
-      controls,
-      {
-        'highlight-mode': {
-          type: 'pressed-group',
-          pressedId: 'highlight-mode-lasso',
-        },
-      },
-      'a marked pressed-button group is one control whose value is the id of '
-        + 'its pressed button',
-    );
-  } finally {
-    fixture.restore();
-  }
-});
-
-test('a pressed group under a skip marker is not serialized', () => {
-  const { group } = makeToolbelt({ pressedMode: 'knn', skipped: true });
-  const fixture = installDocument(new FakeSidebar([group]));
-  try {
-    assert.deepEqual(
-      createUiControlSerializer({ sidebar: fixture.sidebar })
-        .collectUIControls(),
-      {},
-      'data-state-serializer-skip governs pressed groups exactly as it governs '
-        + 'every other serialized control',
-    );
-  } finally {
-    fixture.restore();
-  }
-});
-
-test('a pressed group without exactly one pressed button is refused', () => {
-  for (const [label, mutate] of [
-    ['none pressed', buttons => {
-      for (const button of buttons) button.setAttribute('aria-pressed', 'false');
-    }],
-    ['two pressed', buttons => {
-      for (const button of buttons) button.setAttribute('aria-pressed', 'true');
-    }],
-    ['a coercive value', buttons => {
-      buttons[0].setAttribute('aria-pressed', 'TRUE');
-    }],
-  ]) {
-    const { group, buttons } = makeToolbelt();
-    mutate(buttons);
-    const fixture = installDocument(new FakeSidebar([group]));
-    try {
-      assert.throws(
-        () => createUiControlSerializer({ sidebar: fixture.sidebar })
-          .collectUIControls(),
-        /pressed/i,
-        `a group with ${label} must be refused rather than guessed at`,
-      );
-    } finally {
-      fixture.restore();
-    }
-  }
-});
-
-test('a restore naming a button the group does not have is refused', () => {
-  const { group } = makeToolbelt();
-  const fixture = installDocument(new FakeSidebar([group]));
-  try {
-    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
-    assert.throws(
-      () => serializer.restoreUIControls({
-        'highlight-mode': {
-          type: 'pressed-group',
-          pressedId: 'highlight-mode-retired',
-        },
-      }),
-      /highlight-mode-retired/,
-      'a saved tool the interface no longer offers is named and refused, the '
-        + 'way an unavailable select option already is',
-    );
-    assert.throws(
-      () => serializer.restoreUIControls({
-        'highlight-mode': { type: 'pressed-group', pressedId: 42 },
-      }),
-      /pressedId/i,
-      'a coercive pressedId is refused rather than stringified',
-    );
-    assert.throws(
-      () => serializer.restoreUIControls({
-        'highlight-mode': {
-          type: 'pressed-group',
-          pressedId: 'highlight-mode-lasso',
-          mode: 'lasso',
-        },
-      }),
-      /must contain exactly/i,
-      'a pressed-group record is closed, like every other control record',
-    );
-  } finally {
-    fixture.restore();
-  }
-});
-
-/* ------------------------------------------------------------------ *
- * 3. A restored group reaches the real highlight-mode owner and the
- *    viewer — not only the button's aria-pressed attribute.
- * ------------------------------------------------------------------ */
 
 function makeModeOwner(buttons) {
   const viewerCalls = [];
@@ -393,102 +209,136 @@ function makeModeOwner(buttons) {
   return { viewer, viewerCalls, selectionState, modeUi };
 }
 
-test('a restored selection tool reaches the highlight owner and the viewer', () => {
-  const { group, buttons } = makeToolbelt({ pressedMode: 'annotation' });
-  const fixture = installDocument(new FakeSidebar([group]));
+test('the highlight toolbelt is declared a pressed group of page chrome, with stable ids and one pressed button', () => {
+  const groupTag = /<div[^>]*class="highlight-mode-buttons"[^>]*>/.exec(indexHtml)?.[0];
+  assert.ok(groupTag !== undefined, 'index.html still carries the highlight toolbelt');
+  assert.match(groupTag, /\bdata-state-serializer-pressed-group\b/, 'the toolbelt is marked, or the tool is dropped from every save');
+  assert.match(groupTag, /\bid="highlight-mode"/);
+  const buttonTags = [...indexHtml.matchAll(/<button[^>]*class="[^"]*highlight-mode-btn[^"]*"[^>]*>/g)].map(match => match[0]);
+  assert.equal(buttonTags.length, TOOLBELT_MODES.length);
+  for (const tag of buttonTags) assert.match(tag, /\bid="[^"]+"/, 'each tool button carries a stable id (the saved value)');
+  assert.equal(buttonTags.filter(tag => /\baria-pressed="true"/.test(tag)).length, 1);
+});
+
+test('capturePageChrome records the pressed button of each marked group, and none skipped', () => {
+  const { group } = makeToolbelt({ pressedMode: 'lasso' });
+  const skipped = makeToolbelt({ pressedMode: 'knn', skipped: true }).group;
+  skipped.id = 'other-tools';
+  const fixture = installDocument(new FakePage([group, skipped]));
+  try {
+    assert.deepEqual(capturePageChrome(fixture.page), { pressed: { 'highlight-mode': 'highlight-mode-lasso' } });
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a group without exactly one pressed button is refused rather than guessed at', () => {
+  for (const [label, mutate] of [
+    ['none pressed', buttons => { for (const button of buttons) button.setAttribute('aria-pressed', 'false'); }],
+    ['two pressed', buttons => { for (const button of buttons) button.setAttribute('aria-pressed', 'true'); }],
+    ['a coercive value', buttons => { buttons[0].setAttribute('aria-pressed', 'TRUE'); }],
+  ]) {
+    const { group, buttons } = makeToolbelt();
+    mutate(buttons);
+    const fixture = installDocument(new FakePage([group]));
+    try {
+      assert.throws(() => capturePageChrome(fixture.page), /pressed/i, label);
+    } finally {
+      fixture.restore();
+    }
+  }
+});
+
+test('applyPageChrome refuses a malformed record before changing anything, and leaves out, saying so, a group or a button this page lacks', () => {
+  const { group, buttons } = makeToolbelt();
+  const fixture = installDocument(new FakePage([group]));
   try {
     const owner = makeModeOwner(buttons);
-    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
-
-    // The user works in Lasso and saves.
-    owner.modeUi.setHighlightModeUI('lasso');
-    assert.equal(owner.selectionState.activeMode, 'lasso');
-    const saved = serializer.collectUIControls();
-    assert.deepEqual(
-      saved['highlight-mode'],
-      { type: 'pressed-group', pressedId: 'highlight-mode-lasso' },
-      'the capture must record the tool the user was actually working in',
-    );
-
-    // A later visit opens in the default tool.
-    owner.modeUi.setHighlightModeUI('annotation');
+    assert.throws(() => applyPageChrome({ pressed: { 'highlight-mode': 42 } }, fixture.page), /stable nonempty DOM id/);
+    assert.throws(() => applyPageChrome({ pressed: { 'highlight-mode': ' highlight-mode-lasso' } }, fixture.page), /stable nonempty DOM id/);
+    assert.throws(() => applyPageChrome({ pressed: {}, mode: 'lasso' }, fixture.page), /exactly|unexpected|mode/i);
+    assert.throws(() => applyPageChrome(null, fixture.page), /plain object/);
+    assert.equal(owner.selectionState.activeMode, 'annotation', 'nothing changed');
+    assert.deepEqual(applyPageChrome({ pressed: { 'retired-tools': 'whatever' } }, fixture.page), [
+      'This page has no "retired-tools" buttons, so the one the session pressed there is left out.',
+    ]);
+    assert.deepEqual(applyPageChrome({ pressed: { 'highlight-mode': 'highlight-mode-retired' } }, fixture.page), [
+      'This page has no "highlight-mode-retired" button in "highlight-mode", so that choice of the session is left out.',
+    ]);
     assert.equal(owner.selectionState.activeMode, 'annotation');
-    owner.viewerCalls.length = 0;
-
-    serializer.restoreUIControls(saved);
-
-    assert.equal(
-      owner.selectionState.activeMode,
-      'lasso',
-      'restoring the session must put the highlight owner back in the saved '
-        + 'tool, not only repaint the button',
-    );
-    assert.equal(
-      owner.modeUi.getActiveMode(),
-      'lasso',
-      'the mode owner and the shared selection state must agree after restore',
-    );
-    assert.deepEqual(
-      buttons.map(button => button.getAttribute('aria-pressed')),
-      ['false', 'false', 'false', 'true'],
-      'exactly the restored tool is pressed',
-    );
-    assert.deepEqual(
-      owner.viewerCalls.filter(call => call.includes(':')),
-      ['lasso:true', 'proximity:false', 'knn:false'],
-      'the viewer must be told which tool is live; a restore that stops at the '
-        + 'DOM leaves the next drag doing what the previous session did',
-    );
   } finally {
     fixture.restore();
   }
 });
 
-test('restoring the tool that is already live publishes nothing', () => {
+test('a tool put back reaches the highlight owner and the viewer', () => {
   const { group, buttons } = makeToolbelt({ pressedMode: 'annotation' });
-  const fixture = installDocument(new FakeSidebar([group]));
+  const fixture = installDocument(new FakePage([group]));
   try {
     const owner = makeModeOwner(buttons);
-    owner.modeUi.setHighlightModeUI('proximity');
-    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
-    const saved = serializer.collectUIControls();
-    owner.viewerCalls.length = 0;
-
-    serializer.restoreUIControls(saved);
-
-    assert.deepEqual(
-      owner.viewerCalls,
-      [],
-      'a control already holding its restored value is not republished, which '
-        + 'is what keeps a restore from resetting the tool history it is '
-        + 'restoring into',
-    );
-    assert.equal(owner.selectionState.activeMode, 'proximity');
-  } finally {
-    fixture.restore();
-  }
-});
-
-test('an owner that refuses the restored tool fails the restore loudly', () => {
-  const { group, buttons } = makeToolbelt({ pressedMode: 'annotation' });
-  const fixture = installDocument(new FakeSidebar([group]));
-  try {
-    const owner = makeModeOwner(buttons);
-    owner.modeUi.setHighlightModeUI('knn');
-    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
-    const saved = serializer.collectUIControls();
+    owner.modeUi.setHighlightModeUI('lasso');
+    const saved = capturePageChrome(fixture.page);
+    assert.deepEqual(saved, { pressed: { 'highlight-mode': 'highlight-mode-lasso' } });
     owner.modeUi.setHighlightModeUI('annotation');
+    owner.viewerCalls.length = 0;
+    applyPageChrome(saved, fixture.page);
+    assert.equal(owner.selectionState.activeMode, 'lasso');
+    assert.equal(owner.modeUi.getActiveMode(), 'lasso');
+    assert.deepEqual(buttons.map(button => button.getAttribute('aria-pressed')), ['false', 'false', 'false', 'true']);
+    assert.deepEqual(owner.viewerCalls.filter(call => call.includes(':')), ['lasso:true', 'proximity:false', 'knn:false']);
+    // The tool already live: nothing is published again.
+    owner.viewerCalls.length = 0;
+    applyPageChrome(saved, fixture.page);
+    assert.deepEqual(owner.viewerCalls, []);
+  } finally {
+    fixture.restore();
+  }
+});
 
-    // An owner that silently ignores the click is the failure this whole
-    // mechanism exists to make impossible: the panel would claim a tool the
-    // renderer was never told about.
+test('an owner that ignores the click fails the apply loudly', () => {
+  const { group, buttons } = makeToolbelt({ pressedMode: 'annotation' });
+  const fixture = installDocument(new FakePage([group]));
+  try {
+    const owner = makeModeOwner(buttons);
     owner.modeUi.destroy();
+    assert.throws(() => applyPageChrome({ pressed: { 'highlight-mode': 'highlight-mode-knn' } }, fixture.page), /highlight-mode.*rejected/s);
+  } finally {
+    fixture.restore();
+  }
+});
 
-    assert.throws(
-      () => serializer.restoreUIControls(saved),
-      /highlight-mode.*rejected/s,
-      'a click no owner acted on must fail the restore, never pass silently',
-    );
+test('switching the tool makes no history step, and undo and a jump leave it alone', async () => {
+  const { group, buttons } = makeToolbelt({ pressedMode: 'annotation' });
+  const fixture = installDocument(new FakePage([group]));
+  try {
+    const owner = makeModeOwner(buttons);
+    // The settings domain is the control inventory, as on the page: the toolbelt is not in it.
+    const serializer = createUiControlSerializer({ sidebar: fixture.page });
+    assert.equal(Object.hasOwn(serializer.collectUIControls(), 'highlight-mode'), false);
+    let a = 0;
+    const domains = createDomainRegistry();
+    domains.provide('settings', { capture: () => serializer.collectUIControls(), restore: value => serializer.restoreUIControls(value) });
+    domains.provide('filters', { capture: () => a, restore: value => { a = value; } });
+    for (const id of domains.missing()) domains.provide(id, { capture: () => null, restore: () => {} });
+    const number = { type: 'object', additionalProperties: false, required: ['v'], properties: { v: { type: 'integer' } } };
+    const set = defineAction({ type: 'a.set', title: 'Set a', summary: 'Set a.', group: 'T', params: number, touches: ['filters'], reads: [], effect: 'state', describe: p => `a = ${p.v}`, code: p => `a(${p.v})` });
+    const dispatcher = createActionDispatcher({ catalog: createActionCatalog([set, ...historyActions]) });
+    dispatcher.provide('a.set', ({ v }) => { a = v; });
+    let n = 0;
+    const history = createHistory({
+      dispatcher, domains, dataset: { id: 'd', name: 'D', cellOrder: null },
+      newTrackerId: () => `t-00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`,
+    });
+    await history.startTracker();
+    const s1 = (await dispatcher.dispatch('a.set', { v: 1 })).step;
+    owner.modeUi.setHighlightModeUI('lasso');
+    await history.reconcile();
+    assert.equal(history.active.steps.size, 2, 'the switch is no step, not even one made outside the history');
+    await history.undo();
+    assert.equal(owner.selectionState.activeMode, 'lasso', 'undo leaves the tool');
+    await history.jump(s1.id);
+    assert.equal(owner.selectionState.activeMode, 'lasso', 'a jump leaves the tool');
+    assert.equal(a, 1);
   } finally {
     fixture.restore();
   }

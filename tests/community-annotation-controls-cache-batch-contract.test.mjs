@@ -17,26 +17,19 @@ const setupGuide = readFileSync(
   'utf8'
 );
 
-test('a Pull caches changed raw files a batch at a time and folds the cache as it streams', () => {
+test('a Pull reads changed files into the cache by batch and folds the cache as it streams', () => {
   const start = source.indexOf('async function pullFromGitHub');
   const end = source.indexOf('async function pushToGitHub', start);
   assert.ok(start >= 0 && end > start);
   const pull = source.slice(start, end);
-  // One cache write per fetched batch, one for the moderation file.
-  assert.equal(
-    [...pull.matchAll(/fileCache\.setManyJson\s*\(/g)].length,
-    2
-  );
-  assert.match(pull, /const cacheUserRecords = async \(records\) =>/);
-  assert.match(pull, /onRecords: cacheUserRecords,/);
-  assert.match(
-    pull,
-    /records: cacheRecords,[\s\S]*?signal: opAbort\.signal/
-  );
+  // The files are read and cached by the sync (`pullFiles`), batch by batch;
+  // the controls never hold them.
+  assert.equal([...pull.matchAll(/sync\.pullFiles\(\{/g)].length, 1);
+  assert.match(pull, /sync\.pullFiles\(\{[\s\S]*?fileCache,[\s\S]*?cacheScope,[\s\S]*?signal: opAbort\.signal/);
+  assert.doesNotMatch(pull, /setManyJson|getKnownShas|getAllJsonForRepo/);
   // The merge input is folded from one cache cursor, never collected first.
-  assert.doesNotMatch(pull, /getAllJsonForRepo/);
   assert.match(pull, /const remoteUserFiles = session\.createRemoteUserFiles\(\);/);
-  assert.match(pull, /fileCache\.forEachJsonForRepo\(\{[\s\S]*?remoteUserFiles\.add\(json\);/);
+  assert.match(pull, /foldCachedFiles\(\{ fileCache, cacheScope, remoteUserFiles \}\)/);
   assert.match(pull, /session\.applyPulledRepositoryState\(\{\s*remoteUserFiles,/);
 });
 
@@ -141,17 +134,12 @@ test('configured field mismatch fails before cache selection or raw-file downloa
     'session.setCacheContext({ datasetId, repoRef: canonicalRepoRef, userId })'
   );
   const cacheInit = pull.indexOf('await fileCache.init()', cacheContext);
-  const userDownload = pull.indexOf('sync.pullAllUsers({', cacheInit);
-  const moderationDownload = pull.indexOf(
-    'sync.pullModerationMerges({',
-    cacheInit
-  );
+  const fileDownload = pull.indexOf('sync.pullFiles({', cacheInit);
   assert.ok(fieldValidation >= 0);
   assert.ok(rejection > fieldValidation);
   assert.ok(cacheContext > rejection);
   assert.ok(cacheInit > cacheContext);
-  assert.ok(userDownload > cacheInit);
-  assert.ok(moderationDownload > cacheInit);
+  assert.ok(fileDownload > cacheInit);
 });
 
 test('Pull applies all visible session stages through one synchronous commit', () => {
@@ -201,4 +189,45 @@ test('setup guide distinguishes validated raw-cache refresh from atomic visible 
     setupGuide,
     /before (?:any )?cache or session mutation/
   );
+});
+
+test('a Pull reports what it left out once, with the files and reasons under Details', () => {
+  const report = source.slice(
+    source.indexOf('function reportPullExclusions('),
+    source.indexOf('async function pullFromGitHub')
+  );
+  assert.match(report, /if \(quiet && signature === lastReportedExclusions\) return;/);
+  assert.match(report, /Your published file \$\{ownPath\} is not a valid annotation file[\s\S]*?Publish will not overwrite it/);
+  assert.match(report, /notifications\.warning\(lines\.join\('\\n'\), \{[\s\S]*?details: \[\.\.\.excluded, \.\.\.ignored\]/);
+  const pull = source.slice(source.indexOf('async function pullExclusive'), source.indexOf('async function pushToGitHub'));
+  assert.match(pull, /reportPullExclusions\(\{\s*excluded,\s*ignored: filesResult\.ignored,/);
+  assert.match(pull, /excluded: lastAppliedPull\?\.excluded \?\? \[\]/);
+});
+
+test('an unchanged Pull folds nothing again only while the session still holds that Pull', () => {
+  const pull = source.slice(source.indexOf('async function pullExclusive'), source.indexOf('async function pushToGitHub'));
+  assert.match(
+    pull,
+    /filesResult\.unchanged &&\s*lastAppliedPull !== null &&\s*lastAppliedPull\.key === appliedKey &&\s*lastAppliedPull\.identity === entryOwner\.identity &&\s*JSON\.stringify\(session\.getRemoteFileShas\(\)\) === JSON\.stringify\(pulledFileShas\)/
+  );
+  // The session keeps only the SHAs it publishes onto: config, merges, its own file.
+  assert.match(pull, /const pulledFileShas = \{ 'annotations\/config\.json': configSha \};/);
+  assert.doesNotMatch(pull, /remoteUserShas/);
+});
+
+test('a Pull can be cancelled from its progress, and a failure that may pass keeps the connection', () => {
+  const pull = source.slice(source.indexOf('async function pullExclusive'), source.indexOf('async function pushToGitHub'));
+  assert.match(pull, /notifications\.progress\([\s\S]*?onCancel: \(\) => \{[\s\S]*?abortActiveSync\(/);
+  assert.match(pull, /onWait: \(wait\) => updateProgress\(progressPct, \{ message: wait === null \? progressMessage : wait\.text \}\)/);
+  for (const flow of [pull, source.slice(source.indexOf('async function publishExclusive'))]) {
+    // A failure that may pass, or a sign-in GitHub refused, keeps the repository.
+    assert.match(flow, /!isTransientRoleResolutionFailure\(err\) &&\s*!isTokenAuthFailure\(err\) &&\s*\(access\.getRole\?\.\(\) \|\| 'unknown'\) === 'unknown'/);
+    assert.doesNotMatch(flow, /statusCode === 30[1278]/, 'no dead redirect branches: the Worker never relays a 3xx');
+  }
+  // A role resolution that may pass is asked again after the shared back-off
+  // (the Worker link's retransmission timeout, doubled, at most RFC 6298's
+  // 60 s), never a second copy of the retry rules nor an attempt cap.
+  assert.doesNotMatch(source, /roleRetryDelay|maxRetryAfterMs|roleRetryDelaysMs|exhausted/);
+  const retry = source.slice(source.indexOf('function scheduleTransientRoleRetry('), source.indexOf('function retryConnectedRoleImmediately('));
+  assert.match(retry, /Math\.min\(MAX_QUIET_MS, retryWaitMs\(attempt, link\.timeoutMs\)\)/);
 });

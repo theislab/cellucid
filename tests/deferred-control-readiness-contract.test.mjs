@@ -23,11 +23,13 @@
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
   DEFERRED_CONTROL_IDS,
   DEFERRED_CONTROL_SELECTORS,
+  ownDeferredAvailability,
   retireDeferredControls,
 } from '../assets/js/app/ui/core/deferred-control-readiness.js';
 
@@ -232,6 +234,30 @@ test('admission leaves a control that was already disabled alone', () => {
     'a control disabled by its own owner keeps that state'
   );
   assert.equal(documentOwner.controls.get('hp-lod-enabled').disabled, false);
+});
+
+test('admission asks an owner that keeps a control out of service for its own reason', () => {
+  // The forced LOD level is offered only while level of detail is on
+  // (render-controls.js): its owner disabled it while it was retired, which
+  // admission cannot tell from the retirement, so the owner is asked.
+  const documentOwner = createDocument();
+  const force = documentOwner.controls.get('hp-lod-force');
+  let lodOn = false;
+  ownDeferredAvailability(force, () => lodOn);
+  const admit = retireDeferredControls(documentOwner);
+  admit();
+  assert.equal(force.disabled, true, 'level of detail off: the forced level stays out of service');
+  assert.equal(documentOwner.controls.get('hp-lod-enabled').disabled, false);
+
+  const again = createDocument();
+  lodOn = true;
+  ownDeferredAvailability(again.controls.get('hp-lod-force'), () => lodOn);
+  retireDeferredControls(again)();
+  assert.equal(again.controls.get('hp-lod-force').disabled, false, 'level of detail on: offered');
+  assert.throws(() => ownDeferredAvailability(force, true), /must be a function/);
+  // The owner says so where it is wired.
+  assert.match(readFileSync(new URL('../assets/js/app/ui/modules/render-controls.js', import.meta.url), 'utf8'),
+    /ownDeferredAvailability\(hpLodForceInput, \(\) => acceptedLodEnabled\)/);
 });
 
 test('admission is idempotent', () => {

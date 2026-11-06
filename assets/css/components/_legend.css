@@ -315,6 +315,37 @@
   white-space: nowrap;
 }
 
+/* A category's count is a button: clicking it keeps only some of the
+   category's cells (`filter.category.cell-count`). It reads as the count; a
+   category that keeps only some is drawn as a link, and says so in its title. */
+button.legend-count {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-sans);
+  line-height: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.legend-count:hover {
+  text-decoration: underline;
+}
+
+/* On touch the count is drawn at the touch size (32px), centred in its row. */
+@media (pointer: coarse) {
+  button.legend-count {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--space-8);
+  }
+}
+
+.legend-count.is-limited {
+  opacity: 1;
+  color: var(--color-text-link);
+}
+
 /* A dot of the colour a lower layer is drawn in (a gene's 0, a cell not read),
    made from the view's background by the viewer (rendering/read-cell-layer.js):
    the legend names each state beside the colour it shows as on this theme. */

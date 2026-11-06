@@ -20,62 +20,22 @@
  * @module data/anndata/transcode/zarr-writer
  */
 
+import { AnnDataElementWriter, encodingAttributes as encoding } from '../write/element-writer.js';
+import { VLEN_UTF8, jsonBytes, itemSizeOf, v2ArrayDocument, vlenUtf8Chunk, zarrV2Dtype } from '../../../formats/zarr/format-v2.js';
+
 /** Bytes of one chunk. */
 export const CHUNK_BYTES = 4 * 1024 * 1024;
 
 /** Arrays up to this many bytes are held in the store; larger ones go to the space. */
 const HELD_BYTES = 64 * 1024;
 
-const ITEM_SIZES = { b1: 1, i1: 1, u1: 1, i2: 2, u2: 2, i4: 4, u4: 4, f4: 4, i8: 8, u8: 8, f8: 8 };
-
-/** The Zarr v2 dtype of a typed array, in host (little-endian) order. */
-function dtypeOfValues(values) {
-  if (values instanceof Float64Array) return '<f8';
-  if (values instanceof Float32Array) return '<f4';
-  if (values instanceof Int32Array) return '<i4';
-  if (values instanceof Uint32Array) return '<u4';
-  if (values instanceof Int16Array) return '<i2';
-  if (values instanceof Int8Array) return '|i1';
-  if (values instanceof Uint8Array) return '|u1';
-  if (values instanceof BigInt64Array) return '<i8';
-  throw new TypeError('An array to write must be a numeric typed array.');
-}
-
-function itemSizeOf(dtype) {
-  const size = ITEM_SIZES[dtype.slice(1)];
-  if (size === undefined) throw new TypeError(`The Zarr dtype '${dtype}' is not one this writer writes.`);
-  return size;
-}
-
-function json(value) {
-  return new TextEncoder().encode(JSON.stringify(value, null, 2));
-}
-
-const encoding = (type, version) => ({ 'encoding-type': type, 'encoding-version': version });
-
-/** The bytes of one vlen-utf8 chunk: a count, then each string's length and UTF-8 bytes. */
-export function vlenUtf8Chunk(values) {
-  const encoder = new TextEncoder();
-  const encoded = values.map(value => encoder.encode(value ?? ''));
-  const total = 4 + encoded.reduce((sum, bytes) => sum + 4 + bytes.length, 0);
-  const out = new Uint8Array(total);
-  const view = new DataView(out.buffer);
-  view.setUint32(0, values.length, true);
-  let offset = 4;
-  for (const bytes of encoded) {
-    view.setUint32(offset, bytes.length, true);
-    out.set(bytes, offset + 4);
-    offset += 4 + bytes.length;
-  }
-  return out;
-}
-
-export class AnnDataStoreWriter {
+export class AnnDataStoreWriter extends AnnDataElementWriter {
   /**
    * @param {import('./space.js').TranscodeSpace} space
    * @param {{chunkBytes?: number}} [options]
    */
   constructor(space, { chunkBytes = CHUNK_BYTES } = {}) {
+    super();
     this.space = space;
     this.chunkBytes = chunkBytes;
     /** @type {Map<string, Object>} */
@@ -93,7 +53,7 @@ export class AnnDataStoreWriter {
   _meta(path, name, value) {
     const key = this._key(path, name);
     this.metadata.set(key, value);
-    this.entries.set(key, { bytes: json(value) });
+    this.entries.set(key, { bytes: jsonBytes(value) });
   }
 
   /**
@@ -107,23 +67,8 @@ export class AnnDataStoreWriter {
     this._meta(path, '.zattrs', attrs);
   }
 
-  /** A `dict` group (`obsm`, `layers`, `uns`, ...). */
-  dict(path) {
-    this.group(path, encoding('dict', '0.1.0'));
-  }
-
   _arrayMeta(path, { shape, chunks, dtype, order = 'C', fill = 0, filters = null }, attrs) {
-    this._meta(path, '.zarray', {
-      chunks,
-      compressor: null,
-      dimension_separator: '.',
-      dtype,
-      fill_value: fill,
-      filters,
-      order,
-      shape,
-      zarr_format: 2,
-    });
+    this._meta(path, '.zarray', v2ArrayDocument({ shape, chunks, dtype, fill, order, filters, compressor: null }));
     this._meta(path, '.zattrs', attrs);
   }
 
@@ -154,10 +99,11 @@ export class AnnDataStoreWriter {
    * @param {{values?: ArrayBufferView, region?: import('./space.js').Region, dtype?: string,
    *          shape?: number[], order?: 'C'|'F', attrs?: Object}} array
    *   `values` (host order) or `region` (with its `dtype`, e.g. R's `>f8`);
-   *   `shape` defaults to 1-D; `order: 'F'` for a column-major 2-D array
+   *   `shape` defaults to 1-D; `order: 'F'` for a column-major 2-D array.
+   *   Chunked by its bytes (`chunkBytes`), whatever its role.
    */
   async array(path, { values = null, region = null, dtype = null, shape = null, order = 'C', attrs = encoding('array', '0.2.0') }) {
-    const type = dtype ?? dtypeOfValues(values);
+    const type = dtype ?? zarrV2Dtype(values);
     const itemSize = itemSizeOf(type);
     const source = region ?? await this._source(values);
     const length = values !== null ? values.length : region.byteLength / itemSize;
@@ -199,19 +145,22 @@ export class AnnDataStoreWriter {
     }
   }
 
-  /** A boolean array (`|b1`) from 0/1 bytes. */
-  async booleans(path, bytes, attrs = encoding('array', '0.2.0')) {
-    await this.array(path, { values: bytes, dtype: '|b1', attrs });
-  }
-
   /**
-   * A string array (`vlen-utf8`), chunked by the bytes its strings take.
+   * A string array (`vlen-utf8`), chunked by the bytes its strings take; or
+   * with `scalar`, the one string of a 0-dimensional array.
    *
    * @param {string} path
    * @param {Array<string|null>} values
    * @param {Object} [attrs]
+   * @param {{scalar?: boolean}} [options]
    */
-  async strings(path, values, attrs = encoding('string-array', '0.2.0')) {
+  async strings(path, values, attrs = encoding('string-array', '0.2.0'), { scalar = false } = {}) {
+    if (scalar) {
+      this._arrayMeta(path, { shape: [], chunks: [], dtype: '|O', fill: '', filters: [VLEN_UTF8] }, attrs);
+      const bytes = vlenUtf8Chunk(values);
+      this._chunk(path, '0', { bytes }, 0, bytes.length, bytes.length);
+      return;
+    }
     const encoder = new TextEncoder();
     let averageBytes = 8;
     if (values.length > 0) {
@@ -222,7 +171,7 @@ export class AnnDataStoreWriter {
       averageBytes = Math.max(1, sample / counted);
     }
     const chunk = Math.max(1, Math.min(values.length, Math.floor(this.chunkBytes / averageBytes)));
-    this._arrayMeta(path, { shape: [values.length], chunks: [chunk], dtype: '|O', fill: '', filters: [{ id: 'vlen-utf8' }] }, attrs);
+    this._arrayMeta(path, { shape: [values.length], chunks: [chunk], dtype: '|O', fill: '', filters: [VLEN_UTF8] }, attrs);
     for (let index = 0, start = 0; start < values.length; index++, start += chunk) {
       const part = values.slice(start, start + chunk);
       // A last chunk holds a whole chunk's elements: empty strings past the data.
@@ -231,113 +180,6 @@ export class AnnDataStoreWriter {
       const source = bytes.length <= HELD_BYTES ? { bytes } : await this.space.put(bytes);
       this._chunk(path, String(index), source, 0, bytes.length, bytes.length);
     }
-  }
-
-  /** A scalar string (`encoding-type: string`). */
-  async string(path, value) {
-    this._arrayMeta(path, { shape: [], chunks: [], dtype: '|O', fill: '', filters: [{ id: 'vlen-utf8' }] }, encoding('string', '0.2.0'));
-    const bytes = vlenUtf8Chunk([value]);
-    this._chunk(path, '0', { bytes }, 0, bytes.length, bytes.length);
-  }
-
-  /** A scalar number (`encoding-type: numeric-scalar`). */
-  async number(path, value) {
-    if (typeof value === 'boolean') {
-      await this.array(path, { values: Uint8Array.of(value ? 1 : 0), dtype: '|b1', shape: [], attrs: encoding('numeric-scalar', '0.2.0') });
-    } else if (Number.isInteger(value) && Math.abs(value) < 2 ** 31) {
-      await this.array(path, { values: Int32Array.of(value), shape: [], attrs: encoding('numeric-scalar', '0.2.0') });
-    } else {
-      await this.array(path, { values: Float64Array.of(value), shape: [], attrs: encoding('numeric-scalar', '0.2.0') });
-    }
-  }
-
-  /**
-   * A JSON-like value under `uns`: a record becomes a dict, a string or
-   * number a scalar, a list of strings a string array, a list of numbers an
-   * array. `null` is left out.
-   */
-  async unsValue(path, value) {
-    if (value === null || value === undefined) return;
-    if (typeof value === 'string') return this.string(path, value);
-    if (typeof value === 'number' || typeof value === 'boolean') return this.number(path, value);
-    if (Array.isArray(value)) {
-      if (value.every(item => typeof item === 'string' || item === null)) return this.strings(path, value);
-      if (value.every(item => typeof item === 'number')) return this.array(path, { values: Float64Array.from(value) });
-      if (value.every(item => typeof item === 'boolean')) return this.booleans(path, Uint8Array.from(value, Number));
-      return undefined;
-    }
-    if (ArrayBuffer.isView(value)) return this.array(path, { values: value });
-    this.dict(path);
-    for (const [key, item] of Object.entries(value)) await this.unsValue(`${path}/${key}`, item);
-    return undefined;
-  }
-
-  /**
-   * A dataframe: an index and columns (the kinds `column()` writes).
-   *
-   * @param {string} path
-   * @param {{index: Array<string>, columns: Array<{name: string, column: Object}>}} frame
-   */
-  async dataframe(path, { index, columns }) {
-    const names = [];
-    const taken = new Set(['_index']);
-    for (const { name } of columns) {
-      if (taken.has(name) || name.includes('/') || name === '') continue;
-      taken.add(name);
-      names.push(name);
-    }
-    this.group(path, { '_index': '_index', 'column-order': names, ...encoding('dataframe', '0.2.0') });
-    await this.strings(`${path}/_index`, index);
-    for (const { name, column } of columns) {
-      if (!names.includes(name)) continue;
-      await this.column(`${path}/${name}`, column);
-    }
-  }
-
-  /**
-   * One dataframe column:
-   *
-   * - `{kind: 'numbers', values|region, dtype}` → array;
-   * - `{kind: 'booleans', values: Uint8Array}` → bool array;
-   * - `{kind: 'nullable-integer'|'nullable-boolean', values, mask: Uint8Array}`;
-   * - `{kind: 'categorical', codes: Int8Array|Int16Array|Int32Array, categories, ordered}`;
-   * - `{kind: 'strings', values}` → string array.
-   */
-  async column(path, column) {
-    switch (column.kind) {
-      case 'numbers':
-        return this.array(path, column);
-      case 'booleans':
-        return this.booleans(path, column.values);
-      case 'nullable-integer':
-      case 'nullable-boolean':
-        this.group(path, encoding(column.kind, '0.1.0'));
-        if (column.kind === 'nullable-integer') await this.array(`${path}/values`, { values: column.values });
-        else await this.booleans(`${path}/values`, column.values);
-        return this.booleans(`${path}/mask`, column.mask);
-      case 'categorical':
-        this.group(path, { ordered: column.ordered === true, ...encoding('categorical', '0.2.0') });
-        await this.array(`${path}/codes`, { values: column.codes });
-        return this.strings(`${path}/categories`, column.categories);
-      case 'strings':
-        return this.strings(path, column.values);
-      default:
-        throw new TypeError(`Unknown column kind '${column.kind}'.`);
-    }
-  }
-
-  /**
-   * A compressed sparse matrix group: `csr_matrix` or `csc_matrix`.
-   *
-   * @param {string} path
-   * @param {{format: 'csr'|'csc', shape: [number, number], data: Object, indices: Object, indptr: Object}} matrix
-   *   Each part `{values}` or `{region, dtype}`
-   */
-  async sparse(path, { format, shape, data, indices, indptr }) {
-    this.group(path, { shape, ...encoding(`${format}_matrix`, '0.1.0') });
-    await this.array(`${path}/data`, { ...data, attrs: {} });
-    await this.array(`${path}/indices`, { ...indices, attrs: {} });
-    await this.array(`${path}/indptr`, { ...indptr, attrs: {} });
   }
 
   /**
@@ -365,7 +207,7 @@ export class AnnDataStoreWriter {
   finish() {
     const metadata = {};
     for (const [key, value] of [...this.metadata].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) metadata[key] = value;
-    this.entries.set('.zmetadata', { bytes: json({ metadata, zarr_consolidated_format: 1 }) });
+    this.entries.set('.zmetadata', { bytes: jsonBytes({ metadata, zarr_consolidated_format: 1 }) });
     return { entries: this.entries, used: this.used };
   }
 }

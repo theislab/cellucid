@@ -21,6 +21,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const FIXTURE = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -74,7 +75,7 @@ test('a session saved with edges shown restores the edge count it recorded', asy
   await expect.poll(() => shownEdges(page)).toBe(chosen);
 
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath('edges.cellucid-session');
   await download.saveAs(sessionPath);
@@ -86,7 +87,7 @@ test('a session saved with edges shown restores the edge count it recorded', asy
   await expect(page.locator('#connectivity-limit')).toHaveAttribute('max', '0');
 
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 

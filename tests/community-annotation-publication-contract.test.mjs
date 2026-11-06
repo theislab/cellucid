@@ -4,26 +4,45 @@ import test from 'node:test';
 import { CommunityAnnotationSession } from '../assets/js/app/community-annotations/session.js';
 import {
   CommunityAnnotationGitHubSync,
+  foldCachedFiles,
   parseOwnerRepo,
+  toAnnotationHeadBranch,
 } from '../assets/js/app/community-annotations/github-sync.js';
+import { CommunityAnnotationFileCache } from '../assets/js/app/community-annotations/file-cache.js';
 import {
   ANNOTATION_FILE_MAX_UTF8_BYTES,
   composeUserFile,
 } from '../assets/js/app/community-annotations/wire-contract.js';
+import { createFakeIndexedDB, FakeKeyRange } from './helpers/fake-indexeddb.mjs';
+import {
+  configFor,
+  createVirtualTime,
+  MockAnnotationGitHub,
+  virtualTransport,
+  WORKER_ORIGIN,
+} from './helpers/community-annotation-worker.mjs';
 
 const OPERATION_ID_HEADER = 'X-Cellucid-Operation-Id';
 const OPERATION_OUTCOME_HEADER = 'X-Cellucid-Operation-Outcome';
+const USER_PATH = 'annotations/users/ghid_42.json';
+const DIRECT = { pull: true, triage: false, push: true, maintain: false, admin: false };
+const FORK_ONLY = { pull: true, triage: false, push: false, maintain: false, admin: false };
 
+function json(document, status = 200, headers = {}) {
+  return new Response(JSON.stringify(document), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...headers },
+  });
+}
 
-function mutationResponseHeaders(options, outcome) {
-  const operationId = new Headers(options.headers).get(OPERATION_ID_HEADER);
+function mutationResponseHeaders(request, outcome) {
+  const operationId = request.headers.get(OPERATION_ID_HEADER);
   assert.equal(typeof operationId, 'string');
   return {
     [OPERATION_ID_HEADER]: operationId,
     [OPERATION_OUTCOME_HEADER]: outcome,
   };
 }
-
 
 function validUserDocument() {
   return {
@@ -47,7 +66,7 @@ function userDocumentAtCanonicalByteLength(targetBytes) {
     ...validUserDocument(),
     suggestions: {
       'field:category': [{
-        id: 'seed',
+        id: 'ghid_42_seed',
         label: 'Seed',
         proposedBy: 'ghid_42',
         proposedAt: '2026-07-25T01:02:03.456Z',
@@ -80,7 +99,7 @@ function userDocumentAtCanonicalByteLength(targetBytes) {
     );
     assert.ok(rows >= 1, 'canonical fixture must remain tunable');
     for (let offset = 0; offset < rows; offset += 1) {
-      const prefix = `vote-${String(nextVote).padStart(8, '0')}-`;
+      const prefix = `ghid_42_vote-${String(nextVote).padStart(8, '0')}-`;
       document.votes[
         prefix + 'x'.repeat(128 - prefix.length)
       ] = 'up';
@@ -92,16 +111,34 @@ function userDocumentAtCanonicalByteLength(targetBytes) {
   return document;
 }
 
-
-function createSync() {
-  return new CommunityAnnotationGitHubSync({
-    datasetId: 'synthetic',
+/** A sync on virtual time over `fetchImpl` (the shared mock's fetch by default). */
+function harness({ fetch: fetchImpl, time = createVirtualTime(), datasetId = 'synthetic' }) {
+  const { transport } = virtualTransport(fetchImpl, time);
+  const sync = new CommunityAnnotationGitHubSync({
+    datasetId,
     owner: 'owner',
     repo: 'repo',
     token: 'test-token',
     branch: 'main',
-    workerOrigin: 'https://worker.example',
+    workerOrigin: WORKER_ORIGIN,
+    transport,
   });
+  return { time, transport, sync, run: (promise) => time.run(promise) };
+}
+
+function repository({ permissions = DIRECT, files = {} } = {}) {
+  return new MockAnnotationGitHub({
+    permissions,
+    files: {
+      'annotations/config.json': configFor('synthetic', ['cell_type']),
+      'annotations/users/.gitkeep': '\n',
+      ...files,
+    },
+  });
+}
+
+function requestLines(log) {
+  return log.map((line) => line.replace(/\?.*$/, ''));
 }
 
 
@@ -151,463 +188,251 @@ test('repository references accept only canonical owner/repo[@branch] syntax', (
 
 
 test('publication mode is explicit and validated before network access', async () => {
-  const previousFetch = globalThis.fetch;
   let fetchCount = 0;
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-    throw new Error('unexpected network access');
-  };
-  try {
-    const sync = createSync();
-    await assert.rejects(
-      () => sync.pushMyUserFile({ userDoc: validUserDocument() }),
-      /publicationMode must equal "direct" or "fork-pull-request"/
-    );
-    await assert.rejects(
-      () => sync.pushMyUserFile({
-        userDoc: validUserDocument(),
-        publicationMode: 'automatic',
-      }),
-      /publicationMode must equal "direct" or "fork-pull-request"/
-    );
-    assert.equal(fetchCount, 0);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
+  const { sync } = harness({
+    fetch: async () => {
+      fetchCount += 1;
+      throw new Error('unexpected network access');
+    },
+  });
+  await assert.rejects(
+    () => sync.pushMyUserFile({ userDoc: validUserDocument() }),
+    /publicationMode must equal "direct" or "fork-pull-request"/
+  );
+  await assert.rejects(
+    () => sync.pushMyUserFile({
+      userDoc: validUserDocument(),
+      publicationMode: 'automatic',
+    }),
+    /publicationMode must equal "direct" or "fork-pull-request"/
+  );
+  assert.equal(fetchCount, 0);
 });
 
 test('canonical annotation publication enforces its exact UTF-8 byte boundary before auth or mutation network', async () => {
-  const previousFetch = globalThis.fetch;
-  const exactBoundaryReachedNetwork = new Error(
-    'exact annotation byte boundary reached network'
+  const requested = [];
+  const fetchImpl = async (rawUrl) => {
+    requested.push(new URL(String(rawUrl)).pathname);
+    return json({ error: 'exact annotation byte boundary reached network' }, 418);
+  };
+
+  const exact = userDocumentAtCanonicalByteLength(
+    ANNOTATION_FILE_MAX_UTF8_BYTES
   );
-  let fetchCount = 0;
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-    throw exactBoundaryReachedNetwork;
-  };
+  const exactHarness = harness({ fetch: fetchImpl });
+  await assert.rejects(
+    exactHarness.run(exactHarness.sync.pushMyUserFile({
+      userDoc: exact,
+      publicationMode: 'direct',
+    })),
+    /exact annotation byte boundary reached network/
+  );
+  assert.deepEqual(requested, ['/auth/user'], 'the exact boundary reaches the network, starting with auth');
 
-  try {
-    const sync = createSync();
-    const exact = userDocumentAtCanonicalByteLength(
-      ANNOTATION_FILE_MAX_UTF8_BYTES
-    );
-    await assert.rejects(
-      () => sync.pushMyUserFile({
-        userDoc: exact,
-        publicationMode: 'direct',
-      }),
-      error => error === exactBoundaryReachedNetwork
-    );
-    assert.equal(fetchCount, 1);
-
-    fetchCount = 0;
-    const oversized = userDocumentAtCanonicalByteLength(
-      ANNOTATION_FILE_MAX_UTF8_BYTES + 1
-    );
-    await assert.rejects(
-      () => sync.pushMyUserFile({
-        userDoc: oversized,
-        publicationMode: 'direct',
-      }),
-      error => {
-        assert.equal(
-          error?.code,
-          'COMMUNITY_ANNOTATION_FILE_TOO_LARGE'
-        );
-        assert.equal(error?.maxBytes, ANNOTATION_FILE_MAX_UTF8_BYTES);
-        assert.equal(
-          error?.actualBytes,
-          ANNOTATION_FILE_MAX_UTF8_BYTES + 1
-        );
-        assert.equal(
-          error?.path,
-          'annotations/users/ghid_42.json'
-        );
-        assert.equal(error?.phase, 'publication-preflight');
-        return true;
-      }
-    );
-    assert.equal(fetchCount, 0);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('the browser validator rejects malformed streamed tree JSON before annotation state changes', async () => {
-  const previousFetch = globalThis.fetch;
-  const encoder = new TextEncoder();
-  let fetchCount = 0;
-  globalThis.fetch = async rawUrl => {
-    fetchCount += 1;
-    assert.match(
-      String(rawUrl),
-      /\/api\/repos\/owner\/repo\/git\/trees\/main\?recursive=1$/
-    );
-    return new Response(new ReadableStream({
-      start(controller) {
-        controller.enqueue(encoder.encode('{"tree":[],"\\u0074'));
-        controller.enqueue(
-          encoder.encode('ree":[],"truncated":false}')
-        );
-        controller.close();
-      },
-    }), { status: 200 });
-  };
-
-  try {
-    const sync = createSync();
-    await assert.rejects(
-      () => sync.pullAllUsers({ onRecords: async () => {} }),
-      /duplicate JSON object key "tree"/
-    );
-    assert.equal(fetchCount, 1);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('the browser validator rejects malformed streamed blob base64 before annotation state changes', async () => {
-  const previousFetch = globalThis.fetch;
-  try {
-    for (const content of ['\n', 'e30= ', 'e31=']) {
-      const responses = [
-        {
-          tree: [{
-            type: 'blob',
-            path: 'annotations/users/ghid_42.json',
-            sha: 'a'.repeat(40),
-            size: 2,
-          }],
-          truncated: false,
-        },
-        {
-          encoding: 'base64',
-          content,
-        },
-      ];
-      globalThis.fetch = async () =>
-        new Response(JSON.stringify(responses.shift()), {
-          status: 200,
-        });
-      const sync = createSync();
-      await assert.rejects(
-        () => sync.pullAllUsers({ onRecords: async () => {} }),
-        /base64|padding bits/
-      );
-      assert.equal(responses.length, 0);
-    }
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
-});
-
-test('oversized remote Contents and blob payloads retain typed path-aware pull errors', async () => {
-  const previousFetch = globalThis.fetch;
-  const oversizedContent = Buffer.alloc(
+  requested.length = 0;
+  const oversized = userDocumentAtCanonicalByteLength(
     ANNOTATION_FILE_MAX_UTF8_BYTES + 1
-  ).toString('base64');
-  const assertOversizedPullError = error => {
-    assert.equal(
-      error?.code,
-      'COMMUNITY_ANNOTATION_FILE_TOO_LARGE'
-    );
-    assert.equal(
-      error?.path,
-      'annotations/users/ghid_42.json'
-    );
+  );
+  const oversizedHarness = harness({ fetch: fetchImpl });
+  await assert.rejects(
+    oversizedHarness.run(oversizedHarness.sync.pushMyUserFile({
+      userDoc: oversized,
+      publicationMode: 'direct',
+    })),
+    error => {
+      assert.equal(
+        error?.code,
+        'COMMUNITY_ANNOTATION_FILE_TOO_LARGE'
+      );
+      assert.equal(error?.maxBytes, ANNOTATION_FILE_MAX_UTF8_BYTES);
+      assert.equal(
+        error?.actualBytes,
+        ANNOTATION_FILE_MAX_UTF8_BYTES + 1
+      );
+      assert.equal(error?.path, USER_PATH);
+      assert.equal(error?.phase, 'publication-preflight');
+      return true;
+    }
+  );
+  assert.equal(requested.length, 0);
+});
+
+function pullHarness(github) {
+  const h = harness({ fetch: github.fetch });
+  const fileCache = new CommunityAnnotationFileCache({ indexedDB: createFakeIndexedDB(), keyRange: FakeKeyRange });
+  const cacheScope = { datasetId: 'synthetic', repoRef: 'owner/repo@main', userId: 42 };
+  const pull = async () => {
+    const { snapshot } = await h.sync.validateAndLoadConfig({ datasetId: 'synthetic' });
+    return h.sync.pullFiles({ snapshot, fileCache, cacheScope, ownUserKey: 'ghid_42' });
+  };
+  return { ...h, fileCache, cacheScope, pull: () => h.run(pull()) };
+}
+
+function streamedJsonResponse(pieces) {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const piece of pieces) controller.enqueue(encoder.encode(piece));
+      controller.close();
+    },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
+test('an incomplete streamed users tree fails the Pull before any annotation file is kept', async () => {
+  const github = repository({ files: { [USER_PATH]: '{}\n' } });
+  github.intercept = async (request) => {
+    if (!request.path.includes('/git/trees/')) return undefined;
+    return streamedJsonResponse(['{"sha":"', request.path.split('/').pop(), '","tree":[{"path":']);
+  };
+  const h = pullHarness(github);
+  await assert.rejects(h.pull(), (error) => {
+    assert.equal(error.code, 'COMMUNITY_ANNOTATION_RESPONSE_CUT');
+    assert.equal(error.transient, true);
+    return true;
+  });
+  assert.equal((await h.fileCache.getKnownShas(h.cacheScope)).size, 0);
+  assert.equal(await h.fileCache.getPullMarker(h.cacheScope), null);
+});
+
+test('malformed base64 from the REST blob fallback fails the Pull before the file is kept', async () => {
+  for (const content of ['\n', 'e30= ', 'e31=']) {
+    const text = '{}';
+    const github = repository({ files: { [USER_PATH]: text } });
+    github.intercept = async (request) => {
+      if (request.path === '/graphql/blobs') {
+        const answer = await github._blobs(request.body);
+        const document = await answer.json();
+        for (const blob of Object.values(document.data.repository)) {
+          if (blob !== null && blob.text === text) {
+            blob.isTruncated = true;
+            blob.text = '';
+          }
+        }
+        return json(document);
+      }
+      if (request.path.includes('/git/blobs/')) {
+        return json({ sha: request.path.split('/').pop(), size: 2, encoding: 'base64', content });
+      }
+      return undefined;
+    };
+    const h = pullHarness(github);
+    await assert.rejects(h.pull(), /base64|padding bits/);
+    assert.equal((await h.fileCache.getKnownShas(h.cacheScope)).has(USER_PATH), false);
+  }
+});
+
+test('an oversized own file read through Contents keeps its typed, path-aware error', async () => {
+  const oversizedContent = Buffer.alloc(ANNOTATION_FILE_MAX_UTF8_BYTES + 1).toString('base64');
+  const github = repository();
+  github.intercept = async (request) => {
+    if (request.method === 'GET' && request.path.endsWith(`/contents/${USER_PATH}`)) {
+      return json({ type: 'file', encoding: 'base64', content: oversizedContent, sha: 'a'.repeat(40) });
+    }
+    return undefined;
+  };
+  const h = harness({ fetch: github.fetch });
+  await assert.rejects(h.run(h.sync.pullUserFile({ userKey: 'ghid_42' })), (error) => {
+    assert.equal(error?.code, 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE');
+    assert.equal(error?.path, USER_PATH);
     assert.equal(error?.phase, 'remote-read');
     assert.equal(error?.maxBytes, ANNOTATION_FILE_MAX_UTF8_BYTES);
-    assert.equal(
-      error?.actualBytes,
-      ANNOTATION_FILE_MAX_UTF8_BYTES + 1
-    );
+    assert.equal(error?.actualBytes, ANNOTATION_FILE_MAX_UTF8_BYTES + 1);
     assert.doesNotMatch(String(error), /ReferenceError/);
     return true;
+  });
+});
+
+test('an oversized user file in the tree is excluded by its blob id, typed and path-aware, without being read', async () => {
+  const oversized = `{"pad":"${'x'.repeat(ANNOTATION_FILE_MAX_UTF8_BYTES)}"}`;
+  const github = repository({ files: { [USER_PATH]: oversized } });
+  const asked = [];
+  github.intercept = async (request) => {
+    if (request.path === '/graphql/blobs') asked.push(...request.body.oids);
+    return undefined;
   };
-
-  try {
-    const contentsResponses = [{
-      type: 'file',
-      encoding: 'base64',
-      content: oversizedContent,
-      sha: 'a'.repeat(40),
-    }];
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify(contentsResponses.shift()), {
-        status: 200,
-      });
-    await assert.rejects(
-      () => createSync().pullUserFile({ userKey: 'ghid_42' }),
-      assertOversizedPullError
-    );
-    assert.equal(contentsResponses.length, 0);
-
-    const blobResponses = [
-      {
-        tree: [{
-          type: 'blob',
-          path: 'annotations/users/ghid_42.json',
-          sha: 'b'.repeat(40),
-          size: ANNOTATION_FILE_MAX_UTF8_BYTES,
-        }],
-        truncated: false,
-      },
-      {
-        encoding: 'base64',
-        content: oversizedContent,
-      },
-    ];
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify(blobResponses.shift()), {
-        status: 200,
-      });
-    await assert.rejects(
-      () => createSync().pullAllUsers({ onRecords: async () => {} }),
-      assertOversizedPullError
-    );
-    assert.equal(blobResponses.length, 0);
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
+  const h = pullHarness(github);
+  const result = await h.pull();
+  assert.equal(result.userCount, 1);
+  const record = await h.fileCache.getRecord(h.cacheScope, USER_PATH);
+  assert.equal(record.view, null);
+  assert.equal(record.rejection.code, 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE');
+  assert.match(record.rejection.message, /annotations\/users\/ghid_42\.json/);
+  assert.ok(!asked.includes(record.sha), 'the oversized blob is never downloaded');
+  const { excluded } = await foldCachedFiles({
+    fileCache: h.fileCache,
+    cacheScope: h.cacheScope,
+    remoteUserFiles: { add() { throw new Error('nothing to fold'); } },
+  });
+  assert.deepEqual(excluded.map((entry) => entry.path), [USER_PATH]);
 });
 
 
 test('direct publication never recovers through a branch, Pull Request, or fork', async () => {
-  const previousFetch = globalThis.fetch;
-  const requests = [];
-  globalThis.fetch = async (rawUrl, options = {}) => {
-    const url = new URL(rawUrl);
-    const method = options.method ?? 'GET';
-    requests.push({ method, path: url.pathname });
-    if (method === 'GET' && url.pathname === '/auth/user') {
-      return new Response('{"id":42,"login":"researcher"}', {
-        status: 200,
-      });
+  const github = repository({ permissions: DIRECT });
+  github.intercept = async (request) => {
+    if (request.method === 'PUT') {
+      return json({ error: 'write denied' }, 403, mutationResponseHeaders(request, 'not-applied'));
     }
-    if (
-      method === 'GET' &&
-      url.pathname.endsWith('/contents/annotations/users/ghid_42.json')
-    ) {
-      return new Response('{"error":"Not Found"}', { status: 404 });
-    }
-    if (method === 'GET' && url.pathname === '/api/repos/owner/repo') {
-      return new Response(JSON.stringify({
-        full_name: 'owner/repo',
-        default_branch: 'main',
-        private: false,
-        allow_forking: true,
-        permissions: {
-          pull: true,
-          triage: false,
-          push: true,
-          maintain: false,
-          admin: false,
-        },
-      }), { status: 200 });
-    }
-    if (
-      method === 'PUT' &&
-      url.pathname.endsWith('/contents/annotations/users/ghid_42.json')
-    ) {
-      return new Response('{"error":"write denied"}', {
-        status: 403,
-        headers: mutationResponseHeaders(options, 'not-applied'),
-      });
-    }
-    return new Response('{"error":"unexpected publication route"}', {
-      status: 500,
-    });
+    return undefined;
   };
-  try {
-    const sync = createSync();
-    await assert.rejects(
-      () => sync.pushMyUserFile({
-        userDoc: validUserDocument(),
-        publicationMode: 'direct',
-      }),
-      /write denied/
-    );
-    assert.deepEqual(
-      requests.map(({ method, path }) => `${method} ${path}`),
-      [
-        'GET /auth/user',
-        'GET /api/repos/owner/repo/contents/annotations/users/ghid_42.json',
-        'GET /api/repos/owner/repo',
-        'PUT /api/repos/owner/repo/contents/annotations/users/ghid_42.json',
-      ]
-    );
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
+  const h = harness({ fetch: github.fetch });
+  await assert.rejects(
+    h.run(h.sync.pushMyUserFile({
+      userDoc: validUserDocument(),
+      publicationMode: 'direct',
+    })),
+    (error) => {
+      assert.match(error.message, /write denied/);
+      assert.equal(error.status, 403);
+      assert.equal(error.operation.outcome, 'not-applied');
+      return true;
+    }
+  );
+  assert.deepEqual(requestLines(github.log), [
+    'GET /auth/user',
+    'GET /api/repos/owner/repo',
+    'POST /graphql/snapshot',
+    `GET /api/repos/owner/repo/contents/${USER_PATH}`,
+    `PUT /api/repos/owner/repo/contents/${USER_PATH}`,
+  ]);
 });
 
 
 test('fork Pull Request publication follows only its preselected route', async () => {
-  const previousFetch = globalThis.fetch;
-  const requests = [];
-  const upstreamSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-  const branchSha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
-  const contentSha = 'cccccccccccccccccccccccccccccccccccccccc';
-  globalThis.fetch = async (rawUrl, options = {}) => {
-    const url = new URL(rawUrl);
-    const method = options.method ?? 'GET';
-    requests.push({
-      method,
-      path: url.pathname,
-      query: url.search,
-      body: options.body ?? null,
-    });
-
-    if (method === 'GET' && url.pathname === '/auth/user') {
-      return new Response('{"id":42,"login":"researcher"}', {
-        status: 200,
-      });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname ===
-        '/api/repos/owner/repo/contents/annotations/users/ghid_42.json'
-    ) {
-      return new Response('{"error":"Not Found"}', { status: 404 });
-    }
-    if (method === 'GET' && url.pathname === '/api/repos/owner/repo') {
-      return new Response(JSON.stringify({
-        full_name: 'owner/repo',
-        default_branch: 'main',
-        private: false,
-        allow_forking: true,
-        permissions: {
-          pull: true,
-          triage: false,
-          push: false,
-          maintain: false,
-          admin: false,
-        },
-      }), { status: 200 });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname === '/api/repos/researcher/repo' &&
-      url.search === '?fork_identity=1'
-    ) {
-      return new Response(JSON.stringify({
-        full_name: 'researcher/repo',
-        fork: true,
-        parent: { full_name: 'owner/repo' },
-      }), { status: 200 });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname === '/api/repos/owner/repo/forks'
-    ) {
-      return new Response(JSON.stringify([{
-        full_name: 'researcher/repo',
-        owner: { login: 'researcher' },
-        name: 'repo',
-        parent: { full_name: 'owner/repo' },
-      }]), { status: 200 });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname === '/api/repos/owner/repo/git/ref/heads/main'
-    ) {
-      return new Response(JSON.stringify({
-        object: { sha: upstreamSha },
-      }), { status: 200 });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname.startsWith(
-        '/api/repos/researcher/repo/git/ref/heads/cellucid-annotations/'
-      )
-    ) {
-      return new Response(JSON.stringify({
-        object: { sha: branchSha },
-      }), { status: 200 });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname ===
-        '/api/repos/researcher/repo/contents/annotations/users/ghid_42.json'
-    ) {
-      return new Response('{"error":"Not Found"}', { status: 404 });
-    }
-    if (
-      method === 'PUT' &&
-      url.pathname ===
-        '/api/repos/researcher/repo/contents/annotations/users/ghid_42.json'
-    ) {
-      return new Response(JSON.stringify({
-        content: { sha: contentSha },
-      }), {
-        status: 200,
-        headers: mutationResponseHeaders(options, 'applied'),
-      });
-    }
-    if (
-      method === 'GET' &&
-      url.pathname === '/api/repos/owner/repo/pulls'
-    ) {
-      return new Response('[]', { status: 200 });
-    }
-    if (
-      method === 'POST' &&
-      url.pathname === '/api/repos/owner/repo/pulls'
-    ) {
-      return new Response(JSON.stringify({
-        number: 7,
-        html_url: 'https://github.com/owner/repo/pull/7',
-      }), {
-        status: 201,
-        headers: mutationResponseHeaders(options, 'applied'),
-      });
-    }
-    return new Response('{"error":"unexpected publication request"}', {
-      status: 500,
-    });
-  };
-  try {
-    const sync = createSync();
-    const result = await sync.pushMyUserFile({
-      userDoc: validUserDocument(),
-      publicationMode: 'fork-pull-request',
-    });
-    assert.deepEqual(result, {
-      mode: 'fork-pull-request',
-      prUrl: 'https://github.com/owner/repo/pull/7',
-      prNumber: 7,
-      reused: false,
-      path: 'annotations/users/ghid_42.json',
-      remoteUpdatedAt: null,
-    });
-    assert.equal(
-      requests.some(({ method, path }) =>
-        method === 'PUT' && path.startsWith('/api/repos/owner/repo/')
-      ),
-      false
-    );
-    assert.equal(
-      requests.filter(({ method, path }) =>
-        method === 'POST' && path === '/api/repos/owner/repo/pulls'
-      ).length,
-      1
-    );
-    assert.equal(
-      requests.filter(({ method, path, query }) =>
-        method === 'GET' &&
-        path === '/api/repos/researcher/repo' &&
-        query === '?fork_identity=1'
-      ).length,
-      1
-    );
-    assert.equal(
-      requests.some(({ path }) => path === '/api/repos/owner/repo/forks'),
-      false
-    );
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
+  const github = repository({ permissions: FORK_ONLY });
+  // The contributor's fork already exists under the canonical name.
+  github.repos.set('researcher/repo', {
+    fullName: 'researcher/repo',
+    fork: true,
+    parent: 'owner/repo',
+    branches: new Map(github.repos.get('owner/repo').branches),
+  });
+  const h = harness({ fetch: github.fetch });
+  const result = await h.run(h.sync.pushMyUserFile({
+    userDoc: validUserDocument(),
+    publicationMode: 'fork-pull-request',
+  }));
+  const { view, ...written } = result;
+  assert.deepEqual(written, {
+    mode: 'fork-pull-request',
+    prUrl: 'https://github.com/owner/repo/pull/1',
+    prNumber: 1,
+    reused: false,
+    changed: true,
+    branch: 'main',
+    path: USER_PATH,
+    remoteUpdatedAt: null,
+  });
+  assert.equal(view.username, 'ghid_42');
+  const lines = github.log;
+  assert.equal(lines.some((line) => line.startsWith('PUT /api/repos/owner/repo/')), false, 'never writes upstream');
+  assert.equal(lines.filter((line) => line === 'POST /api/repos/owner/repo/pulls').length, 1);
+  assert.equal(lines.filter((line) => line === 'GET /api/repos/researcher/repo?fork_identity=1').length, 1);
+  assert.equal(lines.some((line) => line.startsWith('GET /api/repos/owner/repo/forks')), false);
+  assert.equal(lines.some((line) => line.startsWith('POST /api/repos/owner/repo/forks')), false);
+  const head = toAnnotationHeadBranch({ baseBranch: 'main', fileUser: 'ghid_42' });
+  assert.ok(lines.includes('POST /api/repos/researcher/repo/git/refs'), 'the head branch is created at the upstream tip');
+  assert.ok(github.filesAt('researcher/repo', head).has(USER_PATH));
 });
 
 

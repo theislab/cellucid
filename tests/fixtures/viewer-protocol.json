@@ -1,5 +1,5 @@
 {
-  "schema": 2,
+  "schema": 5,
   "channel": {
     "path": "_cellucid/ws",
     "hello": [
@@ -36,30 +36,34 @@
   "protocolDocument": {
     "channel": "_cellucid/ws",
     "commands": [
-      "clearHighlights",
+      "action",
+      "agent_answer",
+      "agent_call",
+      "agent_cancel",
+      "agent_list",
       "debug_snapshot",
       "freeze",
-      "highlight",
+      "load_session",
       "ping",
-      "requestSessionBundle",
-      "resetCamera",
-      "setColorBy",
-      "setDataMapping",
-      "setField",
-      "setGeneSet",
-      "setVisibility"
+      "requestSessionBundle"
     ],
     "binaryCommands": [
-      "highlight",
-      "setField",
-      "setVisibility"
+      "action",
+      "load_session"
     ],
     "events": [
+      "action_result",
+      "agent_answered",
+      "agent_asking",
+      "agent_result",
+      "agent_tools",
+      "agent_tools_changed",
       "click",
       "color_by",
       "command_error",
       "data_mapping",
       "debug_snapshot",
+      "history_changed",
       "hover",
       "pong",
       "ready",
@@ -67,7 +71,8 @@
       "result_removed",
       "results",
       "selection",
-      "session_bundle"
+      "session_bundle",
+      "session_loaded"
     ]
   },
   "commands": {
@@ -83,53 +88,91 @@
       "type",
       "requestId"
     ],
-    "clearHighlights": [
-      "type"
-    ],
-    "setColorBy": [
-      "type",
-      "field"
-    ],
-    "resetCamera": [
-      "type"
-    ],
     "freeze": [
       "type"
     ],
-    "setDataMapping": [
+    "action": [
       "type",
       "requestId",
-      "mapping"
+      "action",
+      "params",
+      "turn",
+      "turnLabel"
     ],
-    "setGeneSet": [
+    "agent_list": [
       "type",
       "requestId",
-      "name",
-      "description",
-      "genes"
+      "connection"
+    ],
+    "agent_call": [
+      "type",
+      "requestId",
+      "tool",
+      "args",
+      "agent",
+      "connection"
+    ],
+    "agent_cancel": [
+      "type",
+      "requestId"
+    ],
+    "agent_answer": [
+      "type",
+      "requestId",
+      "allowed"
     ]
   },
   "binaryCommands": {
-    "highlight": [
-      "type",
-      "color",
-      "label"
-    ],
-    "setVisibility": [
-      "type",
-      "visible",
-      "all"
-    ],
-    "setField": [
+    "action": [
       "type",
       "requestId",
-      "key",
-      "kind",
-      "categories",
-      "nObs",
-      "cells",
-      "values"
+      "action",
+      "params",
+      "turn",
+      "turnLabel",
+      "arrays"
+    ],
+    "load_session": [
+      "type",
+      "requestId",
+      "name"
     ]
+  },
+  "action": {
+    "typePattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$",
+    "arrayFields": [
+      "path",
+      "type",
+      "length"
+    ],
+    "stepFields": [
+      "id",
+      "label"
+    ],
+    "body": "binary action: each of header.arrays in order, length elements of its type, little-endian, placed in params at its path (keys and list indices ending in a key params does not hold); action_result: the outcome as UTF-8 JSON",
+    "turn": "turn and turnLabel: both exact text (the turn's id; what it was asked to do), or both null"
+  },
+  "agent": {
+    "connectionFields": [
+      "id",
+      "client"
+    ],
+    "connectionIdPattern": "^[A-Za-z0-9_-]{1,64}$",
+    "body": "agent_tools: the MCP tools (a JSON array) as UTF-8 JSON; agent_result: the MCP tool result ({content, isError, ...}) as UTF-8 JSON; every agent_call is answered by exactly one agent_result"
+  },
+  "history": {
+    "changeKinds": [
+      "step",
+      "moved",
+      "edited",
+      "tracker",
+      "loaded"
+    ],
+    "sessionLoadedTrackerFields": [
+      "id",
+      "name"
+    ],
+    "loadSession": "binary load_session: the header padded to a multiple of 4 bytes, then the .cellucid-session file; name is the file's name without a folder"
   },
   "events": {
     "hover": [
@@ -168,11 +211,11 @@
     "command_error": [
       "type",
       "command",
+      "requestId",
       "reason"
     ],
     "data_mapping": [
       "type",
-      "requestId",
       "origin",
       "mapping"
     ],
@@ -197,6 +240,34 @@
       "revision",
       "nObs",
       "items"
+    ],
+    "history_changed": [
+      "type",
+      "kind",
+      "tracker",
+      "head",
+      "step",
+      "branch"
+    ],
+    "session_loaded": [
+      "type",
+      "requestId",
+      "tracker",
+      "head"
+    ],
+    "agent_asking": [
+      "type",
+      "requestId",
+      "message",
+      "detail"
+    ],
+    "agent_answered": [
+      "type",
+      "requestId",
+      "allowed"
+    ],
+    "agent_tools_changed": [
+      "type"
     ]
   },
   "binaryEvents": {
@@ -210,7 +281,6 @@
     ],
     "result": [
       "type",
-      "requestId",
       "epoch",
       "revision",
       "kind",
@@ -219,6 +289,19 @@
       "meta",
       "cells",
       "values"
+    ],
+    "action_result": [
+      "type",
+      "requestId",
+      "step"
+    ],
+    "agent_tools": [
+      "type",
+      "requestId"
+    ],
+    "agent_result": [
+      "type",
+      "requestId"
     ]
   },
   "results": {
@@ -267,10 +350,6 @@
       "notebook",
       "user"
     ],
-    "fieldKinds": [
-      "categorical",
-      "continuous"
-    ],
     "valueTypes": {
       "uint8": 1,
       "uint16": 2,
@@ -288,7 +367,7 @@
     "user",
     "notebook"
   ],
-  "commandErrorReasonLimit": 240,
+  "commandErrorReasonLimit": 1000,
   "examples": {
     "hello": {
       "type": "hello",
@@ -312,159 +391,401 @@
         "requestId": "r3"
       },
       {
-        "type": "clearHighlights"
-      },
-      {
-        "type": "setColorBy",
-        "field": "cell_type"
-      },
-      {
-        "type": "resetCamera"
-      },
-      {
         "type": "freeze"
       },
       {
-        "type": "setDataMapping",
+        "type": "action",
         "requestId": "r4",
-        "mapping": {
-          "kind": "anndata",
-          "embeddings": {
-            "enabled": [
-              {
-                "key": "X_umap",
-                "columns": [
-                  0,
-                  1
-                ]
-              }
-            ],
-            "defaults": {
-              "1d": null,
-              "2d": {
-                "key": "X_umap",
-                "columns": [
-                  0,
-                  1
-                ]
-              },
-              "3d": null
-            }
-          },
-          "knn": null,
-          "geneNames": "index",
-          "expression": "X",
-          "log1p": {},
-          "highlyVariable": null,
-          "latent": null,
-          "vectorFields": []
+        "action": "color.by",
+        "params": {
+          "field": {
+            "source": "obs",
+            "key": "cell_type"
+          }
+        },
+        "turn": null,
+        "turnLabel": null
+      },
+      {
+        "type": "action",
+        "requestId": "r5",
+        "action": "history.get",
+        "params": {},
+        "turn": null,
+        "turnLabel": null
+      },
+      {
+        "type": "action",
+        "requestId": "r6",
+        "action": "gene-set.save",
+        "params": {
+          "name": "T cell markers",
+          "description": "From the notebook",
+          "genes": [
+            "CD3E",
+            "CD3D",
+            "IL7R"
+          ]
+        },
+        "turn": "python-turn-1",
+        "turnLabel": "Marker genes"
+      },
+      {
+        "type": "action",
+        "requestId": "r7",
+        "action": "cells.visibility.set",
+        "params": {
+          "cells": null,
+          "visible": true
+        },
+        "turn": null,
+        "turnLabel": null
+      },
+      {
+        "type": "action",
+        "requestId": "r14",
+        "action": "history.undo",
+        "params": {},
+        "turn": null,
+        "turnLabel": null
+      },
+      {
+        "type": "agent_list",
+        "requestId": "a1",
+        "connection": {
+          "id": "local-3f9c2a7d",
+          "client": "claude-code"
         }
       },
       {
-        "type": "setGeneSet",
-        "requestId": "r6",
-        "name": "T cell markers",
-        "description": "From the notebook",
-        "genes": [
-          "CD3E",
-          "CD3D",
-          "IL7R"
-        ]
+        "type": "agent_call",
+        "requestId": "a2",
+        "tool": "color_by",
+        "args": {
+          "field": {
+            "source": "obs",
+            "key": "cell_type"
+          }
+        },
+        "agent": "Claude Code",
+        "connection": {
+          "id": "local-3f9c2a7d",
+          "client": "claude-code"
+        }
+      },
+      {
+        "type": "agent_call",
+        "requestId": "a3",
+        "tool": "history_get",
+        "args": {},
+        "agent": "Cursor",
+        "connection": {
+          "id": "local-77e0b1c4",
+          "client": null
+        }
+      },
+      {
+        "type": "agent_cancel",
+        "requestId": "a3"
+      },
+      {
+        "type": "agent_answer",
+        "requestId": "a4",
+        "allowed": false
       }
     ],
     "binaryCommands": [
       {
         "header": {
-          "type": "highlight",
-          "color": "#e41a1c",
-          "label": null
-        },
-        "cells": [
-          0,
-          2,
-          7
-        ],
-        "hex": "340000007b2274797065223a22686967686c69676874222c22636f6c6f72223a2223653431613163222c226c6162656c223a6e756c6c7d20000000000200000007000000"
-      },
-      {
-        "header": {
-          "type": "highlight",
-          "color": "#00FF7f",
-          "label": "Cycling cells"
-        },
-        "cells": [
-          5,
-          2147483648,
-          4294967295
-        ],
-        "hex": "400000007b2274797065223a22686967686c69676874222c22636f6c6f72223a2223303046463766222c226c6162656c223a224379636c696e672063656c6c73227d20200500000000000080ffffffff"
-      },
-      {
-        "header": {
-          "type": "setVisibility",
-          "visible": false,
-          "all": false
-        },
-        "cells": [
-          1,
-          3
-        ],
-        "hex": "340000007b2274797065223a227365745669736962696c697479222c2276697369626c65223a66616c73652c22616c6c223a66616c73657d0100000003000000"
-      },
-      {
-        "header": {
-          "type": "setVisibility",
-          "visible": true,
-          "all": true
-        },
-        "cells": [],
-        "hex": "340000007b2274797065223a227365745669736962696c697479222c2276697369626c65223a747275652c22616c6c223a747275657d2020"
-      },
-      {
-        "header": {
-          "type": "setField",
-          "requestId": "r7",
-          "key": "leiden",
-          "kind": "categorical",
-          "categories": [
-            "0",
-            "1",
-            "2"
-          ],
-          "nObs": 5,
-          "cells": null,
-          "values": "uint8"
-        },
-        "cells": null,
-        "values": [
-          0,
-          2,
-          1,
-          255,
-          0
-        ],
-        "hex": "8c0000007b2274797065223a227365744669656c64222c22726571756573744964223a227237222c226b6579223a226c656964656e222c226b696e64223a2263617465676f726963616c222c2263617465676f72696573223a5b2230222c2231222c2232225d2c226e4f6273223a352c2263656c6c73223a6e756c6c2c2276616c756573223a2275696e7438227d2020000201ff00"
-      },
-      {
-        "header": {
-          "type": "setField",
+          "type": "action",
           "requestId": "r8",
-          "key": "score",
-          "kind": "continuous",
-          "categories": null,
-          "nObs": 10,
-          "cells": 2,
-          "values": "float32"
+          "action": "highlight.cells",
+          "params": {
+            "color": "#e41a1c"
+          },
+          "turn": null,
+          "turnLabel": null,
+          "arrays": [
+            {
+              "path": [
+                "cells"
+              ],
+              "type": "uint32",
+              "length": 3
+            }
+          ]
         },
-        "cells": [
-          3,
-          8
+        "arrays": [
+          {
+            "path": [
+              "cells"
+            ],
+            "type": "uint32",
+            "elements": [
+              0,
+              2,
+              7
+            ]
+          }
         ],
-        "values": [
-          0.5,
-          -1.25
+        "hex": "b00000007b2274797065223a22616374696f6e222c22726571756573744964223a227238222c22616374696f6e223a22686967686c696768742e63656c6c73222c22706172616d73223a7b22636f6c6f72223a2223653431613163227d2c227475726e223a6e756c6c2c227475726e4c6162656c223a6e756c6c2c22617272617973223a5b7b2270617468223a5b2263656c6c73225d2c2274797065223a2275696e743332222c226c656e677468223a337d5d7d000000000200000007000000"
+      },
+      {
+        "header": {
+          "type": "action",
+          "requestId": "r9",
+          "action": "highlight.cells",
+          "params": {
+            "label": "Cycling cells",
+            "page": "Notebook"
+          },
+          "turn": null,
+          "turnLabel": null,
+          "arrays": [
+            {
+              "path": [
+                "cells"
+              ],
+              "type": "uint32",
+              "length": 3
+            }
+          ]
+        },
+        "arrays": [
+          {
+            "path": [
+              "cells"
+            ],
+            "type": "uint32",
+            "elements": [
+              4294967295,
+              5,
+              2147483648
+            ]
+          }
         ],
-        "hex": "800000007b2274797065223a227365744669656c64222c22726571756573744964223a227238222c226b6579223a2273636f7265222c226b696e64223a22636f6e74696e756f7573222c2263617465676f72696573223a6e756c6c2c226e4f6273223a31302c2263656c6c73223a322c2276616c756573223a22666c6f61743332227d2003000000080000000000003f0000a0bf"
+        "hex": "c80000007b2274797065223a22616374696f6e222c22726571756573744964223a227239222c22616374696f6e223a22686967686c696768742e63656c6c73222c22706172616d73223a7b226c6162656c223a224379636c696e672063656c6c73222c2270616765223a224e6f7465626f6f6b227d2c227475726e223a6e756c6c2c227475726e4c6162656c223a6e756c6c2c22617272617973223a5b7b2270617468223a5b2263656c6c73225d2c2274797065223a2275696e743332222c226c656e677468223a337d5d7dffffffff0500000000000080"
+      },
+      {
+        "header": {
+          "type": "action",
+          "requestId": "r10",
+          "action": "cells.visibility.set",
+          "params": {
+            "visible": false
+          },
+          "turn": "python-turn-1",
+          "turnLabel": "Hide the doublets",
+          "arrays": [
+            {
+              "path": [
+                "cells"
+              ],
+              "type": "uint32",
+              "length": 2
+            }
+          ]
+        },
+        "arrays": [
+          {
+            "path": [
+              "cells"
+            ],
+            "type": "uint32",
+            "elements": [
+              1,
+              3
+            ]
+          }
+        ],
+        "hex": "d00000007b2274797065223a22616374696f6e222c22726571756573744964223a22723130222c22616374696f6e223a2263656c6c732e7669736962696c6974792e736574222c22706172616d73223a7b2276697369626c65223a66616c73657d2c227475726e223a22707974686f6e2d7475726e2d31222c227475726e4c6162656c223a22486964652074686520646f75626c657473222c22617272617973223a5b7b2270617468223a5b2263656c6c73225d2c2274797065223a2275696e743332222c226c656e677468223a327d5d7d20200100000003000000"
+      },
+      {
+        "header": {
+          "type": "action",
+          "requestId": "r11",
+          "action": "field.push",
+          "params": {
+            "key": "leiden",
+            "kind": "categorical",
+            "categories": [
+              "0",
+              "1",
+              "2"
+            ],
+            "n_obs": 5,
+            "cells": null
+          },
+          "turn": null,
+          "turnLabel": null,
+          "arrays": [
+            {
+              "path": [
+                "values"
+              ],
+              "type": "uint8",
+              "length": 5
+            }
+          ]
+        },
+        "arrays": [
+          {
+            "path": [
+              "values"
+            ],
+            "type": "uint8",
+            "elements": [
+              0,
+              2,
+              1,
+              255,
+              0
+            ]
+          }
+        ],
+        "hex": "f00000007b2274797065223a22616374696f6e222c22726571756573744964223a22723131222c22616374696f6e223a226669656c642e70757368222c22706172616d73223a7b226b6579223a226c656964656e222c226b696e64223a2263617465676f726963616c222c2263617465676f72696573223a5b2230222c2231222c2232225d2c226e5f6f6273223a352c2263656c6c73223a6e756c6c7d2c227475726e223a6e756c6c2c227475726e4c6162656c223a6e756c6c2c22617272617973223a5b7b2270617468223a5b2276616c756573225d2c2274797065223a2275696e7438222c226c656e677468223a357d5d7d000201ff00"
+      },
+      {
+        "header": {
+          "type": "action",
+          "requestId": "r12",
+          "action": "field.push",
+          "params": {
+            "key": "score",
+            "kind": "continuous",
+            "categories": null,
+            "n_obs": 10
+          },
+          "turn": null,
+          "turnLabel": null,
+          "arrays": [
+            {
+              "path": [
+                "cells"
+              ],
+              "type": "uint32",
+              "length": 2
+            },
+            {
+              "path": [
+                "values"
+              ],
+              "type": "float32",
+              "length": 2
+            }
+          ]
+        },
+        "arrays": [
+          {
+            "path": [
+              "cells"
+            ],
+            "type": "uint32",
+            "elements": [
+              3,
+              8
+            ]
+          },
+          {
+            "path": [
+              "values"
+            ],
+            "type": "float32",
+            "elements": [
+              0.5,
+              -1.25
+            ]
+          }
+        ],
+        "hex": "0c0100007b2274797065223a22616374696f6e222c22726571756573744964223a22723132222c22616374696f6e223a226669656c642e70757368222c22706172616d73223a7b226b6579223a2273636f7265222c226b696e64223a22636f6e74696e756f7573222c2263617465676f72696573223a6e756c6c2c226e5f6f6273223a31307d2c227475726e223a6e756c6c2c227475726e4c6162656c223a6e756c6c2c22617272617973223a5b7b2270617468223a5b2263656c6c73225d2c2274797065223a2275696e743332222c226c656e677468223a327d2c7b2270617468223a5b2276616c756573225d2c2274797065223a22666c6f61743332222c226c656e677468223a327d5d7d20202003000000080000000000003f0000a0bf"
+      },
+      {
+        "header": {
+          "type": "action",
+          "requestId": "r13",
+          "action": "example.nested",
+          "params": {
+            "groups": [
+              {
+                "name": "a"
+              },
+              {
+                "name": "b"
+              }
+            ]
+          },
+          "turn": null,
+          "turnLabel": null,
+          "arrays": [
+            {
+              "path": [
+                "groups",
+                0,
+                "cells"
+              ],
+              "type": "uint32",
+              "length": 2
+            },
+            {
+              "path": [
+                "groups",
+                1,
+                "cells"
+              ],
+              "type": "uint32",
+              "length": 0
+            },
+            {
+              "path": [
+                "weights"
+              ],
+              "type": "float64",
+              "length": 1
+            }
+          ]
+        },
+        "arrays": [
+          {
+            "path": [
+              "groups",
+              0,
+              "cells"
+            ],
+            "type": "uint32",
+            "elements": [
+              1,
+              2
+            ]
+          },
+          {
+            "path": [
+              "groups",
+              1,
+              "cells"
+            ],
+            "type": "uint32",
+            "elements": []
+          },
+          {
+            "path": [
+              "weights"
+            ],
+            "type": "float64",
+            "elements": [
+              0.25
+            ]
+          }
+        ],
+        "hex": "380100007b2274797065223a22616374696f6e222c22726571756573744964223a22723133222c22616374696f6e223a226578616d706c652e6e6573746564222c22706172616d73223a7b2267726f757073223a5b7b226e616d65223a2261227d2c7b226e616d65223a2262227d5d7d2c227475726e223a6e756c6c2c227475726e4c6162656c223a6e756c6c2c22617272617973223a5b7b2270617468223a5b2267726f757073222c302c2263656c6c73225d2c2274797065223a2275696e743332222c226c656e677468223a327d2c7b2270617468223a5b2267726f757073222c312c2263656c6c73225d2c2274797065223a2275696e743332222c226c656e677468223a307d2c7b2270617468223a5b2277656967687473225d2c2274797065223a22666c6f61743634222c226c656e677468223a317d5d7d0100000002000000000000000000d03f"
+      },
+      {
+        "header": {
+          "type": "load_session",
+          "requestId": "r15",
+          "name": "T cell analysis.cellucid-session"
+        },
+        "bodyText": "CELLUCID_SESSION/4\n",
+        "hex": "540000007b2274797065223a226c6f61645f73657373696f6e222c22726571756573744964223a22723135222c226e616d65223a22542063656c6c20616e616c797369732e63656c6c756369642d73657373696f6e227d2043454c4c554349445f53455353494f4e2f340a"
       }
     ],
     "events": [
@@ -512,12 +833,18 @@
       },
       {
         "type": "command_error",
-        "command": "setColorBy",
-        "reason": "no field named cell_type"
+        "command": "action",
+        "requestId": "r4",
+        "reason": "There is no field \"cell_typ\" in obs; did you mean cell_type?"
+      },
+      {
+        "type": "command_error",
+        "command": "freeze",
+        "requestId": null,
+        "reason": "The viewer has no dataset open."
       },
       {
         "type": "data_mapping",
-        "requestId": "r4",
         "origin": "notebook",
         "mapping": {
           "kind": "anndata",
@@ -640,6 +967,69 @@
         "revision": 0,
         "nObs": 2700,
         "items": []
+      },
+      {
+        "type": "history_changed",
+        "kind": "step",
+        "tracker": "t-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10",
+        "head": "s4",
+        "step": "s4",
+        "branch": "b0"
+      },
+      {
+        "type": "history_changed",
+        "kind": "moved",
+        "tracker": "t-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10",
+        "head": "s2",
+        "step": null,
+        "branch": "b0"
+      },
+      {
+        "type": "history_changed",
+        "kind": "edited",
+        "tracker": "t-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10",
+        "head": "s2",
+        "step": null,
+        "branch": "b1"
+      },
+      {
+        "type": "history_changed",
+        "kind": "tracker",
+        "tracker": "t-5d0e1c2b-7a4f-4e8b-9c3d-2f1a0b9c8d7e",
+        "head": "s0",
+        "step": null,
+        "branch": null
+      },
+      {
+        "type": "history_changed",
+        "kind": "loaded",
+        "tracker": "t-5d0e1c2b-7a4f-4e8b-9c3d-2f1a0b9c8d7e",
+        "head": "s9",
+        "step": null,
+        "branch": "b2"
+      },
+      {
+        "type": "session_loaded",
+        "requestId": "r15",
+        "tracker": {
+          "id": "t-5d0e1c2b-7a4f-4e8b-9c3d-2f1a0b9c8d7e",
+          "name": "T cell analysis"
+        },
+        "head": "s9"
+      },
+      {
+        "type": "agent_asking",
+        "requestId": "a4",
+        "message": "Claude Code (local) asks to save a copy as a file. It writes a file on this computer.",
+        "detail": null
+      },
+      {
+        "type": "agent_answered",
+        "requestId": "a4",
+        "allowed": false
+      },
+      {
+        "type": "agent_tools_changed"
       }
     ],
     "binaryEvents": [
@@ -665,8 +1055,110 @@
       },
       {
         "header": {
+          "type": "action_result",
+          "requestId": "r4",
+          "step": {
+            "id": "s3",
+            "label": "Coloured by cell_type"
+          }
+        },
+        "outcome": null,
+        "hex": "5c0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a227234222c2273746570223a7b226964223a227333222c226c6162656c223a22436f6c6f757265642062792063656c6c5f74797065227d7d6e756c6c"
+      },
+      {
+        "header": {
+          "type": "action_result",
+          "requestId": "r11",
+          "step": {
+            "id": "s4",
+            "label": "Added the categorical column leiden"
+          }
+        },
+        "outcome": {
+          "name": "leiden",
+          "kind": "categorical",
+          "id": "user_cat_1"
+        },
+        "hex": "6b0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a22723131222c2273746570223a7b226964223a227334222c226c6162656c223a224164646564207468652063617465676f726963616c20636f6c756d6e206c656964656e227d7d7b226e616d65223a226c656964656e222c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31227d"
+      },
+      {
+        "header": {
+          "type": "action_result",
+          "requestId": "r5",
+          "step": null
+        },
+        "outcome": {
+          "head": "s4",
+          "steps": [
+            {
+              "id": "s0",
+              "label": "Opened Example"
+            }
+          ],
+          "note": "Ünïcode — kept as UTF-8"
+        },
+        "hex": "350000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a227235222c2273746570223a6e756c6c7d7b2268656164223a227334222c227374657073223a5b7b226964223a227330222c226c6162656c223a224f70656e6564204578616d706c65227d5d2c226e6f7465223a22c39c6ec3af636f646520e28094206b657074206173205554462d38227d"
+      },
+      {
+        "header": {
+          "type": "agent_tools",
+          "requestId": "a1"
+        },
+        "body": [
+          {
+            "name": "color_by",
+            "title": "Colour by a field",
+            "description": "Colour the cells by a field.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {}
+            },
+            "annotations": {
+              "title": "Colour by a field",
+              "readOnlyHint": false,
+              "destructiveHint": false,
+              "idempotentHint": false,
+              "openWorldHint": false
+            }
+          }
+        ],
+        "hex": "270000007b2274797065223a226167656e745f746f6f6c73222c22726571756573744964223a226131227d5b7b226e616d65223a22636f6c6f725f6279222c227469746c65223a22436f6c6f75722062792061206669656c64222c226465736372697074696f6e223a22436f6c6f7572207468652063656c6c732062792061206669656c642e222c22696e707574536368656d61223a7b2274797065223a226f626a656374222c2270726f70657274696573223a7b7d7d2c22616e6e6f746174696f6e73223a7b227469746c65223a22436f6c6f75722062792061206669656c64222c22726561644f6e6c7948696e74223a66616c73652c22646573747275637469766548696e74223a66616c73652c226964656d706f74656e7448696e74223a66616c73652c226f70656e576f726c6448696e74223a66616c73657d7d5d"
+      },
+      {
+        "header": {
+          "type": "agent_result",
+          "requestId": "a2"
+        },
+        "body": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"step\":{\"id\":\"s5\",\"label\":\"Coloured by cell_type\"}}"
+            }
+          ],
+          "isError": false
+        },
+        "hex": "280000007b2274797065223a226167656e745f726573756c74222c22726571756573744964223a226132227d7b22636f6e74656e74223a5b7b2274797065223a2274657874222c2274657874223a227b5c22737465705c223a7b5c2269645c223a5c2273355c222c5c226c6162656c5c223a5c22436f6c6f757265642062792063656c6c5f747970655c227d7d227d5d2c2269734572726f72223a66616c73657d"
+      },
+      {
+        "header": {
+          "type": "agent_result",
+          "requestId": "a4"
+        },
+        "body": {
+          "content": [
+            {
+              "type": "text",
+              "text": "The person declined: save a copy."
+            }
+          ],
+          "isError": true
+        },
+        "hex": "280000007b2274797065223a226167656e745f726573756c74222c22726571756573744964223a226134227d7b22636f6e74656e74223a5b7b2274797065223a2274657874222c2274657874223a2254686520706572736f6e206465636c696e65643a2073617665206120636f70792e227d5d2c2269734572726f72223a747275657d"
+      },
+      {
+        "header": {
           "type": "result",
-          "requestId": null,
           "epoch": "0123456789abcdef",
           "revision": 1,
           "kind": "highlight",
@@ -689,12 +1181,11 @@
           7
         ],
         "values": null,
-        "hex": "150100007b2274797065223a22726573756c74222c22726571756573744964223a6e756c6c2c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a312c226b696e64223a22686967686c69676874222c226964223a22686967686c696768745f31222c226e4f6273223a31302c226d657461223a7b226c6162656c223a224c6173736f2073656c656374696f6e2028332063656c6c7329222c22746f6f6c223a226c6173736f222c22706167654964223a22706167655f31222c22706167654e616d65223a22506167652031222c22636f6c6f72223a2223653431613163222c22656e61626c6564223a747275657d2c2263656c6c73223a332c2276616c756573223a6e756c6c7d000000000200000007000000"
+        "hex": "040100007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a312c226b696e64223a22686967686c69676874222c226964223a22686967686c696768745f31222c226e4f6273223a31302c226d657461223a7b226c6162656c223a224c6173736f2073656c656374696f6e2028332063656c6c7329222c22746f6f6c223a226c6173736f222c22706167654964223a22706167655f31222c22706167654e616d65223a22506167652031222c22636f6c6f72223a2223653431613163222c22656e61626c6564223a747275657d2c2263656c6c73223a332c2276616c756573223a6e756c6c7d000000000200000007000000"
       },
       {
         "header": {
           "type": "result",
-          "requestId": null,
           "epoch": "0123456789abcdef",
           "revision": 2,
           "kind": "categorical",
@@ -723,12 +1214,11 @@
           255,
           1
         ],
-        "hex": "e30000007b2274797065223a22726573756c74222c22726571756573744964223a6e756c6c2c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a322c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31222c226e4f6273223a31302c226d657461223a7b226b6579223a22616e6e6f746174696f6e222c2263617465676f72696573223a5b22422063656c6c222c22542063656c6c225d2c226f726967696e223a2275736572227d2c2263656c6c73223a342c2276616c756573223a2275696e7438227d000000000300000004000000090000000100ff01"
+        "hex": "d20000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a322c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31222c226e4f6273223a31302c226d657461223a7b226b6579223a22616e6e6f746174696f6e222c2263617465676f72696573223a5b22422063656c6c222c22542063656c6c225d2c226f726967696e223a2275736572227d2c2263656c6c73223a342c2276616c756573223a2275696e7438227d000000000300000004000000090000000100ff01"
       },
       {
         "header": {
           "type": "result",
-          "requestId": null,
           "epoch": "0123456789abcdef",
           "revision": 3,
           "kind": "continuous",
@@ -747,12 +1237,11 @@
           -1,
           3.5
         ],
-        "hex": "d90000007b2274797065223a22726573756c74222c22726571756573744964223a6e756c6c2c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a332c226b696e64223a22636f6e74696e756f7573222c226964223a22757365725f6f62735f76616c75655f31222c226e4f6273223a332c226d657461223a7b226b6579223a22542063656c6c206d61726b6572732073636f7265222c226f726967696e223a22616e616c79736973227d2c2263656c6c73223a6e756c6c2c2276616c756573223a22666c6f61743332227d0000803e000080bf00006040"
+        "hex": "c80000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a332c226b696e64223a22636f6e74696e756f7573222c226964223a22757365725f6f62735f76616c75655f31222c226e4f6273223a332c226d657461223a7b226b6579223a22542063656c6c206d61726b6572732073636f7265222c226f726967696e223a22616e616c79736973227d2c2263656c6c73223a6e756c6c2c2276616c756573223a22666c6f61743332227d0000803e000080bf00006040"
       },
       {
         "header": {
           "type": "result",
-          "requestId": "r6",
           "epoch": "0123456789abcdef",
           "revision": 4,
           "kind": "geneSet",
@@ -778,12 +1267,11 @@
         },
         "cells": [],
         "values": null,
-        "hex": "470100007b2274797065223a22726573756c74222c22726571756573744964223a227236222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a342c226b696e64223a2267656e65536574222c226964223a2267656e655f7365745f31222c226e4f6273223a31302c226d657461223a7b226e616d65223a22542063656c6c206d61726b657273222c226465736372697074696f6e223a2246726f6d20746865206e6f7465626f6f6b222c2267656e6573223a5b22454e53473030303030313938383531222c22454e53473030303030313637323836222c22454e53473030303030313638363835225d2c2273796d626f6c73223a5b2243443345222c2243443344222c22494c3752225d2c226f726967696e223a226e6f7465626f6f6b227d2c2263656c6c73223a302c2276616c756573223a6e756c6c7d"
+        "hex": "360100007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a342c226b696e64223a2267656e65536574222c226964223a2267656e655f7365745f31222c226e4f6273223a31302c226d657461223a7b226e616d65223a22542063656c6c206d61726b657273222c226465736372697074696f6e223a2246726f6d20746865206e6f7465626f6f6b222c2267656e6573223a5b22454e53473030303030313938383531222c22454e53473030303030313637323836222c22454e53473030303030313638363835225d2c2273796d626f6c73223a5b2243443345222c2243443344222c22494c3752225d2c226f726967696e223a226e6f7465626f6f6b227d2c2263656c6c73223a302c2276616c756573223a6e756c6c7d"
       },
       {
         "header": {
           "type": "result",
-          "requestId": null,
           "epoch": "0123456789abcdef",
           "revision": 5,
           "kind": "visibility",
@@ -799,12 +1287,11 @@
           3
         ],
         "values": null,
-        "hex": "990000007b2274797065223a22726573756c74222c22726571756573744964223a6e756c6c2c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a352c226b696e64223a227669736962696c697479222c226964223a2276697369626c65222c226e4f6273223a31302c226d657461223a7b7d2c2263656c6c73223a332c2276616c756573223a6e756c6c7d010000000200000003000000"
+        "hex": "880000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a352c226b696e64223a227669736962696c697479222c226964223a2276697369626c65222c226e4f6273223a31302c226d657461223a7b7d2c2263656c6c73223a332c2276616c756573223a6e756c6c7d010000000200000003000000"
       },
       {
         "header": {
           "type": "result",
-          "requestId": null,
           "epoch": "0123456789abcdef",
           "revision": 6,
           "kind": "subset",
@@ -823,12 +1310,11 @@
           9
         ],
         "values": null,
-        "hex": "ad0000007b2274797065223a22726573756c74222c22726571756573744964223a6e756c6c2c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a362c226b696e64223a22737562736574222c226964223a226f70656e222c226e4f6273223a31302c226d657461223a7b22646967657374223a2230313233343536373839616263646566227d2c2263656c6c73223a342c2276616c756573223a6e756c6c7d00000000030000000400000009000000"
+        "hex": "9c0000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a362c226b696e64223a22737562736574222c226964223a226f70656e222c226e4f6273223a31302c226d657461223a7b22646967657374223a2230313233343536373839616263646566227d2c2263656c6c73223a342c2276616c756573223a6e756c6c7d00000000030000000400000009000000"
       },
       {
         "header": {
           "type": "result",
-          "requestId": null,
           "epoch": "0123456789abcdef",
           "revision": 7,
           "kind": "geneSet",
@@ -849,7 +1335,7 @@
         },
         "cells": [],
         "values": null,
-        "hex": "000100007b2274797065223a22726573756c74222c22726571756573744964223a6e756c6c2c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a372c226b696e64223a2267656e65536574222c226964223a226d61726b6572735f31222c226e4f6273223a31302c226d657461223a7b226e616d65223a22422063656c6c222c226465736372697074696f6e223a224d61726b65722067656e6573222c2267656e6573223a5b224d53344131222c224344373941225d2c2273796d626f6c73223a6e756c6c2c226f726967696e223a226d61726b657273227d2c2263656c6c73223a302c2276616c756573223a6e756c6c7d"
+        "hex": "ef0000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a372c226b696e64223a2267656e65536574222c226964223a226d61726b6572735f31222c226e4f6273223a31302c226d657461223a7b226e616d65223a22422063656c6c222c226465736372697074696f6e223a224d61726b65722067656e6573222c2267656e6573223a5b224d53344131222c224344373941225d2c2273796d626f6c73223a6e756c6c2c226f726967696e223a226d61726b657273227d2c2263656c6c73223a302c2276616c756573223a6e756c6c7d"
       }
     ]
   }

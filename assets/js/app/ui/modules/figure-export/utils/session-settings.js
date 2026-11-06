@@ -59,6 +59,140 @@ export const FIGURE_EXPORT_SETTING_RANGES = Object.freeze({
   selectionMutedOpacity: Object.freeze([0, 1]),
 });
 
+// ---------------------------------------------------------------------------
+// The settings as parameters of `figure-export.set`
+// ---------------------------------------------------------------------------
+
+/**
+ * Settings that change together, so a step that changes one carries the
+ * others (typing a title also stops it following the dataset; a font size
+ * typed turns Auto text off): a burst of typing is one coalesced step.
+ */
+export const FIGURE_EXPORT_LINKED_KEYS = Object.freeze([
+  Object.freeze(['titleFollowsDataset', 'title']),
+  Object.freeze(['autoTextSize', 'fontSizes']),
+]);
+
+const snakeOf = key => key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+const camelOf = key => key.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+
+function convertKeys(value, convert) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [convert(key), convertKeys(item, convert)]));
+}
+
+/**
+ * Settings (some keys of a record, `assertFigureExportSessionSettings`'s
+ * names) as the parameters of `figure-export.set`: snake_case, as an agent,
+ * Python and R write them.
+ *
+ * @param {Partial<FigureExportSessionSettings>} settings
+ * @returns {object}
+ */
+export function figureExportParamsOf(settings) {
+  return convertKeys(settings, snakeOf);
+}
+
+/**
+ * The parameters of `figure-export.set` as settings (some keys of a record).
+ *
+ * @param {object} params
+ * @returns {Partial<FigureExportSessionSettings>}
+ */
+export function figureExportSettingsOf(params) {
+  return convertKeys(params, camelOf);
+}
+
+/**
+ * The settings that differ between two records, each linked group whole
+ * (`FIGURE_EXPORT_LINKED_KEYS`); `version` is never one.
+ *
+ * @param {FigureExportSessionSettings} before
+ * @param {FigureExportSessionSettings} after
+ * @returns {Partial<FigureExportSessionSettings>}
+ */
+export function changedFigureExportSettings(before, after) {
+  const changed = new Set(KEYS.filter(key => key !== 'version' && JSON.stringify(before[key]) !== JSON.stringify(after[key])));
+  for (const group of FIGURE_EXPORT_LINKED_KEYS) {
+    if (group.some(key => changed.has(key))) for (const key of group) changed.add(key);
+  }
+  return Object.fromEntries(KEYS.filter(key => changed.has(key)).map(key => [key, structuredClone(after[key])]));
+}
+
+const PLOT_SIZE = Object.freeze({
+  type: 'integer', minimum: FIGURE_EXPORT_SETTING_RANGES.plotSize[0], maximum: FIGURE_EXPORT_SETTING_RANGES.plotSize[1],
+});
+const FONT_SIZE = Object.freeze({
+  type: 'integer', minimum: FIGURE_EXPORT_SETTING_RANGES.fontSize[0], maximum: FIGURE_EXPORT_SETTING_RANGES.fontSize[1],
+});
+const FRACTION = Object.freeze({ type: 'number', minimum: 0, maximum: 1 });
+
+/**
+ * The parameter schema of `figure-export.set` (`app/actions/definitions/settings.js`):
+ * every setting of a record but its version, each optional, in the names
+ * `figureExportParamsOf` gives them. `tests/figure-export-session-settings.test.mjs`
+ * holds it to the record's keys, so a setting added to the record is a
+ * parameter the day it lands.
+ */
+export const FIGURE_EXPORT_PARAMS = Object.freeze({
+  type: 'object', additionalProperties: false,
+  examples: [{ width: 1200, height: 900, include_axes: false }],
+  properties: {
+    size_preset: { enum: [...FIGURE_EXPORT_SIZE_PRESETS], description: 'The size preset shown in the panel.' },
+    width: { ...PLOT_SIZE, description: 'Plot width in CSS pixels.' },
+    height: { ...PLOT_SIZE, description: 'Plot height in CSS pixels.' },
+    frame: {
+      type: ['object', 'null'], additionalProperties: false, required: ['lock_aspect', 'rect'],
+      description: 'The part of the view exported (needs the preview on), or null for the whole view.',
+      properties: {
+        lock_aspect: { type: 'boolean', description: 'Keep the frame\'s shape when it is resized.' },
+        rect: {
+          type: 'object', additionalProperties: false, required: ['x', 'y', 'width', 'height'],
+          description: 'The frame as fractions of the view, from its top left.',
+          properties: { x: FRACTION, y: FRACTION, width: FRACTION, height: FRACTION },
+        },
+      },
+    },
+    background: { enum: [...FIGURE_EXPORT_BACKGROUNDS], description: 'The background: the viewer\'s, white, transparent or custom.' },
+    background_color: { type: 'string', pattern: '^#[0-9a-f]{6}$', examples: ['#ffffff'], description: 'The custom background colour, lowercase #rrggbb.' },
+    font_family: { enum: [...FIGURE_EXPORT_FONT_FAMILIES], description: 'The font of every text.' },
+    auto_text_size: { type: 'boolean', description: 'Size the text from the figure\'s size (font_sizes is then null).' },
+    font_sizes: {
+      type: ['object', 'null'], additionalProperties: false, required: [...FONT_SIZE_KEYS].map(snakeOf),
+      description: 'Text sizes in pixels while auto_text_size is off, else null.',
+      properties: Object.fromEntries(FONT_SIZE_KEYS.map(key => [snakeOf(key), FONT_SIZE])),
+    },
+    title_follows_dataset: { type: 'boolean', description: 'The title is the dataset\'s name (title is then null).' },
+    title: { type: ['string', 'null'], description: 'The figure title while it does not follow the dataset, else null.' },
+    x_label: { type: 'string', description: 'The x axis label.' },
+    y_label: { type: 'string', description: 'The y axis label.' },
+    include_axes: { type: 'boolean', description: 'Draw the axes.' },
+    include_legend: { type: 'boolean', description: 'Draw the legend.' },
+    reference_grid: { type: 'boolean', description: 'Draw a reference grid.' },
+    show_orientation: { type: 'boolean', description: 'Draw the 3D orientation indicator.' },
+    depth_sort: { type: 'boolean', description: 'Draw 3D points back to front.' },
+    legend_position: { enum: [...FIGURE_EXPORT_LEGEND_POSITIONS], description: 'Where the legend goes.' },
+    emphasize_selection: { type: 'boolean', description: 'Fade the cells that are not highlighted.' },
+    selection_muted_opacity: { ...FRACTION, description: 'The opacity of the faded cells, 0 to 1.' },
+    preview: {
+      type: 'object', additionalProperties: false, required: ['enabled', 'colorblind_mode'],
+      description: 'The preview in the panel and the colour-vision deficiency it simulates.',
+      properties: {
+        enabled: { type: 'boolean' },
+        colorblind_mode: { enum: [...FIGURE_EXPORT_COLORBLIND_MODES] },
+      },
+    },
+    download: { enum: [...FIGURE_EXPORT_DOWNLOADS], description: 'What Export downloads.' },
+    dpi: { enum: [...FIGURE_EXPORT_DPIS], description: 'The resolution of a PNG.' },
+    svg_strategy: { enum: [...FIGURE_EXPORT_SVG_STRATEGIES, null], description: 'How an SVG draws many points, or null until chosen.' },
+    optimized_target_count: {
+      type: 'integer', minimum: FIGURE_EXPORT_SETTING_RANGES.optimizedTargetCount[0], maximum: FIGURE_EXPORT_SETTING_RANGES.optimizedTargetCount[1],
+      description: 'How many points an optimized SVG keeps.',
+    },
+    export_all_views: { type: 'boolean', description: 'Export every view of the multiview, side by side.' },
+  },
+});
+
 function context(path) {
   return `Figure-export session settings${path ? `.${path}` : ''}`;
 }

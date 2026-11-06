@@ -14,10 +14,11 @@
  *
  * Loading a session opens its dataset with exactly these cells (a dataset
  * open with other cells is read again first, `session-controls.js`). Every
- * per-cell chunk of the session — highlights, labels — names these cells by
- * original position, ascending (cell `i` is `kept[i]`,
- * `session-cell-order.js`), whatever order they were open in, and its
- * fingerprint (cell count, cell-order digest) matches. The recorded set is the truth; the
+ * per-cell part of the session's state values — highlight groups, user
+ * fields' codes and values, cells hidden by hand — names cells by original
+ * position (`app/state/domains/cell-positions.js`), whatever order they were
+ * open in, so it applies to these cells; and its fingerprint (cell count,
+ * cell-order digest) matches. The recorded set is the truth; the
  * specification says how it was made and whether it still reproduces.
  *
  * A session saved while genes were read for a sample of the open cells

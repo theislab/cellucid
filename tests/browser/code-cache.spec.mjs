@@ -20,6 +20,7 @@ import { readFileSync } from 'node:fs';
 
 import { expect, test } from './helpers/test.mjs';
 import { DEPLOYED_APP_ORIGIN, ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { dismissWelcome } from './helpers/welcome.mjs';
 
 test.use({ serviceWorkers: 'allow' });
 
@@ -34,11 +35,7 @@ const LOCAL_DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset
 
 async function openDataset(page, url) {
   await page.goto(url, { waitUntil: 'load' });
-  const welcome = page.locator('#welcome-modal');
-  if (await welcome.isVisible()) {
-    await page.keyboard.press('Escape');
-    await expect(welcome).toBeHidden();
-  }
+  await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 }
 

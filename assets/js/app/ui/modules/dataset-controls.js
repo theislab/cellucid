@@ -2078,6 +2078,39 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
   }
 
   /**
+   * Open what typed text names, as the address bar opens it (a link, an
+   * accession, a Cellucid server: `dataset-connections.js`
+   * `routeTypedAddress`), and show its dataset: a connection whose datasets
+   * are only listed (a catalog of several while another kind of source is
+   * shown, or one connected earlier) shows its default dataset. Failures are
+   * said where the address bar's are (the opening, the notice).
+   *
+   * @param {string} text
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{shown: boolean, problem: string|null}>} whether a
+   *   dataset of it is now open; `problem`: why the text opens nothing
+   */
+  async function openTypedAddress(text, { signal = null } = {}) {
+    const route = await datasetConnections.routeTypedAddress(text, { signal });
+    if (route.kind === 'invalid') return { shown: false, problem: route.message };
+    const sourceType = route.kind;
+    const connected = await datasetConnections.openConnection(sourceType, route.value);
+    if (!connected) return { shown: false, problem: null };
+    if (dataSourceManager.getCurrentSourceType() === sourceType) return { shown: true, problem: null };
+    const source = dataSourceManager.getSource(sourceType);
+    const datasets = await source.listDatasets();
+    const defaultId = source.getConnectionInfo?.()?.defaultDatasetId ?? datasets[0]?.id ?? null;
+    if (defaultId === null) return { shown: false, problem: `${route.value} holds no dataset.` };
+    try {
+      const ready = await handleDatasetChange(defaultId, sourceType, DATA_LOAD_METHODS.SESSION_SOURCE);
+      return { shown: ready === true && dataSourceManager.getCurrentSourceType() === sourceType, problem: null };
+    } catch (error) {
+      if (isCancellation(error)) return { shown: false, problem: null };
+      throw error;
+    }
+  }
+
+  /**
    * Read the open dataset again, in place, with the cells `cellSubset` asks
    * for (a cell subset request, `data/cell-subset-policy.js`; it is this
    * reading's own, never another's). Cells that are the open ones
@@ -2152,8 +2185,10 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     destroy,
     openDatasetSource: record =>
       invokeTracked(() => openDatasetSource(record)),
+    openTypedAddress: (text, options) =>
+      invokeTracked(() => openTypedAddress(text, options)),
     // A dataset opened from this computer, reopened from the handle kept
-    // of it (`app/local-file-handles.js`): what is kept, and the reopen.
+    // of it (`app/library/local-file-handles.js`): what is kept, and the reopen.
     keptLocalFile: datasetId =>
       invokeTracked(() => datasetConnections.keptLocalFile(datasetId)),
     reopenLocalFile: datasetId =>

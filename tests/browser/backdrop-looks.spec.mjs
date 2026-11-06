@@ -22,6 +22,7 @@ import { sceneQuietness } from './helpers/frame-scheduling.mjs';
 import { installMultiDimensionFixture } from './helpers/multi-dimension-fixture.mjs';
 import { decodePng } from './helpers/png-pixels.mjs';
 import { BACKDROP_LOOKS, BACKDROP_LOOK_IDS } from '../../assets/js/rendering/backdrops/backdrop-looks.js';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Bakes, several looks and multiview frames: the macOS Firefox runners render
 // in software, so the file carries its own budget, like the other WebGL specs.
@@ -328,7 +329,7 @@ test('reduced motion: no fade and no ambient motion; otherwise ambient motion is
 
 async function saveSession(page, testInfo, name) {
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath(name);
   await download.saveAs(sessionPath);
@@ -337,7 +338,7 @@ async function saveSession(page, testInfo, name) {
 
 async function loadSession(page, sessionPath) {
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 }

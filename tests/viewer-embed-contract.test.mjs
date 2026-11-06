@@ -270,9 +270,9 @@ test('a viewer host source opens its channel and reads its documents through the
     const commands = [];
     source.onMessage(message => commands.push(message.type));
     source.acceptCommands();
-    port1.postMessage({ t: 'text', s: 0, text: JSON.stringify({ type: 'resetCamera' }) });
+    port1.postMessage({ t: 'text', s: 0, text: JSON.stringify({ type: 'freeze' }) });
     await until(() => commands.length > 0, 'the command arrived');
-    assert.deepEqual(commands, ['resetCamera']);
+    assert.deepEqual(commands, ['freeze']);
 
     // The widget's output went away: the channel ends as stopped.
     const ends = [];

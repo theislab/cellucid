@@ -28,8 +28,9 @@ import {
 import { requireExactKeys } from '../../../../utils/exact-record.js';
 
 const REQUIRED_SELECTION_STATE_METHODS = Object.freeze([
-  'addHighlightDirect',
   'clearPreviewHighlight',
+  'ensureHighlightPage',
+  'getActivePage',
   'getActiveField',
   'getActiveViewId',
   'getCellIndicesForCategory',

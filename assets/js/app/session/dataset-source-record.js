@@ -13,7 +13,7 @@
  * - `{kind: 'file', name, dataset}`: a file or folder opened from this
  *   computer (`name` is the `.h5ad`, `.zarr.zip` or folder name). The session
  *   opens it only where this browser kept its handle, under `dataset`
- *   (`app/local-file-handles.js`, Chromium); elsewhere loading the session
+ *   (`app/library/local-file-handles.js`, Chromium); elsewhere loading the session
  *   asks for it by name. The handle is never part of the session;
  * - `null`: a notebook, or no dataset.
  *

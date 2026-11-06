@@ -1,0 +1,44 @@
+{
+  "examples": [
+    {
+      "height": 1,
+      "left": 0,
+      "panel": "Visualization",
+      "top": 0,
+      "width": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "height": {
+        "exclusiveMinimum": 0,
+        "type": "number"
+      },
+      "left": {
+        "type": "number"
+      },
+      "panel": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "top": {
+        "type": "number"
+      },
+      "width": {
+        "exclusiveMinimum": 0,
+        "type": "number"
+      }
+    },
+    "required": [
+      "panel",
+      "left",
+      "top",
+      "width",
+      "height"
+    ],
+    "type": "object"
+  },
+  "type": "layout.panel.place",
+  "version": 1
+}

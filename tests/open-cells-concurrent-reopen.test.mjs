@@ -10,6 +10,8 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 
 import { annData, categorical, dataFrame, dense, mapping, sparse, strings, zarrEntries } from './helpers/anndata-store.mjs';
 import { createAnnDataReaderHandler } from '../assets/js/data/anndata-reader-worker.js';

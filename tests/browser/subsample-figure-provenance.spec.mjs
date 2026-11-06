@@ -74,7 +74,7 @@ test('a figure of a subsample names its cells; a figure of every cell does not',
   await page.locator('#subsample-method').selectOption('uniform');
   await page.locator('#subsample-seed').fill('7');
   await page.locator('#subsample-apply').click();
-  await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount), { timeout: 30_000 }).toBe(120);
+  await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount)).toBe(120);
   const digest = await page.evaluate(() => window._cellucidState.cellIdentity.digest);
 
   const share = await exportSvg(page, testInfo, 'subsample');

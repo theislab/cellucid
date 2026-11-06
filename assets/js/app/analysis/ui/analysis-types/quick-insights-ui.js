@@ -49,6 +49,7 @@ import {
 } from '../../../ui/components/controls.js';
 import { formatCells, formatCount, formatCountOf, formatSignificant, countNoun } from '../../../../utils/format-units.js';
 import { PageSelectorComponent, PAGE_MODE } from '../shared/page-selector.js';
+import { createDomId } from '../../../ui/components/dom-id.js';
 
 /**
  * Quick Insights Panel
@@ -90,8 +91,8 @@ export class QuickInsights extends BaseAnalysisUI {
     // Request ID to track current computation (prevents stale renders)
     this._currentRequestId = 0;
 
-    // UI instance ID (used to avoid DOM id collisions)
-    this._uiId = `quick-insights-${Math.random().toString(36).slice(2, 9)}`;
+    // UI instance ID (used to avoid DOM id collisions), minted by the page's one id generator.
+    this._uiId = createDomId('quick-insights');
 
     // User-selected obs fields to show (persist across active page switches)
     /** @type {string[]} */
@@ -385,6 +386,53 @@ export class QuickInsights extends BaseAnalysisUI {
   _getObsVariableItems(type) {
     const vars = this.dataLayer.getAvailableVariables(type) || [];
     return vars.map(v => ({ key: v.key, label: v.name || v.key }));
+  }
+
+  /**
+   * The fields a section shows: the person's choice, or, before one, the
+   * first two the dataset offers of that kind. The default is shown, never
+   * kept as a choice: opening the analysis changes nothing.
+   * @param {'categorical'|'continuous'} kind
+   * @returns {string[]}
+   * @private
+   */
+  _shownObsKeys(kind) {
+    const categorical = kind === 'categorical';
+    const chosen = categorical ? this._selectedCategoricalObsKeys : this._selectedContinuousObsKeys;
+    const choseAny = categorical ? this._hasUserSelectedCategoricalObsFields : this._hasUserSelectedContinuousObsFields;
+    if (choseAny || chosen.length > 0) return [...chosen];
+    const variables = this.dataLayer.getAvailableVariables(categorical ? 'categorical_obs' : 'continuous_obs');
+    if (!Array.isArray(variables)) {
+      throw new TypeError(`${categorical ? 'Categorical' : 'Continuous'} observation variable inventory must be an array`);
+    }
+    return variables.slice(0, 2).map(variable => variable.key);
+  }
+
+  /**
+   * Choose the fields shown (`analysis.quick.set`): the composition
+   * (`categorical`) and statistics (`continuous`) fields, by name, only the
+   * kinds given. The whole choice is checked before anything changes.
+   * @param {{categorical?: string[], continuous?: string[]}} fields
+   * @returns {boolean} whether anything changed
+   */
+  setFields({ categorical, continuous }) {
+    const keysOf = kind => {
+      const variables = this.dataLayer.getAvailableVariables(kind);
+      return Array.isArray(variables) ? variables.map(variable => variable.key) : [];
+    };
+    const nextCategorical = categorical === undefined ? null : this._requireSelectedKeys(categorical, keysOf('categorical_obs'), 'Categorical observation');
+    const nextContinuous = continuous === undefined ? null : this._requireSelectedKeys(continuous, keysOf('continuous_obs'), 'Continuous observation');
+    const before = JSON.stringify([this._selectedCategoricalObsKeys, this._selectedContinuousObsKeys,
+      this._hasUserSelectedCategoricalObsFields, this._hasUserSelectedContinuousObsFields]);
+    if (nextCategorical !== null) this._applyCategoricalSelection(nextCategorical);
+    if (nextContinuous !== null) this._applyContinuousSelection(nextContinuous);
+    const changed = JSON.stringify([this._selectedCategoricalObsKeys, this._selectedContinuousObsKeys,
+      this._hasUserSelectedCategoricalObsFields, this._hasUserSelectedContinuousObsFields]) !== before;
+    if (changed) {
+      this._cache.clear();
+      void this._trackInteractiveTask(Promise.resolve(this.updateForSelectedPages()), 'Quick fields');
+    }
+    return changed;
   }
 
   /**
@@ -751,21 +799,13 @@ export class QuickInsights extends BaseAnalysisUI {
       }
     }
 
-    // Default selection (only before the user explicitly picks fields)
-    if (!this._hasUserSelectedCategoricalObsFields && this._selectedCategoricalObsKeys.length === 0) {
-      this._selectedCategoricalObsKeys = availableCatKeys.slice(0, Math.min(2, availableCatKeys.length));
-    }
-    if (!this._hasUserSelectedContinuousObsFields && this._selectedContinuousObsKeys.length === 0) {
-      this._selectedContinuousObsKeys = availableContKeys.slice(0, Math.min(2, availableContKeys.length));
-    }
-
     insights.fieldSelectionMethod =
       (this._hasUserSelectedCategoricalObsFields || this._hasUserSelectedContinuousObsFields)
         ? 'manual'
         : 'default';
 
-    const selectedCatKeys = [...this._selectedCategoricalObsKeys];
-    const selectedContKeys = [...this._selectedContinuousObsKeys];
+    const selectedCatKeys = this._shownObsKeys('categorical');
+    const selectedContKeys = this._shownObsKeys('continuous');
     const obsFields = [...selectedCatKeys, ...selectedContKeys];
     if (new Set(obsFields).size !== obsFields.length) {
       throw new Error(
@@ -1248,12 +1288,14 @@ export class QuickInsights extends BaseAnalysisUI {
       buttonLabel: 'Choose composition fields',
       title: 'Composition fields',
       items: catItems,
-      selectedKeys: this._selectedCategoricalObsKeys,
+      selectedKeys: this._shownObsKeys('categorical'),
       maxListHeight: 240,
       onApply: (keys) => {
         this._applyCategoricalSelection(keys);
         this._cache.clear();
         this.updateForSelectedPages();
+        // A person's choice of fields: a step (`analysis.quick.set`).
+        this._recordPersonChange('fields', { categorical: [...this._selectedCategoricalObsKeys] });
       }
     });
     this._fieldPickers.categorical = catPicker;
@@ -1268,7 +1310,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     if (!insights.categoricalSummaries || insights.categoricalSummaries.length === 0) {
       catSection.appendChild(createEmptyState(
-        this._selectedCategoricalObsKeys.length === 0
+        this._shownObsKeys('categorical').length === 0
           ? 'No composition fields selected.'
           : 'No composition data available.'
       ));
@@ -1334,12 +1376,13 @@ export class QuickInsights extends BaseAnalysisUI {
       buttonLabel: 'Choose statistics fields',
       title: 'Statistics fields',
       items: contItems,
-      selectedKeys: this._selectedContinuousObsKeys,
+      selectedKeys: this._shownObsKeys('continuous'),
       maxListHeight: 240,
       onApply: (keys) => {
         this._applyContinuousSelection(keys);
         this._cache.clear();
         this.updateForSelectedPages();
+        this._recordPersonChange('fields', { continuous: [...this._selectedContinuousObsKeys] });
       }
     });
     this._fieldPickers.continuous = contPicker;
@@ -1354,7 +1397,7 @@ export class QuickInsights extends BaseAnalysisUI {
 
     if (!insights.continuousSummaries || insights.continuousSummaries.length === 0) {
       contSection.appendChild(createEmptyState(
-        this._selectedContinuousObsKeys.length === 0
+        this._shownObsKeys('continuous').length === 0
           ? 'No statistics fields selected.'
           : 'No statistics data available.'
       ));
@@ -1478,7 +1521,10 @@ export class QuickInsights extends BaseAnalysisUI {
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId?.(pageId) || 0,
 
       // Callbacks
-      onSelectionChange: this._handlePageChange,
+      onSelectionChange: pageIds => {
+        this._handlePageChange(pageIds);
+        this._recordPersonChange('pages', { pageIds: [...(pageIds || [])] });
+      },
       onModeChange: this._handleModeChange.bind(this),
       onColorChange: this._handlePageColorChange
     });

@@ -2,23 +2,29 @@
  * @fileoverview Classification of GitHub, Worker, and network failures.
  *
  * The community annotation flows react very differently to an expired token, a
- * rate limit, an untrusted Worker origin, a missing repository, and a repository
- * that is missing the annotation template. Each caller asks the same questions,
- * so the questions live here rather than being re-derived from status codes and
- * message text at every call site.
+ * rate limit, an untrusted Worker origin, a missing repository, a Worker that
+ * cannot be reached, and a repository that does not follow the annotation
+ * layout. Each caller asks the same questions, so the questions live here.
+ *
+ * Every answer is read from what the error states -- its `code`, its HTTP
+ * `status`, where it was asked (`github.path`) and the flags the transport
+ * sets (`rateLimited`) -- never from its message text, which is for people.
  *
  * @module ui/modules/community-annotation/github-error-classification
  */
 
 import { selectAnnotationPublicationMode } from '../../../community-annotations/github-sync.js';
+import { WORKER_RESPONSE_CUT, WORKER_UNREACHABLE } from '../../../community-annotations/worker-request.js';
+import {
+  BYTE_SOURCE_FAILURES,
+  ByteSourceError,
+  isTransientFailure,
+  isUnanswered,
+} from '../../../../formats/io/byte-source.js';
 
 export function httpStatusOrNull(err) {
   const n = Number(err?.status);
   return Number.isFinite(n) ? n : null;
-}
-
-function lowerMessage(err) {
-  return String(err?.message || '').trim().toLowerCase();
 }
 
 export function gitHubApiPath(err) {
@@ -33,35 +39,21 @@ function isRepoInfoApiPath(path) {
   return /^\/repos\/[^/]+\/[^/]+$/i.test(String(path || ''));
 }
 
+/** GitHub refused the token: HTTP 401 (bad, expired or revoked credentials). */
 export function isTokenAuthFailure(err) {
-  if (!err) return false;
-  const statusCode = httpStatusOrNull(err);
-  const msg = lowerMessage(err);
-  if (statusCode === 401) return true;
-  if (statusCode === 403) {
-    return (
-      msg.includes('bad credentials') ||
-      msg.includes('invalid token') ||
-      msg.includes('requires authentication') ||
-      msg.includes('unauthorized') ||
-      msg.includes('token expired') ||
-      msg.includes('jwt expired')
-    );
-  }
-  return (
-    msg.includes('bad credentials') ||
-    msg.includes('invalid token') ||
-    msg.includes('requires authentication') ||
-    msg.includes('unauthorized')
-  );
+  return httpStatusOrNull(err) === 401;
 }
 
+/**
+ * GitHub limits this account's requests: HTTP 429, a 403 the transport read
+ * as a limit (`rateLimited`: a spent budget or a `Retry-After`, GitHub's
+ * secondary limits), or a request the transport gave up on for the limit.
+ */
 export function isRateLimitError(err) {
-  const statusCode = httpStatusOrNull(err);
-  if (statusCode === 429) return true;
-  if (statusCode !== 403) return false;
-  const msg = lowerMessage(err);
-  return msg.includes('rate limit') || msg.includes('secondary rate limit') || msg.includes('abuse detection');
+  const status = httpStatusOrNull(err);
+  if (status === 429) return true;
+  if (status === 403 && err?.rateLimited === true) return true;
+  return err instanceof ByteSourceError && err.code === BYTE_SOURCE_FAILURES.RATE_LIMITED;
 }
 
 export function isWorkerOriginSecurityError(err) {
@@ -69,51 +61,73 @@ export function isWorkerOriginSecurityError(err) {
   return code === 'GITHUB_WORKER_ORIGIN_INVALID' || code === 'GITHUB_WORKER_ORIGIN_UNTRUSTED';
 }
 
+/**
+ * The Worker runs another contract version than this Cellucid: an older one
+ * (`GITHUB_WORKER_OUTDATED`: its owner redeploys it) or one this Cellucid
+ * does not know (`GITHUB_WORKER_INCOMPATIBLE`: reload Cellucid). The error's
+ * own message says which remedy applies.
+ */
 export function isWorkerCompatibilityFailure(err) {
-  return String(err?.code || '').trim() === 'GITHUB_WORKER_INCOMPATIBLE';
+  const code = String(err?.code || '').trim();
+  return code === 'GITHUB_WORKER_INCOMPATIBLE' || code === 'GITHUB_WORKER_OUTDATED';
 }
 
-export function isNetworkFetchFailure(err) {
-  const msg = String(err?.message || '').trim();
-  if (err instanceof TypeError) return true;
-  return /failed to fetch|load failed|networkerror/i.test(msg);
+/**
+ * No answer this page may read came from the Worker: the transport's
+ * `GITHUB_WORKER_UNREACHABLE` (its `answeredBefore` tells a Worker that
+ * stopped answering from one never reached), a request the byte layer
+ * reports unanswered, or `fetch`'s own rejection (a `TypeError`).
+ */
+export function isWorkerUnreachable(err) {
+  return err?.code === WORKER_UNREACHABLE || isUnanswered(err) || err instanceof TypeError;
 }
 
+/** The Worker's answer began and broke off before it was complete. */
+export function isResponseCut(err) {
+  if (err?.code === WORKER_RESPONSE_CUT) return true;
+  return err instanceof ByteSourceError &&
+    (err.code === BYTE_SOURCE_FAILURES.NETWORK || err.code === BYTE_SOURCE_FAILURES.STALLED) &&
+    err.details?.phase === 'body';
+}
+
+/** A failure that may pass if the same request is made again later. */
 export function isTransientRoleResolutionFailure(err) {
   const status = httpStatusOrNull(err);
   return (
-    isNetworkFetchFailure(err) ||
-    err?.code === 'TIMEOUT' ||
-    status === 408 ||
+    isWorkerUnreachable(err) ||
+    isResponseCut(err) ||
     isRateLimitError(err) ||
+    isTransientFailure(err) ||
+    err?.transient === true ||
+    status === 408 ||
     (status !== null && status >= 500)
   );
 }
 
+/** The repository itself is gone or no longer readable: its metadata answered 404. */
 export function isRepoNotFoundOrNoAccess(err) {
-  const statusCode = httpStatusOrNull(err);
-  if (statusCode !== 404) return false;
-  const path = gitHubApiPath(err);
-  // Private repos may appear as 404 when access is lost; treat the repo as not accessible.
-  return isRepoInfoApiPath(path);
+  return httpStatusOrNull(err) === 404 && isRepoInfoApiPath(gitHubApiPath(err));
 }
 
+/**
+ * The repository does not follow the annotation layout
+ * (`COMMUNITY_ANNOTATION_REPOSITORY_LAYOUT_INVALID`: a missing
+ * `annotations/users/` or config, a schema that is not the current one, a
+ * branch that does not exist, a users tree GitHub truncated). Its message
+ * names the path and the remedy.
+ */
 export function isAnnotationRepoStructureError(err) {
-  const statusCode = httpStatusOrNull(err);
-  const path = gitHubApiPath(err);
-  const msg = String(err?.message || '').trim();
+  return err?.code === 'COMMUNITY_ANNOTATION_REPOSITORY_LAYOUT_INVALID';
+}
 
-  // Required template paths under the repo:
-  // - annotations/users/ (directory)
-  // - annotations/schema.json (file)
-  // - annotations/config.json (file)
-  if (statusCode === 404 && /\/contents\/annotations\/(users|schema\.json|config\.json)(?:\/|$)/i.test(path)) {
-    return true;
-  }
-  if (/Expected directory listing at annotations\/users/i.test(msg)) return true;
-  if (/Expected file at annotations\/(schema\.json|config\.json)/i.test(msg)) return true;
-  if (/Invalid JSON at annotations\/(schema\.json|config\.json)/i.test(msg)) return true;
-  return false;
+/**
+ * A repository-wide annotation file does not meet the contract
+ * (`annotations/config.json` invalid JSON or schema, or too large): the
+ * repository's authors fix it; nothing local is wrong.
+ */
+export function isAnnotationContractError(err) {
+  const code = String(err?.code || '').trim();
+  return code === 'COMMUNITY_ANNOTATION_CONTRACT_INVALID' || code === 'COMMUNITY_ANNOTATION_FILE_TOO_LARGE';
 }
 
 export function getPublishCapability(repoInfo) {

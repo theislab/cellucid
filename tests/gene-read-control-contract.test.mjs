@@ -126,11 +126,16 @@ function createState(sample) {
       state.asked.push({ cells, answer });
       return answer.promise;
     },
+    // A read runs until it is stopped, which keeps what it read (an AbortError, as the state's).
     readGenesForMoreCells(target) {
       state.reads.push(target);
-      return new Promise(() => {});
+      return new Promise((_resolve, reject) => { state.stopRead = reject; });
     },
-    stopReadingGenesForMoreCells() { state.stopped++; },
+    stopReadingGenesForMoreCells() {
+      state.stopped++;
+      state.stopRead?.(Object.assign(new Error('Reading genes for more cells was stopped.'), { name: 'AbortError' }));
+      state.stopRead = null;
+    },
     on: (_name, listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     off: (_name, listener) => listeners.delete(listener),
     emit: () => { for (const listener of listeners) listener({}); },
@@ -196,7 +201,9 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
   t.mock.timers.enable({ apis: ['setInterval'] });
   const dom = controlDom();
   const state = createState(null);
-  const control = initGeneReadControl({ dom, state });
+  let openCells = 'every cell';
+  const control = initGeneReadControl({ dom, state, openCellsKey: () => openCells });
+  assert.equal(control.genesAsked(), null, 'no genes asked for yet');
   assert.equal(dom.root.hidden, true, 'every open cell\'s genes are read: nothing to show');
   state.sample = { cells: 3_769, of: 2_282_447 };
   state.emit();
@@ -245,9 +252,10 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
   assert.equal(dom.percent.value, '25');
   state.asked.at(-1).answer.resolve({ bytes: 2.2e9, ms: 290_000, index: { refusal: null, fits: 570_612 } });
   await settle();
-  // Read: priced at the moment it starts, the chosen cells read.
+  // Read (the action cells.read-genes): priced at the moment it starts, the chosen cells read.
   dom.action.click();
   assert.equal(dom.action.disabled, true);
+  await settle();
   state.asked.at(-1).answer.resolve({ bytes: 2.2e9, ms: 290_000, index: { refusal: null, fits: 570_612 } });
   await settle();
   assert.deepEqual(state.reads, [570_612]);
@@ -263,6 +271,18 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
   assert.equal(dom.status.textContent, 'Reading 22K of 571K cells · ~4 min left');
   dom.action.click();
   assert.equal(state.stopped, 1, 'Stop keeps what is read');
+  await settle();
+  assert.equal(said.at(-1), 'Stopped. Genes read for 3,769 of 2,282,447 cells', 'the step ends with what was read');
+  // What the step asked for is what was read, on these open cells (the `cells` state domain).
+  assert.equal(control.genesAsked(), 3_769);
+  openCells = 'a subsample';
+  assert.equal(control.genesAsked(), null, 'a count asked on other cells says nothing of these');
+  control.setGenesAsked(1_000);
+  assert.equal(control.genesAsked(), 1_000);
+  control.setGenesAsked(null);
+  assert.equal(control.genesAsked(), null);
+  assert.throws(() => control.setGenesAsked(0), /whole number of cells/);
+  openCells = 'every cell';
   // Stopped: what was read is the sample, steps made afresh from it.
   state.growth = null;
   state.sample = { cells: 228_245, of: 2_282_447 };
@@ -276,8 +296,7 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
 test('Read never asks for more cells than the gene index fits here, and no room disables the slider', async t => {
   const dom = controlDom();
   const state = createState({ cells: 40_000, of: 455_000 });
-  const control = initGeneReadControl({ dom, state });
-  t.after(() => control.destroy());
+  const control = initGeneReadControl({ dom, state, openCellsKey: () => 'every cell' });
   // Chosen before the room was asked: 100 %.
   dom.slider.value = '4';
   dom.slider.dispatch('input');
@@ -288,13 +307,18 @@ test('Read never asks for more cells than the gene index fits here, and no room 
   state.asked.at(-1).answer.resolve({ bytes: 1e9, ms: 100_000, index: { refusal: null, fits: 120_000 } });
   await settle();
   dom.action.click();
+  await settle();
   state.asked.at(-1).answer.resolve({ bytes: 1e9, ms: 100_000, index: { refusal: 'needs more', fits: 100_000 } });
   await settle();
   assert.deepEqual(state.reads, [100_000], 'held to the room at the moment it starts');
+  // Stopped, the read ends; one control on the page reads genes at a time.
+  state.stopReadingGenesForMoreCells();
+  await settle();
+  control.destroy();
 
   const none = controlDom();
   const full = createState({ cells: 40_000, of: 455_000 });
-  const fullControl = initGeneReadControl({ dom: none, state: full });
+  const fullControl = initGeneReadControl({ dom: none, state: full, openCellsKey: () => 'every cell' });
   t.after(() => fullControl.destroy());
   none.percent.focus();
   full.asked[0].answer.resolve({ bytes: 1e9, ms: 1_000, index: { refusal: 'the gene index of 455,000 cells needs 3 GB', fits: 40_000 } });

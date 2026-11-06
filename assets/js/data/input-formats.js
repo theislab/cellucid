@@ -39,6 +39,8 @@
  * @module data/input-formats
  */
 
+import { PLACES, placePath } from '../app/ui/place-names.js';
+
 /**
  * @typedef {'file'|'zip'|'folder'} InputLayout
  * @typedef {'hdf5'|'zarr'|'rds'|'text'} InputContainer
@@ -228,6 +230,51 @@ export const INPUT_FORMATS = Object.freeze([
     writeAgain: 'Read it with scanpy (sc.read_10x_mtx(folder)) or Seurat (Read10X(folder)), add an embedding, and save it as .h5ad or with cellucid_prepare(), then open the new file.',
   }),
 ]);
+
+/**
+ * Cellucid's own files: not datasets, so no entry point opens them as one.
+ * Each is named by its endings and says, in one sentence (`said`), what it
+ * is and where it goes. The web app takes a library file dropped or chosen
+ * in Open… › File… to My datasets' Import (`app/library/library-file.js`)
+ * and refuses a session file with its sentence; Python (`cellucid serve`)
+ * and R say the same sentence when given one.
+ *
+ * @typedef {Object} CellucidFile
+ * @property {'library'|'session'} id
+ * @property {string} label
+ * @property {ReadonlyArray<string>} names - lower-case name endings
+ * @property {string} said
+ */
+
+/** @type {ReadonlyArray<Readonly<CellucidFile>>} */
+export const CELLUCID_FILES = Object.freeze([
+  Object.freeze({
+    id: 'library',
+    label: 'Cellucid library file',
+    names: Object.freeze(['.cellucid-library']),
+    said: 'This is a Cellucid library file: datasets of My datasets and their saved states, exported by the Cellucid web app. '
+      + `It is not a dataset: import it in the web app with ${placePath(PLACES.session, PLACES.openData, PLACES.myDatasets)} › All… › Import….`,
+  }),
+  Object.freeze({
+    id: 'session',
+    label: 'Cellucid session file',
+    names: Object.freeze(['.cellucid-session']),
+    said: 'This is a Cellucid session file: the history of one dataset, not a dataset. '
+      + `Open its dataset, then load it with ${placePath(PLACES.state, PLACES.sessionFile)} › Load… › Open a session file…; `
+      + 'in Python read it with cellucid.read_session(), in R with cellucid_read_session().',
+  }),
+]);
+
+/**
+ * Which of Cellucid's own files a name is (`CELLUCID_FILES`), or null.
+ *
+ * @param {string} name
+ * @returns {Readonly<CellucidFile>|null}
+ */
+export function cellucidFileOfName(name) {
+  const lower = String(name).toLowerCase();
+  return CELLUCID_FILES.find(file => file.names.some(ending => lower.endsWith(ending))) ?? null;
+}
 
 const BY_ID = new Map(INPUT_FORMATS.map(format => [format.id, format]));
 const LAYOUTS = Object.freeze(['file', 'zip', 'folder']);
@@ -481,7 +528,8 @@ function standsAlone(ending) {
 }
 
 /**
- * The `accept` list of the File… picker: every single-file name ending, in
+ * The `accept` list of the File… picker: every single-file name ending, and
+ * a library file's (`CELLUCID_FILES`: its import), each in
  * the shortest form that names only its format. A two-part ending whose
  * last part is an ending of its own is offered by that part (`.zip` covers
  * `.zarr.zip`); one whose last part is not (`.rds.gz`) is offered whole,
@@ -500,6 +548,8 @@ export function filePickerAccept() {
     if (last === ending || all.includes(last)) endings.add(last);
     else endings.add(ending);
   }
+  // A library file, which Open… › File… takes to My datasets' Import.
+  for (const ending of CELLUCID_FILES.find(file => file.id === 'library').names) endings.add(ending);
   // Compressed copies of the files read in parts (`compressedFormatOfName`),
   // offered whole, as `.rds.gz` is: an `.h5ad.gz`, never a bare `.gz`.
   for (const format of INPUT_FORMATS) {
@@ -621,6 +671,7 @@ export function inputFormatsDocument() {
       names: Object.fromEntries(Object.entries(format.names).map(([key, value]) => [key, [...value]])),
       ...(format.refusal === undefined ? {} : { refusal: format.refusal }),
     })),
+    cellucidFiles: CELLUCID_FILES.map(file => ({ id: file.id, label: file.label, names: [...file.names], said: file.said })),
   };
 }
 

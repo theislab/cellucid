@@ -22,7 +22,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  CELLUCID_FILES,
   INPUT_FORMATS,
+  cellucidFileOfName,
   compressedFormatOfName,
   defaultDatasetIdOf,
   fileFormatOfName,
@@ -54,7 +56,7 @@ const FIXTURE = path.join(ROOT, 'tests/fixtures/input-formats.json');
  * (`tests/test_input_formats.py`) and cellucid-r
  * (`tests/testthat/test-input-formats.R`) pin the same one.
  */
-const INPUT_FORMATS_SHA256 = '7c1e079c33dcd7d1abb17e4996e6e6cf35f1968327a9097701dd9a1ca860c902';
+const INPUT_FORMATS_SHA256 = 'bd7fa1e23a3fd24794b647c5969ddb1aaad9a7b613b1457261c3b10dd705e2e5';
 
 /** A dataset's structure for its default id (`defaultDatasetIdOf`), and its pinned digits. */
 const PBMC = Object.freeze({ nObs: 2700, nVars: 3, varNames: Object.freeze(['CD3E', 'MS4A1', 'LYZ']) });
@@ -173,6 +175,26 @@ test('a name says its format and layout; the longest ending wins', () => {
   assert.equal(readsFromHead(null), false);
 });
 
+test('Cellucid\'s own files are named, are no dataset, and say what they are and where they go', () => {
+  assert.deepEqual(CELLUCID_FILES.map(file => [file.id, file.label, [...file.names]]), [
+    ['library', 'Cellucid library file', ['.cellucid-library']],
+    ['session', 'Cellucid session file', ['.cellucid-session']],
+  ]);
+  assert.equal(cellucidFileOfName('My work.Cellucid-Library')?.id, 'library');
+  assert.equal(cellucidFileOfName('cellucid-session-2026-11-04.cellucid-session')?.id, 'session');
+  assert.equal(cellucidFileOfName('cells.h5ad'), null);
+  for (const file of CELLUCID_FILES) {
+    for (const name of file.names) {
+      assert.equal(fileFormatOfName(`x${name}`), null, `${name} is no dataset`);
+      assert.equal(localFileLayout({ name: `x${name}` }), null);
+    }
+  }
+  assert.match(cellucidFileOfName('x.cellucid-library').said, /library file.*Session › Open data › My datasets › All… › Import…\.$/);
+  assert.match(cellucidFileOfName('x.cellucid-session').said, /session file.*State › Session › Load… › Open a session file….*cellucid\.read_session\(\).*cellucid_read_session\(\)\.$/);
+  // Python and R read them from the document.
+  assert.deepEqual(JSON.parse(inputFormatsJson()).cellucidFiles, CELLUCID_FILES.map(file => ({ ...file, names: [...file.names] })));
+});
+
 test('a folder is a store by its name or by a marker file anywhere below it', () => {
   assert.deepEqual(folderFormatOfPaths(['cells.zarr/X/0']), { format: 'zarr', layout: 'folder' });
   assert.deepEqual(folderFormatOfPaths(['cells/.zgroup']), { format: 'zarr', layout: 'folder' });
@@ -269,7 +291,7 @@ test('catalogs, drops, the picker and the address bar take exactly the names the
   // A two-part ending is offered by its last part only when that part is an
   // ending of its own (`.zip` covers `.zarr.zip`); otherwise whole
   // (`.rds.gz`), never as a bare `.gz` that would offer every gzip file.
-  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
+  assert.equal(filePickerAccept(), '.h5ad,.zip,.loom,.h5,.h5mu,.rds.gz,.rds,.rdata.gz,.rda.gz,.rdata,.rda,.h5seurat,.cellucid-library,.h5ad.gz,.loom.gz,.h5.gz,.h5mu.gz');
   assert.ok(!filePickerAccept().split(',').includes('.gz'));
   assert.deepEqual(localFileLayout({ name: 'GSM1_seurat.rds.gz' }), 'file');
   assert.deepEqual(openableNamePhrases(), [

@@ -231,7 +231,8 @@ test('http sources wait as the host asks when it is busy, then read', async () =
 
 test('http sources refuse a file that changed while it was open', async () => {
   const bytes = pattern(100);
-  const host = fakeHost(bytes, ({ start, end, count }) => new Response(bytes.slice(start, end + 1), {
+  const rewritten = bytes.map(byte => byte ^ 0x5a);
+  const host = fakeHost(bytes, ({ start, end, count }) => new Response((count === 1 ? bytes : rewritten).slice(start, end + 1), {
     status: 206,
     headers: { ETag: count === 1 ? '"one"' : '"two"' },
   }));
@@ -264,7 +265,8 @@ test('http sources refuse an answer of another range, or of a file whose size ch
 
 test('http sources without an ETag tell a new version by its Last-Modified', async () => {
   const bytes = pattern(100);
-  const host = fakeHost(bytes, ({ start, end, count }) => new Response(bytes.slice(start, end + 1), {
+  const rewritten = bytes.map(byte => byte ^ 0x5a);
+  const host = fakeHost(bytes, ({ start, end, count }) => new Response((count === 1 ? bytes : rewritten).slice(start, end + 1), {
     status: 206,
     headers: { 'Last-Modified': count === 1 ? 'Mon, 26 Oct 2026 10:00:00 GMT' : 'Tue, 27 Oct 2026 10:00:00 GMT' },
   }));
@@ -1484,7 +1486,14 @@ test('a read through the page range cache fetches small held pieces again with t
 test('a page that does not answer holds a read for at most one round trip of the link, once a file; a cancelled read stops waiting at once', async t => {
   const { adoptRangeCachePort, withRangeCache } = await import('../assets/js/formats/io/range-cache.js');
   const { port1, port2 } = new MessageChannel();
-  port1.onmessage = () => {};
+  const asked = [];
+  // What each question to the page was given to answer: the length of the timer set as it is asked.
+  const givenMs = [];
+  const setTimer = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (run, ms, ...rest) => {
+    givenMs.push(ms);
+    return setTimer(run, ms, ...rest);
+  });
   adoptRangeCachePort(port2);
   t.after(() => {
     adoptRangeCachePort(null);
@@ -1493,26 +1502,32 @@ test('a page that does not answer holds a read for at most one round trip of the
   const bytes = pattern(1000);
   const source = recordingSource(bytes, POLICY);
   const cached = withRangeCache(source, 'key');
-  let started = performance.now();
+  const answered = new Promise(resolve => {
+    port1.onmessage = event => {
+      asked.push(event.data);
+      resolve();
+    };
+  });
   assert.deepEqual(await cached.read(0, 10, { link: { latencyMs: 40 } }), bytes.subarray(0, 10));
-  const waited = performance.now() - started;
-  assert.ok(waited >= 35 && waited < 1000, `waited ${waited} ms for a page that never answers`);
+  // The page is given one round trip of the link, and the read then goes to the host.
+  assert.deepEqual(givenMs, [40], 'a page that never answers holds the read for one round trip of the link');
+  assert.deepEqual(source.calls, [[0, 10]]);
+  await answered;
+  assert.equal(asked.length, 1);
   // What the page holds of a file is asked once: a read of ranges it is not
   // known to hold goes to the host at once.
-  started = performance.now();
   await cached.read(30, 10, { link: { latencyMs: 40 } });
-  assert.ok(performance.now() - started < 30, 'no second wait for the page');
+  assert.deepEqual(givenMs, [40], 'no second wait for the page');
   // Without a link the page is not asked at all.
-  started = performance.now();
   await cached.read(10, 10, {});
-  assert.ok(performance.now() - started < 30);
-  // Cancelled while it waits for the page: stops at once.
+  assert.deepEqual(givenMs, [40], 'no wait without a link');
+  assert.equal(asked.length, 1);
+  assert.deepEqual(source.calls, [[0, 10], [30, 10], [10, 10]]);
+  // Cancelled while it waits for the page (a wait of an hour): stops at once.
   const controller = new AbortController();
-  started = performance.now();
-  const reading = withRangeCache(source, 'another key').read(20, 10, { link: { latencyMs: 5000 }, signal: controller.signal });
-  setTimeout(() => controller.abort(new DOMException('stop', 'AbortError')), 20);
+  const reading = withRangeCache(source, 'another key').read(20, 10, { link: { latencyMs: 3_600_000 }, signal: controller.signal });
+  queueMicrotask(() => controller.abort(new DOMException('stop', 'AbortError')));
   await assert.rejects(reading, /stop/);
-  assert.ok(performance.now() - started < 1000, 'the cancel ended the wait');
 });
 
 test('a reader asks the page only for ranges the page holds of the file: what it holds, then what the reader hands it', async t => {

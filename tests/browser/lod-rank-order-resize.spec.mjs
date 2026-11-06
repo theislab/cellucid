@@ -19,10 +19,15 @@
  * stores, in 3D and in 2D. Right after the Apply, before the tree, the
  * reduced level draws its cells by rank at once. Stores are forced into
  * segments of 4,096 points so the resize crosses segment boundaries. The
- * cameras are the same object, checked equal before any pixel is compared.
+ * cameras are the same object, checked equal before any pixel is compared,
+ * and so is what the two frames submitted to the GPU
+ * (`helpers/gl-submissions.mjs`).
  */
 
 import { expect, test } from './helpers/test.mjs';
+import { recordSubmissions } from './helpers/gl-submissions.mjs';
+import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
+import { ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX } from './helpers/pixel-parity.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
@@ -35,7 +40,7 @@ const LARGEST = 30_000;
 
 for (const dimension of [3, 2]) {
   for (const [from, to] of [[20_000, LARGEST], [LARGEST, 12_345]]) {
-    test(`${dimension}D: ${from} -> ${to} cells in place draw what a direct open draws`, async ({ page }) => {
+    test(`${dimension}D: ${from} -> ${to} cells in place draw what a direct open draws`, async ({ page, browserName }) => {
       test.setTimeout(300_000);
       const pageErrors = [];
       page.on('pageerror', error => pageErrors.push(error.message));
@@ -44,31 +49,33 @@ for (const dimension of [3, 2]) {
       // A dataset of the dimension asked for, so the live view shows it.
       await loadSyntheticDataset(page, { pointCount: 5_000, pattern: dimension === 3 ? 'atlas' : 'flatumap' });
 
+      await page.evaluate(recordSubmissions);
       const result = await page.evaluate(async ({ dimension, from, to, largest, segmentPoints }) => {
         const viewer = window._cellucidViewer;
         const renderer = viewer.getHPRenderer();
         const gl = viewer.getGLContext();
+        const submissions = window.__submissions;
         const { OPEN_ORDER_PRIORITY } = await import('/assets/js/data/cell-priority.js');
-        const frames = count => new Promise(resolve => {
-          const step = () => (count-- <= 0 ? resolve() : requestAnimationFrame(step));
-          requestAnimationFrame(step);
-        });
+        const nextFrame = () => new Promise(resolve => { requestAnimationFrame(resolve); });
+        // Each wait is on the state itself, one animation frame at a time,
+        // as long as the machine takes: a tree is built in a worker and
+        // adopted over frames, and a frame is as slow as the renderer. The
+        // test's timeout bounds them.
         const settled = async () => {
-          for (let attempt = 0; attempt < 900; attempt += 1) {
-            if (viewer.getFrameScheduleState().settled) return;
-            await frames(1);
-          }
-          throw new Error(`Scene never settled: ${JSON.stringify(viewer.getFrameScheduleState())}`);
+          while (!viewer.getFrameScheduleState().settled) await nextFrame();
+        };
+        // The frame that shows a change has been drawn.
+        const drawn = async () => {
+          while (viewer.getFrameScheduleState().invalidated) await nextFrame();
         };
         const adopted = async () => {
-          for (let attempt = 0; attempt < 1800; attempt += 1) {
+          for (;;) {
             // The renderer facade hands out detached copies, so the store
             // order is asked whether it holds its tree's order whole.
             const tree = renderer.spatialIndices.get(dimension);
             if (tree?.lodLevels?.length > 0 && renderer._liveOrder?.complete === true) return;
-            await frames(1);
+            await nextFrame();
           }
-          throw new Error('The store never took its tree order.');
         };
         // One seeded cloud; every publication is a prefix of it, as the
         // cells of a priority-ordered opening are.
@@ -130,11 +137,19 @@ for (const dimension of [3, 2]) {
           ]) {
             viewer.setFrustumCulling(cull);
             viewer.setForceLOD(forced);
+            // A change of the point size and back: the frame is drawn again
+            // even where culling and the level stayed as they were.
             viewer.setPointSize(5.01);
             viewer.setPointSize(5);
-            await frames(4);
-            await settled();
-            frames_[name] = { pixels: read(), drawn: renderer.getStats('live').visiblePoints, level: renderer.getStats('live').lodLevel };
+            // Settled: the frame of the change and the one after it are drawn,
+            // and nothing asks for another. Their uniforms are recorded.
+            await submissions.recordingUniforms(settled);
+            frames_[name] = {
+              pixels: read(),
+              drawn: renderer.getStats('live').visiblePoints,
+              level: renderer.getStats('live').lodLevel,
+              submitted: submissions.last,
+            };
           }
           viewer.setFrustumCulling(false);
           viewer.setForceLOD(-1);
@@ -164,7 +179,7 @@ for (const dimension of [3, 2]) {
         publish(to, true);
         // Right after the Apply: the reduced level draws by rank, at once.
         viewer.setForceLOD(reducedLevel);
-        await frames(1);
+        await drawn();
         const atOnce = {
           level: renderer.getStats('live').lodLevel,
           drawn: renderer.getStats('live').visiblePoints,
@@ -188,10 +203,17 @@ for (const dimension of [3, 2]) {
           const other = inPlace.frames[name];
           let lit = 0;
           for (let index = 3; index < frame.pixels.length; index += 4) if (frame.pixels[index] !== 0) lit += 1;
+          let differing = 0;
+          for (let index = 0; index < frame.pixels.length; index += 4) {
+            if (frame.pixels[index] !== other.pixels[index] || frame.pixels[index + 1] !== other.pixels[index + 1]
+              || frame.pixels[index + 2] !== other.pixels[index + 2] || frame.pixels[index + 3] !== other.pixels[index + 3]) differing += 1;
+          }
           compared[name] = {
             inputs: [[frame.drawn, frame.level], [other.drawn, other.level]],
             lit,
+            differing,
             difference: firstDifference(frame.pixels, other.pixels),
+            submittedDifference: submissions.difference(frame.submitted, other.submitted),
           };
         }
         return {
@@ -213,7 +235,17 @@ for (const dimension of [3, 2]) {
       for (const [name, frame] of Object.entries(result.frames)) {
         expect(frame.inputs[1], `${name}: points drawn, level`).toEqual(frame.inputs[0]);
         expect(frame.lit, `${name}: lit pixels`).toBeGreaterThan(500);
-        expect(frame.difference, `${name}: first byte that differs`).toBe(-1);
+        // The same draws, ranges and uniforms on both sides.
+        expect(frame.submittedDifference, `${name}: what the two frames submitted`).toBeNull();
+        // Its stores were written two ways, so these are different GPU objects:
+        // on hosted macOS Firefox their pixels may round apart (`helpers/hosted-gl.mjs`),
+        // and no more than that: the stores, camera, level, cells drawn and
+        // everything submitted above are equal there as everywhere.
+        if (isHostedMacosFirefox(browserName)) {
+          expect(frame.differing, `${name}: pixels that differ`).toBeLessThanOrEqual(frame.lit * ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX);
+        } else {
+          expect(frame.difference, `${name}: first byte that differs`).toBe(-1);
+        }
       }
       expect(pageErrors).toEqual([]);
     });

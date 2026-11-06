@@ -1,0 +1,39 @@
+{
+  "examples": [
+    {
+      "description": "",
+      "genes": [
+        "x"
+      ],
+      "name": "x"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "description": {
+        "default": "",
+        "type": "string"
+      },
+      "genes": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "name": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "genes"
+    ],
+    "type": "object"
+  },
+  "type": "gene-set.save",
+  "version": 1
+}

@@ -2,7 +2,9 @@
  * @fileoverview Highlight page tabs UI.
  *
  * Manages the highlight page tab strip (switch, rename, delete, recolor) and
- * the drag-to-combine affordance (union / intersection).
+ * the drag-to-combine affordance (union / intersection). Every change is a
+ * highlight action (`highlight-actions.js`), dispatched with the pages' names;
+ * the tabs are redrawn from the state when it changes.
  *
  * @module ui/modules/highlight/highlight-pages-ui
  */
@@ -17,7 +19,7 @@ import {
 } from './exact-contract.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
 import { countNoun } from '../../../../utils/format-units.js';
-import { removeWithUndo } from './undo-removal.js';
+import { dispatchFromControl } from '../../../actions/control-dispatch.js';
 
 /**
  * @param {object} options
@@ -37,18 +39,10 @@ export function initHighlightPagesUI(options) {
     state,
     'Highlight pages state',
     [
-      'combineHighlightPages',
-      'createHighlightPage',
-      'deleteHighlightPage',
       'ensureHighlightPage',
       'getActivePageId',
       'getHighlightedCellCountForPage',
-      'getHighlightPages',
-      'highlightPageRecord',
-      'renameHighlightPage',
-      'restoreHighlightPage',
-      'setHighlightPageColor',
-      'switchToPage'
+      'getHighlightPages'
     ]
   );
   requireExactKeys(
@@ -56,14 +50,41 @@ export function initHighlightPagesUI(options) {
     ['pagesTabsEl', 'addPageBtn'],
     'Highlight pages DOM'
   );
-  /** Delete a page at once, offering Undo (`undo-removal.js`). */
-  function deletePageWithUndo(page) {
-    return removeWithUndo({
-      record: state.highlightPageRecord(page.id),
-      remove: () => state.deleteHighlightPage(page.id),
-      restore: record => state.restoreHighlightPage(record),
-      removed: `Page "${page.name}"`
-    });
+  /**
+   * Dispatch a page action; resolves to its result, or null when it was not
+   * applied (the notification already said why).
+   */
+  function act(type, params, failure) {
+    return dispatchFromControl(type, params, { failure, category: 'highlight' });
+  }
+
+  /** The current name of the page `pageId` names, or null once it is gone. */
+  function currentPageName(pageId) {
+    const page = state.getHighlightPages().find(candidate => candidate.id === pageId);
+    return page === undefined ? null : page.name;
+  }
+
+  /** Show a page by name, unless it is shown already. */
+  function showPage(pageId) {
+    const name = currentPageName(pageId);
+    if (name === null) return Promise.resolve(null);
+    if (state.getActivePageId() === pageId) return Promise.resolve(true);
+    return act('highlight.page.switch', { page: name }, 'Showing the highlight page failed');
+  }
+
+  /** Delete a page (one history step; the history undoes it). */
+  function deletePage(pageId) {
+    const name = currentPageName(pageId);
+    if (name === null) return Promise.resolve(null);
+    return act('highlight.page.delete', { page: name }, 'Deleting the highlight page failed');
+  }
+
+  /** The tab of `pageId` as drawn now (a redraw replaces tabs). */
+  function tabOf(pageId) {
+    for (const tab of highlightPagesTabsEl.querySelectorAll('.highlight-page-tab')) {
+      if (tab.dataset.pageId === pageId) return tab;
+    }
+    return null;
   }
 
   const highlightPagesTabsEl = requireDomElement(
@@ -142,12 +163,6 @@ export function initHighlightPagesUI(options) {
     return page;
   }
 
-  function requirePageOperation(result, label) {
-    if (result !== true) {
-      throw new Error(`${label} was rejected by highlight state.`);
-    }
-  }
-
   function focusPageTab(pageId) {
     if (destroyed) return false;
     const tabs = highlightPagesTabsEl.querySelectorAll('.highlight-page-tab');
@@ -199,21 +214,17 @@ export function initHighlightPagesUI(options) {
     menu.setAttribute('aria-label', `Combine ${sourcePage.name}`);
     menu.setAttribute('role', 'menu');
 
-    function combineWithPage(targetPage, operation) {
-      const newPage = requirePage(
-        state.combineHighlightPages(
-          sourcePageId,
-          targetPage.id,
-          operation
-        ),
-        'Combined highlight page'
-      );
-      requirePageOperation(
-        state.switchToPage(newPage.id),
-        'Switch to combined highlight page'
-      );
+    async function combineWithPage(targetPage, operation) {
       closeCombineMenu({ restoreFocus: false });
-      focusPageTab(newPage.id);
+      const sourceName = currentPageName(sourcePageId);
+      const targetName = currentPageName(targetPage.id);
+      if (sourceName === null || targetName === null) return;
+      const done = await act(
+        'highlight.page.combine',
+        { pages: [sourceName, targetName], operation },
+        'Combining the highlight pages failed'
+      );
+      if (done !== null) focusPageTab(state.getActivePageId());
     }
 
     for (const targetPage of targetPages) {
@@ -231,7 +242,7 @@ export function initHighlightPagesUI(options) {
           ? `Create a page with cells in both ${sourcePage.name} and ${targetPage.name}`
           : `Create a page with cells in either ${sourcePage.name} or ${targetPage.name}`;
         listen(operationButton, 'click', () => {
-          combineWithPage(targetPage, operation);
+          void combineWithPage(targetPage, operation);
         });
         menu.appendChild(operationButton);
       }
@@ -368,15 +379,17 @@ export function initHighlightPagesUI(options) {
       }
       finished = true;
       input.setCustomValidity('');
-      if (commit) {
-        requirePageOperation(
-          state.renameHighlightPage(page.id, newName),
-          'Highlight page rename'
-        );
-      }
+      const currentName = currentPageName(page.id);
       input.remove();
       activation.hidden = false;
       activation.focus();
+      if (commit && currentName !== null && newName !== currentName) {
+        void act(
+          'highlight.page.rename',
+          { page: currentName, name: newName },
+          'Renaming the highlight page failed'
+        );
+      }
     };
 
     listen(input, 'blur', () => finishRename({ commit: true }));
@@ -623,13 +636,13 @@ export function initHighlightPagesUI(options) {
       // A colour drag fires an input event per pointer move; each published
       // colour recolours the highlights and redraws every page tab and the
       // category builder. The swatch follows every event; the state gets
-      // the latest colour once per frame, and the final one on change.
+      // the latest colour once per frame, and the final one on change. The
+      // history keeps one step per page for the whole drag
+      // (`highlight.page.recolor` coalesces by page).
       const publishColor = coalesceToFrame(color => {
-        if (destroyed || !state.getHighlightPages().some(candidate => candidate.id === page.id)) return;
-        requirePageOperation(
-          state.setHighlightPageColor(page.id, color),
-          'Highlight page color update'
-        );
+        const name = destroyed ? null : currentPageName(page.id);
+        if (name === null) return;
+        void act('highlight.page.recolor', { page: name, color }, 'Recolouring the highlight page failed');
       });
       listen(colorInput, 'input', () => {
         const newColor = colorInput.value;
@@ -663,16 +676,12 @@ export function initHighlightPagesUI(options) {
       nameSpan.textContent = page.name;
       nameSpan.title = page.name;
 
-      listen(nameSpan, 'dblclick', (e) => {
+      listen(nameSpan, 'dblclick', async (e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (state.getActivePageId() !== page.id) {
-          requirePageOperation(
-            state.switchToPage(page.id),
-            'Highlight page switch'
-          );
-        }
-        startPageRename(tab, page);
+        if (await showPage(page.id) === null) return;
+        const current = tabOf(page.id);
+        if (current !== null) startPageRename(current, page);
       });
 
       activation.appendChild(nameSpan);
@@ -688,10 +697,7 @@ export function initHighlightPagesUI(options) {
       );
       activation.appendChild(countSpan);
       listen(activation, 'click', () => {
-        requirePageOperation(
-          state.switchToPage(page.id),
-          'Highlight page switch'
-        );
+        void showPage(page.id);
       });
       listen(activation, 'keydown', (e) => {
         const pageIndex = pages.findIndex(
@@ -715,11 +721,9 @@ export function initHighlightPagesUI(options) {
         if (targetIndex !== null) {
           e.preventDefault();
           const targetPage = pages[targetIndex];
-          requirePageOperation(
-            state.switchToPage(targetPage.id),
-            'Highlight page keyboard switch'
-          );
-          focusPageTab(targetPage.id);
+          void showPage(targetPage.id).then(done => {
+            if (done !== null) focusPageTab(targetPage.id);
+          });
           return;
         }
         const isCurrentlyActive = state.getActivePageId() === page.id;
@@ -728,31 +732,26 @@ export function initHighlightPagesUI(options) {
           (e.key === 'Enter' && isCurrentlyActive)
         ) {
           e.preventDefault();
-          if (!isCurrentlyActive) {
-            requirePageOperation(
-              state.switchToPage(page.id),
-              'Highlight page switch before rename'
-            );
+          if (isCurrentlyActive) {
+            startPageRename(tab, page);
+            return;
           }
-          startPageRename(tab, page);
+          void showPage(page.id).then(done => {
+            const current = tabOf(page.id);
+            if (done !== null && current !== null) startPageRename(current, page);
+          });
           return;
         }
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          requirePageOperation(
-            state.switchToPage(page.id),
-            'Highlight page keyboard switch'
-          );
-          focusPageTab(page.id);
+          void showPage(page.id).then(done => {
+            if (done !== null) focusPageTab(page.id);
+          });
           return;
         }
         if (e.key === 'Delete' && pages.length > 1) {
           e.preventDefault();
-          requirePageOperation(
-            deletePageWithUndo(page),
-            'Highlight page keyboard deletion'
-          );
-          focusPageTab(state.getActivePageId());
+          void deletePage(page.id).then(() => focusPageTab(state.getActivePageId()));
         }
       });
       tab.appendChild(activation);
@@ -796,10 +795,7 @@ export function initHighlightPagesUI(options) {
         deleteBtn.dataset.analyticsId = 'highlight:delete-page';
         listen(deleteBtn, 'click', (e) => {
           e.stopPropagation();
-          requirePageOperation(
-            deletePageWithUndo(page),
-            'Highlight page deletion'
-          );
+          void deletePage(page.id);
         });
         tab.appendChild(deleteBtn);
       }
@@ -818,16 +814,9 @@ export function initHighlightPagesUI(options) {
   state.ensureHighlightPage();
   renderHighlightPages();
 
-  listen(addHighlightPageBtn, 'click', () => {
-    const newPage = requirePage(
-      state.createHighlightPage(),
-      'Created highlight page'
-    );
-    requirePageOperation(
-      state.switchToPage(newPage.id),
-      'Switch to created highlight page'
-    );
-    focusPageTab(newPage.id);
+  listen(addHighlightPageBtn, 'click', async () => {
+    const made = await act('highlight.page.create', {}, 'Making a highlight page failed');
+    if (made !== null) focusPageTab(state.getActivePageId());
   });
 
   return {

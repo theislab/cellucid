@@ -29,6 +29,7 @@ import { createDrag, dragAndDrop, folderPayload } from './helpers/dataset-drop.m
 import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -173,13 +174,13 @@ test('a session saved on another modality restores it', async ({ page }, testInf
   };
   await applyModality('prot');
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('modality.cellucid-session');
   await (await downloadPromise).saveAs(sessionPath);
 
   await applyModality('rna');
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles(sessionPath);
   await expect.poll(() => page.evaluate(() => window._cellucidState.getDataMapping().modality)).toBe('prot');
   await expect.poll(() => page.evaluate(() => window._cellucidState.getVarAxisGeneCount())).toBe(5);
@@ -190,7 +191,7 @@ test('a 10x .h5 linked at startup fails over the empty viewer, saying what to do
   const url = `${SAMPLE_ORIGIN}/formats/filtered_feature_bc_matrix.h5`;
   const bytes = await readFile(await unpacked('tenx', 'tenx', 'v3-gex.h5'));
   await page.route(url, route => fulfillFile(route, bytes));
-  await page.goto(`/?data=${encodeURIComponent(url)}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(url)}`, { waitUntil: 'domcontentloaded' });
   const failed = page.locator('.opening-overlay[data-state="failed"]');
   await expect(failed).toBeVisible();
   await expect(failed.locator('.opening-title')).toHaveText('The data could not be opened');

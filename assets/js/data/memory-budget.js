@@ -29,7 +29,11 @@
  *   the GPU, the coloured field), a neighbour graph while a view shows its
  *   edges (`setWorkingSet('graph', bytes)`), what a worker builds while it
  *   builds it (a worker's `setWorkingSet` reaches the page, counted under the
- *   worker's name: the reader worker's `'graph build'`), and, where the browser can
+ *   worker's name: the reader worker's `'graph build'`), the values the
+ *   action history keeps for every step of the dataset shown
+ *   (`setWorkingSet('history', bytes)`, `app/history/dataset-history.js`: the
+ *   typed arrays of its value pool, each buffer once; the person's work,
+ *   never evicted, held while the dataset is shown), and, where the browser can
  *   measure the page (`measureUserAgentSpecificMemory`, cross-origin isolated
  *   pages only), what it uses beyond everything counted. The auto-fit sizes
  *   the open cells against the allowance (`anndata/subsample-plan.js`).

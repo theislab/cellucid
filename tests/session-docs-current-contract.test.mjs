@@ -3,6 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
 const MAINTAINER_REFERENCE_URL = new URL(
+  '../assets/js/app/session/README.md',
+  import.meta.url,
+);
+const INVENTORY_REFERENCE_URL = new URL(
   '../assets/js/app/state-serializer/README.md',
   import.meta.url,
 );
@@ -18,15 +22,20 @@ test('session maintainer reference describes only the atomic current format', as
   for (const exact of [
     'one current state document',
     'one awaited public operation',
-    'CELLUCID_SESSION/3',
-    'ui/figure-export',
-    'analysis/docked',
-    'cinematic/camera',
-    'Exactly one codes chunk is required for every categorical overlay field',
-    'one compact binary membership chunk per advertised group',
+    'CELLUCID_SESSION/4',
+    'history-file.js',
+    'values/<priority>/<k>',
+    'parts/<priority>/<k>',
+    'chat/<n>/<m>',
+    'journal/<n>',
+    'Bounded pieces',
+    'Compression, per chunk by measured gain',
+    'a value, an array or a part no step refers to and a step referring to a value the file lacks are rejected',
+    'one tracker of one root',
+    'A session file holds domain values as they are, with no encoder of its own per feature',
     'the complete restore rejects and rolls back',
     'no dataset-agnostic layout subset is salvaged',
-    'not accepted by the generic Session file **Load**',
+    'a session file holds domain values',
     'do not add a reader for an older shape',
   ]) {
     assert.match(normalized, new RegExp(
@@ -35,11 +44,12 @@ test('session maintainer reference describes only the atomic current format', as
     ));
   }
 
-  // The reference states which controls the generic contributor deliberately
-  // does not carry. That claim went stale once already — `pointer-lock` sat in
-  // DOMAIN_OWNED_IDS with no entry here, so a reader checking why the pointer
+  // The control inventory's reference states which controls it deliberately
+  // leaves out. That claim went stale once already — `pointer-lock` sat in
+  // DOMAIN_OWNED_IDS with no entry there, so a reader checking why the pointer
   // capture box does not come back found nothing. Derive the set rather than
-  // restating it, so the next id added there has to be explained here too.
+  // restating it, so the next id added there has to be explained there too.
+  const inventory = (await readFile(INVENTORY_REFERENCE_URL, 'utf8')).replaceAll(/\s+/g, ' ').trim();
   const uiControlsSource = await readFile(UI_CONTROLS_URL, 'utf8');
   const domainOwnedBlock = /const DOMAIN_OWNED_IDS = new Set\(\[([\s\S]*?)\]\)/
     .exec(uiControlsSource);
@@ -55,13 +65,13 @@ test('session maintainer reference describes only the atomic current format', as
     'DOMAIN_OWNED_IDS must be non-empty, or the loop below is vacuous',
   );
   const undocumented = domainOwnedIds.filter(
-    id => !normalized.includes(`\`${id}\``),
+    id => !inventory.includes(`\`${id}\``),
   );
   assert.deepEqual(
     undocumented,
     [],
-    'every id the generic UI contributor skips must be named in the '
-      + 'maintainer reference with the reason it is skipped; a silent exclusion '
+    'every id the control inventory leaves out must be named in its '
+      + 'reference with the reason it is left out; a silent exclusion '
       + 'is indistinguishable from a control that was forgotten',
   );
 
@@ -73,6 +83,16 @@ test('session maintainer reference describes only the atomic current format', as
     'pages/groups appear immediately',
     'dev-phase',
     'Recommended Additions',
+    // Session format 3: one state in per-feature chunks.
+    'CELLUCID_SESSION/3\\n',
+    'contributor',
+    'restore transaction',
+    'Exactly one codes chunk is required',
+    'membership chunk per advertised group',
+    'seven static chunks',
+    'PUBLISHED_DEFAULT_STATIC_CHUNK_PROFILE',
+    'Session Bundle Coverage',
+    'participant of the restore transaction whose rollback restores the previous',
     // Session format 1.
     'analysis/cache-inventory',
     'bulk-gene',

@@ -1,0 +1,12 @@
+{
+  "examples": [
+    {}
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "type": "highlight.clear-all",
+  "version": 1
+}

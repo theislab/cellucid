@@ -17,28 +17,36 @@
 import { EventEmitter } from '../utils/event-emitter.js';
 import { toCacheScopeKey, toSessionStorageKey } from './cache-scope.js';
 import { getCommunityAnnotationScopeLock } from './scope-lock.js';
+import { toCleanString } from '../../utils/clean-string.js';
 import {
-  ANNOTATION_LIMITS,
+  annotationSuggestionIdOwner,
   assertAnnotationBucket,
   assertConfigDocument,
   assertMergesDocument,
   assertUtcDateTime,
   assertUserDocument,
+  exactLabelForCompare,
   hasAnnotationSuggestionIdDelimiter,
+  isAnnotationExactNonblank,
+  isExactLinkedInHandle,
+  isExactOrcidId,
   isReservedAnnotationFieldKey,
   parseExactJson,
 } from './wire-contract.js';
-import { isExactOrcidId } from './profile-identifiers.js';
-import { formatCountOf } from '../../utils/format-units.js';
 import { throwIfAborted } from '../../utils/abort.js';
 
-const STORAGE_VERSION = 1;
+/**
+ * The local state format. 2: suggestion ids carry their owner
+ * (`ghid_<n>_...`, user file version 3) and only the SHAs the session reads
+ * are kept. A state written in another format is reported, never read.
+ */
+const STORAGE_VERSION = 2;
 
-const MAX_LABEL_LEN = 120;
-const MAX_ONTOLOGY_LEN = 64;
-const MAX_EVIDENCE_LEN = 2000;
-const MAX_COMMENT_LEN = 500;
-const MAX_MERGE_NOTE_LEN = 512;
+/** The remote files whose SHAs the session reads: config, merges and the current user's own file. */
+const SESSION_SHA_PATHS = Object.freeze([
+  'annotations/config.json',
+  'annotations/moderation/merges.json',
+]);
 
 const DEFAULT_MIN_ANNOTATORS = 1;
 const DEFAULT_CONSENSUS_THRESHOLD = 0.5;
@@ -48,12 +56,15 @@ const DEFAULT_CONSENSUS_THRESHOLD = 0.5;
 // without changing the common case.
 const FIELDKEY_ESCAPE_PREFIX = 'fk~';
 
-function toCleanString(value) {
-  return String(value ?? '').trim();
+/** Code-unit order: what anything written or exported is sorted by (the same bytes in every locale). */
+function compareCodeUnits(left, right) {
+  return left < right ? -1 : (left > right ? 1 : 0);
 }
 
-function exactLabelForCompare(value) {
-  return typeof value === 'string' ? value : '';
+/** A contract timestamp as an instant (milliseconds), so `...:00Z` and `...:00.000Z` compare equal. */
+function instantOf(value) {
+  const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function nowIso() {
@@ -99,35 +110,55 @@ function toFileUserKeyFromId(userId) {
   return id ? `ghid_${id}` : null;
 }
 
-function createId() {
+function randomId() {
   if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
     throw new Error('[CommunityAnnotationSession] crypto.randomUUID is required');
   }
   return crypto.randomUUID();
 }
 
-function assertStringLength(text, maxLen, fieldName = 'value') {
+/**
+ * A new suggestion id: its owner's identity, then a random UUID
+ * (`ghid_<n>_<uuid>`). The owner prefix is the contract's (user file
+ * version 3): no file can hold, or forge, another user's suggestion id.
+ */
+function createSuggestionId(owner) {
+  if (!/^ghid_[1-9][0-9]*$/.test(owner)) {
+    const error = new Error(
+      '[CommunityAnnotationSession] proposing a label requires your GitHub identity; sign in first'
+    );
+    error.code = 'COMMUNITY_ANNOTATION_IDENTITY_REQUIRED';
+    throw error;
+  }
+  return `${owner}_${randomId()}`;
+}
+
+/**
+ * Contributor text has no length limit of its own: the annotation file's
+ * 1,000,000 bytes bound it (`ANNOTATION_FILE_MAX_UTF8_BYTES`, checked when
+ * the file is composed for publishing).
+ */
+function assertOptionalString(text, fieldName = 'value') {
   if (text === null || text === undefined) return '';
   if (typeof text !== 'string') {
     throw new Error(`[CommunityAnnotationSession] ${fieldName} must be a string`);
   }
-  // `maxLen` null: a key the exporters write (a category label) has no length
-  // limit; the annotation file's byte cap bounds it.
-  if (maxLen !== null && Array.from(text).length > maxLen) {
+  return text;
+}
+
+/** An empty string, or text whose first and last characters are not whitespace (the contract's class). */
+function assertExactOrEmpty(text, fieldName) {
+  if (text && !isAnnotationExactNonblank(text)) {
     throw new Error(
-      `[CommunityAnnotationSession] ${fieldName} must be at most ${formatCountOf(maxLen, 'character')}`
+      `[CommunityAnnotationSession] ${fieldName} must not have leading or trailing whitespace`
     );
   }
   return text;
 }
 
-function assertExactNonblankString(
-  value,
-  maxLen,
-  fieldName = 'value'
-) {
-  const text = assertStringLength(value, maxLen, fieldName);
-  if (!/\S/.test(text) || /^\s|\s$/.test(text)) {
+function assertExactNonblankString(value, fieldName = 'value') {
+  const text = assertOptionalString(value, fieldName);
+  if (!isAnnotationExactNonblank(text)) {
     throw new Error(
       `[CommunityAnnotationSession] ${fieldName} must be nonblank without leading or trailing whitespace`
     );
@@ -135,21 +166,13 @@ function assertExactNonblankString(
   return text;
 }
 
-function assertOptionalExactNonblankString(
-  value,
-  maxLen,
-  fieldName = 'value'
-) {
+function assertOptionalExactNonblankString(value, fieldName = 'value') {
   if (value === null) return null;
-  return assertExactNonblankString(value, maxLen, fieldName);
+  return assertExactNonblankString(value, fieldName);
 }
 
 function assertSessionFieldKey(value, fieldName = 'fieldKey') {
-  const field = assertExactNonblankString(
-    value,
-    ANNOTATION_LIMITS.datasetId,
-    fieldName
-  );
+  const field = assertExactNonblankString(value, fieldName);
   if (isReservedAnnotationFieldKey(field)) {
     throw new Error(
       `[CommunityAnnotationSession] ${fieldName} uses the reserved ` +
@@ -160,11 +183,7 @@ function assertSessionFieldKey(value, fieldName = 'fieldKey') {
 }
 
 function assertSessionSuggestionId(value, fieldName = 'suggestionId') {
-  const id = assertExactNonblankString(
-    value,
-    ANNOTATION_LIMITS.suggestionId,
-    fieldName
-  );
+  const id = assertExactNonblankString(value, fieldName);
   if (hasAnnotationSuggestionIdDelimiter(id)) {
     throw new Error(
       `[CommunityAnnotationSession] ${fieldName} must not contain the ":" ` +
@@ -174,16 +193,8 @@ function assertSessionSuggestionId(value, fieldName = 'suggestionId') {
   return id;
 }
 
-function exactNonblankStringOrNull(value, maxLen) {
-  if (
-    typeof value !== 'string' ||
-    !/\S/.test(value) ||
-    /^\s|\s$/.test(value) ||
-    Array.from(value).length > maxLen
-  ) {
-    return null;
-  }
-  return value;
+function exactNonblankStringOrNull(value) {
+  return typeof value === 'string' && isAnnotationExactNonblank(value) ? value : null;
 }
 
 function encodeFieldKeyForKey(fieldKey) {
@@ -326,7 +337,7 @@ function sanitizeProfile(profile) {
     }
   }
   const username = normalizeUsername(profile?.username ?? '') || 'local';
-  const login = assertStringLength(profile?.login ?? '', 64, 'login');
+  const login = assertOptionalString(profile?.login ?? '', 'login');
   const githubUserIdRaw = profile?.githubUserId;
   let githubUserId = null;
   if (githubUserIdRaw !== null && githubUserIdRaw !== undefined) {
@@ -337,21 +348,17 @@ function sanitizeProfile(profile) {
     }
     githubUserId = githubUserIdRaw;
   }
-  const displayName = assertStringLength(profile?.displayName ?? '', 120, 'displayName');
-  const title = assertStringLength(profile?.title ?? '', 120, 'title');
-  const orcid = assertStringLength(profile?.orcid ?? '', 64, 'orcid');
-  const linkedin = assertStringLength(profile?.linkedin ?? '', 120, 'linkedin');
+  const displayName = assertOptionalString(profile?.displayName ?? '', 'displayName');
+  const title = assertOptionalString(profile?.title ?? '', 'title');
+  const orcid = assertOptionalString(profile?.orcid ?? '', 'orcid');
+  const linkedin = assertOptionalString(profile?.linkedin ?? '', 'linkedin');
   for (const [field, value] of [
     ['login', login],
     ['displayName', displayName],
     ['title', title],
     ['orcid', orcid],
   ]) {
-    if (value && (!/\S/.test(value) || /^\s|\s$/.test(value))) {
-      throw new Error(
-        `[CommunityAnnotationSession] ${field} must not have leading or trailing whitespace`
-      );
-    }
+    assertExactOrEmpty(value, field);
   }
   if (githubUserId === null && username !== 'local') {
     throw new Error(
@@ -363,7 +370,7 @@ function sanitizeProfile(profile) {
       '[CommunityAnnotationSession] username must match the GitHub user id'
     );
   }
-  if (linkedin && !/^[a-z0-9-]{3,120}$/.test(linkedin)) {
+  if (linkedin && !isExactLinkedInHandle(linkedin)) {
     throw new Error(
       '[CommunityAnnotationSession] linkedin must be a lowercase LinkedIn handle'
     );
@@ -377,17 +384,17 @@ function sanitizeProfile(profile) {
 }
 
 function sanitizeKnownUserProfile(input) {
-  const login = assertStringLength(input?.login ?? '', 64, 'login');
-  const displayName = assertStringLength(input?.displayName ?? '', 120, 'displayName');
-  const title = assertStringLength(input?.title ?? '', 120, 'title');
-  const orcid = assertStringLength(input?.orcid ?? '', 64, 'orcid');
-  const linkedin = assertStringLength(input?.linkedin ?? '', 120, 'linkedin');
+  const login = assertOptionalString(input?.login ?? '', 'login');
+  const displayName = assertOptionalString(input?.displayName ?? '', 'displayName');
+  const title = assertOptionalString(input?.title ?? '', 'title');
+  const orcid = assertOptionalString(input?.orcid ?? '', 'orcid');
+  const linkedin = assertOptionalString(input?.linkedin ?? '', 'linkedin');
   if (orcid && !isExactOrcidId(orcid)) {
     throw new Error(
       '[CommunityAnnotationSession] known profile orcid must be an exact checksum-valid ORCID iD'
     );
   }
-  if (linkedin && !/^[a-z0-9-]{3,120}$/.test(linkedin)) {
+  if (linkedin && !isExactLinkedInHandle(linkedin)) {
     throw new Error(
       '[CommunityAnnotationSession] known profile linkedin must be a lowercase LinkedIn handle'
     );
@@ -407,7 +414,6 @@ function normalizeUsername(username) {
       '[CommunityAnnotationSession] username must equal "local" or an exact ghid identity'
     );
   }
-  assertStringLength(username, 64, 'username');
   const id = Number(username.slice(5));
   if (
     !Number.isSafeInteger(id) ||
@@ -464,16 +470,10 @@ function normalizeMarkers(input) {
   const out = [];
   for (const raw of input) {
     if (typeof raw === 'string') {
-      if (!/\S/.test(raw)) {
-        throw new Error('[CommunityAnnotationSession] marker strings must be nonblank');
-      }
-      if (/^\s|\s$/.test(raw)) {
+      if (!isAnnotationExactNonblank(raw)) {
         throw new Error(
-          '[CommunityAnnotationSession] marker strings must not have leading or trailing whitespace'
+          '[CommunityAnnotationSession] marker strings must be nonblank without leading or trailing whitespace'
         );
-      }
-      if (Array.from(raw).length > 64) {
-        throw new Error('[CommunityAnnotationSession] marker strings must be at most 64 characters');
       }
       out.push(raw);
       continue;
@@ -488,16 +488,10 @@ function normalizeMarkers(input) {
         );
       }
       const gene = raw.gene;
-      if (typeof gene !== 'string' || !/\S/.test(gene)) {
-        throw new Error('[CommunityAnnotationSession] marker gene must be nonblank');
-      }
-      if (/^\s|\s$/.test(gene)) {
+      if (typeof gene !== 'string' || !isAnnotationExactNonblank(gene)) {
         throw new Error(
-          '[CommunityAnnotationSession] marker gene must not have leading or trailing whitespace'
+          '[CommunityAnnotationSession] marker gene must be nonblank without leading or trailing whitespace'
         );
-      }
-      if (Array.from(gene).length > 64) {
-        throw new Error('[CommunityAnnotationSession] marker gene must be at most 64 characters');
       }
       const entry = { gene };
       const logFC = raw.logFC;
@@ -523,34 +517,10 @@ function normalizeMarkers(input) {
 }
 
 function normalizeSuggestion(input, { proposedBy } = {}) {
-  const label = assertStringLength(input?.label, MAX_LABEL_LEN, 'label');
-  if (!/\S/.test(label) || /^\s|\s$/.test(label)) {
-    throw new Error(
-      '[CommunityAnnotationSession] label must be nonblank without leading or trailing whitespace'
-    );
-  }
-
-  const ontologyId = assertStringLength(
-    input?.ontologyId,
-    MAX_ONTOLOGY_LEN,
-    'ontologyId'
-  );
-  const evidence = assertStringLength(
-    input?.evidence,
-    MAX_EVIDENCE_LEN,
-    'evidence'
-  );
-  const editedAt = assertStringLength(input?.editedAt, 64, 'editedAt') || null;
-  for (const [field, value] of [
-    ['ontologyId', ontologyId],
-    ['evidence', evidence],
-  ]) {
-    if (value && (!/\S/.test(value) || /^\s|\s$/.test(value))) {
-      throw new Error(
-        `[CommunityAnnotationSession] ${field} must not have leading or trailing whitespace`
-      );
-    }
-  }
+  const label = assertExactNonblankString(input?.label, 'label');
+  const ontologyId = assertExactOrEmpty(assertOptionalString(input?.ontologyId, 'ontologyId'), 'ontologyId');
+  const evidence = assertExactOrEmpty(assertOptionalString(input?.evidence, 'evidence'), 'evidence');
+  const owner = normalizeUsername(proposedBy || input?.proposedBy || 'local') || 'local';
 
   const upvotes = uniqueStrings(ensureStringArray(input?.upvotes).map((u) => normalizeUsername(u)).filter(Boolean));
   const upSet = new Set(upvotes);
@@ -561,13 +531,13 @@ function normalizeSuggestion(input, { proposedBy } = {}) {
   );
 
   return {
-    id: createId(),
+    id: createSuggestionId(owner),
     label,
     ontologyId: ontologyId || null,
     evidence: evidence || null,
-    proposedBy: normalizeUsername(proposedBy || input?.proposedBy || 'local') || 'local',
+    proposedBy: owner,
     proposedAt: nowIso(),
-    editedAt,
+    editedAt: null,
     upvotes,
     downvotes,
     markers: normalizeMarkers(input?.markers),
@@ -576,46 +546,21 @@ function normalizeSuggestion(input, { proposedBy } = {}) {
 }
 
 function normalizeComment(input, { authorUsername } = {}) {
-  const text = assertStringLength(input?.text, MAX_COMMENT_LEN, 'comment text');
-  if (!/\S/.test(text) || /^\s|\s$/.test(text)) {
-    throw new Error(
-      '[CommunityAnnotationSession] comment text must be nonblank without leading or trailing whitespace'
-    );
-  }
+  const text = assertExactNonblankString(input?.text, 'comment text');
 
   const author = normalizeUsername(authorUsername || input?.authorUsername || 'local') || 'local';
   const id = input?.id === undefined
-    ? createId()
-    : assertStringLength(input.id, ANNOTATION_LIMITS.commentId, 'comment id');
+    ? randomId()
+    : assertExactNonblankString(input.id, 'comment id');
   const createdAt = input?.createdAt === undefined
     ? nowIso()
-    : assertStringLength(input.createdAt, 64, 'comment createdAt');
+    : assertUtcDateTime(input.createdAt, '$ comment createdAt');
   const editedAt =
     input?.editedAt === undefined || input.editedAt === null
       ? null
-      : assertStringLength(input.editedAt, 64, 'comment editedAt');
+      : assertUtcDateTime(input.editedAt, '$ comment editedAt');
 
   return { id, text, authorUsername: author, createdAt, editedAt };
-}
-
-function normalizeCommentArray(comments) {
-  if (!Array.isArray(comments)) {
-    throw new Error('[CommunityAnnotationSession] comments must be an array');
-  }
-  const out = [];
-  const seenIds = new Set();
-  for (const c of comments) {
-    const normalized = normalizeComment(c);
-    if (!normalized) {
-      throw new Error('[CommunityAnnotationSession] comment is invalid');
-    }
-    if (seenIds.has(normalized.id)) {
-      throw new Error('[CommunityAnnotationSession] comment ids must be unique');
-    }
-    seenIds.add(normalized.id);
-    out.push(normalized);
-  }
-  return out;
 }
 
 function suggestionKey(fieldKey, catKey, suggestionId) {
@@ -641,130 +586,121 @@ function parseBucketKey(bucket) {
   return { fieldKey, catKey };
 }
 
-function normalizeModerationMerge(entry) {
-  const document = {
-    version: 1,
-    updatedAt: entry?.at,
-    merges: [entry],
-  };
-  assertMergesDocument(document, { path: '$ moderation merge' });
-  return { ...entry };
-}
-
-function compactModerationMerges(merges) {
+/**
+ * Validate a whole moderation-merge list once: one merge per (bucket, from),
+ * no cycles, every field exact (the contract's merges view). Every list the
+ * session keeps passed through here, so nothing that reads it validates again.
+ */
+function assertModerationMerges(merges, path = '$ moderation merges') {
   if (!Array.isArray(merges)) {
     throw new Error('[CommunityAnnotationSession] moderation merges must be an array');
   }
-  assertMergesDocument(
-    { version: 1, updatedAt: nowIso(), merges },
-    { path: '$ moderation merges' }
-  );
+  assertMergesDocument({ version: 1, updatedAt: nowIso(), merges }, { path });
+  return merges;
+}
+
+/** A validated merge list in its written order: by bucket, then source id, in code units. */
+function compactModerationMerges(merges) {
+  assertModerationMerges(merges);
   return merges
     .map((entry) => ({ ...entry }))
-    .sort((a, b) => {
-      const ka = `${a.bucket}::${a.fromSuggestionId}`;
-      const kb = `${b.bucket}::${b.fromSuggestionId}`;
-      return ka.localeCompare(kb);
-    });
+    .sort((a, b) =>
+      compareCodeUnits(a.bucket, b.bucket) ||
+      compareCodeUnits(a.fromSuggestionId, b.fromSuggestionId)
+    );
 }
 
 function resolveMergeTarget(fromId, fromToMap) {
-  const start = toCleanString(fromId);
-  if (!start) return null;
-  let cur = start;
+  let cur = fromId;
   const seen = new Set([cur]);
   while (fromToMap.has(cur)) {
-    const next = toCleanString(fromToMap.get(cur));
-    if (!next) break;
-    if (seen.has(next)) return null; // cycle
+    const next = fromToMap.get(cur);
+    if (seen.has(next)) return null; // cycle (a validated list has none)
     seen.add(next);
     cur = next;
   }
   return cur;
 }
 
-function buildEffectiveModerationMergeMapForBucket(merges, bucket) {
-  const bucketClean = toCleanString(bucket);
-  if (!bucketClean || !Array.isArray(merges) || merges.length === 0) return new Map();
-
-  /** @type {Map<string, {at: string, index: number, into: string}>} */
-  const newestByFrom = new Map();
-  const fromTo = new Map();
-
-  const isNewer = (prev, nextAt, nextIndex) => {
-    const prevAt = toCleanString(prev?.at || '');
-    const nextAtClean = toCleanString(nextAt || '');
-    if (prevAt && nextAtClean) {
-      if (nextAtClean > prevAt) return true;
-      if (nextAtClean < prevAt) return false;
-      return nextIndex > (prev?.index ?? -1);
-    }
-    if (!prevAt && nextAtClean) return true;
-    if (prevAt && !nextAtClean) return false;
-    return nextIndex > (prev?.index ?? -1);
-  };
-
-  for (let i = 0; i < merges.length; i++) {
-    const m = normalizeModerationMerge(merges[i]);
-    if (!m || m.bucket !== bucketClean) continue;
-    const from = toCleanString(m.fromSuggestionId);
-    const into = toCleanString(m.intoSuggestionId);
-    if (!from || !into) continue;
-    const prev = newestByFrom.get(from) || null;
-    const time = toCleanString(m.editedAt || m.at || '');
-    if (!prev || isNewer(prev, time, i)) {
-      newestByFrom.set(from, { at: time, index: i, into });
-      fromTo.set(from, into);
-    }
-  }
-
-  return fromTo;
-}
-
-function buildEffectiveModerationMergeMapByBucket(merges) {
+/**
+ * The merge map of every bucket (from id -> into id) of a validated merge
+ * list. A list holds one merge per (bucket, from), so the map is the list.
+ */
+function buildMergeMapsByBucket(merges) {
   /** @type {Map<string, Map<string, string>>} */
   const out = new Map();
-  if (!Array.isArray(merges) || merges.length === 0) return out;
-  /** @type {Map<string, Map<string, {at: string, index: number, into: string}>>} */
-  const newest = new Map();
-
-  const isNewer = (prev, nextAt, nextIndex) => {
-    const prevAt = toCleanString(prev?.at || '');
-    const nextAtClean = toCleanString(nextAt || '');
-    if (prevAt && nextAtClean) {
-      if (nextAtClean > prevAt) return true;
-      if (nextAtClean < prevAt) return false;
-      return nextIndex > (prev?.index ?? -1);
+  for (const merge of merges) {
+    let map = out.get(merge.bucket);
+    if (map === undefined) {
+      map = new Map();
+      out.set(merge.bucket, map);
     }
-    if (!prevAt && nextAtClean) return true;
-    if (prevAt && !nextAtClean) return false;
-    return nextIndex > (prev?.index ?? -1);
-  };
-
-  for (let i = 0; i < merges.length; i++) {
-    const m = normalizeModerationMerge(merges[i]);
-    if (!m) continue;
-    const bucket = toCleanString(m.bucket);
-    const from = toCleanString(m.fromSuggestionId);
-    const into = toCleanString(m.intoSuggestionId);
-    if (!bucket || !from || !into) continue;
-    if (!newest.has(bucket)) newest.set(bucket, new Map());
-    const bucketNewest = newest.get(bucket);
-    const prev = bucketNewest.get(from) || null;
-    const time = toCleanString(m.editedAt || m.at || '');
-    if (!prev || isNewer(prev, time, i)) {
-      bucketNewest.set(from, { at: time, index: i, into });
-    }
-  }
-
-  for (const [bucket, bucketNewest] of newest.entries()) {
-    const map = new Map();
-    for (const [from, meta] of bucketNewest.entries()) {
-      map.set(from, meta.into);
-    }
-    out.set(bucket, map);
+    map.set(merge.fromSuggestionId, merge.intoSuggestionId);
   }
   return out;
+}
+
+const EMPTY_MERGE_MAP = Object.freeze(new Map());
+
+/**
+ * The consensus of one bucket's bundled suggestions (`_bucketView`).
+ *
+ * The leader has the most net votes (up - down), then the most up votes.
+ * `confidence` = leader's net votes / unique voters of the bucket. Fewer
+ * voters than `minAnnotators`, or no voter at all, is `pending` (zero voters
+ * never make a consensus, whatever the settings); a tie for the lead is
+ * `disputed`; otherwise `consensus` when confidence reaches `threshold`.
+ */
+function consensusOf(list, settings) {
+  if (!list.length) {
+    return { status: 'pending', label: null, confidence: 0, voters: 0, netVotes: 0, suggestionId: null };
+  }
+  let bestNet = null;
+  let bestUp = null;
+  const leaders = [];
+  for (const s of list) {
+    const up = s.upvotes.length;
+    const net = up - s.downvotes.length;
+    if (bestNet === null || net > bestNet || (net === bestNet && up > bestUp)) {
+      bestNet = net;
+      bestUp = up;
+      leaders.length = 0;
+      leaders.push(s);
+    } else if (net === bestNet && up === bestUp) {
+      leaders.push(s);
+    }
+  }
+  // Bundles have distinct labels, so tied leaders name distinct labels.
+  const label = leaders.map((s) => s.label).sort(compareCodeUnits).join(', ');
+  const isTie = leaders.length > 1;
+  const suggestionId = isTie ? null : leaders[0].id;
+
+  const voterSet = new Set();
+  for (const s of list) {
+    for (const u of s.upvotes) voterSet.add(u);
+    for (const u of s.downvotes) voterSet.add(u);
+  }
+  const voters = voterSet.size;
+  if (voters === 0 || voters < settings.minAnnotators) {
+    return { status: 'pending', label, confidence: 0, voters, netVotes: bestNet, suggestionId };
+  }
+  // Net support share (-1..1) of the unique voters of the bucket.
+  const confidence = bestNet / voters;
+  // A tie is always disputed: no single label leads.
+  const status = (!isTie && confidence >= settings.threshold) ? 'consensus' : 'disputed';
+  return { status, label, confidence, voters, netVotes: bestNet, suggestionId };
+}
+
+/** A comment's last write (edit, else creation) as an instant. */
+function commentInstant(comment) {
+  return instantOf(comment.editedAt || comment.createdAt) ?? -Infinity;
+}
+
+/** Comments in creation order (instants; then author and id in code units, so every browser writes one order). */
+function commentOrder(a, b) {
+  return ((instantOf(a.createdAt) ?? 0) - (instantOf(b.createdAt) ?? 0)) ||
+    compareCodeUnits(a.authorUsername, b.authorUsername) ||
+    compareCodeUnits(a.id, b.id);
 }
 
 function parseVoteKey(key) {
@@ -928,16 +864,19 @@ function assertExactLocalFields(value, path, fields) {
   return object;
 }
 
-function assertRemoteFileShaMap(value, path = '$ remote file SHAs') {
+/**
+ * A map of repository paths to Git blob SHAs. `ownPath` given (the SHAs the
+ * session keeps): only config, merges and that user file; otherwise (SHAs a
+ * Pull hands in) any annotation file.
+ */
+function assertRemoteFileShaMap(value, path = '$ remote file SHAs', { ownPath } = {}) {
   const map = assertLocalRecord(value, path);
   for (const [filePath, sha] of Object.entries(map)) {
-    const supportedPath =
-      filePath === 'annotations/config.json' ||
-      filePath === 'annotations/moderation/merges.json' ||
-      /^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(filePath);
+    const supportedPath = ownPath === undefined
+      ? SESSION_SHA_PATHS.includes(filePath) || /^annotations\/users\/ghid_[1-9][0-9]*\.json$/.test(filePath)
+      : SESSION_SHA_PATHS.includes(filePath) || filePath === ownPath;
     if (
       !supportedPath ||
-      filePath.length > 512 ||
       typeof sha !== 'string' ||
       !/^[0-9a-f]{40}$/.test(sha)
     ) {
@@ -945,6 +884,11 @@ function assertRemoteFileShaMap(value, path = '$ remote file SHAs') {
     }
   }
   return map;
+}
+
+/** The current user's own file path for a profile, or null without a GitHub identity. */
+function ownUserFilePath(username) {
+  return /^ghid_[1-9][0-9]*$/.test(username) ? `annotations/users/${username}.json` : null;
 }
 
 function assertLocalProfile(value, scopeUserId) {
@@ -957,29 +901,14 @@ function assertLocalProfile(value, scopeUserId) {
     'orcid',
     'linkedin',
   ]);
-  if (
-    typeof profile.username !== 'string' ||
-    !profile.username ||
-    profile.username.length > ANNOTATION_LIMITS.username
-  ) {
+  if (typeof profile.username !== 'string' || !profile.username) {
     throw new Error('$ local state.profile.username: must be a nonempty string');
   }
-  for (const [field, limit] of [
-    ['login', ANNOTATION_LIMITS.login],
-    ['displayName', ANNOTATION_LIMITS.displayName],
-    ['title', ANNOTATION_LIMITS.title],
-    ['orcid', ANNOTATION_LIMITS.orcid],
-    ['linkedin', ANNOTATION_LIMITS.linkedin],
-  ]) {
-    if (
-      typeof profile[field] !== 'string' ||
-      Array.from(profile[field]).length > limit
-    ) {
-      throw new Error(
-        `$ local state.profile.${field}: must be a string of at most ${formatCountOf(limit, 'character')}`
-      );
+  for (const field of ['login', 'displayName', 'title', 'orcid', 'linkedin']) {
+    if (typeof profile[field] !== 'string') {
+      throw new Error(`$ local state.profile.${field}: must be a string`);
     }
-    if (profile[field] && (!/\S/.test(profile[field]) || /^\s|\s$/.test(profile[field]))) {
+    if (profile[field] && !isAnnotationExactNonblank(profile[field])) {
       throw new Error(
         `$ local state.profile.${field}: must be nonblank without edge whitespace`
       );
@@ -1010,7 +939,7 @@ function assertLocalProfile(value, scopeUserId) {
       '$ local state.profile.githubUserId: does not match the active cache scope'
     );
   }
-  if (profile.linkedin && !/^[a-z0-9-]{3,120}$/.test(profile.linkedin)) {
+  if (profile.linkedin && !isExactLinkedInHandle(profile.linkedin)) {
     throw new Error('$ local state.profile.linkedin: has an invalid format');
   }
   if (profile.orcid && !isExactOrcidId(profile.orcid)) {
@@ -1036,8 +965,7 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
   document.annotationFields.forEach((field, index) => {
     if (
       typeof field !== 'string' ||
-      !/\S/.test(field) ||
-      /^\s|\s$/.test(field)
+      !isAnnotationExactNonblank(field)
     ) {
       throw new Error(
         `$ local state.annotationFields[${index}]: must be a nonblank string`
@@ -1225,7 +1153,8 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
 
   assertRemoteFileShaMap(
     document.remoteFileShas,
-    '$ local state.remoteFileShas'
+    '$ local state.remoteFileShas',
+    { ownPath: ownUserFilePath(profile.username) }
   );
   if (document.lastSyncAt !== null) {
     assertUtcDateTime(document.lastSyncAt, '$ local state.lastSyncAt');
@@ -1240,8 +1169,9 @@ function assertLocalPersistenceDocument(value, { scopeUserId = null } = {}) {
  * happens in `CommunityAnnotationSession#_mergeRemoteUserFilesExact`.
  *
  * What is kept: each user's public profile, the current user's own file (for
- * multi-device hydration), deletion markers, the newest copy of every
- * suggestion, and every other user's votes and comments.
+ * multi-device hydration), deletion markers, every suggestion (a suggestion
+ * id names its owner, so it lives in exactly one file), and every other
+ * user's votes and comments.
  */
 export class RemoteUserFiles {
   /**
@@ -1256,43 +1186,53 @@ export class RemoteUserFiles {
     this.ownDoc = null;
     /** @type {Array<[string, string, string]>} bucket, suggestion id, owner */
     this.deletions = [];
-    /** @type {Map<string, { bucket: string, suggestion: object, sourceUser: string, path: string }>} */
+    /** @type {Map<string, { bucket: string, suggestion: object, sourceUser: string }>} */
     this.suggestions = new Map();
     /** @type {Map<string, Map<string, 'up'|'down'>>} suggestion id -> user -> direction */
     this.votes = new Map();
     /** @type {Map<string, Map<string, object>>} suggestion id -> author and comment id -> comment */
     this.comments = new Map();
     this._usernames = new Set();
-    /** @type {Map<string, { bucket: string, proposedBy: string }>} */
-    this._identity = new Map();
   }
 
-  /** @param {object} document - One parsed `annotations/users/*.json`. */
-  add(document) {
-    const index = this.count;
-    const path = `$ user documents[${index}]`;
-    assertUserDocument(document, { path });
-    if (this._usernames.has(document.username)) {
-      throw new Error(
-        `${path}.username: duplicate user file identity ` +
-        `${JSON.stringify(document.username)}`
-      );
-    }
-    for (const [bucket, list] of Object.entries(document.suggestions)) {
-      list.forEach((suggestion, listIndex) => {
-        const previous = this._identity.get(suggestion.id);
-        if (
-          previous !== undefined &&
-          (previous.bucket !== bucket || previous.proposedBy !== suggestion.proposedBy)
-        ) {
-          throw new Error(
-            `${path}.suggestions[${JSON.stringify(bucket)}][${listIndex}].id: ` +
-            `${JSON.stringify(suggestion.id)} conflicts with the suggestion owned by ` +
-            `${JSON.stringify(previous.proposedBy)} in bucket ` +
-            `${JSON.stringify(previous.bucket)}`
-          );
-        }
-      });
+  /**
+   * Fold one user file's dataset view in. A file that is not a valid view, a
+   * second file of one user, or a suggestion whose id does not name its
+   * proposer is refused before anything of it is folded, with
+   * `code: 'COMMUNITY_ANNOTATION_FILE_REJECTED'` and the file's `path`, so
+   * the caller can leave that one file out of the Pull and say so.
+   *
+   * @param {object} document - One parsed `annotations/users/*.json` dataset view.
+   * @param {{path?: string|null}} [options] - The file's repository path.
+   */
+  add(document, { path = null } = {}) {
+    const label = path ?? `$ user documents[${this.count}]`;
+    try {
+      assertUserDocument(document, { path: label });
+      if (this._usernames.has(document.username)) {
+        throw new Error(
+          `${label}.username: duplicate user file identity ${JSON.stringify(document.username)}`
+        );
+      }
+      for (const [bucket, list] of Object.entries(document.suggestions)) {
+        list.forEach((suggestion, listIndex) => {
+          if (
+            annotationSuggestionIdOwner(suggestion.id) !== document.username ||
+            this.suggestions.has(suggestion.id)
+          ) {
+            throw new Error(
+              `${label}.suggestions[${JSON.stringify(bucket)}][${listIndex}].id: ` +
+              `${JSON.stringify(suggestion.id)} is not a suggestion id of ${JSON.stringify(document.username)}`
+            );
+          }
+        });
+      }
+    } catch (cause) {
+      const error = new Error(cause?.message || String(cause));
+      error.code = 'COMMUNITY_ANNOTATION_FILE_REJECTED';
+      error.path = path;
+      error.cause = cause;
+      throw error;
     }
     const docUser = document.username;
     this._usernames.add(docUser);
@@ -1306,27 +1246,14 @@ export class RemoteUserFiles {
       for (const id of ids) this.deletions.push([bucket, id, docUser]);
     }
 
-    // The newest copy of each suggestion wins, as in mergeSuggestionMeta(); a
-    // tie goes to another user's copy over the current user's.
-    const preferIncoming = docUser !== this.ownUsername;
     for (const [bucket, list] of Object.entries(document.suggestions)) {
-      list.forEach((suggestion, listIndex) => {
-        this._identity.set(suggestion.id, { bucket, proposedBy: suggestion.proposedBy });
-        const previous = this.suggestions.get(suggestion.id);
-        let incomingWins = true;
-        if (previous !== undefined) {
-          const leftTime = Date.parse(previous.suggestion.editedAt || previous.suggestion.proposedAt);
-          const rightTime = Date.parse(suggestion.editedAt || suggestion.proposedAt);
-          incomingWins = rightTime > leftTime || (rightTime === leftTime && preferIncoming);
-        }
-        if (!incomingWins) return;
+      for (const suggestion of list) {
         this.suggestions.set(suggestion.id, {
           bucket,
           suggestion: cloneWireSuggestion(suggestion),
           sourceUser: docUser,
-          path: `${path}.suggestions[${JSON.stringify(bucket)}][${listIndex}]`,
         });
-      });
+      }
     }
 
     if (docUser !== this.ownUsername) {
@@ -1340,28 +1267,6 @@ export class RemoteUserFiles {
         for (const comment of commentList) {
           const normalized = normalizeComment({ ...comment, authorUsername: docUser });
           byAuthorAndId.set(`${normalized.authorUsername}\u0000${normalized.id}`, normalized);
-        }
-      }
-    }
-  }
-
-  /**
-   * Refuse a local suggestion whose id another user's file assigns to another
-   * bucket or owner.
-   *
-   * @param {Record<string, object[]>} localSuggestions
-   */
-  assertNoConflictWith(localSuggestions) {
-    for (const [bucket, list] of Object.entries(localSuggestions)) {
-      for (const suggestion of list) {
-        const remote = this.suggestions.get(suggestion.id);
-        if (remote === undefined) continue;
-        if (remote.bucket !== bucket || remote.suggestion.proposedBy !== suggestion.proposedBy) {
-          throw new Error(
-            `${remote.path}.id: ${JSON.stringify(suggestion.id)} conflicts with the ` +
-            `suggestion owned by ${JSON.stringify(suggestion.proposedBy)} in bucket ` +
-            `${JSON.stringify(bucket)}`
-          );
         }
       }
     }
@@ -1387,6 +1292,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     this._saveTimer = null;
     this._loadedForKey = null;
     this._pullApplicationTransactionActive = false;
+    // Bumped by every change (`_touch`); with the state object it keys what is
+    // derived from the state (`_derived`).
+    this._revision = 0;
+    this._derivedCache = null;
     // A pending debounced save is written before the page goes away. These
     // listeners are registered here, before the scope lock is ever acquired,
     // so on pagehide they run ahead of the lock's own release listener and the
@@ -1407,7 +1316,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       }
       const scopeKey = assertExactNonblankString(
         evt.scopeKey,
-        2048,
         'lock loss scopeKey'
       );
       if (!this._lockScopeKey || scopeKey !== this._lockScopeKey) return;
@@ -1470,19 +1378,11 @@ export class CommunityAnnotationSession extends EventEmitter {
     const nextDatasetId =
       datasetId === undefined
         ? this._datasetId
-        : assertOptionalExactNonblankString(
-          datasetId,
-          ANNOTATION_LIMITS.datasetId,
-          'cache datasetId'
-        );
+        : assertOptionalExactNonblankString(datasetId, 'cache datasetId');
     const nextRepoRef =
       repoRef === undefined
         ? this._repoRef
-        : assertOptionalExactNonblankString(
-          repoRef,
-          1280,
-          'cache repoRef'
-        );
+        : assertOptionalExactNonblankString(repoRef, 'cache repoRef');
     let nextUserId = this._cacheUserId;
     if (userId !== undefined) {
       if (userId === null) {
@@ -1699,11 +1599,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   recordDatasetAccess({ datasetId, fieldsToAnnotate = [] } = {}) {
-    const did = assertExactNonblankString(
-      datasetId,
-      ANNOTATION_LIMITS.datasetId,
-      'datasetId'
-    );
+    const did = assertExactNonblankString(datasetId, 'datasetId');
     if (!Array.isArray(fieldsToAnnotate)) {
       throw new Error('[CommunityAnnotationSession] fieldsToAnnotate must be an array');
     }
@@ -2004,10 +1900,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   _resolveCategoryKey(fieldKey, catIdxOrKey) {
-    const f = exactNonblankStringOrNull(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId
-    );
+    const f = exactNonblankStringOrNull(fieldKey);
     if (!f) return null;
     if (isReservedAnnotationFieldKey(f)) {
       throw new Error(
@@ -2029,8 +1922,7 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     if (
       typeof catIdxOrKey !== 'string' ||
-      !/\S/.test(catIdxOrKey) ||
-      /^\s|\s$/.test(catIdxOrKey)
+      !isAnnotationExactNonblank(catIdxOrKey)
     ) {
       return null;
     }
@@ -2038,10 +1930,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   toBucketKey(fieldKey, catIdxOrKey) {
-    const f = exactNonblankStringOrNull(
-      fieldKey,
-      ANNOTATION_LIMITS.datasetId
-    );
+    const f = exactNonblankStringOrNull(fieldKey);
     const catKey = this._resolveCategoryKey(f, catIdxOrKey);
     if (!f || !catKey) return null;
     return bucketKey(f, catKey);
@@ -2071,8 +1960,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     for (let i = 0; i < list.length; i++) {
       if (
         typeof list[i] !== 'string' ||
-        !/\S/.test(list[i]) ||
-        /^\s|\s$/.test(list[i])
+        !isAnnotationExactNonblank(list[i])
       ) {
         throw new Error(
           `[CommunityAnnotationSession] category at index ${i} must be nonblank ` +
@@ -2112,9 +2000,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     const f = assertSessionFieldKey(fieldKey);
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) return [];
-    const key = bucketKey(f, catKey);
-    const list = this._state.suggestions[key] || [];
-    const merged = this._applyModerationMergesForBucket(key, list);
+    const merged = this._bucketView(bucketKey(f, catKey)).suggestions;
     return merged.map((s) => {
       const mergedFrom = Array.isArray(s?.mergedFrom) ? s.mergedFrom : [];
       return {
@@ -2132,25 +2018,111 @@ export class CommunityAnnotationSession extends EventEmitter {
     });
   }
 
-  _applyModerationMergesForBucket(bucket, suggestionsList) {
-    const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-    const bucketClean = toCleanString(bucket);
-    if (!bucketClean || !merges.length) return Array.isArray(suggestionsList) ? suggestionsList : [];
+  /**
+   * What is derived from the state and kept until it changes: the merge map
+   * of every bucket, each bucket's bundled view and its consensus. Keyed by
+   * the state object and its revision (`_touch` bumps it, a Pull swaps the
+   * object), so a `changed` listener that reads every bucket again costs a
+   * lookup per bucket, not a recomputation.
+   */
+  _derived() {
+    const cache = this._derivedCache;
+    if (cache !== null && cache.state === this._state && cache.revision === this._revision) {
+      return cache;
+    }
+    const merges = this._state.moderationMerges;
+    this._derivedCache = {
+      state: this._state,
+      revision: this._revision,
+      mergeMaps: Array.isArray(merges) && merges.length ? buildMergeMapsByBucket(merges) : new Map(),
+      views: new Map(),
+      consensus: new Map(),
+    };
+    return this._derivedCache;
+  }
 
-    const fromTo = buildEffectiveModerationMergeMapForBucket(merges, bucketClean);
-    if (!fromTo.size) return Array.isArray(suggestionsList) ? suggestionsList : [];
+  /** The merge map (from id -> into id) of one bucket. */
+  _mergeMapFor(bucket) {
+    return this._derived().mergeMaps.get(bucket) ?? EMPTY_MERGE_MAP;
+  }
+
+  /**
+   * One bucket as it is shown and counted (memoised per revision): every
+   * suggestion bundled with the ones it belongs with, each bundle shown once
+   * as its main suggestion, with votes de-duplicated per user.
+   *
+   * 1. Moderation merges: members merged (through any chain) into one target
+   *    form a bundle under that target. A user's vote on the target wins;
+   *    otherwise the majority of the user's votes on the members (a tie is no
+   *    vote).
+   * 2. Equal labels: bundles whose main labels are the same text
+   *    (`exactLabelForCompare`: Unicode NFC, nothing folded) are one bundle,
+   *    so two people who propose "T cell" independently support one label
+   *    rather than splitting it into a tie. Its main suggestion is the
+   *    earliest proposed (then the lowest id in code units); a user's vote is
+   *    the majority of that user's bundle votes (a tie is no vote).
+   *
+   * `mergedFrom` lists every other member with its own votes, and says how it
+   * joined (`bundledBy`: `'merge'` or `'label'`).
+   *
+   * @param {string} bucket
+   * @returns {{suggestions: object[], memberOf: Map<string, string>}} `memberOf`: suggestion id -> main id
+   */
+  _bucketView(bucket) {
+    const derived = this._derived();
+    const stored = this._state.suggestions[bucket];
+    const cached = derived.views.get(bucket);
+    // A bucket whose list was replaced is derived again, whatever the revision.
+    if (cached !== undefined && cached.stored === stored) return cached.view;
+
+    const list = Array.isArray(stored) ? stored : [];
+    // Labels are compared in NFC once per suggestion, not once per comparison.
+    const labelKey = new Map();
+    const labelOf = (s) => {
+      let key = labelKey.get(s.id);
+      if (key === undefined) {
+        key = exactLabelForCompare(s.label);
+        labelKey.set(s.id, key);
+      }
+      return key;
+    };
+    const netOf = (s) => s.upvotes.length - s.downvotes.length;
+    const memberOrder = (a, b) =>
+      (netOf(b) - netOf(a)) ||
+      compareCodeUnits(labelOf(a), labelOf(b)) ||
+      compareCodeUnits(a.id, b.id);
+
+    // Without merges and without two equal labels nothing is bundled: the
+    // stored suggestions are the view (they hold each user once: `vote` and
+    // the Pull keep them so), and are never handed out uncopied
+    // (`getSuggestions` copies).
+    if (this._mergeMapFor(bucket).size === 0) {
+      const seen = new Set();
+      let bundled = false;
+      for (const s of list) {
+        const key = labelOf(s);
+        if (seen.has(key)) {
+          bundled = true;
+          break;
+        }
+        seen.add(key);
+      }
+      if (!bundled) {
+        const memberOf = new Map();
+        for (const s of list) memberOf.set(s.id, s.id);
+        const view = { suggestions: list.slice().sort(memberOrder), memberOf };
+        derived.views.set(bucket, { stored, view });
+        return view;
+      }
+    }
 
     const byId = new Map();
-    for (const s of Array.isArray(suggestionsList) ? suggestionsList : []) {
-      const id = toCleanString(s?.id);
-      if (!id) continue;
-      const up = uniqueStrings(ensureStringArray(s?.upvotes).map((u) => normalizeUsername(u)).filter(Boolean));
+    for (const s of list) {
+      const id = s?.id;
+      if (typeof id !== 'string' || !id) continue;
+      const up = uniqueStrings(ensureStringArray(s?.upvotes));
       const upSet = new Set(up);
-      const down = uniqueStrings(
-        ensureStringArray(s?.downvotes)
-          .map((u) => normalizeUsername(u))
-          .filter((u) => u && !upSet.has(u))
-      );
+      const down = uniqueStrings(ensureStringArray(s?.downvotes).filter((u) => !upSet.has(u)));
       byId.set(id, {
         ...s,
         upvotes: up,
@@ -2159,100 +2131,123 @@ export class CommunityAnnotationSession extends EventEmitter {
       });
     }
 
-    // Group by resolved merge target and compute:
-    // - Bundle vote totals (de-duplicated per user across the bundle)
-    // - A non-destructive "mergedFrom" list so original per-suggestion votes/comments remain visible
-    const targetForId = new Map();
-    /** @type {Map<string, string[]>} */
-    const groups = new Map();
+    const memberCopy = (m, bundledBy) => ({
+      ...m,
+      bundledBy,
+      upvotes: m.upvotes.slice(),
+      downvotes: m.downvotes.slice(),
+      comments: Array.isArray(m.comments) ? m.comments.slice() : []
+    });
+
+    // 1) Moderation merges.
+    const fromTo = this._mergeMapFor(bucket);
+    /** @type {Map<string, string[]>} target id -> member ids (target first) */
+    const mergeGroups = new Map();
     for (const id of byId.keys()) {
-      const resolved = resolveMergeTarget(id, fromTo) || id;
+      const resolved = fromTo.size ? (resolveMergeTarget(id, fromTo) || id) : id;
       const targetId = byId.has(resolved) ? resolved : id;
-      targetForId.set(id, targetId);
-      if (!groups.has(targetId)) groups.set(targetId, []);
-      groups.get(targetId).push(id);
+      if (!mergeGroups.has(targetId)) mergeGroups.set(targetId, [targetId]);
+      if (targetId !== id) mergeGroups.get(targetId).push(id);
     }
-
-    for (const [targetId, memberIds] of groups.entries()) {
-      if (!targetId || !Array.isArray(memberIds) || memberIds.length <= 1) continue;
+    /** @type {Map<string, object>} target id -> bundle main with bundle votes */
+    const groupMain = new Map();
+    for (const [targetId, memberIds] of mergeGroups) {
       const target = byId.get(targetId);
-      if (!target) continue;
-
-      const mergedIds = memberIds.filter((id) => id && id !== targetId);
-      /** @type {any[]} */
-      const mergedFrom = [];
-      for (const mid of mergedIds) {
-        const m = byId.get(mid);
-        if (!m) continue;
-        mergedFrom.push({
-          ...m,
-          upvotes: Array.isArray(m.upvotes) ? m.upvotes.slice() : [],
-          downvotes: Array.isArray(m.downvotes) ? m.downvotes.slice() : [],
-          comments: Array.isArray(m.comments) ? m.comments.slice() : []
-        });
+      if (memberIds.length === 1) {
+        groupMain.set(targetId, { ...target, mergedFrom: [] });
+        continue;
       }
-      mergedFrom.sort((a, b) => {
-        const an = (a?.upvotes?.length || 0) - (a?.downvotes?.length || 0);
-        const bn = (b?.upvotes?.length || 0) - (b?.downvotes?.length || 0);
-        if (bn !== an) return bn - an;
-        return toCleanString(a?.label || '').localeCompare(toCleanString(b?.label || ''));
-      });
-      target.mergedFrom = mergedFrom;
-
-      // Aggregate votes across the bundle (de-duplicated per user).
-      // Per-user effective vote rule:
-      // - If the user voted the bundle main suggestion (the merge target), that vote wins.
-      // - Else, delegate from votes on merged members by majority (ties => no vote).
-      /** @type {Map<string, {targetVote: 'up'|'down'|null, up: number, down: number}>} */
       const perUser = new Map();
-      const ensure = (u) => {
-        const key = toCleanString(u);
-        if (!key) return null;
-        if (!perUser.has(key)) perUser.set(key, { targetVote: null, up: 0, down: 0 });
-        return perUser.get(key);
+      const entryFor = (u) => {
+        let entry = perUser.get(u);
+        if (entry === undefined) {
+          entry = { targetVote: null, up: 0, down: 0 };
+          perUser.set(u, entry);
+        }
+        return entry;
       };
       for (const mid of memberIds) {
         const m = byId.get(mid);
-        if (!m) continue;
-        const isTarget = toCleanString(mid) === toCleanString(targetId);
-        for (const u of Array.isArray(m.upvotes) ? m.upvotes : []) {
-          const entry = ensure(u);
-          if (!entry) continue;
-          if (isTarget) entry.targetVote = 'up';
-          else entry.up++;
+        const isTarget = mid === targetId;
+        for (const u of m.upvotes) {
+          if (isTarget) entryFor(u).targetVote = 'up';
+          else entryFor(u).up++;
         }
-        for (const u of Array.isArray(m.downvotes) ? m.downvotes : []) {
-          const entry = ensure(u);
-          if (!entry) continue;
-          if (isTarget) entry.targetVote = 'down';
-          else entry.down++;
+        for (const u of m.downvotes) {
+          if (isTarget) entryFor(u).targetVote = 'down';
+          else entryFor(u).down++;
         }
       }
-      const upSet = new Set();
-      const downSet = new Set();
-      for (const [u, entry] of perUser.entries()) {
-        if (entry.targetVote === 'up') {
-          upSet.add(u);
-          continue;
-        }
-        if (entry.targetVote === 'down') {
-          downSet.add(u);
-          continue;
-        }
-        if (entry.up > entry.down) upSet.add(u);
-        else if (entry.down > entry.up) downSet.add(u);
+      const up = [];
+      const down = [];
+      for (const [u, entry] of perUser) {
+        const vote = entry.targetVote ?? (entry.up > entry.down ? 'up' : entry.down > entry.up ? 'down' : null);
+        if (vote === 'up') up.push(u);
+        else if (vote === 'down') down.push(u);
       }
-      target.upvotes = uniqueStrings([...upSet]);
-      target.downvotes = uniqueStrings([...downSet]);
+      const mergedFrom = memberIds
+        .filter((mid) => mid !== targetId)
+        .map((mid) => memberCopy(byId.get(mid), 'merge'))
+        .sort(memberOrder);
+      groupMain.set(targetId, { ...target, upvotes: up, downvotes: down, mergedFrom });
     }
 
-    const out = [];
-    for (const [id, s] of byId.entries()) {
-      if ((targetForId.get(id) || id) !== id) continue;
-      out.push(s);
+    // 2) Equal labels.
+    /** @type {Map<string, object[]>} label -> bundle mains */
+    const byLabel = new Map();
+    for (const main of groupMain.values()) {
+      const label = labelOf(main);
+      if (!byLabel.has(label)) byLabel.set(label, []);
+      byLabel.get(label).push(main);
     }
-    out.sort((a, b) => ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0)));
-    return out;
+    const memberOf = new Map();
+    const out = [];
+    for (const mains of byLabel.values()) {
+      if (mains.length === 1) {
+        const main = mains[0];
+        out.push(main);
+        memberOf.set(main.id, main.id);
+        for (const m of main.mergedFrom) memberOf.set(m.id, main.id);
+        continue;
+      }
+      mains.sort((a, b) => {
+        const at = instantOf(a.proposedAt);
+        const bt = instantOf(b.proposedAt);
+        if (at !== bt) {
+          if (at === null) return 1;
+          if (bt === null) return -1;
+          return at - bt;
+        }
+        return compareCodeUnits(a.id, b.id);
+      });
+      const tally = new Map();
+      for (const main of mains) {
+        for (const u of main.upvotes) tally.set(u, (tally.get(u) ?? 0) + 1);
+        for (const u of main.downvotes) tally.set(u, (tally.get(u) ?? 0) - 1);
+      }
+      const up = [];
+      const down = [];
+      for (const [u, net] of tally) {
+        if (net > 0) up.push(u);
+        else if (net < 0) down.push(u);
+      }
+      const [lead, ...others] = mains;
+      const mergedFrom = [...lead.mergedFrom];
+      for (const other of others) {
+        const { mergedFrom: otherMembers, ...otherMain } = other;
+        mergedFrom.push(memberCopy({ ...otherMain, upvotes: otherMain.upvotes, downvotes: otherMain.downvotes }, 'label'));
+        for (const m of otherMembers) mergedFrom.push(m);
+      }
+      mergedFrom.sort(memberOrder);
+      const main = { ...lead, upvotes: up, downvotes: down, mergedFrom };
+      out.push(main);
+      for (const m of [main, ...mergedFrom]) memberOf.set(m.id, main.id);
+    }
+
+    out.sort(memberOrder);
+    const view = { suggestions: out, memberOf };
+    derived.views.set(bucket, { stored, view });
+    return view;
   }
 
   addSuggestion(fieldKey, catIdx, { label, ontologyId = null, evidence = null, markers = null } = {}) {
@@ -2264,10 +2259,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     const key = bucketKey(f, catKey);
     const labelNormalized = exactLabelForCompare(label);
     if (labelNormalized) {
-      const existing = this._state.suggestions?.[key] || [];
-      const visible = this._applyModerationMergesForBucket(key, existing);
-      for (const s of visible) {
-        if (!s) continue;
+      for (const s of this._bucketView(key).suggestions) {
         if (exactLabelForCompare(s.label) === labelNormalized) {
           throw new Error('[CommunityAnnotationSession] suggestion already exists for this label');
         }
@@ -2313,19 +2305,13 @@ export class CommunityAnnotationSession extends EventEmitter {
     let didUpdate = false;
 
     if (label !== undefined) {
-      const nextLabel = assertStringLength(label, MAX_LABEL_LEN, 'label');
-      if (!/\S/.test(nextLabel) || /^\s|\s$/.test(nextLabel)) {
-        throw new Error(
-          '[CommunityAnnotationSession] label must be nonblank without leading or trailing whitespace'
-        );
-      }
+      const nextLabel = assertExactNonblankString(label, 'label');
       const nextNorm = exactLabelForCompare(nextLabel);
-      if (nextNorm) {
-        const visible = this._applyModerationMergesForBucket(bucket, list);
-        for (const s of visible) {
-          if (!s) continue;
-          const sid = toCleanString(s.id);
-          if (!sid || sid === id) continue;
+      // Renaming to another label already shown is refused, as proposing it
+      // is; keeping the label (or its NFC form) never is, whatever bundle the
+      // suggestion is in.
+      if (nextNorm !== exactLabelForCompare(suggestion.label)) {
+        for (const s of this._bucketView(bucket).suggestions) {
           if (exactLabelForCompare(s.label) === nextNorm) {
             throw new Error('[CommunityAnnotationSession] suggestion already exists for this label');
           }
@@ -2338,12 +2324,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     if (ontologyId !== undefined) {
-      const next = assertStringLength(ontologyId, MAX_ONTOLOGY_LEN, 'ontologyId');
-      if (next && (!/\S/.test(next) || /^\s|\s$/.test(next))) {
-        throw new Error(
-          '[CommunityAnnotationSession] ontologyId must not have leading or trailing whitespace'
-        );
-      }
+      const next = assertExactOrEmpty(assertOptionalString(ontologyId, 'ontologyId'), 'ontologyId');
       const nextValue = next ? next : null;
       if ((suggestion.ontologyId ?? null) !== nextValue) {
         suggestion.ontologyId = nextValue;
@@ -2352,12 +2333,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     if (evidence !== undefined) {
-      const next = assertStringLength(evidence, MAX_EVIDENCE_LEN, 'evidence');
-      if (next && (!/\S/.test(next) || /^\s|\s$/.test(next))) {
-        throw new Error(
-          '[CommunityAnnotationSession] evidence must not have leading or trailing whitespace'
-        );
-      }
+      const next = assertExactOrEmpty(assertOptionalString(evidence, 'evidence'), 'evidence');
       const nextValue = next ? next : null;
       if ((suggestion.evidence ?? null) !== nextValue) {
         suggestion.evidence = nextValue;
@@ -2400,18 +2376,14 @@ export class CommunityAnnotationSession extends EventEmitter {
     // merge chain that ultimately resolves to this id (and any merges where this id is a node).
     // This ensures merged items re-appear as independent suggestions after deletion.
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-    if (merges.length) {
-      const fromTo = buildEffectiveModerationMergeMapForBucket(merges, bucket);
-      if (fromTo.size) {
-        this._state.moderationMerges = merges.filter((mRaw) => {
-          const m = normalizeModerationMerge(mRaw);
-          if (!m) return false;
-          if (m.bucket !== bucket) return true;
-          if (m.fromSuggestionId === id || m.intoSuggestionId === id) return false;
-          const resolved = resolveMergeTarget(m.fromSuggestionId, fromTo);
-          return resolved !== id;
-        });
-      }
+    const fromTo = this._mergeMapFor(bucket);
+    if (fromTo.size) {
+      // A subset of a valid merge list is valid: no revalidation.
+      this._state.moderationMerges = merges.filter((m) => {
+        if (m.bucket !== bucket) return true;
+        if (m.fromSuggestionId === id || m.intoSuggestionId === id) return false;
+        return resolveMergeTarget(m.fromSuggestionId, fromTo) !== id;
+      });
     }
 
     if (!this._state.deletedSuggestions || typeof this._state.deletedSuggestions !== 'object') this._state.deletedSuggestions = {};
@@ -2522,36 +2494,25 @@ export class CommunityAnnotationSession extends EventEmitter {
     const direct = this.getMyVoteDirect(f, catKey, sid);
     if (direct) return { vote: direct, source: 'direct', delegatedUp: 0, delegatedDown: 0 };
 
+    // The vote this user's bundle votes add up to (`_bucketView`), shown on
+    // the bundle's main card only.
     const bucket = bucketKey(f, catKey);
-    const list = this._state.suggestions?.[bucket] || [];
-    const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-    const map = buildEffectiveModerationMergeMapForBucket(merges, bucket);
-    if (!map.size) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
-
-    const targetId = resolveMergeTarget(sid, map) || sid;
-    // Delegate only on the merge target (bundle-main) card.
-    if (targetId !== sid) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
-
-    const familyOtherIds = [];
-    for (const s of Array.isArray(list) ? list : []) {
-      const id = toCleanString(s?.id);
-      if (!id || id === sid) continue;
-      const resolved = resolveMergeTarget(id, map) || id;
-      if (resolved === targetId) familyOtherIds.push(id);
-    }
-    if (!familyOtherIds.length) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
+    const view = this._bucketView(bucket);
+    if (view.memberOf.get(sid) !== sid) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
+    const main = view.suggestions.find((s) => s.id === sid);
+    // An unbundled suggestion is its own view (no `mergedFrom`): nothing to delegate.
+    if (!main || !(main.mergedFrom?.length > 0)) return { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 };
 
     let delegatedUp = 0;
     let delegatedDown = 0;
-    for (const oid of uniqueStrings(familyOtherIds)) {
-      const k = suggestionKey(f, catKey, oid);
-      const v = this._state.myVotes?.[k] || null;
+    for (const member of main.mergedFrom) {
+      const v = this._state.myVotes?.[suggestionKey(f, catKey, member.id)] || null;
       if (v === 'up') delegatedUp++;
       else if (v === 'down') delegatedDown++;
     }
-    if (delegatedUp > delegatedDown) return { vote: 'up', source: 'delegated', delegatedUp, delegatedDown };
-    if (delegatedDown > delegatedUp) return { vote: 'down', source: 'delegated', delegatedUp, delegatedDown };
-    return { vote: null, source: 'none', delegatedUp, delegatedDown };
+    const me = normalizeUsername(this._getEffectiveUserKey());
+    const vote = main.upvotes.includes(me) ? 'up' : (main.downvotes.includes(me) ? 'down' : null);
+    return { vote, source: vote === null ? 'none' : 'delegated', delegatedUp, delegatedDown };
   }
 
   getMyVote(fieldKey, catIdx, suggestionId) {
@@ -2571,12 +2532,10 @@ export class CommunityAnnotationSession extends EventEmitter {
     let suggestion = list.find((s) => s?.id === sid) || null;
     let storeSid = sid;
     if (!suggestion) {
-      const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-      const map = buildEffectiveModerationMergeMapForBucket(merges, key);
-      if (map.size) {
-        const target = resolveMergeTarget(sid, map) || sid;
-        suggestion = list.find((s) => s?.id === target) || null;
-        storeSid = target;
+      const main = this._bucketView(key).memberOf.get(sid);
+      if (main !== undefined) {
+        suggestion = list.find((s) => s?.id === main) || null;
+        storeSid = main;
       }
     }
     if (!suggestion) return null;
@@ -2614,11 +2573,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   editComment(fieldKey, catIdx, suggestionId, commentId, newText) {
     const f = assertSessionFieldKey(fieldKey);
     const sid = assertSessionSuggestionId(suggestionId);
-    const cid = assertExactNonblankString(
-      commentId,
-      ANNOTATION_LIMITS.commentId,
-      'commentId'
-    );
+    const cid = assertExactNonblankString(commentId, 'commentId');
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
       throw new Error('[CommunityAnnotationSession] category required');
@@ -2626,16 +2581,15 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
-    const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-    const map = buildEffectiveModerationMergeMapForBucket(merges, key);
-    const target = map.size ? (resolveMergeTarget(sid, map) || sid) : sid;
+    const memberOf = this._bucketView(key).memberOf;
+    const target = memberOf.get(sid) ?? sid;
 
     let owningSid = null;
     let comment = null;
     for (const s of list) {
       const sId = toCleanString(s?.id);
       if (!sId) continue;
-      const t = map.size ? (resolveMergeTarget(sId, map) || sId) : sId;
+      const t = memberOf.get(sId) ?? sId;
       if (t !== target) continue;
       if (!Array.isArray(s.comments)) continue;
       const found = s.comments.find((c) => toCleanString(c?.id) === cid) || null;
@@ -2647,12 +2601,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (!comment || !owningSid) return false;
     if (!this.isMyComment(comment.authorUsername)) return false;
 
-    const nextText = assertStringLength(newText, MAX_COMMENT_LEN, 'comment text');
-    if (!/\S/.test(nextText) || /^\s|\s$/.test(nextText)) {
-      throw new Error(
-        '[CommunityAnnotationSession] comment text must be nonblank without leading or trailing whitespace'
-      );
-    }
+    const nextText = assertExactNonblankString(newText, 'comment text');
     comment.text = nextText;
     comment.editedAt = nowIso();
 
@@ -2674,11 +2623,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   deleteComment(fieldKey, catIdx, suggestionId, commentId) {
     const f = assertSessionFieldKey(fieldKey);
     const sid = assertSessionSuggestionId(suggestionId);
-    const cid = assertExactNonblankString(
-      commentId,
-      ANNOTATION_LIMITS.commentId,
-      'commentId'
-    );
+    const cid = assertExactNonblankString(commentId, 'commentId');
     const catKey = this._resolveCategoryKey(f, catIdx);
     if (!catKey) {
       throw new Error('[CommunityAnnotationSession] category required');
@@ -2686,9 +2631,8 @@ export class CommunityAnnotationSession extends EventEmitter {
 
     const key = bucketKey(f, catKey);
     const list = this._state.suggestions[key] || [];
-    const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-    const map = buildEffectiveModerationMergeMapForBucket(merges, key);
-    const target = map.size ? (resolveMergeTarget(sid, map) || sid) : sid;
+    const memberOf = this._bucketView(key).memberOf;
+    const target = memberOf.get(sid) ?? sid;
 
     let owningSid = null;
     let owningSuggestion = null;
@@ -2696,7 +2640,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     for (const s of list) {
       const sId = toCleanString(s?.id);
       if (!sId) continue;
-      const t = map.size ? (resolveMergeTarget(sId, map) || sId) : sId;
+      const t = memberOf.get(sId) ?? sId;
       if (t !== target) continue;
       if (!Array.isArray(s.comments)) continue;
       const idxFound = s.comments.findIndex((c) => toCleanString(c?.id) === cid);
@@ -2783,26 +2727,22 @@ export class CommunityAnnotationSession extends EventEmitter {
       throw new Error('[CommunityAnnotationSession] category required');
     }
     const bucket = bucketKey(f, catKey);
-    const entry = normalizeModerationMerge({
+    const entry = {
       bucket,
       fromSuggestionId: from,
       intoSuggestionId: into,
       by: this._getEffectiveUserKey(),
       at: nowIso(),
       note
-    });
-    if (!Array.isArray(this._state.moderationMerges)) {
-      throw new Error('[CommunityAnnotationSession] moderation merges state must be an array');
-    }
-    // Keep moderation merges as the current effective mapping:
-    // a "from" suggestion can only be merged into one "into" suggestion at a time.
-    this._state.moderationMerges = this._state.moderationMerges.filter((mRaw) => {
-      const m = normalizeModerationMerge(mRaw);
-      if (m.bucket !== entry.bucket) return true;
-      return m.fromSuggestionId !== entry.fromSuggestionId;
-    });
-    this._state.moderationMerges.push(entry);
-    // Votes/comments are auto-combined at runtime from the merge mapping.
+    };
+    // A "from" suggestion is merged into one "into" suggestion at a time: the
+    // new merge replaces an earlier one of the same source. The whole list is
+    // validated once (a cycle is refused here, not at Publish).
+    const next = this.getModerationMerges().filter(
+      (m) => m.bucket !== bucket || m.fromSuggestionId !== from
+    );
+    next.push(entry);
+    this._state.moderationMerges = assertModerationMerges(next);
     this._touch();
     return true;
   }
@@ -2819,44 +2759,24 @@ export class CommunityAnnotationSession extends EventEmitter {
       'fromSuggestionId'
     );
 
-    const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
+    const merges = this.getModerationMerges();
     if (!merges.length) return false;
 
     const nextNote =
       note === null || note === ''
         ? null
-        : assertStringLength(note, MAX_MERGE_NOTE_LEN, 'merge note');
-    if (nextNote && (!/\S/.test(nextNote) || /^\s|\s$/.test(nextNote))) {
-      throw new Error(
-        '[CommunityAnnotationSession] merge note must not have leading or trailing whitespace'
-      );
-    }
+        : assertExactNonblankString(note, 'merge note');
 
-    const cleaned = [];
     let didUpdate = false;
-    for (const mRaw of merges) {
-      const m = normalizeModerationMerge(mRaw);
-      if (m.bucket !== bucket || m.fromSuggestionId !== from) {
-        cleaned.push(m);
-        continue;
-      }
-      if (!this.isMyComment(m.by)) {
-        cleaned.push(m);
-        continue;
-      }
-
-      const prevNote = m.note ?? null;
-      if (prevNote === nextNote) {
-        cleaned.push(m);
-        continue;
-      }
-
-      const updated = normalizeModerationMerge({ ...m, note: nextNote, editedAt: nowIso() });
-      cleaned.push(updated);
+    const next = merges.map((m) => {
+      if (m.bucket !== bucket || m.fromSuggestionId !== from) return m;
+      if (!this.isMyComment(m.by)) return m;
+      if ((m.note ?? null) === nextNote) return m;
       didUpdate = true;
-    }
+      return { ...m, note: nextNote, editedAt: nowIso() };
+    });
     if (!didUpdate) return false;
-    this._state.moderationMerges = compactModerationMerges(cleaned);
+    this._state.moderationMerges = compactModerationMerges(next);
     this._touch();
     return true;
   }
@@ -2875,14 +2795,9 @@ export class CommunityAnnotationSession extends EventEmitter {
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     if (!merges.length) return false;
 
-    const before = merges.length;
-    const next = merges.filter((mRaw) => {
-      const m = normalizeModerationMerge(mRaw);
-      if (!m) return false;
-      if (m.bucket !== bucket) return true;
-      return m.fromSuggestionId !== from;
-    });
-    if (next.length === before) return false;
+    // A subset of a valid merge list is valid: no revalidation.
+    const next = merges.filter((m) => m.bucket !== bucket || m.fromSuggestionId !== from);
+    if (next.length === merges.length) return false;
     this._state.moderationMerges = next;
     this._touch();
     return true;
@@ -2905,38 +2820,22 @@ export class CommunityAnnotationSession extends EventEmitter {
     const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
     if (!merges.length) return false;
 
-    const map = buildEffectiveModerationMergeMapForBucket(merges, bucket);
+    const map = this._mergeMapFor(bucket);
     const target =
       exactIntoSuggestionId === null
         ? null
-        : (
-          resolveMergeTarget(exactIntoSuggestionId, map) ||
-          exactIntoSuggestionId
-        );
+        : (resolveMergeTarget(exactIntoSuggestionId, map) || exactIntoSuggestionId);
 
+    // The latest merge (by instant; among equal instants the later in the list).
     let best = null;
-    for (const mRaw of merges) {
-      const m = normalizeModerationMerge(mRaw);
-      if (!m || m.bucket !== bucket) continue;
-      const fromId = toCleanString(m.fromSuggestionId);
-      if (!fromId) continue;
-      const resolved = resolveMergeTarget(fromId, map) || fromId;
+    for (const m of merges) {
+      if (m.bucket !== bucket) continue;
+      const resolved = resolveMergeTarget(m.fromSuggestionId, map) || m.fromSuggestionId;
       if (target && resolved !== target) continue;
-      const at = toCleanString(m.at || '');
-      if (!best) {
-        best = { fromId, at };
-        continue;
-      }
-      if (at && best.at) {
-        if (at > best.at) best = { fromId, at };
-      } else if (at && !best.at) {
-        best = { fromId, at };
-      } else if (!at && !best.at) {
-        // no timestamps: keep last encountered
-        best = { fromId, at };
-      }
+      const at = instantOf(m.at);
+      if (best === null || at >= best.at) best = { fromId: m.fromSuggestionId, at };
     }
-    if (!best?.fromId) return false;
+    if (best === null) return false;
     return this.detachModerationMerge({ fieldKey: f, catIdx: catKey, fromSuggestionId: best.fromId });
   }
 
@@ -2968,81 +2867,14 @@ export class CommunityAnnotationSession extends EventEmitter {
       return { status: 'pending', label: null, confidence: 0, voters: 0, netVotes: 0, suggestionId: null };
     }
     const key = bucketKey(f, catKey);
-    const list = this._applyModerationMergesForBucket(key, this._state.suggestions[key] || []);
-    if (!list.length) {
-      return { status: 'pending', label: null, confidence: 0, voters: 0, netVotes: 0, suggestionId: null };
-    }
-
-    let best = null;
-    let bestNet = null;
-    let bestUp = null;
-    /** @type {any[]} */
-    const bestSuggestions = [];
-    for (const s of list) {
-      const up = Array.isArray(s.upvotes) ? s.upvotes.length : 0;
-      const down = Array.isArray(s.downvotes) ? s.downvotes.length : 0;
-      const net = up - down;
-      if (bestNet == null || net > bestNet || (net === bestNet && bestUp != null && up > bestUp)) {
-        bestNet = net;
-        bestUp = up;
-        best = { suggestion: s, netVotes: net, up, down };
-        bestSuggestions.length = 0;
-        bestSuggestions.push(s);
-      } else if (net === bestNet && up === bestUp) {
-        bestSuggestions.push(s);
-      }
-    }
-
-    const labelParts = [];
-    const seen = new Set();
-    for (const s of bestSuggestions) {
-      const label = toCleanString(s?.label || '');
-      if (!label || seen.has(label)) continue;
-      seen.add(label);
-      labelParts.push(label);
-    }
-    labelParts.sort((left, right) =>
-      left < right ? -1 : (left > right ? 1 : 0)
-    );
-    const bestLabel = labelParts.length ? labelParts.join(', ') : (best?.suggestion?.label || null);
-    const isTie = bestSuggestions.length > 1;
-
-    const votersSet = new Set();
-    for (const s of list) {
-      for (const u of ensureStringArray(s.upvotes)) votersSet.add(u);
-      for (const u of ensureStringArray(s.downvotes)) votersSet.add(u);
-    }
-
-    const voters = votersSet.size;
-    const minA = settings.minAnnotators;
-    if (voters < minA) {
-      return {
-        status: 'pending',
-        label: bestLabel,
-        confidence: 0,
-        voters,
-        netVotes: best?.netVotes || 0,
-        suggestionId: isTie ? null : (best?.suggestion?.id || null)
-      };
-    }
-
-    // "Confidence" is net support share (-1..1): (unique_upvotes - unique_downvotes) / unique_total_voters.
-    // Voters are unique across all votes in this bucket, so one user counts once in the denominator.
-    const confidence =
-      voters === 0
-        ? 0
-        : (best?.netVotes ?? 0) / voters;
-    const th = settings.threshold;
-    // Ties are always disputed (no single winning label), even if the top net-vote share crosses threshold.
-    const status = (!isTie && confidence >= th) ? 'consensus' : 'disputed';
-    return {
-      status,
-      label: bestLabel,
-      confidence,
-      voters,
-      netVotes: best?.netVotes || 0,
-      suggestionId: isTie ? null : (best?.suggestion?.id || null)
-    };
+    const derived = this._derived();
+    const memoKey = `${settings.minAnnotators}\u0000${settings.threshold}\u0000${key}`;
+    const view = this._bucketView(key);
+    const memo = derived.consensus.get(memoKey);
+    if (memo !== undefined && memo.view === view) return { ...memo.result };
+    const result = consensusOf(view.suggestions, settings);
+    derived.consensus.set(memoKey, { view, result });
+    return { ...result };
   }
 
   /**
@@ -3092,7 +2924,6 @@ export class CommunityAnnotationSession extends EventEmitter {
       );
       const catKey = assertExactNonblankString(
         parts.catKey,
-        null,
         'consensus category'
       );
       return { fieldKey, catKey, bucket: bucketKey(fieldKey, catKey) };
@@ -3107,7 +2938,7 @@ export class CommunityAnnotationSession extends EventEmitter {
         '[CommunityAnnotationSession] suggestions state must be an object'
       );
     }
-    const buckets = Object.keys(this._state.suggestions).sort((a, b) => a.localeCompare(b));
+    const buckets = Object.keys(this._state.suggestions).sort(compareCodeUnits);
     for (const rawBucket of buckets) {
       const parts = parseBucket(rawBucket);
       const { fieldKey, catKey, bucket } = parts;
@@ -3139,20 +2970,12 @@ export class CommunityAnnotationSession extends EventEmitter {
             s.id,
             'consensus suggestion id'
           ),
-          label: assertExactNonblankString(
-            s.label,
-            ANNOTATION_LIMITS.label,
-            'consensus suggestion label'
-          ),
+          label: assertExactNonblankString(s.label, 'consensus suggestion label'),
           ontologyId: s?.ontologyId ?? null,
           evidence: s?.evidence ?? null,
           markers: s?.markers ?? null,
           proposedBy: normalizeUsername(s.proposedBy),
-          proposedAt: assertExactNonblankString(
-            s.proposedAt,
-            64,
-            'consensus suggestion proposedAt'
-          ),
+          proposedAt: assertUtcDateTime(s.proposedAt, '$ consensus suggestion proposedAt'),
           upvotes: s.upvotes.slice(),
           downvotes: s.downvotes.slice(),
           ...(includeComments ? { comments: s.comments.map((c) => ({ ...c })) } : {}),
@@ -3190,16 +3013,28 @@ export class CommunityAnnotationSession extends EventEmitter {
     return { ...map };
   }
 
+  /**
+   * Record the remote SHAs of a Pull or Publish. Only the SHAs the session
+   * reads are kept (config, merges, the current user's own file): every
+   * other user's SHA lives in the file cache (IndexedDB), so this state
+   * stays a few hundred bytes however many contributors a repository has.
+   *
+   * @param {Record<string, string>} nextMap
+   */
   setRemoteFileShas(nextMap) {
     const input = assertRemoteFileShaMap(nextMap);
-    this._state.remoteFileShas = { ...input };
+    const ownPath = ownUserFilePath(this._getEffectiveUserKey());
+    const kept = {};
+    for (const path of [...SESSION_SHA_PATHS, ownPath]) {
+      if (path !== null && Object.hasOwn(input, path)) kept[path] = input[path];
+    }
+    this._state.remoteFileShas = kept;
     this._touch();
   }
 
   setRemoteFileSha(path, sha) {
     const current = this.getRemoteFileShas();
     current[path] = sha;
-    assertRemoteFileShaMap(current);
     this.setRemoteFileShas(current);
     return true;
   }
@@ -3563,11 +3398,8 @@ export class CommunityAnnotationSession extends EventEmitter {
         `fieldsToAnnotate[${index}]`
       )
     );
-    if (moderationDocument !== null) {
-      assertMergesDocument(moderationDocument, {
-        path: '$ pulled moderation document',
-      });
-    }
+    // A pulled merges document is validated once, where it is applied
+    // (`setModerationMergesFromDoc`), inside the transaction.
     const preserveLocalModeration =
       this.getModerationMerges().length > 0;
 
@@ -3603,9 +3435,9 @@ export class CommunityAnnotationSession extends EventEmitter {
     });
   }
 
-  markSyncedNow() {
-    this._state.lastSyncAt = nowIso();
-    this._touch();
+  /** When the last Pull completed (an ISO instant), or null before the first. */
+  getLastPullAt() {
+    return this._state.lastSyncAt;
   }
 
   /**
@@ -3664,7 +3496,6 @@ export class CommunityAnnotationSession extends EventEmitter {
         );
       }
     }
-    remote.assertNoConflictWith(this._state.suggestions);
 
     const preferLocalVotes = options.preferLocalVotes !== false;
     const hydrateFromOwnFile = options.hydrateFromOwnFile !== false;
@@ -3854,12 +3685,9 @@ export class CommunityAnnotationSession extends EventEmitter {
         // 2) Votes (schema stores only by suggestionId)
         const remoteVotes = myRemoteDoc.votes && typeof myRemoteDoc.votes === 'object' ? myRemoteDoc.votes : null;
         if (remoteVotes) {
-          const merges = Array.isArray(this._state.moderationMerges) ? this._state.moderationMerges : [];
-          const mergeMapByBucket = buildEffectiveModerationMergeMapByBucket(merges);
-
           const resolveTargetForBucket = (bucket, suggestionId) => {
-            const map = mergeMapByBucket.get(bucket) || null;
-            return map ? (resolveMergeTarget(suggestionId, map) || suggestionId) : suggestionId;
+            const map = this._mergeMapFor(bucket);
+            return map.size ? (resolveMergeTarget(suggestionId, map) || suggestionId) : suggestionId;
           };
 
           const localTargetsByBucket = new Map(); // bucket -> Set(targetId)
@@ -3929,15 +3757,10 @@ export class CommunityAnnotationSession extends EventEmitter {
             for (const c of commentList) {
               const normalized = normalizeComment({ ...c, authorUsername: myUserLower });
               const prev = byId.get(normalized.id) || null;
-              if (prev) {
-                const prevTime = toCleanString(prev.editedAt || prev.createdAt || '');
-                const nextTime = toCleanString(normalized.editedAt || normalized.createdAt || '');
-                if (nextTime && prevTime && nextTime <= prevTime) continue;
-              }
+              if (prev && commentInstant(normalized) <= commentInstant(prev)) continue;
               byId.set(normalized.id, normalized);
             }
-            const merged = [...byId.values()]
-              .sort((a, b) => toCleanString(a?.createdAt || '').localeCompare(toCleanString(b?.createdAt || '')));
+            const merged = [...byId.values()].sort(commentOrder);
             if (merged.length) this._state.myComments[sid] = merged;
           }
         }
@@ -3996,12 +3819,8 @@ export class CommunityAnnotationSession extends EventEmitter {
       if (!commentsById.has(sid)) commentsById.set(sid, new Map());
       const aggregateKey = `${normalized.authorUsername}\u0000${normalized.id}`;
       const existing = commentsById.get(sid).get(aggregateKey);
-      // Last-write-wins: prefer newer editedAt or createdAt
-      if (existing) {
-        const existingTime = existing.editedAt || existing.createdAt || '';
-        const newTime = normalized.editedAt || normalized.createdAt || '';
-        if (newTime <= existingTime) return;
-      }
+      // Last-write-wins: the later edit (or creation) instant.
+      if (existing && commentInstant(normalized) <= commentInstant(existing)) return;
       commentsById.get(sid).set(aggregateKey, normalized);
     };
 
@@ -4028,8 +3847,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       for (const s of m.values()) {
         const sid = s.id;
         const commentMap = commentsById.get(sid) || new Map();
-        const commentList = [...commentMap.values()]
-          .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+        const commentList = [...commentMap.values()].sort(commentOrder);
         out.push({
           ...s,
           upvotes: uniqueStrings([...(upvotesById.get(sid) || new Set())]),
@@ -4089,6 +3907,13 @@ export class CommunityAnnotationSession extends EventEmitter {
     if (raw !== null) {
       try {
         const parsed = parseExactJson(raw, { path: `$ local state ${key}` });
+        if (parsed?.version !== STORAGE_VERSION) {
+          throw new Error(
+            `written by another Cellucid version in local format ${JSON.stringify(parsed?.version)}; ` +
+            `this Cellucid reads format ${STORAGE_VERSION} only. Clear this repository's local annotation cache ` +
+            '(your published annotations stay on GitHub) and Pull again'
+          );
+        }
         assertLocalPersistenceDocument(parsed, {
           scopeUserId: normalizeGitHubUserIdOrNull(this._cacheUserId),
         });
@@ -4170,6 +3995,7 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   _touch({ isolateListenerFailures = false } = {}) {
+    this._revision += 1;
     if (this._pullApplicationTransactionActive) {
       return;
     }

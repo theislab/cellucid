@@ -792,7 +792,9 @@ const SCENARIOS = {
     let sessionPath = null;
     steps.push(await measured(page, 'session-save', async () => {
       const downloadPromise = page.waitForEvent('download', { timeout: 120_000 });
-      await page.locator('#save-state-btn').click();
+      // Share… › Save file (the whole history as the dialog opens).
+      await page.locator('#history-share-btn').click();
+      await page.locator('#history-share-save').click();
       const download = await downloadPromise;
       sessionPath = path.join(context.outDir, `${context.stamp}-session.cellucid-session`);
       await download.saveAs(sessionPath);
@@ -820,6 +822,8 @@ const SCENARIOS = {
     });
     const restore = await measured(page, 'session-restore', async () => {
       const chooserPromise = page.waitForEvent('filechooser', { timeout: 60_000 });
+      // Load… › Open a session file….
+      await page.locator('#history-load-btn').click();
       await page.locator('#load-state-btn').click();
       const chooser = await chooserPromise;
       await chooser.setFiles(sessionPath);

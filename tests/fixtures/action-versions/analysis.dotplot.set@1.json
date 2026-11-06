@@ -1,0 +1,248 @@
+{
+  "examples": [
+    {
+      "in": "panel",
+      "options": {
+        "cells": "x",
+        "colorMap": "Reds",
+        "cutoff": 0,
+        "geneSets": [
+          {
+            "genes": [
+              "x"
+            ],
+            "name": "x"
+          }
+        ],
+        "groupBy": "x",
+        "groupOrder": "field",
+        "groups": {
+          "mode": "all"
+        },
+        "matrix": "x",
+        "maxDotSize": "auto",
+        "meanOnlyExpressing": false,
+        "plot": "dot",
+        "scale": "none",
+        "swapAxes": false
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "cells": "x",
+        "colorMap": "Reds",
+        "cutoff": 0,
+        "geneSets": [
+          {
+            "genes": [
+              "x"
+            ],
+            "name": "x"
+          }
+        ],
+        "groupBy": "x",
+        "groupOrder": "field",
+        "groups": {
+          "mode": "all"
+        },
+        "matrix": "x",
+        "maxDotSize": "auto",
+        "meanOnlyExpressing": false,
+        "plot": "dot",
+        "scale": "none",
+        "swapAxes": false
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "cells": "x",
+        "colorMap": "Reds",
+        "cutoff": 0,
+        "geneSets": [
+          {
+            "genes": [
+              "x"
+            ],
+            "name": "x"
+          }
+        ],
+        "groupBy": "x",
+        "groupOrder": "field",
+        "groups": {
+          "ids": [
+            "x"
+          ],
+          "mode": "subset"
+        },
+        "matrix": "x",
+        "maxDotSize": "auto",
+        "meanOnlyExpressing": false,
+        "plot": "dot",
+        "scale": "none",
+        "swapAxes": false
+      },
+      "show": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "options": {
+        "additionalProperties": false,
+        "properties": {
+          "cells": {
+            "type": "string"
+          },
+          "colorMap": {
+            "enum": [
+              "Reds",
+              "Viridis",
+              "Blues"
+            ],
+            "type": "string"
+          },
+          "cutoff": {
+            "type": "number"
+          },
+          "geneSets": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "genes": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "name": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "genes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "groupBy": {
+            "type": "string"
+          },
+          "groupOrder": {
+            "enum": [
+              "field",
+              "size",
+              "dendrogram"
+            ],
+            "type": "string"
+          },
+          "groups": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "const": "all",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "ids": {
+                    "items": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "mode": {
+                    "const": "subset",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "ids"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "matrix": {
+            "type": "string"
+          },
+          "maxDotSize": {
+            "enum": [
+              "auto",
+              "12",
+              "18",
+              "24",
+              "32"
+            ],
+            "type": "string"
+          },
+          "meanOnlyExpressing": {
+            "type": "boolean"
+          },
+          "plot": {
+            "enum": [
+              "dot",
+              "matrix",
+              "violin"
+            ],
+            "type": "string"
+          },
+          "scale": {
+            "enum": [
+              "none",
+              "var",
+              "z"
+            ],
+            "type": "string"
+          },
+          "swapAxes": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "show": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "options"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.dotplot.set",
+  "version": 1
+}

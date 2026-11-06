@@ -205,3 +205,28 @@ export function bibtex(citation) {
   const body = fields.map(([name, value]) => `  ${name.padEnd(width)} = {${value}},\n`).join('');
   return `@${entry}{${BIBTEX_KEY},\n${body}}\n`;
 }
+
+/**
+ * How Cellucid is cited (APA), read once from the deployed `CITATION.cff`:
+ * what the methods paragraph names (`history.methods`). Answers null, and
+ * says so once, when the file cannot be read.
+ *
+ * @param {(url: string) => Promise<string>} [fetchText]
+ * @returns {() => Promise<string|null>}
+ */
+export function cellucidCitationReader(fetchText = async url => {
+  const response = await fetch(url, { cache: 'no-cache' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.text();
+}) {
+  let read = null;
+  return () => {
+    read ??= fetchText(CITATION_PATH)
+      .then(text => apa(parsePreferredCitation(text)))
+      .catch(error => {
+        console.warn('[citation] Cellucid\'s citation could not be read', error);
+        return null;
+      });
+    return read;
+  };
+}

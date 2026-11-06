@@ -14,6 +14,8 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
+import { armSelection } from './helpers/selection-gesture.mjs';
 
 // `scripts/generate-browser-catalog-fixtures.py`: the current-ui cells, whose
 // cell_type cycles alpha, beta, gamma, with a 70,000-category inventory.
@@ -26,8 +28,6 @@ const fixturePath = path.join(
 const UINT32_MISSING = 4_294_967_295;
 /** Where each label sits in the inventory. */
 const PLACEMENT = Object.freeze({ alpha: 65_536, beta: 69_999, gamma: 0 });
-const GESTURE_LANDING_TIMEOUT_MS = 3_000;
-
 /** The fixture's codes: the first five gamma cells are missing. */
 function fixtureCodes() {
   const labels = ['alpha', 'beta', 'gamma'];
@@ -133,22 +133,6 @@ async function altClick(page, point) {
   await page.mouse.move(point.x + 40, point.y + 40);
 }
 
-async function armAnnotation(page, point) {
-  const controls = page.locator('#annotation-step-controls');
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await altClick(page, point);
-    const armed = await controls.waitFor({
-      state: 'attached',
-      timeout: GESTURE_LANDING_TIMEOUT_MS,
-    }).then(() => true, error => {
-      if (error?.name !== 'TimeoutError') throw error;
-      return false;
-    });
-    if (armed) return;
-  }
-  await expect(controls).toBeVisible();
-}
-
 function highlightedCells(page) {
   return page.evaluate(() => {
     const highlight = window._cellucidState.highlightArray;
@@ -193,7 +177,7 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   // Selection and highlight: Alt+click a beta cell (code 69,999) selects the
   // beta category, and confirming highlights exactly its cells.
   const point = await findCellPoint(page, betaCells);
-  await armAnnotation(page, point);
+  await armSelection(page, 'annotation', () => altClick(page, point));
   await expect.poll(async () => (
     await page.evaluate(() => window._cellucidViewer.getUnifiedSelectionState().candidateCount)
   )).toBe(40);
@@ -233,13 +217,13 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   // Session round trip: the saved state restores the same codes, the same
   // filter and the same highlight into a fresh page.
   const sessionDownload = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('uint32.cellucid-session');
   await (await sessionDownload).saveAs(sessionPath);
 
   await openFixture(page);
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooserPromise).setFiles(sessionPath);
   await expect(page.locator('#filter-count')).toHaveText('Showing 80 of 120 cells');
   await expect.poll(() => highlightedCells(page)).toEqual(betaCells);

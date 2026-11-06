@@ -130,6 +130,7 @@ function readerOf(file, { onTransfer = null, sourceAccess = null, keeping = null
       lastModified: file.lastModified ?? null,
       // A public S3 object's other addresses: six more connections each.
       mirrors: access === null ? equivalentS3Urls(file.url) : [],
+      head: head?.bytes ?? null,
     }, access === null ? {} : { access });
     // Bytes an earlier reading of this version kept in this browser are
     // read from there; what is fetched is kept (`kept-parts.js`). A file

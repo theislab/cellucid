@@ -25,6 +25,9 @@ async function openDataset(page) {
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
+  // The opening's card sits over the plot until the opening ends, which can
+  // be after the dataset's name is shown: the plot is measured once it is gone.
+  await expect(page.locator('.opening-overlay')).toBeHidden();
   // A phone starts with the plot and the panel's peek bar: these specs
   // measure the panel open, then closed, then open again.
   await openPhoneSheet(page);
@@ -100,6 +103,8 @@ function measure(page) {
       toggleSize: { width: toggleBox.width, height: toggleBox.height },
       toggleOnTop: hit === toggle || toggle.contains(hit),
       plotAtCentre: centre === canvas,
+      // What is at the centre, named, so a failure says what covers the plot.
+      centre: centre === null ? null : `${centre.tagName.toLowerCase()}${centre.id ? `#${centre.id}` : ''}${typeof centre.className === 'string' && centre.className ? `.${centre.className.trim().split(/\s+/).join('.')}` : ''}`,
     };
   });
 }
@@ -188,7 +193,7 @@ for (const phone of [
         if (state === 'closed') {
           expect(geometry.sidebar.right, 'the closed sheet is off screen')
             .toBeLessThanOrEqual(0);
-          expect(geometry.plotAtCentre).toBe(true);
+          expect(geometry.plotAtCentre, `the plot is at the centre, not ${geometry.centre}`).toBe(true);
           // Closed, the sheet is its peek bar along the foot of the screen.
           expect(geometry.toggle).toMatchObject({
             left: 0,
@@ -202,7 +207,7 @@ for (const phone of [
         // sidebar's paper, the close-control strip included: no band of the
         // plot shows through above the menu.
         expect(geometry.sidebar).toEqual(geometry.canvas);
-        expect(geometry.plotAtCentre).toBe(false);
+        expect(geometry.plotAtCentre, `the sheet covers the centre, not ${geometry.centre}`).toBe(false);
         expect(geometry.sidebarPaint, `${state}: the strip is painted`)
           .toBe(geometry.paperPaint);
         expect(alphaOf(geometry.sidebarPaint)).toBe(1);
@@ -222,10 +227,12 @@ for (const phone of [
       await toggleSidebar(page, { hidden: true });
 
       // Turned on its side the phone is past the sheet breakpoint: the
-      // sidebar floats beside the plot instead.
+      // sidebar floats beside the plot instead, shown as it was chosen (the
+      // sheet closed on the phone was page chrome, not that choice).
       await page.setViewportSize({ width: phone.height, height: phone.width });
       await expectBufferFollows(page);
-      await toggleSidebar(page, { hidden: false });
+      await expect(page.locator('#sidebar')).not.toHaveClass(/\bhidden\b/);
+      await sidebarSettled(page);
       let geometry = await measure(page);
       expectCanvasFillsViewport(geometry);
       expectToggleOnScreen(geometry);
@@ -295,7 +302,7 @@ test.describe('on a small tablet', () => {
       const geometry = await measure(page);
       expectCanvasFillsViewport(geometry);
       expectToggleOnScreen(geometry);
-      expect(geometry.plotAtCentre).toBe(true);
+      expect(geometry.plotAtCentre, `the plot is at the centre, not ${geometry.centre}`).toBe(true);
       if (state === 'closed') {
         expect(geometry.sidebar.right).toBeLessThanOrEqual(0);
         expect(geometry.toggle.left).toBeLessThan(geometry.viewport.width / 4);

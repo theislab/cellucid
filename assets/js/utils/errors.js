@@ -13,6 +13,10 @@
  *   logged with what was being done instead of surfacing as an unhandled
  *   rejection, and never stops the work that follows it.
  *
+ * - **Said to a person** (`sayFailure`): a failure written as a sentence is said
+ *   as it is; a broken invariant of the code is named as such, its own text left
+ *   for Details and the console.
+ *
  * Crossing a thread or a process, an error keeps its name, kind, code,
  * details, explanation and mark through `utils/error-wire.js`.
  *
@@ -76,6 +80,29 @@ export function settleQuietly(work, doing) {
  * @param {unknown} error
  * @returns {string}
  */
+/**
+ * Whether a failure is a broken invariant of the code, not a sentence for a
+ * person: every check of the code's own contracts throws a `TypeError`, as the
+ * engine does for a programming error. Its name survives `error-wire.js`.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isInternalFailure(error) {
+  return ['TypeError', 'ReferenceError', 'SyntaxError'].includes(error?.name);
+}
+
+/**
+ * A failure as a person reads it: `failureText` when it is written for one
+ * (a refusal, a read that says why), else that something inside went wrong.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function sayFailure(error) {
+  return isInternalFailure(error) ? 'a problem inside Cellucid stopped it.' : failureText(error);
+}
+
 export function failureText(error) {
   const seen = new Set();
   const words = [];

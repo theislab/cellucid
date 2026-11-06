@@ -1,9 +1,12 @@
 /**
- * Bounded, exact client for the public ORCID endpoints used by the identity UI.
+ * Exact client for the public ORCID endpoints used by the identity UI.
  *
- * The public API is an external trust boundary: every response is streamed
- * through a byte ceiling and parsed with duplicate-key rejection before its
- * small UI projection is validated.
+ * The public API is an external trust boundary: a response is read through
+ * the app's one transport (`formats/io/byte-source.js` `fetchOnce` /
+ * `withRetries`: a stall timeout from the measured link, never a total
+ * deadline; ORCID's request budget; busy answers asked again), refused above
+ * a byte ceiling, and parsed with duplicate-key rejection before its small UI
+ * projection is validated.
  */
 
 import {
@@ -14,11 +17,29 @@ import {
 } from './profile-identifiers.js';
 import { parseExactJson } from './wire-contract.js';
 import { throwIfAborted } from '../../utils/abort.js';
+import {
+  fetchOnce,
+  isTransientAnswer,
+  spreadOf,
+  transientStatusError,
+  withRetries,
+} from '../../formats/io/byte-source.js';
+import { ResponseClock } from '../../formats/io/link.js';
+import { realmHosts } from '../../formats/io/hosts.js';
 
 export const ORCID_RESPONSE_MAX_UTF8_BYTES = 256 * 1024;
 const ORCID_EXPANDED_SEARCH_MAX_RESULTS = 8;
 
 const ORCID_API_ORIGIN = 'https://pub.orcid.org';
+
+/** The link to ORCID, measured across every request of this page. */
+let orcidLink = null;
+
+/** The transport ORCID requests go through: the page's fetch, the realm's book of hosts, one measured link. */
+function defaultOrcidTransport() {
+  orcidLink ??= new ResponseClock();
+  return { fetch: (url, init) => globalThis.fetch(url, init), hosts: realmHosts, clock: orcidLink };
+}
 
 function assertAbortSignalOrNull(signal) {
   if (
@@ -42,147 +63,27 @@ function createResponseError(message, code, cause = undefined) {
   return error;
 }
 
-function responseTooLarge(label) {
-  return createResponseError(
-    `${label} exceeds ${ORCID_RESPONSE_MAX_UTF8_BYTES} bytes`,
-    'ORCID_RESPONSE_TOO_LARGE'
-  );
-}
-
-async function cancelResponseBody(response) {
-  if (typeof response?.body?.cancel !== 'function') return;
-  try {
-    await response.body.cancel();
-  } catch {
-    // The authoritative protocol/size error remains the public outcome.
-  }
-}
-
-function knownResponseByteLength(response) {
-  const raw = response?.headers?.get?.('content-length') ?? null;
-  if (raw === null || raw === '' || !/^[0-9]+$/.test(raw)) return null;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) ? value : Number.POSITIVE_INFINITY;
-}
-
 /**
- * Read one ORCID response without ever buffering more than the public ceiling.
+ * One ORCID JSON body: at most `ORCID_RESPONSE_MAX_UTF8_BYTES`, UTF-8, exact
+ * JSON (duplicate keys refused).
  *
- * @param {Response|object} response
- * @param {{label:string,signal?:AbortSignal|null}} options
- * @returns {Promise<any>}
+ * @param {Uint8Array} bytes
+ * @param {string} label
+ * @returns {any}
  */
-export async function readBoundedOrcidJson(
-  response,
-  { label, signal = null }
-) {
-  const ownerSignal = assertAbortSignalOrNull(signal);
-  if (typeof label !== 'string' || !label || /^\s|\s$/.test(label)) {
-    throw new TypeError('ORCID response label must be an exact nonblank string');
-  }
-  try {
-    throwIfAborted(ownerSignal);
-  } catch (primary) {
-    await cancelResponseBody(response);
-    throw primary;
-  }
-
-  const knownByteLength = knownResponseByteLength(response);
-  if (
-    knownByteLength !== null &&
-    knownByteLength > ORCID_RESPONSE_MAX_UTF8_BYTES
-  ) {
-    const primary = responseTooLarge(label);
-    await cancelResponseBody(response);
-    throw primary;
-  }
-
-  const body = response?.body;
-  if (!body || typeof body.getReader !== 'function') {
-    await cancelResponseBody(response);
+export function decodeOrcidJson(bytes, label) {
+  if (bytes.byteLength > ORCID_RESPONSE_MAX_UTF8_BYTES) {
     throw createResponseError(
-      `${label} body must expose a readable byte stream`,
-      'ORCID_RESPONSE_INVALID'
+      `${label} exceeds ${ORCID_RESPONSE_MAX_UTF8_BYTES} bytes`,
+      'ORCID_RESPONSE_TOO_LARGE'
     );
   }
-
-  const reader = body.getReader();
-  const decoder = new TextDecoder('utf-8', {
-    fatal: true,
-    ignoreBOM: true,
-  });
-  const textParts = [];
-  let byteLength = 0;
-  let streamDone = false;
-  let readerCancelled = false;
-  const cancelLiveReader = async () => {
-    if (streamDone || readerCancelled) return;
-    readerCancelled = true;
-    try {
-      await reader.cancel();
-    } catch {
-      // The authoritative protocol/size error remains the public outcome.
-    }
-  };
-
+  let text;
   try {
-    while (true) {
-      const part = await reader.read();
-      throwIfAborted(ownerSignal);
-      if (part.done) {
-        streamDone = true;
-        try {
-          textParts.push(decoder.decode());
-        } catch (cause) {
-          throw createResponseError(
-            `${label} is not valid UTF-8`,
-            'ORCID_RESPONSE_INVALID',
-            cause
-          );
-        }
-        break;
-      }
-      if (!(part.value instanceof Uint8Array)) {
-        const primary = createResponseError(
-          `${label} stream returned a non-byte chunk`,
-          'ORCID_RESPONSE_INVALID'
-        );
-        await cancelLiveReader();
-        throw primary;
-      }
-      byteLength += part.value.byteLength;
-      if (byteLength > ORCID_RESPONSE_MAX_UTF8_BYTES) {
-        const primary = responseTooLarge(label);
-        await cancelLiveReader();
-        throw primary;
-      }
-      try {
-        textParts.push(decoder.decode(part.value, { stream: true }));
-      } catch (cause) {
-        const primary = createResponseError(
-          `${label} is not valid UTF-8`,
-          'ORCID_RESPONSE_INVALID',
-          cause
-        );
-        await cancelLiveReader();
-        throw primary;
-      }
-    }
-  } catch (error) {
-    let primary = error;
-    if (ownerSignal?.aborted) {
-      try {
-        throwIfAborted(ownerSignal);
-      } catch (abortError) {
-        primary = abortError;
-      }
-    }
-    await cancelLiveReader();
-    throw primary;
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (cause) {
+    throw createResponseError(`${label} is not valid UTF-8`, 'ORCID_RESPONSE_INVALID', cause);
   }
-
-  throwIfAborted(ownerSignal);
-  const text = textParts.join('');
   try {
     if (!text) throw new Error('empty response body');
     return parseExactJson(text, { path: label });
@@ -195,53 +96,36 @@ export async function readBoundedOrcidJson(
   }
 }
 
-function requestOptions(signal) {
-  return {
-    method: 'GET',
-    headers: { Accept: 'application/vnd.orcid+json' },
-    signal,
-    cache: 'no-store',
-    credentials: 'omit',
-    mode: 'cors',
-    referrerPolicy: 'no-referrer',
-  };
-}
-
-async function fetchSuccessfulJson(url, { label, signal }) {
+async function fetchSuccessfulJson(url, { label, signal, transport = null }) {
   const ownerSignal = assertAbortSignalOrNull(signal);
   throwIfAborted(ownerSignal);
-  let response;
-  try {
-    response = await fetch(url, requestOptions(ownerSignal));
-  } catch (error) {
-    throwIfAborted(ownerSignal);
-    throw error;
+  const { fetch: fetchImpl, hosts, clock } = transport ?? defaultOrcidTransport();
+  const { response, bytes } = await withRetries(async () => {
+    const answer = await fetchOnce(url, {
+      method: 'GET',
+      headers: { Accept: 'application/vnd.orcid+json' },
+      cache: 'no-store',
+      credentials: 'omit',
+      mode: 'cors',
+      referrerPolicy: 'no-referrer',
+    }, { fetchImpl, signal: ownerSignal, clock, hosts, label });
+    if (!answer.response.ok && isTransientAnswer(answer.response, answer.said)) {
+      throw transientStatusError(answer.response, label, answer.said);
+    }
+    return answer;
+  }, { signal: ownerSignal, clock, random: spreadOf(url) });
+  throwIfAborted(ownerSignal);
+  if (!response.ok || bytes === null) {
+    throw new Error(`${label} failed (HTTP ${response.status})`);
   }
-  try {
-    throwIfAborted(ownerSignal);
-  } catch (primary) {
-    await cancelResponseBody(response);
-    throw primary;
-  }
-  if (!response?.ok) {
-    const status = Number.isSafeInteger(response?.status)
-      ? response.status
-      : 0;
-    const primary = new Error(`${label} failed (HTTP ${status})`);
-    await cancelResponseBody(response);
-    throw primary;
-  }
-  return readBoundedOrcidJson(response, {
-    label: `${label} response`,
-    signal: ownerSignal,
-  });
+  return decodeOrcidJson(bytes, `${label} response`);
 }
 
-export async function fetchOrcidPerson(orcidId, { signal = null } = {}) {
+export async function fetchOrcidPerson(orcidId, { signal = null, transport = null } = {}) {
   const id = assertExactOrcidId(orcidId);
   const document = await fetchSuccessfulJson(
     `${ORCID_API_ORIGIN}/v3.0/${encodeURIComponent(id)}/person`,
-    { label: 'ORCID lookup', signal }
+    { label: 'ORCID lookup', signal, transport }
   );
   return {
     name: parseOrcidPersonName(document),
@@ -251,13 +135,9 @@ export async function fetchOrcidPerson(orcidId, { signal = null } = {}) {
 
 export async function fetchOrcidExpandedSearch(
   query,
-  { signal = null } = {}
+  { signal = null, transport = null } = {}
 ) {
-  const exactQuery = assertExactOptionalProfileText(
-    query,
-    'ORCID search query',
-    240
-  );
+  const exactQuery = assertExactOptionalProfileText(query, 'ORCID search query');
   if (!exactQuery) return [];
   const document = await fetchSuccessfulJson(
     (
@@ -265,7 +145,7 @@ export async function fetchOrcidExpandedSearch(
       `${encodeURIComponent(exactQuery)}` +
       `&rows=${ORCID_EXPANDED_SEARCH_MAX_RESULTS}`
     ),
-    { label: 'ORCID search', signal }
+    { label: 'ORCID search', signal, transport }
   );
   return parseOrcidExpandedSearch(document, {
     maximumResults: ORCID_EXPANDED_SEARCH_MAX_RESULTS,

@@ -122,6 +122,22 @@ async function prepareVotingHarness(page, { suggestionCount = 27 } = {}) {
 }
 
 test.beforeEach(async ({ page }) => {
+  // The signed-in session seeded below talks to the compiled-in Worker
+  // origin; no request may reach the real Worker. Sign-out's revoke is
+  // answered here as the Worker answers it (CAP lookups are routed per test).
+  await page.route('**/auth/revoke', route => route.fulfill(
+    route.request().method() === 'OPTIONS'
+      ? {
+        status: 204,
+        headers: {
+          'access-control-allow-headers': 'authorization',
+          'access-control-allow-methods': 'POST, OPTIONS',
+          'access-control-allow-origin': '*',
+        },
+        body: '',
+      }
+      : { status: 204, headers: { 'access-control-allow-origin': '*' }, body: '' }
+  ));
   await page.addInitScript(() => {
     window._simulate_repo_connected = true;
     window._author_mode = true;
@@ -189,7 +205,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          contractVersion: 2,
+          contractVersion: 3,
           results: [{
             id: isQuick
               ? 'quick'
@@ -467,9 +483,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
   await primary.getByRole('button', { name: 'Search CAP' }).click();
   const unicodeResult = primary.locator('.cap-search-item');
   try {
-    await expect(unicodeResult).toBeVisible({
-      timeout: 10_000,
-    });
+    await expect(unicodeResult).toBeVisible();
   } catch (error) {
     const messages = await page.locator(
       '#notification-center .notification-message'
@@ -684,7 +698,7 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          contractVersion: 2,
+          contractVersion: 3,
           results: [],
           omittedInvalidCount: 0,
         }),

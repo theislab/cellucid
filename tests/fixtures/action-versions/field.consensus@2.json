@@ -1,0 +1,164 @@
+{
+  "examples": [
+    {
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "key": "x",
+      "mapping": [
+        {
+          "category": "T cells",
+          "label": "x",
+          "status": "consensus",
+          "voters": 0
+        }
+      ],
+      "provenance": {
+        "branch": "x",
+        "commit": "x",
+        "pulledAt": "x",
+        "repository": "x"
+      },
+      "settings": {
+        "minAnnotators": 0,
+        "threshold": -1
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "key": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "mapping": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "category": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "label": {
+              "minLength": 1,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "enum": [
+                "consensus",
+                "disputed",
+                "pending"
+              ],
+              "type": "string"
+            },
+            "voters": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "category",
+            "status",
+            "label",
+            "voters"
+          ],
+          "type": "object"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "provenance": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pulledAt": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "repository",
+          "branch",
+          "commit",
+          "pulledAt"
+        ],
+        "type": "object"
+      },
+      "settings": {
+        "additionalProperties": false,
+        "properties": {
+          "minAnnotators": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "threshold": {
+            "maximum": 1,
+            "minimum": -1,
+            "type": "number"
+          }
+        },
+        "required": [
+          "minAnnotators",
+          "threshold"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "key",
+      "field",
+      "mapping",
+      "settings",
+      "provenance"
+    ],
+    "type": "object"
+  },
+  "type": "field.consensus",
+  "version": 2
+}

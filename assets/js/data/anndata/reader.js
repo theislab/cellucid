@@ -82,7 +82,7 @@ import { denseGraphLines, gatheredGraph, heldGraphLines, inducedGraphLines, plac
 import { cellSubsetRunCosts, columnIndexResidentBytes, geneLayoutOf, geneReadCost, openMatrixColumns, openMatrixRows, readCellSubset, readInWholeChunks, readsThroughRowIndex } from './matrix-access.js';
 import { SLAB_BYTES, asNumbers, readContinuous, readIntegers, readRowSlabs, readRowsInStoreOrder, readStored, scatterRows } from './values.js';
 import { currentLayoutView, isOlderAnnDataLayout } from './older-layouts.js';
-import { cellMapOf } from './views/modalities.js';
+import { cellMapOf, frameRows } from './views/modalities.js';
 import { noEmbeddingRefusal } from './views/refusal.js';
 import { cellSubsetView, CellRows, estimatedChunkShare, gatheredArray, keptValueStats, runsOfPositions } from './views/cell-subset.js';
 import { cellReadLayout, defaultExpressionPath, firstGeneReadCost, geneReadMs, heldPrefix, linkPriced, linkReadMs, noteGeneSampleSeen, openOrderSpecOf, prefixRowsOf, resolveCellSubset, wholeSampleCost } from './subsample-plan.js';
@@ -108,7 +108,8 @@ import {
 } from './prefix-column-index.js';
 import { PRIORITY_ORIGINAL_COLUMN, readPrefixCounts, requirePrefixRows } from './priority-layout.js';
 import { findKeptRuns, keepRun, keptIndexGroup, keptIndexPrefix, orderKey } from './kept-column-index.js';
-import { pricingLink } from '../host-link-memory.js';
+import { plannedHostLink, pricingLink } from '../host-link-memory.js';
+import { plannedLink } from '../../formats/io/link.js';
 import { formatCount, formatCountOf } from '../../utils/format-units.js';
 import { geneLayoutReason } from '../gene-read-plan.js';
 
@@ -642,15 +643,16 @@ function startPrefixReads(full, resolution, readOptions) {
 }
 
 /**
- * Children of `uns['cellucid']` the tree read leaves out: `session` is the
- * record the Python package's `apply_cellucid_session_to_anndata` keeps of a
- * session applied to the file, which can be large and which the viewer does
- * not use; `outlierQuantiles` holds one array per categorical field
+ * Children of `uns['cellucid']` the tree read leaves out: `history_applied`,
+ * `gene_sets` and `pulled` are the records the Python and R packages keep on
+ * the data (each saved history applied, with the whole file when asked; the
+ * gene sets and the columns a pull wrote), which can be large and which the
+ * viewer does not use; `outlierQuantiles` holds one array per categorical field
  * (several MB each), so opening describes it (`describeStoredOutlierQuantiles`)
  * and a field's array is read only when its outlier filter is used
  * (`readStoredOutlierQuantiles`).
  */
-const CELLUCID_UNREAD_KEYS = Object.freeze(['session', 'outlierQuantiles']);
+const CELLUCID_UNREAD_KEYS = Object.freeze(['history_applied', 'gene_sets', 'pulled', 'outlierQuantiles']);
 
 /**
  * What `uns['cellucid']['outlierQuantiles']` holds, from its metadata and two
@@ -682,8 +684,12 @@ async function describeStoredOutlierQuantiles(node, readOptions) {
   return description;
 }
 
-/** `uns['cellucid']` as plain JSON values, its stored outlier quantiles described. */
-async function readUnsCellucid(node, readOptions) {
+/**
+ * `uns['cellucid']` as plain JSON values, its stored outlier quantiles
+ * described (what opening checks; a copy checks the record it writes
+ * against it, `write/changes.js`).
+ */
+export async function readUnsCellucid(node, readOptions) {
   const [cellucid, outliers] = await Promise.all([
     readUnsTree(node, "uns['cellucid']", readOptions, CELLUCID_UNREAD_KEYS),
     isGroup(node) && node.has('outlierQuantiles')
@@ -692,6 +698,24 @@ async function readUnsCellucid(node, readOptions) {
   ]);
   if (outliers !== null) cellucid.outlierQuantiles = outliers;
   return cellucid;
+}
+
+/** The records the Python and R packages keep in `uns['cellucid']`, which opening leaves unread. */
+const PACKAGE_RECORD_KEYS = Object.freeze(['history_applied', 'gene_sets', 'pulled']);
+
+/**
+ * The packages' records of `uns['cellucid']` as plain JSON values (those it
+ * holds of `history_applied`, `gene_sets`, `pulled`): what an apply plan
+ * reads of a dataset (`write/copy-target.js`: the applies before it, the
+ * gene sets kept), never opening.
+ */
+export async function readUnsCellucidRecords(node, readOptions) {
+  const records = {};
+  if (!isGroup(node)) return records;
+  for (const key of PACKAGE_RECORD_KEYS) {
+    if (node.has(key)) records[key] = await readUnsTree(node.get(key), `uns['cellucid']['${key}']`, readOptions);
+  }
+  return records;
 }
 
 /**
@@ -1697,10 +1721,13 @@ export class AnnDataReader {
     candidate._name = name;
     candidate._store = store;
     candidate._decodedChunkBytes = decodedChunkBytes;
-    candidate._link = link;
+    // The link plans read: the source's, as measured, or as the machine's
+    // link is held (`link.js` `plannedLink`). Its requests are measured and
+    // shaped by the source's own meter either way.
+    candidate._link = plannedLink(link);
     // What the host delivered on earlier visits: the link sizing prices at
     // until this one's own reads measure more (`host-link-memory.js`).
-    candidate._hostLink = hostLink;
+    candidate._hostLink = plannedHostLink(hostLink);
     candidate._held = held;
     candidate._keptIndexes = keptIndexes?.identity == null ? null : {
       identity: keptIndexes.identity,
@@ -3286,6 +3313,22 @@ export class AnnDataReader {
     add(child(root, 'raw'), 'raw.var');
     for (const name of this._modalities?.keys() ?? []) add(child(child(root, 'mod'), name), `${name} var`);
     return frames;
+  }
+
+  /**
+   * The store as stored, for a copy of the whole dataset (`write/copy.js`):
+   * every cell, whichever are open. Refused while the store does not hold
+   * every row of its matrix yet (a matrix read after its map, `held`).
+   *
+   * @returns {Object}
+   */
+  storedRoot() {
+    const root = this._fullRoot ?? this._root;
+    if (root === null) throw new Error('No dataset is open to copy.');
+    if (this._held != null && this._held.rows < (frameRows(root.get('obs')) ?? 0)) {
+      throw new Error('The expression matrix of this dataset is still being read: a copy can be saved once every cell\'s values are in.');
+    }
+    return root;
   }
 
   /**

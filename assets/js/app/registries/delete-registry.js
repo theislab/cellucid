@@ -162,4 +162,39 @@ export class DeleteRegistry extends BaseRegistry {
     this._purgedFields.clear();
     this._recordReplacement();
   }
+
+  /**
+   * Every deleted field by name, in the order deleted: its source, original
+   * key, and whether it is purged (no longer restorable).
+   *
+   * @returns {Array<{source: string, key: string, purged: boolean}>}
+   */
+  toEntries() {
+    return [...this._deletedFields].map(id => {
+      const at = id.indexOf(':');
+      return { source: id.slice(0, at), key: id.slice(at + 1), purged: this._purgedFields.has(id) };
+    });
+  }
+
+  /**
+   * Replace every deletion with `entries` (`toEntries`'s shape).
+   *
+   * @param {ReturnType<DeleteRegistry['toEntries']>} entries
+   */
+  fromEntries(entries) {
+    if (!Array.isArray(entries)) throw new TypeError('Deleted field entries must be a list');
+    const deleted = new Set();
+    const purged = new Set();
+    for (const { source, key, purged: isPurged } of entries) {
+      requireSourceAndKey(source, key);
+      if (typeof isPurged !== 'boolean') throw new TypeError('A deleted field entry says whether it is purged');
+      const id = makeFieldId(source, key);
+      if (deleted.has(id)) throw new TypeError(`Field "${id}" is deleted twice`);
+      deleted.add(id);
+      if (isPurged) purged.add(id);
+    }
+    this._deletedFields = deleted;
+    this._purgedFields = purged;
+    this._recordReplacement();
+  }
 }

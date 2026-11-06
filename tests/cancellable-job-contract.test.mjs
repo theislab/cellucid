@@ -169,6 +169,23 @@ test('a job follows only its own reads, and the generic read notifications skip 
   assert.match(shown.calls[0][2], /^Reading genes/);
 });
 
+test('a job follows the reads of every cell it owns (a copy of the dataset), and a saved file\'s outcome is told even when quick', () => {
+  const log = fakeLog();
+  const notifications = fakeNotifications();
+  notifications.success = (message, options) => notifications.calls.push(['success', message, options]);
+  const job = new CancellableJob({ title: 'Save AnnData with this state', readKind: 'cells', notifications, log, notifyAfterMs: Infinity, successNotice: true });
+  const copyRead = { id: 1, kind: 'cells', owner: job.id, label: 'a copy of the dataset', status: 'running', bytesFetched: 10, bytesTotal: 100, startedAt: performance.now() };
+  log.record(copyRead);
+  log.record({ ...copyRead, id: 2, owner: null, label: 'cells' });
+  assert.equal(job.readTotals().fetched, 10, 'its own reads only');
+  assert.equal(isJobRead(copyRead), true, 'shown by the job, not the generic notifications');
+  assert.equal(isJobRead({ ...copyRead, owner: null }), false, 'an export\'s reads of every cell stay the generic notifications\'');
+  job.succeed('Saved copy.zarr.zip (1 MB): 3 changes applied.', { details: 'Left out:\n• Colours' });
+  assert.equal(isJobRead(copyRead), false, 'an ended job shows nothing');
+  assert.deepEqual(notifications.calls.at(-1), ['success', 'Saved copy.zarr.zip (1 MB): 3 changes applied.', { category: 'calculation', details: 'Left out:\n• Colours', duration: 0 }]);
+  assert.throws(() => new CancellableJob({ title: 'x', readKind: 'genes', notifications, log }), /Unknown job read kind/);
+});
+
 test('a job joining a gene load a view started adopts its reads: one notification for the run, the job\'s', async t => {
   const { getReadActivityLog } = await import('../assets/js/data/read-activity-log.js');
   const { createDataState } = await import('../assets/js/app/state/index.js');

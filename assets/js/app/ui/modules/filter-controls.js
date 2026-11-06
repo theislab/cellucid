@@ -2,8 +2,10 @@
  * @fileoverview Active filter summary UI.
  *
  * Renders the current filter stack, allows enabling/disabling filters, and
- * provides remove controls. This module does not render the legend itself; it
- * delegates cross-module refresh via callbacks.
+ * provides remove controls: each is an action (`filter.enable`,
+ * `filter.remove`) naming the field and the kind of filter. This module does
+ * not render the legend itself; it delegates cross-module refresh via
+ * callbacks.
  *
  * The list's two interactions are delegated to the list element, so a render
  * only builds rows. Counting a filter's cells is a pass over the dataset per
@@ -23,6 +25,7 @@ import {
 } from '../components/controls.js';
 import { formatCount, formatCountOf, formatOpenCells } from '../../../utils/format-units.js';
 import { createVisibilityGatedRender } from '../core/visibility-gate.js';
+import { dispatchFromControl } from '../../actions/control-dispatch.js';
 
 /**
  * @typedef {object} FilterCallbacks
@@ -58,8 +61,16 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
   }
 
   function afterChange() {
+    if (destroyed) return;
     callbacks.onFiltersChanged?.();
     render();
+  }
+
+  /** The filter a row shows, by name: its field and kind. */
+  function rowTarget(id) {
+    const filter = (state.getActiveFiltersStructured?.() ?? []).find(candidate => candidate.id === id);
+    if (filter === undefined) return null;
+    return { field: { source: filter.source, key: filter.fieldKey }, kind: filter.type };
   }
 
   if (activeFiltersEl) {
@@ -67,8 +78,13 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
       if (destroyed) return;
       const id = rowFilterId(event.target);
       if (id === null) return;
-      state.toggleFilterEnabled?.(id, event.target.checked);
-      afterChange();
+      const target = rowTarget(id);
+      if (target === null) return;
+      void dispatchFromControl(
+        'filter.enable',
+        { ...target, enabled: event.target.checked },
+        { failure: 'Could not change the filter' }
+      ).then(afterChange);
     }, { signal: lifecycle.signal });
     activeFiltersEl.addEventListener('click', (event) => {
       if (destroyed) return;
@@ -79,8 +95,9 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
       const id = rowFilterId(button);
       if (id === null) return;
       event.stopPropagation();
-      state.removeFilter?.(id);
-      afterChange();
+      const target = rowTarget(id);
+      if (target === null) return;
+      void dispatchFromControl('filter.remove', target, { failure: 'Could not remove the filter' }).then(afterChange);
     }, { signal: lifecycle.signal });
   }
 

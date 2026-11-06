@@ -1,0 +1,47 @@
+{
+  "examples": [
+    {
+      "analysis": "markers",
+      "in": "panel"
+    },
+    {
+      "analysis": "markers",
+      "in": "panel"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "analysis": {
+        "enum": [
+          "markers",
+          "differential",
+          "dotplot",
+          "signature",
+          "composition",
+          "correlation"
+        ],
+        "type": "string"
+      },
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      }
+    },
+    "required": [
+      "analysis"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.run",
+  "version": 1
+}

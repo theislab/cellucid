@@ -35,6 +35,7 @@ import { coalesceToFrame } from '../components/controls.js';
 import { formatPercent } from '../components/display-format.js';
 import { describePlanBytes } from '../../state/managers/outlier-quantiles.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { createLatestDispatch } from '../../actions/control-dispatch.js';
 
 /** Join names as people list them: `a`, `a or b`, `a, b or c`. */
 function listOr(names) {
@@ -220,13 +221,19 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
     }
   }
 
+  // The threshold is the action `filter.outlier`: a drag dispatches its
+  // latest value (one step), and the control shows the state once it settles.
+  const thresholdDispatch = createLatestDispatch('filter.outlier', {
+    failure: 'Could not filter outliers',
+    onSettled: () => render(),
+  });
   const applyThreshold = () => {
-    if (destroyed || input === null) return;
+    if (destroyed || input === null || field === null) return;
     const pct = parseFloat(input.value);
     if (display) display.textContent = formatPercent(pct);
     // The first move below 100% gets the field's quantiles; a cancelled or
     // failed attempt is told by the status line.
-    void state.setOutlierThresholdForActive(pct / 100).finally(() => render());
+    thresholdDispatch.push({ field: { source: 'obs', key: field.key }, threshold: pct / 100 });
   };
   const frame = coalesceToFrame(applyThreshold);
   if (input) {
@@ -252,10 +259,20 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
   if (action) {
     action.addEventListener('click', () => {
       if (shownAction === 'latent') onChooseLatent();
-      else if (shownAction === 'cancel') state.cancelOutlierQuantiles();
+      else if (shownAction === 'cancel') {
+        // A threshold still waiting its turn would start the computing again.
+        thresholdDispatch.clear();
+        state.cancelOutlierQuantiles();
+      }
     }, { signal: lifecycle.signal });
   }
   const unsubscribe = state.on('outliers:status', () => render());
+  // A threshold set elsewhere (an undo, an agent, a notebook) is shown; the
+  // thumb being dragged is left alone.
+  const unsubscribeVisibility = state.on('visibility:changed', () => {
+    if (destroyed || dragging || thresholdDispatch.pending || field === null || input === null) return;
+    if (String(Math.round((field._outlierThreshold ?? 1) * 100)) !== input.value) render();
+  });
 
   return {
     render,
@@ -265,6 +282,7 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
       frame.cancel();
       lifecycle.abort();
       unsubscribe?.();
+      unsubscribeVisibility?.();
     },
   };
 }

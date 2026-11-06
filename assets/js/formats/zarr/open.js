@@ -42,13 +42,14 @@ import { createLimiter } from './stores/common.js';
 import { releaseIdleDecodeWorkers } from '../io/decode-pool.js';
 import { SharedWorks, cancelled, withinLifetime } from '../../utils/abort.js';
 import { isObjectRecord } from '../../utils/exact-record.js';
+import { reportedCores } from '../../utils/machine.js';
 
 const MiB = 1024 * 1024;
 const V2_FILES = ['.zgroup', '.zarray', '.zattrs'];
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 /** Chunks decoded at once: enough to use every core, few enough to bound transient memory. */
-const DECODE_CONCURRENCY = Math.max(4, Math.min(16, Number(globalThis.navigator?.hardwareConcurrency) || 4));
+const DECODE_CONCURRENCY = Math.max(4, Math.min(16, reportedCores() ?? 4));
 
 function jsonOf(bytes, what) {
   let text;
@@ -83,6 +84,9 @@ async function readV2(store, keys, rootFetched, consolidatedWanted, options, sto
   if (consolidatedBytes === undefined && consolidatedWanted && (keys === null || keys.has('.zmetadata'))) {
     consolidatedBytes = await store.get('.zmetadata', options);
   }
+  // Keys compared in one Unicode form (`sameForm`): the documents name a
+  // node as written, a listing may hold it normalised (a ZIP reader's).
+  const listed = keys === null ? null : new Set([...keys].map(sameForm));
   const covered = new Set();
   if (consolidatedWanted && consolidatedBytes) {
     const consolidated = jsonOf(consolidatedBytes, `${storeName}/.zmetadata`);
@@ -91,9 +95,9 @@ async function readV2(store, keys, rootFetched, consolidatedWanted, options, sto
     }
     for (const [key, json] of Object.entries(consolidated.metadata)) {
       // A listed store is the authority on what exists.
-      if (keys !== null && !keys.has(key)) continue;
+      if (listed !== null && !listed.has(sameForm(key))) continue;
       put(key, json);
-      covered.add(key);
+      covered.add(sameForm(key));
     }
   }
   if (keys === null) {
@@ -114,12 +118,23 @@ async function readV2(store, keys, rootFetched, consolidatedWanted, options, sto
     }
     return docs;
   }
-  const missing = [...keys].filter(key => V2_FILES.includes(splitKey(key)[1]) && !covered.has(key));
+  const missing = [...keys].filter(key => V2_FILES.includes(splitKey(key)[1]) && !covered.has(sameForm(key)));
   const bytes = await store.getMany(missing, options);
   missing.forEach((key, i) => {
     if (bytes[i] !== null) put(key, jsonOf(bytes[i], `${storeName}/${key}`));
   });
   return docs;
+}
+
+/**
+ * A store key in one Unicode form (NFC), to compare what the documents name
+ * (as written: a column `café` may be decomposed, as macOS writes it) with
+ * what a listing holds (a ZIP reader's names are normalised,
+ * `zip/names.js`); the node keeps the documents' own form, which its
+ * attributes name it by.
+ */
+function sameForm(key) {
+  return key.normalize('NFC');
 }
 
 /** Metadata documents of a Zarr v3 store: path -> zarr.json. */
@@ -131,6 +146,7 @@ async function readV3(store, keys, rootFetched, consolidatedWanted, options, sto
   const root = jsonOf(rootBytes, `${storeName}/zarr.json`);
   if (!isObjectRecord(root)) throw new ZarrFormatError(`${storeName}/zarr.json is not a JSON object.`);
   docs.set('', root);
+  const listed = keys === null ? null : new Set([...keys].map(sameForm));
   const covered = new Set(['zarr.json']);
   const consolidated = consolidatedWanted ? root.consolidated_metadata?.metadata : undefined;
   if (isObjectRecord(consolidated)) {
@@ -138,9 +154,9 @@ async function readV3(store, keys, rootFetched, consolidatedWanted, options, sto
       for (const [relative, json] of Object.entries(entries)) {
         const path = joinPath(prefix, relative);
         const key = joinPath(path, 'zarr.json');
-        if (keys !== null && !keys.has(key)) continue;
+        if (listed !== null && !listed.has(sameForm(key))) continue;
         if (!docs.has(path)) docs.set(path, json);
-        covered.add(key);
+        covered.add(sameForm(key));
         // A nested group may carry its own consolidated listing, relative to it.
         if (isObjectRecord(json?.consolidated_metadata?.metadata)) add(path, json.consolidated_metadata.metadata);
       }
@@ -150,7 +166,7 @@ async function readV3(store, keys, rootFetched, consolidatedWanted, options, sto
     throw new ZarrFormatError(`${storeName} has no consolidated metadata, and a web host cannot list its contents. Consolidate the store (zarr.consolidate_metadata) before publishing it.`);
   }
   if (keys !== null) {
-    const missing = [...keys].filter(key => splitKey(key)[1] === 'zarr.json' && !covered.has(key));
+    const missing = [...keys].filter(key => splitKey(key)[1] === 'zarr.json' && !covered.has(sameForm(key)));
     const bytes = await store.getMany(missing, options);
     missing.forEach((key, i) => {
       if (bytes[i] !== null) docs.set(splitKey(key)[0], jsonOf(bytes[i], `${storeName}/${key}`));

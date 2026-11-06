@@ -14,11 +14,16 @@
  * this page's address and is never shared; the dialog says so when it left
  * something out.
  *
+ * An agent, a notebook and a replay get the same link and snippets with
+ * `dataset.share-link` (asked of an agent as `publishes`: the link goes to
+ * the agent, and from there wherever it is sent).
+ *
  * @module ui/modules/share-dialog
  */
 
 import { dataLinkLeavesOutAccess, readDataSourceUrlParameters } from '../../url-state.js';
 import { copyWithFeedback, wireAppDialog } from '../components/app-dialog.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
 
 export const PUBLIC_APP_URL = 'https://www.cellucid.com/';
 export const BADGE_IMAGE_URL = `${PUBLIC_APP_URL}assets/img/open-in-cellucid.svg`;
@@ -81,7 +86,12 @@ export function embedHtml(shareUrl, datasetName) {
     + 'width="100%" height="640" style="border: 0;" allow="fullscreen" loading="lazy"></iframe>';
 }
 
-export function initShareDialog({ ownerDocument = document, dataSourceManager }) {
+/**
+ * @param {{ownerDocument?: Document, dataSourceManager: object,
+ *   actions?: {provide: (type: string, handler: Function) => () => void}|null}} options -
+ *   `actions`: the page's dispatcher, on which the dialog's link is provided as `dataset.share-link`
+ */
+export function initShareDialog({ ownerDocument = document, dataSourceManager, actions = null }) {
   if (dataSourceManager === null || typeof dataSourceManager?.getCurrentSourceType !== 'function') {
     throw new TypeError('Share needs the data source manager.');
   }
@@ -119,11 +129,11 @@ export function initShareDialog({ ownerDocument = document, dataSourceManager })
   button.addEventListener('click', () => {
     refresh();
     if (shareUrl === null) return;
-    const name = dataSourceManager.getCurrentMetadata?.()?.name ?? '';
-    link.value = shareUrl;
-    accessNote.hidden = !dataLinkLeavesOutAccess(ownerDocument.defaultView.location.href);
-    badge.value = badgeMarkdown(shareUrl);
-    embed.value = embedHtml(shareUrl, name);
+    const made = snippets(shareUrl);
+    link.value = made.link;
+    accessNote.hidden = !made.accessLeftOut;
+    badge.value = made.badge;
+    embed.value = made.embed;
     owner.open(button);
   }, { signal: controller.signal });
 
@@ -138,10 +148,35 @@ export function initShareDialog({ ownerDocument = document, dataSourceManager })
     field.addEventListener('focus', () => field.select(), { signal: controller.signal });
   }
 
+  /** What the dialog shows for the dataset shown: the link, the badge, the embed snippet, and whether access was left out. */
+  function snippets(url) {
+    const name = dataSourceManager.getCurrentMetadata?.()?.name ?? '';
+    return {
+      link: url,
+      badge: badgeMarkdown(url),
+      embed: embedHtml(url, name),
+      accessLeftOut: dataLinkLeavesOutAccess(ownerDocument.defaultView.location.href),
+    };
+  }
+
+  // An agent's, a notebook's or a replay's Share (`dataset.share-link`): the dialog's link and snippets.
+  const unprovide = actions === null ? () => {} : actions.provide('dataset.share-link', () => {
+    const url = currentShareUrl();
+    if (url === null) {
+      throw new ActionRefused(
+        'The dataset shown has no link that opens it for someone else (a file of this computer, a notebook\'s dataset or a server on this computer): the person shares the file itself.',
+        { code: 'unavailable', type: 'dataset.share-link' },
+      );
+    }
+    const made = snippets(url);
+    return { link: made.link, badge: made.badge, embed: made.embed, access_left_out: made.accessLeftOut };
+  });
+
   refresh();
   return {
     refresh,
     destroy() {
+      unprovide();
       controller.abort();
       owner.destroy();
     },

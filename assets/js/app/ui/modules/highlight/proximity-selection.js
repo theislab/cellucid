@@ -36,13 +36,13 @@ import {
   requireViewerHostSource,
   requireMethods,
   requireSafeInteger,
-  requireSavedHighlightGroup,
   requireSelectionPreviewEvent,
   requireSelectionStepEvent,
   requireUnifiedSelectionState,
 } from './exact-contract.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { createSelectionConfirmer } from './highlight-actions.js';
 
 /**
  * @param {object} options
@@ -65,8 +65,9 @@ export function initProximitySelection(options) {
     state,
     'Proximity selection state',
     [
-      'addHighlightDirect',
       'clearPreviewHighlight',
+      'ensureHighlightPage',
+      'getActivePage',
       'setPreviewHighlightFromIndices'
     ]
   );
@@ -103,6 +104,8 @@ export function initProximitySelection(options) {
   const lifecycleController = new AbortController();
   const pendingDeliveries = new Set();
   let destroyed = false;
+  // Confirm makes one `highlight.cells` step (`highlight-actions.js`).
+  const confirmer = createSelectionConfirmer({ state, isDestroyed: () => destroyed });
   let destructionPromise = null;
 
   function listen(target, eventName, listener) {
@@ -129,18 +132,11 @@ export function initProximitySelection(options) {
     );
 
     const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
-    const savedGroup = state.addHighlightDirect({
-      type: 'proximity',
+    void confirmer.confirm({
+      tool: 'proximity',
       label: `Proximity${stepsLabel} (${formatCountOf(proximityEvent.cellCount, 'cell')})`,
       cellIndices: proximityEvent.cellIndices
     });
-    requireSavedHighlightGroup(
-      savedGroup,
-      'proximity',
-      proximityEvent.cellIndices,
-      'Saved proximity highlight group',
-      state.pointCount
-    );
 
     debug.log(`[UI] Proximity selected ${formatCountOf(proximityEvent.cellCount, 'cell')} from ${proximityEvent.steps} drag(s)`);
     trackDelivery(deliverSelectionToViewerHost({
@@ -351,7 +347,7 @@ export function initProximitySelection(options) {
         redo: handleProximityRedo,
         confirm: () => {
           viewer.confirmProximitySelection();
-          state.clearPreviewHighlight();
+          confirmer.clearPreview();
         },
         cancel: () => {
           viewer.cancelProximitySelection();

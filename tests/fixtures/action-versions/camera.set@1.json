@@ -1,0 +1,124 @@
+{
+  "examples": [
+    {
+      "camera": {
+        "freefly": {
+          "pitch": 0,
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "yaw": 0
+        },
+        "navigationMode": "orbit",
+        "orbit": {
+          "phi": 0,
+          "radius": 1,
+          "target": [
+            0,
+            0,
+            0
+          ],
+          "targetRadius": 1,
+          "theta": 0
+        }
+      },
+      "view": "View 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "camera": {
+        "additionalProperties": false,
+        "properties": {
+          "freefly": {
+            "additionalProperties": false,
+            "properties": {
+              "pitch": {
+                "type": "number"
+              },
+              "position": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "yaw": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "position",
+              "yaw",
+              "pitch"
+            ],
+            "type": "object"
+          },
+          "navigationMode": {
+            "enum": [
+              "orbit",
+              "planar",
+              "free"
+            ]
+          },
+          "orbit": {
+            "additionalProperties": false,
+            "properties": {
+              "phi": {
+                "type": "number"
+              },
+              "radius": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "target": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "targetRadius": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "theta": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "radius",
+              "targetRadius",
+              "theta",
+              "phi",
+              "target"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "navigationMode",
+          "orbit",
+          "freefly"
+        ],
+        "type": "object"
+      },
+      "view": {
+        "pattern": "^View [1-9][0-9]*$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "view",
+      "camera"
+    ],
+    "type": "object"
+  },
+  "type": "camera.set",
+  "version": 1
+}

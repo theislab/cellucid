@@ -118,144 +118,53 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
   await dismissWelcome(page);
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  await page.locator('#split-keep-view-btn').click();
+  await expect(page.locator('.split-badge')).toHaveCount(2);
 
+  // A host's setVisibility is the `cells.visibility.set` action, dispatched
+  // with origin host (`viewer-host/command-handler.js`): it hides cells in
+  // the selected view only, and each view replays its own mask.
   const proof = await page.evaluate(async () => {
-    const [
-      { DataStateColorMethods },
-      { DataStateFilterMethods },
-      { viewContextCoreMethods },
-      { createViewerHostCommandHandlers },
-      { createCellIdentity },
-    ] = await Promise.all([
-      import('/assets/js/app/state/managers/color-manager.js'),
-      import('/assets/js/app/state/managers/filter-manager.js'),
-      import('/assets/js/app/state/managers/view-context-core.js'),
-      import('/assets/js/app/viewer-host-command-handler.js'),
-      import('/assets/js/data/cell-identity.js'),
-    ]);
-
-    const pointCount = 4;
-    const layouts = [];
-    const viewer = {
-      setViewLayout(mode, viewId) {
-        layouts.push([mode, viewId]);
-      },
-      resetCamera() {},
-    };
-    const state = {
-      pointCount,
-      obsData: { fields: [] },
-      varData: { fields: [] },
-      activeFieldIndex: -1,
-      activeVarFieldIndex: -1,
-      activeFieldSource: null,
-      activeViewId: 'live',
-      colorsArray: new Uint8Array(pointCount * 4),
-      categoryTransparency: Uint8Array.from([1, 1, 1, 1]),
-      cellVisibilityMask: Uint8Array.from([1, 1, 1, 1]),
-      centroidPositions: new Float32Array(),
-      centroidColors: new Uint8Array(),
-      centroidLabels: [],
-      filteredCount: { shown: pointCount, total: pointCount },
-      viewContexts: new Map(),
-      dimensionManager: null,
-      viewer,
-      _cloneFieldState: viewContextCoreMethods._cloneFieldState,
-      _cloneObsData: viewContextCoreMethods._cloneObsData,
-      _cloneVarData: viewContextCoreMethods._cloneVarData,
-      _buildContextFromCurrent: viewContextCoreMethods._buildContextFromCurrent,
-      _syncActiveContext: viewContextCoreMethods._syncActiveContext,
-      createViewFromActive: viewContextCoreMethods.createViewFromActive,
-      setActiveView: viewContextCoreMethods.setActiveView,
-      setCellVisibility: DataStateFilterMethods.prototype.setCellVisibility,
-      computeGlobalVisibility:
-        DataStateFilterMethods.prototype.computeGlobalVisibility,
-      _applyOverlaysToFields() {},
-      _injectUserDefinedFields() {},
-      _ensureActiveSelectionNotDeleted() {},
-      _reinitializeActiveField() {},
-      _rebuildLabelLayerFromCentroids() {},
-      _pushColorsToViewer() {},
-      _pushTransparencyToViewer() {},
-      _pushOutliersToViewer() {},
-      _pushCentroidsToViewer() {},
-      _pushOutlierThresholdToViewer() {},
-      getCurrentOutlierThreshold() {
-        return 1;
-      },
-      isOutlierFilterEnabledForActiveField() {
-        return false;
-      },
-      _updateActiveCategoryCounts() {
-        return false;
-      },
-      updateFilteredCount() {},
-      updateFilterSummary() {},
-      _notifyVisibilityChange() {},
-    };
-
-    state.viewContexts.set(
-      'live',
-      state._buildContextFromCurrent('live', { cloneArrays: false }),
-    );
-    state.createViewFromActive('snapshot-jupyter');
-
-    const commands = createViewerHostCommandHandlers({
-      state,
-      viewer,
-      refreshUi() {},
-      reportDataMapping: async () => false,
-      getCellIdentity: () => createCellIdentity({ nObs: state.pointCount }),
-      getShownHostDataset: () => 'example',
-      results: { answer() {} },
-      getHostLabel: () => 'Python',
-    });
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    const actions = getActions();
+    const state = window._cellucidState;
+    const viewer = window._cellucidViewer;
+    const kept = viewer.getSnapshotViews()[0].id;
+    const asHost = { origin: 'host', host: 'python' };
+    const firstCells = [0, 1, 2, 3];
     const sequence = [];
     const record = label => {
       sequence.push({
         label,
-        viewId: state.activeViewId,
-        mask: Array.from(state.cellVisibilityMask),
-        transparency: Array.from(state.categoryTransparency),
+        viewId: state.getActiveViewId() === kept ? 'kept' : state.getActiveViewId(),
+        mask: firstCells.map(cell => state.cellVisibilityMask[cell]),
+        transparency: firstCells.map(cell => (state.categoryTransparency[cell] > 0 ? 1 : 0)),
+        hidden: state.cellVisibilityMask.length - state.cellVisibilityMask.reduce((sum, value) => sum + value, 0),
       });
     };
 
-    state.setActiveView('snapshot-jupyter');
-    await commands.handleMessage({
-      type: 'setVisibility',
-      cells: [0],
-      visible: false,
-    });
-    record('snapshot hides cell 0');
+    await actions.dispatch('view.focus', { view: 'View 2' });
+    const hideKept = await actions.dispatch('cells.visibility.set', { cells: [0], visible: false }, asHost);
+    record('kept view hides cell 0');
 
-    state.setActiveView('live');
-    state.computeGlobalVisibility();
-    record('live replay after snapshot command');
+    await actions.dispatch('view.focus', { view: 'View 1' });
+    record('live replay after kept-view command');
 
-    await commands.handleMessage({
-      type: 'setVisibility',
-      cells: [2],
-      visible: false,
-    });
+    const hideLive = await actions.dispatch('cells.visibility.set', { cells: [2], visible: false }, asHost);
     record('live hides cell 2');
 
-    state.setActiveView('snapshot-jupyter');
-    state.computeGlobalVisibility();
-    record('snapshot replay after live command');
+    await actions.dispatch('view.focus', { view: 'View 2' });
+    record('kept replay after live command');
 
-    state.setActiveView('live');
-    state.computeGlobalVisibility();
+    await actions.dispatch('view.focus', { view: 'View 1' });
     record('live final replay');
 
     return {
+      outcomes: [hideKept.outcome, hideLive.outcome],
       sequence,
       contexts: {
-        live: Array.from(
-          state.viewContexts.get('live').cellVisibilityMask,
-        ),
-        snapshot: Array.from(
-          state.viewContexts.get('snapshot-jupyter').cellVisibilityMask,
-        ),
+        live: firstCells.map(cell => state.viewContexts.get('live').cellVisibilityMask[cell]),
+        kept: firstCells.map(cell => state.viewContexts.get(kept).cellVisibilityMask[cell]),
       },
       // The active view's context shares the state's mask; the two views'
       // contexts never share one.
@@ -263,55 +172,56 @@ test('Viewer host visibility replay stays isolated across live and snapshot view
         state.cellVisibilityMask
           === state.viewContexts.get('live').cellVisibilityMask
         && state.viewContexts.get('live').cellVisibilityMask
-          !== state.viewContexts.get('snapshot-jupyter').cellVisibilityMask
+          !== state.viewContexts.get(kept).cellVisibilityMask
       ),
-      layouts,
+      focus: viewer.getViewLayout(),
     };
   });
 
+  expect(proof.outcomes).toEqual([{ cells: 1, not_open: 0 }, { cells: 1, not_open: 0 }]);
   expect(proof.sequence).toEqual([
     {
-      label: 'snapshot hides cell 0',
-      viewId: 'snapshot-jupyter',
+      label: 'kept view hides cell 0',
+      viewId: 'kept',
       mask: [0, 1, 1, 1],
       transparency: [0, 1, 1, 1],
+      hidden: 1,
     },
     {
-      label: 'live replay after snapshot command',
+      label: 'live replay after kept-view command',
       viewId: 'live',
       mask: [1, 1, 1, 1],
       transparency: [1, 1, 1, 1],
+      hidden: 0,
     },
     {
       label: 'live hides cell 2',
       viewId: 'live',
       mask: [1, 1, 0, 1],
       transparency: [1, 1, 0, 1],
+      hidden: 1,
     },
     {
-      label: 'snapshot replay after live command',
-      viewId: 'snapshot-jupyter',
+      label: 'kept replay after live command',
+      viewId: 'kept',
       mask: [0, 1, 1, 1],
       transparency: [0, 1, 1, 1],
+      hidden: 1,
     },
     {
       label: 'live final replay',
       viewId: 'live',
       mask: [1, 1, 0, 1],
       transparency: [1, 1, 0, 1],
+      hidden: 1,
     },
   ]);
   expect(proof.contexts).toEqual({
     live: [1, 1, 0, 1],
-    snapshot: [0, 1, 1, 1],
+    kept: [0, 1, 1, 1],
   });
   expect(proof.independentBuffers).toBe(true);
-  expect(proof.layouts).toEqual([
-    ['grid', 'snapshot-jupyter'],
-    ['grid', 'live'],
-    ['grid', 'snapshot-jupyter'],
-    ['grid', 'live'],
-  ]);
+  expect(proof.focus).toEqual({ mode: 'grid', activeId: 'live', liveViewHidden: false });
 
   await page.evaluate(result => {
     const card = document.createElement('section');

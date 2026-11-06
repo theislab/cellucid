@@ -192,6 +192,11 @@ test('dataset replacement retires deleted-field purge confirmation ownership', a
   await page.locator('#continuous-field').selectOption({ label: 'score' });
   await page.locator('#delete-continuous-field').click();
   await page.locator('.confirm-dialog-confirm').click();
+  // The deletion has landed (its purge button is listed) before the state is read:
+  // reading it straight after the click raced the deletion on WebKit.
+  await expect(
+    page.locator('button[data-action="purge-field"][data-source="obs"]'),
+  ).toHaveCount(1);
   const before = await readObsFieldContract(page);
   await staleConfirm.evaluate(button => button.click());
 

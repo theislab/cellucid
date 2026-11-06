@@ -1,5 +1,11 @@
+/**
+ * Large state decodes and restores: a session file's cell sets
+ * (`session/codecs/cell-set.js`, read by `session/history-file.js`) yield as
+ * they decode, so a cancellation wins on any machine; a large user field put
+ * back by the `field-overlays` state domain is laid in whole, with centroids
+ * for the layouts that are resident.
+ */
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -8,9 +14,9 @@ import {
 import {
   encodeUvarints,
 } from '../assets/js/app/session/codecs/varint.js';
-import {
-  restore as restoreUserDefinedCodes,
-} from '../assets/js/app/session/contributors/user-defined-codes.js';
+import { createFieldOverlaysDomain } from '../assets/js/app/state/domains/field-overlays.js';
+import { DataState } from '../assets/js/app/state/core/data-state.js';
+import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import {
   DimensionManager,
 } from '../assets/js/data/dimension-manager.js';
@@ -28,8 +34,8 @@ function scheduleCancel(cancel) {
 
 /**
  * A real DimensionManager with two 2D layouts, only the first of them
- * resident. Restored codes get centroids for exactly the resident layout,
- * computed from its positions: cell `i` sits at (i, 2i).
+ * resident. A restored user field gets centroids for exactly the resident
+ * layout, computed from its positions: cell `i` sits at (i, 2i).
  */
 function residentDimensionManager(pointCount) {
   const manager = new DimensionManager();
@@ -62,72 +68,18 @@ function residentDimensionManager(pointCount) {
   return manager;
 }
 
-/** A user-defined codes payload in the runs encoding (1). */
-function userCodesPayload({ length, pairs }) {
-  const body = encodeUvarints([length, pairs.length, ...pairs.flat()]);
-  const payload = new Uint8Array(1 + body.length);
-  payload[0] = 1;
-  payload.set(body, 1);
-  return payload;
-}
-
-function userCodesContext(pointCount, signal = null) {
-  const template = {
-    _userDefinedId: 'field-a',
-    _isUserDefined: true,
-    kind: 'category',
-    key: 'restored_groups',
-    codes: null,
-    loaded: false,
-    _codesLengthHint: pointCount,
-    _codesTypeHint: 'Uint8Array',
-    // A session record carries no centroids: restoring codes computes them.
-    centroidsByLayout: new Map(),
-    _normalizedLayouts: new Set(),
-    // Restoring codes bounds them against the field's own inventory, so a
-    // categorical template without categories is not a state the metadata
-    // restore can produce. The width here is what these payloads exercise, so
-    // the inventory covers every uint8 code rather than constraining it.
-    categories: Array.from({ length: 256 }, (_value, index) => `c${index}`),
-  };
-  const state = {
-    pointCount,
-    dimensionManager: residentDimensionManager(pointCount),
-    obsData: { fields: [] },
-    varData: { fields: [] },
-    viewContexts: new Map(),
-    getUserDefinedFieldsRegistry() {
-      return {
-        getField(fieldId) {
-          return fieldId === 'field-a' ? template : null;
-        },
-      };
-    },
-    getActiveField() {
-      return null;
-    },
-  };
-  return {
-    context: {
-      abortSignal: signal,
-      state,
-    },
-    template,
-  };
-}
-
-function userCodesMetadata(payload) {
-  return {
-    id: 'user-defined/codes/field-a',
-    contributorId: 'user-defined-codes',
-    priority: 'lazy',
-    kind: 'binary',
-    codec: 'gzip',
-    label: 'User-defined codes: restored_groups',
-    datasetDependent: true,
-    storedBytes: payload.byteLength,
-    uncompressedBytes: payload.byteLength,
-  };
+/** A DataState of `pointCount` cells, every one open, over `residentDimensionManager`. */
+function stateWithResidentLayout(pointCount) {
+  // The views a state domain covers: the live view alone.
+  const viewer = { getSnapshotViews: () => [] };
+  const state = new DataState(viewer, null);
+  state.pointCount = pointCount;
+  state.cellIdentity = createCellIdentity({ nObs: pointCount });
+  state.dimensionManager = residentDimensionManager(pointCount);
+  state.obsData = { fields: [] };
+  state.varData = { fields: [] };
+  state._resetViewContexts();
+  return { state, viewer };
 }
 
 test('a large sorted-delta cell set yields so a scheduled cancellation wins', async () => {
@@ -151,7 +103,6 @@ test('a large sorted-delta cell set yields so a scheduled cancellation wins', as
     await assert.rejects(
       decodeCellSet(payload, {
         cellCount: count,
-        reference: null,
         signal: controller.signal,
       }),
       error => error === cancellation,
@@ -171,7 +122,7 @@ test('a large bitset cell set yields so a scheduled cancellation wins', async ()
   const timer = scheduleCancel(() => controller.abort(cancellation));
   try {
     await assert.rejects(
-      decodeCellSet(payload, { cellCount, reference: null, signal: controller.signal }),
+      decodeCellSet(payload, { cellCount, signal: controller.signal }),
       error => error === cancellation,
     );
   } finally {
@@ -179,80 +130,40 @@ test('a large bitset cell set yields so a scheduled cancellation wins', async ()
   }
 });
 
-test('one very large code run yields and never publishes partial codes on cancel', async () => {
-  const pointCount = 1024 * 1024;
-  const payload = userCodesPayload({
-    length: pointCount,
-    pairs: [[7, pointCount]],
-  });
-  const controller = new AbortController();
-  const cancellation = new Error('scheduled code cancellation');
-  const { context, template } = userCodesContext(
-    pointCount,
-    controller.signal,
-  );
-  const unrestoredCentroids = template.centroidsByLayout;
-  const unrestoredNormalized = template._normalizedLayouts;
-  let abortFired = false;
-  const timer = scheduleCancel(() => {
-    abortFired = true;
-    controller.abort(cancellation);
-  });
-  try {
-    await assert.rejects(
-      restoreUserDefinedCodes(
-        context,
-        userCodesMetadata(payload),
-        payload,
-      ),
-      error => error === cancellation,
-    );
-  } finally {
-    clearImmediate(timer);
-  }
-
-  assert.equal(abortFired, true);
-  assert.equal(template.codes, null);
-  assert.equal(template.loaded, false);
-  assert.equal(template._codesLengthHint, pointCount);
-  assert.equal(template._codesTypeHint, 'Uint8Array');
-  // Nor centroids of codes it never published.
-  assert.strictEqual(template.centroidsByLayout, unrestoredCentroids);
-  assert.strictEqual(template._normalizedLayouts, unrestoredNormalized);
-  assert.equal(template.centroidsByLayout.size, 0);
-  assert.equal(template._normalizedLayouts.size, 0);
-});
-
-test('a run-encoded payload with many runs decodes directly into its final typed array', async () => {
+test('a large user field is laid in whole, with centroids for the one resident layout', async () => {
   const pointCount = 128 * 1024;
-  const pairs = new Array(pointCount);
-  for (let index = 0; index < pointCount; index++) {
-    pairs[index] = [index & 1, 1];
-  }
-  const payload = userCodesPayload({ length: pointCount, pairs });
-  const { context, template } = userCodesContext(pointCount);
+  const codes = new Uint8Array(pointCount);
+  for (let index = 0; index < pointCount; index++) codes[index] = index & 1;
+  const categories = Array.from({ length: 200 }, (_value, index) => `c${index}`);
+  // A field-overlays value as the history holds it (one user field, its
+  // codes a column over every cell of the dataset).
+  const value = {
+    renamedFields: [],
+    renamedCategories: [],
+    deletedFields: [],
+    userFields: [{
+      id: 'user_cat_1', source: 'obs', kind: 'category', key: 'restored_groups', deleted: false, purged: false,
+      createdAt: 1, sourceField: null, operation: null, categories, codes: { cells: null, values: codes },
+      sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null,
+    }],
+  };
+  const { state, viewer } = stateWithResidentLayout(pointCount);
+  await createFieldOverlaysDomain({ state, viewer, refreshUi: () => {} }).restore(value);
+  const template = state.getUserDefinedFieldsRegistry().getField('user_cat_1');
 
-  await restoreUserDefinedCodes(
-    context,
-    userCodesMetadata(payload),
-    payload,
-  );
+  // Every cell open in its own order: the column is the field's codes, never
+  // copied cell by cell.
+  assert.equal(template.codes, codes);
+  assert.equal(template.loaded, true);
+  assert.equal(state.obsData.fields.at(-1)._userDefinedId, 'user_cat_1');
 
-  assert.ok(template.codes instanceof Uint8Array);
-  assert.equal(template.codes.length, pointCount);
-  assert.deepEqual(
-    Array.from(template.codes.subarray(0, 8)),
-    [0, 1, 0, 1, 0, 1, 0, 1],
-  );
-  assert.equal(template.codes.at(-1), 1);
-
-  // The session record carried no centroids; restoring the codes computed
-  // them for the one resident layout, in normalized space.
+  // The value carried no centroids; restoring the field computed them for
+  // the one resident layout, in normalized space.
   assert.deepEqual([...template.centroidsByLayout.keys()], ['X_umap_2d']);
   assert.deepEqual([...template._normalizedLayouts], ['X_umap_2d']);
   const centroids = template.centroidsByLayout.get('X_umap_2d');
-  // Only c0 and c1 hold cells; the other 254 categories have no centroid.
-  assert.equal(template.categories.length, 256);
+  // Only c0 and c1 hold cells; the other 198 categories have no centroid.
+  assert.equal(template.categories.length, 200);
   assert.deepEqual(centroids.map(centroid => centroid.category), ['c0', 'c1']);
   const half = pointCount / 2;
   // Even cells hold code 0, odd cells code 1.
@@ -266,14 +177,4 @@ test('a run-encoded payload with many runs decodes directly into its final typed
     position: [half, 2 * half],
     n_points: half,
   });
-
-  const source = await readFile(
-    new URL(
-      '../assets/js/app/session/contributors/user-defined-codes.js',
-      import.meta.url,
-    ),
-    'utf8',
-  );
-  assert.doesNotMatch(source, /new Array\s*\(\s*pairCount\s*\)/);
-  assert.match(source, /codes\.fill\s*\(/);
 });

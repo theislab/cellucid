@@ -62,6 +62,7 @@ import { cellsSteady } from '../../../data/open-cells-work.js';
 import { isCellList } from '../../utils/cell-set.js';
 import { registerResidentHolder, residencyBudgetBytes } from '../../../data/memory-budget.js';
 import { failureText } from '../../../utils/errors.js';
+import { dispatchFromControl } from '../../actions/control-dispatch.js';
 
 // =============================================================================
 // PARALLEL LOADING
@@ -1141,16 +1142,26 @@ export class DataLayer {
   }
 
   /**
-   * Set the persistent color for a highlight page.
+   * Set the persistent color for a highlight page (a sample of a page
+   * recolours its page): a highlight action, named by the page's name.
    * @param {string} pageId
    * @param {string} color
-   * @returns {boolean}
+   * @returns {Promise<object|null>} The action's result, or null when it was
+   *   not applied (the notification says why)
    */
   setPageColor(pageId, color) {
-    if (typeof this.state?.setHighlightPageColor !== 'function') {
-      throw new TypeError('DataLayer state.setHighlightPageColor is required');
+    if (typeof this.state?.getHighlightPages !== 'function') {
+      throw new TypeError('DataLayer state.getHighlightPages is required');
     }
-    return this.state.setHighlightPageColor(pageId, color);
+    const sample = parseSamplePageId(pageId);
+    const baseId = sample === null ? pageId : sample.baseId;
+    const page = this.state.getHighlightPages().find(candidate => candidate.id === baseId);
+    if (page === undefined) return Promise.resolve(null);
+    return dispatchFromControl(
+      'highlight.page.recolor',
+      { page: page.name, color },
+      { failure: 'Recolouring the highlight page failed', category: 'highlight' }
+    );
   }
 
   /**

@@ -48,6 +48,7 @@ export const WORKER_ENTRIES = Object.freeze([
   { name: 'pointRasterWorker', source: 'assets/js/app/analysis/plots/point-raster-worker.js' },
   { name: 'spatialTreeWorker', source: 'assets/js/rendering/high-perf/spatial-tree-worker.js' },
   { name: 'subsetEntries', source: 'assets/js/data/anndata/subset-entries.js' },
+  { name: 'zarrEncodeTask', source: 'assets/js/formats/zarr/encode-task.js' },
 ].map(entry => Object.freeze(entry)));
 
 /**

@@ -184,7 +184,7 @@ test('a recorded dataset that could not be opened abandons the restore', async (
 
 /**
  * Load a session saved on a file of this computer (`{kind: 'file'}`) with
- * `kept` (the handle kept of it, `app/local-file-handles.js`), recording
+ * `kept` (the handle kept of it, `app/library/local-file-handles.js`), recording
  * what the controls ask and offer.
  */
 async function loadLocalSession({ kept, opens = true }) {

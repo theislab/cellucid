@@ -27,10 +27,9 @@ import {
 import { SLIDER_STEPS, boundText, createRangeScale, parseBound } from './legend/range-bounds.js';
 import { createDomId } from '../components/dom-id.js';
 import { initOutlierFilterControl } from './outlier-filter-control.js';
+import { createLatestDispatch, dispatchFromControl } from '../../actions/control-dispatch.js';
 import { PLACES } from '../place-names.js';
 import { formatSignificant } from '../../../utils/format-units.js';
-
-let colormapMenuIdCounter = 0;
 
 
 export function initLegendRenderer({ state, viewer, dom, dataSourceManager = null, onChooseLatent = () => {} }) {
@@ -57,8 +56,16 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     refreshCategoryCounts,
     renderCategoricalLegend,
     releaseCategoricalLegend,
+    syncCategoryState,
     destroy: destroyCategoricalLegend
   } = initCategoricalLegend({ state, legendEl, dataSourceManager });
+  /**
+   * The continuous legend shows the field's state as it is now: its colour
+   * scale, switches and visible range (a change made by an undo, an agent or
+   * a notebook reaches it here). Null while no continuous legend is drawn.
+   * @type {(() => void)|null}
+   */
+  let syncContinuous = null;
   // Counts change on every visibility frame; while the legend's panel is
   // collapsed (or the sidebar hidden) they are refreshed once it is shown.
   // Created at the first refresh.
@@ -93,6 +100,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     const renderSignal = renderLifecycleController.signal;
     if (!legendEl) return;
     setDisplayOptionsVisibility(field);
+    syncContinuous = null;
     if (!field) {
       releaseCategoricalLegend();
       legendEl.replaceChildren();
@@ -114,6 +122,9 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     legendEl.replaceChildren();
 
     if (model.kind === 'continuous') {
+      // The field as the actions name it: every change below is dispatched
+      // (`app/actions/`), and the legend follows the state (`syncContinuous`).
+      const fieldRef = { source: state.activeFieldSource, key: field.key };
       // How the range sliders map onto values, re-drawn when the log switch
       // changes it (set with the range filter below).
       let remapSliders = null;
@@ -138,7 +149,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
       const colormapMenu = document.createElement('div');
       colormapMenu.className = 'colormap-menu';
-      colormapMenu.id = `legend-colormap-menu-${++colormapMenuIdCounter}`;
+      colormapMenu.id = createDomId('legend-colormap-menu');
       colormapMenu.setAttribute('role', 'group');
       colormapMenu.setAttribute('aria-label', 'Color palettes');
       colormapMenu.hidden = true;
@@ -167,10 +178,16 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
               return;
             }
             closeColormapMenu({ restoreFocus: false });
-            state.setContinuousColormap(state.activeFieldIndex, cm.id);
-            render(state.getActiveField());
-            // The legend was rebuilt; keep focus on the new palette control.
-            legendEl.querySelector('.colorbar-gradient')?.focus();
+            void dispatchFromControl(
+              'color.continuous.colormap',
+              { field: fieldRef, colormap: cm.id },
+              { failure: 'Could not change the colour map' }
+            ).then(() => {
+              if (destroyed || renderSignal.aborted) return;
+              render(state.getActiveField());
+              // The legend was rebuilt; keep focus on the new palette control.
+              legendEl.querySelector('.colorbar-gradient')?.focus();
+            });
           }, renderSignal);
           colormapMenu.appendChild(option);
         });
@@ -240,8 +257,11 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         label: 'Gray for zero',
         checked: Boolean(model.zeroGray?.enabled),
         onChange: next => {
-          state.setContinuousZeroGray(state.activeFieldIndex, next);
-          refreshColorbarLabels();
+          void dispatchFromControl(
+            'color.continuous.zero-gray',
+            { field: fieldRef, enabled: next },
+            { failure: 'Could not change gray for zero' }
+          ).then(() => refreshColorbarLabels());
         }
       });
       zeroGraySwitch.root.classList.add('switch-compact', 'legend-zero-gray-switch');
@@ -263,9 +283,11 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         label: 'Log color scale',
         checked: Boolean(model.logEnabled),
         onChange: next => {
-          state.setContinuousLogScale(state.activeFieldIndex, next);
-          refreshColorbarLabels();
-          remapSliders?.(state.getLegendModel(state.getActiveField()));
+          void dispatchFromControl(
+            'color.continuous.log',
+            { field: fieldRef, enabled: next },
+            { failure: 'Could not change the colour scale' }
+          ).then(() => refreshColorbarLabels());
         }
       });
       logSwitch.root.classList.add('switch-compact');
@@ -274,25 +296,42 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         label: 'Rescale to range',
         checked: Boolean(model.colorbar?.usingFilter),
         onChange: next => {
-          state.setContinuousColorRescale(state.activeFieldIndex, next);
-          if (next) {
-            const filter = state.getLegendModel(state.getActiveField()).filter;
-            state.setContinuousColorRange(state.activeFieldIndex, filter.min, filter.max);
-          }
-          refreshColorbarLabels();
+          void dispatchFromControl(
+            'color.continuous.rescale',
+            { field: fieldRef, enabled: next },
+            { failure: 'Could not rescale the colours' }
+          ).then(() => refreshColorbarLabels());
         }
       });
       rescaleSwitch.root.classList.add('switch-compact');
       const isRescaling = () => rescaleSwitch.root.getAttribute('aria-checked') === 'true';
 
+      // What the colour scale showed last: drawn again only when it changed
+      // (a visibility change asks on every frame of a drag).
+      let shownScale = null;
       function refreshColorbarLabels() {
-        const activeModel = state.getLegendModel(state.getActiveField());
+        if (destroyed || renderSignal.aborted || state.getActiveField() !== field) return;
+        const activeModel = state.getLegendModel(field);
         if (!activeModel || activeModel.kind !== 'continuous') return;
         const cMin = activeModel.colorbar?.min ?? activeModel.stats.min;
         const cMax = activeModel.colorbar?.max ?? activeModel.stats.max;
+        const scale = [
+          activeModel.colormap?.id, activeModel.logEnabled, cMin, cMax, activeModel.zeroGray?.enabled,
+          activeModel.zeroGray?.applies, activeModel.zeroGray?.drawn, activeModel.colorbar?.usingFilter,
+          activeModel.colorbar?.centered, activeModel.geneSample != null,
+        ].join('|');
+        if (scale === shownScale) return;
+        shownScale = scale;
         minSpan.textContent = formatSignificant(cMin);
         maxSpan.textContent = formatSignificant(cMax);
-        colorHeader.textContent = `Color scale (${activeModel.colormap?.label || 'Viridis'})`;
+        const colormapLabel = activeModel.colormap?.label || 'Viridis';
+        colorHeader.textContent = `Color scale (${colormapLabel})`;
+        StyleManager.setVariable(gradientBar, '--colorbar-stops', activeModel.colorStops.join(', '));
+        gradientBar.setAttribute('aria-label', `Color palette: ${colormapLabel}`);
+        if (activeModel.logEnabled !== shownLog) {
+          shownLog = activeModel.logEnabled;
+          remapSliders?.(activeModel);
+        }
         syncLayerNote(activeModel);
         syncZeroGray(activeModel);
         syncCentreNote(activeModel);
@@ -376,6 +415,20 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
 
       let liveFilteringEnabled = true;
       let filterBtn = null;
+      // The log setting the sliders map with, and the range the filter had
+      // when the legend last showed it: a change of either made elsewhere
+      // (an undo, an agent) is shown; the bounds being moved here are not
+      // overwritten meanwhile (Live filtering off, or a drag being applied).
+      let shownLog = Boolean(model.logEnabled);
+      let shownFilter = { min: model.filter.min, max: model.filter.max };
+      const rangeDispatch = createLatestDispatch('filter.continuous.range', {
+        failure: 'Could not set the visible range',
+        onSettled: () => syncContinuous?.(),
+      });
+      const colorRangeDispatch = createLatestDispatch('color.continuous.range', {
+        failure: 'Could not set the colour range',
+        onSettled: () => refreshColorbarLabels(),
+      });
       const liveSwitch = createSwitch({
         label: 'Live filtering',
         checked: true,
@@ -435,7 +488,9 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
         listen(slider, 'change', () => slid.flush(), renderSignal);
         const commitBox = () => {
           const typed = parseBound(box.value, dataRange);
-          if (typed === null) {
+          // Not a number, or the bound already (Enter, then the change event
+          // leaving the box fires): nothing to apply.
+          if (typed === null || typed === bounds[which]) {
             showBox(box, bounds[which]);
             return;
           }
@@ -471,8 +526,11 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
           bounds.min = dataRange.min;
           bounds.max = dataRange.max;
           showBounds();
-          state.resetContinuousFilter(state.activeFieldIndex);
-          followColorRange();
+          void dispatchFromControl(
+            'filter.continuous.reset',
+            { field: fieldRef },
+            { failure: 'Could not reset the visible range' }
+          ).then(() => refreshColorbarLabels());
         }
       });
       actions.appendChild(filterBtn);
@@ -520,20 +578,31 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
           showBox(field.box, bound);
           if (field !== moved && from === 'slider') field.slider.value = String(sliderScale.positionOf(bound, field === minField ? 'min' : 'max'));
         }
+        // Applied, the range's colours follow it when rescaling (the action
+        // does both); with Live filtering off only the colours follow.
         if (liveFilteringEnabled) applyFilter();
-        followColorRange();
+        else followColorRange();
       }
 
       function followColorRange() {
-        if (isRescaling()) {
-          state.setContinuousColorRange(state.activeFieldIndex, bounds.min, bounds.max);
-          refreshColorbarLabels();
-        }
+        if (isRescaling()) colorRangeDispatch.push({ field: fieldRef, min: bounds.min, max: bounds.max });
       }
 
       function applyFilter() {
-        state.applyContinuousFilter(state.activeFieldIndex, bounds.min, bounds.max);
+        rangeDispatch.push({ field: fieldRef, min: bounds.min, max: bounds.max });
       }
+
+      syncContinuous = () => {
+        if (destroyed || renderSignal.aborted || state.getActiveField() !== field) return;
+        refreshColorbarLabels();
+        if (rangeDispatch.pending || colorRangeDispatch.pending) return;
+        const filter = state.getLegendModel(field).filter;
+        if (filter.min === shownFilter.min && filter.max === shownFilter.max) return;
+        shownFilter = { min: filter.min, max: filter.max };
+        bounds.min = filter.min;
+        bounds.max = filter.max;
+        showBounds();
+      };
 
       // The colour scale's switch changes how the sliders map (log or not),
       // never the bounds.
@@ -557,8 +626,10 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
       const isCategorical = Boolean(field && field.kind === 'category');
       centroidControls.hidden = !isCategorical;
 
-      // Sync checkbox state with viewer when centroid controls become visible
-      if (isCategorical && viewer) {
+      // The toggles show the focused view's own flags (the `views` state
+      // domain holds them per view), shown or not: a restore that changed a
+      // flag, or another view focused, is read here.
+      if (viewer) {
         const activeViewId = state.getActiveViewId?.() || 'live';
         const flags = viewer.getCentroidFlags?.(activeViewId) || { points: false, labels: false };
         if (centroidPointsCheckbox) {
@@ -595,6 +666,7 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     destroyed = true;
     const failures = [];
     for (const cleanup of [
+      () => unsubscribeColors?.(),
       () => renderLifecycleController.abort(),
       () => lifecycleController.abort(),
       () => outlierControl.destroy(),
@@ -617,10 +689,20 @@ export function initLegendRenderer({ state, viewer, dom, dataSourceManager = nul
     }
   }
 
+  // A recolour or a colour-scale change made anywhere (an undo, an agent, a
+  // notebook) is shown in place; a visibility change reaches the counts and
+  // the visible range through `refreshCategoryCounts` below.
+  const unsubscribeColors = state.on?.('colors:changed', () => {
+    if (destroyed) return;
+    syncCategoryState();
+    syncContinuous?.();
+  }) ?? null;
+
   return {
     render,
     refreshCategoryCounts: () => {
       if (destroyed) return;
+      syncContinuous?.();
       if (!legendEl) {
         refreshCategoryCounts();
         return;

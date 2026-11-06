@@ -103,6 +103,10 @@ function constantCorrelationReason(result) {
   return `${name ?? (result.constant === 'x' ? 'X' : 'Y')} is constant in these cells`;
 }
 
+
+/** A finite number, or null (JSON has no NaN). */
+const finiteOrNull = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
 export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   static getRequirements() {
     return {
@@ -191,8 +195,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
       onSelectionChange: pageIds => {
-        this._selectedPages = pageIds || [];
-        this._currentConfig.pages = this._selectedPages;
+        this._assignPages(pageIds || []);
+        this._recordPersonChange('pages', { pageIds: [...this._selectedPages] });
         this._updateRunRow();
         this._updateStale();
       },
@@ -200,13 +204,12 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages.length > 0 ? this._selectedPages : undefined,
+      initialSelection: this._pageSelectionToShow(),
       includeDerivedPages: true,
       getCellCountForPageId: pageId => this.dataLayer.getCellCountForPageId(pageId),
       label: 'Pages'
     });
-    this._selectedPages = this._pageSelector.getSelectedPages();
-    this._currentConfig.pages = [...this._selectedPages];
+    this._adoptSelectorDefault();
   }
 
   // ===========================================================================
@@ -475,7 +478,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
   // ===========================================================================
 
   async _exportPlotPNG() {
-    if (this._refuseStaleExport('PNG')) return;
+    if (await this._refuseStaleExport('PNG')) return;
     const plotEl = this._plotContainerId ? document.getElementById(this._plotContainerId) : null;
     if (!plotEl) return;
 
@@ -499,6 +502,27 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
    * points, variables by key.
    * @returns {null|{kind: 'correlation', version: number, payload: unknown}}
    */
+  /**
+   * One row per page: r, r squared, p and the cells, as an agent reads the
+   * result (`describeResult`).
+   * @override
+   */
+  _resultTable(result, top) {
+    const pages = Array.isArray(result?.data) ? result.data : [];
+    const method = result?.metadata?.method ?? null;
+    const cellsOf = page => (Number.isFinite(page.n) ? page.n
+      : (Array.isArray(page.xValues) || ArrayBuffer.isView(page.xValues) ? page.xValues.length : null));
+    return {
+      columns: ['page', 'method', 'r', 'r_squared', 'p_value', 'cells'],
+      rows: pages.slice(0, top).map(page => [
+        String(page.pageName ?? ''), method, finiteOrNull(page.r),
+        Number.isFinite(page.rSquared) ? page.rSquared : (Number.isFinite(page.r) ? page.r * page.r : null),
+        finiteOrNull(page.pValue), cellsOf(page)
+      ]),
+      total: pages.length
+    };
+  }
+
   _exportResult() {
     if (this._lastResult === null || this._lastResult === undefined) return null;
     return createResultEnvelope('correlation', this._lastResult);
@@ -562,7 +586,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         }
       }
     }
-    await this._restoreAnalysisResult(result);
+    await this._restoreAnalysisResult(result, envelope.provenance);
   }
 
   // ===========================================================================

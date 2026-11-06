@@ -21,6 +21,7 @@ import {
   APP_ORIGIN as ORIGIN,
   SAMPLE_ORIGIN,
 } from './helpers/origins.mjs';
+import { expectWelcomeShown } from './helpers/welcome.mjs';
 
 const fixturesDirectory = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -128,7 +129,7 @@ test(
       // The welcome's Start exploring never waits for startup: it only
       // closes the dialog, leaving these controls and their line in view.
       const start = page.locator('#welcome-start-btn');
-      await expect(page.locator('#welcome-modal')).toBeVisible();
+      await expectWelcomeShown(page);
       await expect(start).toBeEnabled();
       await start.click();
       await expect(page.locator('#welcome-modal')).toBeHidden();

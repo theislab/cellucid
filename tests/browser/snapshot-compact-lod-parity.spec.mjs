@@ -76,15 +76,12 @@ test('a snapshot draws a reduced LOD level with the live view pixels and no elem
     // crossfade (a 3-D dataset replacing a 2-D one moves the studio surface
     // from dots to floor) would otherwise differ between the two captures.
     const settled = async () => {
-      for (let attempt = 0; attempt < 600; attempt += 1) {
-        // Settled, not merely still: a frame still owed (a draw order that
-        // waits its turn to be adopted, one a frame) asks for another frame
-        // without an animation, and a capture taken before it compares a
-        // pane drawn in its previous order.
-        if (viewer.getFrameScheduleState().settled) return;
-        await frames(1);
-      }
-      throw new Error(`Scene never settled: ${JSON.stringify(viewer.getFrameScheduleState())}`);
+      // Settled, not merely still: a frame still owed (a draw order that
+      // waits its turn to be adopted, one a frame) asks for another frame
+      // without an animation, and a capture taken before it compares a
+      // pane drawn in its previous order. Frame by frame, as long as the
+      // renderer takes: the test's timeout is the fence.
+      while (!viewer.getFrameScheduleState().settled) await frames(1);
     };
     // The snapshot takes the live camera only once the live camera is final:
     // publishing the synthetic dataset starts a zoom that eases toward its
@@ -105,13 +102,7 @@ test('a snapshot draws a reduced LOD level with the live view pixels and no elem
       // draws full detail (level -1) and has nothing left to animate, so a
       // settled scene is no sign the forced level is drawn. On a macOS WebKit
       // runner the live capture came before the levels did.
-      const levelDeadline = performance.now() + 120_000;
-      while (viewer.getRendererStats(viewId).lodLevel !== level) {
-        if (performance.now() > levelDeadline) {
-          throw new Error(`"${viewId}" never drew LOD level ${level}.`);
-        }
-        await frames(1);
-      }
+      while (viewer.getRendererStats(viewId).lodLevel !== level) await frames(1);
       await settled();
       draws.arrays = 0;
       draws.elements = 0;

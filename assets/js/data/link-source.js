@@ -719,6 +719,8 @@ export class LinkDataSource {
       title: this._opening?.title ?? null,
       baseUrl: this._catalog?.baseUrl ?? null,
       datasetsCount: this._datasets?.length || 0,
+      // The dataset it opens on: a catalog's default, else its one dataset.
+      defaultDatasetId: this._connected ? this._catalog?.defaultDatasetId ?? this._datasets?.[0]?.id ?? null : null,
     };
   }
 

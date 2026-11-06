@@ -25,9 +25,9 @@ test('browser CI shards every engine with bounded process generations', async ()
   assert.match(workflow, /schedule:\n\s+- cron: "[^"]+"\n\s+workflow_dispatch:/);
   assert.match(
     workflow,
-    /os: \$\{\{ fromJSON\(\(github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch'\) && '\["ubuntu-latest", "macos-latest", "windows-latest"\]' \|\| '\["ubuntu-latest"\]'\) \}\}\n\s+browser: \[chromium, firefox, webkit\]\n\s+shard: \["1\/7", "2\/7", "3\/7", "4\/7", "5\/7", "6\/7", "7\/7"\]/,
+    /os: \$\{\{ fromJSON\(\(github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch'\) && '\["ubuntu-latest", "macos-latest", "windows-latest"\]' \|\| '\["ubuntu-latest"\]'\) \}\}\n\s+browser: \[chromium, firefox, webkit\]\n\s+shard: \["1\/8", "2\/8", "3\/8", "4\/8", "5\/8", "6\/8", "7\/8", "8\/8"\]/,
   );
-  for (const shard of ['1/7', '2/7', '3/7', '4/7', '5/7', '6/7', '7/7']) {
+  for (const shard of ['1/8', '2/8', '3/8', '4/8', '5/8', '6/8', '7/8', '8/8']) {
     assert.ok(
       workflow.includes(
         `- os: macos-latest\n            browser: webkit\n            shard: "${shard}"`,
@@ -81,11 +81,11 @@ test('browser CI shards every engine with bounded process generations', async ()
   // implementation the cell ran on), not once per shard.
   assert.match(
     workflow,
-    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/7'\n\s+run: >-\n\s+xvfb-run --auto-servernum --\n\s+npm run test:browser --\n\s+--project=firefox\n\s+--headed\n\s+tests\/browser\/webgl2-runtime\.spec\.mjs/,
+    /if: matrix\.browser == 'firefox' && runner\.os == 'Linux' && matrix\.shard == '1\/8'\n\s+run: >-\n\s+xvfb-run --auto-servernum --\n\s+npm run test:browser --\n\s+--project=firefox\n\s+--headed\n\s+tests\/browser\/webgl2-runtime\.spec\.mjs/,
   );
   assert.match(
     workflow,
-    /if: \(matrix\.browser != 'firefox' \|\| runner\.os != 'Linux'\) && matrix\.shard == '1\/7'\n\s+run: >-\n\s+npm run test:browser --\n\s+--project=\$\{\{ matrix\.browser \}\}\n\s+tests\/browser\/webgl2-runtime\.spec\.mjs/,
+    /if: \(matrix\.browser != 'firefox' \|\| runner\.os != 'Linux'\) && matrix\.shard == '1\/8'\n\s+run: >-\n\s+npm run test:browser --\n\s+--project=\$\{\{ matrix\.browser \}\}\n\s+tests\/browser\/webgl2-runtime\.spec\.mjs/,
   );
   // A red job keeps the host's picture beside Playwright's: the kernel log
   // on Linux, sockets and memory on Windows, memory and graphics on macOS.

@@ -683,10 +683,8 @@ test('coarse LOD picking follows the rendered live and snapshot prefixes', async
     viewer.setAdaptiveLOD(true);
     viewer.setForceLOD(0);
     // The levels are built off the main thread; draw until both panes have
-    // them, by the clock (a slow runner draws few frames while they build).
-    for (const deadline = performance.now() + 120_000; ;) {
-      if (viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(snapshot.id) >= 0) break;
-      if (performance.now() > deadline) throw new Error('The panes\' levels never landed.');
+    // them, however long the build takes.
+    while (!(viewer.getCurrentLODLevel('live') >= 0 && viewer.getCurrentLODLevel(snapshot.id) >= 0)) {
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
     await waitForFrames();
@@ -1406,11 +1404,9 @@ test('adaptive LOD publishes complete dimension-owned GPU resources', async ({
   const result = await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
     viewer.setAdaptiveLOD(true);
-    // The tree with its levels is built off the main thread: waited for by
-    // the clock (a slow runner draws few frames while it builds).
-    for (const deadline = performance.now() + 120_000; ;) {
-      if (viewer.debugRendererStatus().lodLevelCount > 0) break;
-      if (performance.now() > deadline) throw new Error('The tree\'s levels never landed.');
+    // The tree with its levels is built off the main thread: waited for
+    // however long the build takes.
+    while (!(viewer.debugRendererStatus().lodLevelCount > 0)) {
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
     await new Promise((resolve) => {

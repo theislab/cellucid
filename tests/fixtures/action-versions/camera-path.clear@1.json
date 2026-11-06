@@ -1,0 +1,12 @@
+{
+  "examples": [
+    {}
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "type": "camera-path.clear",
+  "version": 1
+}

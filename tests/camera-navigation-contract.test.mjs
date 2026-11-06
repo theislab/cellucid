@@ -36,8 +36,8 @@ const uiCoordinatorSource = await readFile(
   new URL('../assets/js/app/ui/core/ui-coordinator.js', import.meta.url),
   'utf8'
 );
-const coreStateSource = await readFile(
-  new URL('../assets/js/app/session/contributors/core-state.js', import.meta.url),
+const cameraDomainSource = await readFile(
+  new URL('../assets/js/app/state/domains/camera.js', import.meta.url),
   'utf8'
 );
 const domCacheSource = await readFile(
@@ -49,7 +49,8 @@ const indexHtml = await readFile(new URL('../index.html', import.meta.url), 'utf
 test('navigation has one home: the Navigation panel', () => {
   /* Compare Views and Camera Path each used to carry a copy of the mode select
      and its settings. Navigation is now its own panel, and Camera Path keeps
-     the panel in step through camera-controls.js instead of a mirror. */
+     the panel in step through camera-controls.js instead of a mirror: the
+     mode is all it shows there (the navigation settings are settings). */
   const section = indexHtml.slice(
     indexHtml.indexOf('id="navigation-section"'),
     indexHtml.indexOf('</details>', indexHtml.indexOf('id="navigation-section"'))
@@ -70,8 +71,11 @@ test('navigation has one home: the Navigation panel', () => {
 
   assert.doesNotMatch(cinematicCameraSource, /wireNavigationSettings/);
   assert.match(cinematicCameraSource, /navigation\.syncNavigationMode\(mode\)/);
-  assert.match(cinematicCameraSource, /\.\.\.navigation\.exportSettings\(\)/);
-  assert.match(cinematicCameraSource, /navigation\.restoreSettings\(data\)/);
+  assert.deepEqual(
+    [...new Set(cinematicCameraSource.match(/\bnavigation\.[A-Za-z]+/g))],
+    ['navigation.syncNavigationMode'],
+    'Camera Path uses the Navigation panel only to show the mode'
+  );
   assert.match(uiCoordinatorSource, /initCinematicCamera\(\{[\s\S]*?navigation: cameraControls,/);
   assert.match(cameraControlsSource, /wireNavigationSettings\(\{/);
 });
@@ -350,9 +354,15 @@ test('the navigation selector forwards exact values to the viewer', () => {
     cameraControlsSource,
     /selectValue === 'free'\s*\?\s*'free'[\s\S]*?'orbit'/
   );
+  // The select's exact value is the `camera.navigation.set` action's mode,
+  // which reaches the viewer unchanged.
   assert.match(
     cameraControlsSource,
-    /viewer\.setNavigationMode\(navigationModeSelect\.value\)/
+    /const mode = navigationModeSelect\.value;[\s\S]*?'camera\.navigation\.set',\s*\{ view: viewNameOf\(viewer, viewer\.getFocusedViewId\(\)\), mode \}/
+  );
+  assert.match(
+    cameraControlsSource,
+    /const exactMode = assertNavigationMode\(mode\);[\s\S]*?viewer\.setNavigationMode\(exactMode\)/
   );
 
   for (const [label, source] of [
@@ -374,19 +384,32 @@ test('representation, view-row, and session boundaries preserve exact camera own
   assert.doesNotMatch(representationControlsSource, /parseInt\(|Number\(select\.value\)/);
   assert.match(
     representationControlsSource,
-    /state\.setViewRepresentation\(viewId, layoutKey, \{ followsDefault: false \}\)/
+    /const layoutKey = select\.value;\s*void act\(\(\) => showAction\(viewId, layoutKey\)\)/
   );
   assert.match(
     representationControlsSource,
-    /state\.cycleRepresentation\(state\.getActiveViewId\(\), dimension\)/
+    /await state\.setViewEmbeddingRef\(viewId, embedding\)/
   );
+  assert.match(
+    representationControlsSource,
+    /await state\.cycleRepresentation\(viewId, dimension\)/
+  );
+  // A view row's navigation badge is the `camera.navigation.set` action of its
+  // view; the action moves the focused view through the panel's mode and any
+  // other view through its own.
   assert.match(
     viewControlsSource,
-    /isFocusedView[\s\S]*?viewer\.setNavigationMode\(nextMode\)[\s\S]*?viewer\.setViewNavigationMode\(targetViewId,\s*nextMode\)/
+    /'camera\.navigation\.set',\s*\{ view: viewNameOf\(viewer, targetViewId\), mode: nextMode \}/
   );
   assert.match(
-    coreStateSource,
-    /viewer\.setNavigationMode\(sessionCamera\.navigationMode\)/
+    cameraControlsSource,
+    /if \(viewId === viewer\.getFocusedViewId\(\)\) \{\s*viewer\.setNavigationMode\(exactMode\);[\s\S]*?\} else \{\s*viewer\.setViewNavigationMode\(viewId, exactMode\);/
+  );
+  // A restored camera (a history step, a session load) sets the focused
+  // view's mode first, then its camera.
+  assert.match(
+    cameraDomainSource,
+    /if \(id === focused\) \{\s*viewer\.setNavigationMode\(wanted\.navigationMode\);\s*viewer\.setCameraState\(wanted\);/
   );
 });
 

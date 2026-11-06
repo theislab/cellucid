@@ -86,8 +86,7 @@ test('same-reference live publication preserves immutable kept-view geometry', a
     viewer.setViewLayout('grid', 'live');
 
     // The levels are built off the main thread; draw until both panes have them.
-    for (let frame = 0; frame < 600; frame++) {
-      if (viewer.getCurrentLODLevel(first.id) >= 0 && viewer.getCurrentLODLevel(second.id) >= 0) break;
+    while (!(viewer.getCurrentLODLevel(first.id) >= 0 && viewer.getCurrentLODLevel(second.id) >= 0)) {
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
     await new Promise(resolve => {

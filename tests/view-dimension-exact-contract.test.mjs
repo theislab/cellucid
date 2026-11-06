@@ -6,9 +6,10 @@
  * coordinates, publishes the renderer, the dimension manager and the viewer,
  * and restores all of them on failure; every view -- active or not --
  * announces a committed change with `view:representation-changed`. The public
- * entries (`setViewEmbedding`, `restoreViewEmbedding`,
- * `showDefaultRepresentation`, `cycleRepresentation`) only resolve which
- * layout and whether the view then follows its dimension's default.
+ * entries (`setViewEmbedding`, `showDefaultRepresentation`,
+ * `cycleRepresentation`) only resolve which layout and whether the view then
+ * follows its dimension's default; a views state value names both, and its
+ * restore hands them to the transaction as they are (`state/domains/views.js`).
  */
 
 import assert from 'node:assert/strict';
@@ -423,8 +424,9 @@ test('whether a view follows its default is decided by the entry, never guessed'
   // Naming what the view shows changes only the intent.
   await state.setViewEmbedding('live', { key: '3d', columns: null });
   assert.equal(context.followsDefault, false);
-  // A session records what a view showed: the default's view follows it again.
-  await state.restoreViewEmbedding('live', { key: '3d', columns: null });
+  // A views state value records whether the view follows its default, and
+  // its restore puts that back as recorded.
+  await state.setViewRepresentation('live', '3d', { followsDefault: true });
   assert.equal(context.followsDefault, true);
   await state.setViewRepresentation('live', '3d', { followsDefault: false });
   assert.equal(context.followsDefault, false);

@@ -519,7 +519,7 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
   );
   assert.match(
     source,
-    /if \(cleanupComplete\) return;\s*if \(exportInFlight\) \{[\s\S]*?cancel\(activeExportAbortController, 'user'[\s\S]*setBusy\(true\);[\s\S]*await exportFigureFromUi\(abortController\.signal\)/
+    /if \(cleanupComplete\) return;\s*if \(exportInFlight\) \{[\s\S]*?cancel\(activeExportAbortController, 'user'[\s\S]*setBusy\(true\);[\s\S]*await exportFigureFromUi\(abortController\.signal, \{ forAction \}\)/
   );
   assert.match(
     source,

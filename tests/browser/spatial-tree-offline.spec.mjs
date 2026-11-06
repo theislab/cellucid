@@ -10,6 +10,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
+import { goOffline } from './helpers/offline.mjs';
 
 const DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
 
@@ -32,7 +33,7 @@ test('a tree asked for offline says its code could not be loaded, once, and is b
   await waitForPageAtRest(page);
   expect(await hasTree(page)).toBe(false);
 
-  await context.setOffline(true);
+  await goOffline(context);
   // Culling draws from the tree: the next frame asks for it.
   await page.evaluate(() => {
     const viewer = window._cellucidViewer;

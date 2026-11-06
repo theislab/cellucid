@@ -250,8 +250,9 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
   });
   // It moves up by the drag, as far as the top margin (8 px) lets it: the
   // panel, kept above the panel's bar at the foot of the screen, may start
-  // less than the drag's 150 px from the top.
-  expect(before.y).toBeGreaterThan(8 + 40);
+  // less than the drag's 150 px from the top (the shortcuts list, with the
+  // history's keys, is most of the screen tall), but below the margin.
+  expect(before.y).toBeGreaterThan(8 + 8);
   await expect.poll(async () => Math.round((await panel.boundingBox()).y))
     .toBe(Math.round(Math.max(8, before.y - 150)));
   expect(await page.evaluate(() => getComputedStyle(

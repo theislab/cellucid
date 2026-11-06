@@ -29,6 +29,12 @@ local-serving CLI (`npx cellucid`) for offline, air-gapped, or firewalled
 environments that cannot reach `www.cellucid.com`. If that ships, it will
 appear here and this README will describe it.
 
+Its version matches Cellucid's: each Cellucid release (the web app and the
+Python and R packages, which share one version) publishes this placeholder
+under the same version from the
+[`theislab/cellucid` releases](https://github.com/theislab/cellucid/releases).
+Every version holds the same pointers.
+
 ## How to actually use Cellucid
 
 | You have | Do this |
@@ -63,6 +69,7 @@ troubleshooting are covered in the
 | Python package | https://pypi.org/project/cellucid/ |
 | R package | https://github.com/theislab/cellucid-r |
 | Issues | https://github.com/theislab/cellucid/issues |
+| Contact | hello@cellucid.com |
 
 ## License
 

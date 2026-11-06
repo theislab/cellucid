@@ -16,6 +16,7 @@
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { expectWelcomeShown } from './helpers/welcome.mjs';
 
 const PLAIN_START_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}` +
@@ -36,7 +37,7 @@ function observeProductErrors(page) {
 
 async function openPlainStart(page) {
   await page.goto(PLAIN_START_URL, { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('#welcome-modal')).toBeVisible();
+  await expectWelcomeShown(page);
 }
 
 /** The catalog default is open and the dropdown shows it, untouched. */
@@ -141,7 +142,7 @@ test('Learn more leaves the dropdown inactive before and after closing', async (
   await page.bringToFront();
 
   // The link opens the documentation beside the app; the dialog stays.
-  await expect(page.locator('#welcome-modal')).toBeVisible();
+  await expectWelcomeShown(page);
   await expect(page.locator('#dataset-select')).not.toBeFocused();
   await page.keyboard.press('Escape');
   await expect(page.locator('#welcome-modal')).toBeHidden();
@@ -190,6 +191,10 @@ async function expectCardFits(page, label) {
 
 /** Once the dialog has closed and the dataset is drawn, a touch on the plot reaches the plot. */
 async function expectPlotReachable(page) {
+  // The sample's opening is shown over the plot until its first view is
+  // drawn, a moment after its name is in the panel: on WebKit the point was
+  // read in between, 1 run in 12, and was the opening's panel.
+  await expect(page.locator('.opening-overlay')).toBeHidden();
   expect(await page.evaluate(() => (
     document.elementFromPoint(innerWidth / 2, innerHeight * 0.4)?.id
   ))).toBe('glcanvas');

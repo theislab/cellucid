@@ -46,8 +46,10 @@ export function sourceClosure(root, entries, leftOut) {
     seen.add(file);
     // What a left-out module imports is left out with it.
     if (leftOut.has(file)) continue;
-    const source = readFileSync(path.join(root, file), 'utf8');
-    for (const match of source.matchAll(/(?:^|\n)\s*(?:import|export)\s[^;]*?from\s*'([^']+)'|(?:^|\n)\s*import\s*'([^']+)'|import\(\s*'([^']+)'\s*\)/g)) {
+    // Its code as printed without comments (`codeOf`), so an import named in
+    // a comment is not followed: esbuild prints every specifier in double quotes.
+    const code = codeOf(readFileSync(path.join(root, file), 'utf8'), file);
+    for (const match of code.matchAll(/(?:^|[;}\n])\s*(?:import|export)\b[^;"'`]*?\bfrom\s*"([^"]+)"|(?:^|[;}\n])\s*import\s*"([^"]+)"|\bimport\(\s*"([^"]+)"\s*\)/g)) {
       const target = match[1] ?? match[2] ?? match[3];
       if (target.startsWith('.')) stack.push(path.posix.normalize(path.posix.join(path.posix.dirname(file), target)));
     }

@@ -561,7 +561,7 @@ test('session loading uses one cross-browser file-input contract even when anoth
   const selectedFile = { name: 'current.cellucid-session' };
   const fixture = installFilePicker({ outcome: 'change', selectedFile });
   try {
-    const result = await SessionSerializer.prototype._pickSessionFile.call({});
+    const result = await SessionSerializer.prototype.pickSessionFile.call({});
     assert.equal(result, selectedFile);
     assert.equal(fixture.input.type, 'file');
     assert.equal(fixture.input.accept, '.cellucid-session,application/octet-stream');
@@ -579,7 +579,7 @@ test('session loading uses one cross-browser file-input contract even when anoth
 test('session file-picker cancellation terminates once without polling', async () => {
   const fixture = installFilePicker({ outcome: 'cancel' });
   try {
-    const result = await SessionSerializer.prototype._pickSessionFile.call({});
+    const result = await SessionSerializer.prototype.pickSessionFile.call({});
     assert.equal(result, null);
     assert.deepEqual(fixture.metrics(), {
       appended: 1,

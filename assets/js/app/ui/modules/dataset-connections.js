@@ -18,7 +18,10 @@ import {
 } from '../../../data/data-source.js';
 import { getProviderRegistry } from '../../../data/sources/registry.js';
 import { probeRemoteServer, validateRemoteServerUrl } from '../../../data/remote-source.js';
-import { filePickerAccept, folderFormatOfPaths, folderMarkersOf, inputFormat, openableNamesText } from '../../../data/input-formats.js';
+import {
+  cellucidFileOfName, filePickerAccept, folderFormatOfPaths, folderMarkersOf, inputFormat, openableNamesText,
+} from '../../../data/input-formats.js';
+import { importLibraryFile } from './my-datasets/index.js';
 import { routeAddress } from './address-routing.js';
 import { initOpenDataMenu } from './open-data-menu.js';
 import { getNotificationCenter } from '../../notification-center.js';
@@ -36,7 +39,7 @@ import {
   readPermissionOf,
   rememberTabDataset,
   tabLocalDataset
-} from '../../local-file-handles.js';
+} from '../../library/local-file-handles.js';
 import { isPlainRecord } from '../../../utils/exact-record.js';
 import { formatCountOf, countNoun } from '../../../utils/format-units.js';
 import { isCancellation, cancelled, onAbort } from '../../../utils/abort.js';
@@ -528,6 +531,23 @@ export function shortAddress(address) {
 }
 
 /**
+ * The file types File… offers in the browser's own file picker
+ * (`showOpenFilePicker`): every ending File… takes (`filePickerAccept`)
+ * that the picker accepts. Chromium refuses the whole call over one
+ * ending with a character other than a letter, a digit, `+` or `.`, or
+ * longer than 16 characters (`.cellucid-library`): such an ending is left
+ * out of the filter, and its files are still chosen through the picker's
+ * All files.
+ *
+ * @param {string} accept - Comma-separated endings, as `filePickerAccept()` writes them
+ * @returns {Array<{description: string, accept: Record<string, string[]>}>}
+ */
+export function filePickerTypes(accept) {
+  const endings = accept.split(',').filter(ending => /^\.[A-Za-z0-9+.]{1,15}$/.test(ending));
+  return [{ description: 'Datasets', accept: { 'application/octet-stream': endings } }];
+}
+
+/**
  * Why a folder picked with the folder dialog cannot be a Zarr store although
  * it may be one, or null. A Zarr v2 store keeps its metadata in files whose
  * names start with "." (`.zgroup`, `.zattrs`, `.zarray`, `.zmetadata`), and
@@ -808,7 +828,7 @@ export function initDatasetConnections(options) {
    *   and runs under the choice's own intent (a dropped folder is listed
    *   there; `signal` stops the listing on Cancel or a newer choice);
    *   `handle`, where the browser gave one, is kept once the dataset opened
-   *   (`app/local-file-handles.js`).
+   *   (`app/library/local-file-handles.js`).
    * @param {{loadMethod: string,
    *   load: (source: Object, files: ArrayLike<File>) => Promise<Object>}} loader
    * @returns {Promise<boolean>} Whether the choice is the dataset open now.
@@ -1013,13 +1033,25 @@ export function initDatasetConnections(options) {
       userDataFileInput,
       userDataFolderInput
     } = openMenu;
-    // File… offers every single-file format the registry names.
+    // File… offers every single-file format the registry names, and a library file.
     userDataFileInput.accept = filePickerAccept();
+    /**
+     * Cellucid's own files chosen in File… (`CELLUCID_FILES`): a library file
+     * goes to My datasets' Import, a session file is refused saying where it
+     * goes. Whether `file` was one.
+     */
+    const takeCellucidFile = file => {
+      const own = cellucidFileOfName(file.name);
+      if (own === null) return false;
+      if (own.id === 'library') importLibraryFile(file);
+      else notifications.error(own.said, { category: 'data', title: 'Cannot open this file' });
+      return true;
+    };
     /**
      * File… or Folder…. Where the browser gives the page a handle of what
      * is chosen (`localHandlesAvailable`), its own pickers, so the choice
      * reopens with one click after a reload or from a session
-     * (`app/local-file-handles.js`); elsewhere the file inputs. Either runs
+     * (`app/library/local-file-handles.js`); elsewhere the file inputs. Either runs
      * inside the click, as a dialog must.
      */
     const chooseLocal = kind => {
@@ -1029,12 +1061,7 @@ export function initDatasetConnections(options) {
       }
       const picked = kind === 'folder'
         ? view.showDirectoryPicker({ mode: 'read' })
-        : view.showOpenFilePicker({
-            types: [{
-              description: 'Datasets',
-              accept: { 'application/octet-stream': filePickerAccept().split(',') }
-            }]
-          }).then(([handle]) => handle);
+        : view.showOpenFilePicker({ types: filePickerTypes(filePickerAccept()) }).then(([handle]) => handle);
       void launchOperation(async () => {
         let handle;
         try {
@@ -1060,6 +1087,7 @@ export function initDatasetConnections(options) {
           return;
         }
         const file = await handle.getFile();
+        if (takeCellucidFile(file)) return;
         const layout = localFileLayout(file);
         if (layout === null) {
           notifications.error(
@@ -1088,6 +1116,10 @@ export function initDatasetConnections(options) {
     listen(userDataFileInput, 'change', event => {
       const files = event.target.files;
       if (!files || files.length === 0) return undefined;
+      if (takeCellucidFile(files[0])) {
+        userDataFileInput.value = '';
+        return undefined;
+      }
       const layout = localFileLayout(files[0]);
       if (layout === null) {
         notifications.error(
@@ -1152,6 +1184,10 @@ export function initDatasetConnections(options) {
             ),
             'Dropped dataset failed'
           );
+        },
+        importLibrary: file => {
+          if (destroyed) return;
+          importLibraryFile(file);
         },
         refuse: message => {
           if (destroyed) return;
@@ -1886,44 +1922,31 @@ export function initDatasetConnections(options) {
      * whether it is a Cellucid server before anything is connected.
      */
     async function openAddress() {
-      const route = routeAddress(dataAddressInput.value);
-      if (route.kind === 'invalid') {
-        notifications.error(route.message, { category: 'connectivity' });
-        return;
-      }
-      let kind = route.kind === 'server' ? 'remote' : 'link';
-      let value = route.kind === 'server' ? route.url : route.value;
       // Asking the address whether it is a server is the opening's first
       // step: the connection that follows joins this opening, and how the
       // opening ends is that connection's (`saysOutcome: false`), its
       // failure included.
       const probe = new AbortController();
       let asking = null;
-      if (route.kind === 'ask') {
-        asking = beginOpening({
-          title: route.value,
-          step: 'Checking for a Cellucid server',
-          onCancel: () => probe.abort(),
-          saysOutcome: false
-        });
-        activeOpenings.set(asking, () => probe.abort());
-      }
       try {
-        if (route.kind === 'ask') {
-          setBusy(1);
-          let isServer;
-          try {
-            isServer = await probeRemoteServer(route.url, {
-              signal: AbortSignal.any([lifecycleController.signal, probe.signal])
+        const route = await routeTypedAddress(dataAddressInput.value, {
+          signal: probe.signal,
+          asking: ask => {
+            asking = beginOpening({
+              title: ask.value,
+              step: 'Checking for a Cellucid server',
+              onCancel: () => probe.abort(),
+              saysOutcome: false
             });
-          } finally {
-            setBusy(-1);
+            activeOpenings.set(asking, () => probe.abort());
           }
-          if (destroyed || probe.signal.aborted) return;
-          kind = isServer ? 'remote' : 'link';
-          value = isServer ? route.url : route.value;
+        });
+        if (route.kind === 'invalid') {
+          notifications.error(route.message, { category: 'connectivity' });
+          return;
         }
-        await openKind(kind, value);
+        if (destroyed || probe.signal.aborted) return;
+        await openKind(route.kind, route.value);
       } catch (error) {
         if (probe.signal.aborted && isCancellation(error)) return;
         throw error;
@@ -2025,7 +2048,7 @@ export function initDatasetConnections(options) {
 
   /**
    * The file or folder kept for the dataset `datasetId` (its handle,
-   * `app/local-file-handles.js`): its name, its kind, and whether the browser
+   * `app/library/local-file-handles.js`): its name, its kind, and whether the browser
    * lets it be read without asking the person; null when none is kept, or
    * the browser gives no handles.
    *
@@ -2111,6 +2134,34 @@ export function initDatasetConnections(options) {
   }
 
   /**
+   * What typed text opens, as the address bar decides it
+   * (`address-routing.js`): a Cellucid server (`remote`) or linked data
+   * (`link`), or why it opens nothing (`invalid`). A web address the text
+   * cannot settle is asked whether it is a Cellucid server (`asking` is told
+   * first, so an opening can show that step).
+   *
+   * @param {string} text
+   * @param {{signal?: AbortSignal|null, asking?: (route: {url: string, value: string}) => void}} [options]
+   * @returns {Promise<{kind: 'remote'|'link', value: string}|{kind: 'invalid', message: string}>}
+   */
+  async function routeTypedAddress(text, { signal = null, asking = () => {} } = {}) {
+    const route = routeAddress(text);
+    if (route.kind === 'invalid') return route;
+    if (route.kind === 'server') return { kind: 'remote', value: route.url };
+    if (route.kind === 'link') return { kind: 'link', value: route.value };
+    asking(route);
+    setBusy(1);
+    try {
+      const isServer = await probeRemoteServer(route.url, {
+        signal: signal === null ? lifecycleController.signal : AbortSignal.any([lifecycleController.signal, signal])
+      });
+      return isServer ? { kind: 'remote', value: route.url } : { kind: 'link', value: route.value };
+    } finally {
+      setBusy(-1);
+    }
+  }
+
+  /**
    * Open the connection of one source type at `value` (a data link's
    * locator, a server address).
    *
@@ -2130,6 +2181,7 @@ export function initDatasetConnections(options) {
   return Object.freeze({
     destroy,
     openConnection,
+    routeTypedAddress,
     keptLocalFile: keptLocalFileOf,
     reopenLocalFile
   });

@@ -1,21 +1,14 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { dismissWelcome, expectWelcomeShown } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import {
-  ORCID_REQUEST_TIMEOUT_MS,
   ORCID_SEARCH_DEBOUNCE_MS,
   ORCID_SUGGESTION_HIDE_DELAY_MS,
 } from '../../assets/js/app/ui/modules/community-annotation/identity-profile-modal.js';
 
 const PREPARED_DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=ui-keyboard-lifecycle-ci`;
-
-// The ORCID timeout contract swaps the product's request deadline for this one
-// and blurs the combobox this long after the debounce would fire. The lead is
-// shorter than the shortened deadline, so the blur is always due first.
-const SHORTENED_ORCID_TIMEOUT_MS = 80;
-const TIMEOUT_BLUR_LEAD_MS = 20;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -326,7 +319,7 @@ test('community profile modal owns focus, requests, timers, and global listeners
     .getByRole('button', { name: 'Edit', exact: true });
   await expect(editProfile).toBeEnabled();
 
-  await page.evaluate(({ hideDelayMs, requestTimeoutMs }) => {
+  await page.evaluate(({ hideDelayMs }) => {
     const nativeAddEventListener = window.addEventListener;
     const nativeRemoveEventListener = window.removeEventListener;
     const nativeSetTimeout = window.setTimeout;
@@ -382,7 +375,7 @@ test('community profile modal owns focus, requests, timers, and global listeners
       timerId = nativeSetTimeout.call(this, wrapped, delay, ...args);
       if (
         probe.capture &&
-        (delay === hideDelayMs || delay === requestTimeoutMs)
+        delay === hideDelayMs
       ) {
         timers.set(timerId, delay);
       }
@@ -414,7 +407,6 @@ test('community profile modal owns focus, requests, timers, and global listeners
     window.__cellucidProfileModalProbe = probe;
   }, {
     hideDelayMs: ORCID_SUGGESTION_HIDE_DELAY_MS,
-    requestTimeoutMs: ORCID_REQUEST_TIMEOUT_MS,
   });
 
   for (const exit of ['close', 'cancel', 'escape', 'save']) {
@@ -483,8 +475,7 @@ test('community profile modal owns focus, requests, timers, and global listeners
   await expect.poll(
     () => page.evaluate(
       () => window.__cellucidProfileModalProbe.fetchStarts
-    ),
-    { timeout: 3000 }
+    )
   ).toBe(1);
   await dialog.getByRole('button', { name: 'Close' }).click();
   await expect(dialog).toHaveCount(0);
@@ -719,15 +710,14 @@ test('ORCID combobox owns bounded superseded search and complete keyboard select
   expect(productErrors).toEqual([]);
 });
 
-test('ORCID retry, blur, timeout, and Escape settlements stay with the focused combobox', async ({
+test('ORCID retry, blur, and Escape settlements stay with the focused combobox', async ({
   page
 }) => {
   const productErrors = observeProductErrors(page);
-  await page.addInitScript(({ requestTimeoutMs, shortenedTimeoutMs }) => {
+  await page.addInitScript(() => {
     window._simulate_repo_connected = true;
     window._author_mode = true;
     const nativeFetch = window.fetch;
-    const nativeSetTimeout = window.setTimeout;
     const successDocument = {
       'expanded-result': [{
         'orcid-id': '0000-0002-1825-0097',
@@ -784,7 +774,6 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
       queries: [],
       retiredBodies: [],
       retryAttempts: 0,
-      shortenTimeout: false,
       settle(query, outcome) {
         const owner = this.pending.get(query);
         if (!owner) {
@@ -803,17 +792,6 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
         }
         throw new Error(`Unknown synthetic ORCID outcome: ${outcome}`);
       },
-    };
-    window.setTimeout = function exactOrcidTimeout(
-      callback,
-      delay,
-      ...args
-    ) {
-      const exactDelay =
-        probe.shortenTimeout && Number(delay) === requestTimeoutMs
-          ? shortenedTimeoutMs
-          : delay;
-      return nativeSetTimeout.call(this, callback, exactDelay, ...args);
     };
     const pendingRequest = (query, signal) => new Promise(
       (resolve, reject) => {
@@ -861,19 +839,19 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
         if (probe.retryAttempts === 1) {
           return Promise.resolve(response(emptyDocument));
         }
+        // A refusal that is not transient (a network error or a busy answer
+        // would be asked again by the transport, never shown).
         if (probe.retryAttempts === 2) {
-          return Promise.reject(
-            new Error('Synthetic focused ORCID failure')
-          );
+          return Promise.resolve(new Response(
+            JSON.stringify({ error: 'Synthetic focused ORCID failure' }),
+            { status: 400, headers: { 'content-type': 'application/json' } }
+          ));
         }
         return Promise.resolve(response(successDocument));
       }
       return pendingRequest(query, options.signal);
     };
     window.__cellucidOrcidLifecycleProbe = probe;
-  }, {
-    requestTimeoutMs: ORCID_REQUEST_TIMEOUT_MS,
-    shortenedTimeoutMs: SHORTENED_ORCID_TIMEOUT_MS,
   });
   await page.goto(PREPARED_DATASET_URL, {
     waitUntil: 'domcontentloaded',
@@ -942,7 +920,7 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
   await outlastPageTimers(page, ORCID_SUGGESTION_HIDE_DELAY_MS);
   await orcidInput.focus();
   await expect(status).toContainText(
-    'Synthetic focused ORCID failure'
+    'ORCID search failed (HTTP 400)'
   );
   await titleInput.focus();
   // A real blur: let the popup's hide affordance run out before returning.
@@ -1018,40 +996,6 @@ test('ORCID retry, blur, timeout, and Escape settlements stay with the focused c
   );
   await expect(listbox).not.toBeVisible();
 
-  await page.evaluate(blurAfterMs => {
-    const probe = window.__cellucidOrcidLifecycleProbe;
-    probe.shortenTimeout = true;
-    const dialogOwner = document.querySelector(
-      '.community-annotation-modal-overlay'
-    );
-    // Each field is named by its visible <label for>.
-    const fieldLabelled = text => [...dialogOwner.querySelectorAll('label')]
-      .find(label => label.textContent.trim() === text).control;
-    const orcid = fieldLabelled('ORCID');
-    const title = fieldLabelled('Affiliation / role');
-    orcid.focus();
-    orcid.value = 'Deferred timeout query';
-    orcid.dispatchEvent(new Event('input', { bubbles: true }));
-    // Deadline order makes this deterministic on any runner: the debounce
-    // fires first and arms the shortened request timeout, and this blur is
-    // due before that timeout can be.
-    setTimeout(() => title.focus(), blurAfterMs);
-  }, ORCID_SEARCH_DEBOUNCE_MS + TIMEOUT_BLUR_LEAD_MS);
-  await expect.poll(
-    () => page.evaluate(
-      () => window.__cellucidOrcidLifecycleProbe.queries.at(-1)
-    )
-  ).toBe('Deferred timeout query');
-  // The request is in flight, so its shortened timeout is armed; outlast it.
-  await outlastPageTimers(page, SHORTENED_ORCID_TIMEOUT_MS);
-  await expect(status).not.toContainText(
-    'ORCID request timed out'
-  );
-  await expect(listbox).not.toBeVisible();
-
-  await page.evaluate(() => {
-    window.__cellucidOrcidLifecycleProbe.shortenTimeout = false;
-  });
   await orcidInput.fill('Escape pending query');
   await expect.poll(
     () => page.evaluate(
@@ -1132,12 +1076,9 @@ test('community profile modal cannot outlive its controls owner', async ({
     }
     edit.click();
 
-    for (
-      let attempt = 0;
-      attempt < 20 &&
-        !document.querySelector('.community-annotation-modal-overlay');
-      attempt += 1
-    ) {
+    // The click's handler opens the dialog after work of its own: a task at
+    // a time until it has, however many that takes.
+    while (!document.querySelector('.community-annotation-modal-overlay')) {
       await new Promise(resolve => setTimeout(resolve, 0));
     }
     const overlay = document.querySelector(
@@ -1849,7 +1790,7 @@ test('community annotation GitHub sync controls expose exact accessible identiti
     }
     element.open = true;
   });
-  await section.getByRole('button', { name: 'Connect GitHub…' }).click();
+  await section.getByRole('button', { name: 'GitHub sync…' }).click();
 
   const dialog = page.getByRole('dialog', { name: 'GitHub sync' });
   await expect(dialog).toBeVisible();
@@ -1878,7 +1819,7 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
 
   // The modal is `aria-modal="true"`, so focus must enter it and stay inside.
   // It lands on the dialog itself, so no choice opens looking pre-selected.
-  await expect(modal).toBeVisible();
+  await expectWelcomeShown(page);
   await expect(modal).toBeFocused();
   await expect(startButton).not.toBeFocused();
 

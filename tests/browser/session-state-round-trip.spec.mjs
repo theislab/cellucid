@@ -16,101 +16,48 @@
  * difference in a container. A control that stops restoring fails this spec the
  * day it stops, whether or not anyone updated a list.
  *
- * The state it builds deliberately includes a **highlight group with cell
- * membership**. No published preset ships one, so before this spec the lazy
- * binary `highlights/cells/<groupId>` path had never been exercised by a real
- * end-to-end save and load — only by node fixtures. It also includes a kept
- * view, a second highlight page, a non-default selection tool, and controls
- * from four different accordions.
+ * The captures are every state domain's value (`app/state/domains/`), the
+ * same values a session file holds and the history steps between, compared
+ * domain by domain by their content hashes (and whole, for a readable
+ * difference). A kept view is named by its position in them, never by the
+ * viewer's own `snap_<n>` id, so views rebuilt by a restore compare equal.
  *
- * One thing is normalized before comparing, and only one: the viewer's
- * snapshot-view counter is monotonic for the lifetime of the page and is never
- * reset, so views rebuilt by a restore are numbered `snap_2`, `snap_3`, …
- * rather than reusing the saved `snap_1`. The spec asserts the renumbering is a
- * consistent position-preserving relabeling and then applies it, which keeps
- * every other multiview field — layout, active view, per-view camera, per-view
- * dimension, per-view filters, per-view active field — inside the comparison.
+ * The state it builds deliberately includes a **highlight group with cell
+ * membership**, a kept view, a second highlight page, controls from four
+ * different accordions, the theme and the Figure export settings; and a
+ * non-default selection tool, page chrome a session carries outside its
+ * history. It is drifted partly through the interface and partly behind the
+ * history's back (state methods called directly): a save keeps what is shown
+ * either way, as its own step.
  */
 
-import { readFile } from 'node:fs/promises';
 import { expect, test } from './helpers/test.mjs';
 
-import { readBundle } from '../../assets/js/app/session/bundle/reader.js';
-import { gzipDecompress } from '../../assets/js/app/session/codecs/gzip.js';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { waitForHistory } from './helpers/state-history.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
   + '&dataset=current-ui&acceptance=session-round-trip-ci';
 
 /**
- * Every chunk of one saved session, decoded.
- *
- * JSON chunks become their parsed payload; binary chunks keep their exact
- * bytes as a hex string so a membership array that came back permuted or
- * truncated is a visible difference rather than an equal length.
+ * Every state domain's value now, with its content hash: the whole state the
+ * running app says it has, re-derived from the live DOM, `DataState` and the
+ * viewer. Typed arrays come back as plain arrays, so a membership that came
+ * back permuted or truncated is a visible difference.
  */
-async function readSessionChunks(sessionPath) {
-  const bytes = await readFile(sessionPath);
-  const { manifest, chunkStream } = await readBundle(
-    new Blob([bytes]),
-    { signal: null, onProgress: null },
-  );
-  const order = [];
-  const payloads = new Map();
-  for await (const chunk of chunkStream) {
-    const raw = chunk.meta.codec === 'gzip'
-      ? await gzipDecompress(chunk.bytes, {
-        maxOutputBytes: chunk.meta.uncompressedBytes,
-        signal: null,
-      })
-      : chunk.bytes;
-    order.push(chunk.meta.id);
-    payloads.set(
-      chunk.meta.id,
-      chunk.meta.kind === 'json'
-        ? JSON.parse(new TextDecoder().decode(raw))
-        : `binary:${Buffer.from(raw).toString('hex')}`,
-    );
-  }
-  return { manifest, order, payloads };
-}
-
-/**
- * Rewrite the restored snapshot ids back onto the saved ones.
- *
- * Asserts the relabeling before applying it, so a restore that lost, added, or
- * reordered a view is a failure rather than a rename.
- */
-function relabelSnapshotIds(savedCore, restoredCore) {
-  const saved = savedCore.multiview.snapshots.map(snapshot => snapshot.id);
-  const restored = restoredCore.multiview.snapshots.map(snapshot => snapshot.id);
-  expect(
-    restored.length,
-    'the restore must rebuild exactly the kept views the session recorded',
-  ).toBe(saved.length);
-
-  const rename = new Map(restored.map((id, index) => [id, saved[index]]));
-  expect(
-    new Set(rename.values()).size,
-    'the snapshot relabeling must be one-to-one',
-  ).toBe(saved.length);
-
-  const rewritten = structuredClone(restoredCore);
-  for (const snapshot of rewritten.multiview.snapshots) {
-    snapshot.id = rename.get(snapshot.id);
-  }
-  if (rewritten.multiview.layout.activeId !== 'live') {
-    const mapped = rename.get(rewritten.multiview.layout.activeId);
-    expect(
-      mapped,
-      'the restored active view must be one of the rebuilt snapshots',
-    ).not.toBe(undefined);
-    rewritten.multiview.layout.activeId = mapped;
-  }
-  return rewritten;
+function domainState(page) {
+  return page.evaluate(async () => {
+    const { getStateDomains } = await import('/assets/js/app/actions/index.js');
+    const { captureEveryDomain, fingerprintOf } = await import('/assets/js/app/state/domains/fingerprint.js');
+    const values = await captureEveryDomain(getStateDomains());
+    const { domains: hashes } = await fingerprintOf(values);
+    const plain = JSON.parse(JSON.stringify(values, (_key, value) => (ArrayBuffer.isView(value) ? Array.from(value) : value)));
+    return { hashes, values: plain };
+  });
 }
 
 /**
@@ -142,7 +89,7 @@ async function setControl(page, id, value) {
 
 async function saveSession(page, testInfo, name) {
   const downloadPromise = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const download = await downloadPromise;
   const sessionPath = testInfo.outputPath(name);
   await download.saveAs(sessionPath);
@@ -151,7 +98,7 @@ async function saveSession(page, testInfo, name) {
 
 async function loadSession(page, sessionPath) {
   const chooserPromise = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 }
@@ -229,7 +176,8 @@ test('a saved session restores to the exact state it recorded', async (
   ).toBe(3);
   expect(Math.min(...built.counts)).toBeGreaterThan(0);
 
-  // A non-default selection tool.
+  // A non-default selection tool: page chrome, which a session carries outside its
+  // history (its `chrome`, CEL-0249), never as a setting.
   await page.locator('#highlight-mode-lasso').click();
   await expect(page.locator('#highlight-mode-lasso'))
     .toHaveAttribute('aria-pressed', 'true');
@@ -270,34 +218,23 @@ test('a saved session restores to the exact state it recorded', async (
   await page.locator('#split-keep-view-btn').click();
   await expect(page.locator('#split-view-badges-list > *')).not.toHaveCount(0);
 
+  const saved = await domainState(page);
   const savedPath = await saveSession(page, testInfo, 'saved.cellucid-session');
-  const saved = await readSessionChunks(savedPath);
 
-  // The saved file has to contain the things this spec claims to cover;
+  // The saved state has to contain the things this spec claims to cover;
   // otherwise the comparison below could be satisfied by two empty states.
-  const savedCore = saved.payloads.get('core/state');
+  const { highlights, settings, layout, views } = saved.values;
+  expect(highlights.pages, 'two highlight pages').toHaveLength(2);
+  expect(highlights.pages.flatMap(entry => entry.groups)).toHaveLength(3);
   expect(
-    saved.order.filter(id => id.startsWith('highlights/cells/')),
-    'the session must carry one membership chunk per highlight group — this is '
-      + 'the path no published preset exercises',
-  ).toHaveLength(3);
-  expect(savedCore.uiControls['theme-select']).toEqual({
-    type: 'select',
-    value: 'dark',
-  });
-  expect(Object.hasOwn(savedCore.uiControls, 'hp-antialias')).toBe(false);
-  expect(saved.payloads.get('ui/figure-export')).toMatchObject({
-    width: 1234,
-    height: 777,
-    xLabel: 'UMAP one',
-    dpi: 600,
-  });
-  expect(savedCore.uiControls['highlight-mode']).toEqual({
-    type: 'pressed-group',
-    pressedId: 'highlight-mode-lasso',
-  });
-  expect(savedCore.multiview.snapshots.length).toBeGreaterThan(0);
-  expect(saved.payloads.get('highlights/meta').pages).toHaveLength(2);
+    highlights.pages.flatMap(entry => entry.groups).every(group => group.cells.length > 0),
+    'every highlight group holds its cells: the membership no published preset carries',
+  ).toBe(true);
+  expect(layout.theme).toBe('dark');
+  expect(Object.hasOwn(settings.controls, 'hp-antialias')).toBe(false);
+  expect(settings.figureExport).toMatchObject({ width: 1234, height: 777, xLabel: 'UMAP one', dpi: 600 });
+  expect(Object.hasOwn(settings.controls, 'highlight-mode')).toBe(false);
+  expect(views.views.length).toBeGreaterThan(1);
 
   // ---------------------------------------------------------------------
   // Drift past the saved state, in every part of it.
@@ -341,6 +278,7 @@ test('a saved session restores to the exact state it recorded', async (
   await loadSession(page, savedPath);
 
   await expect(page.locator('#point-size')).toHaveValue('31');
+  // The tool chosen when it was saved comes back with it, once its head is shown.
   await expect(page.locator('#highlight-mode-lasso'))
     .toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('#categorical-field option:checked'))
@@ -352,49 +290,23 @@ test('a saved session restores to the exact state it recorded', async (
   expect(await page.evaluate(() => localStorage.getItem('cellucid_theme')))
     .toBe('dark');
 
-  const restoredPath = await saveSession(
-    page,
-    testInfo,
-    'restored.cellucid-session',
-  );
-  const restored = await readSessionChunks(restoredPath);
-
   // ---------------------------------------------------------------------
-  // Compare the two captures whole.
+  // Compare the two captures whole, domain by domain.
   // ---------------------------------------------------------------------
-  expect(
-    restored.order,
-    'the restored state must produce the same chunk inventory, in the same '
-      + 'order; a missing chunk is state that did not come back',
-  ).toEqual(saved.order);
-  expect(restored.manifest.datasetFingerprint)
-    .toEqual(saved.manifest.datasetFingerprint);
-
-  const restoredCore = relabelSnapshotIds(
-    savedCore,
-    restored.payloads.get('core/state'),
-  );
-  expect(
-    restoredCore,
-    'the whole core state must come back: camera, dimension, every UI control, '
-      + 'filters, active fields, and the complete multiview graph',
-  ).toEqual(savedCore);
-
-  for (const chunkId of saved.order) {
-    if (chunkId === 'core/state') continue;
-    expect(
-      restored.payloads.get(chunkId),
-      `the "${chunkId}" chunk must come back unchanged`,
-    ).toEqual(saved.payloads.get(chunkId));
+  await waitForHistory(page);
+  const restored = await domainState(page);
+  for (const id of Object.keys(saved.hashes)) {
+    expect(restored.values[id], `the "${id}" state must come back exactly`).toEqual(saved.values[id]);
   }
+  expect(restored.hashes, 'every state domain comes back, to its content hash').toEqual(saved.hashes);
 
   // ---------------------------------------------------------------------
   // A restore raises nothing (CEL-0239).
   //
   // This assertion used to carry a named exemption for exactly one uncaught
-  // `RangeError` per restore. `state-serializer/multiview.js` empties the
-  // viewer's snapshot inventory through `clearPublishedSnapshotViews()` at the
-  // start of the rebuild, and `ui/modules/view-controls.js` kept private
+  // `RangeError` per restore. A restore of the views emptied the viewer's
+  // snapshot inventory at the start of the rebuild, and
+  // `ui/modules/view-controls.js` kept private
   // `activeViewId` and `liveViewHidden` copies of state its owners had already
   // moved. The badge render that the same rebuild scheduled then threw on a
   // kept view that no longer existed. The module now reads both from their

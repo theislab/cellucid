@@ -196,3 +196,65 @@ test('every number setting the panel exports is its last committed value', async
   }
   assert.doesNotMatch(body, /Input\.value\)|parseInt|Number\((?!dpiSelect)/);
 });
+
+// ---------------------------------------------------------------------------
+// The settings as the parameters of `figure-export.set` (a step like any other)
+// ---------------------------------------------------------------------------
+
+test('every setting of the record is a parameter of figure-export.set, in its snake_case name', async () => {
+  const {
+    FIGURE_EXPORT_PARAMS, figureExportParamsOf, figureExportSettingsOf,
+  } = await import('../assets/js/app/ui/modules/figure-export/utils/session-settings.js');
+  const { schemaProblem } = await import('../assets/js/app/actions/schema.js');
+  const { getActionCatalog } = await import('../assets/js/app/actions/index.js');
+  const record = settings();
+  const { version, ...rest } = record;
+  assert.equal(version, 1);
+  const params = figureExportParamsOf(rest);
+  // The schema names exactly the record's settings: one added to the record is a parameter at once.
+  assert.deepEqual(Object.keys(FIGURE_EXPORT_PARAMS.properties).sort(), Object.keys(params).sort());
+  assert.deepEqual(Object.keys(params.font_sizes).sort(), ['axis_label', 'base', 'centroid_label', 'legend', 'ticks', 'title']);
+  assert.deepEqual(Object.keys(params.frame), ['lock_aspect', 'rect']);
+  assert.deepEqual(Object.keys(params.preview), ['enabled', 'colorblind_mode']);
+  // Every valid record is a valid step, and comes back exactly.
+  assert.equal(schemaProblem(FIGURE_EXPORT_PARAMS, params), null);
+  assert.deepEqual(figureExportSettingsOf(params), rest);
+  const derived = settings({ autoTextSize: true, fontSizes: null, titleFollowsDataset: true, title: null, frame: null, svgStrategy: null });
+  const { version: _v, ...derivedRest } = derived;
+  assert.equal(schemaProblem(FIGURE_EXPORT_PARAMS, figureExportParamsOf(derivedRest)), null);
+  // The action is in the catalogue, changes the settings domain only, and its example is valid.
+  const definition = getActionCatalog().get('figure-export.set');
+  assert.deepEqual(definition.touches, ['settings']);
+  assert.equal(definition.params, FIGURE_EXPORT_PARAMS);
+  assert.match(definition.describe({ width: 900, include_axes: false, frame: null }, null), /^Figure export: width 900, include axes off, frame none$/);
+  assert.equal(definition.coalesce({ title: 'a', title_follows_dataset: false }), 'title,title_follows_dataset');
+});
+
+test('what changed between two records, settings that change together carried together', async () => {
+  const { changedFigureExportSettings } = await import('../assets/js/app/ui/modules/figure-export/utils/session-settings.js');
+  const before = settings();
+  assert.deepEqual(changedFigureExportSettings(before, settings()), {});
+  assert.deepEqual(changedFigureExportSettings(before, settings({ width: 900, sizePreset: '1200x900' })), { sizePreset: '1200x900', width: 900 });
+  // Typing a title: the title and whether it follows the dataset, every keystroke, so a burst coalesces.
+  assert.deepEqual(changedFigureExportSettings(before, settings({ title: 'B' })), { titleFollowsDataset: false, title: 'B' });
+  assert.deepEqual(
+    changedFigureExportSettings(before, settings({ autoTextSize: true, fontSizes: null })),
+    { autoTextSize: true, fontSizes: null },
+  );
+  assert.deepEqual(
+    changedFigureExportSettings(before, settings({ fontSizes: { base: 15, legend: 13, ticks: 12, axisLabel: 16, title: 22, centroidLabel: 11 } })),
+    { autoTextSize: false, fontSizes: { base: 15, legend: 13, ticks: 12, axisLabel: 16, title: 22, centroidLabel: 11 } },
+  );
+  const moved = changedFigureExportSettings(before, settings({ frame: { lockAspect: true, rect: { x: 0.2, y: 0.2, width: 0.5, height: 0.4 } } }));
+  assert.deepEqual(Object.keys(moved), ['frame']);
+});
+
+test('the panel records a person\'s change of any setting as one figure-export.set step and provides the action', async () => {
+  const source = await readFile(new URL('../assets/js/app/ui/modules/figure-export/figure-export-ui.js', import.meta.url), 'utf8');
+  // One observer of the whole panel, not a recorder per control: a control added later is recorded too.
+  assert.match(source, /for \(const type of \['input', 'change', 'click', 'pointerup', 'keyup'\]\) listen\(container, type, observeSettings\);/);
+  assert.match(source, /recordObserved\('figure-export\.set', figureExportParamsOf\(changed\)\)/);
+  assert.match(source, /getActions\(\)\.provide\('figure-export\.set'/);
+  // A restore or the action itself puts the baseline the next change is compared with.
+  assert.match(source, /observedSettings = settingsNow\(\);\n  }\n/);
+});

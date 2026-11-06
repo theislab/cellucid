@@ -21,6 +21,7 @@
  */
 
 import { PLACES, placePath } from '../place-names.js';
+import { GRAPH_SHORTCUTS } from '../modules/state/model.js';
 
 export const DOCS_BASE_URL = 'https://docs.cellucid.com/en/latest/user_guide/web_app/';
 
@@ -145,10 +146,11 @@ const TIPS = {
   'open-data': {
     title: 'Open data',
     body: [
-      'Three ways to open a dataset. Opening one replaces the dataset that is open now.',
+      'Four ways to open a dataset. Opening one replaces the dataset that is open now.',
       {
         list: [
           'Sample dataset: a public dataset, read in place as each view needs it. While a catalog of several datasets is connected, this list shows its datasets instead.',
+          'My datasets: the datasets you opened in this browser, each opened again with one click.',
           'File or folder from this computer: AnnData (`.h5ad`, `.zarr.zip`, a `.zarr` folder), a Seurat or SingleCellExperiment object (`.rds`, `.rda`/`.RData`), MuData (`.h5mu`, MuData Zarr), Loom (`.loom`), a 10x Cell Ranger `.h5`, a Cell Ranger outs/ folder, or a MatrixMarket folder. Nothing is uploaded.',
           'Link or server: a link or an id of published data, or the address of a `cellucid serve` server.',
         ],
@@ -158,6 +160,48 @@ const TIPS = {
     links: [
       doc('Loading options', 'b_data_loading/01_loading_options_overview', 'at-a-glance'),
       doc('Choose a workflow', 'b_data_loading/01_loading_options_overview', 'fast-path-choose-a-workflow-decision-tree'),
+    ],
+  },
+  // ----------------------------------------------------------------- Agents
+  'agent-connect': {
+    title: 'Claude and ChatGPT',
+    body: [
+      'Claude and ChatGPT can work in Cellucid in this browser: read the open dataset, colour, filter, highlight, run analyses and explain what they find. Each step they take is kept in the history, labelled as theirs, and one click undoes their whole turn; before a large download they ask you here.',
+      { list: [
+        'Copy the connector address and add it in Claude (Customize › Connectors › Add custom connector) or in ChatGPT (as a custom connector).',
+        'Claude or ChatGPT opens a page with a code and Open Cellucid to approve. That link brings you here to Allow or Deny. With Cellucid open on another device, type the code under Code from another device.',
+        'Manage… lists the agents connected through this browser: Remove ends one; Forget this browser ends them all.',
+      ] },
+      'The Cellucid relay passes the agent\'s requests to this tab and the answers back. It keeps no account and no chat, and no dataset bytes pass through it. Every Cellucid tab of this browser shares the connection; requests go to the one used last.',
+    ],
+    links: [
+      doc('Connect Claude or ChatGPT', 'g_agents/02_connect_claude_and_chatgpt', 'set-it-up'),
+      doc('What the relay keeps', 'g_agents/02_connect_claude_and_chatgpt', 'what-the-relay-carries-and-keeps'),
+      doc('What goes over the network', 'o_accessibility_privacy_security/02_privacy_model', 'what-goes-over-the-network-and-why'),
+    ],
+  },
+  'agent-approval': {
+    title: 'Approving a connection',
+    body: [
+      'An app asks to work in Cellucid in this browser. Allow it only if you started connecting from that app yourself, just now, and the code matches the one on the page that asked. Claude and ChatGPT are named by the site that vouches for them (claude.ai, chatgpt.com); another app carries a warning.',
+      `Allowing lets it read the open dataset and act in it; every step it takes is kept in the history and can be undone. Deny, or closing this, sends it away. ${placePath(PLACES.agents, PLACES.agentConnect)} › Manage… removes a connection later.`,
+    ],
+    links: [
+      doc('Connect Claude or ChatGPT', 'g_agents/02_connect_claude_and_chatgpt', 'set-it-up'),
+      doc('What goes over the network', 'o_accessibility_privacy_security/02_privacy_model', 'what-goes-over-the-network-and-why'),
+    ],
+  },
+  'my-datasets': {
+    title: 'My datasets',
+    body: [
+      'The datasets you opened in this browser, most recent first: samples you chose, links and repository datasets, Cellucid servers, and files and folders of this computer. The menu offers the five most recent; All… lists every one with its details and saved states.',
+      'A choice opens it again with one click, with the cells you chose for it. Continue opens it with its latest saved state. A file or folder opens again where the browser keeps its handle (Chrome, Edge; it may ask first); elsewhere you choose it again.',
+      'Kept in this browser only, never uploaded: no server, no account. What a link carried to grant access (a key, a token) is never kept. Forget takes a dataset off the list; its saved states stay unless you tick them. A private window keeps the list until it closes.',
+      'To take them to another browser, All… › Export… writes the datasets and saved states you tick to a .cellucid-library file (saved states whole, conversations with agents included); Import… there adds them beside what it keeps, replacing nothing.',
+    ],
+    links: [
+      doc('My datasets', 'b_data_loading/01_loading_options_overview', 'my-datasets'),
+      doc('Privacy', 'o_accessibility_privacy_security/02_privacy_model', 'indexeddb-larger-local-cache-persists-until-cleared'),
     ],
   },
   subsample: {
@@ -186,7 +230,7 @@ const TIPS = {
   'kept-stores': {
     title: 'Stored',
     body: [
-      'What this browser keeps so datasets open again faster (converted files, downloads, downloaded parts, gene indexes, unsaved highlight drafts and host speeds), in this site\'s private storage in your browser profile and never uploaded; Manage… shows where and how much, and removes what you choose.',
+      'What this browser keeps so datasets open again faster (converted files, downloads, downloaded parts, gene indexes, the histories it kept and host speeds), in this site\'s private storage in your browser profile and never uploaded; Manage… shows where and how much, and removes what you choose, the list of My datasets included.',
     ],
     links: [
       doc('Stored in this browser', 'b_data_loading/01_loading_options_overview', 'stored-in-this-browser'),
@@ -204,6 +248,7 @@ const TIPS = {
         ],
       },
       'You can also drop a file or a folder anywhere on the page. Files stay on this computer: the browser reads them and nothing is uploaded.',
+      `What you open is listed under ${PLACES.myDatasets.name}, to open again with one click where the browser keeps its handle (Chrome, Edge); elsewhere you choose it again.`,
       'Safari’s folder dialog leaves out hidden files (names starting with “.”), where a Zarr v2 store keeps its metadata: in Safari, drag the folder onto the page or open its `.zarr.zip`. A Zarr v3 store opens either way.',
     ],
     links: [
@@ -235,14 +280,214 @@ const TIPS = {
     ],
   },
   'session-file': {
-    title: 'Session file',
+    title: 'Share and Load',
     body: [
-      'Save writes a `.cellucid-session` file with the state of the app: views and cameras, active fields, filters, highlight pages and groups, panel layout, analysis windows and the camera path.',
-      'Load restores such a file onto the same dataset. The dataset itself is not in the file, and a session saved from a different dataset is refused without changing anything.',
+      'Share… writes a `.cellucid-session` file: the history (the branches you tick, main and the one shown by default), the current state only (one step, without how you got there), or the steps only (a replay plan for any dataset). You choose whether notes, conversations, Recently deleted, analysis results, times and where the dataset opens from go with it; What’s inside lists everything the file holds.',
+      'Load… opens a saved state of this browser or a session file. A file’s trackers are added beside yours, never in place of them; a file of another dataset is offered as a replay of its steps on this one.',
     ],
     links: [
       doc('What is saved', 'l_sessions_sharing/02_what_gets_saved_and_restored', 'quick-summary-read-this-if-you-only-have-60-seconds'),
       doc('Save and restore', 'l_sessions_sharing/03_save_restore_ux', 'fast-path-wet-lab-non-technical-save-my-work'),
+    ],
+  },
+
+  // ------------------------------------------------------------------ State
+  'history': {
+    title: 'History',
+    body: [
+      'Every change to the dataset shown is a step: colouring, filters, labels, highlights, views, analyses, the camera and the layout. Steps of an agent (Claude, ChatGPT) or a notebook (Python, R) carry its name; an agent’s turn is one row you can undo at once.',
+      'Click a row to select it, double-click to show that step, and › to open its details (who, when, the code, what changed, notes, and its actions). Acting after going back starts a branch: the steps you left stay, as a ⑂ row where they part. Runs of camera and panel steps fold into one row (Camera ×6); undo still goes step by step.',
+      'Shift+click selects several steps of one line: Group (▣) names them as one node and keeps every step; Merge into one step (⧉) replaces them with their net change. Recording can be paused from the status line: changes still apply, and resuming keeps them as one step.',
+      'Keys in the history:',
+      { list: GRAPH_SHORTCUTS.map(([keys, does]) => `${keys}: ${does}`) },
+    ],
+    links: [
+      doc('The history', 'm_state_history/01_the_history', 'the-history-graph'),
+      doc('Undo and redo', 'm_state_history/01_the_history', 'undo-and-redo'),
+      doc('Branches', 'm_state_history/02_branches_trackers_and_comparing', 'branches'),
+      doc('Tour and exports', 'm_state_history/04_tour_methods_and_report', 'play-as-a-tour'),
+    ],
+  },
+  'history-record-camera': {
+    title: 'Camera moves',
+    body: [
+      'On (the default), every camera move and change of navigation is a step. Off, camera moves make no step, and undo, redo and jumps leave the camera where it is; the steps still keep each view, so a tour, Compare and a shared file show it.',
+      'It never touches the analysis: colours, filters, labels and results are always recorded. It is a setting of this browser, for every dataset; turned on again, the next move is recorded.',
+    ],
+    links: [
+      doc('History settings', 'm_state_history/05_recording_groups_notes_and_cleanup', 'history-settings'),
+    ],
+  },
+  'history-record-layout': {
+    title: 'Panels, windows and theme',
+    body: [
+      'On (the default), docking, moving and resizing panels and analysis windows, opening sections, hiding the sidebar and the theme are steps. Off, they make no step, and going back leaves them as they are.',
+      'It never touches the analysis. It is a setting of this browser, for every dataset.',
+    ],
+    links: [
+      doc('History settings', 'm_state_history/05_recording_groups_notes_and_cleanup', 'history-settings'),
+    ],
+  },
+  'history-autosave': {
+    title: 'Autosave in this browser',
+    body: [
+      'On by default: every step is written to this browser a moment after it is made, so a closed tab or a crash loses at most the change of its last moment, and opening the dataset again offers to continue. Off, nothing is written (saving under a name in Load… still works); turned on again, the whole history is written.',
+    ],
+    links: [
+      doc('Every step is kept', 'm_state_history/03_saved_states_and_autosave', 'continue-where-you-left-off'),
+      doc('History settings', 'm_state_history/05_recording_groups_notes_and_cleanup', 'history-settings'),
+    ],
+  },
+  'history-diff': {
+    title: 'Compare two steps',
+    body: [
+      'Choose any two steps of this tracker, on one branch or on two (each step is listed once, under its branch), to see what differs between the state after one and after the other, part by part: fields and labels, filters, colors, highlights, views, camera, settings and layout.',
+      'Nothing is changed or shown: the comparison reads the steps as they were kept.',
+    ],
+    links: [
+      doc('Compare two steps', 'm_state_history/02_branches_trackers_and_comparing', 'compare-two-steps'),
+    ],
+  },
+  'saved-states': {
+    title: 'Load',
+    body: [
+      'Every history this browser keeps, for every dataset: the autosave of each dataset and the ones you saved under a name. Open one to continue where it left off (its dataset is opened first), rename it, delete it, or replay its steps on the dataset shown, in a new tracker.',
+      'Save keeps the history shown under a name: the whole history, the current state only, or the steps only. Kept in this browser only, never uploaded; Share… writes a file for another machine.',
+      'Open a session file… loads one beside your trackers. Replay a session file here… applies its steps by name on the dataset shown; what does not match is reported.',
+    ],
+    links: [
+      doc('The Load dialog', 'm_state_history/03_saved_states_and_autosave', 'the-load-dialog'),
+      doc('Continue where you left off', 'm_state_history/03_saved_states_and_autosave', 'continue-where-you-left-off'),
+      doc('Privacy', 'o_accessibility_privacy_security/02_privacy_model', 'indexeddb-larger-local-cache-persists-until-cleared'),
+    ],
+  },
+  'history-share': {
+    title: 'Share this history',
+    body: [
+      'History: the branches you tick, with every value, opening as it is on this dataset. Current state: what is shown now as one step, without notes, conversations, agents or times. Steps only: no cells and no values, a plan that replays on any dataset.',
+      'Results: analysis results in the file, or computed again when it is opened (smaller). Times: exact, the dates only, or none. Dataset: its name and where it opens (file name, link or server), or its name only.',
+      'The line above Save file counts what the file holds; What’s inside lists every kind of content it carries, the privacy of the file in one table.',
+    ],
+    links: [
+      doc('What is saved', 'l_sessions_sharing/02_what_gets_saved_and_restored', 'quick-summary-read-this-if-you-only-have-60-seconds'),
+      doc('Share a history', 'm_state_history/06_sharing_and_replay', 'share-a-history'),
+    ],
+  },
+  'history-deleted': {
+    title: 'Recently deleted',
+    body: [
+      'Every edit of the history can be undone here: deleted steps and branches, merges, groups, renames, notes and bookmarks, removed trackers. Restore puts it back exactly, or as new (“X (restored)”) when what it changed was changed again.',
+      'Nothing expires. Empty frees the memory an entry holds; it can no longer be restored. Ctrl+Z stays for the state.',
+    ],
+    links: [
+      doc('Recently deleted', 'm_state_history/05_recording_groups_notes_and_cleanup', 'recently-deleted'),
+      doc('Delete one step', 'm_state_history/01_the_history', 'delete-one-step'),
+    ],
+  },
+  'history-map': {
+    title: 'Branch map',
+    body: [
+      'Every branch at once: the graph with each branch on its own lane, and the table of branches with where each starts, its steps and its last change. Click a branch in the table to find it in the graph; double-click to show it.',
+      'Tick branches to archive or delete several. Main and locked branches are not deleted; archived ones are hidden from the sidebar and kept.',
+    ],
+    links: [
+      doc('The branch map', 'm_state_history/02_branches_trackers_and_comparing', 'the-branch-map'),
+    ],
+  },
+  'history-replay': {
+    title: 'Replay report',
+    body: [
+      'Each step of the replayed history and what became of it here: applied (✓), changing nothing here (=), not applied with why (✗), skipped (a change made outside the steps) or stopped. A step not applied is kept, flagged; its button shows it in the graph.',
+      'A step that names a field, a category or a gene this dataset lacks offers Use instead: choose the name it has here, then Replay again with these names replays the same steps in a new tracker, which keeps the names chosen. Keep as is closes the report.',
+    ],
+    links: [
+      doc('Replay on another dataset', 'm_state_history/06_sharing_and_replay', 'replay-a-history-on-another-dataset'),
+    ],
+  },
+  'history-memory': {
+    title: 'History memory',
+    body: [
+      'The history keeps every value of every step in memory, and what Recently deleted holds, so any step comes back exactly; nothing is dropped to make room. Values are kept once, however many steps share them, so most steps cost nothing; large cell sets (a brush over many cells, hidden cells) and analysis results cost the most.',
+      'When the history passes what this device has room for, the status line says so and names the largest parts. Each step’s part has Show; Recently deleted… empties what it keeps; merging steps into one keeps only their net change.',
+    ],
+    links: [
+      doc('Recently deleted', 'm_state_history/05_recording_groups_notes_and_cleanup', 'recently-deleted'),
+    ],
+  },
+  'history-report': {
+    title: 'Report',
+    body: [
+      'The report lists the dataset and the software, a methods paragraph and every step shown with who took it, when, its parameters and what it changed, then the pseudocode. It opens in a window of its own, to read, print or save as PDF.',
+      'A picture of the selected view, drawn as the figure export draws it, can follow each step you choose (the bookmarks and the last step of each group by default): each is shown in turn and drawn, then the history returns to the step it showed. No picture is ever stored in the history. Pictures take a moment per step; turn them off for a report of the steps alone (this browser remembers it).',
+    ],
+    links: [
+      doc('Print report', 'm_state_history/04_tour_methods_and_report', 'print-report'),
+      doc('Methods paragraph', 'm_state_history/04_tour_methods_and_report', 'copy-methods-paragraph'),
+    ],
+  },
+
+  // ----------------------------------------------------------------- Agents
+  'agent-chat': {
+    title: 'Chat',
+    body: [
+      'Ask an agent (Claude, or OpenAI’s models behind ChatGPT) about the dataset shown, or have it work in it: color by a field, filter, compare groups, run an analysis, annotate clusters. It reads the dataset through the same tools as Claude and ChatGPT connected to Cellucid.',
+      'Every change it makes is a step of the history, marked with its name. Each message you send is one turn: Undo turn under it takes the turn back (when you or another agent acted meanwhile, it asks whether to take out only the turn’s own steps or everything since it began). Stop ends the turn; a step it was taking is rolled back.',
+      'What it may do without asking is yours to set (Permissions, in the settings): by default it asks you here before heavy work, before pausing the history, and before what the history cannot take back (writing a file, deleting what was saved, a large download, publishing).',
+      'The conversation is kept with the history of this dataset, so it comes back with Continue and a saved state; another dataset shows its own. A turn still running when you open another dataset stops; one whose agent opened it goes on there. Share… leaves the conversations out unless you tick Conversations in its dialog.',
+      'Requests go from this tab straight to the provider you chose, with your API key; it is billed to your account. Cellucid has no server in between. Sent, under each turn, says what left this browser: your message and the tool results. The dataset\'s files stay here, but a result can carry part of the data (the values of cells, a picture of the plot).',
+      '`/` opens the chat from anywhere on the page. Export saves the chat as Markdown.',
+    ],
+    links: [
+      doc('Steps of agents', 'm_state_history/01_the_history', 'steps-of-agents-and-notebooks'),
+      doc('The chat bar', 'g_agents/01_chat_bar', 'turns'),
+      doc('What is sent', 'g_agents/01_chat_bar', 'what-is-sent-sent'),
+    ],
+  },
+  'agent-chat-key': {
+    title: 'API key',
+    body: [
+      'Your own key from the provider (Anthropic for Claude, OpenAI for its models); Get a key opens the page where you make one. Its use is billed to that account.',
+      'By default it is kept for this tab only: a reload keeps it, closing the tab forgets it. Remember on this browser keeps it until you press Forget, for every tab of this browser profile. Either way it stays in this browser, is sent only to its provider, and is never written to a session file or the history.',
+      'A key the provider refuses is said here; the models listed are the ones this key may use.',
+    ],
+    links: [
+      doc('sessionStorage', 'o_accessibility_privacy_security/02_privacy_model', 'sessionstorage-per-tab-clears-when-the-tab-closes'),
+      doc('localStorage', 'o_accessibility_privacy_security/02_privacy_model', 'localstorage-persists-until-cleared'),
+      doc('Chat settings', 'g_agents/01_chat_bar', 'settings'),
+    ],
+  },
+
+  'agent-permissions': {
+    title: 'Agent permissions',
+    body: [
+      'What agents may do in this tab without asking you: the chat bar\'s, and Claude or ChatGPT connected to Cellucid (their tool list says it too). Reading the dataset is always allowed.',
+      {
+        list: [
+          'Changes in this tab: colour, filter, highlight, views, new fields, analyses (each a step the history can undo), and opening another dataset (its history stays kept).',
+          'Heavy work: what this device and connection, as measured, would take longer than about 10 s to do (a long analysis, reading genes for many cells, opening many cells).',
+          'Pausing the history: changes still apply, recorded later as one step.',
+          'What cannot be undone: writing a file, deleting what was saved, a large download, publishing.',
+        ],
+      },
+      'Each kind is Ask, Allow or Deny. Ask shows a card with the estimate; the agent waits. Allow Once, in This chat (or connection, until the page closes), or Always (sets the kind to Allow). Deny tells the agent in one sentence.',
+      'Modes set every kind at once: Ask before heavy or irreversible (the default), Allow everything undoable without asking, or Read only. Kept in this browser.',
+    ],
+    links: [
+      doc('Permissions', 'g_agents/03_permissions_and_what_agents_see', 'permissions'),
+      doc('What agents are sent', 'g_agents/03_permissions_and_what_agents_see', 'what-agents-are-sent'),
+      doc('Steps of agents', 'm_state_history/01_the_history', 'steps-of-agents-and-notebooks'),
+      doc('Kept in this browser', 'o_accessibility_privacy_security/02_privacy_model', 'localstorage-persists-until-cleared'),
+    ],
+  },
+  'agent-chat-effort': {
+    title: 'Effort',
+    body: [
+      'How much the model thinks before it answers or acts, as its provider offers it for this model: higher is slower and uses more tokens, lower is quicker and cheaper. Model\'s default leaves it to the model.',
+      'Claude\'s models list the levels they take; OpenAI does not list them, so a level a model does not take is refused in one sentence, and you choose another.',
+    ],
+    links: [
+      doc('Chat settings', 'g_agents/01_chat_bar', 'settings'),
+      doc('Steps of agents', 'm_state_history/01_the_history', 'steps-of-agents-and-notebooks'),
     ],
   },
 
@@ -457,10 +702,11 @@ const TIPS = {
     body: [
       'For a categorical field: tick a category to show or hide its cells, click a swatch to change its colour, and rename, merge or delete categories. Centroids mark the centre of each category on the plot.',
       'For a continuous field: pick a colour map and drag the range to rescale colours or filter cells.',
-      'Hiding a category or narrowing a range is a filter on the selected view.',
+      'Hiding a category or narrowing a range is a filter on the selected view. Click a category\'s count to keep only that many of its cells, a random sample with a fixed seed; type all to show every cell again.',
     ],
     links: [
       doc('Legend', 'd_fields_coloring_legends/04_legend_behavior', 'categorical-legend-checkboxes-swatches-category-tools'),
+      doc('Keep some cells', 'd_fields_coloring_legends/04_legend_behavior', 'keep-only-some-cells-of-a-category-the-count'),
       doc('Color-by behavior', 'd_fields_coloring_legends/03_color_by_behavior', 'categorical-color-by-discrete-labels'),
     ],
   },
@@ -982,6 +1228,7 @@ const TIPS = {
     title: 'General shortcuts',
     body: [
       'Shortcuts act on the focused view, and never while you are typing in a field. Press ? to open this panel from anywhere.',
+      'Ctrl/⌘+Z and Shift+Ctrl/⌘+Z undo and redo steps of the history, also with a slider or checkbox focused; a text field keeps its own undo. `/` opens the agent chat.',
     ],
     links: [
       doc('Camera shortcuts', 'c_core_interactions/02_camera_controls_advanced', 'keyboard-shortcuts-that-affect-camera-navigation'),
@@ -1074,8 +1321,8 @@ const TIPS = {
   'community-consensus-column': {
     title: 'Consensus column',
     body: [
-      'Builds a local obs column from the current votes: each category becomes its consensus label, Disputed, or Pending.',
-      'It does not change the voting rules and publishes nothing; it is only for colouring and analysis here.',
+      'Builds a local obs column from the current votes: each category becomes its consensus label, Disputed, or Pending (a label agreed as literally “Pending” keeps its own category; the status is then “Pending (status)”).',
+      'Its rule starts as the column’s repository rule. It is a history step naming each category’s outcome, so it replays by name; a Pull or vote that changes the consensus marks it “consensus changed since built”, with Rebuild. It publishes nothing.',
     ],
     links: [
       doc('Consensus column', 'j_community_annotation/02_author_guide', 'build-a-consensus-column-optional-local'),
@@ -1145,8 +1392,8 @@ const TIPS = {
     title: 'Share link',
     body: [
       'A link to www.cellucid.com that reopens this dataset for anyone, carrying only what picks the dataset.',
-      'It reopens the dataset, not your view of it: to share the camera, colours, filters and highlights, save a session file and send it with the link.',
-      'Only a sample, a public GitHub export or a server other people can reach has a link; a file from disk, a notebook or a server on localhost does not.',
+      `It reopens the dataset, not your view of it: to share the camera, colours, filters and highlights, write a session file with ${placePath(PLACES.state, PLACES.sessionFile)} › Share… and send it with the link.`,
+      'Only a sample, a link to published data (in its public form: what granted access is left out) or a server other people can reach has a link; a file from disk, a notebook or a server on localhost does not.',
     ],
     links: [
       doc('Which datasets can be shared', 'l_sessions_sharing/13_share_links_badges_and_embeds', 'which-datasets-can-be-shared'),

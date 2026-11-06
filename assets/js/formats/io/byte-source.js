@@ -17,6 +17,7 @@
  * @module formats/io/byte-source
  */
 
+import { ReadWitness, witnessHolds } from './read-witness.js';
 import { onAbort, abortReason, awaitWithSignal, cancel } from '../../utils/abort.js';
 import { isHostUrl, routedFetch } from './host-fetch.js';
 import { ResponseClock } from './link.js';
@@ -528,9 +529,13 @@ export function errorReasonOf(said) {
 /**
  * Whether an answer says the host limits how fast it is read: HTTP 429, or a
  * 403 that says so -- its JSON error names a rate limit
- * (`RATE_LIMITING_REASONS`: Google's APIs), or its request budget is spent
- * (`X-RateLimit-Remaining: 0`: GitHub's API answers its limit so). `said`:
- * the answer's body, when it was read (`fetchOnce`).
+ * (`RATE_LIMITING_REASONS`: Google's APIs), its request budget is spent
+ * (`X-RateLimit-Remaining: 0`: GitHub's API answers its limit so), or it
+ * names when to ask again (`Retry-After`: GitHub's secondary rate limits
+ * answer 403 with a `Retry-After` while the budget has requests left,
+ * https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit;
+ * a refusal that will pass is no refusal of access). `said`: the answer's
+ * body, when it was read (`fetchOnce`).
  *
  * @param {Response} response
  * @param {string|null} [said]
@@ -540,7 +545,9 @@ export function isLimitAnswer(response, said = null) {
   const status = response.status;
   if (status === 429) return true;
   if (status !== 403) return false;
-  return RATE_LIMITING_REASONS.has(errorReasonOf(said)) || budgetOf(response.headers)?.remaining === 0;
+  return RATE_LIMITING_REASONS.has(errorReasonOf(said)) ||
+    budgetOf(response.headers)?.remaining === 0 ||
+    retryAfterMilliseconds(response.headers.get('Retry-After')) !== null;
 }
 
 /** Whether an answer says the host may answer if asked again: a transient status, or a rate limit (`isLimitAnswer`). */
@@ -1231,7 +1238,7 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
  *   confirmUnreadable?: () => Promise<boolean>}|null, hosts?: ReturnType<import('./hosts.js').createHostBook>}} [options]
  * @returns {ByteSource}
  */
-export function httpByteSource({ url, size, name, identity = null, etag: knownTag = null, lastModified: knownModified = null, mirrors = [] }, { fetch: fetchImpl = routedFetch, policy, access = null, hosts = realmHosts } = {}) {
+export function httpByteSource({ url, size, name, identity = null, etag: knownTag = null, lastModified: knownModified = null, mirrors = [], head = null }, { fetch: fetchImpl = routedFetch, policy, access = null, hosts = realmHosts } = {}) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -1467,7 +1474,43 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
     }
   }
 
+  /**
+   * A new validator is a question its bytes answer (`read-witness.js`): GitHub
+   * Pages gives every file of a site new ones at every deployment although
+   * its bytes are the same. The range itself, when read before, and the
+   * file's first, middle and last reads, asked for once per new validator, are
+   * compared. Other bytes are refused, and every later read too: nothing
+   * mixes two versions. With nothing read yet nothing proves it the same.
+   */
+  async function requireSameBytes(offset, bytes, tag, modified, call) {
+    const refuse = () => {
+      rewritten = modified === null
+        ? `${fileName} changed on the host while it was open; open it again to read the new version.`
+        : `${fileName} changed on the host while it was open (modified ${modified}); open it again to read the new version.`;
+      return new ByteSourceError(BYTE_SOURCE_FAILURES.CHANGED, rewritten);
+    };
+    if (witness.compare('', offset, bytes) === 'different') throw refuse();
+    const version = `${tag} ${modified}`;
+    let asked = askedOfVersion.get(version);
+    if (asked === undefined) {
+      asked = (async () => {
+        const witnesses = witness.witnessesAcross();
+        if (witnesses.length === 0) return false;
+        // Shared by every read waiting on it, so no one read's Stop ends it.
+        const held = await Promise.all(witnesses.map(async each => witnessHolds(each, await readOnce(each.start, each.length, {
+          signal: null, clock: call.clock, onBytes: null, onWait: call.onWait, witnessing: true,
+        }))));
+        return !held.includes(false);
+      })();
+      askedOfVersion.set(version, asked);
+      // A failed asking (the link) says nothing of the file: asked again by the next read.
+      asked.catch(() => askedOfVersion.delete(version));
+    }
+    if (!await asked) throw refuse();
+  }
+
   async function readOnce(offset, length, call) {
+    if (rewritten !== null) throw new ByteSourceError(BYTE_SOURCE_FAILURES.CHANGED, rewritten);
     const { signal } = call;
     let answer;
     if (access === null) {
@@ -1519,32 +1562,22 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
       );
     }
     if (status === 206) requireAnsweredRange(response, offset, length, size, fileName);
-    const responseTag = response.headers.get('ETag');
-    if (responseTag !== null) {
-      if (etag === null) etag = responseTag;
-      else if (responseTag !== etag) {
-        throw new ByteSourceError(
-          BYTE_SOURCE_FAILURES.CHANGED,
-          `${fileName} changed on the host while it was open; open it again to read the new version.`
-        );
-      }
-    }
     // Without an ETag, its modification time tells a new version.
+    const responseTag = response.headers.get('ETag');
     const responseModified = responseTag === null ? response.headers.get('Last-Modified') : null;
-    if (responseModified !== null) {
-      if (lastModified === null) lastModified = responseModified;
-      else if (responseModified !== lastModified) {
-        throw new ByteSourceError(
-          BYTE_SOURCE_FAILURES.CHANGED,
-          `${fileName} changed on the host while it was open (modified ${responseModified}); open it again to read the new version.`
-        );
-      }
-    }
     if (bytes.length !== length) {
       throw new ByteSourceError(
         BYTE_SOURCE_FAILURES.SHORT_READ,
         `${fileName}: asked for ${formatCountOf(length, 'byte')} at ${offset}, received ${bytes.length}; the file may have changed.`
       );
+    }
+    if (call.witnessing !== true) {
+      const moved = (responseTag !== null && etag !== null && responseTag !== etag)
+        || (responseModified !== null && lastModified !== null && responseModified !== lastModified);
+      if (moved) await requireSameBytes(offset, bytes, responseTag, responseModified, call);
+      if (responseTag !== null) etag = responseTag;
+      if (responseModified !== null) lastModified = responseModified;
+      if (etag !== null || lastModified !== null) witness.note('', offset, bytes);
     }
     if (response.url && response.url !== answer.base && answer.sentAt !== null) {
       // Answered from the base URL: the final URL's stated lifetime starts now.
@@ -1557,6 +1590,13 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
     return bytes;
   }
 
+  /** What was read of the file, and what each new validator was found to be. */
+  const witness = new ReadWitness();
+  // The head read beside its probe, under the validators it was described with: read, wherever later reads are answered from.
+  if (head instanceof Uint8Array && head.length > 0) witness.note('', 0, head);
+  const askedOfVersion = new Map();
+  /** Why every read is refused, once the file was found rewritten. */
+  let rewritten = null;
   /** Requests made without a measured link (tests, a lone source) share one clock. */
   const ownClock = new ResponseClock();
   // Ranges of this file delivered so far: once any was, its host is waited for (`withRetries` `delivered`).

@@ -15,6 +15,18 @@
  * the phone layout the open sidebar is a full-screen sheet the user closes
  * to reach the plot, not a panel beside it, so it occludes nothing.
  *
+ * Showing, hiding and resizing the sidebar are actions
+ * (`layout.sidebar.show`, `layout.sidebar.width`, provided here): the toggle
+ * dispatches, and a resize drag is recorded when it ends.
+ *
+ * The phone sheet is page chrome, not state (History v2 §3.3.8): on the
+ * phone layout the toggle, the peek bar and the H key open and close the
+ * sheet and record nothing, and the sidebar shown or hidden (the `layout`
+ * state, `isShownChosen`) is not the sheet. An action, an undo or a session
+ * changes that choice there without touching the sheet, so Undo pressed
+ * inside the sheet never closes it; the choice shows again once the window
+ * is wider than the phone layout.
+ *
  * @module ui/modules/sidebar-controls
  */
 
@@ -22,6 +34,7 @@ import { rememberPhoneSheet } from '../core/phone-sheet-memory.js';
 import { clampSidebarWidthPx } from '../../sidebar-metrics.js';
 import { StyleManager } from '../../../utils/style-manager.js';
 import { computeLeftOcclusionRatio } from '../../../rendering/viewport-center.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
 
 /**
  * Open the sidebar for a control outside it that leads to one inside it
@@ -46,9 +59,14 @@ export function revealSidebar(ownerDocument) {
   }
 }
 
-export function initSidebarControls({ dom, onViewportOcclusionChange }) {
+export function initSidebarControls({ dom, onViewportOcclusionChange, actions }) {
   if (dom === null || typeof dom !== 'object' || Array.isArray(dom)) {
     throw new TypeError('Sidebar controls require one DOM reference object.');
+  }
+  for (const method of ['dispatch', 'provide', 'recordObserved']) {
+    if (typeof actions?.[method] !== 'function') {
+      throw new TypeError(`Sidebar controls require the action dispatcher (${method}).`);
+    }
   }
   if (typeof onViewportOcclusionChange !== 'function') {
     throw new TypeError(
@@ -190,11 +208,14 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   syncSidebarToggleState();
   publishViewportOcclusion();
 
+  // The phone layout (layouts/_responsive.css): the open sidebar is a sheet
+  // over the whole screen.
+  const phoneLayout = ownerWindow.matchMedia('(max-width: 720px)');
+  const onPhone = () => phoneLayout.matches;
   // Whether this tab left the phone panel open or as the peek bar, kept for
   // the next load of the tab (session storage: never in the address).
-  const phoneLayout = ownerWindow.matchMedia?.('(max-width: 720px)') ?? null;
   const rememberSheet = () => {
-    if (phoneLayout?.matches !== true) return;
+    if (!onPhone()) return;
     rememberPhoneSheet(ownerWindow, sidebar.classList.contains('hidden') ? 'peek' : 'open');
   };
 
@@ -210,7 +231,43 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
       );
     }
   };
-  sidebarToggle.addEventListener('click', handleSidebarToggle);
+  const isShown = () => !sidebar.classList.contains('hidden');
+  /**
+   * The sidebar shown or hidden as the `layout` state holds it. Beside the
+   * plot it is what shows; on the phone layout the sheet opens and closes
+   * apart from it, and the phone layout starts with it shown.
+   */
+  let shownChosen = onPhone() ? true : isShown();
+  /** Show what was chosen, beside the plot; the phone sheet is left as it is. */
+  const showChosen = () => {
+    if (!destroyed && !onPhone() && isShown() !== shownChosen) handleSidebarToggle();
+  };
+  /** Choose the sidebar shown or hidden; false when it already was. */
+  const choose = shown => {
+    if (destroyed || shownChosen === shown) return false;
+    shownChosen = shown;
+    showChosen();
+    return true;
+  };
+  /**
+   * The toggle, the phone bar and the links that reveal the sidebar: beside
+   * the plot they ask through the action (a failure reaches the page's
+   * unhandled-rejection report like any other); on the phone layout they
+   * open or close the sheet, which is no step.
+   */
+  const requestShown = shown => {
+    if (destroyed) return;
+    if (onPhone()) {
+      if (isShown() !== shown) handleSidebarToggle();
+      return;
+    }
+    void actions.dispatch('layout.sidebar.show', { shown });
+  };
+  // Wider than the phone layout again, the sidebar is as it was chosen.
+  const handlePhoneLayoutChange = () => showChosen();
+  phoneLayout.addEventListener('change', handlePhoneLayoutChange);
+  const requestToggle = () => requestShown(!isShown());
+  sidebarToggle.addEventListener('click', requestToggle);
 
   // The phone panel's peek bar: the dataset's name and a handle; a tap or an
   // upward swipe opens the panel.
@@ -218,7 +275,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   const phoneSheetName = ownerDocument.getElementById('phone-sheet-name');
   const datasetName = ownerDocument.getElementById('dataset-name');
   const openFromBar = () => {
-    if (!destroyed && sidebar.classList.contains('hidden')) handleSidebarToggle();
+    if (!destroyed && !isShown()) requestShown(true);
   };
   let swipeFrom = null;
   const onBarPointerDown = event => { swipeFrom = event.clientY; };
@@ -243,6 +300,9 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   let isResizing = false;
   let startX = 0;
   let startWidth = 0;
+  /** The width the person or an action chose last, or null while the stylesheet's holds. */
+  let chosenWidth = null;
+  let resizedWidth = null;
 
   const finishSidebarResize = () => {
     if (!isResizing) return;
@@ -251,10 +311,17 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
     ownerDocument.body.style.cursor = '';
     ownerDocument.body.style.userSelect = '';
     ownerDocument.body.style.webkitUserSelect = '';
+    // One step per drag, with the width it ended at.
+    if (resizedWidth !== null && resizedWidth !== startWidth) {
+      void actions.recordObserved('layout.sidebar.width', { width: resizedWidth });
+    }
+    resizedWidth = null;
   };
 
   const updateSidebarWidth = (width) => {
     const clampedWidth = clampSidebarWidthPx(width);
+    chosenWidth = clampedWidth;
+    resizedWidth = isResizing ? clampedWidth : null;
     StyleManager.setVariable(
       ownerDocument.documentElement,
       '--sidebar-user-width',
@@ -317,20 +384,62 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
   geometryObserver.observe(sidebar);
   geometryObserver.observe(canvas);
 
+  const removeShowAction = actions.provide('layout.sidebar.show', ({ shown }) => (choose(shown) ? { shown } : null));
+  const removeWidthAction = actions.provide('layout.sidebar.width', ({ width }) => {
+    if (destroyed) return null;
+    if (responsiveResizeMedia.matches) {
+      throw new ActionRefused('On a window this narrow the sidebar takes the width the screen gives it; widen the window to set it.', {
+        code: 'refused',
+      });
+    }
+    const before = chosenWidth;
+    updateSidebarWidth(width);
+    return chosenWidth === before ? null : { width: chosenWidth };
+  });
+
   return {
     syncSidebarToggleState,
+    /**
+     * Whether the sidebar is shown (as chosen: on the phone layout, not
+     * whether its sheet is open), and its width (the one a person or an
+     * action chose, else the stylesheet's).
+     */
+    describe: () => ({ shown: shownChosen, width: chosenWidth ?? sidebar.offsetWidth }),
+    /** Whether the sidebar is shown as the `layout` state holds it (not the phone sheet). */
+    isShownChosen: () => shownChosen,
+    /**
+     * Show or hide the sidebar the way the action does, without a step: what
+     * a restore of the `layout` state domain calls (the toggle itself
+     * dispatches `layout.sidebar.show`). The phone sheet is left as it is.
+     */
+    show(shown) {
+      choose(shown);
+    },
+    /** Give the sidebar a width (null: the stylesheet's), without a step: the `layout` domain's restore. */
+    setWidth(width) {
+      if (destroyed) return;
+      if (width === null) {
+        chosenWidth = null;
+        StyleManager.removeVariable(ownerDocument.documentElement, '--sidebar-user-width');
+        publishViewportOcclusion();
+        return;
+      }
+      updateSidebarWidth(width);
+    },
     disconnectGeometryObserver() {
       geometryObserver.disconnect();
     },
     destroy() {
       if (destroyed) return;
       destroyed = true;
+      removeShowAction();
+      removeWidthAction();
       if (transitionFrame !== 0) {
         ownerWindow.cancelAnimationFrame(transitionFrame);
         transitionFrame = 0;
       }
       finishSidebarResize();
-      sidebarToggle.removeEventListener('click', handleSidebarToggle);
+      sidebarToggle.removeEventListener('click', requestToggle);
       if (phoneSheetBar !== null) {
         phoneSheetBar.removeEventListener('click', openFromBar);
         phoneSheetBar.removeEventListener('pointerdown', onBarPointerDown);
@@ -350,6 +459,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange }) {
         'change',
         handleResponsiveResizeChange
       );
+      phoneLayout.removeEventListener('change', handlePhoneLayoutChange);
       geometryObserver.disconnect();
     },
   };

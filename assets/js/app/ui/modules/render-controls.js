@@ -76,6 +76,7 @@ import {
 } from '../../../rendering/viewer-backgrounds.js';
 import { requireExactObjectKeys } from '../../../utils/exact-record.js';
 import { PLACES } from '../place-names.js';
+import { ownDeferredAvailability } from '../core/deferred-control-readiness.js';
 
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
@@ -981,10 +982,16 @@ export function initRenderControls(options) {
   // and saying why: the page turns level of detail on and off by itself
   // (`onFullDetailFrameCost` below), and a row that appeared and went with
   // it moved every control under it 40 px at a time the GPU decided.
+  // Offered once the deferred controls are admitted only while level of detail is on.
+  ownDeferredAvailability(hpLodForceInput, () => acceptedLodEnabled);
   function syncForcedLodUi() {
     syncForcedLodRange();
     hpLodForceInput.disabled = !acceptedLodEnabled;
-    hpLodForceContainer.title = acceptedLodEnabled ? '' : 'Turn Level of detail (LOD) on to force a level.';
+    // Why it is unavailable, on the row (a disabled slider gets no hover in every browser) and on
+    // the slider itself, for what reads the control.
+    const reason = acceptedLodEnabled ? '' : 'Turn Level of detail (LOD) on to force a level.';
+    hpLodForceContainer.title = reason;
+    hpLodForceInput.title = reason;
     hpLodForceDisplay.textContent = formatForcedLodLevel(
       assertForcedLodLevel(hpLodForceInput.value, 'Forced LOD level')
     );
@@ -1177,11 +1184,12 @@ export function initRenderControls(options) {
     stopWaitingForFraming = null;
   }
 
+  // Waiting goes on until a measurement starts (`measuring`): a framing with
+  // nothing to measure (`nothing-fewer`) leaves it waiting for the next.
   function waitForNextFraming() {
-    stopWaiting();
+    if (stopWaitingForFraming !== null) return;
     stopWaitingForFraming = viewer.onPresentedViewStateChanged(({ reason }) => {
       if (reason !== 'camera-settled' && reason !== 'focus') return;
-      stopWaiting();
       if (!destroyed && !ownPerformanceChoice) viewer.measureFullDetailFrameCost();
     });
   }

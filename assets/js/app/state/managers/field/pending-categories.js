@@ -49,6 +49,24 @@ export function forgetPendingCategoryState(field) {
 }
 
 /**
+ * What is held for `field`, in the order it was held: the hidden labels and
+ * the colours (channels from 0 to 1) of labels its open cells do not hold yet.
+ * The state domains read it (`app/state/domains/filters.js`, `colors.js`), so
+ * a held label is part of the state, not lost on the next capture.
+ *
+ * @param {object} field
+ * @returns {{visibility: Array<{categoryName: string|boolean, visible: boolean}>, colors: Array<{categoryName: string|boolean, color: number[]}>}}
+ */
+export function pendingCategoryState(field) {
+  const held = PENDING.get(field);
+  if (held === undefined) return { visibility: [], colors: [] };
+  return {
+    visibility: [...held.visibility].map(([categoryName, visible]) => ({ categoryName, visible })),
+    colors: [...held.colors].map(([categoryName, color]) => ({ categoryName, color: [...color] })),
+  };
+}
+
+/**
  * Apply what was held for the labels `field` has now (its categories grew),
  * into its per-category visibility and colours; the caller makes visibility
  * and colours again from them, as it does for every category a growth
@@ -81,4 +99,35 @@ export function applyPendingCategoryState(state, field) {
   const applied = visibility.length + colors.length;
   if (held.visibility.size === 0 && held.colors.size === 0) PENDING.delete(field);
   return applied;
+}
+
+/**
+ * The labels held for each field over every view (the focused view's fields
+ * and each other view's context), in field order: what a loaded state names
+ * that no open cell holds yet, as the person is told after a load
+ * (`app/session/session-serializer.js`). A label held in several views, or
+ * for both its visibility and its colour, is counted once.
+ *
+ * @param {object} state - The data state (`obsData`, `varData`, `viewContexts`)
+ * @returns {Array<{source: 'obs'|'var', key: string, labels: Array<string|boolean>}>}
+ */
+export function heldCategoriesOf(state) {
+  const focused = state.getActiveViewId?.() ?? null;
+  const owners = [state];
+  if (state.viewContexts instanceof Map) {
+    for (const [viewId, context] of state.viewContexts) if (viewId !== focused) owners.push(context);
+  }
+  const held = new Map();
+  for (const owner of owners) {
+    for (const [data, source] of [[owner.obsData, 'obs'], [owner.varData, 'var']]) {
+      for (const field of data?.fields ?? []) {
+        const pending = field !== null && typeof field === 'object' ? PENDING.get(field) : undefined;
+        if (pending === undefined) continue;
+        const id = `${source}:${field.key}`;
+        if (!held.has(id)) held.set(id, { source, key: field.key, labels: new Set() });
+        for (const label of [...pending.visibility.keys(), ...pending.colors.keys()]) held.get(id).labels.add(label);
+      }
+    }
+  }
+  return [...held.values()].map(({ source, key, labels }) => ({ source, key, labels: [...labels] }));
 }

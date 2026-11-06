@@ -7,11 +7,14 @@
     "test:browser": "playwright test",
     "test:browser:bounded": "node scripts/run-browser-shard-bounded.mjs",
     "test:browser:repeat": "node scripts/run-browser-specs-repeat.mjs",
+    "test:live-agents": "CELLUCID_LIVE_AGENTS=1 playwright test tests/browser/live-agents --project=chromium --workers=1",
     "test:worker-bundle": "npx --yes wrangler@4.115.0 deploy --dry-run --config wrangler.community-annotations.jsonc",
+    "test:relay-bundle": "npx --yes wrangler@4.115.0 deploy --dry-run --config wrangler.relay.jsonc",
     "bench:analysis": "node scripts/benchmark-analysis.mjs",
     "bench:anndata": "node scripts/benchmark-anndata.mjs",
     "bench:hdf5": "node scripts/benchmark-hdf5-reader.mjs",
-    "bench:formats": "node scripts/benchmark-formats.mjs"
+    "bench:formats": "node scripts/benchmark-formats.mjs",
+    "stress:history": "node scripts/history-stress.mjs"
   },
   "engines": {
     "node": ">=22.15"

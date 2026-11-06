@@ -2,9 +2,10 @@
  * The settings of the option-driven analyses (marker genes, differential
  * expression, gene signature, correlation) go through a session unchanged:
  * `exportSettings()` is exactly `{options, selectedPages, view}` (plus a
- * mode's own keys), the session stores it as typed JSON, and
- * `importSettings()` of that record on a fresh UI exports the same record
- * again — every option (including ones hidden by `when`), the "More options"
+ * mode's own keys), the session stores it as every history value is
+ * (`app/history/value-parts.js`), and `importSettings()` of that record on a
+ * fresh UI exports the same record again — every option (including ones
+ * hidden by `when`), the "More options"
  * and group disclosures, the mode's view state and the selected pages. A
  * record with an unknown or missing option is refused whole.
  */
@@ -15,9 +16,9 @@ import { CorrelationAnalysisUI } from '../assets/js/app/analysis/ui/analysis-typ
 import { DEAnalysisUI } from '../assets/js/app/analysis/ui/analysis-types/de-analysis-ui.js';
 import { GeneSignatureUI } from '../assets/js/app/analysis/ui/analysis-types/gene-signature-ui.js';
 import { GenesPanelUI } from '../assets/js/app/analysis/ui/analysis-types/genes-panel-ui.js';
-import { requireTypedJsonValue } from '../assets/js/app/analysis/shared/analysis-result-codec.js';
 import { DerivedResultsRegistry } from '../assets/js/app/registries/derived-results.js';
-import { decodeTypedJson, encodeTypedJson } from '../assets/js/app/session/codecs/typed-json.js';
+import { hashValue } from '../assets/js/app/history/value-pool.js';
+import { joinValue, parseArrayDigest, splitValue } from '../assets/js/app/history/value-parts.js';
 import { getDataSourceManager } from '../assets/js/data/data-source-manager.js';
 
 // No form is mounted: settings live on the UI itself.
@@ -84,10 +85,23 @@ function createUI(UI) {
   return ui;
 }
 
-/** The session's own storage step: typed JSON bytes and back. */
-function throughSession(value) {
-  requireTypedJsonValue(value);
-  return decodeTypedJson(encodeTypedJson(value));
+/**
+ * The session's own storage step (`app/history/value-parts.js`, as the
+ * session file and the autosave keep a history value): the value's skeleton
+ * as JSON text, each typed array as its bytes, joined again and checked
+ * against the hash the history keeps the value by.
+ */
+async function throughSession(value) {
+  const hash = await hashValue(value);
+  const arrays = new Map();
+  const text = JSON.stringify(await splitValue(value, arrays));
+  const restored = joinValue(JSON.parse(text), digest => {
+    const { type } = parseArrayDigest(digest);
+    const array = arrays.get(digest);
+    return new type(new Uint8Array(array.buffer, array.byteOffset, array.byteLength).slice().buffer);
+  });
+  assert.equal(await hashValue(restored), hash, 'what is read back is the value saved');
+  return restored;
 }
 
 /** Let asynchronous group descriptions settle. */
@@ -200,9 +214,9 @@ for (const { label, UI, options: changed, view, extra = {} } of CASES) {
     };
     assert.deepEqual(Object.keys(source.exportSettings()).sort(), Object.keys(settings).sort());
 
-    source.importSettings(throughSession(settings));
+    source.importSettings(await throughSession(settings));
     await settle();
-    const exported = throughSession(source.exportSettings());
+    const exported = await throughSession(source.exportSettings());
     assert.deepEqual(exported, settings, 'what was imported is what is exported');
 
     const fresh = createUI(UI);

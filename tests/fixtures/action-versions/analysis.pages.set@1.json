@@ -1,0 +1,64 @@
+{
+  "examples": [
+    {
+      "analysis": "markers",
+      "in": "panel",
+      "pages": [
+        "x"
+      ]
+    },
+    {
+      "analysis": "markers",
+      "in": "panel",
+      "pages": [
+        "x"
+      ]
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "analysis": {
+        "enum": [
+          "markers",
+          "differential",
+          "dotplot",
+          "signature",
+          "composition",
+          "quick",
+          "detailed",
+          "correlation"
+        ],
+        "type": "string"
+      },
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "pages": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array",
+        "uniqueItems": true
+      }
+    },
+    "required": [
+      "analysis",
+      "pages"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.pages.set",
+  "version": 1
+}

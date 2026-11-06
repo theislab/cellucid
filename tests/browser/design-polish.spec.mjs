@@ -24,7 +24,7 @@
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { dismissWelcome, expectWelcomeShown } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
@@ -336,7 +336,7 @@ test.describe('short screen', () => {
   test('startup notifications never cover the welcome dialog', async ({ page }) => {
     await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
     const modal = page.locator('#welcome-modal');
-    await expect(modal).toBeVisible();
+    await expectWelcomeShown(page);
     await expect(page.locator('#dataset-name')).toHaveText(
       'Current UI fixture',
     );

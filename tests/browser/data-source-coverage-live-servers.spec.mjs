@@ -31,6 +31,7 @@
  * not a stub: every status, header, frame and byte comes from Python,
  * including the authenticated `hello` that a wrong token would close with 4401.
  */
+import { allowOutsideHost } from './helpers/outside-requests.mjs';
 import { expect, test } from './helpers/test.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -222,6 +223,8 @@ test('the sidebar Connect control adopts a real Python server', async ({
 test('a published GitHub catalog renders from a startup intent', async ({
   page,
 }) => {
+  allowOutsideHost('raw.githubusercontent.com');
+  allowOutsideHost('api.github.com');
   test.skip(
     !(await reachable(GITHUB_CATALOG_URL)),
     'raw.githubusercontent.com is not reachable',
@@ -247,6 +250,8 @@ test('a published GitHub catalog renders from a startup intent', async ({
 test('the Open from link control loads a published GitHub repository', async ({
   page,
 }) => {
+  allowOutsideHost('raw.githubusercontent.com');
+  allowOutsideHost('api.github.com');
   test.skip(
     !(await reachable(GITHUB_CATALOG_URL)),
     'raw.githubusercontent.com is not reachable',
@@ -388,5 +393,5 @@ test('a viewer channel that stops is reported, not silently frozen', async ({
   await expect(
     page.locator('#notification-center .notification')
       .filter({ hasText: 'stopped (its server no longer answers)' }),
-  ).toHaveCount(1, { timeout: 45_000 });
+  ).toHaveCount(1);
 });

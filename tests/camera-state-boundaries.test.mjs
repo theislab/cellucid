@@ -12,13 +12,12 @@ const {
   interpolateCameraState,
   resolveSegmentDurations
 } = await import('../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js');
-const {
-  capture: captureCoreState
-} = await import('../assets/js/app/session/contributors/core-state.js');
+const { createCameraDomain } = await import('../assets/js/app/state/domains/camera.js');
+const { createViewsDomain } = await import('../assets/js/app/state/domains/views.js');
 
 const scopedSources = await Promise.all([
-  '../assets/js/app/session/contributors/core-state.js',
-  '../assets/js/app/state-serializer/multiview.js',
+  '../assets/js/app/state/domains/camera.js',
+  '../assets/js/app/state/domains/views.js',
   '../assets/js/app/ui/modules/camera-controls.js',
   '../assets/js/app/ui/modules/view-controls.js',
   '../assets/js/app/ui/modules/cinematic-camera/index.js',
@@ -34,6 +33,14 @@ const scopedSources = await Promise.all([
   relativePath,
   source: await readFile(new URL(relativePath, import.meta.url), 'utf8')
 })));
+const filtersDomainSource = await readFile(
+  new URL('../assets/js/app/state/domains/filters.js', import.meta.url),
+  'utf8'
+);
+const colorsDomainSource = await readFile(
+  new URL('../assets/js/app/state/domains/colors.js', import.meta.url),
+  'utf8'
+);
 
 function cameraState(navigationMode = 'orbit') {
   return {
@@ -53,108 +60,101 @@ function cameraState(navigationMode = 'orbit') {
   };
 }
 
-test('session capture publishes each view\'s camera as the viewer reports it', t => {
-  const previousDocument = globalThis.document;
-  globalThis.document = {
-    getElementById() {
-      return null;
-    }
-  };
-  t.after(() => {
-    if (previousDocument === undefined) delete globalThis.document;
-    else globalThis.document = previousDocument;
-  });
-
+test('the camera and views domains hold each view\'s camera and representation as the viewer reports them', () => {
   const currentCamera = cameraState();
   currentCamera.orbit.radius = 2.43;
   currentCamera.orbit.targetRadius = 2.43;
-  const liveEmbedding = Object.freeze({
+  // The live view shows a 3D representation: columns 0, 2, 1 of an AnnData
+  // obsm array, named by provenance.
+  const provenance = Object.freeze({
     key: 'X_pca',
     columns: Object.freeze([0, 2, 1])
   });
-  const fields = [{
-    key: 'cell_type',
-    kind: 'category',
-    categories: ['A', 'B']
-  }];
-  const state = {
-    activeFieldSource: 'obs',
-    activeFieldIndex: 0,
-    activeVarFieldIndex: -1,
-    viewContexts: new Map(),
-    getFields() {
-      return fields;
-    },
-    getVarFields() {
+  const set = [];
+  const viewer = {
+    getSnapshotViews() {
       return [];
     },
-    async ensureFieldLoaded() {
-      return fields[0];
+    getLiveViewHidden() {
+      return false;
     },
-    setActiveField() {
-      return { field: fields[0], pointCount: 2, centroidInfo: '' };
-    },
-    // The live view shows a 3D representation: columns 0, 2, 1 of an
-    // AnnData obsm array, named by provenance.
-    getViewEmbeddingRef(viewId) {
-      assert.equal(viewId, 'live');
-      return liveEmbedding;
-    },
-    getActiveViewId() {
+    getFocusedViewId() {
       return 'live';
+    },
+    setViewCameraState(viewId) {
+      set.push(['setViewCameraState', viewId]);
+    },
+    setNavigationMode(mode) {
+      set.push(['setNavigationMode', mode]);
+    },
+    setCameraState() {
+      set.push(['setCameraState']);
+    },
+    getViewLayout() {
+      return { mode: 'grid', activeId: 'live', liveViewHidden: false };
+    },
+    getCamerasLocked() {
+      return true;
+    },
+    // The focused live view follows the current camera; the viewer, not the
+    // domain, decides which views do.
+    getViewCameraState(viewId) {
+      assert.equal(viewId, 'live');
+      return currentCamera;
+    },
+    getCentroidFlags(viewId) {
+      assert.equal(viewId, 'live');
+      return { points: true, labels: false };
     }
   };
-  const [chunk] = captureCoreState({
-    state,
-    viewer: {
-      getCamerasLocked() {
-        return true;
-      },
-      getCameraState() {
-        return currentCamera;
-      },
-      getViewLayout() {
-        return {
-          mode: 'grid',
-          activeId: 'live',
-          liveViewHidden: false
-        };
-      },
-      getSnapshotViews() {
-        return [];
-      },
-      // The focused live view follows the current camera; the viewer, not
-      // the session, decides which views do.
-      getViewCameraState(viewId) {
-        assert.equal(viewId, 'live');
-        return structuredClone(currentCamera);
-      },
-      getCentroidFlags(viewId) {
-        assert.equal(viewId, 'live');
-        return { points: true, labels: false };
-      }
+  const state = {
+    viewContexts: new Map(),
+    getActiveViewId() {
+      return 'live';
     },
-    sidebar: {
-      querySelectorAll() {
-        return [];
+    getViewLayoutKey(viewId) {
+      assert.equal(viewId, 'live');
+      return 'X_pca_3d';
+    },
+    dimensionManager: {
+      viewLayouts: new Map([['live', 'X_pca_3d']]),
+      getLayout(layoutKey) {
+        assert.equal(layoutKey, 'X_pca_3d');
+        return { layoutKey, dimension: 3, provenance };
       }
     }
-  });
+  };
 
-  // The focused view's camera is the one its view record holds; the session
-  // stores it once.
-  assert.equal(Object.hasOwn(chunk.payload, 'camera'), false);
-  assert.deepEqual(chunk.payload.multiview.live.cameraState, currentCamera);
-  assert.deepEqual(chunk.payload.multiview.live.centroids, { points: true, labels: false });
+  // Each view's camera is held once, by the camera domain, as a copy of
+  // what the viewer reports.
+  const cameras = createCameraDomain({ viewer, refreshUi() {} }).capture();
+  assert.deepEqual(cameras, { views: [currentCamera] });
+  assert.notStrictEqual(cameras.views[0], currentCamera);
+  assert.throws(
+    () => createCameraDomain({ viewer, refreshUi() {} }).restore({
+      views: [{ ...currentCamera, freefly: { ...currentCamera.freefly, position: [1, 2] } }]
+    }),
+    /Camera to restore for View 1 must contain an exact navigationMode plus complete orbit and freefly state/
+  );
+  assert.deepEqual(set, [], 'an incomplete camera is refused before it is set');
+
   // The live view's geometry is one embedding reference, captured as a plain
-  // JSON copy; its dimension is the reference's and is not stored.
-  assert.equal(Object.hasOwn(chunk.payload, 'liveDimensionLevel'), false);
-  assert.deepEqual(chunk.payload.liveEmbedding, {
-    key: 'X_pca',
-    columns: [0, 2, 1]
+  // JSON copy; its dimension is the reference's and is not stored, and the
+  // views value holds no camera.
+  const views = createViewsDomain({ state, viewer, refreshUi() {} }).capture();
+  assert.deepEqual(views, {
+    layout: 'grid',
+    focus: 0,
+    liveHidden: false,
+    camerasLinked: true,
+    views: [{
+      embedding: { key: 'X_pca', columns: [0, 2, 1] },
+      followsDefault: true,
+      centroids: { points: true, labels: false }
+    }]
   });
-  assert.notStrictEqual(chunk.payload.liveEmbedding, liveEmbedding);
-  assert.equal(Object.isFrozen(chunk.payload.liveEmbedding.columns), false);
+  assert.notStrictEqual(views.views[0].embedding.columns, provenance.columns);
+  assert.equal(Object.isFrozen(views.views[0].embedding.columns), false);
 });
 
 test('the current camera-state contract requires both synchronized representations', () => {
@@ -249,7 +249,7 @@ test('camera-path math never invents missing camera coordinates', () => {
   assert.doesNotMatch(cameraPathUi, /positionMethod:\s*dom\.[^\n]*(?:\|\||\?\?)/);
   assert.doesNotMatch(cameraPathUi, /rotationMethod:\s*dom\.[^\n]*(?:\|\||\?\?)/);
   assert.doesNotMatch(cameraPathUi, /easing:\s*dom\.[^\n]*(?:\|\||\?\?)/);
-  assert.match(cameraPathUi, /assertCameraPathSessionState\(data\)/);
+  assert.match(cameraPathUi, /assertCameraPathState\(data\)/);
 });
 
 test('camera-path interpolation rejects incomplete state and unsupported settings', () => {
@@ -447,27 +447,33 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
   );
 });
 
-test('session, snapshot, and figure-export boundaries assert exact camera state', () => {
+test('state-domain, snapshot, and figure-export boundaries assert exact camera state', () => {
   const byPath = new Map(scopedSources.map(({ relativePath, source }) => [relativePath, source]));
-  const coreStateSource = byPath.get(
-    '../assets/js/app/session/contributors/core-state.js'
+  const cameraDomainSource = byPath.get('../assets/js/app/state/domains/camera.js');
+  // Every view's camera, captured and restored (a history step, a session
+  // load), is checked whole.
+  assert.match(
+    cameraDomainSource,
+    /cloneCameraState\(viewer\.getViewCameraState\(id\), `Camera of view "\$\{id\}"`\)/
   );
   assert.match(
-    coreStateSource,
-    /assertCameraState\([\s\S]*?focusedCameraState\(sessionState\.multiview\)/
+    cameraDomainSource,
+    /cloneCameraState\(value\.views\[index\], `Camera to restore for \$\{viewNameInValue\(index, liveHidden\)\}`\)/
   );
-  assert.doesNotMatch(
-    coreStateSource,
-    /_pushOutliersToViewer|_pushOutlierThresholdToViewer/,
-    'session restore must use the current visibility/transparency owner'
+  for (const [label, source] of [['filters', filtersDomainSource], ['colors', colorsDomainSource]]) {
+    assert.doesNotMatch(
+      source,
+      /_pushOutliersToViewer|_pushOutlierThresholdToViewer/,
+      `a ${label} restore must use the current visibility/transparency owner`
+    );
+  }
+  assert.match(
+    filtersDomainSource,
+    /state\.endBatch\(\);\s*\}\s*state\.computeGlobalVisibility\(\);/
   );
   assert.match(
-    coreStateSource,
-    /state\.computeGlobalVisibility\(\);\s*state\._pushColorsToViewer\(\);/
-  );
-  assert.match(
-    byPath.get('../assets/js/app/state-serializer/multiview.js'),
-    /assertCameraState\(multiview\.live\.cameraState/
+    colorsDomainSource,
+    /state\.updateColorsContinuous\(active\);\s*state\._pushColorsToViewer\(\);/
   );
   assert.match(
     byPath.get('../assets/js/app/ui/modules/figure-export/figure-export-engine.js'),

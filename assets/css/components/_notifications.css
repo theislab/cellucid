@@ -2,11 +2,12 @@
    Notification Center - Centralized status & progress system
    ===================================================================== */
 
-/* Notifications share the bottom edge with the selection bar and stack above
-   it while it is shown (select-bar-placement.js publishes its height). */
+/* Notifications share the bottom edge with the selection bar and the agents'
+   dock and stack above whichever stands higher (select-bar-placement.js and
+   app/agent/dock.js publish their heights). */
 .notification-center {
   position: fixed;
-  bottom: calc(var(--space-4) + var(--select-bar-block-size, 0px));
+  bottom: calc(var(--space-4) + max(var(--select-bar-block-size, 0px), var(--agent-dock-block-size, 0px)));
   right: var(--space-4);
   z-index: var(--z-notification);
   display: flex;
@@ -150,6 +151,14 @@
   align-self: flex-start;
 }
 
+/* An action with the other choice beside it ("Continue", "Start fresh"), on one row. */
+.notification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  align-self: flex-start;
+}
+
 /* Type-specific styles - newspaper-inspired visual distinction */
 /* Uses ink weight variations instead of colors */
 .notification-success {
@@ -276,6 +285,13 @@
 
 /* Responsive adjustments */
 @media (max-width: 480px) {
+  /* A phone's community annotation dialog fills the screen and keeps its
+     form at the bottom, where the cards stack: they wait beneath it and are
+     seen once it closes (they were announced when they arrived). */
+  body:has(.community-annotation-modal-overlay) .notification-center {
+    z-index: calc(var(--z-modal) - 1);
+  }
+
   .notification-center {
     left: var(--space-2);
     right: var(--space-2);

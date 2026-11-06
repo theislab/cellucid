@@ -70,7 +70,7 @@ test('an expanded analysis view settles centred with its resizer corner on the c
       .filter(animation => animation.transitionProperty === 'transform')
       .map(animation => animation.playState);
     // Transition events are dispatched with the next animation frames.
-    for (let frame = 0; frame < 600 && !started.includes('transform'); frame++) {
+    while (!started.includes('transform')) {
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
     return { running, started };

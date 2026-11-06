@@ -13,16 +13,20 @@
  * @module analysis/ui/components/control-accessibility
  */
 
+import { createDomId } from '../../../ui/components/dom-id.js';
+
 /** Selector for elements that can be the target of a `<label for>`. */
 const LABELLABLE = 'input, select, textarea, meter, output, progress';
-
-let controlScopeCounter = 0;
 
 /**
  * Create an id scope that is unique for the lifetime of the document.
  *
  * Every analysis UI instance owns one scope, so the sidebar copy and each
  * floating copy of the same analysis mode generate distinct element ids.
+ *
+ * Minted by the page's one id generator (`ui/components/dom-id.js`), so the
+ * ids made from it are known as this page's own (`isGeneratedDomId` of the
+ * scope): nothing saved or walked names them.
  *
  * @param {string} name - Human-meaningful prefix, e.g. an analysis mode id.
  * @returns {string} A unique id prefix.
@@ -31,8 +35,7 @@ export function createControlScope(name) {
   if (typeof name !== 'string' || name.length === 0 || name.trim() !== name) {
     throw new TypeError('Control scope name must be exact non-empty text');
   }
-  controlScopeCounter += 1;
-  return `${name}-${controlScopeCounter}`;
+  return createDomId(name);
 }
 
 /**

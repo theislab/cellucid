@@ -74,11 +74,9 @@ test('switching between two layouts of one dimension rebuilds the view geometry'
     // of it has been drawn; a count of frames is no proof of that where a
     // tree takes longer to land than the frames do.
     const rest = async () => {
-      for (let frame = 0; frame < 1800; frame++) {
-        if (viewer.getFrameScheduleState().settled && viewer.isPresentedGeometrySettled()) return;
+      while (!(viewer.getFrameScheduleState().settled && viewer.isPresentedGeometrySettled())) {
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
-      throw new Error(`The views never came to rest: ${JSON.stringify(viewer.getFrameScheduleState())}`);
     };
     const snapshotId = viewer.getSnapshotViews()[0].id;
     const dimension = state.getViewDimensionLevel(snapshotId);

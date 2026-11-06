@@ -2,8 +2,10 @@
  * User-created fields are the one thing in Cellucid that cannot be regenerated
  * from an export. A category the user renamed, a column the user built from
  * highlight pages, a field the user soft-deleted — the app is the only record
- * of all three, and a session bundle is the only way any of it survives a
- * reload. These tests hold the three invariants that make that record truthful.
+ * of all three, and its history (the `field-overlays` state domain,
+ * `app/state/domains/field-overlays.js`, saved in a session file) is the only
+ * way any of it survives a reload. These tests hold the three invariants that
+ * make that record truthful.
  *
  * 1. A rename follows the thing it was applied to. A category's identity is its
  *    label, not its position in the inventory, so a rename recorded against
@@ -20,8 +22,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import * as fieldOverlays from
-  '../assets/js/app/session/contributors/field-overlays.js';
+import {
+  captureFieldOverlays,
+  createFieldOverlaysDomain
+} from '../assets/js/app/state/domains/field-overlays.js';
 import { DeleteRegistry } from '../assets/js/app/registries/delete-registry.js';
 import { RenameRegistry } from '../assets/js/app/registries/rename-registry.js';
 import {
@@ -103,6 +107,7 @@ function makeState({ pointCount = POINTS, obsFields = [] } = {}) {
   state.getDatasetGeneration = () => 0;
 
   state._syncActiveContext = () => {};
+  state.getActiveViewId = viewContextCoreMethods.getActiveViewId;
   state._propagateRenameToViewContexts =
     viewContextCoreMethods._propagateRenameToViewContexts;
   state._refreshInactiveViewLabels = viewContextCoreMethods._refreshInactiveViewLabels;
@@ -152,7 +157,20 @@ function makeState({ pointCount = POINTS, obsFields = [] } = {}) {
 // 1. A category rename names a category, not a position
 // ---------------------------------------------------------------------------
 
-test('a category rename survives the same dataset exported with one more category', () => {
+/** The views a state domain covers: the live view alone. */
+const ONE_VIEW = Object.freeze({ getSnapshotViews: () => [] });
+
+/**
+ * The field overlays of `source`, as the `field-overlays` state domain holds
+ * them, put back on `target` (a copy, as the history or a session file gives
+ * it back).
+ */
+async function carryFieldOverlays(source, target) {
+  const value = structuredClone(captureFieldOverlays(source));
+  await createFieldOverlaysDomain({ state: target, viewer: ONE_VIEW, refreshUi: () => {} }).restore(value);
+}
+
+test('a category rename survives the same dataset exported with one more category', async () => {
   // Saved against [B, Mono, NK, T]: the third entry, NK, becomes "Natural killer".
   const source = makeState({
     obsFields: [categoricalField('cell_type', ['B', 'Mono', 'NK', 'T'], POINTS)]
@@ -163,18 +181,17 @@ test('a category rename survives the same dataset exported with one more categor
     ['B', 'Mono', 'Natural killer', 'T']
   );
 
-  const payload = fieldOverlays.capture({ state: source })[0].payload;
 
   // The dataset is exported again from the same embedding with one more cell
   // type, which sorts in ahead of NK. Positions, cell count, and var count are
   // unchanged, so the session's dataset fingerprint still matches and the
-  // bundle restores.
+  // session restores.
   const restored = makeState({
     obsFields: [
       categoricalField('cell_type', ['B', 'DC', 'Mono', 'NK', 'T'], POINTS)
     ]
   });
-  fieldOverlays.restore({ state: restored }, null, structuredClone(payload));
+  await carryFieldOverlays(source, restored);
 
   assert.deepEqual(
     restored.obsData.fields[0].categories,
@@ -183,17 +200,16 @@ test('a category rename survives the same dataset exported with one more categor
   );
 });
 
-test('a category rename is dropped, never transplanted, when its category is gone', () => {
+test('a category rename is dropped, never transplanted, when its category is gone', async () => {
   const source = makeState({
     obsFields: [categoricalField('cell_type', ['B', 'Mono', 'NK', 'T'], POINTS)]
   });
   source.renameCategory('obs', 0, 2, 'Natural killer');
-  const payload = fieldOverlays.capture({ state: source })[0].payload;
 
   const restored = makeState({
     obsFields: [categoricalField('cell_type', ['B', 'Mono', 'T'], POINTS)]
   });
-  fieldOverlays.restore({ state: restored }, null, structuredClone(payload));
+  await carryFieldOverlays(source, restored);
 
   assert.deepEqual(
     restored.obsData.fields[0].categories,
@@ -202,18 +218,17 @@ test('a category rename is dropped, never transplanted, when its category is gon
   );
 });
 
-test('a category rename round-trips through a session unchanged', () => {
+test('a category rename round-trips through a session unchanged', async () => {
   const source = makeState({
     obsFields: [categoricalField('cell_type', ['B', 'Mono', 'NK'], POINTS)]
   });
   source.renameField('obs', 0, 'Cell type');
   source.renameCategory('obs', 0, 1, 'Monocyte');
-  const payload = fieldOverlays.capture({ state: source })[0].payload;
 
   const restored = makeState({
     obsFields: [categoricalField('cell_type', ['B', 'Mono', 'NK'], POINTS)]
   });
-  fieldOverlays.restore({ state: restored }, null, structuredClone(payload));
+  await carryFieldOverlays(source, restored);
 
   assert.equal(restored.obsData.fields[0].key, 'Cell type');
   assert.deepEqual(
@@ -449,51 +464,6 @@ test('renaming a user-defined field or label never walks the cell axis', async (
     field.codes,
     realCodes,
     'a rename must not rebuild the codes array'
-  );
-});
-
-test('a restored field can be renamed while its codes chunk is still in flight', () => {
-  // A session restores field definitions eagerly and the codes arrays lazily,
-  // so a user-defined column appears in the field list with `codes === null`
-  // for as long as its chunk takes to arrive. Renaming it in that window is an
-  // ordinary thing to do and used to throw.
-  const registry = new UserDefinedFieldsRegistry();
-  registry.fromSessionMeta([{
-    id: 'user_cat_1',
-    source: 'obs',
-    kind: 'category',
-    key: 'My cats',
-    categories: ['a', 'b', 'c'],
-    isDeleted: false,
-    isPurged: false,
-    codesLength: 500_000,
-    codesType: 'Uint8Array',
-    centroidsByDim: {},
-    normalizedDims: [],
-    sourceField: null,
-    operation: null,
-    sourcePages: [],
-    overlapStrategy: 'first',
-    overlapLabel: null,
-    intersectionLabels: null,
-    uncoveredLabel: null,
-    createdAt: 1
-  }]);
-  const field = registry.getField('user_cat_1');
-  assert.equal(field.codes, null);
-  assert.equal(field.loaded, false);
-
-  assert.equal(registry.updateField('user_cat_1', { key: 'Renamed' }), true);
-  assert.equal(field.key, 'Renamed');
-  assert.equal(
-    registry.updateField('user_cat_1', { categories: ['a', 'B', 'c'] }),
-    true
-  );
-  assert.deepEqual(field.categories, ['a', 'B', 'c']);
-  assert.equal(
-    field.codes,
-    null,
-    'the rename must not invent a codes array the chunk has yet to deliver'
   );
 });
 

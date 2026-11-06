@@ -534,9 +534,6 @@ function makeSidebar(dom) {
         return controls.filter(control => control.tagName === 'SELECT');
       }
       if (selector === 'details.accordion-section') return [];
-      // This fixture is the renderer accordion, which holds no pressed-button
-      // group. Reporting none is faithful, not a simplification.
-      if (selector === '[data-state-serializer-pressed-group]') return [];
       throw new Error(`Unexpected sidebar selector ${selector}`);
     },
   };

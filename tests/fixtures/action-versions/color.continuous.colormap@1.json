@@ -1,0 +1,93 @@
+{
+  "examples": [
+    {
+      "colormap": "viridis",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "colormap": {
+        "enum": [
+          "viridis",
+          "plasma",
+          "inferno",
+          "magma",
+          "cividis",
+          "turbo",
+          "twilight",
+          "coolwarm",
+          "bluered",
+          "spectral",
+          "rdylbu",
+          "rdbu",
+          "piyg",
+          "prgn",
+          "brbg",
+          "seismic",
+          "ylgnbu",
+          "ylorrd",
+          "ylorbr",
+          "gnbu",
+          "bupu",
+          "rdpu",
+          "purd",
+          "orrd",
+          "blues",
+          "greens",
+          "reds",
+          "purples",
+          "oranges",
+          "greys",
+          "heat",
+          "hot",
+          "cool",
+          "jet",
+          "rainbow",
+          "ocean",
+          "terrain",
+          "spring",
+          "summer",
+          "autumn",
+          "winter",
+          "bone",
+          "copper",
+          "pink"
+        ],
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "obs",
+              "var"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "field",
+      "colormap"
+    ],
+    "type": "object"
+  },
+  "type": "color.continuous.colormap",
+  "version": 1
+}

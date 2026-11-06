@@ -158,12 +158,13 @@ test('the structured data describes the web app truthfully', () => {
   assert.equal('citation' in JSON_LD, false);
 });
 
-test('the Content-Security-Policy allows exactly the import map, the boot script and the JSON-LD block', () => {
+test('the Content-Security-Policy allows exactly the import map, the boot script, the JSON-LD block and the style gate', () => {
   const policy = only(/<meta http-equiv="Content-Security-Policy" content="([\s\S]*?)" \/>/g, INDEX, 'CSP');
   const hashes = [...policy.matchAll(/'sha256-([A-Za-z0-9+/=]+)'/g)].map(match => match[1]);
   const importMap = only(/^[ \t]*<script type="importmap">([\s\S]*?)<\/script>/gm, INDEX, 'import map');
   const boot = only(/^[ \t]*<script id="cellucid-page-boot">([\s\S]*?)<\/script>/gm, INDEX, 'boot script');
-  const expected = [importMap, boot, JSON_LD_TEXT].map(text => createHash('sha256').update(text, 'utf8').digest('base64'));
+  const styleGate = only(/^[ \t]*<script id="cellucid-style-gate">([\s\S]*?)<\/script>/gm, INDEX, 'style gate');
+  const expected = [importMap, boot, JSON_LD_TEXT, styleGate].map(text => createHash('sha256').update(text, 'utf8').digest('base64'));
   assert.deepEqual(
     hashes,
     expected,
@@ -229,9 +230,11 @@ test('crawlable text says what Cellucid is and links out without taking Tab stop
 test('the home page links its privacy policy, terms and accessibility statement', async () => {
   // Quiet footer links: Privacy (which Google's brand verification asks the
   // home page for) and Terms beside Docs, Cite and GitHub, Accessibility beside
-  // the licence; a new tab keeps the app's state.
+  // the licence, Contact (the project's address) beside who made it; a new tab
+  // keeps the app's state. Each line fits the narrowest sidebar (260px).
   const footer = only(/<div id="copyright">([\s\S]*?)<\/div>/g, INDEX, 'footer');
   assert.match(footer, /GitHub<\/a> · <a href="privacy\.html" target="_blank" rel="noopener">Privacy<\/a> · <a href="terms\.html" target="_blank" rel="noopener">Terms<\/a><\/p>/);
+  assert.match(footer, /Theis Lab<\/a> · <a href="mailto:hello@cellucid\.com">Contact<\/a><\/p>/);
   assert.match(footer, /<p><a href="#" id="license-link">BSD 3-Clause license<\/a> · <a href="accessibility\.html" target="_blank" rel="noopener">Accessibility<\/a><\/p>/);
   for (const name of READING_PAGES) {
     const page = await read(name);

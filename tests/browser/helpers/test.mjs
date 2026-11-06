@@ -7,6 +7,8 @@ import {
 
 import { installDevice } from './device.mjs';
 import { setAsideLeavingReports } from './leaving-document.mjs';
+import { expectNoOutsideRequests, watchOutsideRequests } from './outside-requests.mjs';
+import { expectNoSplitClicks, forgetSplitClicks, watchSplitClicks } from './split-clicks.mjs';
 
 export async function retirePageApplication(page) {
   if (page.isClosed()) return;
@@ -159,6 +161,24 @@ async function clearOriginStorage(context, origin) {
 }
 
 /**
+ * `CELLUCID_BROWSER_TEST_CPU_THROTTLE=<rate>` slows the main thread of every
+ * page by that factor (Chromium only: the DevTools protocol's CPU
+ * throttling), so a developer machine orders work as a slow hosted runner
+ * does: what a spec read "right after" an action is then not there yet. It
+ * slows a page's own thread, not its workers or the GPU. Unset in CI.
+ */
+const CPU_THROTTLE = Number(process.env.CELLUCID_BROWSER_TEST_CPU_THROTTLE ?? 0);
+
+function throttleCpu(context, browserName) {
+  if (!(CPU_THROTTLE > 1) || browserName !== 'chromium') return;
+  const throttle = async page => {
+    const session = await context.newCDPSession(page);
+    await session.send('Emulation.setCPUThrottlingRate', { rate: CPU_THROTTLE });
+  };
+  context.on('page', page => { throttle(page).catch(() => {}); });
+}
+
+/**
  * `CELLUCID_FIGURE_EXPORT_POINT_PASS=page` runs every figure export's point
  * passes on the page, as on a browser whose workers have no WebGL2
  * (WebKitGTK, WPE): the run exercises that placement in any engine.
@@ -187,25 +207,35 @@ export const test = playwrightTest.extend({
   // A context a spec opens itself (`browser.newContext`) runs on the same
   // device as the test's own, or on the one it names:
   // `browser.newContext({ device: { openingMsPerCell: 2 } })`.
-  deviceForNewContexts: [async ({ browser, device }, use) => {
+  deviceForNewContexts: [async ({ browser, browserName, device }, use) => {
     const newContext = browser.newContext;
     browser.newContext = async function newContextOnDevice({ device: own, ...options } = {}) {
       const context = await newContext.call(this, options);
       await installDevice(context, own ?? device);
       setAsideLeavingReports(context);
+      watchOutsideRequests(context);
+      await watchSplitClicks(context);
+      throttleCpu(context, browserName);
       return context;
     };
+    // Every context of the test is watched for clicks a layout change split
+    // (`split-clicks.mjs`); the test that had one fails here, naming it.
+    forgetSplitClicks();
     try {
       await use();
     } finally {
       browser.newContext = newContext;
     }
+    expectNoSplitClicks();
   }, { auto: true }],
   context: async ({ context, browserName, persistentStorage, device, playwright }, use, testInfo) => {
     if (!persistentStorage || browserName !== 'webkit') {
       await installDevice(context, device);
       setAsideLeavingReports(context);
+      watchOutsideRequests(context);
+      await watchSplitClicks(context);
       await use(context);
+      await expectNoOutsideRequests();
       return;
     }
     const { viewport, userAgent, deviceScaleFactor, isMobile, hasTouch, baseURL, headless, locale } = testInfo.project.use;
@@ -224,7 +254,11 @@ export const test = playwrightTest.extend({
       await clearOriginStorage(persistent, baseURL);
       await installDevice(persistent, device);
       setAsideLeavingReports(persistent);
+      watchOutsideRequests(persistent);
+      await watchSplitClicks(persistent);
+      throttleCpu(persistent, browserName);
       await use(persistent);
+      await expectNoOutsideRequests();
     } finally {
       await clearOriginStorage(persistent, baseURL).catch(() => {});
       await persistent.close();
@@ -251,6 +285,8 @@ export const test = playwrightTest.extend({
     }
     try {
       await use(page);
+      // Before the application retires, which stops what it still asks.
+      await expectNoOutsideRequests();
     } finally {
       // A failed test names the startup phase each page stopped in, so a
       // stalled bootstrap reports where it waited instead of only that the

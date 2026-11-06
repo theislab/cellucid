@@ -1,0 +1,297 @@
+{
+  "examples": [
+    {
+      "embeddings": {
+        "defaults": {
+          "1d": {
+            "columns": [
+              0
+            ],
+            "key": "x"
+          },
+          "2d": {
+            "columns": [
+              0
+            ],
+            "key": "x"
+          },
+          "3d": {
+            "columns": [
+              0
+            ],
+            "key": "x"
+          }
+        },
+        "enabled": [
+          {
+            "columns": [
+              0
+            ],
+            "key": "x"
+          }
+        ]
+      },
+      "expression": "x",
+      "gene_names": "x",
+      "highly_variable": "x",
+      "knn": "x",
+      "latent": "x",
+      "log1p": [
+        {
+          "base": 0,
+          "matrix": "x"
+        }
+      ],
+      "modality": "x",
+      "vector_fields": [
+        {
+          "embedding": {
+            "columns": [
+              0
+            ],
+            "key": "x"
+          },
+          "key": "x"
+        }
+      ]
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "embeddings": {
+        "additionalProperties": false,
+        "properties": {
+          "defaults": {
+            "additionalProperties": false,
+            "properties": {
+              "1d": {
+                "additionalProperties": false,
+                "properties": {
+                  "columns": {
+                    "items": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  },
+                  "key": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key",
+                  "columns"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "2d": {
+                "additionalProperties": false,
+                "properties": {
+                  "columns": {
+                    "items": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  },
+                  "key": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key",
+                  "columns"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "3d": {
+                "additionalProperties": false,
+                "properties": {
+                  "columns": {
+                    "items": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  },
+                  "key": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key",
+                  "columns"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "1d",
+              "2d",
+              "3d"
+            ],
+            "type": "object"
+          },
+          "enabled": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "columns": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "key": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "columns"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "defaults"
+        ],
+        "type": "object"
+      },
+      "expression": {
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "gene_names": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "highly_variable": {
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "knn": {
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "latent": {
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "log1p": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "base": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "matrix": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "matrix",
+            "base"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "modality": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "vector_fields": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "embedding": {
+              "additionalProperties": false,
+              "properties": {
+                "columns": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "key": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "columns"
+              ],
+              "type": "object"
+            },
+            "key": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "key",
+            "embedding"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      }
+    },
+    "type": "object"
+  },
+  "type": "mapping.set",
+  "version": 1
+}

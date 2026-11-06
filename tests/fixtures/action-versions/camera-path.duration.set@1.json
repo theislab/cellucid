@@ -1,0 +1,31 @@
+{
+  "examples": [
+    {
+      "keyframe": "x",
+      "seconds": 0.1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "keyframe": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "seconds": {
+        "minimum": 0.1,
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "seconds"
+    ],
+    "type": "object"
+  },
+  "type": "camera-path.duration.set",
+  "version": 1
+}

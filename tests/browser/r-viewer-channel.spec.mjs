@@ -7,8 +7,8 @@
  *   priority order, whose X R makes gene by gene from the object's genes x
  *   cells matrix -- and a gene read through the app's data layer holds
  *   exactly the values R holds, cell by original position.
- * - On the viewer channel, R's highlight and visibility commands arrive as
- *   binary frames, the cells R named, ascending; a selection the page makes
+ * - On the viewer channel, R's highlight and visibility actions arrive as
+ *   binary frames, the cells R named, 0-based, in its order; a selection the page makes
  *   reaches R whole; stopping the viewer ends the page's channel.
  *
  * Needs CELLUCID_RSCRIPT set to an Rscript whose library (R_LIBS) has
@@ -50,9 +50,9 @@ v <- cellucid_serve(sce, dataset_id = "r-channel", dataset_name = "R channel", s
 say(list(url = v$url, viewerId = v$viewer_id, viewerToken = v$viewer_token, cells = n_cells,
          gene = rownames(counts)[[gene]], values = I(as.numeric(counts[gene, ]))))
 wait_turn()
-cellucid_highlight(v, c(9L, 2L, 5L, 5L), color = "#00ff7f")
-cellucid_set_visibility(v, c(3, 1), visible = FALSE)
-cellucid_set_visibility(v, NULL, visible = TRUE)
+cellucid_highlight_cells(v, cells = c(9L, 2L, 5L), color = "#00ff7f")
+cellucid_cells_visibility_set(v, cells = c(3, 1), visible = FALSE)
+cellucid_cells_visibility_set(v, cells = NULL, visible = TRUE)
 ready <- cellucid_wait_ready(v, timeout = 60)
 say(list(ready = ready))
 deadline <- proc.time()[["elapsed"]] + 60
@@ -135,16 +135,19 @@ test('the R viewer serves its object uncompressed and talks binary frames on the
         viewerToken: config.viewerToken,
       });
       window.__channel = { source, commands: [], highlights: [], ends: [] };
-      source.onHighlight((cells, color) => {
-        window.__channel.highlights.push(cells === null ? 'clear' : {
-          typed: cells instanceof Uint32Array, cells: Array.from(cells), color,
-        });
+      source.onAction(async ({ action, params }) => {
+        if (action === 'highlight.cells') {
+          window.__channel.highlights.push({
+            typed: params.cells instanceof Uint32Array, cells: Array.from(params.cells), color: params.color,
+          });
+        } else {
+          window.__channel.commands.push(action === 'cells.visibility.set'
+            ? `visibility:${params.visible}:${params.cells === null ? 'all' : Array.from(params.cells).join(',')}`
+            : action);
+        }
+        return { outcome: null, step: null };
       });
-      source.onMessage(message => {
-        window.__channel.commands.push(message.type === 'setVisibility'
-          ? `setVisibility:${message.visible}:${message.cells === null ? 'all' : Array.from(message.cells).join(',')}`
-          : message.type);
-      });
+      source.onMessage(message => window.__channel.commands.push(message.type));
       source.onChannelEnd(end => window.__channel.ends.push(end.kind));
       if (!(await source.initialize())) throw new Error('the channel did not open');
       // Every cell open: the channel names cells by their original positions.
@@ -156,10 +159,10 @@ test('the R viewer serves its object uncompressed and talks binary frames on the
       source.acceptCommands();
     }, config);
     giveTurn();
-    await expect.poll(() => page.evaluate(() => window.__channel.highlights), { timeout: 30_000 })
-      .toEqual([{ typed: true, cells: [1, 4, 8], color: '#00ff7f' }]);
-    await expect.poll(() => page.evaluate(() => window.__channel.commands), { timeout: 30_000 })
-      .toEqual(['setVisibility:false:0,2', 'setVisibility:true:all']);
+    await expect.poll(() => page.evaluate(() => window.__channel.highlights))
+      .toEqual([{ typed: true, cells: [8, 1, 4], color: '#00ff7f' }]);
+    await expect.poll(() => page.evaluate(() => window.__channel.commands))
+      .toEqual(['visibility:false:2,0', 'visibility:true:all']);
     await page.evaluate(async cells => {
       await window.__channel.source.notifyReady({ dimensions: 2 });
       const selected = new Uint32Array(5000);
@@ -171,7 +174,7 @@ test('the R viewer serves its object uncompressed and talks binary frames on the
 
     giveTurn();
     expect(await next()).toEqual({ stopped: true });
-    await expect.poll(() => page.evaluate(() => window.__channel.ends), { timeout: 30_000 }).toEqual(['stopped']);
+    await expect.poll(() => page.evaluate(() => window.__channel.ends)).toEqual(['stopped']);
   } finally {
     if (child.exitCode === null) {
       const exited = new Promise(resolve => child.once('exit', resolve));

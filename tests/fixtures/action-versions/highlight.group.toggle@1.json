@@ -1,0 +1,34 @@
+{
+  "examples": [
+    {
+      "enabled": false,
+      "group": "x",
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean"
+      },
+      "group": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "group",
+      "enabled"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.group.toggle",
+  "version": 1
+}

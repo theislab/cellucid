@@ -4,6 +4,8 @@
  * kept views share them until one changes them, and each array (and each
  * category list) is checked once, not on every action.
  */
+import { blocksRun } from './helpers/block-counts.mjs';
+
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -61,26 +63,22 @@ test('a kept view shares its source\'s category arrays until either changes one,
   assert.deepEqual(Array.from(carried.colors.subarray(3, 6)), [0, 255, 0]);
 });
 
-test('a field of a million categories is checked once: a later colouring, a view and a toggle cost no pass over its categories', () => {
+test('a field of a million categories is checked once: a later colouring, a view and a toggle cost no pass over its categories', async () => {
   const color = Object.create(DataStateColorMethods.prototype);
   const field = categoryField(1_000_000);
   color.ensureCategoryMetadata(field);
   assert.equal(field._categoryColors.byteLength + field._categoryVisible.byteLength, 4_000_000);
-  const time = fn => {
-    const start = performance.now();
-    fn();
-    return performance.now() - start;
-  };
-  const later = time(() => color.ensureCategoryMetadata(field));
-  const views = time(() => {
+  // Blocks of the app's code that ran (`helpers/block-counts.mjs`): a pass over a million categories runs a million.
+  const APP = '/assets/js/';
+  const later = await blocksRun(APP, () => color.ensureCategoryMetadata(field));
+  const views = await blocksRun(APP, () => {
     for (let view = 0; view < 8; view++) viewContextCoreMethods._cloneFieldState.call({ _fieldCountMemo: null }, field);
   });
   withCategoryVisibility(field, 7, false);
-  const afterToggle = time(() => color.ensureCategoryMetadata(field));
-  // A pass over a million categories takes tens of milliseconds; these take none.
-  assert.ok(later < 5, `a later check took ${later} ms`);
-  assert.ok(views < 5, `eight views took ${views} ms`);
-  assert.ok(afterToggle < 5, `a check after a toggle took ${afterToggle} ms`);
+  const afterToggle = await blocksRun(APP, () => color.ensureCategoryMetadata(field));
+  assert.ok(later < 1000, `a later check ran ${later} blocks`);
+  assert.ok(views < 1000, `eight views ran ${views} blocks`);
+  assert.ok(afterToggle < 1000, `a check after a toggle ran ${afterToggle} blocks`);
 });
 
 test('a category list renamed in place is checked again; a wrong state is refused, never half repaired', () => {

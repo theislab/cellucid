@@ -3,15 +3,15 @@
  *
  * These validators accept JSON values without rewriting them. Callers must
  * validate before publishing, caching, or mutating session state.
+ *
+ * The repository template, theislab/cellucid-annotation, states the same
+ * contract as JSON Schemas (`annotations/schema.json`,
+ * `annotations/config.schema.json`, `annotations/moderation/merges.schema.json`)
+ * and a Python validator (`scripts/validate_user_files.py`). One accept/reject
+ * corpus, generated there by `scripts/generate_contract_corpus.py` and copied
+ * byte for byte to `tests/fixtures/community-annotation-contract-corpus.json`,
+ * holds this module and that validator to the same verdict on every case.
  */
-
-import { isExactOrcidId } from './profile-identifiers.js';
-
-export const ANNOTATION_CONTRACT_IDS = Object.freeze({
-  user: 'https://cellucid.com/contracts/community-annotation/user-v2.schema.json',
-  config: 'https://cellucid.com/contracts/community-annotation/config-v1.schema.json',
-  merges: 'https://cellucid.com/contracts/community-annotation/merges-v2.schema.json',
-});
 
 /*
  * Files and dataset views.
@@ -20,55 +20,141 @@ export const ANNOTATION_CONTRACT_IDS = Object.freeze({
  * field and a category label ("leiden" / "0"), so everything a contributor
  * writes is kept per dataset:
  *
- * - a user file (version 2) holds the profile once and, under
+ * - a user file (version 3) holds the profile once and, under
  *   `datasets[<datasetId>]`, that dataset's access record, suggestions, votes,
  *   comments and deletion markers;
- * - the merges file (version 2) names the dataset of every merge.
+ * - the merges file (version 3) names the dataset of every merge;
+ * - the configuration file (version 1) lists the supported datasets.
  *
  * The app works on one dataset at a time, so `github-sync.js` projects each
  * file onto the open dataset (a *dataset view*: the shape `assertUserDocument`
- * and `assertMergesDocument` validate) when it pulls, and composes the file
- * back from the view when it publishes, replacing only that dataset's part
- * and keeping every other dataset's part byte for byte. Nothing else in the
- * app reads or writes the file shapes.
+ * and `assertMergesDocument` validate, version 1 of its own) when it pulls,
+ * and composes the file back from the view when it publishes, replacing only
+ * that dataset's part and keeping every other dataset's part byte for byte.
+ * A projection reads only the open dataset's part: another dataset's section
+ * is not this dataset's business, so it can never make a file fail here.
+ * Nothing else in the app reads or writes the file shapes.
+ *
+ * Suggestion identifiers (user file and merges version 3).
+ *
+ * Every suggestion id is `<owner>_<rest>`: `<owner>` is the proposer's
+ * `ghid_<n>` and `<rest>` is exact nonblank text without `:` (the app writes
+ * `${ghid}_${crypto.randomUUID()}`). A suggestion's id starts with its own
+ * `proposedBy` and `_`, and the digits of `ghid_<n>` end at that `_`, so
+ * `ghid_1_` never prefixes `ghid_12_...`: no contributor can write an id that
+ * collides with, or claims to be, another contributor's suggestion. Votes,
+ * comments and merges may name anyone's suggestion; deletion markers name
+ * only the file owner's.
  */
 
-// GitHub's repository Contents API supports its complete JSON/base64 contract
-// only for files whose decoded content is at most 1 MB. Keep this as one shared
-// browser/Worker boundary so publication and remote reconciliation cannot drift.
-export const ANNOTATION_FILE_MAX_UTF8_BYTES = 1_000_000;
+export const ANNOTATION_USER_FILE_VERSION = 3;
+export const ANNOTATION_MERGES_FILE_VERSION = 3;
+const ANNOTATION_CONFIG_FILE_VERSION = 1;
+const DATASET_VIEW_VERSION = 1;
 
 /**
- * Lengths of the text a contributor types, as the annotation schema states
- * them. Counts (datasets, fields, suggestions, votes, comments, merges) and the
- * keys the exporters write (field keys, `field:category` buckets) have no
- * limit of their own: the 1,000,000-byte file is the only bound on how much
- * one contributor file holds.
+ * Git blob object ids (the SHA-1 of `blob <byte length>\0<bytes>`) of the
+ * canonical schema files of theislab/cellucid-annotation:
+ * `annotations/schema.json` (user), `annotations/config.schema.json` (config)
+ * and `annotations/moderation/merges.schema.json` (merges). A repository is
+ * accepted only when those paths hold exactly these blobs. Its Git tree names
+ * their ids, so nothing is downloaded to check them; the shared corpus carries
+ * the schema texts and the web suite recomputes these ids from them.
  */
-export const ANNOTATION_LIMITS = Object.freeze({
-  githubUserId: Number.MAX_SAFE_INTEGER,
-  username: 64,
-  login: 64,
-  displayName: 120,
-  title: 120,
-  orcid: 64,
-  linkedin: 120,
-  datasetId: 256,
-  datasetName: 120,
-  suggestionId: 128,
-  label: 120,
-  ontologyId: 64,
-  evidence: 2000,
-  markerGene: 64,
-  commentId: 128,
-  commentText: 500,
-  mergeNote: 512,
+export const ANNOTATION_SCHEMA_BLOB_OIDS = Object.freeze({
+  user: '9c7263612ce91052cddca9bc5b25680bcaf09194',
+  config: '967093fe91eb99234239399ab067d63305952a6b',
+  merges: '102bae917d6fe7810acb5c494cee498ceadf6e27',
 });
+
+// GitHub's repository Contents API returns a file's content as JSON only up
+// to 1 MB (https://docs.github.com/en/rest/repos/contents#get-repository-content).
+// Keep this as one shared browser/Worker boundary so publication and remote
+// reconciliation cannot drift. It is the only size bound of the contract:
+// nothing a contributor types and nothing a file counts has a limit of its own.
+export const ANNOTATION_FILE_MAX_UTF8_BYTES = 1_000_000;
+
+// The deepest JSON nesting either validator reads. The repository validator
+// is Python, whose json decoder recurses once per nesting level and stops at
+// the interpreter's recursion limit (sys.getrecursionlimit(), 1000 by default:
+// https://docs.python.org/3/library/sys.html#sys.getrecursionlimit), so it
+// cannot read deeper JSON on every Python it supports; this module refuses the
+// same documents with the same sentence. No valid annotation document nests
+// deeper than 7 levels (user file > datasets > section > suggestions > bucket
+// list > suggestion > markers > marker), so the bound never refuses a valid
+// file. The shared corpus pins the value for both validators.
+const ANNOTATION_JSON_MAX_DEPTH = 512;
+
+/**
+ * The whitespace of the annotation contract, as one regular-expression
+ * character class: the union of ECMAScript `\s` and Python's `str.isspace()`
+ * (Python adds U+001C-U+001F and U+0085; ECMAScript adds U+FEFF). The schemas,
+ * this module, the session and the repository validator all use exactly this
+ * class, so a string is "exact" in the same way everywhere.
+ */
+export const ANNOTATION_WHITESPACE_CLASS =
+  '[\\u0009-\\u000d\\u001c-\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a' +
+  '\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]';
+
+const WHITESPACE = new RegExp(ANNOTATION_WHITESPACE_CLASS);
+const BLANK = new RegExp(`^${ANNOTATION_WHITESPACE_CLASS}*$`);
+
+/**
+ * Exact nonblank text: a string whose first and last characters are both
+ * outside `ANNOTATION_WHITESPACE_CLASS` (so it is not empty either). Every
+ * text a contributor writes into a file has this form; it is never trimmed.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isAnnotationExactNonblank(value) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    !WHITESPACE.test(value[0]) &&
+    !WHITESPACE.test(value[value.length - 1])
+  );
+}
+
+const ORCID_ID = /^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$/;
+// LinkedIn's public profile handle: lowercase letters, digits and hyphens,
+// at least 3 characters (LinkedIn's own minimum for a custom profile URL).
+const LINKEDIN_HANDLE = /^[a-z0-9-]{3,}$/;
+
+/**
+ * An ORCID iD in its one exact form `0000-0000-0000-000X`, with a valid ISO
+ * 7064 MOD 11-2 check character
+ * (https://support.orcid.org/hc/en-us/articles/360006897674).
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isExactOrcidId(value) {
+  if (typeof value !== 'string' || !ORCID_ID.test(value)) return false;
+  const compact = value.replaceAll('-', '');
+  let total = 0;
+  for (let index = 0; index < 15; index += 1) {
+    total = (total + Number(compact[index])) * 2;
+  }
+  const result = (12 - (total % 11)) % 11;
+  const expected = result === 10 ? 'X' : `${result}`;
+  return compact[15] === expected;
+}
+
+/**
+ * A LinkedIn handle exactly as it appears in a profile URL: no `@`, no URL.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isExactLinkedInHandle(value) {
+  return typeof value === 'string' && LINKEDIN_HANDLE.test(value);
+}
 
 const UTC_DATE_TIME =
   /^(?<year>[0-9]{4})-(?<month>[0-9]{2})-(?<day>[0-9]{2})T(?<hour>[0-9]{2}):(?<minute>[0-9]{2}):(?<second>[0-9]{2})(?:\.(?<millisecond>[0-9]{3}))?Z$/;
 const GHID = /^ghid_[1-9][0-9]*$/;
-const LINKEDIN = /^[a-z0-9-]{3,120}$/;
+const SUGGESTION_ID_OWNER = /^ghid_[1-9][0-9]*(?=_)/;
 
 /**
  * `fk~<urlencoded>` is the v1 bucket representation for a field key containing
@@ -86,6 +172,37 @@ export function isReservedAnnotationFieldKey(value) {
 
 export function hasAnnotationSuggestionIdDelimiter(value) {
   return typeof value === 'string' && value.includes(':');
+}
+
+/**
+ * The owner a suggestion id names: `'ghid_<n>'` for an id of the form
+ * `ghid_<n>_<rest>` (`<rest>` exact nonblank text without `:`), else null.
+ *
+ * @param {unknown} id
+ * @returns {string|null}
+ */
+/**
+ * The text two suggestion labels (or two agreed consensus labels) are
+ * compared by: the exact label in Unicode Normalization Form C, so the same
+ * text typed or pasted in composed and decomposed form ("é" as one or two
+ * code points) is one label. Nothing else is folded (no case, no inner
+ * whitespace): "T cell" and "T Cell" stay apart. The one rule for label
+ * identity: consensus bundles, the duplicate check of a new suggestion, an
+ * agent naming a suggestion by its label, and the consensus column.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function exactLabelForCompare(value) {
+  return typeof value === 'string' ? value.normalize('NFC') : '';
+}
+
+export function annotationSuggestionIdOwner(id) {
+  if (typeof id !== 'string') return null;
+  const owner = SUGGESTION_ID_OWNER.exec(id)?.[0];
+  if (owner === undefined) return null;
+  const rest = id.slice(owner.length + 1);
+  return !rest.includes(':') && isAnnotationExactNonblank(rest) ? owner : null;
 }
 
 class AnnotationContractError extends Error {
@@ -117,11 +234,7 @@ export class AnnotationFileTooLargeError extends Error {
 }
 
 export function toAnnotationPublicationBytes(value, { path } = {}) {
-  if (
-    typeof path !== 'string' ||
-    !path ||
-    /^\s|\s$/.test(path)
-  ) {
+  if (!isAnnotationExactNonblank(path)) {
     throw new Error('Annotation publication path must be an exact nonblank string');
   }
   if (typeof TextEncoder === 'undefined') {
@@ -169,31 +282,40 @@ function child(path, key) {
   return `${path}[${JSON.stringify(key)}]`;
 }
 
-function assertString(
-  value,
-  path,
-  { min = 1, max, pattern = null, nullable = false } = {}
-) {
-  if (nullable && value === null) return null;
+function assertString(value, path) {
   if (typeof value !== 'string') reject(path, 'must be a JSON string');
-  const length = Array.from(value).length;
-  if (length < min) reject(path, `must contain at least ${min} character(s)`);
-  if (max !== undefined && length > max) {
-    reject(path, `must contain at most ${max} character(s)`);
-  }
-  if (pattern && !pattern.test(value)) reject(path, 'has an invalid format');
   return value;
 }
 
-function assertNonblankString(value, path, max) {
-  const string = assertString(value, path, { max });
-  if (!/\S/.test(string)) reject(path, 'must be nonblank');
-  if (/^\s|\s$/.test(string)) reject(path, 'must not have leading or trailing whitespace');
+function assertExactNonblank(value, path) {
+  const string = assertString(value, path);
+  if (!isAnnotationExactNonblank(string)) {
+    reject(
+      path,
+      BLANK.test(string)
+        ? 'must be nonblank'
+        : 'must not have leading or trailing whitespace'
+    );
+  }
+  return string;
+}
+
+function assertNullableExactNonblank(value, path) {
+  if (value === null) return null;
+  const string = assertString(value, path);
+  if (!isAnnotationExactNonblank(string)) {
+    reject(
+      path,
+      BLANK.test(string)
+        ? 'must be nonblank or null'
+        : 'must not have leading or trailing whitespace'
+    );
+  }
   return string;
 }
 
 function assertFieldKey(value, path) {
-  const field = assertNonblankString(value, path);
+  const field = assertExactNonblank(value, path);
   if (isReservedAnnotationFieldKey(field)) {
     reject(
       path,
@@ -203,16 +325,22 @@ function assertFieldKey(value, path) {
   return field;
 }
 
+/** Validate one suggestion id and return the owner it names. */
 function assertSuggestionId(value, path) {
-  const id = assertNonblankString(
-    value,
-    path,
-    ANNOTATION_LIMITS.suggestionId
-  );
+  const id = assertString(value, path);
   if (hasAnnotationSuggestionIdDelimiter(id)) {
     reject(path, 'suggestion identifiers must not contain the ":" delimiter');
   }
-  return id;
+  assertExactNonblank(id, path);
+  const owner = annotationSuggestionIdOwner(id);
+  if (owner === null) {
+    reject(
+      path,
+      'suggestion identifiers must have the form ghid_<n>_<id>: ' +
+      'the proposer\'s identity, "_", then the rest of the id'
+    );
+  }
+  return owner;
 }
 
 function assertInteger(value, path, { min, max } = {}) {
@@ -231,12 +359,9 @@ function assertNumber(value, path, { min, max } = {}) {
   return value;
 }
 
-function assertArray(value, path, { min = 0, max } = {}) {
+function assertArray(value, path, { min = 0 } = {}) {
   if (!Array.isArray(value)) reject(path, 'must be a JSON array');
   if (value.length < min) reject(path, `must contain at least ${min} item(s)`);
-  if (max !== undefined && value.length > max) {
-    reject(path, `must contain at most ${max} item(s)`);
-  }
   return value;
 }
 
@@ -248,152 +373,173 @@ function assertUniqueStrings(values, path) {
   });
 }
 
+// One JSON string token. Unrolled (`plain* (escape plain*)*`), so a long
+// string is one native scan however long it is.
+const JSON_STRING_TOKEN =
+  /"[^"\\\u0000-\u001f]*(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})[^"\\\u0000-\u001f]*)*"/y;
+const JSON_NUMBER_TOKEN = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
+
+/** Say where and why a string token that did not match is invalid. */
+function describeInvalidString(text, start) {
+  if (text[start] !== '"') return [start, 'expected a JSON string'];
+  let index = start + 1;
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    if (code < 0x20) return [index, 'unescaped control character in JSON string'];
+    if (code === 0x5c) {
+      const escape = text[index + 1];
+      if (escape === undefined) return [index, 'unterminated JSON string escape'];
+      if (escape === 'u') {
+        if (!/^[0-9a-fA-F]{4}$/.test(text.slice(index + 2, index + 6))) {
+          return [index, 'invalid JSON Unicode escape'];
+        }
+        index += 6;
+        continue;
+      }
+      if (!'"\\/bfnrt'.includes(escape)) return [index, 'invalid JSON string escape'];
+      index += 2;
+      continue;
+    }
+    index += 1;
+  }
+  return [start, 'unterminated JSON string'];
+}
+
 /**
  * Parse JSON while rejecting duplicate object keys.
  *
  * Native JSON.parse keeps the last duplicate key, which would make the browser
- * contract weaker than the repository validator. This syntax pass decodes each
- * object key before comparison, so `"name"` and `"\u006eame"` are duplicates.
+ * contract weaker than the repository validator, so this parser builds the
+ * value itself and compares decoded keys (`"name"` and `"name"` are
+ * duplicates). It accepts exactly the JSON that JSON.parse accepts (nested at
+ * most `ANNOTATION_JSON_MAX_DEPTH` levels) and returns the same value.
+ *
+ * One pass, not a duplicate-key scan followed by JSON.parse: measured on
+ * 1 MB annotation files (median of 60 runs, Node 26, Apple M-series), this
+ * pass takes 5.4 ms where the scan plus JSON.parse took 8.9 ms (many short
+ * tokens), 1.1 ms where it took 5.1 ms (long texts) and 3.5 ms where it took
+ * 8.9 ms (escaped texts). Each string is matched by one sticky regular
+ * expression and handed to JSON.parse only when it holds an escape, so a long
+ * text is one native scan; a megabyte that never closes its string is refused
+ * in about 9 ms.
  */
 export function parseExactJson(text, { path = '$' } = {}) {
   if (typeof text !== 'string') reject(path, 'JSON input must be a string');
 
   let index = 0;
   const length = text.length;
-  const syntax = (message) => reject(`${path} at character ${index}`, message);
+  const syntax = (message, at = index) =>
+    reject(`${path} at character ${at}`, message);
   const skipWhitespace = () => {
-    while (
-      index < length &&
-      (text[index] === ' ' ||
-        text[index] === '\n' ||
-        text[index] === '\r' ||
-        text[index] === '\t')
-    ) {
+    while (index < length) {
+      const code = text.charCodeAt(index);
+      if (code !== 0x20 && code !== 0x0a && code !== 0x0d && code !== 0x09) return;
       index += 1;
     }
   };
-
-  const parseStringToken = () => {
-    if (text[index] !== '"') syntax('expected a JSON string');
-    const start = index;
-    index += 1;
-    while (index < length) {
-      const code = text.charCodeAt(index);
-      const char = text[index];
-      if (char === '"') {
-        index += 1;
-        try {
-          return JSON.parse(text.slice(start, index));
-        } catch {
-          syntax('invalid JSON string');
-        }
-      }
-      if (code < 0x20) syntax('unescaped control character in JSON string');
-      if (char !== '\\') {
-        index += 1;
-        continue;
-      }
-      index += 1;
-      if (index >= length) syntax('unterminated JSON string escape');
-      const escape = text[index];
-      if ('"\\/bfnrt'.includes(escape)) {
-        index += 1;
-        continue;
-      }
-      if (escape !== 'u') syntax('invalid JSON string escape');
-      const hex = text.slice(index + 1, index + 5);
-      if (hex.length !== 4 || !/^[0-9a-fA-F]{4}$/.test(hex)) {
-        syntax('invalid JSON Unicode escape');
-      }
-      index += 5;
+  const parseString = () => {
+    JSON_STRING_TOKEN.lastIndex = index;
+    const match = JSON_STRING_TOKEN.exec(text);
+    if (match === null) {
+      const [at, message] = describeInvalidString(text, index);
+      syntax(message, at);
     }
-    syntax('unterminated JSON string');
+    index = JSON_STRING_TOKEN.lastIndex;
+    const token = match[0];
+    return token.includes('\\') ? JSON.parse(token) : token.slice(1, -1);
   };
 
   const parseValue = (depth) => {
-    if (depth > 512) syntax('JSON nesting exceeds 512 levels');
     skipWhitespace();
     if (index >= length) syntax('expected a JSON value');
-    const char = text[index];
+    const code = text.charCodeAt(index);
 
-    if (char === '"') {
-      parseStringToken();
-      return;
-    }
-    if (char === '{') {
+    if (code === 0x22) return parseString();
+    if (code === 0x7b || code === 0x5b) {
+      if (depth >= ANNOTATION_JSON_MAX_DEPTH) {
+        syntax(`JSON nesting exceeds ${ANNOTATION_JSON_MAX_DEPTH} levels`);
+      }
       index += 1;
       skipWhitespace();
-      const keys = new Set();
-      if (text[index] === '}') {
+      if (code === 0x5b) {
+        const array = [];
+        if (text.charCodeAt(index) === 0x5d) {
+          index += 1;
+          return array;
+        }
+        while (true) {
+          array.push(parseValue(depth + 1));
+          skipWhitespace();
+          const next = text.charCodeAt(index);
+          if (next === 0x5d) {
+            index += 1;
+            return array;
+          }
+          if (next !== 0x2c) syntax('expected "," or "]" in JSON array');
+          index += 1;
+        }
+      }
+      const object = {};
+      if (text.charCodeAt(index) === 0x7d) {
         index += 1;
-        return;
+        return object;
       }
       while (true) {
         skipWhitespace();
-        const key = parseStringToken();
-        if (keys.has(key)) {
-          syntax(`duplicate JSON object key ${JSON.stringify(key)}`);
+        const keyAt = index;
+        const key = parseString();
+        if (Object.hasOwn(object, key)) {
+          syntax(`duplicate JSON object key ${JSON.stringify(key)}`, keyAt);
         }
-        keys.add(key);
         skipWhitespace();
-        if (text[index] !== ':') syntax('expected ":" after JSON object key');
+        if (text.charCodeAt(index) !== 0x3a) syntax('expected ":" after JSON object key');
         index += 1;
-        parseValue(depth + 1);
+        const value = parseValue(depth + 1);
+        if (key === '__proto__') {
+          // JSON.parse defines `__proto__` as an own data property; an
+          // assignment would set the object's prototype instead.
+          Object.defineProperty(object, key, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        } else {
+          object[key] = value;
+        }
         skipWhitespace();
-        if (text[index] === '}') {
+        const next = text.charCodeAt(index);
+        if (next === 0x7d) {
           index += 1;
-          return;
+          return object;
         }
-        if (text[index] !== ',') syntax('expected "," or "}" in JSON object');
-        index += 1;
-      }
-    }
-    if (char === '[') {
-      index += 1;
-      skipWhitespace();
-      if (text[index] === ']') {
-        index += 1;
-        return;
-      }
-      while (true) {
-        parseValue(depth + 1);
-        skipWhitespace();
-        if (text[index] === ']') {
-          index += 1;
-          return;
-        }
-        if (text[index] !== ',') syntax('expected "," or "]" in JSON array');
+        if (next !== 0x2c) syntax('expected "," or "}" in JSON object');
         index += 1;
       }
     }
     if (text.startsWith('true', index)) {
       index += 4;
-      return;
+      return true;
     }
     if (text.startsWith('false', index)) {
       index += 5;
-      return;
+      return false;
     }
     if (text.startsWith('null', index)) {
       index += 4;
-      return;
+      return null;
     }
-    const number = text
-      .slice(index)
-      .match(/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/);
-    if (!number) syntax('invalid JSON value');
-    index += number[0].length;
+    JSON_NUMBER_TOKEN.lastIndex = index;
+    const number = JSON_NUMBER_TOKEN.exec(text);
+    if (number === null) syntax('invalid JSON value');
+    index = JSON_NUMBER_TOKEN.lastIndex;
+    return Number(number[0]);
   };
 
-  skipWhitespace();
-  parseValue(0);
+  const value = parseValue(0);
   skipWhitespace();
   if (index !== length) syntax('unexpected content after the JSON value');
-  try {
-    return JSON.parse(text);
-  } catch {
-    syntax('invalid JSON');
-  }
+  return value;
 }
 
 export function assertUtcDateTime(value, path = '$') {
@@ -431,25 +577,20 @@ export function assertUtcDateTime(value, path = '$') {
 }
 
 function assertGhid(value, path) {
-  return assertString(value, path, {
-    max: ANNOTATION_LIMITS.username,
-    pattern: GHID,
-  });
+  const string = assertString(value, path);
+  if (!GHID.test(string)) reject(path, 'must have the exact form ghid_<GitHub user id>');
+  return string;
 }
 
 function assertBucket(value, path) {
-  const bucket = assertNonblankString(value, path);
+  const bucket = assertExactNonblank(value, path);
   const delimiter = bucket.indexOf(':');
   if (delimiter <= 0 || delimiter === bucket.length - 1) {
     reject(path, 'must have <fieldKey>:<categoryLabel> form');
   }
-  const field = bucket.slice(0, delimiter);
-  const category = bucket.slice(delimiter + 1);
   if (
-    !/\S/.test(field) ||
-    !/\S/.test(category) ||
-    /^\s|\s$/.test(field) ||
-    /^\s|\s$/.test(category)
+    !isAnnotationExactNonblank(bucket.slice(0, delimiter)) ||
+    !isAnnotationExactNonblank(bucket.slice(delimiter + 1))
   ) {
     reject(path, 'fieldKey and categoryLabel must both be nonblank without edge whitespace');
   }
@@ -467,54 +608,27 @@ function assertSuggestion(value, path, fileUser, suggestionIds) {
     ['id', 'label', 'proposedBy', 'proposedAt'],
     ['ontologyId', 'evidence', 'markers', 'editedAt']
   );
-  const id = assertSuggestionId(suggestion.id, child(path, 'id'));
-  if (suggestionIds.has(id)) reject(child(path, 'id'), 'must be globally unique');
-  suggestionIds.add(id);
-  assertNonblankString(
-    suggestion.label,
-    child(path, 'label'),
-    ANNOTATION_LIMITS.label
-  );
+  const idPath = child(path, 'id');
+  const owner = assertSuggestionId(suggestion.id, idPath);
+  if (suggestionIds.has(suggestion.id)) reject(idPath, 'must be globally unique');
+  suggestionIds.add(suggestion.id);
+  assertExactNonblank(suggestion.label, child(path, 'label'));
   if (Object.hasOwn(suggestion, 'ontologyId')) {
-    assertString(suggestion.ontologyId, child(path, 'ontologyId'), {
-      min: suggestion.ontologyId === null ? 0 : 1,
-      max: ANNOTATION_LIMITS.ontologyId,
-      nullable: true,
-    });
-    if (typeof suggestion.ontologyId === 'string' && !/\S/.test(suggestion.ontologyId)) {
-      reject(child(path, 'ontologyId'), 'must be nonblank or null');
-    }
-    if (typeof suggestion.ontologyId === 'string' && /^\s|\s$/.test(suggestion.ontologyId)) {
-      reject(child(path, 'ontologyId'), 'must not have leading or trailing whitespace');
-    }
+    assertNullableExactNonblank(suggestion.ontologyId, child(path, 'ontologyId'));
   }
   if (Object.hasOwn(suggestion, 'evidence')) {
-    assertString(suggestion.evidence, child(path, 'evidence'), {
-      min: suggestion.evidence === null ? 0 : 1,
-      max: ANNOTATION_LIMITS.evidence,
-      nullable: true,
-    });
-    if (typeof suggestion.evidence === 'string' && !/\S/.test(suggestion.evidence)) {
-      reject(child(path, 'evidence'), 'must be nonblank or null');
-    }
-    if (typeof suggestion.evidence === 'string' && /^\s|\s$/.test(suggestion.evidence)) {
-      reject(child(path, 'evidence'), 'must not have leading or trailing whitespace');
-    }
+    assertNullableExactNonblank(suggestion.evidence, child(path, 'evidence'));
   }
   if (Object.hasOwn(suggestion, 'markers') && suggestion.markers !== null) {
     const markers = assertArray(suggestion.markers, child(path, 'markers'));
     markers.forEach((marker, index) => {
       const markerPath = `${child(path, 'markers')}[${index}]`;
       if (typeof marker === 'string') {
-        assertNonblankString(marker, markerPath, ANNOTATION_LIMITS.markerGene);
+        assertExactNonblank(marker, markerPath);
         return;
       }
       const record = assertExactFields(marker, markerPath, ['gene'], ['logFC', 'pval']);
-      assertNonblankString(
-        record.gene,
-        child(markerPath, 'gene'),
-        ANNOTATION_LIMITS.markerGene
-      );
+      assertExactNonblank(record.gene, child(markerPath, 'gene'));
       if (Object.hasOwn(record, 'logFC')) {
         assertNumber(record.logFC, child(markerPath, 'logFC'));
       }
@@ -527,6 +641,12 @@ function assertSuggestion(value, path, fileUser, suggestionIds) {
   if (proposedBy !== fileUser) {
     reject(child(path, 'proposedBy'), `must equal file identity ${JSON.stringify(fileUser)}`);
   }
+  if (owner !== proposedBy) {
+    reject(
+      idPath,
+      `must start with ${JSON.stringify(`${proposedBy}_`)}, its proposer's identity`
+    );
+  }
   assertUtcDateTime(suggestion.proposedAt, child(path, 'proposedAt'));
   if (Object.hasOwn(suggestion, 'editedAt') && suggestion.editedAt !== null) {
     assertUtcDateTime(suggestion.editedAt, child(path, 'editedAt'));
@@ -536,7 +656,7 @@ function assertSuggestion(value, path, fileUser, suggestionIds) {
 function assertDatasetAccessMap(value, path) {
   const datasets = assertRecord(value, path);
   for (const [datasetId, entryValue] of Object.entries(datasets)) {
-    assertNonblankString(datasetId, `${path} key`, ANNOTATION_LIMITS.datasetId);
+    assertExactNonblank(datasetId, `${path} key`);
     const entryPath = child(path, datasetId);
     const entry = assertExactFields(
       entryValue,
@@ -558,6 +678,15 @@ function assertDatasetAccessMap(value, path) {
   }
 }
 
+/**
+ * Validate one dataset view of a user file (version 1 of its own): the
+ * profile and one dataset's access record, suggestions, votes, comments and
+ * deletion markers.
+ *
+ * @param {unknown} value
+ * @param {{path?: string, filename?: string|null}} [options]
+ * @returns {object}
+ */
 export function assertUserDocument(value, { path = '$', filename = null } = {}) {
   const document = assertExactFields(
     value,
@@ -574,10 +703,11 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
       'deletedSuggestions',
     ]
   );
-  if (document.version !== 1) reject(child(path, 'version'), 'must equal 1');
+  if (document.version !== DATASET_VIEW_VERSION) {
+    reject(child(path, 'version'), `must equal ${DATASET_VIEW_VERSION}`);
+  }
   const githubUserId = assertInteger(document.githubUserId, child(path, 'githubUserId'), {
     min: 1,
-    max: ANNOTATION_LIMITS.githubUserId,
   });
   const expectedUser = `ghid_${githubUserId}`;
   const username = assertGhid(document.username, child(path, 'username'));
@@ -587,22 +717,15 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
   if (filename !== null && filename !== `${expectedUser}.json`) {
     reject(path, `filename must be exactly ${JSON.stringify(`${expectedUser}.json`)}`);
   }
-  const optionalStrings = [
-    ['login', ANNOTATION_LIMITS.login, null],
-    ['displayName', ANNOTATION_LIMITS.displayName, null],
-    ['title', ANNOTATION_LIMITS.title, null],
-    ['orcid', ANNOTATION_LIMITS.orcid, null],
-    ['linkedin', ANNOTATION_LIMITS.linkedin, LINKEDIN],
-  ];
-  for (const [field, max, pattern] of optionalStrings) {
+  for (const field of ['login', 'displayName', 'title', 'orcid', 'linkedin']) {
     if (!Object.hasOwn(document, field)) continue;
-    assertNonblankString(document[field], child(path, field), max);
-    if (pattern && !pattern.test(document[field])) {
-      reject(child(path, field), 'has an invalid format');
-    }
-    if (field === 'orcid' && !isExactOrcidId(document[field])) {
-      reject(child(path, field), 'must be an exact checksum-valid ORCID iD');
-    }
+    assertExactNonblank(document[field], child(path, field));
+  }
+  if (Object.hasOwn(document, 'orcid') && !isExactOrcidId(document.orcid)) {
+    reject(child(path, 'orcid'), 'must be an exact checksum-valid ORCID iD');
+  }
+  if (Object.hasOwn(document, 'linkedin') && !isExactLinkedInHandle(document.linkedin)) {
+    reject(child(path, 'linkedin'), 'has an invalid format');
   }
   assertUtcDateTime(document.updatedAt, child(path, 'updatedAt'));
   if (Object.hasOwn(document, 'datasets')) {
@@ -610,40 +733,32 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
   }
 
   const suggestionIds = new Set();
-  const suggestions = assertRecord(
-    document.suggestions,
-    child(path, 'suggestions')
-  );
+  const suggestionsPath = child(path, 'suggestions');
+  const suggestions = assertRecord(document.suggestions, suggestionsPath);
   for (const [bucket, listValue] of Object.entries(suggestions)) {
-    assertBucket(bucket, `${child(path, 'suggestions')} key`);
-    const listPath = child(child(path, 'suggestions'), bucket);
-    const list = assertArray(listValue, listPath, {
-      max: ANNOTATION_LIMITS.suggestionsPerBucket,
-    });
+    assertBucket(bucket, `${suggestionsPath} key`);
+    const listPath = child(suggestionsPath, bucket);
+    const list = assertArray(listValue, listPath);
     list.forEach((suggestion, index) => {
       assertSuggestion(suggestion, `${listPath}[${index}]`, username, suggestionIds);
     });
   }
 
-  const votes = assertRecord(
-    document.votes,
-    child(path, 'votes')
-  );
+  const votesPath = child(path, 'votes');
+  const votes = assertRecord(document.votes, votesPath);
   for (const [suggestionId, direction] of Object.entries(votes)) {
-    assertSuggestionId(suggestionId, `${child(path, 'votes')} key`);
+    assertSuggestionId(suggestionId, `${votesPath} key`);
     if (direction !== 'up' && direction !== 'down') {
-      reject(child(child(path, 'votes'), suggestionId), 'must equal "up" or "down"');
+      reject(child(votesPath, suggestionId), 'must equal "up" or "down"');
     }
   }
 
   if (Object.hasOwn(document, 'comments')) {
-    const comments = assertRecord(
-      document.comments,
-      child(path, 'comments')
-    );
+    const commentsPath = child(path, 'comments');
+    const comments = assertRecord(document.comments, commentsPath);
     for (const [suggestionId, listValue] of Object.entries(comments)) {
-      assertSuggestionId(suggestionId, `${child(path, 'comments')} key`);
-      const listPath = child(child(path, 'comments'), suggestionId);
+      assertSuggestionId(suggestionId, `${commentsPath} key`);
+      const listPath = child(commentsPath, suggestionId);
       const list = assertArray(listValue, listPath);
       const commentIds = new Set();
       list.forEach((commentValue, index) => {
@@ -654,18 +769,10 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
           ['id', 'text', 'authorUsername', 'createdAt'],
           ['editedAt']
         );
-        const id = assertNonblankString(
-          comment.id,
-          child(commentPath, 'id'),
-          ANNOTATION_LIMITS.commentId
-        );
+        const id = assertExactNonblank(comment.id, child(commentPath, 'id'));
         if (commentIds.has(id)) reject(child(commentPath, 'id'), 'must be unique');
         commentIds.add(id);
-        assertNonblankString(
-          comment.text,
-          child(commentPath, 'text'),
-          ANNOTATION_LIMITS.commentText
-        );
+        assertExactNonblank(comment.text, child(commentPath, 'text'));
         const author = assertGhid(
           comment.authorUsername,
           child(commentPath, 'authorUsername')
@@ -685,16 +792,20 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
   }
 
   if (Object.hasOwn(document, 'deletedSuggestions')) {
-    const deleted = assertRecord(
-      document.deletedSuggestions,
-      child(path, 'deletedSuggestions')
-    );
+    const deletedPath = child(path, 'deletedSuggestions');
+    const deleted = assertRecord(document.deletedSuggestions, deletedPath);
     for (const [bucket, idsValue] of Object.entries(deleted)) {
-      assertBucket(bucket, `${child(path, 'deletedSuggestions')} key`);
-      const idsPath = child(child(path, 'deletedSuggestions'), bucket);
+      assertBucket(bucket, `${deletedPath} key`);
+      const idsPath = child(deletedPath, bucket);
       const ids = assertArray(idsValue, idsPath);
       ids.forEach((id, index) => {
-        assertSuggestionId(id, `${idsPath}[${index}]`);
+        const idPath = `${idsPath}[${index}]`;
+        if (assertSuggestionId(id, idPath) !== username) {
+          reject(
+            idPath,
+            `must name a suggestion of the file owner (start with ${JSON.stringify(`${username}_`)})`
+          );
+        }
       });
       assertUniqueStrings(ids, idsPath);
     }
@@ -704,7 +815,9 @@ export function assertUserDocument(value, { path = '$', filename = null } = {}) 
 
 export function assertConfigDocument(value, { path = '$' } = {}) {
   const document = assertExactFields(value, path, ['version', 'supportedDatasets']);
-  if (document.version !== 1) reject(child(path, 'version'), 'must equal 1');
+  if (document.version !== ANNOTATION_CONFIG_FILE_VERSION) {
+    reject(child(path, 'version'), `must equal ${ANNOTATION_CONFIG_FILE_VERSION}`);
+  }
   const entries = assertArray(
     document.supportedDatasets,
     child(path, 'supportedDatasets'),
@@ -720,20 +833,12 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
       'annotatableSettings',
       'closedFields',
     ]);
-    const datasetId = assertNonblankString(
-      entry.datasetId,
-      child(entryPath, 'datasetId'),
-      ANNOTATION_LIMITS.datasetId
-    );
+    const datasetId = assertExactNonblank(entry.datasetId, child(entryPath, 'datasetId'));
     if (datasetIds.has(datasetId)) {
       reject(child(entryPath, 'datasetId'), 'must be unique');
     }
     datasetIds.add(datasetId);
-    assertNonblankString(
-      entry.name,
-      child(entryPath, 'name'),
-      ANNOTATION_LIMITS.datasetName
-    );
+    assertExactNonblank(entry.name, child(entryPath, 'name'));
     const fieldsPath = child(entryPath, 'fieldsToAnnotate');
     const fields = assertArray(entry.fieldsToAnnotate, fieldsPath, { min: 1 });
     fields.forEach((field, fieldIndex) => {
@@ -784,9 +889,19 @@ export function assertConfigDocument(value, { path = '$' } = {}) {
   return document;
 }
 
+/**
+ * Validate one dataset view of the merges file (version 1 of its own): that
+ * dataset's merges, without their dataset id.
+ *
+ * @param {unknown} value
+ * @param {{path?: string}} [options]
+ * @returns {object}
+ */
 export function assertMergesDocument(value, { path = '$' } = {}) {
   const document = assertExactFields(value, path, ['version', 'updatedAt', 'merges']);
-  if (document.version !== 1) reject(child(path, 'version'), 'must equal 1');
+  if (document.version !== DATASET_VIEW_VERSION) {
+    reject(child(path, 'version'), `must equal ${DATASET_VIEW_VERSION}`);
+  }
   assertUtcDateTime(document.updatedAt, child(path, 'updatedAt'));
   const merges = assertArray(document.merges, child(path, 'merges'));
   const byBucketFrom = new Set();
@@ -800,14 +915,10 @@ export function assertMergesDocument(value, { path = '$' } = {}) {
       ['note', 'editedAt']
     );
     const bucket = assertBucket(merge.bucket, child(mergePath, 'bucket'));
-    const from = assertSuggestionId(
-      merge.fromSuggestionId,
-      child(mergePath, 'fromSuggestionId')
-    );
-    const into = assertSuggestionId(
-      merge.intoSuggestionId,
-      child(mergePath, 'intoSuggestionId')
-    );
+    assertSuggestionId(merge.fromSuggestionId, child(mergePath, 'fromSuggestionId'));
+    assertSuggestionId(merge.intoSuggestionId, child(mergePath, 'intoSuggestionId'));
+    const from = merge.fromSuggestionId;
+    const into = merge.intoSuggestionId;
     if (from === into) {
       reject(mergePath, 'fromSuggestionId and intoSuggestionId must differ');
     }
@@ -821,17 +932,7 @@ export function assertMergesDocument(value, { path = '$' } = {}) {
     assertGhid(merge.by, child(mergePath, 'by'));
     assertUtcDateTime(merge.at, child(mergePath, 'at'));
     if (Object.hasOwn(merge, 'note')) {
-      assertString(merge.note, child(mergePath, 'note'), {
-        min: merge.note === null ? 0 : 1,
-        max: ANNOTATION_LIMITS.mergeNote,
-        nullable: true,
-      });
-      if (typeof merge.note === 'string' && !/\S/.test(merge.note)) {
-        reject(child(mergePath, 'note'), 'must be nonblank or null');
-      }
-      if (typeof merge.note === 'string' && /^\s|\s$/.test(merge.note)) {
-        reject(child(mergePath, 'note'), 'must not have leading or trailing whitespace');
-      }
+      assertNullableExactNonblank(merge.note, child(mergePath, 'note'));
     }
     if (Object.hasOwn(merge, 'editedAt') && merge.editedAt !== null) {
       assertUtcDateTime(merge.editedAt, child(mergePath, 'editedAt'));
@@ -853,25 +954,24 @@ export function assertMergesDocument(value, { path = '$' } = {}) {
   return document;
 }
 
-export function assertSchemaIdentity(value, kind, { path = '$' } = {}) {
-  const schema = assertRecord(value, path);
-  const expectedId = ANNOTATION_CONTRACT_IDS[kind];
-  if (!expectedId) reject(path, `unknown schema kind ${JSON.stringify(kind)}`);
-  if (schema.$schema !== 'https://json-schema.org/draft/2020-12/schema') {
-    reject(child(path, '$schema'), 'must declare JSON Schema draft 2020-12');
-  }
-  if (schema.$id !== expectedId) {
-    reject(child(path, '$id'), `must equal ${JSON.stringify(expectedId)}`);
-  }
-  return schema;
-}
-
 const USER_FILE_PROFILE_FIELDS = Object.freeze([
   'login',
   'displayName',
   'title',
   'orcid',
   'linkedin',
+]);
+
+const USER_SECTION_REQUIRED_FIELDS = Object.freeze([
+  'fieldsToAnnotate',
+  'lastAccessedAt',
+  'suggestions',
+  'votes',
+]);
+
+const USER_SECTION_OPTIONAL_FIELDS = Object.freeze([
+  'comments',
+  'deletedSuggestions',
 ]);
 
 const USER_SECTION_CONTENT_FIELDS = Object.freeze([
@@ -882,16 +982,20 @@ const USER_SECTION_CONTENT_FIELDS = Object.freeze([
 ]);
 
 /**
- * The dataset view of one section of a user file.
+ * The dataset view of one section of a user file. The view copies the
+ * section's content (`clone`) when it is handed to the app, and shares it
+ * when it is only validated.
  *
- * @param {object} file - A validated user file
- * @param {string} datasetId
- * @param {object|null} section
+ * @param {object} file - A user file whose top level is checked
+ * @param {string|null} datasetId
+ * @param {object|null} section - A section whose fields are checked
+ * @param {{clone: boolean}} options
  * @returns {object}
  */
-function userViewOf(file, datasetId, section) {
+function userViewOf(file, datasetId, section, { clone }) {
+  const copy = clone ? structuredClone : (value) => value;
   const view = {
-    version: 1,
+    version: DATASET_VIEW_VERSION,
     username: file.username,
     githubUserId: file.githubUserId,
     updatedAt: file.updatedAt,
@@ -902,58 +1006,70 @@ function userViewOf(file, datasetId, section) {
   if (section !== null) {
     view.datasets = {
       [datasetId]: {
-        fieldsToAnnotate: [...section.fieldsToAnnotate],
+        fieldsToAnnotate: clone ? [...section.fieldsToAnnotate] : section.fieldsToAnnotate,
         lastAccessedAt: section.lastAccessedAt,
       },
     };
   }
-  view.suggestions = structuredClone(section?.suggestions ?? {});
-  view.votes = structuredClone(section?.votes ?? {});
+  view.suggestions = section === null ? {} : copy(section.suggestions);
+  view.votes = section === null ? {} : copy(section.votes);
   if (section !== null && Object.hasOwn(section, 'comments')) {
-    view.comments = structuredClone(section.comments);
+    view.comments = copy(section.comments);
   }
   if (section !== null && Object.hasOwn(section, 'deletedSuggestions')) {
-    view.deletedSuggestions = structuredClone(section.deletedSuggestions);
+    view.deletedSuggestions = copy(section.deletedSuggestions);
   }
   return view;
 }
 
-/**
- * Validate one user file (`annotations/users/ghid_<id>.json`, version 2).
- *
- * @param {unknown} value
- * @param {{path?: string, filename?: string|null}} [options]
- * @returns {object}
- */
-export function assertUserFile(value, { path = '$', filename = null } = {}) {
+/** The top level of a user file: its fields, version and profile. */
+function assertUserFileProfile(value, path, filename) {
   const file = assertExactFields(
     value,
     path,
     ['version', 'username', 'githubUserId', 'updatedAt', 'datasets'],
     USER_FILE_PROFILE_FIELDS
   );
-  if (file.version !== 2) reject(child(path, 'version'), 'must equal 2');
-  const datasets = assertRecord(file.datasets, child(path, 'datasets'));
-  for (const [datasetId, sectionValue] of Object.entries(datasets)) {
-    assertNonblankString(datasetId, `${child(path, 'datasets')} key`, ANNOTATION_LIMITS.datasetId);
-    const sectionPath = child(child(path, 'datasets'), datasetId);
-    const section = assertExactFields(
-      sectionValue,
-      sectionPath,
-      ['fieldsToAnnotate', 'lastAccessedAt', 'suggestions', 'votes'],
-      ['comments', 'deletedSuggestions']
-    );
-    // Every section is a complete dataset view of its own; validating that
-    // view checks the section with the rules the app applies to it.
-    assertUserDocument(userViewOf(file, datasetId, section), {
-      path: sectionPath,
-      filename,
-    });
+  if (file.version !== ANNOTATION_USER_FILE_VERSION) {
+    reject(child(path, 'version'), `must equal ${ANNOTATION_USER_FILE_VERSION}`);
   }
-  if (Object.keys(datasets).length === 0) {
-    // The profile alone still names its owner, which is what the validator
-    // below proves; an empty file is a valid file.
-    assertUserDocument(userViewOf(file, null, null), { path, filename });
+  assertRecord(file.datasets, child(path, 'datasets'));
+  // The profile alone is a dataset view without a section.
+  assertUserDocument(userViewOf(file, null, null, { clone: false }), { path, filename });
+  return file;
+}
+
+function assertUserSection(file, datasetId, path, filename) {
+  const sectionPath = child(child(path, 'datasets'), datasetId);
+  const section = assertExactFields(
+    file.datasets[datasetId],
+    sectionPath,
+    USER_SECTION_REQUIRED_FIELDS,
+    USER_SECTION_OPTIONAL_FIELDS
+  );
+  // A section is a complete dataset view of its own; validating that view
+  // checks the section with the rules the app applies to it.
+  assertUserDocument(userViewOf(file, datasetId, section, { clone: false }), {
+    path: sectionPath,
+    filename,
+  });
+  return section;
+}
+
+/**
+ * Validate one whole user file (`annotations/users/ghid_<id>.json`,
+ * version 3): the profile and every dataset's section. The app checks a whole
+ * file before it publishes the contributor's own file.
+ *
+ * @param {unknown} value
+ * @param {{path?: string, filename?: string|null}} [options]
+ * @returns {object}
+ */
+export function assertUserFile(value, { path = '$', filename = null } = {}) {
+  const file = assertUserFileProfile(value, path, filename);
+  for (const datasetId of Object.keys(file.datasets)) {
+    assertExactNonblank(datasetId, `${child(path, 'datasets')} key`);
+    assertUserSection(file, datasetId, path, filename);
   }
   return file;
 }
@@ -961,7 +1077,9 @@ export function assertUserFile(value, { path = '$', filename = null } = {}) {
 /**
  * The open dataset's view of one user file: the profile, and that dataset's
  * suggestions, votes, comments and deletion markers (empty when the
- * contributor has none for it).
+ * contributor has none for it). Only the profile and that section are
+ * validated: another dataset's section is not this dataset's business, so a
+ * file can be read here whatever it holds for other datasets.
  *
  * @param {unknown} value - A user file
  * @param {string} datasetId
@@ -969,10 +1087,12 @@ export function assertUserFile(value, { path = '$', filename = null } = {}) {
  * @returns {object} A dataset view (`assertUserDocument`)
  */
 export function projectUserFile(value, datasetId, { path = '$', filename = null } = {}) {
-  const file = assertUserFile(value, { path, filename });
-  assertNonblankString(datasetId, `${path} dataset`, ANNOTATION_LIMITS.datasetId);
-  const section = Object.hasOwn(file.datasets, datasetId) ? file.datasets[datasetId] : null;
-  return assertUserDocument(userViewOf(file, datasetId, section), { path, filename });
+  assertExactNonblank(datasetId, `${path} dataset`);
+  const file = assertUserFileProfile(value, path, filename);
+  const section = Object.hasOwn(file.datasets, datasetId)
+    ? assertUserSection(file, datasetId, path, filename)
+    : null;
+  return userViewOf(file, datasetId, section, { clone: true });
 }
 
 /**
@@ -989,7 +1109,7 @@ export function projectUserFile(value, datasetId, { path = '$', filename = null 
 export function composeUserFile(previous, datasetId, view, { path = '$', filename = null } = {}) {
   const prior = previous === null ? null : assertUserFile(previous, { path, filename });
   const current = assertUserDocument(view, { path, filename });
-  assertNonblankString(datasetId, `${path} dataset`, ANNOTATION_LIMITS.datasetId);
+  assertExactNonblank(datasetId, `${path} dataset`);
   if (prior !== null && prior.githubUserId !== current.githubUserId) {
     reject(path, 'must belong to the same contributor as the published file');
   }
@@ -1011,7 +1131,7 @@ export function composeUserFile(previous, datasetId, view, { path = '$', filenam
   }
   datasets[datasetId] = section;
   const file = {
-    version: 2,
+    version: ANNOTATION_USER_FILE_VERSION,
     username: current.username,
     githubUserId: current.githubUserId,
     updatedAt: current.updatedAt,
@@ -1023,36 +1143,49 @@ export function composeUserFile(previous, datasetId, view, { path = '$', filenam
   return assertUserFile(file, { path, filename });
 }
 
+/** The top level of the merges file: its fields, version and time. */
+function assertMergesFileTop(value, path) {
+  const file = assertExactFields(value, path, ['version', 'updatedAt', 'merges']);
+  if (file.version !== ANNOTATION_MERGES_FILE_VERSION) {
+    reject(child(path, 'version'), `must equal ${ANNOTATION_MERGES_FILE_VERSION}`);
+  }
+  assertUtcDateTime(file.updatedAt, child(path, 'updatedAt'));
+  assertArray(file.merges, child(path, 'merges'));
+  return file;
+}
+
+function mergesViewOf(file, merges, { clone }) {
+  return {
+    version: DATASET_VIEW_VERSION,
+    updatedAt: file.updatedAt,
+    merges: merges.map(({ datasetId: _datasetId, ...merge }) =>
+      clone ? structuredClone(merge) : merge
+    ),
+  };
+}
+
 /**
- * Validate the merges file (`annotations/moderation/merges.json`, version 2):
- * every merge names its dataset, and the merges of each dataset form a valid
- * merges view of their own.
+ * Validate the whole merges file (`annotations/moderation/merges.json`,
+ * version 3): every merge names its dataset, and the merges of each dataset
+ * form a valid merges view of their own.
  *
  * @param {unknown} value
  * @param {{path?: string}} [options]
  * @returns {object}
  */
 export function assertMergesFile(value, { path = '$' } = {}) {
-  const file = assertExactFields(value, path, ['version', 'updatedAt', 'merges']);
-  if (file.version !== 2) reject(child(path, 'version'), 'must equal 2');
-  assertUtcDateTime(file.updatedAt, child(path, 'updatedAt'));
-  const merges = assertArray(file.merges, child(path, 'merges'));
+  const file = assertMergesFileTop(value, path);
   const byDataset = new Map();
-  merges.forEach((value, index) => {
+  file.merges.forEach((merge, index) => {
     const mergePath = `${child(path, 'merges')}[${index}]`;
-    const merge = assertRecord(value, mergePath);
-    const datasetId = assertNonblankString(
-      merge.datasetId,
-      child(mergePath, 'datasetId'),
-      ANNOTATION_LIMITS.datasetId
-    );
-    const { datasetId: _datasetId, ...rest } = merge;
+    assertRecord(merge, mergePath);
+    const datasetId = assertExactNonblank(merge.datasetId, child(mergePath, 'datasetId'));
     if (!byDataset.has(datasetId)) byDataset.set(datasetId, []);
-    byDataset.get(datasetId).push(rest);
+    byDataset.get(datasetId).push(merge);
   });
   for (const [datasetId, list] of byDataset) {
     assertMergesDocument(
-      { version: 1, updatedAt: file.updatedAt, merges: list },
+      mergesViewOf(file, list, { clone: false }),
       { path: `${path} dataset ${JSON.stringify(datasetId)}` }
     );
   }
@@ -1061,7 +1194,8 @@ export function assertMergesFile(value, { path = '$' } = {}) {
 
 /**
  * The open dataset's view of the merges file: its merges, without the
- * dataset name.
+ * dataset id. Only the file's top level and that dataset's merges are
+ * validated; another dataset's merges are not this dataset's business.
  *
  * @param {unknown} value
  * @param {string} datasetId
@@ -1069,11 +1203,14 @@ export function assertMergesFile(value, { path = '$' } = {}) {
  * @returns {object} A merges view (`assertMergesDocument`)
  */
 export function projectMergesFile(value, datasetId, { path = '$' } = {}) {
-  const file = assertMergesFile(value, { path });
-  const merges = file.merges
-    .filter(merge => merge.datasetId === datasetId)
-    .map(({ datasetId: _datasetId, ...merge }) => structuredClone(merge));
-  return assertMergesDocument({ version: 1, updatedAt: file.updatedAt, merges }, { path });
+  assertExactNonblank(datasetId, `${path} dataset`);
+  const file = assertMergesFileTop(value, path);
+  const own = file.merges.filter(
+    (merge) => isRecord(merge) && merge.datasetId === datasetId
+  );
+  return assertMergesDocument(mergesViewOf(file, own, { clone: true }), {
+    path: `${path} dataset ${JSON.stringify(datasetId)}`,
+  });
 }
 
 /**
@@ -1089,7 +1226,7 @@ export function projectMergesFile(value, datasetId, { path = '$' } = {}) {
 export function composeMergesFile(previous, datasetId, view, { path = '$' } = {}) {
   const prior = previous === null ? null : assertMergesFile(previous, { path });
   const current = assertMergesDocument(view, { path });
-  assertNonblankString(datasetId, `${path} dataset`, ANNOTATION_LIMITS.datasetId);
+  assertExactNonblank(datasetId, `${path} dataset`);
   const merges = [
     ...(prior?.merges ?? [])
       .filter(merge => merge.datasetId !== datasetId)
@@ -1097,7 +1234,7 @@ export function composeMergesFile(previous, datasetId, view, { path = '$' } = {}
     ...current.merges.map(merge => ({ datasetId, ...structuredClone(merge) })),
   ];
   return assertMergesFile(
-    { version: 2, updatedAt: current.updatedAt, merges },
+    { version: ANNOTATION_MERGES_FILE_VERSION, updatedAt: current.updatedAt, merges },
     { path }
   );
 }

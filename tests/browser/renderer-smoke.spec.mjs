@@ -93,9 +93,13 @@ test('volumetric smoke completes its exact GPU density and noise path', async ({
   });
   const renderMode = page.locator('#render-mode');
   await expect(renderMode).toHaveValue('points');
+  const building = Date.now();
   await renderMode.selectOption('smoke');
   await expect(renderMode).toHaveValue('smoke');
   await Promise.all([densityReady, noiseReady]);
+  // What follows draws smoke frames on the same GPU: the budget follows what the
+  // volume and noise took here (seconds on software GL, 50 s on hosted macOS Firefox).
+  test.setTimeout(test.info().timeout + 2 * (Date.now() - building));
   await page.evaluate(() => new Promise(resolve => {
     requestAnimationFrame(() => requestAnimationFrame(resolve));
   }));
@@ -1569,11 +1573,14 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
   await page.locator('#render-mode').selectOption('smoke');
   await expect(page.locator('#render-mode')).toHaveValue('smoke');
   await expect(page.locator('#split-keep-view-btn')).toBeDisabled();
+  // Smoke draws the live view alone, which the selector shows (disabled);
+  // the person's layout choice stays as it was: turning smoke on publishes
+  // no layout, so turning it off (or a failure) changes no view state.
   await expect(page.locator('#view-layout-mode')).toHaveValue('single');
   expect(await page.evaluate(
     () => window._cellucidViewer.getViewLayout(),
   )).toEqual({
-    mode: 'single',
+    mode: 'grid',
     activeId: 'live',
     liveViewHidden: false,
   });
@@ -1582,7 +1589,7 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
   )).toBe(0);
   expect(await page.evaluate(
     () => window.__getSmokeModeLayoutPublications(),
-  )).toEqual([['single', 'live']]);
+  )).toEqual([]);
   await page.evaluate(() => {
     const canvas = document.querySelector('#glcanvas');
     const gl = canvas?.getContext('webgl2');
@@ -1614,20 +1621,20 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
   await expect(page.locator('#smoke-controls')).not.toHaveClass(/\bvisible\b/);
   await expect(page.locator('#points-controls')).toHaveClass(/\bvisible\b/);
   await expect(page.locator('#split-keep-view-btn')).toBeEnabled();
-  await expect(page.locator('#view-layout-mode')).toHaveValue('single');
+  await expect(page.locator('#view-layout-mode')).toHaveValue('grid');
   expect(await page.evaluate(
     () => window.__getSmokeModeActiveViewPublications(),
   )).toBe(0);
   expect(await page.evaluate(
     () => window.__getSmokeModeLayoutPublications(),
-  )).toEqual([['single', 'live']]);
+  )).toEqual([]);
   const runtimeNotifications = page.locator('.notification-error').filter({
     hasText: 'Volumetric smoke stopped rendering, so the view is back in Points.',
   });
   await expect(runtimeNotifications).toHaveCount(1);
-  // The fallback is over (its one layout publication made above) once the
+  // The fallback is over once the
   // scene has settled and stays undrawn: no later frame can try smoke again.
-  await expect.poll(() => sceneQuietness(page), { timeout: 30_000 }).toBe('quiet');
+  await expect.poll(() => sceneQuietness(page)).toBe('quiet');
   await expect(runtimeNotifications).toHaveCount(1);
   expect(browserErrors).toEqual([]);
 
@@ -1657,10 +1664,7 @@ test('runtime smoke noise failure settles once to points and retries cleanly', a
   )).toBe(0);
   expect(await page.evaluate(
     () => window.__getSmokeModeLayoutPublications(),
-  )).toEqual([
-    ['single', 'live'],
-    ['single', 'live'],
-  ]);
+  )).toEqual([]);
   expect(browserErrors).toEqual([]);
 });
 

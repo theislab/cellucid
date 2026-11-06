@@ -222,15 +222,24 @@ test('hiding one category rewrites only that category in the legend', async ({
     const records = [];
     const observer = new MutationObserver(list => records.push(...list));
     observer.observe(legend, { subtree: true, childList: true, characterData: true, attributes: true });
-    target.querySelector('.legend-checkbox').click();
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    observer.disconnect();
-    const owners = new Set();
-    for (const record of records) {
+    const rowOf = record => {
       const node = record.target.nodeType === Node.ELEMENT_NODE
         ? record.target
         : record.target.parentElement;
-      const row = node.closest('.legend-item');
+      return node.closest('.legend-item');
+    };
+    const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    target.querySelector('.legend-checkbox').click();
+    // The checkbox dispatches an action, which settles asynchronously: wait for
+    // the row's own rewrite (a fixed two frames missed it on WebKit; so would
+    // a fixed time, where the action takes longer), then two more frames, in
+    // which a rewrite of any other row would also land.
+    while (!records.some(record => rowOf(record) === target)) await frames();
+    await frames();
+    observer.disconnect();
+    const owners = new Set();
+    for (const record of records) {
+      const row = rowOf(record);
       owners.add(row === null ? 'outside rows' : row.querySelector('.legend-label-main').textContent);
     }
     return { owners: [...owners].sort(), rows: legend.querySelectorAll('.legend-item').length };

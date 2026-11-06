@@ -148,6 +148,8 @@ async function routeDrive(context, bytes, { isPublic, heldBack = false }) {
     return route.fulfill({ status: 204, headers: CORS });
   });
   await context.route('https://accounts.google.com/gsi/client', route => route.fulfill({ status: 200, contentType: 'application/javascript', body: GIS }));
+  // Sign out takes the token back: answered here, as every host a spec reads from.
+  await context.route('https://oauth2.googleapis.com/revoke', route => route.fulfill({ status: 200, headers: { 'access-control-allow-origin': '*' }, body: '{}' }));
   await context.route('https://apis.google.com/js/api.js', route => route.fulfill({ status: 200, contentType: 'application/javascript', body: GAPI }));
   await context.route(`https://www.googleapis.com/drive/v3/files/${DRIVE_ID}?**`, route => {
     const request = route.request();

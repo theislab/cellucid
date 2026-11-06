@@ -104,6 +104,9 @@ export class AnalysisUIManager {
 
     // Current page selection (shared across mode switches)
     this._currentPages = [];
+    // Whether the shared selection was given (a person's, an action's, a
+    // page change's), not only seeded (`seedCurrentPages`).
+    this._currentPagesGiven = false;
 
     // Lifecycle ownership. Reset is reusable after settlement; destroy is
     // terminal and keeps its exact task for referential idempotency.
@@ -257,11 +260,11 @@ export class AnalysisUIManager {
         container.classList.add(`${id}-analysis-panel`, 'analysis-panel');
         // Analysis panels are built lazily, so the `id`-bearing controls they
         // contain appear and disappear with the accordion the user happens to
-        // have open. The session UI-control contributor requires an exact,
-        // stable inventory, so a session captured with one analysis panel open
-        // could not be restored with another open. Analysis settings travel in
-        // the analysis-window contributor instead, which is why the floating
-        // copies already carry this attribute.
+        // have open. The control inventory (`state-serializer/ui-controls.js`)
+        // requires an exact, stable set of ids, so a state captured with one
+        // analysis panel open could not be restored with another open.
+        // Analysis settings are the `analysis` state domain's instead, which
+        // is why the floating copies already carry this attribute.
         container.setAttribute('data-state-serializer-skip', 'true');
       } else {
         console.warn(`[AnalysisUIManager] No container available for mode: ${id}`);
@@ -299,10 +302,7 @@ export class AnalysisUIManager {
     // Skip if already active
     if (modeId === this._activeMode) {
       // Still notify of current pages in case they changed
-      const entry = this._uis.get(modeId);
-      if (entry?.ui?.onPageSelectionChange) {
-        entry.ui.onPageSelectionChange(this._currentPages);
-      }
+      this._handCurrentPages(this._uis.get(modeId));
       return true;
     }
 
@@ -319,9 +319,7 @@ export class AnalysisUIManager {
     }
 
     // Notify of current pages
-    if (entry.ui?.onPageSelectionChange) {
-      entry.ui.onPageSelectionChange(this._currentPages);
-    }
+    this._handCurrentPages(entry);
     // Changes it recorded while another mode was shown.
     entry.ui?.onShown?.();
 
@@ -353,9 +351,38 @@ export class AnalysisUIManager {
     this._activeMode = null;
   }
 
+  /**
+   * Hand the shared selection to a mode. An analysis takes pages given to it
+   * as its own, none included (`BaseAnalysisUI._assignPages`); an empty
+   * selection only seeded is not given -- there is no selection to share --
+   * so the mode shows the default its page selector offers (a "Rest of" page
+   * when no base page has cells).
+   * @param {{ui?: Object}|undefined} entry
+   * @private
+   */
+  _handCurrentPages(entry) {
+    if (typeof entry?.ui?.onPageSelectionChange !== 'function') return;
+    entry.ui.onPageSelectionChange([...this._currentPages], {
+      given: this._currentPagesGiven || this._currentPages.length > 0,
+    });
+  }
+
   // ===========================================================================
   // Page Change Notifications
   // ===========================================================================
+
+  /**
+   * Set the shared selection to the module's default (its non-empty base
+   * pages, at start and when a page change leaves no selection): validated as
+   * `setCurrentPages`, but not a selection given (see `_handCurrentPages`).
+   * @param {string[]} pageIds - Selected page IDs
+   * @param {{notifyActiveUI?: boolean}} [options] - Hand it to the active UI.
+   */
+  seedCurrentPages(pageIds, { notifyActiveUI = false } = {}) {
+    this.setCurrentPages(pageIds, { notifyActiveUI: false });
+    this._currentPagesGiven = false;
+    if (notifyActiveUI) this._handCurrentPages(this._uis.get(this._activeMode));
+  }
 
   /**
    * Set the current page selection used across modes.
@@ -426,14 +453,12 @@ export class AnalysisUIManager {
       nextPages.push(pageId);
     }
     this._currentPages = nextPages;
+    this._currentPagesGiven = true;
 
     if (!notifyActiveUI) return;
 
     // Only notify active UI
-    const entry = this._uis.get(this._activeMode);
-    if (entry?.ui?.onPageSelectionChange) {
-      entry.ui.onPageSelectionChange([...this._currentPages]);
-    }
+    this._handCurrentPages(this._uis.get(this._activeMode));
   }
 
   /**
@@ -515,6 +540,17 @@ export class AnalysisUIManager {
     }
 
     return entry.ui;
+  }
+
+  /**
+   * A mode's UI when it is made, else null: never makes it. What reads use,
+   * so reading a mode leaves the panel's analyses (state) as they were.
+   * @param {string} modeId - Mode ID
+   * @returns {Object|null}
+   */
+  peekUI(modeId) {
+    const entry = this._uis.get(modeId);
+    return entry?.initialized ? entry.ui : null;
   }
 
   /**
@@ -680,12 +716,34 @@ export class AnalysisUIManager {
         this._registry.clear();
         this._activeMode = null;
         this._currentPages = [];
+        this._currentPagesGiven = false;
         throwLifecycleErrors(
           errors,
           'Analysis UI manager destruction failed'
         );
       }
     );
+  }
+
+  /**
+   * Unmake one mode's panel (it is made again, with its opening settings,
+   * when it is next opened): what a restored state that never opened it
+   * holds (`ComparisonModule.importSessionState`). The open mode is not
+   * released.
+   *
+   * @param {string} modeId
+   * @returns {Promise<void>}
+   */
+  async releaseMode(modeId) {
+    const entry = this._uis.get(modeId);
+    if (entry === undefined || entry.initialized !== true) return;
+    if (this._activeMode === modeId) {
+      throw new Error(`The open analysis "${modeId}" cannot be released`);
+    }
+    const ui = entry.ui;
+    entry.ui = null;
+    entry.initialized = false;
+    await destroyUI(ui);
   }
 
   /**
@@ -724,6 +782,7 @@ export class AnalysisUIManager {
         }
         this._activeMode = null;
         this._currentPages = [];
+        this._currentPagesGiven = false;
         throwLifecycleErrors(errors, 'Analysis UI manager reset failed');
       }
     );

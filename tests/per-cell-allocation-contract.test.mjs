@@ -67,8 +67,8 @@ const ALLOWED = [
   },
   {
     file: 'data/anndata/transcode/zarr-writer.js',
-    allocations: ['new Uint8Array(total)', 'new Uint8Array(size)'],
-    reason: 'One chunk the converter writes (`CHUNK_BYTES`, 4 MiB), or its vlen-utf8 strings.',
+    allocations: ['new Uint8Array(size)'],
+    reason: 'One chunk the converter writes (`CHUNK_BYTES`, 4 MiB).',
   },
   {
     file: 'data/base-anndata-adapter.js',
@@ -110,6 +110,26 @@ const ALLOWED = [
     file: 'formats/hdf5/read-plan.js',
     allocations: ['new Uint8Array(needed)'],
     reason: 'A compact dataset, which the HDF5 format keeps in its object header: at most 64 KiB.',
+  },
+  {
+    file: 'formats/zarr/format-v2.js',
+    allocations: ['new Uint8Array(total)'],
+    reason: 'One vlen-utf8 chunk being written (its strings a chunk\'s, `data/anndata/write/layout.js`).',
+  },
+  {
+    file: 'formats/zarr/writer.js',
+    allocations: ['new Uint8Array(bytes.length)', 'new Uint8Array(this.chunkLength * size)', 'new Uint16Array(values.length)'],
+    reason: 'One chunk being encoded or filled (its shape the layout\'s, `data/anndata/write/layout.js`): shuffled, or the chunk of rows or of a block of columns being filled; and the float16 bits of one read of a copy (a slab, `SLAB_BYTES`, or a window of a transposition).',
+  },
+  {
+    file: 'formats/zip/writer.js',
+    allocations: [
+      'new Uint8Array(4 + 8 * values.length)', 'new Uint8Array(LOCAL_BYTES + nameBytes.length + extra.length)',
+      'new Uint8Array(CENTRAL_BYTES + nameBytes.length + extra.length)',
+      'new Uint8Array((zip64 ? ZIP64_END_BYTES + ZIP64_LOCATOR_BYTES : 0) + END_BYTES)',
+      'new Uint8Array(Math.max(DIRECTORY_SEGMENT_BYTES, record.length))',
+    ],
+    reason: 'One ZIP record: a ZIP64 field of at most three values, an entry\'s header or central record (its name at most 64 KiB), the end records, a segment of the central directory.',
   },
   {
     file: 'formats/hdf5/writer.js',

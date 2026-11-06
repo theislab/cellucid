@@ -62,6 +62,7 @@ function createHarness() {
   const calls = [];
   let pointerLockHandler = null;
   let projectileCompletion = null;
+  const presentedListeners = new Set();
   const viewer = {
     getCamerasLocked() {
       return false;
@@ -115,12 +116,17 @@ function createHarness() {
     },
     setShowOrbitAnchor(value) {
       calls.push(['setShowOrbitAnchor', value]);
+    },
+    onPresentedViewStateChanged(listener) {
+      presentedListeners.add(listener);
+      return () => presentedListeners.delete(listener);
     }
   };
   return {
     calls,
     dom,
     viewer,
+    presentedListeners,
     getPointerLockHandler: () => pointerLockHandler,
     getProjectileCompletion: () => projectileCompletion
   };
@@ -183,6 +189,7 @@ test('camera-control destroy retires DOM, pointer-lock, and projectile owners', 
     );
     assert.equal(harness.dom.projectilesEnabledCheckbox.checked, false);
     assert.equal(harness.dom.pointerLockCheckbox.checked, false);
+    assert.equal(harness.presentedListeners.size, 0, 'camera gestures are no longer observed');
     assert.deepEqual(
       notificationCalls.map(call => call[0]),
       ['loading', 'dismiss']

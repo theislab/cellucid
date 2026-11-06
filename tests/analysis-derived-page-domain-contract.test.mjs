@@ -189,6 +189,52 @@ test(
   },
 );
 
+test(
+  'an empty seeded selection reaches a mode as no choice; a given one, even empty, as a choice',
+  () => {
+    // An analysis takes pages given to it as its own, none included. The
+    // module's default (its base pages that hold cells, at start and when a
+    // page change leaves no selection) is no choice; when it is empty, handing
+    // it as one made Detailed show no page instead of its selector's default
+    // ("Rest of Page 1").
+    const seen = [];
+    const entry = {
+      config: { id: 'detailed' },
+      container: {},
+      initialized: true,
+      ui: { onPageSelectionChange: (pageIds, options) => seen.push([[...pageIds], options]) },
+    };
+    const manager = Object.create(AnalysisUIManager.prototype);
+    manager.dataLayer = createDataLayer();
+    manager._uis = new Map([['detailed', entry]]);
+    manager._registry = new Map([['detailed', entry.config]]);
+    manager._activeMode = null;
+
+    manager.seedCurrentPages([]);
+    assert.equal(manager.switchToMode('detailed'), true);
+    // The page-change default reaches the shown mode the same way.
+    manager.seedCurrentPages([], { notifyActiveUI: true });
+    // A default that names pages is the shared selection.
+    manager.seedCurrentPages([REST_OF_PAGE_1], { notifyActiveUI: true });
+    // A selection given, even none, is a choice.
+    manager.setCurrentPages([]);
+    assert.deepEqual(seen, [
+      [[], { given: false }],
+      [[], { given: false }],
+      [[REST_OF_PAGE_1], { given: true }],
+      [[], { given: true }],
+    ]);
+
+    // The analysis side: no choice leaves the selector's default to show.
+    const ui = createSelectorlessUI(BaseAnalysisUI.prototype, createDataLayer());
+    ui._currentConfig = { pages: [] };
+    ui._assignPages([], { given: false });
+    assert.equal(ui._pageSelectionToShow(), undefined);
+    ui._assignPages([]);
+    assert.deepEqual(ui._pageSelectionToShow(), []);
+  },
+);
+
 test('the four page domains are the same domain', () => {
   const dataLayer = createDataLayer();
   const baseUI = createSelectorlessUI(BaseAnalysisUI.prototype, dataLayer);

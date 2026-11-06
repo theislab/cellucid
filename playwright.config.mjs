@@ -15,6 +15,10 @@ const firefoxWebGLPreferences = Object.freeze({
 
 export default defineConfig({
   testDir: './tests/browser',
+  // The live agent specs call the real Anthropic and OpenAI APIs with the
+  // owner's keys: they are never in a CI run or a plain local run, only in
+  // `npm run test:live-agents` (tests/browser/live-agents/live-harness.mjs).
+  testIgnore: process.env.CELLUCID_LIVE_AGENTS === '1' ? [] : ['**/live-agents/**'],
   fullyParallel: false,
   forbidOnly: true,
   // Deliberately zero, in CI as well as locally, matching the policy stated in

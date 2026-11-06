@@ -82,7 +82,7 @@ test('Apply keeps the camera, the coloured field and its filter, and shows what 
   // The camera as it stands once nothing moves it any more.
   await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
-    for (let i = 0; i < 600 && !viewer.getFrameScheduleState().settled; i++) {
+    while (!viewer.getFrameScheduleState().settled) {
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
   });
@@ -92,11 +92,11 @@ test('Apply keeps the camera, the coloured field and its filter, and shows what 
   await page.locator('#subsample-method').selectOption('uniform');
   await page.locator('#subsample-seed').fill('7');
   await page.locator('#subsample-apply').click();
-  await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount), { timeout: 30_000 }).toBe(120);
+  await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount)).toBe(120);
   await expect.poll(() => page.evaluate(() => window._cellucidState.obsData.fields[window._cellucidState.activeFieldIndex]?.key ?? null)).toBe(key);
   await page.evaluate(async () => {
     const viewer = window._cellucidViewer;
-    for (let i = 0; i < 600 && !viewer.getFrameScheduleState().settled; i++) {
+    while (!viewer.getFrameScheduleState().settled) {
       await new Promise(resolve => requestAnimationFrame(resolve));
     }
   });

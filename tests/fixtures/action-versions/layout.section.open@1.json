@@ -1,0 +1,27 @@
+{
+  "examples": [
+    {
+      "open": false,
+      "section": "Visualization"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "open": {
+        "type": "boolean"
+      },
+      "section": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "section",
+      "open"
+    ],
+    "type": "object"
+  },
+  "type": "layout.section.open",
+  "version": 1
+}

@@ -15,6 +15,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -162,7 +163,7 @@ for (const [format, input, file] of [
 
       // The session records the graph (restored by the next test).
       const downloadPromise = page.waitForEvent('download');
-      await page.locator('#save-state-btn').click();
+      await clickSaveSession(page);
       sessionPath = testInfo.outputPath('knn.cellucid-session');
       await (await downloadPromise).saveAs(sessionPath);
       expect(errors).toEqual([]);
@@ -173,7 +174,7 @@ for (const [format, input, file] of [
       await openFullFixture(page, input, file);
       expect(await mappingGroup(page, 'knn')).toBe('connectivities');
       const chooserPromise = page.waitForEvent('filechooser');
-      await page.locator('#load-state-btn').click();
+      await clickLoadSession(page);
       await (await chooserPromise).setFiles(sessionPath);
       await expect.poll(() => mappingGroup(page, 'knn')).toBe('scvi_connectivities');
       expect(await edgeCount(page)).toBe(EXPECTED.knn.scvi_connectivities.n_edges);
@@ -293,7 +294,7 @@ for (const [format, input, file] of [
       // A gene only raw has is dropped, and the panel says so.
       await colourByGene(page, 'PPBP');
       const downloadPromise = page.waitForEvent('download');
-      await page.locator('#save-state-btn').click();
+      await clickSaveSession(page);
       sessionPath = testInfo.outputPath('genes.cellucid-session');
       await (await downloadPromise).saveAs(sessionPath);
       await expression.selectOption('X');
@@ -310,7 +311,7 @@ for (const [format, input, file] of [
       const errors = collectBrowserErrors(page);
       await openFullFixture(page, input, file);
       const chooserPromise = page.waitForEvent('filechooser');
-      await page.locator('#load-state-btn').click();
+      await clickLoadSession(page);
       await (await chooserPromise).setFiles(sessionPath);
       await expect.poll(() => page.evaluate(() => {
         const mapping = window._cellucidState.getDataMapping();
@@ -414,7 +415,7 @@ for (const [format, input, file] of [
 
       // The session restores the space and the threshold.
       const downloadPromise = page.waitForEvent('download');
-      await page.locator('#save-state-btn').click();
+      await clickSaveSession(page);
       sessionPath = testInfo.outputPath('latent.cellucid-session');
       await (await downloadPromise).saveAs(sessionPath);
       expect(errors).toEqual([]);
@@ -425,7 +426,7 @@ for (const [format, input, file] of [
       const latent = page.locator('#data-mapping-latent');
       await openFullFixture(page, input, file);
       const chooserPromise = page.waitForEvent('filechooser');
-      await page.locator('#load-state-btn').click();
+      await clickLoadSession(page);
       await (await chooserPromise).setFiles(sessionPath);
       await expect.poll(() => mappingGroup(page, 'latent')).toBe('X_pca');
       await expect.poll(() => activeOutliers(page)).toEqual({
@@ -510,7 +511,7 @@ for (const [format, input, file] of [
       expect(await page.evaluate(
         () => window._cellucidViewer.hasVectorFieldForLayout('velocity', 'X_pca[2,3]')
       )).toBe(false);
-      await page.locator('#save-state-btn').click();
+      await clickSaveSession(page);
       sessionPath = testInfo.outputPath('vectors.cellucid-session');
       await (await downloadPromise).saveAs(sessionPath);
       expect(errors).toEqual([]);
@@ -521,7 +522,7 @@ for (const [format, input, file] of [
       await openFullFixture(page, input, file);
       expect((await mappingGroup(page, 'vectorFields')).length).toBe(2);
       const chooserPromise = page.waitForEvent('filechooser');
-      await page.locator('#load-state-btn').click();
+      await clickLoadSession(page);
       await (await chooserPromise).setFiles(sessionPath);
       await expect.poll(() => mappingGroup(page, 'vectorFields')).toEqual([]);
       expect(errors).toEqual([]);

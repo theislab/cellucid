@@ -4,15 +4,28 @@
  * host: one per file) reuses the reader worker's opened store and the gene
  * index segments of the cells both openings share, while the store's
  * version is unchanged (`httpStore.version` / `unchanged`, one `HEAD` of its
- * consolidated metadata); a new version, or a host that names none, opens it
- * anew.
+ * consolidated metadata), or its validators moved and what was read is the
+ * same (a site deployed again gives every file new ones); other bytes, or a
+ * host that names no version, open it anew.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+// The link too: the host below is a function in this process, so what its
+// requests measure is how busy this machine is, never a link. Measured, a
+// loaded runner's 900-cell opening took over no index of the 300 cells open
+// before it (`undefined !== 300`, Web contracts run 42180511574, Windows).
+// With every interval timed 40 times longer it does so on every run: the
+// first gene of its 900 cells is priced at 14.7 s, genes are read for 8 of
+// them, and the share opens in the file's cell order, of which the cells
+// open before are no prefix.
+import { LINK_AT_REST, holdMachineAtRest } from './helpers/machine-at-rest.mjs';
 
 import { annData, categorical, dataFrame, dense, mapping, sparse, strings, zarrEntries } from './helpers/anndata-store.mjs';
-import { createAnnDataReaderHandler } from '../assets/js/data/anndata-reader-worker.js';
+import { cellsToOpen, createAnnDataReaderHandler } from '../assets/js/data/anndata-reader-worker.js';
 import { createMulberry32 } from '../assets/js/app/utils/random-utils.js';
+
+holdMachineAtRest({ link: LINK_AT_REST });
 
 const CELLS = 1200;
 const GENES = 60;
@@ -98,7 +111,9 @@ function handler() {
   };
 }
 
-const request = k => ({ mode: 'subsample', method: 'uniform', k, seed: 7, strict: true });
+// Genes read for every open cell, whatever the link: fitted, a gene sample follows what the reads
+// measured, and a loaded machine measures the fake host in tens of KB/s (8 of 900 cells on a CI runner).
+const request = k => ({ mode: 'subsample', method: 'uniform', k, seed: 7, strict: true, genes: 'all' });
 
 async function indexBuilt(call) {
   for (let wait = 0; (await call('geneReadPlan', 'X')).built !== true; wait++) {
@@ -128,12 +143,18 @@ for (const [label, validatorOf] of [
     assert.equal(raised.nObs, 900);
     const plan = await call('geneReadPlan', 'X');
     assert.equal(plan.progressive?.done, 300, 'the index of the first 300 cells is taken over');
-    // A new version of the store: opened anew.
+    // Deployed again with the same bytes: its validators moved, what was read decides.
     version = 2;
+    const deployed = await call('open', { source, cellSubset: request(450), reopen: true });
+    assert.equal(deployed.sameVersion, true, 'the same bytes: the store is taken over');
+    // A new version of the store: other bytes, opened anew.
+    version = 3;
+    for (const [key, bytes] of files) if (key !== '.zmetadata') files.set(key, bytes.map(byte => byte ^ 0x5a));
     const again = requests.length;
-    await call('open', { source, cellSubset: request(450), reopen: true });
+    const opened = await call('open', { source, cellSubset: request(400), reopen: true }).catch(error => error);
     const reread = requests.slice(again).filter(item => item.key === '.zmetadata').map(item => item.method);
-    assert.deepEqual(reread, ['HEAD', 'GET'], 'a store of another version is read again');
+    assert.deepEqual(reread, ['HEAD', 'GET', 'GET'], 'a store of another version is read again');
+    assert.notEqual(opened.sameVersion, true);
     await call('close');
   });
 }
@@ -148,6 +169,20 @@ test('a folder whose host names no version is opened anew on Apply', async t => 
   await call('open', { source, cellSubset: request(600), reopen: true });
   assert.deepEqual(requests.slice(before).filter(item => item.key === '.zmetadata').map(item => item.method), ['GET']);
   await call('close');
+});
+
+test('a progressive opening is planned only where it can grow in place: a folder whose host names no version opens every cell at once', () => {
+  // Each step of a growth reads the same bytes again; a folder no later
+  // reading can tell to be the same is read anew, other cells than those
+  // shown, and its growth stopped at the first view (the Garcia sample on
+  // a host naming no validator: 48,860 of 219,731 cells, "A progressive
+  // opening step read other cells than the ones shown and more").
+  const asked = { mode: 'all', progressive: { targetMs: 1000, msPerCell: 0.02 } };
+  assert.deepEqual(cellsToOpen(asked, { key: null, folder: { version: null } }), { mode: 'all' }, 'every cell at once');
+  assert.equal(cellsToOpen(asked, { key: null, folder: { version: '"v1"' } }), asked, 'a versioned folder grows');
+  assert.equal(cellsToOpen(asked, { key: '["file","a.h5ad",1,2]', folder: null }), asked, 'a file by its key grows');
+  assert.equal(cellsToOpen({ mode: 'all' }, { key: null, folder: { version: null } }).progressive, undefined);
+  assert.equal(cellsToOpen(null, { key: null, folder: null }), null);
 });
 
 test('a folder read at a version naming its content is taken over on every reading again, though its host shows the page no validator', async t => {
@@ -176,22 +211,30 @@ test('a folder read at a version naming its content is taken over on every readi
   await call('close');
 });
 
-test('a store rewritten with byte-identical metadata is opened anew when its host names a write time', async t => {
+test('a store with byte-identical metadata and a new write time: the bytes read decide, not the time', async t => {
   // An ETag made from the bytes (S3, GitHub) stays when the metadata is
-  // written again with the same bytes; the write time moves.
+  // written again with the same bytes; the write time moves, as it does for a
+  // site deployed again with the same files.
   const files = storeFiles();
   let written = 'Mon, 26 Oct 2026 10:00:00 GMT';
   const requests = serveStore(t, files, key => ({ etag: `"sha-${key.length}"`, modified: written }));
   const call = handler();
   const source = { url: BASE, name: 'store.zarr' };
   await call('open', { source, cellSubset: request(300) });
+  await call('getMatrixColumn', 'X', 3);
+  await indexBuilt(call);
   let before = requests.length;
   await call('open', { source, cellSubset: request(600), reopen: true });
   assert.deepEqual(requests.slice(before).filter(item => item.key === '.zmetadata').map(item => item.method), ['HEAD'], 'unchanged: taken over');
   written = 'Tue, 27 Oct 2026 09:00:00 GMT';
+  const deployed = await call('open', { source, cellSubset: request(900), reopen: true });
+  assert.equal(deployed.sameVersion, true, 'written again with the same bytes: taken over');
+  written = 'Wed, 28 Oct 2026 09:00:00 GMT';
+  for (const [key, bytes] of files) if (key !== '.zmetadata') files.set(key, bytes.map(byte => byte ^ 0x5a));
   before = requests.length;
-  await call('open', { source, cellSubset: request(900), reopen: true });
-  assert.deepEqual(requests.slice(before).filter(item => item.key === '.zmetadata').map(item => item.method), ['HEAD', 'GET'], 'written again: opened anew');
+  const rewritten = await call('open', { source, cellSubset: request(800), reopen: true }).catch(error => error);
+  assert.deepEqual(requests.slice(before).filter(item => item.key === '.zmetadata').map(item => item.method), ['HEAD', 'GET', 'GET'], 'other bytes: opened anew');
+  assert.notEqual(rewritten.sameVersion, true);
   await call('close');
 });
 

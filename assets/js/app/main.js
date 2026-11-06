@@ -26,12 +26,29 @@ import {
   initUI
 } from './ui/core/ui-coordinator.js';
 import {
-  createSessionSerializer
+  createSessionSerializer,
+  SAVE_DEFAULTS
 } from './session/index.js';
+import { createViewCarry } from './session/view-carry.js';
+import { providePersistenceActions } from './history/persistence-actions.js';
+import { provideAnnDataCopyAction } from './history/anndata-copy-save.js';
+import { createSpool } from './exports/cell-exports.js';
+import { keptLocalFile } from './library/local-file-handles.js';
+import { capturePageChrome, planPageChrome } from './state-serializer/ui-controls.js';
+import { downloadBlob } from './utils/download.js';
+import { datasetFactsOf } from './ui/modules/state/dataset-facts.js';
+import { cellucidCitationReader } from './citation.js';
+import { getActions, getStateDomains } from './actions/index.js';
+import { createDatasetHistories } from './history/dataset-history.js';
+import { onHistorySettingsChange } from './history/history-settings.js';
+import { recordDatasetOpened } from './library/my-datasets.js';
+import { hasPendingConnectCode } from './agent/bridge/connect-code.js';
+import { createAgentCalls } from './agent/bridge/agent-calls.js';
 import {
   classifyAdvertisedDatasetStateRestoreError,
   restoreCurrentDatasetState
 } from './session/catalog-default-session.js';
+import { isOtherSessionFormat } from './session/bundle/format.js';
 import {
   createDatasetRuntimeRetirementOwner,
   createLatestDatasetPublicationContinuationOwner,
@@ -42,7 +59,13 @@ import {
   stageDatasetPositionPayload
 } from './dataset-reload-outcome.js';
 import { initDockableAccordions } from './dockable-accordions.js';
-import { setDockableAccordions } from './dockable-accordions-registry.js';
+import { getDockableAccordions, setDockableAccordions } from './dockable-accordions-registry.js';
+import { installStateDomains } from './state/domains/index.js';
+import { installSettingsActions } from './ui/modules/settings-actions.js';
+import { installLayoutActions } from './ui/modules/layout-actions.js';
+import { installReadActions } from './reads/index.js';
+import { describeOpenDataset } from './reads/dataset.js';
+import { installAnalysisActions } from './analysis/actions.js';
 import { getNotificationCenter } from './notification-center.js';
 import { installMatrixShareNotices } from './matrix-share-notices.js';
 import { showReadProgress } from './read-progress-notifications.js';
@@ -80,7 +103,7 @@ import { createMappingLayoutProvider } from './state/managers/mapping-manager.js
 import { createVectorFieldManager, resolveVectorFields } from '../data/vector-field-manager.js';
 import { anndataCellIdentity, anndataCellPriority, createCandidateAnnDataBinding } from '../data/anndata-provider.js';
 import { parseSubsampleUrlParameters } from './subsample-url.js';
-import { setNextCellSubsetRequest, setTabCellSubsetRequest } from '../data/cell-subset-policy.js';
+import { setNextCellSubsetRequest, setTabCellSubsetRequest, withdrawNextCellSubsetRequest } from '../data/cell-subset-policy.js';
 import { getDataSourceManager } from '../data/data-source-manager.js';
 import { getTransferLog } from '../data/transfer-log.js';
 import { getReadActivityLog } from '../data/read-activity-log.js';
@@ -94,15 +117,18 @@ import {
 } from '../data/viewer-host-source.js';
 import {
   createViewerHostCommandHandlers
-} from './viewer-host-command-handler.js';
-import { createViewerHostResults } from './viewer-host-results.js';
-import { createHighlightDraft } from './highlight-draft.js';
+} from './viewer-host/command-handler.js';
+import { createViewerHostHistoryEvents } from './viewer-host/history-events.js';
+import { getCurrentHistory, subscribeCurrentHistory } from './history/current.js';
+import { dispatchFromControl } from './actions/control-dispatch.js';
+import { viewNameOf } from './actions/targets/views.js';
+import { createViewerHostResults } from './viewer-host/results.js';
 import { createOpenCellsResize } from './open-cells-resize.js';
 import { recordFirstFrame } from '../data/opening-cost.js';
 import { runAfterNextFrame } from '../rendering/frame-phases.js';
 import {
   createViewerHostPointerDelivery
-} from './viewer-host-pointer-delivery.js';
+} from './viewer-host/pointer-delivery.js';
 // benchmark module is lazy-loaded when needed
 import {
   DataSourceError,
@@ -160,6 +186,11 @@ debug.log('Starting…');
 
 const BENCHMARK_GPU_ESTIMATE_BYTES_PER_POINT = 28;
 const MEBIBYTE = 1024 * 1024;
+/** Said of a published sample view of another session format: the dataset itself is open, nothing is wrong with it. */
+const SAMPLE_VIEW_NOT_YET = 'This dataset\u2019s starting view isn\u2019t available right now, so it opens on its default view.';
+
+/** The page chrome sessions and saved states carry outside the history (CEL-0249). */
+const PAGE_CHROME = Object.freeze({ capture: () => capturePageChrome(), plan: chrome => planPageChrome(chrome) });
 
 /**
  * Edges a millisecond one pass of `forwardEdgeRows` walks, before this page
@@ -251,7 +282,7 @@ void sweepAbandonedTranscodes();
     const sidebar = document.getElementById('sidebar');
     const renderModeSelect = document.getElementById('render-mode');
 
-    setDockableAccordions(initDockableAccordions({ sidebar }));
+    setDockableAccordions(initDockableAccordions({ sidebar, actions: getActions() }));
 
     // The notification center is created before the first yield below, so
     // whatever fails or reports from here on has somewhere to be announced.
@@ -262,11 +293,13 @@ void sweepAbandonedTranscodes();
     // A subsample the link names (`subsample-url.js`): the linked dataset
     // opens with exactly it, overriding fitting to the device; a share also
     // applies to datasets opened next in this tab. A malformed one is said
-    // by name, and the dataset opens as if it named none.
+    // by name, and the dataset opens as if it named none. Startup's opening
+    // that never reached its reader leaves it to no later opening (below).
+    let linkedCells = null;
     try {
       const linked = parseSubsampleUrlParameters(urlParams);
       if (linked !== null) {
-        setNextCellSubsetRequest(linked);
+        linkedCells = setNextCellSubsetRequest(linked);
         if (linked.mode === 'all' || linked.percent !== undefined) {
           setTabCellSubsetRequest(linked.mode === 'all' ? linked : { ...linked, strict: false });
         }
@@ -289,7 +322,9 @@ void sweepAbandonedTranscodes();
     }
 
     initWelcomeModal();
-    if (shouldShowWelcome) {
+    // A page opened to approve an agent's connection (the relay's link) goes
+    // straight to that question (`app/agent/connect/`), without the welcome.
+    if (shouldShowWelcome && !hasPendingConnectCode()) {
       showWelcomeModal();
     }
     // The analysis panel and windows are imported on demand: requested now,
@@ -318,7 +353,11 @@ void sweepAbandonedTranscodes();
     const connectivityInfo = document.getElementById('connectivity-info');
     let ui = null;
     let sidebarLayout = null;
+    /** Removers of the actions and reads provided here (settings, layout, reads, analyses). */
+    const actionOwners = [];
     let comparisonModule = null;
+    /** Withdraws the state domains' owners (`app/state/domains/`), once installed. */
+    let uninstallStateDomains = null;
     /** Unwires the page from the memory model (`app/page-memory.js`), once wired. */
     let stopPageMemory = null;
     // The owner of every dataset change (`createLatestDatasetReloadCoordinator`),
@@ -379,10 +418,15 @@ void sweepAbandonedTranscodes();
         // until then.
         ...(pageLeaving ? [] : [() => retireAnnDataReaderWorkers()]),
         () => stopPerfMonitoring(),
+        // Every action under way ends before the owners of its state go: it
+        // records nothing and puts nothing back into a withdrawn owner.
+        () => getActions().retire(),
+        ...(uninstallStateDomains === null ? [] : [() => uninstallStateDomains()]),
         ...(comparisonModule === null
           ? []
           : [() => comparisonModule.destroy()]),
         ...(ui === null ? [] : [() => ui.destroy()]),
+        ...actionOwners.splice(0).map(remove => () => remove()),
         ...(sidebarLayout === null ? [] : [() => sidebarLayout.destroy()]),
         ...(stopPageMemory === null ? [] : [() => stopPageMemory()]),
         () => viewer.dispose()
@@ -402,7 +446,18 @@ void sweepAbandonedTranscodes();
     // The sidebar toggle is painted with the first frame, and on a phone it is
     // the only way out of the full-screen menu, so it works from now on rather
     // than from the end of the first dataset load.
-    sidebarLayout = initSidebarLayout({ documentOwner: document, viewer });
+    sidebarLayout = initSidebarLayout({ documentOwner: document, viewer, actions: getActions() });
+    // Settings and layout are actions from here: what a person changes is
+    // recorded, and an agent, a notebook or a replay changes it the same way.
+    actionOwners.push(
+      installSettingsActions({ sidebar, actions: getActions() }),
+      installLayoutActions({
+        actions: getActions(),
+        dockable: getDockableAccordions(),
+        describeSidebar: sidebarLayout.describeSidebar,
+        themeSelect,
+      })
+    );
 
     const state = createDataState({ viewer, labelLayer });
     // A matrix read after its map: its pass said, its genes read on arrival.
@@ -518,15 +573,13 @@ void sweepAbandonedTranscodes();
 
     // Initialize DataSourceManager
     const dataSourceManager = getDataSourceManager();
-    // Unsaved highlights survive a reload: a draft per dataset in this
-    // browser, offered when the dataset opens again (`highlight-draft.js`).
-    const highlightDraft = createHighlightDraft({
-      state,
-      notifications,
-      datasetKey: () => dataSourceManager.getCurrentDatasetId?.() ?? null,
-      datasetName: () => dataSourceManager.getCurrentMetadata?.()?.name ?? null
-    });
-    window.addEventListener('pagehide', () => { void highlightDraft.flush(); });
+    // The history of the dataset shown (`history/dataset-history.js`), made
+    // once the session owner exists (below): opened when a dataset is
+    // published, begun once its starting view is applied, retired before any
+    // other runtime is published. What it changed is kept in this browser as
+    // it is made; leaving the page writes what is still waiting.
+    let datasetHistories = null;
+    window.addEventListener('pagehide', () => { void datasetHistories?.flush(); });
     datasetReloadCoordinator = createLatestDatasetReloadCoordinator(
       () => {
         const source = dataSourceManager.activeSource;
@@ -635,7 +688,7 @@ void sweepAbandonedTranscodes();
 
     // Check if a viewer host (Python, Jupyter or R) opened this page
     let viewerHostSource = null;
-    // What the person makes, published to the host (app/viewer-host-results.js).
+    // What the person makes, published to the host (app/viewer-host/results.js).
     let viewerHostResults = null;
     /** The open cells grown or cut in place (`open-cells-resize.js`), once the UI is up. */
     let openCellsResize = null;
@@ -1391,14 +1444,20 @@ void sweepAbandonedTranscodes();
     }
 
     // Everything that shows or acts on the shown cells outside the live
-    // scene: kept views, the in-progress selection, open field interactions,
-    // and the connectivity edges. Each goes before the replacement touches
-    // DataState or the viewer. Kept views go first, so the live view is the
+    // scene: the dataset's history, kept views, the in-progress selection,
+    // open field interactions, and the connectivity edges. Each goes before
+    // the replacement touches DataState or the viewer. The history goes
+    // first: it stops recording, and a jump under way puts nothing more back
+    // (its autosave finishes writing what changed). The same dataset read
+    // again on other cells (`keepHistory`: Cells to open, or a history step
+    // shown that reads them) keeps its history: the reading is a step of it,
+    // or one of its steps shown. Kept views go next, so the live view is the
     // focused one when the rest retire. The viewer drops its edge graph when
     // new points are loaded, so an edge owner retired any later still answers
     // the replacement's first visibility notification and asks the viewer
     // about a graph it no longer has.
-    function retireDatasetInteractions() {
+    function retireDatasetInteractions({ keepHistory = false } = {}) {
+      if (!keepHistory) void datasetHistories?.retire();
       retireKeptViews();
       retireInProgressHighlightSelection();
       ui?.prepareDatasetReplacement?.();
@@ -1779,7 +1838,7 @@ void sweepAbandonedTranscodes();
 
     function commitDatasetRuntimeStage(
       stage,
-      { restorationPublication = null } = {}
+      { restorationPublication = null, keepHistory = false } = {}
     ) {
       if (
         stage === null ||
@@ -1806,7 +1865,7 @@ void sweepAbandonedTranscodes();
       // This function is intentionally synchronous. The reload transaction is
       // checked immediately before this sole publication call, so no newer
       // selection can interleave with the dataset-owned state replacement.
-      retireDatasetInteractions();
+      retireDatasetInteractions({ keepHistory });
       DATASET_BASE_URL = stage.baseUrl;
       dimensionManager = stage.dimensionManager;
       obs = stage.generation.obsFields;
@@ -1943,13 +2002,13 @@ void sweepAbandonedTranscodes();
     // not. Its connectivity edges were retired with the attempt (they are
     // read again when edges are next turned on), so the controls are
     // republished for the restored graph.
-    function restorePreviousRuntime(stage, restorationPublication) {
+    function restorePreviousRuntime(stage, restorationPublication, { keepHistory = false } = {}) {
       if (stage === null) {
         publishEmptyDatasetRuntime({ restorationPublication });
       } else if (stage.runtimeKind === 'synthetic') {
         commitSyntheticRuntimeStage(stage, { restorationPublication });
       } else {
-        commitDatasetRuntimeStage(stage, { restorationPublication });
+        commitDatasetRuntimeStage(stage, { restorationPublication, keepHistory });
       }
       connectivityRuntimeOwner.synchronizeDatasetPublication();
     }
@@ -2074,16 +2133,10 @@ void sweepAbandonedTranscodes();
               : `Loaded a neighbour graph of ${formatCountOf(publishedGraph.n_edges, 'edge')}.`);
           }
           ui.refreshDatasetUI(activeMetadata);
-          // Highlights of this dataset not saved in a session, kept from
-          // an earlier visit: offered back.
-          void highlightDraft.datasetOpened().catch(error => {
-            console.warn('[Main] Reading the highlight draft failed:', error);
-          });
           // The notebook learns the mapping each dataset opens with.
           if (viewerHostSource !== null && state.getDataMapping() !== null) {
             void viewerHostSource.notifyDataMapping({
               origin: state.getDataMappingOrigin(),
-              requestId: null,
               mapping: state.getDataMapping()
             }).catch(error => {
               console.error('[Main] Viewer host data-mapping report failed:', error);
@@ -2423,12 +2476,16 @@ void sweepAbandonedTranscodes();
       let publication;
       const previousRuntimeStage = activeRuntimeStage;
       const previousPublication = activeDatasetPublication;
+      // The open dataset read again on other cells (Cells to open, or a
+      // history step shown that reads them) keeps its history: the reading
+      // is one of its steps, and its starting view is not put back again.
+      const keepHistory = loadMethod === DATA_LOAD_METHODS.SUBSAMPLE && (datasetHistories?.current() ?? null) !== null;
       try {
-        publication = commitDatasetRuntimeStage(runtimeStage);
+        publication = commitDatasetRuntimeStage(runtimeStage, { keepHistory });
       } catch (runtimeError) {
         let restorationError = null;
         try {
-          restorePreviousRuntime(previousRuntimeStage, previousPublication);
+          restorePreviousRuntime(previousRuntimeStage, previousPublication, { keepHistory });
         } catch (error) {
           restorationError = error;
         }
@@ -2451,6 +2508,9 @@ void sweepAbandonedTranscodes();
           );
         } catch (error) {
           retirementError = error;
+        }
+        if (restorationError === null && managerRollbackError === null && !keepHistory) {
+          restartShownDatasetHistory(previousRuntimeStage);
         }
         const rollbackErrors = [
           runtimeError,
@@ -2481,6 +2541,15 @@ void sweepAbandonedTranscodes();
           }
         });
       }
+      // The dataset shown now has its history (kept, when it is the same
+      // dataset read again); a new one's first tracker starts once its
+      // starting view is applied (`beginShownDatasetHistory`, below).
+      const shownHistory = keepHistory
+        ? datasetHistories.current()
+        : datasetHistories.open({
+            id: dataSourceManager.getCurrentIdentityId(),
+            name: selectionStage.metadata?.name ?? datasetName
+          });
       // What showing a cell costs this page, for the next opening's first
       // view: these cells, from their GPU stores to their first frame.
       if (showingStartedAt !== null) {
@@ -2571,12 +2640,23 @@ void sweepAbandonedTranscodes();
       // still fail and leave this dataset in place. Startup's sidecar
       // requests are deadline-bound startup steps; an interactive switch's
       // end with the publication that owns them.
-      const stateOutcome = await restoreAdvertisedDatasetState({
-        requestStep: isStartupLoad
-          ? (url, operation) => startup.step('session', url, operation)
-          : (_url, operation) => operation(publication.signal),
-        signal: publication.signal
-      });
+      const stateOutcome = keepHistory
+        ? { status: 'ready' }
+        : await restoreAdvertisedDatasetState({
+            requestStep: isStartupLoad
+              ? (url, operation) => startup.step('session', url, operation)
+              : (_url, operation) => operation(publication.signal),
+            signal: publication.signal
+          });
+      // Its starting view applied (or none, or one that failed): the
+      // dataset's first tracker starts from what is shown.
+      if (publication.isCurrent() === true) await beginShownDatasetHistory(shownHistory);
+      // My datasets (`library/my-datasets.js`): a dataset the person opened
+      // (the startup's default sample is not one), or the same one read on
+      // other cells, which only updates it.
+      if (publication.isCurrent() === true && loadMethod !== DATA_LOAD_METHODS.DEFAULT_DEMO) {
+        void recordDatasetOpened(dataSourceManager, { counted: !keepHistory });
+      }
       const settledStateOutcome =
         await settlePublishedDatasetStateOutcome({
           outcome: stateOutcome,
@@ -2717,6 +2797,7 @@ void sweepAbandonedTranscodes();
             rollbackErrors.push(error);
           }
         }
+        if (rollbackErrors.length === 1) restartShownDatasetHistory(previousRuntimeStage);
         throw rollbackErrors.length === 1
           ? runtimeError
           : new AggregateError(
@@ -2894,18 +2975,87 @@ void sweepAbandonedTranscodes();
     // Smoke volume is built lazily when switching to smoke mode
     // (no initial build to save startup time)
 
+    // Session files hold the history of the dataset shown (format 4).
     const sessionSerializer = createSessionSerializer({
       state,
-      viewer,
-      sidebar,
-      dataSourceManager
+      dataSourceManager,
+      getHistory: () => datasetHistories?.current() ?? null,
+      dispatcher: getActions(),
+      // A loaded session plays its camera path when it was saved with Autoplay on.
+      onLoaded: () => { ui?.cinematicCamera?.startAutoplay(); },
+      // The page chrome sessions carry outside the history: the selection tool (CEL-0249).
+      chrome: PAGE_CHROME,
     });
-    // Highlights a session file holds (saved or restored) are no unsaved
-    // draft: the draft of them goes.
-    sessionSerializer.setSessionFileObserver({
-      saving: () => highlightDraft.sessionSaving(),
-      restored: () => highlightDraft.sessionRestored()
+    datasetHistories = createDatasetHistories({
+      dispatcher: getActions(),
+      domains: getStateDomains(),
+      notifications,
+      header: () => sessionSerializer.captureSessionHeader(),
+      loadSavedHistory: (open, options) => sessionSerializer.loadSavedHistory(open, options),
+      // A saved state opens its dataset first, as a session file does (the session controls).
+      openSavedState: id => ui.openSavedState(id),
+      chrome: PAGE_CHROME,
     });
+    // The history written down or read out (methods, pseudocode, saved states, Share, Save in this browser).
+    providePersistenceActions({
+      dispatcher: getActions(),
+      histories: datasetHistories,
+      serializer: sessionSerializer,
+      datasetFacts: datasetFactsOf({ state, dataSourceManager }),
+      citation: cellucidCitationReader(),
+      download: (blob, filename) => downloadBlob(blob, filename),
+    });
+    // "Save AnnData with this state…": a new .zarr.zip of the dataset with the state shown applied.
+    provideAnnDataCopyAction({
+      dispatcher: getActions(),
+      histories: datasetHistories,
+      serializer: sessionSerializer,
+      state,
+      adapter: () => shownAnnDataSource()?.getAdapter?.() ?? null,
+      datasetFacts: datasetFactsOf({ state, dataSourceManager }),
+      // The dataset's own file, when it was opened from this computer: a copy never goes over it.
+      sourceHandle: async () => {
+        const datasetId = dataSourceManager.getCurrentDatasetId?.() ?? null;
+        const kept = datasetId === null ? null : await keptLocalFile(datasetId);
+        return kept?.kind === 'file' ? kept.handle : null;
+      },
+      createSpool,
+      download: (blob, filename) => downloadBlob(blob, filename),
+      notifications,
+    });
+    // What a re-read of the open dataset with other cells keeps (Cells to open).
+    const viewCarry = createViewCarry({ domains: getStateDomains() });
+
+    /**
+     * Start the first tracker of the dataset shown, once its starting view is
+     * applied. A history that cannot start leaves the dataset open with its
+     * steps unrecorded, and says so once.
+     */
+    async function beginShownDatasetHistory(history) {
+      try {
+        await datasetHistories.begin(history);
+      } catch (error) {
+        console.error('[Main] The history of the dataset could not start:', error);
+        notifications.error(
+          'The dataset is open, but its history could not start, so its steps are not recorded and cannot be undone.',
+          { category: 'session', title: 'History unavailable', details: error instanceof Error ? error.message : String(error) }
+        );
+      }
+    }
+
+    /**
+     * A replacement that failed after the history was retired shows the
+     * previous dataset again: its history starts again from what is shown
+     * (the steps before are kept in this browser and offered to continue).
+     */
+    function restartShownDatasetHistory(previousStage) {
+      if (previousStage === null || previousStage?.runtimeKind !== 'dataset') return;
+      const history = datasetHistories.open({
+        id: dataSourceManager.getCurrentIdentityId(),
+        name: dataSourceManager.getCurrentMetadata?.()?.name ?? null
+      });
+      void beginShownDatasetHistory(history);
+    }
     // A graphics reset keeps everything in the page; the session is
     // captured at the loss in case the context does not come back.
     keepSessionThroughGraphicsReset({ viewer, sessionSerializer, notifications });
@@ -2965,6 +3115,14 @@ void sweepAbandonedTranscodes();
           // A startup request that stalled ends startup on its failure
           // surface, naming the phase and URL, not as a missing sample view.
           if (error?.code === STARTUP_STALL_CODE) throw error;
+          // A whole sample view of another session format: the app and the
+          // datasets are deployed minutes apart. Nothing is wrong with the
+          // dataset, which opens on the store's own default view.
+          if (isOtherSessionFormat(error)) {
+            console.info('[Main] The sample view is of another session format for now:', error.message);
+            notifications.info(SAMPLE_VIEW_NOT_YET, { category: 'data' });
+            return { status: 'ready' };
+          }
           const message = error instanceof Error
             ? error.message
             : String(error);
@@ -3007,10 +3165,9 @@ void sweepAbandonedTranscodes();
     if (viewerHostSource) {
       viewerHostSource.onMessage(async message => {
         if (message.type !== 'requestSessionBundle') return;
-        const saved = highlightDraft.sessionSaving();
-        const bundle = await sessionSerializer.createSessionBundle();
+        // The notebook gets the history as Save writes it (without the conversations).
+        const bundle = await sessionSerializer.createSessionBundle({ choice: SAVE_DEFAULTS });
         viewerHostSource.sendSessionBundle(message.requestId, bundle);
-        await saved();
       });
     }
 
@@ -3029,10 +3186,22 @@ void sweepAbandonedTranscodes();
       },
       datasetChanges: datasetReloadCoordinator,
       sessionSerializer,
+      datasetHistories,
+      viewCarry,
       dataSourceManager,
       viewerHostSource
     });
     window._cellucidUi = ui;
+    window._cellucidHistories = datasetHistories;
+    // What an agent, a notebook or a test reads of the open dataset.
+    actionOwners.push(installReadActions({
+      actions: getActions(),
+      state,
+      viewer,
+      dataSourceManager,
+      documentRef: document,
+      getFigureExport: () => ui?.figureExport ?? null
+    }));
     // The data controls are live from here: a dataset the person chooses
     // from now on decides what startup opens (`defaultSample`).
     const controlsLiveAt = datasetReloadCoordinator.actionSequence;
@@ -3060,9 +3229,7 @@ void sweepAbandonedTranscodes();
         },
         retireKeptViews,
         retireSelections: retireInProgressHighlightSelection,
-        keptViews: sessionSerializer === null
-          ? null
-          : { capture: () => sessionSerializer.captureViewCarry(), restore: record => sessionSerializer.restoreViewCarry(record) },
+        keptViews: { capture: () => viewCarry.captureKeptViews(), restore: record => viewCarry.restore(record) },
         connectivity: {
           getConnectivityGraph: connectivityRuntimeOwner.getConnectivityGraph,
           replaceConnectivityGraph: connectivityRuntimeOwner.replaceConnectivityGraph,
@@ -3076,6 +3243,8 @@ void sweepAbandonedTranscodes();
         adoptMetadata: metadata => dataSourceManager.adoptResizedMetadata(metadata),
         afterResize: async () => {
           ui.refreshOpenCells(dataSourceManager.getCurrentMetadata());
+          // My datasets keeps the cells it is open with now.
+          void recordDatasetOpened(dataSourceManager, { counted: false });
           if (viewerHostResults !== null) await viewerHostResults.resync();
         }
       }
@@ -3098,51 +3267,88 @@ void sweepAbandonedTranscodes();
         viewerHostSource,
         getCellIdentity
       });
+      // The host's actions, dispatched as the host's, and the session files
+      // it pushes, loaded as the person's Load loads one (`command-handler.js`).
       const viewerHostCommandHandlers = createViewerHostCommandHandlers({
-        state,
-        viewer,
-        refreshUi: ui.refreshUiAfterStateLoad,
-        reportDataMapping: report => viewerHostSource.notifyDataMapping(report),
-        getCellIdentity,
         getShownHostDataset: () => viewerHostSource.getShownHostDataset(),
-        results: viewerHostResults,
-        getHostLabel: () => viewerHostSource.getHostLabel()
+        getHostLabel: () => viewerHostSource.getHostLabel(),
+        getHostLanguage: () => viewerHostSource.getHostLanguage(),
+        actions: getActions(),
+        loadSession: async file => {
+          await sessionSerializer.restoreFromBlob(file);
+          const tree = datasetHistories.current()?.active ?? null;
+          if (tree === null) throw new Error('The session was read, but no history shows it.');
+          return { tracker: { id: tree.id, name: tree.name }, head: tree.headId };
+        }
       });
-      // Every mapping change reaches the notebook, except an answer to its
-      // own setDataMapping, which the command handler sends with the request
-      // id it names.
+      // Every change of the history reaches the host (`history-events.js`).
+      createViewerHostHistoryEvents({
+        notify: change => viewerHostSource.notifyHistoryChanged(change),
+        getCurrentHistory,
+        subscribeCurrentHistory,
+        onError: error => console.error('[Main] Viewer host history report failed:', error)
+      });
+      // Every mapping change reaches the notebook, its own `mapping.set`
+      // too (origin `notebook`): the action's answer says only that it ran.
       state.on('mapping:changed', ({ mapping, origin }) => {
-        if (origin === 'notebook') return;
         void viewerHostSource.notifyDataMapping({
           origin,
-          requestId: null,
           mapping
         }).catch(error => {
           console.error('[Main] Viewer host data-mapping report failed:', error);
         });
       });
-      viewerHostSource.onHighlight(
-        viewerHostCommandHandlers.handleHighlight
-      );
-      viewerHostSource.onMessage(
-        viewerHostCommandHandlers.handleMessage
-      );
+      viewerHostSource.onAction(viewerHostCommandHandlers.handleAction);
+      viewerHostSource.onLoadSession(viewerHostCommandHandlers.handleLoadSession);
+      // An agent app on this computer driving this viewer through the
+      // host's `cellucid mcp` (`agent/bridge/agent-calls.js`): its calls run
+      // as the agent through a local connection, under the person's
+      // permissions, asked in the confirm card and answered back to the host.
+      const agentPresence = ui.agents?.presence ?? null;
+      const localAgentCalls = createAgentCalls({
+        actions: getActions(),
+        kind: 'local',
+        permissionFor: question => agentPresence?.permissionFor(question) ?? null,
+        questionFor: signal => agentPresence?.questionFor(signal) ?? null,
+        onResult: (id, result) => viewerHostSource.sendAgentResult(id, result),
+        onAsking: (id, question) => viewerHostSource.sendAgentAsking(id, question),
+        onAnswered: (id, allowed) => viewerHostSource.sendAgentAnswered(id, allowed),
+      });
+      viewerHostSource.onAgent({
+        list: connection => localAgentCalls.list(connection.id),
+        call: call => {
+          localAgentCalls.run(call).catch(error => console.error('[Main] An agent call could not be answered to the host:', error));
+        },
+        cancel: id => localAgentCalls.cancel(id),
+        answer: (id, allowed) => {
+          const signal = localAgentCalls.signalOf(id);
+          if (signal !== null) agentPresence?.answer(signal, allowed);
+        },
+      });
+      // The host stopped, or the viewer was opened elsewhere: no answer can reach its agents.
+      viewerHostSource.onChannelEnd(() => localAgentCalls.failAll('The Cellucid viewer\'s link to its host ended'));
+      const agentToolsChanged = () => {
+        try {
+          viewerHostSource.notifyAgentToolsChanged();
+        } catch (error) {
+          console.error('[Main] The host could not be told the agent tools changed:', error);
+        }
+      };
+      agentPresence?.onPermissionsChanged(agentToolsChanged);
+      // A tool says whether its change is recorded (History settings, `mcp-tools.js`).
+      onHistorySettingsChange(agentToolsChanged);
       // Every handler is in place: commands the host sent while the dataset
       // opened run now, in order.
       viewerHostSource.acceptCommands();
     }
 
-    // Allow session serializer to capture/restore cinematic camera state and
-    // the figure-export settings.
-    sessionSerializer.setCinematicCameraRef(ui.cinematicCamera);
-    sessionSerializer.setFigureExportRef(ui.figureExport);
-
     // The analysis panel and windows start once their code has arrived
-    // (`analysisCode`), without holding the rest of startup. Sessions wait for
-    // them, so a session's analysis parts are taken and given only once they
-    // exist (`setAnalysisRefs`).
+    // (`analysisCode`), without holding the rest of startup. The `analysis`
+    // state domain reaches them through these refs (null when the code could
+    // not load), so the history, a session file and a re-read of the open
+    // cells (`session/view-carry.js`) carry them once they exist.
     const pageAnalysisSection = document.getElementById('page-analysis-section');
-    sessionSerializer.setAnalysisRefs(analysisCode.then(({ createComparisonModule }) => {
+    const analysisRefs = analysisCode.then(({ createComparisonModule }) => {
       if (applicationRetired || pageAnalysisSection === null) return null;
       comparisonModule = createComparisonModule({
         state,
@@ -3151,6 +3357,14 @@ void sweepAbandonedTranscodes();
       });
       // Store reference for potential external access
       window._comparisonModule = comparisonModule;
+      // The analyses as actions; their results name the dataset they are of.
+      actionOwners.push(installAnalysisActions({
+        actions: getActions(),
+        comparisonModule,
+        dockable: getDockableAccordions(),
+        section: pageAnalysisSection,
+        describeOpenDataset: () => describeOpenDataset(dataSourceManager)
+      }));
       const analysisWindowManager = comparisonModule.getAnalysisWindowManager();
       return { comparisonModule, analysisWindowManager };
     }).catch(error => {
@@ -3160,7 +3374,22 @@ void sweepAbandonedTranscodes();
         { category: 'analysis', title: 'Analysis unavailable' }
       );
       return null;
-    }));
+    });
+
+    // Every state domain's owner (`app/state/domains/`): what the history,
+    // the session file and the state fingerprint read and put back.
+    uninstallStateDomains = installStateDomains({
+      state,
+      viewer,
+      sidebar,
+      refreshUi: ui.refreshUiAfterStateLoad,
+      cinematicCamera: ui.cinematicCamera,
+      figureExport: ui.figureExport,
+      analysis: () => analysisRefs,
+      getDockable: getDockableAccordions,
+      openCells: ui.openCells,
+      sidebarLayout,
+    });
 
     // Setup connectivity controls
     // NOTE: Handlers are ALWAYS set up so they work for datasets loaded dynamically (h5ad/zarr)
@@ -5552,18 +5781,23 @@ void sweepAbandonedTranscodes();
       void ui?.cycleRepresentation?.(dim);
     };
 
+    // X and O, P, G: actions, as the Clear button and the navigation select.
     clearActivePageHighlights = () => {
-      if (state.clearActivePageHighlights) {
-        state.clearActivePageHighlights();
-      }
+      const page = state.getActivePage();
+      if (page === null || page.highlightedGroups.length === 0) return;
+      void dispatchFromControl(
+        'highlight.page.clear',
+        { page: page.name },
+        { failure: 'Clearing the highlight page failed', category: 'highlight' }
+      );
     };
 
     setNavigationMode = (mode) => {
-      const navigationModeSelect = document.getElementById('navigation-mode');
-      if (navigationModeSelect) {
-        navigationModeSelect.value = mode;
-        navigationModeSelect.dispatchEvent(new Event('change', { bubbles: true }));
-      }
+      void dispatchFromControl(
+        'camera.navigation.set',
+        { view: viewNameOf(viewer, viewer.getFocusedViewId()), mode },
+        { failure: 'Changing the navigation mode failed', category: 'render' }
+      );
     };
 
     viewer.start();
@@ -5636,7 +5870,7 @@ void sweepAbandonedTranscodes();
       // A viewer host: it is told the viewer is ready only once its own
       // dataset is on screen. A dataset the user chose instead in this
       // viewer is not the one the host's cell positions describe: its
-      // results name no host dataset (app/viewer-host-results.js), and the
+      // results name no host dataset (app/viewer-host/results.js), and the
       // commands that name cells are refused while it is open.
       if (viewerHostSource !== null && startupOutcome === 'ready') {
         await startup.step(
@@ -5658,6 +5892,7 @@ void sweepAbandonedTranscodes();
         }
       }
     }
+    if (linkedCells !== null) withdrawNextCellSubsetRequest(linkedCells);
     startup.enter('ready');
     // Opened, or startup showed none: a failure was said where it happened.
     if (startupOutcome === 'ready') startupOpening.end();

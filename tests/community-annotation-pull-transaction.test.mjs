@@ -16,7 +16,7 @@ function remoteUserDocument() {
     updatedAt: '2026-07-30T01:02:03.456Z',
     suggestions: {
       'cell_type:Alpha': [{
-        id: 'remote-suggestion',
+        id: 'ghid_7_remote-suggestion',
         label: 'Remote T cell',
         proposedBy: 'ghid_7',
         proposedAt: '2026-07-30T01:02:03.456Z',
@@ -33,8 +33,8 @@ function moderationDocument(merges = null) {
     updatedAt: '2026-07-30T01:02:03.456Z',
     merges: merges ?? [{
       bucket: 'cell_type:Alpha',
-      fromSuggestionId: 'remote-alias',
-      intoSuggestionId: 'remote-suggestion',
+      fromSuggestionId: 'ghid_8_remote-alias',
+      intoSuggestionId: 'ghid_7_remote-suggestion',
       by: 'ghid_42',
       at: '2026-07-30T01:02:03.456Z',
     }],
@@ -288,10 +288,12 @@ test('successful Pull application publishes the whole new session through one ch
     { cell_type: { minAnnotators: 2, threshold: 0.75 } }
   );
   assert.deepEqual(session.getModerationMerges(), moderationDocument().merges);
-  assert.deepEqual(
-    session.getRemoteFileShas(),
-    pulledStateOptions(session).remoteFileShas
-  );
+  // Only the SHAs the session reads are kept: another user's file SHA lives
+  // in the file cache.
+  assert.deepEqual(session.getRemoteFileShas(), {
+    'annotations/config.json': 'b'.repeat(40),
+    'annotations/moderation/merges.json': 'c'.repeat(40),
+  });
   assert.deepEqual(
     session.getDatasetAccessMap().synthetic.fieldsToAnnotate,
     ['cell_type']
@@ -303,7 +305,7 @@ test('successful Pull application publishes the whole new session through one ch
     'unpublished local intent must survive the rebuilt remote view'
   );
   assert.equal(
-    suggestions.some(({ id }) => id === 'remote-suggestion'),
+    suggestions.some(({ id }) => id === 'ghid_7_remote-suggestion'),
     true
   );
   assert.deepEqual(
@@ -326,8 +328,8 @@ test('Pull application preserves pre-existing local moderation intent', () => {
   session.addModerationMerge({
     fieldKey: 'cell_type',
     catIdx: 0,
-    fromSuggestionId: 'local-alias',
-    intoSuggestionId: 'local-target',
+    fromSuggestionId: 'ghid_42_local-alias',
+    intoSuggestionId: 'ghid_42_local-target',
     note: 'Unpublished local merge',
   });
   const localMerges = session.getModerationMerges();

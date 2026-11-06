@@ -9,18 +9,12 @@ import {
   FieldOverlayPublicMethods,
 } from '../assets/js/app/state/managers/field/overlay-public.js';
 import {
-  SessionSerializer,
-} from '../assets/js/app/session/session-serializer.js';
-import {
   createObsFieldLoader,
   createVarFieldLoader,
 } from '../assets/js/data/data-loaders.js';
 import {
   getDataSourceManager,
 } from '../assets/js/data/data-source-manager.js';
-import {
-  DimensionManager,
-} from '../assets/js/data/dimension-manager.js';
 import {
   InlineEditor,
 } from '../assets/js/app/ui/components/inline-editor.js';
@@ -261,6 +255,9 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
     const attributes = new Map();
     const cancelButton = createControl();
     const confirmButton = createControl();
+    // What will happen: the sentence and the list the dialog words as text.
+    const message = { textContent: '' };
+    const list = { hidden: true, replaceChildren() {} };
     const root = {
       contains() {
         return false;
@@ -277,6 +274,8 @@ test('replacing a confirm dialog synchronously cancels its prior owner', t => {
         if (selector === '.confirm-dialog') return root;
         if (selector === '.confirm-dialog-cancel') return cancelButton;
         if (selector === '.confirm-dialog-confirm') return confirmButton;
+        if (selector === '.confirm-dialog-message') return message;
+        if (selector === '.confirm-dialog-list') return list;
         return null;
       },
       remove() {
@@ -1097,497 +1096,6 @@ test(
   },
 );
 
-const SESSION_DATA_MAPPING = Object.freeze({
-  kind: 'anndata',
-  embeddings: {
-    enabled: [{ key: 'X_umap_3d', columns: [0, 1, 2] }],
-    defaults: { '1d': null, '2d': null, '3d': { key: 'X_umap_3d', columns: [0, 1, 2] } },
-  },
-  knn: null,
-  geneNames: 'index',
-  expression: 'X',
-  log1p: {},
-  highlyVariable: null,
-  latent: null,
-  vectorFields: [],
-});
-
-/**
- * Give a DataState stub what a session fingerprint reads besides its arrays:
- * the data mapping, the live view's layout key and the dimension manager
- * that names that layout.
- */
-function withFingerprintOwners(state, mapping = SESSION_DATA_MAPPING) {
-  const dimensionManager = new DimensionManager();
-  dimensionManager.registerLayouts([{
-    layoutKey: 'X_umap_3d',
-    dimension: 3,
-    label: 'UMAP 3D',
-    path: 'obsm/0/0-1-2',
-    provenance: { key: 'X_umap_3d', columns: [0, 1, 2] },
-    origin: 'identity',
-  }]);
-  dimensionManager.setRepresentations(['X_umap_3d'], new Map([[3, 'X_umap_3d']]));
-  // The reader worker's cell-order digest of that layout (`cell-order-digest.js`).
-  dimensionManager.getCellOrderDigest = async layoutKey => {
-    assert.equal(layoutKey, 'X_umap_3d');
-    return '0123456789abcdef';
-  };
-  state.dimensionManager = dimensionManager;
-  state.dataMapping = mapping;
-  state.getDataMapping = () => state.dataMapping;
-  state.getViewLayoutKey = viewId => {
-    assert.equal(viewId, 'live');
-    return 'X_umap_3d';
-  };
-  // The manifest's `requires` is read from the focused view's state.
-  state.getActiveViewId = () => 'live';
-  return state;
-}
-
-function createSessionSerializer(contributor) {
-  return new SessionSerializer({
-    state: withFingerprintOwners({
-      getDatasetGeneration: () => 0,
-      obsData: { fields: [] },
-      pointCount: 0,
-      getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(0),
-      varData: { fields: [] },
-    }),
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: null,
-    comparisonModule: null,
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    figureExport: null,
-    contributors: [contributor],
-  });
-}
-
-test(
-  'session capture drains the exact current UI mutation before contributors read state',
-  async () => {
-    const settlement = deferred();
-    const capture = deferred();
-    const events = [];
-    const serializer = createSessionSerializer({
-      id: 'owned-state',
-      async capture() {
-        events.push('capture:start');
-        await capture.promise;
-        events.push('capture:done');
-        return [{
-          id: 'owned/state',
-          contributorId: 'owned-state',
-          priority: 'eager',
-          kind: 'json',
-          codec: 'none',
-          label: 'Owned state',
-          datasetDependent: false,
-          payload: { activeFieldKey: 'cell_type' },
-        }];
-      },
-      restore() {},
-    });
-    serializer.setCaptureSettlement(async () => {
-      events.push('settle:start');
-      await settlement.promise;
-      events.push('settle:done');
-      return () => {
-        events.push('settle:release');
-      };
-    });
-
-    const captureTask = serializer.createSessionBundle();
-    await Promise.resolve();
-    assert.deepEqual(events, ['settle:start']);
-
-    settlement.resolve();
-    // Every turn the capture takes before its contributor runs (the open
-    // cells taken in use, the fingerprint asked for) passes.
-    await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(events, [
-      'settle:start',
-      'settle:done',
-      'capture:start',
-    ]);
-    capture.resolve();
-    await captureTask;
-    assert.deepEqual(events, [
-      'settle:start',
-      'settle:done',
-      'capture:start',
-      'capture:done',
-      'settle:release',
-    ]);
-  },
-);
-
-test(
-  'session capture rejects a dataset generation replaced between contributor awaits',
-  async () => {
-    const entered = deferred();
-    const release = deferred();
-    let generation = 1;
-    const state = withFingerprintOwners({
-      getDatasetGeneration: () => generation,
-      obsData: { fields: [] },
-      pointCount: 2,
-      getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(6),
-      varData: { fields: [{ key: 'GENE_A' }] },
-    });
-    const serializer = new SessionSerializer({
-      state,
-      viewer: {},
-      sidebar: {},
-      dataSourceManager: null,
-      comparisonModule: null,
-      analysisWindowManager: null,
-      cinematicCamera: null,
-      figureExport: null,
-      contributors: [{
-        id: 'dataset-owned',
-        async capture() {
-          const capturedCount = state.pointCount;
-          entered.resolve();
-          await release.promise;
-          return [{
-            id: 'dataset/owned',
-            contributorId: 'dataset-owned',
-            priority: 'eager',
-            kind: 'json',
-            codec: 'none',
-            label: 'Dataset-owned state',
-            datasetDependent: true,
-            payload: { capturedCount },
-          }];
-        },
-        restore() {},
-      }],
-    });
-
-    const capture = serializer.createSessionBundle();
-    await entered.promise;
-    generation++;
-    state.pointCount = 3;
-    state.positionsArray = new Float32Array(9);
-    state.obsData = { fields: [] };
-    state.varData = {
-      fields: [{ key: 'GENE_A' }, { key: 'GENE_B' }],
-    };
-    release.resolve();
-
-    await assert.rejects(
-      capture,
-      /dataset.*(?:changed|replaced|generation)/i,
-    );
-  },
-);
-
-test(
-  'session capture rejects a data mapping replaced between contributor awaits',
-  async () => {
-    const entered = deferred();
-    const release = deferred();
-    // Same generation, same arrays: only the mapping the dataset is shown
-    // with changes, which changes what every saved selection is bound to.
-    const state = withFingerprintOwners({
-      getDatasetGeneration: () => 1,
-      obsData: { fields: [] },
-      pointCount: 2,
-      getViewDimensionLevel: () => 3,
-      positionsArray: new Float32Array(6),
-      varData: { fields: [{ key: 'GENE_A' }] },
-    });
-    const serializer = new SessionSerializer({
-      state,
-      viewer: {},
-      sidebar: {},
-      dataSourceManager: null,
-      comparisonModule: null,
-      analysisWindowManager: null,
-      cinematicCamera: null,
-      figureExport: null,
-      contributors: [{
-        id: 'dataset-owned',
-        async capture() {
-          entered.resolve();
-          await release.promise;
-          return [{
-            id: 'dataset/owned',
-            contributorId: 'dataset-owned',
-            priority: 'eager',
-            kind: 'json',
-            codec: 'none',
-            label: 'Dataset-owned state',
-            datasetDependent: true,
-            payload: { capturedCount: state.pointCount },
-          }];
-        },
-        restore() {},
-      }],
-    });
-
-    const capture = serializer.createSessionBundle();
-    await entered.promise;
-    state.dataMapping = { ...SESSION_DATA_MAPPING, geneNames: 'column:gene_symbols' };
-    release.resolve();
-
-    await assert.rejects(
-      capture,
-      error => (
-        error.code === 'SESSION_CAPTURE_DATASET_CHANGED'
-        && /dataset.*(?:changed|replaced|generation)/i.test(error.message)
-      ),
-    );
-  },
-);
-
-test(
-  'session restore retires the current UI mutation before contributor snapshots or writes',
-  async () => {
-    const target = createSessionSerializer({
-      id: 'owned-state',
-      capture() {
-        return [{
-          id: 'owned/state',
-          contributorId: 'owned-state',
-          priority: 'eager',
-          kind: 'json',
-          codec: 'none',
-          label: 'Owned state',
-          datasetDependent: false,
-          payload: { value: 1 },
-        }];
-      },
-      restore() {},
-    });
-    const settlement = deferred();
-    const restore = deferred();
-    const events = [];
-    target.setRestoreSettlement(async () => {
-      events.push('settle:start');
-      await settlement.promise;
-      events.push('settle:done');
-      return () => {
-        events.push('settle:release');
-      };
-    });
-
-    const restoreTask = target._runOwnedRestore(
-      async () => {
-        events.push('restore:start');
-        await restore.promise;
-        events.push('restore:done');
-      },
-      { signal: null },
-    );
-    await Promise.resolve();
-    assert.deepEqual(events, ['settle:start']);
-
-    settlement.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    assert.deepEqual(events, [
-      'settle:start',
-      'settle:done',
-      'restore:start',
-    ]);
-    restore.resolve();
-    await restoreTask;
-    assert.deepEqual(events, [
-      'settle:start',
-      'settle:done',
-      'restore:start',
-      'restore:done',
-      'settle:release',
-    ]);
-  },
-);
-
-test(
-  'session capture waits for an active restore to reach one terminal state',
-  async () => {
-    const restore = deferred();
-    const events = [];
-    let value = 'before';
-    const serializer = createSessionSerializer({
-      id: 'owned-state',
-      capture() {
-        events.push(`capture:${value}`);
-        return [{
-          id: 'owned/state',
-          contributorId: 'owned-state',
-          priority: 'eager',
-          kind: 'json',
-          codec: 'none',
-          label: 'Owned state',
-          datasetDependent: false,
-          payload: { value },
-        }];
-      },
-      restore() {},
-    });
-    const restoreTask = serializer._runOwnedRestore(
-      async () => {
-        value = 'half-restored';
-        events.push('restore:start');
-        await restore.promise;
-        value = 'restored';
-        events.push('restore:done');
-      },
-      { signal: null },
-    );
-    await Promise.resolve();
-    assert.deepEqual(events, ['restore:start']);
-
-    const captureTask = serializer.createSessionBundle();
-    await Promise.resolve();
-    assert.deepEqual(events, ['restore:start']);
-
-    restore.resolve();
-    await restoreTask;
-    await captureTask;
-    assert.deepEqual(events, [
-      'restore:start',
-      'restore:done',
-      'capture:restored',
-    ]);
-  },
-);
-
-test(
-  'session restore waits for an active capture and captures are serialized',
-  async () => {
-    const firstCapture = deferred();
-    const events = [];
-    let captureCalls = 0;
-    const serializer = createSessionSerializer({
-      id: 'owned-state',
-      async capture() {
-        const call = ++captureCalls;
-        events.push(`capture:${call}:start`);
-        if (call === 1) await firstCapture.promise;
-        events.push(`capture:${call}:done`);
-        return [{
-          id: 'owned/state',
-          contributorId: 'owned-state',
-          priority: 'eager',
-          kind: 'json',
-          codec: 'none',
-          label: 'Owned state',
-          datasetDependent: false,
-          payload: { call },
-        }];
-      },
-      restore() {},
-    });
-
-    const firstBundle = serializer.createSessionBundle();
-    await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(events, ['capture:1:start']);
-    const restoreTask = serializer._runOwnedRestore(
-      async () => {
-        events.push('restore');
-      },
-      { signal: null },
-    );
-    const secondBundle = serializer.createSessionBundle();
-    await Promise.resolve();
-    await Promise.resolve();
-    assert.deepEqual(events, ['capture:1:start']);
-
-    firstCapture.resolve();
-    await Promise.all([firstBundle, restoreTask, secondBundle]);
-    assert.deepEqual(events, [
-      'capture:1:start',
-      'capture:1:done',
-      'restore',
-      'capture:2:start',
-      'capture:2:done',
-    ]);
-  },
-);
-
-test(
-  'session restore releases its field lease after failure, cancellation, and supersession',
-  async () => {
-    const serializer = createSessionSerializer({
-      id: 'owned-state',
-      capture() {
-        return [];
-      },
-      restore() {},
-    });
-    let acquisitions = 0;
-    let releases = 0;
-    serializer.setRestoreSettlement(async () => {
-      acquisitions++;
-      return () => {
-        releases++;
-      };
-    });
-
-    const exactFailure = new Error('exact restore operation failure');
-    await assert.rejects(
-      serializer._runOwnedRestore(
-        async () => {
-          throw exactFailure;
-        },
-        { signal: null },
-      ),
-      error => error === exactFailure,
-    );
-    assert.deepEqual({ acquisitions, releases }, {
-      acquisitions: 1,
-      releases: 1,
-    });
-
-    const canceled = serializer._runOwnedRestore(
-      async abortController => new Promise((resolve, reject) => {
-        abortController.signal.addEventListener(
-          'abort',
-          () => reject(abortController.signal.reason),
-          { once: true },
-        );
-      }),
-      { signal: null },
-    );
-    await Promise.resolve();
-    await serializer.cancelRestore();
-    await assert.rejects(canceled, (error => cancellationKind(error) === 'user'));
-    assert.deepEqual({ acquisitions, releases }, {
-      acquisitions: 2,
-      releases: 2,
-    });
-
-    const first = serializer._runOwnedRestore(
-      async abortController => new Promise((resolve, reject) => {
-        abortController.signal.addEventListener(
-          'abort',
-          () => reject(abortController.signal.reason),
-          { once: true },
-        );
-      }),
-      { signal: null },
-    );
-    await Promise.resolve();
-    const second = serializer._runOwnedRestore(
-      async () => {},
-      { signal: null },
-    );
-    await assert.rejects(first, (error => cancellationKind(error) === 'superseded'));
-    await second;
-    assert.deepEqual({ acquisitions, releases }, {
-      acquisitions: 4,
-      releases: 4,
-    });
-  },
-);
-
 test(
   'the UI binds the shared field owner to every session capture path',
   async () => {
@@ -1649,16 +1157,17 @@ test(
       fieldSelectorSource,
       /readDatasetGeneration\(\) !== datasetGeneration/,
     );
-    for (const source of [fieldSelectorSource, geneSelectorSource]) {
-      assert.match(
-        source,
-        /const intent = interactionOwner\.beginIntent\(\)/,
-      );
-      assert.match(
-        source,
-        /interactionOwner\.assertIntentCurrent\(intent\)/,
-      );
-    }
+    // Duplicating (an obs field or a gene) is the field selector's action
+    // `field.duplicate`: the copy is the latest choice.
+    assert.match(
+      fieldSelectorSource,
+      /const intent = interactionOwner\.beginIntent\(\)/,
+    );
+    assert.match(
+      fieldSelectorSource,
+      /interactionOwner\.assertIntentCurrent\(intent\)/,
+    );
+    assert.match(geneSelectorSource, /callbacks\.onDuplicateField\(FieldSource\.VAR, selectedGeneOriginalIdx\)/);
     assert.match(confirmDialogSource, /return cancel;/);
   },
 );

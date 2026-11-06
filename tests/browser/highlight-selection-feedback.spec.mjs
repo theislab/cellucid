@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { armSelection } from './helpers/selection-gesture.mjs';
 
 const PREPARED_DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -124,37 +125,6 @@ async function altDrag(page, from, to) {
   }
   await page.mouse.up();
   await page.keyboard.up('Alt');
-}
-
-// How long a gesture that did land may take to arm its tool before it counts
-// as dropped. Generous on purpose: judging a slow-but-landed gesture dropped
-// would repeat it, and a repeated gesture changes what the tool holds.
-const GESTURE_LANDING_TIMEOUT_MS = 3_000;
-
-/**
- * Repeat a gesture until it actually arms the tool.
- *
- * A synthetic pointer sequence can land while the renderer is still settling
- * its first frames, and is then dropped before any tool sees it. Retrying keeps
- * the environment's timing out of the assertions below, which are about what
- * the tool does once a gesture has landed. Each attempt waits for the tool to
- * arm before deciding the gesture was dropped, so a loaded runner that arms it
- * late is never handed a second gesture on top of the first.
- */
-async function armSelection(page, tool, gesture) {
-  const controls = page.locator(`#${tool}-step-controls`);
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await gesture();
-    const armed = await controls.waitFor({
-      state: 'attached',
-      timeout: GESTURE_LANDING_TIMEOUT_MS,
-    }).then(() => true, error => {
-      if (error?.name !== 'TimeoutError') throw error;
-      return false;
-    });
-    if (armed) return;
-  }
-  await expect(controls).toBeVisible();
 }
 
 const unifiedState = page => page.evaluate(
@@ -409,7 +379,7 @@ test(
 
     for (const mode of ['knn', 'proximity', 'lasso', 'annotation']) {
       await page.locator(`.highlight-mode-btn[data-mode="${mode}"]`).click();
-      expect(await pressedState()).toEqual([
+      await expect.poll(() => pressedState()).toEqual([
         ['annotation', mode === 'annotation' ? 'true' : 'false'],
         ['knn', mode === 'knn' ? 'true' : 'false'],
         ['proximity', mode === 'proximity' ? 'true' : 'false'],
@@ -420,7 +390,7 @@ test(
     // Space activates a focused mode button, and the contract holds for it too.
     await page.locator('.highlight-mode-btn[data-mode="lasso"]').focus();
     await page.keyboard.press('Space');
-    expect(await pressedState()).toEqual([
+    await expect.poll(() => pressedState()).toEqual([
       ['annotation', 'false'],
       ['knn', 'false'],
       ['proximity', 'false'],

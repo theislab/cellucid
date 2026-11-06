@@ -1,10 +1,12 @@
 /**
- * @fileoverview Deterministic ZIP32 writer for atomic figure-export batches.
+ * @fileoverview Deterministic ZIP archive for atomic figure-export batches.
  *
  * Batch exports use one stored (uncompressed) ZIP archive so every supported
  * browser receives one download initiated by one user action. Entry bytes are
- * preserved exactly. Fixed ZIP timestamps and stable input order make the
- * archive deterministic for identical filenames and blobs.
+ * preserved exactly. The archive is the app's one ZIP writer's
+ * (`formats/zip/writer.js`: fixed timestamps, ZIP64 fields where a size or
+ * offset needs them), and stable input order makes it deterministic for
+ * identical filenames and blobs.
  *
  * Each entry is checksummed `CRC_SLICE_BYTES` at a time, read from its Blob
  * slice by slice, and the archive takes the entry Blobs themselves as its
@@ -20,16 +22,8 @@ import {
   throwIfFigureExportAborted,
 } from '../figure-export-contract.js';
 import { crc32 } from '../../../../../formats/zip/crc32.js';
+import { createZipWriter } from '../../../../../formats/zip/writer.js';
 
-const MAX_U16 = 0xffff;
-const MAX_U32 = 0xffff_ffff;
-const UTF8_FLAG = 0x0800;
-const STORED_METHOD = 0;
-const DOS_TIME_MIDNIGHT = 0;
-const DOS_DATE_1980_01_01 = 0x0021;
-const LOCAL_HEADER_SIZE = 30;
-const CENTRAL_HEADER_SIZE = 46;
-const END_RECORD_SIZE = 22;
 const ENTRY_KEYS = new Set(['filename', 'blob']);
 /** Bytes of an entry read and checksummed per task. */
 const CRC_SLICE_BYTES = 4 * 1024 * 1024;
@@ -68,65 +62,6 @@ function assertExactEntry(entry, index) {
   }
 }
 
-function makeLocalHeader({ crc, size, filenameLength }) {
-  const header = new Uint8Array(LOCAL_HEADER_SIZE);
-  const view = new DataView(header.buffer);
-  view.setUint32(0, 0x0403_4b50, true);
-  view.setUint16(4, 20, true);
-  view.setUint16(6, UTF8_FLAG, true);
-  view.setUint16(8, STORED_METHOD, true);
-  view.setUint16(10, DOS_TIME_MIDNIGHT, true);
-  view.setUint16(12, DOS_DATE_1980_01_01, true);
-  view.setUint32(14, crc, true);
-  view.setUint32(18, size, true);
-  view.setUint32(22, size, true);
-  view.setUint16(26, filenameLength, true);
-  view.setUint16(28, 0, true);
-  return header;
-}
-
-function makeCentralHeader({
-  crc,
-  size,
-  filenameLength,
-  localOffset,
-}) {
-  const header = new Uint8Array(CENTRAL_HEADER_SIZE);
-  const view = new DataView(header.buffer);
-  view.setUint32(0, 0x0201_4b50, true);
-  view.setUint16(4, 20, true);
-  view.setUint16(6, 20, true);
-  view.setUint16(8, UTF8_FLAG, true);
-  view.setUint16(10, STORED_METHOD, true);
-  view.setUint16(12, DOS_TIME_MIDNIGHT, true);
-  view.setUint16(14, DOS_DATE_1980_01_01, true);
-  view.setUint32(16, crc, true);
-  view.setUint32(20, size, true);
-  view.setUint32(24, size, true);
-  view.setUint16(28, filenameLength, true);
-  view.setUint16(30, 0, true);
-  view.setUint16(32, 0, true);
-  view.setUint16(34, 0, true);
-  view.setUint16(36, 0, true);
-  view.setUint32(38, 0, true);
-  view.setUint32(42, localOffset, true);
-  return header;
-}
-
-function makeEndRecord({ entryCount, centralSize, centralOffset }) {
-  const record = new Uint8Array(END_RECORD_SIZE);
-  const view = new DataView(record.buffer);
-  view.setUint32(0, 0x0605_4b50, true);
-  view.setUint16(4, 0, true);
-  view.setUint16(6, 0, true);
-  view.setUint16(8, entryCount, true);
-  view.setUint16(10, entryCount, true);
-  view.setUint32(12, centralSize, true);
-  view.setUint32(16, centralOffset, true);
-  view.setUint16(20, 0, true);
-  return record;
-}
-
 /**
  * The CRC-32 of a staged Blob, read one slice per task.
  *
@@ -153,7 +88,7 @@ async function checksumBlob(blob, size, signal) {
 }
 
 /**
- * Create one deterministic, uncompressed ZIP32 Blob.
+ * Create one deterministic, uncompressed ZIP Blob.
  *
  * @param {{ filename: string; blob: Blob }[]} entries
  * @param {object} [options]
@@ -170,13 +105,9 @@ export async function createFigureExportZip(
       'Figure export ZIP requires at least two staged artifacts.'
     );
   }
-  if (entries.length > MAX_U16) {
-    throw new RangeError('Figure export ZIP exceeds the ZIP32 entry limit.');
-  }
 
-  const encoder = new TextEncoder();
   const names = new Set();
-  const plans = entries.map((entry, index) => {
+  entries.forEach((entry, index) => {
     assertExactEntry(entry, index);
     if (names.has(entry.filename)) {
       throw new Error(
@@ -184,76 +115,16 @@ export async function createFigureExportZip(
       );
     }
     names.add(entry.filename);
-
-    const filenameBytes = encoder.encode(entry.filename);
-    if (filenameBytes.length > MAX_U16) {
-      throw new RangeError(
-        `Figure export ZIP filename ${index} exceeds the ZIP32 limit.`
-      );
-    }
-    if (entry.blob.size > MAX_U32) {
-      throw new RangeError(
-        `Figure export ZIP entry ${index} exceeds the ZIP32 size limit.`
-      );
-    }
-    return {
-      filenameBytes,
-      blob: entry.blob,
-      size: entry.blob.size,
-    };
   });
 
-  let localSize = 0;
-  let centralSize = 0;
-  for (const plan of plans) {
-    localSize += LOCAL_HEADER_SIZE + plan.filenameBytes.length + plan.size;
-    centralSize += CENTRAL_HEADER_SIZE + plan.filenameBytes.length;
-    if (localSize > MAX_U32 || centralSize > MAX_U32) {
-      throw new RangeError('Figure export ZIP exceeds the ZIP32 archive limit.');
-    }
-  }
-  if (localSize + centralSize + END_RECORD_SIZE > MAX_U32) {
-    throw new RangeError('Figure export ZIP exceeds the ZIP32 archive limit.');
-  }
-
-  const localParts = [];
-  const centralParts = [];
-  let localOffset = 0;
-  for (const plan of plans) {
+  const parts = [];
+  const zip = createZipWriter({ write: part => { parts.push(part); } });
+  for (const entry of entries) {
     throwIfFigureExportAborted(signal);
-    const crc = await checksumBlob(plan.blob, plan.size, signal);
-    localParts.push(
-      makeLocalHeader({
-        crc,
-        size: plan.size,
-        filenameLength: plan.filenameBytes.length,
-      }),
-      plan.filenameBytes,
-      plan.blob,
-    );
-    centralParts.push(
-      makeCentralHeader({
-        crc,
-        size: plan.size,
-        filenameLength: plan.filenameBytes.length,
-        localOffset,
-      }),
-      plan.filenameBytes,
-    );
-    localOffset += LOCAL_HEADER_SIZE + plan.filenameBytes.length + plan.size;
+    const crc = await checksumBlob(entry.blob, entry.blob.size, signal);
+    await zip.add(entry.filename, entry.blob, { crc });
   }
-
   throwIfFigureExportAborted(signal);
-  return new Blob(
-    [
-      ...localParts,
-      ...centralParts,
-      makeEndRecord({
-        entryCount: plans.length,
-        centralSize,
-        centralOffset: localSize,
-      }),
-    ],
-    { type: 'application/zip' },
-  );
+  await zip.finish();
+  return new Blob(parts, { type: 'application/zip' });
 }

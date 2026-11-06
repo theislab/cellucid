@@ -1,0 +1,308 @@
+{
+  "examples": [
+    {
+      "in": "panel",
+      "options": {
+        "cells": "x",
+        "compareAgainst": "rest",
+        "correction": "bh",
+        "direction": "up",
+        "excludeGenes": [
+          "x"
+        ],
+        "excludePattern": "x",
+        "foldChange": "auto",
+        "groupBy": "x",
+        "matrix": "x",
+        "maxAdjP": 0,
+        "maxPctRef": 0,
+        "method": "wilcox",
+        "minCells": 2,
+        "minLog2FC": 0,
+        "minPctIn": 0,
+        "onlyGenes": "x",
+        "onlyGenesList": "x",
+        "pConvention": "exact",
+        "rankBy": "score",
+        "referenceGroup": "x",
+        "restIncludes": "all",
+        "smallGroups": "skip",
+        "testGroups": {
+          "mode": "all"
+        },
+        "topN": 1
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "cells": "x",
+        "compareAgainst": "rest",
+        "correction": "bh",
+        "direction": "up",
+        "excludeGenes": [
+          "x"
+        ],
+        "excludePattern": "x",
+        "foldChange": "auto",
+        "groupBy": "x",
+        "matrix": "x",
+        "maxAdjP": 0,
+        "maxPctRef": 0,
+        "method": "wilcox",
+        "minCells": 2,
+        "minLog2FC": 0,
+        "minPctIn": 0,
+        "onlyGenes": "x",
+        "onlyGenesList": "x",
+        "pConvention": "exact",
+        "rankBy": "score",
+        "referenceGroup": "x",
+        "restIncludes": "all",
+        "smallGroups": "skip",
+        "testGroups": {
+          "mode": "all"
+        },
+        "topN": 1
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "cells": "x",
+        "compareAgainst": "rest",
+        "correction": "bh",
+        "direction": "up",
+        "excludeGenes": [
+          "x"
+        ],
+        "excludePattern": "x",
+        "foldChange": "auto",
+        "groupBy": "x",
+        "matrix": "x",
+        "maxAdjP": 0,
+        "maxPctRef": 0,
+        "method": "wilcox",
+        "minCells": 2,
+        "minLog2FC": 0,
+        "minPctIn": 0,
+        "onlyGenes": "x",
+        "onlyGenesList": "x",
+        "pConvention": "exact",
+        "rankBy": "score",
+        "referenceGroup": "x",
+        "restIncludes": "all",
+        "smallGroups": "skip",
+        "testGroups": {
+          "ids": [
+            "x"
+          ],
+          "mode": "subset"
+        },
+        "topN": 1
+      },
+      "show": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "options": {
+        "additionalProperties": false,
+        "properties": {
+          "cells": {
+            "type": "string"
+          },
+          "compareAgainst": {
+            "enum": [
+              "rest",
+              "group"
+            ],
+            "type": "string"
+          },
+          "correction": {
+            "enum": [
+              "bh",
+              "bonferroni"
+            ],
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "up",
+              "down",
+              "both"
+            ],
+            "type": "string"
+          },
+          "excludeGenes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "excludePattern": {
+            "type": "string"
+          },
+          "foldChange": {
+            "enum": [
+              "auto",
+              "log1p",
+              "stored"
+            ],
+            "type": "string"
+          },
+          "groupBy": {
+            "type": "string"
+          },
+          "matrix": {
+            "type": "string"
+          },
+          "maxAdjP": {
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "maxPctRef": {
+            "maximum": 100,
+            "minimum": 0,
+            "type": "number"
+          },
+          "method": {
+            "enum": [
+              "wilcox",
+              "ttest",
+              "ttest_overestim_var"
+            ],
+            "type": "string"
+          },
+          "minCells": {
+            "minimum": 2,
+            "type": "integer"
+          },
+          "minLog2FC": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "minPctIn": {
+            "maximum": 100,
+            "minimum": 0,
+            "type": "number"
+          },
+          "onlyGenes": {
+            "type": "string"
+          },
+          "onlyGenesList": {
+            "type": "string"
+          },
+          "pConvention": {
+            "enum": [
+              "exact",
+              "normal",
+              "normal_tie"
+            ],
+            "type": "string"
+          },
+          "rankBy": {
+            "enum": [
+              "score",
+              "padj",
+              "log2fc",
+              "auroc",
+              "pct_diff"
+            ],
+            "type": "string"
+          },
+          "referenceGroup": {
+            "type": "string"
+          },
+          "restIncludes": {
+            "enum": [
+              "all",
+              "selected"
+            ],
+            "type": "string"
+          },
+          "smallGroups": {
+            "enum": [
+              "skip",
+              "pool",
+              "test"
+            ],
+            "type": "string"
+          },
+          "testGroups": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "const": "all",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "ids": {
+                    "items": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "mode": {
+                    "const": "subset",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "ids"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "topN": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "show": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "options"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.markers.set",
+  "version": 1
+}

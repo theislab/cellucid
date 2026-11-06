@@ -269,3 +269,22 @@ test('the disabled text colour only paints rules that select a disabled state', 
   }
   assert.deepEqual(offenders, []);
 });
+
+/* The history's branch lanes (History v2 §3.9) are lines and glyphs, so
+   WCAG 2.2 SC 1.4.11 Non-text Contrast applies: 3:1 against the panel
+   surfaces they are drawn on, in both themes, for all eight slots. */
+test('the eight history lane colours clear 3:1 on the panel surfaces in every theme', () => {
+  const failures = [];
+  for (const [themeName, theme] of themes) {
+    for (let lane = 0; lane < 8; lane++) {
+      const token = `--history-lane-${lane}`;
+      assert.equal(theme.has(token), true, `${themeName} theme declares ${token}`);
+      const colour = toRgb(resolve(token, theme, primitives));
+      for (const surface of ['--color-surface-primary', '--color-surface-secondary']) {
+        const ratio = contrastRatio(colour, toRgb(resolve(surface, theme, primitives)));
+        if (ratio < 3) failures.push(`${themeName}: ${token} on ${surface} = ${ratio.toFixed(2)}:1`);
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+});

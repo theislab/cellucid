@@ -517,11 +517,7 @@ test('GPU noise scheduling safely uses timer fallback without a paired frame can
       const settlement = transaction.completion.catch(() => {});
       // Wait for the timer-driven scheduler to advance, however late a
       // loaded runner fires its first timer, rather than for a fixed interval.
-      const deadline = performance.now() + 10_000;
-      while (
-        transaction._phase === 'initialize' &&
-        performance.now() < deadline
-      ) {
+      while (transaction._phase === 'initialize') {
         await new Promise(resolve => setTimeout(resolve, 10));
       }
       const phaseAfterTimer = transaction._phase;

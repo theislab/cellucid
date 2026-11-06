@@ -5,15 +5,15 @@
 import { workerScript } from '../js/workers/worker-script.js';
 
 /** @returns {URL} assets/js/data/anndata-reader-worker.js */
-export const annDataReaderWorkerScript = () => workerScript(import.meta.url, '../js/data/anndata-reader-worker.js', './anndata-reader-worker.659d3a4476a6.js');
+export const annDataReaderWorkerScript = () => workerScript(import.meta.url, '../js/data/anndata-reader-worker.js', './anndata-reader-worker.867234dcdc72.js');
 /** @returns {URL} assets/js/app/ui/modules/benchmark/generation-worker.js */
-export const benchmarkGenerationWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/benchmark/generation-worker.js', './generation-worker.fa69215673ab.js');
+export const benchmarkGenerationWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/benchmark/generation-worker.js', './generation-worker.ae77b6362e8e.js');
 /** @returns {URL} assets/js/app/analysis/compute/data-worker.js */
-export const dataWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/compute/data-worker.js', './data-worker.aebfc0e685cd.js');
+export const dataWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/compute/data-worker.js', './data-worker.4cfd04e36e20.js');
 /** @returns {URL} assets/js/formats/io/decode-worker.js */
-export const decodeWorkerScript = () => workerScript(import.meta.url, '../js/formats/io/decode-worker.js', './decode-worker.799b3bcd4dc6.js');
+export const decodeWorkerScript = () => workerScript(import.meta.url, '../js/formats/io/decode-worker.js', './decode-worker.cad7d92cbf8a.js');
 /** @returns {URL} assets/js/app/ui/modules/figure-export/utils/figure-export-worker.js */
-export const figureExportWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/figure-export/utils/figure-export-worker.js', './figure-export-worker.96ed1e8fe262.js');
+export const figureExportWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/figure-export/utils/figure-export-worker.js', './figure-export-worker.f3f60b7ddba3.js');
 /** @returns {URL} assets/js/formats/rds/gunzip-worker.js */
 export const gunzipWorkerScript = () => workerScript(import.meta.url, '../js/formats/rds/gunzip-worker.js', './gunzip-worker.1570154d01b1.js');
 /** @returns {URL} assets/js/formats/text/matrix-market-entries.js */
@@ -21,8 +21,10 @@ export const matrixMarketEntriesScript = () => workerScript(import.meta.url, '..
 /** @returns {URL} assets/js/app/analysis/plots/point-raster-worker.js */
 export const pointRasterWorkerScript = () => workerScript(import.meta.url, '../js/app/analysis/plots/point-raster-worker.js', './point-raster-worker.70368d8ed712.js');
 /** @returns {URL} assets/js/rendering/high-perf/spatial-tree-worker.js */
-export const spatialTreeWorkerScript = () => workerScript(import.meta.url, '../js/rendering/high-perf/spatial-tree-worker.js', './spatial-tree-worker.21d08c2ef1fa.js');
+export const spatialTreeWorkerScript = () => workerScript(import.meta.url, '../js/rendering/high-perf/spatial-tree-worker.js', './spatial-tree-worker.0b8973c151ea.js');
 /** @returns {URL} assets/js/data/anndata/subset-entries.js */
 export const subsetEntriesScript = () => workerScript(import.meta.url, '../js/data/anndata/subset-entries.js', './subset-entries.831137776222.js');
+/** @returns {URL} assets/js/formats/zarr/encode-task.js */
+export const zarrEncodeTaskScript = () => workerScript(import.meta.url, '../js/formats/zarr/encode-task.js', './encode-task.f8cc5879c787.js');
 /** @returns {URL} assets/wasm/codecs.wasm */
 export const codecsWasm = () => new URL('../wasm/codecs.wasm?v=e19ba7156cb8', import.meta.url);

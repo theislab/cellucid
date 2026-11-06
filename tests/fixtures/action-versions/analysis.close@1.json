@@ -1,0 +1,12 @@
+{
+  "examples": [
+    {}
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "type": "analysis.close",
+  "version": 1
+}

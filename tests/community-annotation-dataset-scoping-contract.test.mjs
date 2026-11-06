@@ -18,7 +18,7 @@ import {
 const AT = '2026-10-22T10:00:00.000Z';
 
 function view(datasetId, label, vote = 'up') {
-  const id = `${datasetId}-suggestion`;
+  const id = `ghid_7_${datasetId}-suggestion`;
   return {
     version: 1,
     username: 'ghid_7',
@@ -37,7 +37,7 @@ test('a user file keeps each dataset in its own section', () => {
   const first = composeUserFile(null, 'atlas-a', view('atlas-a', 'T cell'));
   const both = composeUserFile(first, 'atlas-b', view('atlas-b', 'B cell', 'down'));
   assertUserFile(both);
-  assert.equal(both.version, 2);
+  assert.equal(both.version, 3);
   assert.deepEqual(Object.keys(both.datasets).sort(), ['atlas-a', 'atlas-b']);
   assert.deepEqual(both.datasets['atlas-a'], first.datasets['atlas-a'],
     'publishing dataset B keeps dataset A byte for byte');
@@ -46,8 +46,8 @@ test('a user file keeps each dataset in its own section', () => {
   const b = projectUserFile(both, 'atlas-b');
   assert.deepEqual(a.suggestions['leiden:0'].map(s => s.label), ['T cell']);
   assert.deepEqual(b.suggestions['leiden:0'].map(s => s.label), ['B cell']);
-  assert.deepEqual(a.votes, { 'atlas-a-suggestion': 'up' });
-  assert.deepEqual(b.votes, { 'atlas-b-suggestion': 'down' });
+  assert.deepEqual(a.votes, { 'ghid_7_atlas-a-suggestion': 'up' });
+  assert.deepEqual(b.votes, { 'ghid_7_atlas-b-suggestion': 'down' });
 
   const other = projectUserFile(both, 'atlas-c');
   assert.deepEqual(other.suggestions, {});
@@ -72,19 +72,21 @@ test('a view cannot be composed onto another contributor\'s file', () => {
   const someone = composeUserFile(null, 'atlas-a', view('atlas-a', 'T cell'));
   const other = { ...view('atlas-a', 'T cell'), username: 'ghid_8', githubUserId: 8 };
   other.suggestions['leiden:0'][0].proposedBy = 'ghid_8';
+  other.suggestions['leiden:0'][0].id = 'ghid_8_atlas-a-suggestion';
+  other.votes = { 'ghid_8_atlas-a-suggestion': 'up' };
   assert.throws(() => composeUserFile(someone, 'atlas-a', other), /same contributor/);
 });
 
 test('a version 1 user file is refused, not read as one dataset', () => {
   const legacy = { ...view('atlas-a', 'T cell') };
-  assert.throws(() => assertUserFile(legacy), /unknown field|must equal 2/);
+  assert.throws(() => assertUserFile(legacy), /unknown field|must equal 3/);
 });
 
 function mergesView(from, into) {
   return {
     version: 1,
     updatedAt: AT,
-    merges: [{ bucket: 'leiden:0', fromSuggestionId: from, intoSuggestionId: into, by: 'ghid_7', at: AT }],
+    merges: [{ bucket: 'leiden:0', fromSuggestionId: `ghid_1_${from}`, intoSuggestionId: `ghid_2_${into}`, by: 'ghid_7', at: AT }],
   };
 }
 
@@ -98,7 +100,7 @@ test('merges are kept per dataset and never applied to another', () => {
   assert.deepEqual(projectMergesFile(both, 'atlas-b').merges, mergesView('y', 'x').merges);
   assert.deepEqual(projectMergesFile(both, 'atlas-c').merges, []);
 
-  const cycle = { ...both, merges: [...both.merges, { ...both.merges[0], fromSuggestionId: 'y', intoSuggestionId: 'x' }] };
+  const cycle = { ...both, merges: [...both.merges, { ...both.merges[0], fromSuggestionId: 'ghid_2_y', intoSuggestionId: 'ghid_1_x' }] };
   assert.throws(() => assertMergesFile(cycle), /cycle/);
   assert.throws(
     () => assertMergesFile({ ...both, merges: [{ ...mergesView('x', 'y').merges[0] }] }),

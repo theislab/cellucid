@@ -201,6 +201,8 @@ test('Google\'s 403 naming a rate limit is a rate limit: asked again, named in t
   // GitHub's API answers its spent budget with 403 and the count at 0.
   assert.equal(isLimitAnswer(refused({ 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1800003600' }), null), true);
   assert.equal(isLimitAnswer(refused({ 'X-RateLimit-Remaining': '12' }), null), false);
+  // GitHub's secondary rate limits: 403 with a Retry-After while the budget has requests left.
+  assert.equal(isLimitAnswer(refused({ 'X-RateLimit-Remaining': '4990', 'Retry-After': '60' }), null), true);
   let refusals = 2;
   const fetch = async (url, init) => {
     if (refusals > 0) {

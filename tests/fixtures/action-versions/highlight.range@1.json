@@ -1,0 +1,63 @@
+{
+  "examples": [
+    {
+      "color": "#e41a1c",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "max": 0,
+      "min": 0,
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "color": {
+        "pattern": "^#[0-9a-fA-F]{6}$",
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "obs",
+              "var"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "max": {
+        "type": "number"
+      },
+      "min": {
+        "type": "number"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "field",
+      "min",
+      "max"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.range",
+  "version": 1
+}

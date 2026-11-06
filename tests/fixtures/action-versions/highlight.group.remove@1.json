@@ -1,0 +1,29 @@
+{
+  "examples": [
+    {
+      "group": "x",
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "group": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "group"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.group.remove",
+  "version": 1
+}

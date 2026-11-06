@@ -3,8 +3,8 @@
  * items grouped by dataset (its file's name and host), each row what it is,
  * its size, when it was last used, whether an open tab uses it (then it
  * cannot be chosen) and what it spares; the connection speeds remembered per
- * host as one row; the files of this computer kept to reopen, a row each;
- * the Stored row's summary; where it is kept, as the
+ * host as one row; My datasets as one row (each of its datasets is listed in
+ * its own dialog, never here); the Stored row's summary; where it is kept, as the
  * browser says it; and what a removal did.
  */
 import assert from 'node:assert/strict';
@@ -13,8 +13,8 @@ import test from 'node:test';
 import {
   describeKeptItem,
   describeKeptKind,
-  describeHighlightDraft,
-  describeLocalFile,
+  describeSavedState,
+  describeMyDatasets,
   describeWhen,
   describeDecoderDecisions,
   describeRememberedHosts,
@@ -84,22 +84,26 @@ test('when an item was last used or saved, in words', () => {
   assert.equal(describeWhen('used', new Date(2026, 0, 5).getTime(), NOW, 'en-GB'), 'used 5 Jan 2026');
 });
 
-test('a draft of unsaved highlights is a row of its dataset: its size, what it is, how many, when saved', () => {
-  assert.deepEqual(describeHighlightDraft({ key: 'atlas', name: 'Lung atlas', highlights: 3, bytes: 2048, savedAt: NOW - DAY }, NOW), {
+test('a saved state is a row of its dataset: its size, what it is, how many steps, when saved', () => {
+  const state = { id: 'a', kind: 'autosave', name: null, dataset: { id: 'atlas', name: 'Lung atlas' }, steps: 3, bytes: 2048, updatedAt: NOW - DAY, openable: true };
+  assert.deepEqual(describeSavedState(state, NOW), {
     name: 'Lung atlas',
     size: '2.0 KB',
-    meta: 'Unsaved highlights draft · 3 highlights · saved yesterday',
+    meta: 'History kept in this browser · 3 steps · saved yesterday',
   });
-  assert.equal(describeHighlightDraft({ key: 'x', name: null, highlights: 1, bytes: 10, savedAt: 0 }, NOW).name, 'Unnamed dataset');
-  assert.equal(describeHighlightDraft({ key: 'x', name: null, highlights: 1, bytes: 10, savedAt: 0 }, NOW).meta, 'Unsaved highlights draft · 1 highlight');
+  const named = { ...state, kind: 'named', name: 'Before clustering', dataset: { id: 'x', name: null }, steps: 1, updatedAt: 0 };
+  assert.equal(describeSavedState(named, NOW).name, 'Unnamed dataset');
+  assert.equal(describeSavedState(named, NOW).meta, 'Saved as "Before clustering" · 1 step');
+  assert.equal(describeSavedState({ ...named, openable: false }, NOW).meta, 'Saved as "Before clustering" · 1 step · kept by another version');
 });
 
-test('a file of this computer kept to reopen is a row: its name, file or folder, when last opened', () => {
-  assert.deepEqual(describeLocalFile({ key: 'h5ad_cells_1a2b3c4d', name: 'cells.h5ad', kind: 'file', openedAt: NOW - DAY }, NOW), {
-    name: 'cells.h5ad',
-    meta: 'File to reopen · opened yesterday',
-  });
-  assert.equal(describeLocalFile({ key: 'z', name: 'suo.zarr', kind: 'folder', openedAt: 0 }, NOW).meta, 'Folder to reopen');
+test('My datasets is one row: how many datasets it lists, and the files to reopen among them; none while it holds nothing', () => {
+  assert.deepEqual(describeMyDatasets(7, 2), { name: 'My datasets', facts: '7 datasets opened in this browser · 2 files to reopen' });
+  assert.deepEqual(describeMyDatasets(1), { name: 'My datasets', facts: '1 dataset opened in this browser' });
+  assert.equal(describeMyDatasets(1, 1).facts, '1 dataset opened in this browser · 1 file to reopen');
+  // A handle kept without its dataset listed (the list forgotten elsewhere) is still offered to forget.
+  assert.equal(describeMyDatasets(0, 1).facts, '0 datasets opened in this browser · 1 file to reopen');
+  assert.equal(describeMyDatasets(0, 0), null);
 });
 
 test('what a removal did', () => {
@@ -110,6 +114,8 @@ test('what a removal did', () => {
   assert.equal(describeRemoval({ removed: 2, held: 0, hosts: 3 }), 'Removed 2 items. Forgot the connection speeds of 3 hosts.');
   assert.equal(describeRemoval({ removed: 0, held: 0, hosts: 1 }), 'Forgot the connection speeds of 1 host.');
   assert.equal(describeRemoval({ removed: 0, held: 0, hosts: 1, decoders: 4 }), 'Forgot the connection speeds of 1 host. Forgot the decoder choices.');
+  assert.equal(describeRemoval({ removed: 1, held: 0, datasets: 3 }), 'Removed 1 item. Forgot 3 datasets of My datasets.');
+  assert.equal(describeRemoval({ removed: 0, held: 0, datasets: 1 }), 'Forgot 1 dataset of My datasets.');
 });
 
 test('the decoder choices kept are one row, none while nothing is kept', () => {
@@ -145,14 +151,12 @@ test('the Stored row: the datasets kept and their bytes; with none, the hosts re
   assert.deepEqual(said(items), ['2 datasets · 540 MB kept', '2 datasets · 540 MB kept']);
   assert.deepEqual(said(items, 3), ['2 datasets · 540 MB · 3 more', '2 datasets · 540 MB · 3 connection speeds']);
   assert.deepEqual(said([], 1), ['1 connection speed', '1 connection speed']);
-  assert.deepEqual(said(items, 1, 2), ['2 datasets · 540 MB · 3 more', '2 datasets · 540 MB · 2 highlights drafts · 1 connection speed']);
-  assert.deepEqual(said([], 0, 1), ['1 highlights draft', '1 highlights draft']);
-  assert.deepEqual(said(items, 1, 2, 3), ['2 datasets · 540 MB · 6 more', '2 datasets · 540 MB · 2 highlights drafts · 3 files to reopen · 1 connection speed']);
-  assert.deepEqual(said([], 0, 0, 1), ['1 file to reopen', '1 file to reopen']);
-  assert.deepEqual(said([], 2, 1), ['3 items', '1 highlights draft · 2 connection speeds']);
+  assert.deepEqual(said(items, 1, 2), ['2 datasets · 540 MB · 3 more', '2 datasets · 540 MB · 2 saved states · 1 connection speed']);
+  assert.deepEqual(said([], 0, 1), ['1 saved state', '1 saved state']);
+  assert.deepEqual(said([], 2, 1), ['3 items', '1 saved state · 2 connection speeds']);
   assert.deepEqual(said([], 0), ['', '']);
   // Never longer than the row holds beside Manage… (the longest wording, with every count large).
-  assert.ok(said(items, 99, 99, 99)[0].length <= 30, said(items, 99, 99, 99)[0]);
+  assert.ok(said(items, 99, 99)[0].length <= 30, said(items, 99, 99)[0]);
 
   const dom = () => {
     const listeners = new Map();
@@ -218,12 +222,12 @@ test('where it is kept, as the browser says it: its private storage for this sit
   const rows = Object.fromEntries(whereFacts(place).map(row => [row.label, row]));
   assert.equal(rows.Place.value, "this browser's private storage for www.cellucid.com");
   assert.match(rows.Place.title, /^The storage of https:\/\/www\.cellucid\.com in this browser \(its private file system, IndexedDB and localStorage\), inside this browser profile and managed by the browser: not a folder you can open/);
-  assert.equal(rows.Holds.value, 'files, highlight drafts, connection speeds');
-  assert.match(rows.Holds.title, /unsaved highlight drafts and the decoder choices in its IndexedDB/);
-  // Files to reopen are named only where the browser gives their handles.
+  assert.equal(rows.Holds.value, 'files, saved states, My datasets, connection speeds');
+  assert.match(rows.Holds.title, /the saved states of histories, My datasets and the decoder choices in its IndexedDB/);
+  // The handles of files to reopen are named only where the browser gives them.
   const withHandles = Object.fromEntries(whereFacts(place, { handles: true }).map(row => [row.label, row]));
-  assert.equal(withHandles.Holds.value, 'files, highlight drafts, files to reopen, connection speeds');
-  assert.match(withHandles.Holds.title, /unsaved highlight drafts, the browser's handles of files to reopen and the decoder choices in its IndexedDB/);
+  assert.equal(withHandles.Holds.value, 'files, saved states, My datasets, connection speeds');
+  assert.match(withHandles.Holds.title, /the saved states of histories, My datasets with the browser's handles of files to reopen and the decoder choices in its IndexedDB/);
   assert.equal(rows['Removed by'].value, "this dialog, or the browser's Clear site data");
   assert.equal(rows.Space.value, "1.2 GB used · 63 GB free (browser's figures)");
   assert.match(rows.Space.title, /The browser's own estimate for this whole site/);

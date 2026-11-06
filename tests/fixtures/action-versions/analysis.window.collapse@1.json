@@ -1,0 +1,27 @@
+{
+  "examples": [
+    {
+      "collapsed": false,
+      "window": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "collapsed": {
+        "type": "boolean"
+      },
+      "window": {
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "window",
+      "collapsed"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.window.collapse",
+  "version": 1
+}

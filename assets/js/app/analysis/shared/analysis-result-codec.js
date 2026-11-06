@@ -2,14 +2,17 @@
  * Analysis result codec: an analysis result as JSON values plus typed numeric
  * arrays, and back, exactly.
  *
- * Sessions store an analysis result as typed JSON (`session/codecs/typed-json.js`):
- * finite numbers, strings, booleans, null, arrays, plain objects, and typed
- * arrays of six element types, which are written as their bytes. A result in
- * memory holds more than that: NaN and infinite statistics, `undefined`
- * fields, typed arrays of other element types, one object reached from two
- * places, and long columns of numbers or labels inside arrays of records. This
- * codec writes every such value as an explicit tagged node, so decoding gives
- * back a value deep-equal to the original, with the same sharing.
+ * A shown result is kept in the history's values (the `analysis` state domain,
+ * `app/state/domains/analysis.js`): plain data and typed arrays
+ * (`app/history/value-pool.js`), which a session file and the autosave keep as
+ * a JSON skeleton plus each array's bytes (`app/history/value-parts.js`). A
+ * result in memory holds more than plain data: `undefined` fields, one object
+ * reached from two places, and long columns of numbers or labels inside arrays
+ * of records, which as plain data would be one JSON number or string per
+ * element. This codec writes every such value as an explicit tagged node, and
+ * NaN, infinite and negative-zero numbers and typed arrays outside its six
+ * native element types too, so decoding gives back a value deep-equal to the
+ * original, with the same sharing.
  *
  * Encoded nodes (every tag object has the key `$`; nothing else does):
  *
@@ -18,8 +21,9 @@
  * - `{$: 'undefined'}`.
  * - `{$: 'typed', type, values}`: a typed array (copied, so the encoded value
  *   never aliases the live result). `values` is the array itself for the six
- *   element types typed JSON stores, else an Int32Array (Int8, Int16) or a
- *   Uint8Array (Uint8Clamped) of the same numbers.
+ *   native element types (Uint8, Uint16, Uint32, Int32, Float32, Float64),
+ *   else an Int32Array (Int8, Int16) or a Uint8Array (Uint8Clamped) of the
+ *   same numbers.
  * - `{$: 'numbers', values: Float64Array}` and `{$: 'counts', values:
  *   Uint32Array}`: an array of numbers (`counts` when every one is an integer
  *   in [0, 2^32)).
@@ -411,32 +415,4 @@ export function decodeAnalysisResult(encoded, label = 'Analysis result') {
   }
 
   return decodeNode(encoded, label);
-}
-
-/**
- * Throw unless `value` is made only of JSON values and the six typed array
- * types typed JSON stores, with no object using the reserved key "$typed".
- *
- * @param {unknown} value
- * @param {string} [path='value']
- */
-export function requireTypedJsonValue(value, path = 'value') {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError(`${path} must be a finite number`);
-    return;
-  }
-  if (isTypedArray(value)) {
-    if (!NATIVE_TYPED_ARRAYS.has(value.constructor.name)) {
-      throw new TypeError(`${path} is a ${value.constructor.name}`);
-    }
-    return;
-  }
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => requireTypedJsonValue(item, `${path}[${index}]`));
-    return;
-  }
-  if (!isPlainRecord(value)) throw new TypeError(`${path} must be a plain object`);
-  if (Object.hasOwn(value, '$typed')) throw new TypeError(`${path} uses the reserved key "$typed"`);
-  for (const [key, child] of Object.entries(value)) requireTypedJsonValue(child, `${path}.${key}`);
 }

@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { SESSION_TEST_VERSION } from './helpers/session-dataset.mjs';
 
 import {
   beginCellsChangeOnceSettled,
@@ -17,6 +18,11 @@ import {
   useOpenCells,
 } from '../assets/js/data/open-cells-work.js';
 import { SessionSerializer } from '../assets/js/app/session/session-serializer.js';
+import { readHistoryFileManifest } from '../assets/js/app/session/history-file.js';
+import { createActionCatalog } from '../assets/js/app/actions/catalog.js';
+import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
+import { createDomainRegistry } from '../assets/js/app/actions/domains.js';
+import { createHistory } from '../assets/js/app/history/history.js';
 import { DimensionManager } from '../assets/js/data/dimension-manager.js';
 import { initCellExportsUi } from '../assets/js/app/ui/modules/cell-exports-ui.js';
 import { createCellIdentity } from '../assets/js/data/cell-identity.js';
@@ -114,39 +120,29 @@ function datasetState() {
   return state;
 }
 
+/** The session files of `state`, over a started history whose domains hold nothing. */
+async function sessionFiles(state) {
+  const domains = createDomainRegistry();
+  for (const id of domains.missing()) domains.provide(id, { capture: () => null, restore: () => {} });
+  const dispatcher = createActionDispatcher({ catalog: createActionCatalog([]) });
+  const history = createHistory({ dispatcher, domains, dataset: { id: null, name: null, cellOrder: null }, newTrackerId: () => 't-00000000-0000-4000-8000-000000000001' });
+  await history.startTracker();
+  return new SessionSerializer({ state, dataSourceManager: null, getHistory: () => history, dispatcher, onLoaded: () => {}, version: () => SESSION_TEST_VERSION });
+}
+
 test('a growth step waits for a session being saved, and the session describes one set of cells', async () => {
   const state = datasetState();
+  const serializer = await sessionFiles(state);
   const entered = deferred();
   const release = deferred();
-  const serializer = new SessionSerializer({
-    state,
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: null,
-    comparisonModule: null,
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    figureExport: null,
-    contributors: [{
-      id: 'per-cell',
-      async capture() {
-        const count = state.pointCount;
-        entered.resolve();
-        await release.promise;
-        return [{
-          id: 'per-cell/count',
-          contributorId: 'per-cell',
-          priority: 'eager',
-          kind: 'json',
-          codec: 'none',
-          label: 'Per-cell state',
-          datasetDependent: true,
-          payload: { count },
-        }];
-      },
-      restore() {},
-    }],
-  });
+  // The session's dataset part is taken over several turns (the reader worker answers the digest).
+  const digest = state.dimensionManager.getCellOrderDigest;
+  state.dimensionManager.getCellOrderDigest = async layoutKey => {
+    const answer = await digest(layoutKey);
+    entered.resolve();
+    await release.promise;
+    return answer;
+  };
   const saving = serializer.createSessionBundle();
   await entered.promise;
   // A progressive opening's next step asks to change the cells now.
@@ -162,33 +158,20 @@ test('a growth step waits for a session being saved, and the session describes o
   const bundle = await saving;
   await step;
   assert.equal(committed, true);
-  assert.ok(bundle instanceof Blob);
-  const { readBundle } = await import('../assets/js/app/session/bundle/reader.js');
-  const { manifest } = await readBundle(bundle, { signal: null, onProgress: null });
+  const manifest = await readHistoryFileManifest(bundle);
   assert.equal(manifest.datasetFingerprint.cellCount, 2, 'saved on the cells open when it began');
   assert.equal(manifest.datasetFingerprint.cellOrder.digest, '0000000000000002');
 });
 
 test('a session asked for while a growth step commits is saved on the cells after it', async () => {
   const state = datasetState();
-  const serializer = new SessionSerializer({
-    state,
-    viewer: {},
-    sidebar: {},
-    dataSourceManager: null,
-    comparisonModule: null,
-    analysisWindowManager: null,
-    cinematicCamera: null,
-    figureExport: null,
-    contributors: [],
-  });
+  const serializer = await sessionFiles(state);
   const end = await beginCellsChangeOnceSettled();
   const saving = serializer.createSessionBundle();
   await turn();
   state.grow();
   end();
-  const { readBundle } = await import('../assets/js/app/session/bundle/reader.js');
-  const { manifest } = await readBundle(await saving, { signal: null, onProgress: null });
+  const manifest = await readHistoryFileManifest(await saving);
   assert.equal(manifest.datasetFingerprint.cellCount, 4);
   assert.equal(manifest.datasetFingerprint.cellOrder.digest, '0000000000000004');
 });

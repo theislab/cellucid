@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { array, group, shardedEntries, zarrEntries } from './helpers/anndata-store.mjs';
+import { virtualTime } from './helpers/virtual-time.mjs';
 import { memoryStore, openZarr } from '../assets/js/formats/zarr/index.js';
 import { httpStore } from '../assets/js/formats/zarr/stores/http.js';
 import { bytesByteSource } from '../assets/js/formats/io/byte-source.js';
@@ -150,7 +151,13 @@ test('HDF5: chunk index leaves, chunk groups and the chunk table shared by two r
     const selection = [[8000, 10000]];
     const expected = Array.from(await reference.get(name).read(selection));
     // Opened, nothing of the dataset read yet: its table, leaves and chunks are read by the two reads.
-    const root = await openHdf5(createByteReader(source), { load: [''] });
+    // Its link on a clock of its own, on which no request takes any time: how
+    // far a read reaches past what it was asked for follows the link as
+    // measured (a request a round trip's worth of bytes long,
+    // `LinkMeter.maxRequestBytes`), and timed, a request held at the gate for
+    // as long as a busy machine takes to get there was a slow link's, whose
+    // opening then read the dataset the two reads below were to read.
+    const root = await openHdf5(createByteReader(source, { clock: virtualTime().now }), { load: [''] });
     const node = root.get(name);
     held.close();
     counting = true;

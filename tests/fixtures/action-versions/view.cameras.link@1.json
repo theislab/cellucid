@@ -1,0 +1,21 @@
+{
+  "examples": [
+    {
+      "linked": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "linked": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "linked"
+    ],
+    "type": "object"
+  },
+  "type": "view.cameras.link",
+  "version": 1
+}

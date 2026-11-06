@@ -14,6 +14,9 @@
   folder picker and folder drops read too) -- each under its own id.
 - ``tests/browser/fixtures/uint32-categories.h5ad``: the current-ui dataset
   with 70,000 ``cell_type`` categories.
+- ``tests/browser/fixtures/replay-other.h5ad``: the current-ui cells as
+  another sample, for a history recorded on current-ui replayed on it: some
+  names the same, some not.
 - ``tests/browser/fixtures/broken-catalogs/``: one catalog per way a catalog
   cannot be read (a missing, truncated or corrupt file, an id the file does
   not state, a truncated ``datasets.json``, a catalog without ``schema``).
@@ -364,6 +367,20 @@ def uint32_categories() -> anndata.AnnData:
     return adata
 
 
+def replay_other() -> anndata.AnnData:
+    """The current-ui cells as another sample, for replaying a history
+    recorded on current-ui (`history-replay-other-dataset.spec.mjs`): its
+    `cell_type` shares only `gamma` (alpha is `delta`, beta is `epsilon`),
+    `score` is the same, and of the genes CD3E is CD3D."""
+    adata = current_ui()
+    relabel = {"alpha": "delta", "beta": "epsilon", "gamma": "gamma"}
+    labels = [relabel[label] for label in adata.obs["cell_type"].astype(str)]
+    adata.obs["cell_type"] = _categorical(labels, ["gamma", "delta", "epsilon"])
+    adata.var_names = pd.Index(["GAPDH", "ACTB", "CD3D", "MS4A1", "NKG7", "LYZ"])
+    adata.uns["cellucid"] = {**adata.uns["cellucid"], "id": "replay-other", "name": "Replay fixture"}
+    return adata
+
+
 def main() -> None:
     broken = FIXTURES / "broken-catalogs"
     forms = FIXTURES / "forms-catalog"
@@ -412,6 +429,7 @@ def main() -> None:
     ])
 
     uint32_categories().write_h5ad(FIXTURES / "uint32-categories.h5ad", compression="gzip")
+    replay_other().write_h5ad(FIXTURES / "replay-other.h5ad")
 
     # Catalogs that cannot be read, each for one reason.
     good = (forms / "forms-h5ad.h5ad").read_bytes()

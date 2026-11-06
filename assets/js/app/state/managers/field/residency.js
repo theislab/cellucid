@@ -10,8 +10,12 @@
  *
  * Arrays a view still needs are always resident: the active field of every
  * view, every field carrying filter state in any view (every filter applies
- * whatever is coloured, and a disabled filter can be re-enabled without a
- * reload), and every field mid-load. An inactive gene whose column has a
+ * whatever is coloured, and a disabled filter or a deleted field can come back
+ * without a reload), every field mid-load, and a user-defined field's own
+ * arrays, which no file can give back (its codes, a pushed column's values:
+ * only a copy of a file's column reads its values again). A released field
+ * keeps what was set on it, its colours, every category shown and its full
+ * range; the visibility pass reads no array for those. An inactive gene whose column has a
  * sparse form (`data/column-forms.js`: nearly every gene) keeps that form
  * alone, its entries instead of four bytes a cell (40 MB at 10M cells), and
  * selecting it again makes its column from the form without a read
@@ -21,9 +25,11 @@
  * reports); selecting one again reloads it. The budget only decides what is
  * kept warm: a field of any size is loaded and shown.
  *
- * Release runs when the active field changes, never while fields are being
- * staged, so a session restore or analysis that loads several fields before
- * using them cannot lose one in between.
+ * Release runs when the active field changes, and whenever the memory model
+ * trims (`data/memory-budget.js`: over budget, and down to nothing when the
+ * page is hidden, so any tab switch releases every inactive field). A reader
+ * that loads several fields before using them reads again what went meanwhile
+ * (`state/domains/fields.js` `loadFields`); a batch is never trimmed.
  *
  * @module state/managers/field/residency
  */
@@ -31,8 +37,7 @@
 import { residencyBudgetBytes } from '../../../../data/memory-budget.js';
 import { columnFormOf, noteColumnForm } from '../../../../data/column-forms.js';
 import { allocateTypedArray } from '../../../../data/sparse-column-index.js';
-import { hasOutlierFilter, hasRangeFilter } from '../filter-manager.js';
-import { hiddenCategoryCount } from '../../../utils/category-state.js';
+import { hasCategoryFilter, hasOutlierFilter, hasRangeFilter } from '../filter-manager.js';
 
 const FIELD_ARRAY_KEYS = Object.freeze(['values', 'codes', 'outlierQuantiles']);
 
@@ -61,11 +66,19 @@ function viewsOf(state) {
  * stay, since every filter applies whatever is coloured.
  */
 function hasFilterState(field) {
-  if (field.kind === 'category') {
-    if (hasOutlierFilter(field) || field._missingVisible === false) return true;
-    return field._categoryVisible !== undefined && hiddenCategoryCount(field._categoryVisible) > 0;
-  }
-  return hasRangeFilter(field);
+  // A deleted field's filter applies again when the field comes back.
+  const kept = field._isDeleted === true ? { ...field, _isDeleted: false } : field;
+  return kept.kind === 'category' ? hasCategoryFilter(kept) || hasOutlierFilter(kept) : hasRangeFilter(kept);
+}
+
+/**
+ * Whether a field's arrays exist nowhere else: a user-defined field's, unless
+ * it is a copy of a file's continuous column, which reads its values again
+ * from its source (`field/loading.js`).
+ */
+function holdsOnlyCopy(field) {
+  if (field._isUserDefined !== true) return false;
+  return !(field.kind === 'continuous' && typeof field._sourceField?.sourceKey === 'string');
 }
 
 /**
@@ -135,8 +148,8 @@ function positionsOf(fields, key) {
 /**
  * Cache keys whose arrays some view needs right now, per source, among the
  * cached ones (no other key holds bytes): each view's active field, cached
- * fields mid-load or carrying filter state, and the sources of loaded
- * user-defined aliases. The work is the views times the cached keys and
+ * fields mid-load or carrying filter state, user-defined fields' own arrays,
+ * and the sources of loaded user-defined aliases. The work is the views times the cached keys and
  * aliases, not the inventories' length.
  *
  * @param {object} state
@@ -166,7 +179,7 @@ function keysInUse(state, caches) {
         if (used.has(key)) continue;
         for (const position of positionsOf(fields, key)) {
           const field = fields[position];
-          if (field._loadingPromise || hasFilterState(field)) {
+          if (field._loadingPromise || hasFilterState(field) || holdsOnlyCopy(field)) {
             used.add(key);
             break;
           }

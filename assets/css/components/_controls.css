@@ -294,7 +294,8 @@ textarea.obs-select {
    field it promised a list that is not there — and its text stops short of
    the chevron instead of running underneath it. The chevron is centred on the
    control's own height, so a taller or shorter select needs no override. */
-select.obs-select {
+select.obs-select,
+button.obs-select[aria-haspopup="menu"] {
   padding-right: var(--space-6);
   text-overflow: ellipsis;
   appearance: none;
@@ -306,6 +307,14 @@ select.obs-select {
   background-position: calc(100% - var(--space-3-5)) 50%, calc(100% - var(--space-2-5)) 50%;
   background-size: var(--space-1) var(--space-1), var(--space-1) var(--space-1);
   background-repeat: no-repeat;
+}
+
+/* A menu chosen from as a select is (My datasets): its button is drawn as
+   one, its value on one line, cut at the chevron. */
+button.obs-select[aria-haspopup="menu"] {
+  overflow: hidden;
+  white-space: nowrap;
+  text-align: left;
 }
 
 /* ------------------------------------------------------------------------

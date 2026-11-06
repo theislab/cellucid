@@ -16,6 +16,8 @@
  *   the browser only on its click, and says what it answered.
  * - A window that gives the site no storage says it keeps data only until the
  *   tab closes, found by asking the browser for its storage.
+ * - My datasets (the dataset the address opened is listed) is one row, never
+ *   a row per dataset (`my-datasets.spec.mjs`); Remove all forgets it too.
  *
  * What is kept is written as the keepers write it (`transcode/space.js`
  * manifests), so the spec needs no large file.
@@ -146,8 +148,9 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   await manage.click();
   const dialog = page.locator('#kept-stores-dialog');
   await expect(dialog).toBeVisible();
-  const sections = dialog.locator('.kept-dataset:not(.kept-hosts)');
+  const sections = dialog.locator('.kept-dataset:not(.kept-hosts):not(.kept-library)');
   await expect(sections).toHaveCount(2);
+  await expect(dialog.locator('.kept-library .kept-dataset-facts')).toHaveText('1 dataset opened in this browser');
   const atlas = sections.filter({ hasText: 'atlas.h5ad' });
   await expect(atlas.locator('.kept-dataset-facts')).toHaveText('example.org · 8.0 MB');
   await expect(atlas.locator('.select-item-name')).toHaveText(['Downloaded parts', 'Gene index (X, every cell)', 'Whole download']);
@@ -189,7 +192,8 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   await manage.click();
   await expect(hosts).toHaveCount(1);
   await page.locator('#kept-stores-remove-all').click();
-  await expect(page.locator('#kept-stores-status')).toHaveText('Removed 1 item. Forgot the connection speeds of 2 hosts. 1 item in use by an open tab stays until that tab closes.');
+  await expect(page.locator('#kept-stores-status')).toHaveText('Removed 1 item. Forgot 1 dataset of My datasets. Forgot the connection speeds of 2 hosts. 1 item in use by an open tab stays until that tab closes.');
+  await expect(dialog.locator('.kept-library')).toHaveCount(0);
   await expect(hosts).toHaveCount(0);
   await expect(atlas.locator('[data-item-id]')).toHaveCount(1);
   expect(await page.evaluate(() => localStorage.getItem('cellucid:host-link:v1'))).toBeNull();
@@ -202,34 +206,31 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   expect(errors).toEqual([]);
 });
 
-test('a draft of unsaved highlights is listed under its dataset\'s name, and removed when chosen', async ({ page, browserName }) => {
+test('a saved state is listed under its dataset\'s name, and removed when chosen', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   // A window that keeps nothing says so on the row instead (covered by the last test).
   test.skip(!(await pageWritesStorage(page)), 'this window gives a page no storage that lasts');
-  await page.evaluate(() => {
-    window._cellucidState.addHighlightDirect({ cellIndices: Uint32Array.of(1, 2, 3), label: 'probe', type: 'lasso' });
-  });
-  // Written shortly after the change, and heard by the row.
-  await expect(page.locator('#kept-stores-text')).toHaveAttribute('title', /1 highlights draft/);
+  // The dataset's history has begun once it opened; a named save of it is kept at once.
+  await expect.poll(() => page.evaluate(() => window._cellucidHistories.current()?.active !== null)).toBe(true);
+  await page.evaluate(() => window._cellucidHistories.savedStates.saveAs('Probe'));
+  // Heard by the row.
+  await expect(page.locator('#kept-stores-text')).toHaveAttribute('title', /1 saved state/);
   await page.locator('#kept-stores-manage-btn').click();
-  const drafts = page.locator('#kept-stores-dialog .kept-drafts');
-  await expect(drafts.locator('.kept-dataset-name')).toHaveText('Unsaved highlights');
-  const row = drafts.locator('[data-item-id^="draft:"]');
+  const saved = page.locator('#kept-stores-dialog .kept-saved-states');
+  await expect(saved.locator('.kept-dataset-name')).toHaveText('Saved states');
+  const row = saved.locator('[data-item-id^="saved:"]');
   await expect(row.locator('.select-item-name')).toHaveText('Current UI fixture');
-  await expect(row.locator('.select-item-meta')).toHaveText('Unsaved highlights draft · 1 highlight · saved today');
-  // Files to reopen are named where the browser gives their handles (Chromium).
-  await expect(page.locator('#kept-stores-where dt:text-is("Holds") + dd')).toHaveText(browserName === 'chromium'
-    ? 'files, highlight drafts, files to reopen, connection speeds'
-    : 'files, highlight drafts, connection speeds');
+  await expect(row.locator('.select-item-meta')).toHaveText('Saved as "Probe" · 0 steps · saved today');
+  await expect(page.locator('#kept-stores-where dt:text-is("Holds") + dd')).toHaveText('files, saved states, My datasets, connection speeds');
   await row.locator('input').check();
   await page.locator('#kept-stores-remove-selected').click();
   await expect(page.locator('#kept-stores-status')).toHaveText('Removed 1 item.');
-  await expect(drafts).toHaveCount(0);
-  expect(await page.evaluate(async () => (await import('/assets/js/app/highlight-draft.js')).listHighlightDrafts().then(list => list.length))).toBe(0);
-  await expect(page.locator('#kept-stores-text')).not.toHaveAttribute('title', /highlights draft/);
+  await expect(saved).toHaveCount(0);
+  expect(await page.evaluate(async () => (await import('/assets/js/app/history/autosave.js')).listSavedStates().then(list => list.length))).toBe(0);
+  await expect(page.locator('#kept-stores-text')).not.toHaveAttribute('title', /saved state/);
   expect(errors).toEqual([]);
 });
 
@@ -274,15 +275,17 @@ test('a window that gives the site no storage says it keeps data only until the 
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await expect(page.locator('#kept-stores-line')).toBeVisible();
   await expect(page.locator('#kept-stores-text')).toHaveText('Kept for this tab only');
+  // The dataset the address opened is listed in My datasets (until the window closes).
+  await expect.poll(() => page.evaluate(async () => (await (await import('/assets/js/app/library/my-datasets.js')).listMyDatasets()).length)).toBe(1);
   await page.locator('#kept-stores-manage-btn').click();
   await expect(page.locator('#kept-stores-dialog')).toBeVisible();
-  // Nothing is kept for a later visit; the connection speeds this window measured (its localStorage) may be listed.
-  await expect(page.locator('#kept-stores-dialog .kept-dataset:not(.kept-hosts)')).toHaveCount(0);
-  const speeds = await page.locator('#kept-stores-dialog .kept-hosts').count();
-  await expect(page.locator('#kept-stores-empty')).toBeVisible({ visible: speeds === 0 });
+  // Nothing is kept for a later visit; the connection speeds this window measured (its localStorage) may be listed, and My datasets is one row.
+  await expect(page.locator('#kept-stores-dialog .kept-dataset:not(.kept-hosts):not(.kept-library)')).toHaveCount(0);
+  await expect(page.locator('#kept-stores-dialog .kept-library')).toHaveCount(1);
+  await expect(page.locator('#kept-stores-empty')).toBeHidden();
   await expect(page.locator('#kept-stores-where dt')).toHaveText(['Place']);
   await expect(page.locator('#kept-stores-where dd')).toHaveText('This browser window keeps data only until the tab closes');
   await expect(page.locator('#kept-stores-persist')).toBeHidden();
-  await expect(page.locator('#kept-stores-remove-all')).toBeEnabled({ enabled: speeds > 0 });
+  await expect(page.locator('#kept-stores-remove-all')).toBeEnabled();
   expect(errors).toEqual([]);
 });

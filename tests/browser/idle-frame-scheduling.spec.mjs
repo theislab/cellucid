@@ -240,8 +240,7 @@ test('a renderer slower than the settle window still settles the camera', async 
   });
 
   await expect.poll(
-    () => page.evaluate(() => window.__slowFrameSettlement.events),
-    { timeout: 30_000 },
+    () => page.evaluate(() => window.__slowFrameSettlement.events)
   ).toEqual(['camera-changing', 'camera-settled']);
   await page.evaluate(() => {
     window.__slowFrameSettlement.unsubscribe();

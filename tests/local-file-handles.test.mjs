@@ -5,8 +5,8 @@
  * (a file's size and modification time, a folder's digest of every file's);
  * a reopen asks the browser for leave to read it unless given, and refuses,
  * saying to choose it again with Open…, when leave is refused, when it is
- * gone or when it changed (a gone or changed one is forgotten). The Stored
- * dialog lists and forgets them; a tab notes which local dataset it shows,
+ * gone or when it changed (a gone or changed one is forgotten). My datasets
+ * lists the datasets they open and forgets them; a tab notes which local dataset it shows,
  * in its own sessionStorage, so its reload can offer it. Browsers without
  * handles keep and offer nothing.
  */
@@ -26,7 +26,7 @@ import {
   readPermissionOf,
   rememberTabDataset,
   tabLocalDataset,
-} from '../assets/js/app/local-file-handles.js';
+} from '../assets/js/app/library/local-file-handles.js';
 
 function mapStore() {
   const map = new Map();

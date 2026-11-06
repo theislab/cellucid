@@ -8,6 +8,8 @@ import { createAccordionInteractions } from './dockable-accordions/interactions.
 import { createSheetLayout } from './dockable-accordions/sheets.js';
 import { announceKeyboardMove } from './ui/keyboard-move.js';
 import { cancel } from '../utils/abort.js';
+import { ActionRefused } from './actions/dispatcher.js';
+import { quoteName } from './actions/targets/names.js';
 
 const DRAG_THRESHOLD_PX = 6;
 const DETACH_DISTANCE_PX = 30;     // Distance from sidebar right edge to detach
@@ -19,13 +21,12 @@ const FLOAT_MIN_WIDTH_PX = 220;
  *
  * `--z-layer` is read back off the panels themselves rather than tracked in a
  * counter here. A counter is a private copy of "what is currently on top", and
- * the DOM is the thing that actually holds that: a session restore writes
- * `--z-layer` straight onto the panels it reopens
- * (`session/contributors/dockable-layout.js`), so a counter that only ever
- * counted this module's own calls came back from a restore believing the stack
- * was empty. Every panel torn off after that got a layer below the restored
- * ones and could never be clicked to the front again, because clicking raised
- * it by one from the same stale base.
+ * the DOM is the thing that actually holds that: a restore floats panels
+ * through this module but a counter that only ever counted this module's own
+ * calls once came back from a session restore (which wrote `--z-layer` itself)
+ * believing the stack was empty. Every panel torn off after that got a layer
+ * below the restored ones and could never be clicked to the front again,
+ * because clicking raised it by one from the same stale base.
  */
 const FLOAT_BASE_LAYER = 90;
 
@@ -95,8 +96,8 @@ function panelActions(frame) {
  * Whether this panel is floating.
  *
  * The frame's class is the owner. The stylesheet keys the entire floating
- * presentation off it, and the session contributor reads it as the truth about
- * what is in the floating root (`session/contributors/dockable-layout.js`). A
+ * presentation off it, and the `layout` state domain reads it as the truth
+ * about what is in the floating root (`app/state/domains/layout.js`). A
  * `state.isFloating` field beside it was a second copy of the same fact, and
  * `unregister()` could drop the record while the class stayed on the element —
  * leaving a panel that was visibly floating and that `dock()` refused to bring
@@ -193,10 +194,21 @@ function ensureFloatingRoot() {
   return root;
 }
 
-export function initDockableAccordions({ sidebar } = {}) {
+/**
+ * @param {{sidebar: HTMLElement, actions: ReturnType<typeof import('./actions/dispatcher.js').createActionDispatcher>}} options
+ *   `actions`: the dispatcher the sidebar sections' float, dock and place
+ *   actions are provided on (`app/actions/definitions/layout.js`); their
+ *   buttons dispatch them, and a drag or resize is recorded when it ends.
+ */
+export function initDockableAccordions({ sidebar, actions } = {}) {
   if (!sidebar) {
     console.warn('[DockableAccordions] Missing sidebar element; skipping.');
     return { dock: () => {}, undock: () => {} };
+  }
+  for (const method of ['dispatch', 'provide', 'recordObserved']) {
+    if (typeof actions?.[method] !== 'function') {
+      throw new TypeError(`Dockable panels need the action dispatcher (${method}).`);
+    }
   }
 
   const floatingRoot = ensureFloatingRoot();
@@ -247,6 +259,9 @@ export function initDockableAccordions({ sidebar } = {}) {
       readoutTimer: null,
       // The caller's observer of a size the user chose (resize, fit, maximize).
       onGeometryChange: null,
+      // The caller's recorder of a box the user ended a gesture in (a window
+      // that is not a sidebar section: an analysis window).
+      onPlaced: null,
       // Whether the panel becomes a bottom sheet on a phone.
       sheet: false,
     };
@@ -353,7 +368,7 @@ export function initDockableAccordions({ sidebar } = {}) {
       'accordion-copy-btn accordion-undock-btn',
       `Undock ${title} panel into a floating window`,
       signal,
-      () => undockFromButton(summary, details)
+      () => undockFromButton(details)
     );
     ensurePanelButton(
       actions,
@@ -361,36 +376,57 @@ export function initDockableAccordions({ sidebar } = {}) {
       'accordion-dock-btn',
       `Dock ${title} panel back into sidebar`,
       signal,
-      () => dockFromButton(summary, details)
+      () => dockFromButton(details)
     );
   }
 
-  function undockFromButton(summary, details) {
-    const state = getState(details);
-    if (isFloating(details) || !state.dockable) return;
+  /** A button's action, dispatched; a refusal or failure is said, never thrown into the click. */
+  function dispatchFromButton(type, params) {
+    actions.dispatch(type, params).catch(error => {
+      console.error(`[DockableAccordions] ${type} failed:`, error);
+    });
+  }
+
+  function undockFromButton(details) {
+    if (isFloating(details) || !getState(details).dockable) return;
+    dispatchFromButton('layout.panel.float', { panel: details.id });
+  }
+
+  function dockFromButton(details) {
+    if (!isFloating(details) || !getState(details).dockable) return;
+    dispatchFromButton('layout.panel.dock', { panel: details.id });
+  }
+
+  /**
+   * Float a section beside the sidebar, clear of the windows already open
+   * (the undock button's place).
+   */
+  function undockBesideSidebar(details) {
     const frame = panelFrame(details);
     const rect = frame.getBoundingClientRect();
     const sidebarRect = sidebar.getBoundingClientRect();
     undock(details, sidebarRect.right + 24, rect.top, { besideOpenWindows: true });
-    // The control that was activated is hidden now; focus moves to the one
-    // that reverses it, in the same bar.
-    panelActions(frame)?.querySelector('.accordion-dock-btn')?.focus();
-    announceKeyboardMove(
-      document,
-      `${panelTitle(summary)} is now a floating window. `
-      + 'Use the dock button in its header to put it back in the sidebar.'
-    );
   }
 
-  function dockFromButton(summary, details) {
-    const state = getState(details);
-    if (!isFloating(details) || !state.dockable) return;
-    dock(details);
-    panelActions(panelFrame(details))?.querySelector('.accordion-undock-btn')?.focus();
-    announceKeyboardMove(
-      document,
-      `${panelTitle(summary)} is docked in the sidebar again.`
-    );
+  /**
+   * After a person floated or docked a section with its button: the control
+   * that was activated is hidden now, so focus moves to the one that
+   * reverses it, in the same bar, and the move is announced.
+   */
+  function followMoveWithFocus(details) {
+    const frame = panelFrame(details);
+    const title = panelTitle(details.querySelector(':scope > summary'));
+    if (isFloating(details)) {
+      panelActions(frame)?.querySelector('.accordion-dock-btn')?.focus();
+      announceKeyboardMove(
+        document,
+        `${title} is now a floating window. `
+        + 'Use the dock button in its header to put it back in the sidebar.'
+      );
+    } else {
+      panelActions(frame)?.querySelector('.accordion-undock-btn')?.focus();
+      announceKeyboardMove(document, `${title} is docked in the sidebar again.`);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -619,6 +655,7 @@ export function initDockableAccordions({ sidebar } = {}) {
     undock,
     dock,
     floatingArea,
+    placed: (details, kind) => placedByGesture(details, kind),
     constants: {
       DRAG_THRESHOLD_PX,
       DETACH_DISTANCE_PX,
@@ -638,11 +675,14 @@ export function initDockableAccordions({ sidebar } = {}) {
    * window's copy, maximize and close buttons), placed in the frame's header
    * action bar beside the summary. They stay with the frame for its lifetime.
    * `options.onGeometryChange({width, height})` hears every size the user
-   * chooses — a resize, a fit, a maximize. `options.sheet` makes the panel a
+   * chooses — a resize, a fit, a maximize. `options.onPlaced({left, top,
+   * width, height})` records the box a window that is not a sidebar section
+   * (`dockable: false`) ends a move or resize in; a sidebar section's is
+   * recorded here (`layout.panel.place`). `options.sheet` makes the panel a
    * bottom sheet on a phone (`dockable-accordions/sheets.js`).
    *
    * @param {HTMLElement} details
-   * @param {{ dockable?: boolean, actions?: Element[], onGeometryChange?: Function, sheet?: boolean }} [options]
+   * @param {{ dockable?: boolean, actions?: Element[], onGeometryChange?: Function, onPlaced?: Function, sheet?: boolean }} [options]
    */
   function register(details, options = {}) {
     if (!(details instanceof HTMLElement)) return;
@@ -661,6 +701,10 @@ export function initDockableAccordions({ sidebar } = {}) {
       throw new TypeError('A panel geometry observer must be a function.');
     }
     state.onGeometryChange = options.onGeometryChange ?? null;
+    if (options.onPlaced !== undefined && typeof options.onPlaced !== 'function') {
+      throw new TypeError('A panel placement recorder must be a function.');
+    }
+    state.onPlaced = options.onPlaced ?? null;
     state.sheet = options.sheet === true;
 
     // One controller per registration owns every listener and every element
@@ -744,6 +788,107 @@ export function initDockableAccordions({ sidebar } = {}) {
     stateByDetails.delete(details);
     if (state.sheet) sheets?.release(details);
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Actions: float, dock and place a sidebar section (definitions/layout.js)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** The sidebar's sections, docked or floating, in registration order. */
+  function sidebarSections() {
+    return [...stateByDetails].filter(([details, state]) => state.dockable && details.id.length > 0
+      && details.isConnected !== false).map(([details]) => details);
+  }
+
+  function sectionTitle(details) {
+    return panelTitle(details.querySelector(':scope > summary') ?? details);
+  }
+
+  /**
+   * The section a name stands for: its id, or its title as the sidebar shows
+   * it (any case), or an `ActionRefused` listing the sections.
+   *
+   * @param {string} name
+   * @returns {HTMLElement}
+   */
+  function resolveSection(name) {
+    const sections = sidebarSections();
+    const byId = sections.find(details => details.id === name);
+    if (byId !== undefined) return byId;
+    const wanted = String(name).trim().toLowerCase();
+    const byTitle = sections.filter(details => sectionTitle(details).toLowerCase() === wanted);
+    if (byTitle.length === 1) return byTitle[0];
+    throw new ActionRefused(
+      `There is no sidebar section ${quoteName(name)}; the sections are ${sections.map(sectionTitle).join(', ')}.`,
+      { code: 'no-target' }
+    );
+  }
+
+  /** A section's box as its frame holds it (`--pos-*`). */
+  function boxOf(details) {
+    return interactions.frameRect(panelFrame(details));
+  }
+
+  /** What a gesture ended in, recorded (a step per drag, coalesced per panel). */
+  function placedByGesture(details, kind) {
+    const state = stateByDetails.get(details);
+    if (state === undefined) return;
+    if (!state.dockable) {
+      if (state.onPlaced !== null && isFloating(details)) state.onPlaced(boxOf(details));
+      return;
+    }
+    if (details.id.length === 0) return;
+    const outcome = { panel: sectionTitle(details) };
+    const [type, params] = kind === 'dock'
+      ? ['layout.panel.dock', { panel: details.id }]
+      : [kind === 'float' ? 'layout.panel.float' : 'layout.panel.place', { panel: details.id, ...boxOf(details) }];
+    actions.recordObserved(type, params, {}, outcome)
+      .catch(error => console.error(`[DockableAccordions] ${type} could not be recorded:`, error));
+  }
+
+  const RECT_KEYS = ['left', 'top', 'width', 'height'];
+
+  actions.provide('layout.panel.float', (params, { meta }) => {
+    const details = resolveSection(params.panel);
+    const given = RECT_KEYS.filter(key => params[key] !== undefined);
+    if (given.length !== 0 && given.length !== RECT_KEYS.length) {
+      throw new ActionRefused('Give all of left, top, width and height, or none of them to place it beside the sidebar.', {
+        code: 'bad-params'
+      });
+    }
+    if (isFloating(details)) return null;
+    if (given.length === 0) {
+      undockBesideSidebar(details);
+    } else {
+      undock(details, params.left, params.top, {
+        preferredSize: { width: params.width, height: params.height }
+      });
+    }
+    if (!isFloating(details)) {
+      throw new ActionRefused(`${sectionTitle(details)} cannot float.`, { code: 'refused' });
+    }
+    if (meta.origin === 'user') followMoveWithFocus(details);
+    return { panel: sectionTitle(details) };
+  });
+
+  actions.provide('layout.panel.dock', (params, { meta }) => {
+    const details = resolveSection(params.panel);
+    if (!isFloating(details)) return null;
+    dock(details);
+    if (meta.origin === 'user') followMoveWithFocus(details);
+    return { panel: sectionTitle(details) };
+  });
+
+  actions.provide('layout.panel.place', params => {
+    const details = resolveSection(params.panel);
+    if (!isFloating(details)) {
+      throw new ActionRefused(
+        `${sectionTitle(details)} is docked in the sidebar; undock it first (layout.panel.float).`,
+        { code: 'refused' }
+      );
+    }
+    interactions.placeFloating(details, params);
+    return { panel: sectionTitle(details) };
+  });
 
   sidebar.querySelectorAll('details.accordion-section').forEach((details) => {
     register(details, { dockable: true });
@@ -840,6 +985,26 @@ export function initDockableAccordions({ sidebar } = {}) {
      * @param {HTMLElement} details
      * @returns {boolean} Whether it is maximized now.
      */
-    toggleMaximize: details => interactions.toggleMaximize(details)
+    toggleMaximize: details => interactions.toggleMaximize(details),
+    /**
+     * Put a floating panel at a box (kept inside the area and its size
+     * limits); returns the box it stands in.
+     */
+    place: (details, rect) => interactions.placeFloating(details, rect),
+    /** Whether a panel floats. */
+    isFloating,
+    /**
+     * The sidebar's sections as the layout read gives them: id, title,
+     * floating or docked, open, and a floating one's box.
+     * @returns {Array<{id: string, title: string, floating: boolean, open: boolean, left?: number, top?: number, width?: number, height?: number}>}
+     */
+    describeSections: () => sidebarSections().map(details => ({
+      id: details.id,
+      title: sectionTitle(details),
+      floating: isFloating(details),
+      open: details.open === true,
+      ...(isFloating(details) ? boxOf(details) : {})
+    })),
+    resolveSection
   };
 }

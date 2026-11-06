@@ -76,6 +76,7 @@
  */
 
 import { LOCAL_POLICY } from '../formats/io/byte-source.js';
+import { isHeld } from '../utils/machine.js';
 
 /** Where the records are kept. */
 export const HOST_LINK_STORAGE_KEY = 'cellucid:host-link:v1';
@@ -270,6 +271,22 @@ export function hostLinkSeed(origin, { storage = pageStorage(), timeline = globa
     paceMs: visitPace(origin, storage, now),
     thisMachine: onThisMachine(origin),
   };
+}
+
+/**
+ * The seed the reader plans with (`AnnDataReader`): `seed` (`hostLinkSeed`)
+ * as it is, or, while the machine's link is held (`utils/machine.js`
+ * `link`), only where the host is (`thisMachine`, which is no measurement):
+ * what earlier visits measured of it and what the page's own downloads
+ * measured of this browser's downlink are measurements of the link too, and
+ * a held link is planned on as held.
+ *
+ * @param {Object|null} seed
+ * @returns {Object|null}
+ */
+export function plannedHostLink(seed) {
+  if (seed === null || seed === undefined || !isHeld('link')) return seed ?? null;
+  return { origin: seed.origin, thisMachine: seed.thisMachine === true };
 }
 
 function readPaces(storage) {

@@ -7,9 +7,10 @@
  * had no centroids and therefore no labels, and switching a view's dimension
  * while one was active threw "Raw 2D positions are unavailable for centroid
  * computation". They are now computed from each layout's normalized positions,
- * recorded as normalized, and recomputed after every category edit. A session
- * stores only the codes: restoring them computes the centroids again from the
- * positions of each resident layout.
+ * recorded as normalized, and recomputed after every category edit. The
+ * `field-overlays` state domain (`app/state/domains/field-overlays.js`), which
+ * the history and a session file keep, holds only the codes: restoring them
+ * computes the centroids again from the positions of each resident layout.
  */
 
 import assert from 'node:assert/strict';
@@ -22,8 +23,10 @@ import { UserDefinedFieldsRegistry } from '../assets/js/app/registries/user-defi
 import {
   computeCentroidsForDimension,
 } from '../assets/js/app/registries/user-defined-fields/centroids.js';
-import * as fieldOverlays from '../assets/js/app/session/contributors/field-overlays.js';
-import * as userDefinedCodes from '../assets/js/app/session/contributors/user-defined-codes.js';
+import {
+  captureFieldOverlays,
+  createFieldOverlaysDomain,
+} from '../assets/js/app/state/domains/field-overlays.js';
 import { loadsAsReader } from './helpers/dimension-loads.mjs';
 
 /** The embedding id of each dimension: one v3 `embeddings.items` entry each. */
@@ -110,6 +113,8 @@ function datasetManager(dimensions = [1, 2, 3]) {
 function recordingViewer() {
   const centroidPublications = [];
   const viewer = {
+    // The live view alone: the views a state domain covers.
+    getSnapshotViews: () => [],
     hasVectorFieldForLayout: () => false,
     isDisposed: () => false,
     resetVectorFieldOverlay() {},
@@ -141,7 +146,7 @@ async function createScene({ resident = ['X_umap_2d'], dimensions = [1, 2, 3] } 
   const live = await manager.getPositions('X_umap_2d');
   manager.setViewLayout('live', 'X_umap_2d');
   state.initScene(live, { fields: [] });
-  return { centroidPublications, manager, state };
+  return { centroidPublications, manager, state, viewer };
 }
 
 /** Two highlight pages turned into a categorical, the Category Builder path. */
@@ -364,49 +369,31 @@ test('a built-in categorical edited into a derived field gets normalized centroi
   }
 });
 
+/**
+ * The field overlays of `state` put back on a new page, as the history or a
+ * session file gives them back (a copy of the value).
+ */
 async function saveAndRestore(state, makeTarget) {
-  const [overlayChunk] = fieldOverlays.capture({ state });
-  // Exactly what the bundle writer stores and the reader parses.
-  const overlayPayload = JSON.parse(JSON.stringify(overlayChunk.payload));
-  const codeChunks = userDefinedCodes.capture({ state });
-
+  const value = structuredClone(captureFieldOverlays(state));
   const target = await makeTarget();
-  fieldOverlays.restore({ state: target.state }, overlayChunk, overlayPayload);
-  const restoredBeforeCodes = new Map(
-    target.state.obsData.fields
-      .filter(candidate => candidate._isUserDefined === true)
-      .map(candidate => [
-        candidate._userDefinedId,
-        {
-          centroids: [...candidate.centroidsByLayout.keys()],
-          normalized: [...candidate._normalizedLayouts],
-        },
-      ])
-  );
-  for (const { payload, ...meta } of codeChunks) {
-    await userDefinedCodes.restore(
-      { state: target.state, abortSignal: null },
-      { ...meta, storedBytes: payload.byteLength, uncompressedBytes: payload.byteLength },
-      payload
-    );
-  }
-  return { overlayPayload, restoredBeforeCodes, target };
+  await createFieldOverlaysDomain({ state: target.state, viewer: target.viewer, refreshUi: () => {} }).restore(value);
+  return { value, target };
 }
 
-const SESSION_RECORD_KEYS = Object.freeze([
+/** A user category field as the field-overlays value holds it: its definition and codes. */
+const USER_CATEGORY_KEYS = Object.freeze([
   'categories',
-  'codesLength',
-  'codesType',
+  'codes',
   'createdAt',
+  'deleted',
   'id',
   'intersectionLabels',
-  'isDeleted',
-  'isPurged',
   'key',
   'kind',
   'operation',
   'overlapLabel',
   'overlapStrategy',
+  'purged',
   'source',
   'sourceField',
   'sourcePages',
@@ -423,25 +410,24 @@ test('a session restores user-defined centroids exactly where they were drawn, 1
     drawnBefore[dimension] = source.centroidPublications.at(-1);
   }
 
-  const { overlayPayload, restoredBeforeCodes, target } = await saveAndRestore(
+  const { value, target } = await saveAndRestore(
     source.state,
     // Only the live layout is resident, so the 1D and 3D centroids drawn
     // after the restore are computed when each layout loads.
     () => createScene()
   );
-  // The session record holds the field's definition and code shape only:
-  // centroids are derived state, never stored.
-  const record = overlayPayload.userDefinedFields.find(item => item.id === id);
-  assert.deepEqual(Object.keys(record).sort(), SESSION_RECORD_KEYS);
-  assert.equal(Object.hasOwn(record, 'centroidsByDim'), false);
-  assert.equal(Object.hasOwn(record, 'normalizedDims'), false);
-  // The metadata restore publishes no centroids before the codes exist.
-  assert.deepEqual(restoredBeforeCodes.get(id), { centroids: [], normalized: [] });
+  // The value holds the field's definition and codes only: centroids are
+  // derived state, never kept.
+  const record = value.userFields.find(item => item.id === id);
+  assert.deepEqual(Object.keys(record).sort(), USER_CATEGORY_KEYS);
+  for (const derived of ['centroidsByLayout', 'centroidsByDim', 'normalizedDims', 'normalizedLayouts']) {
+    assert.equal(Object.hasOwn(record, derived), false, `${derived} is derived, never kept`);
+  }
 
   const restored = target.state.obsData.fields.find(
     candidate => candidate._userDefinedId === id
   );
-  // Restoring the codes recomputed the centroids of the one resident layout
+  // Restoring the field recomputed the centroids of the one resident layout
   // from its positions; they equal the ones the source drew there.
   assert.deepEqual([...restored.centroidsByLayout.keys()], ['X_umap_2d']);
   assert.deepEqual([...restored._normalizedLayouts], ['X_umap_2d']);
@@ -469,62 +455,4 @@ test('a session restores user-defined centroids exactly where they were drawn, 1
     [...restored._normalizedLayouts].sort(),
     ['X_umap_1d', 'X_umap_2d', 'X_umap_3d']
   );
-});
-
-test('a session record carrying centroids is refused; one without them restores empty', () => {
-  const centroids = [{ category: 'a', position: [0], n_points: 1 }];
-  const item = {
-    id: 'user_cat_1',
-    source: 'obs',
-    kind: 'category',
-    key: 'groups',
-    categories: ['a'],
-    isDeleted: false,
-    isPurged: false,
-    codesLength: 1,
-    codesType: 'Uint8Array',
-    sourceField: null,
-    operation: null,
-    sourcePages: [],
-    overlapStrategy: 'first',
-    overlapLabel: null,
-    intersectionLabels: null,
-    uncoveredLabel: null,
-    createdAt: 1,
-  };
-  assert.deepEqual(Object.keys(item).sort(), SESSION_RECORD_KEYS);
-  const registry = new UserDefinedFieldsRegistry();
-  const state = {
-    applyFieldOverlays() {},
-    getRenameRegistry: () => ({ clear() {}, fromJSON() {}, toJSON() {} }),
-    getDeleteRegistry: () => ({ clear() {}, fromJSON() {}, toJSON() {} }),
-    getUserDefinedFieldsRegistry: () => registry,
-  };
-  const payloadWith = record => ({
-    renames: { fields: {}, categories: {} },
-    deletedFields: { deleted: [], purged: [] },
-    userDefinedFields: [record],
-  });
-
-  // The per-dimension record of the earlier session schema is not part of
-  // this one, in either half or together.
-  for (const extra of [
-    { centroidsByDim: { 1: centroids }, normalizedDims: [1] },
-    { centroidsByDim: {} },
-    { normalizedDims: [] },
-  ]) {
-    assert.throws(
-      () => fieldOverlays.restore({ state }, null, payloadWith({ ...item, ...extra })),
-      /must contain exactly/
-    );
-  }
-
-  fieldOverlays.restore({ state }, null, payloadWith(item));
-  const restored = registry.getField('user_cat_1');
-  assert.equal(restored.loaded, false);
-  assert.equal(restored.codes, null);
-  assert.ok(restored.centroidsByLayout instanceof Map);
-  assert.equal(restored.centroidsByLayout.size, 0);
-  assert.ok(restored._normalizedLayouts instanceof Set);
-  assert.equal(restored._normalizedLayouts.size, 0);
 });

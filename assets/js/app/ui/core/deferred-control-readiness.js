@@ -62,6 +62,29 @@ export const DEFERRED_CONTROL_IDS = Object.freeze([
 export const DEFERRED_CONTROL_SELECTORS = Object.freeze(['.benchmark-preset']);
 
 /**
+ * Deferred controls whose owner also keeps them unavailable for a reason of
+ * its own (the forced LOD level while level of detail is off): control →
+ * `() => boolean`, whether the owner offers it now.
+ * @type {WeakMap<Element, () => boolean>}
+ */
+const ownerAvailability = new WeakMap();
+
+/**
+ * Say, from a deferred control's owner, when it offers the control. Admission
+ * asks it instead of offering the control regardless: an owner that took the
+ * control out of service while it was retired (and set `disabled` to what
+ * the retirement had already set) keeps it out.
+ *
+ * @param {Element} control
+ * @param {() => boolean} isAvailable
+ */
+export function ownDeferredAvailability(control, isAvailable) {
+  if (control === null || typeof control !== 'object') throw new TypeError('A deferred control must be an element.');
+  if (typeof isAvailable !== 'function') throw new TypeError('A deferred control\'s availability must be a function.');
+  ownerAvailability.set(control, isAvailable);
+}
+
+/**
  * Take the late-wired controls out of service until their listeners exist.
  *
  * Only controls this call actually disabled are admitted again, so a control
@@ -103,6 +126,6 @@ export function retireDeferredControls(documentOwner) {
   return function admitDeferredControls() {
     if (admitted) return;
     admitted = true;
-    for (const control of retired) control.disabled = false;
+    for (const control of retired) control.disabled = !(ownerAvailability.get(control)?.() ?? true);
   };
 }

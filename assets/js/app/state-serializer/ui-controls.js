@@ -1,12 +1,15 @@
 /**
- * @fileoverview Exact UI-control save/restore helpers for session bundles.
- *
- * The current session format owns one closed inventory of stable DOM ids. A
- * candidate is validated completely before any control is changed.
+ * @fileoverview The control inventory: every stable control of the sidebar
+ * and the floating panels, its value, how it is put back, and which state
+ * domain holds it (`controlDomainOf`). The `settings` and `layout` domains
+ * take their part of it; `setting.set` and `settings.list` read and set it.
+ * A record is validated completely before any control is changed
+ * (`README.md` in this folder).
  *
  * @module state-serializer/ui-controls
  */
 
+import { isStableId } from '../utils/stable-id.js';
 import { isGeneratedDomId } from '../ui/components/dom-id.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { throwIfAborted } from '../../utils/abort.js';
@@ -21,25 +24,6 @@ const SERIALIZABLE_INPUT_TYPES = new Set([
 ]);
 
 /**
- * A toolbelt: several buttons of which exactly one is pressed at a time.
- *
- * A group marked with this attribute is one serialized control whose value is
- * the id of its `aria-pressed="true"` button. Marking it is what puts it in the
- * inventory — there is no list of group ids here, so a second toolbelt is
- * carried the day its markup lands.
- *
- * The alternative considered and rejected was to inventory every
- * `role="group"` holding pressed buttons. `index.html` already uses
- * `role="group"` for the field-action toolbars, whose buttons are momentary
- * actions with ids, so that rule would have swept in controls that have no
- * value to save. An explicit marker is also what makes a group visible to
- * `tests/session-preset-control-inventory-contract.test.mjs`, which reads the
- * static markup: a group recognized only by a runtime-set attribute would be
- * invisible there and would read as a preset carrying a key the markup lacks.
- */
-const PRESSED_GROUP_SELECTOR = '[data-state-serializer-pressed-group]';
-
-/**
  * A control whose choices follow the embedding the active view shows (the
  * vector-field controls: a field is bound to one embedding, so the select
  * lists different fields, or none, per view layout). Its record is checked
@@ -51,8 +35,8 @@ const PRESSED_GROUP_SELECTOR = '[data-state-serializer-pressed-group]';
  */
 const AFTER_EMBEDDING_SELECTOR = '[data-state-serializer-after-embedding]';
 
-// These controls are serialized by their feature owners, never by the generic
-// DOM-control contributor.
+// Not in the inventory: another domain's owner reads their state from the
+// state it shows, or they are not a preference (README.md lists each with why).
 const DOMAIN_OWNED_IDS = new Set([
   'navigation-mode',
   'categorical-field',
@@ -60,6 +44,8 @@ const DOMAIN_OWNED_IDS = new Set([
   'outlier-filter',
   'gene-expression-search',
   'view-representation-select',
+  // The views domain holds the layout; `view.layout.set` changes it.
+  'view-layout-mode',
   'dataset-select',
   'pointer-lock',
   'data-address',
@@ -106,8 +92,20 @@ function isStateSerializerSkipped(element) {
   );
 }
 
+/**
+ * A floating analysis window (`analysis/ui/analysis-window-manager.js`): an
+ * accordion section the `analysis` domain holds, window and place, not the
+ * layout.
+ *
+ * @param {Element} details
+ */
+export function isAnalysisWindowSection(details) {
+  return details.classList?.contains('analysis-window-panel') === true
+    || Object.hasOwn(details.dataset ?? {}, 'analysisWindowId');
+}
+
 function assertStableId(id, context) {
-  if (typeof id !== 'string' || id.length === 0 || id !== id.trim()) {
+  if (!isStableId(id)) {
     throw new TypeError(`${context} must have a stable nonempty DOM id.`);
   }
   return id;
@@ -133,81 +131,142 @@ function afterEmbeddingControlIds(inventory) {
 }
 
 /**
- * The identified buttons of one pressed group, in document order.
+ * Page chrome kept in sessions and saved states but outside the history
+ * (CEL-0249, History v2 §3.3.8): a toolbelt, several buttons of which
+ * exactly one is pressed at a time, marked with this attribute. Its value
+ * is the id of its `aria-pressed="true"` button. The selection tool
+ * (`#highlight-mode`: Annotation, KNN drag, Proximity drag, Lasso) is one: it
+ * decides what the next drag on the canvas does, so a session reopened in
+ * another tool would do something the person did not ask for. It is never a
+ * history step and never moved by undo or a jump; a save and the autosave
+ * keep it (`capturePageChrome`), a load and Continue put it back after the
+ * head is shown (`applyPageChrome`).
  *
- * @param {object} group
- * @param {string} id
- * @returns {object[]}
+ * An explicit marker rather than every `role="group"` of pressed buttons:
+ * the field-action toolbars are such groups of momentary actions with no
+ * value. A second toolbelt marked the same way is carried with no edit here.
  */
+const PRESSED_GROUP_SELECTOR = '[data-state-serializer-pressed-group]';
+
+/** The identified buttons of one pressed group, in document order. */
 function pressedGroupButtons(group, id) {
-  if (typeof group.querySelectorAll !== 'function') {
-    throw new TypeError(
-      `Session UI pressed group "${id}" must support DOM queries.`,
-    );
-  }
+  if (typeof group.querySelectorAll !== 'function') throw new TypeError(`Page chrome group "${id}" must support DOM queries.`);
   const buttons = [...group.querySelectorAll('button[id]')];
-  if (buttons.length === 0) {
-    throw new TypeError(
-      `Session UI pressed group "${id}" has no identified buttons.`,
-    );
-  }
+  if (buttons.length === 0) throw new TypeError(`Page chrome group "${id}" has no identified buttons.`);
   const seen = new Set();
   for (const button of buttons) {
-    const buttonId = assertStableId(
-      button.id,
-      `Every button of session UI pressed group "${id}"`,
-    );
-    if (seen.has(buttonId)) {
-      throw new TypeError(
-        `Session UI pressed group "${id}" button id "${buttonId}" is not unique.`,
-      );
-    }
+    const buttonId = assertStableId(button.id, `Every button of page chrome group "${id}"`);
+    if (seen.has(buttonId)) throw new TypeError(`Page chrome group "${id}" button id "${buttonId}" is not unique.`);
     seen.add(buttonId);
-    if (typeof button.getAttribute !== 'function') {
-      throw new TypeError(
-        `Session UI pressed group "${id}" button "${buttonId}" must expose its `
-          + 'attributes.',
-      );
-    }
+    if (typeof button.getAttribute !== 'function') throw new TypeError(`Page chrome group "${id}" button "${buttonId}" must expose its attributes.`);
   }
   return buttons;
 }
 
 /**
- * The id of the one pressed button of a group.
- *
- * A group with no pressed button, or with several, is refused rather than
- * resolved to a guess: the value it would restore is the mode every later
- * gesture is interpreted in.
- *
- * @param {object[]} buttons
- * @param {string} id
- * @returns {string}
+ * The id of the one pressed button of a group. A group with none pressed,
+ * or several, is refused rather than guessed at: it is the mode every later
+ * gesture is read in.
  */
 function pressedButtonId(buttons, id) {
   let pressedId = null;
   for (const button of buttons) {
     const pressed = button.getAttribute('aria-pressed');
     if (pressed !== null && pressed !== 'true' && pressed !== 'false') {
-      throw new TypeError(
-        `Session UI pressed group "${id}" button "${button.id}" aria-pressed `
-          + 'must be "true", "false", or absent.',
-      );
+      throw new TypeError(`Page chrome group "${id}" button "${button.id}" aria-pressed must be "true", "false", or absent.`);
     }
     if (pressed !== 'true') continue;
-    if (pressedId !== null) {
-      throw new TypeError(
-        `Session UI pressed group "${id}" has more than one pressed button.`,
-      );
-    }
+    if (pressedId !== null) throw new TypeError(`Page chrome group "${id}" has more than one pressed button.`);
     pressedId = button.id;
   }
-  if (pressedId === null) {
-    throw new TypeError(
-      `Session UI pressed group "${id}" requires exactly one pressed button.`,
-    );
-  }
+  if (pressedId === null) throw new TypeError(`Page chrome group "${id}" requires exactly one pressed button.`);
   return pressedId;
+}
+
+/** The page's pressed groups not skipped, by id. */
+function pressedGroups(root) {
+  const groups = new Map();
+  if (!root || typeof root.querySelectorAll !== 'function') throw new TypeError('Page chrome is read from the page (a root that supports DOM queries).');
+  for (const group of root.querySelectorAll(PRESSED_GROUP_SELECTOR)) {
+    if (isStateSerializerSkipped(group)) continue;
+    const id = assertStableId(group.id, 'Every page chrome group');
+    if (groups.has(id)) throw new TypeError(`Page chrome group id "${id}" is not unique.`);
+    groups.set(id, group);
+  }
+  return groups;
+}
+
+/**
+ * The page chrome kept outside the history: `{pressed: {[groupId]: buttonId}}`
+ * (the `data-state-serializer-pressed-group` id, the id of its pressed button).
+ * @param {ParentNode} [root] - the page (the document by default)
+ */
+export function capturePageChrome(root = globalThis.document) {
+  const pressed = {};
+  for (const [id, group] of pressedGroups(root)) pressed[id] = pressedButtonId(pressedGroupButtons(group, id), id);
+  return { pressed };
+}
+
+/**
+ * What putting page chrome back (`capturePageChrome`'s record) will do on
+ * this page, checked whole first: a malformed record is refused before
+ * anything changes. A group this page lacks, or a button its group lacks (a
+ * file of another Cellucid), is left out and said in `notes`; `apply()`
+ * then sets each group by the `click` its owner listens for, as a person's
+ * click, and makes no history step (it is no action and no domain holds it).
+ * A load takes the plan before the history is replaced and applies it once
+ * its head is shown.
+ * @param {{pressed: Record<string, string>}} chrome
+ * @param {ParentNode} [root]
+ * @returns {{notes: string[], apply: () => void}}
+ */
+export function planPageChrome(chrome, root = globalThis.document) {
+  requirePlainRecord(chrome, 'Page chrome');
+  requireExactKeys(chrome, ['pressed'], 'Page chrome');
+  requirePlainRecord(chrome.pressed, 'Page chrome pressed');
+  const groups = pressedGroups(root);
+  const plan = [];
+  const notes = [];
+  for (const [id, buttonId] of Object.entries(chrome.pressed)) {
+    assertStableId(id, 'Page chrome group');
+    assertStableId(buttonId, `Page chrome group "${id}" pressed button`);
+    const group = groups.get(id);
+    if (group === undefined) {
+      notes.push(`This page has no "${id}" buttons, so the one the session pressed there is left out.`);
+      continue;
+    }
+    const buttons = pressedGroupButtons(group, id);
+    pressedButtonId(buttons, id);
+    const target = buttons.find(button => button.id === buttonId);
+    if (target === undefined) {
+      notes.push(`This page has no "${buttonId}" button in "${id}", so that choice of the session is left out.`);
+      continue;
+    }
+    plan.push({ id, group, target });
+  }
+  return {
+    notes,
+    apply() {
+      for (const { id, group, target } of plan) {
+        if (pressedButtonId(pressedGroupButtons(group, id), id) === target.id) continue;
+        // The owner's own click listener tells the viewer which tool is live; writing aria-pressed would not.
+        dispatchControlEvent(id, target, 'click');
+        if (pressedButtonId(pressedGroupButtons(group, id), id) !== target.id) throw new Error(`Page chrome group "${id}" rejected button "${target.id}".`);
+      }
+    },
+  };
+}
+
+/**
+ * Put page chrome back at once (`planPageChrome`, then its `apply`).
+ * @param {{pressed: Record<string, string>}} chrome
+ * @param {ParentNode} [root]
+ * @returns {string[]} what was left out, said
+ */
+export function applyPageChrome(chrome, root = globalThis.document) {
+  const plan = planPageChrome(chrome, root);
+  plan.apply();
+  return plan.notes;
 }
 
 /**
@@ -231,7 +290,46 @@ function isSessionControlId(elementId) {
   return !DOMAIN_OWNED_IDS.has(elementId) && !DEVICE_PREFERENCE_CONTROL_IDS.has(elementId);
 }
 
-function buildCurrentInventory(sidebar) {
+/**
+ * The state domain (`app/actions/domains.js`) whose value holds each control
+ * of the inventory: the one map that splits the inventory between domains.
+ * Every control is a setting unless listed here: the open sections and the
+ * theme are the layout's; the centroid toggles show the focused view's own
+ * flags, which the views' value holds view by view. Each control's value is
+ * captured and restored by exactly one domain, so a settings value never
+ * changes when a panel opens or another view is focused. A control added to
+ * the markup is a setting with no edit here.
+ *
+ * Controls whose state their feature owner saves (`DOMAIN_OWNED_IDS`: the
+ * multiview layout, the navigation mode, the field pickers, …) are not in the
+ * inventory at all.
+ */
+const CONTROL_DOMAINS = new Map([
+  ['theme-select', 'layout'],
+  ['toggle-centroid-points', 'views'],
+  ['toggle-centroid-labels', 'views'],
+]);
+
+/** The domains `controlDomainOf` names. */
+export const CONTROL_DOMAIN_IDS = Object.freeze(['settings', 'layout', 'views']);
+
+/**
+ * @param {string} key An inventory key (a control id, or `accordion:<id>`)
+ * @param {string} type The inventory type
+ * @returns {'settings'|'layout'|'views'}
+ */
+export function controlDomainOf(key, type) {
+  if (type === 'details') return 'layout';
+  return CONTROL_DOMAINS.get(key) ?? 'settings';
+}
+
+/**
+ * The controls `setting.set` sets and `settings.list` lists: every control
+ * of the inventory but the layout's, which the layout actions change.
+ */
+export const SETTING_CONTROL_DOMAINS = Object.freeze(['settings', 'views']);
+
+function buildCurrentInventory(sidebar, domains = null) {
   const inventory = new Map();
 
   for (const input of queryAll(sidebar, 'input[id]')) {
@@ -255,8 +353,14 @@ function buildCurrentInventory(sidebar) {
     });
   }
 
+  // Every sidebar section's open state is the layout's: a section marked
+  // `data-state-serializer-skip` keeps its controls out, not itself. An
+  // analysis window is the `analysis` domain's.
   for (const details of queryAll(sidebar, 'details.accordion-section')) {
-    if (isStateSerializerSkipped(details)) continue;
+    if (isAnalysisWindowSection(details)) continue;
+    const marked = details.closest('[data-state-serializer-skip]');
+    const markedAround = marked === details ? details.parentElement?.closest?.('[data-state-serializer-skip]') ?? null : marked;
+    if (markedAround !== null || isGeneratedDomId(details.id)) continue;
     const elementId = assertStableId(
       details.id,
       'Every serialized accordion',
@@ -267,19 +371,9 @@ function buildCurrentInventory(sidebar) {
     });
   }
 
-  for (const group of queryAll(sidebar, PRESSED_GROUP_SELECTOR)) {
-    if (isStateSerializerSkipped(group)) continue;
-    const elementId = assertStableId(
-      group.id,
-      'Every serialized pressed group',
-    );
-    if (!isSessionControlId(elementId)) continue;
-    registerInventoryEntry(inventory, elementId, {
-      element: group,
-      type: 'pressed-group',
-    });
+  if (domains !== null) {
+    for (const [id, entry] of inventory) if (!domains.includes(controlDomainOf(id, entry.type))) inventory.delete(id);
   }
-
   return inventory;
 }
 
@@ -342,29 +436,6 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
     requireExactKeys(record, ['type', 'open'], `Session UI control "${id}"`);
     if (typeof record.open !== 'boolean') {
       throw new TypeError(`Session UI control "${id}" open must be boolean.`);
-    }
-    return;
-  }
-
-  if (type === 'pressed-group') {
-    requireExactKeys(
-      record,
-      ['type', 'pressedId'],
-      `Session UI control "${id}"`,
-    );
-    assertStableId(
-      record.pressedId,
-      `Session UI control "${id}" pressedId`,
-    );
-    const buttons = pressedGroupButtons(element, id);
-    // Reading the current pressed button here is what makes a malformed group
-    // fail during validation rather than half-way through the restore.
-    pressedButtonId(buttons, id);
-    if (!buttons.some(button => button.id === record.pressedId)) {
-      throw new RangeError(
-        `Session UI pressed group "${id}" button "${record.pressedId}" is not `
-          + 'available in the current interface.',
-      );
     }
     return;
   }
@@ -432,7 +503,28 @@ function validateCompleteControls(controls, inventory, laterValueIds = new Set()
   }
 }
 
+/**
+ * How many control events a restore or `setSetting` is dispatching now: a
+ * change heard meanwhile is the app putting a value back, not a person's
+ * (`ui/modules/settings-actions.js` records only a person's).
+ */
+let applyingDepth = 0;
+
+/** Whether the change event being heard was dispatched by a restore or `setSetting`. */
+export function isApplyingControls() {
+  return applyingDepth > 0;
+}
+
 function dispatchControlEvent(id, element, type) {
+  applyingDepth++;
+  try {
+    dispatchControlEventNow(id, element, type);
+  } finally {
+    applyingDepth--;
+  }
+}
+
+function dispatchControlEventNow(id, element, type) {
   const ownerWindow = element?.ownerDocument?.defaultView ?? null;
   if (
     ownerWindow === null
@@ -493,28 +585,6 @@ function restoreValidatedControl(id, entry, data) {
   }
   if (type === 'details') {
     element.open = data.open;
-    return;
-  }
-  if (type === 'pressed-group') {
-    const buttons = pressedGroupButtons(element, id);
-    if (pressedButtonId(buttons, id) === data.pressedId) return;
-    const target = buttons.find(button => button.id === data.pressedId);
-    if (target === undefined) {
-      throw new RangeError(
-        `Session UI pressed group "${id}" button "${data.pressedId}" is not `
-          + 'available in the current interface.',
-      );
-    }
-    // Same publication rule as every other control: the owner's own `click`
-    // listener is what tells the viewer which tool is live. Writing
-    // `aria-pressed` here instead would repaint the toolbelt and leave the next
-    // gesture in the previous mode.
-    dispatchControlEvent(id, target, 'click');
-    if (pressedButtonId(pressedGroupButtons(element, id), id) !== data.pressedId) {
-      throw new Error(
-        `Session UI control "${id}" rejected restored button "${data.pressedId}".`,
-      );
-    }
     return;
   }
   if (holdsPreference(element)) {
@@ -584,22 +654,36 @@ function assertRestoreOptions(options) {
   }
 }
 
-export function createUiControlSerializer({ sidebar }) {
+/** The order controls are restored in. */
+const RESTORE_ORDER = Object.freeze([
+  'details', 'checkbox', 'select', 'range', 'number', 'color', 'text',
+]);
+
+/**
+ * The serializer over the stable-id control inventory.
+ *
+ * @param {{sidebar: HTMLElement, domains?: string[]|null}} options -
+ *   `domains` keeps the controls whose value those state domains hold
+ *   (`controlDomainOf`): the `settings` and `layout` domains each take their
+ *   part of the one inventory (`app/state/domains/settings.js`, `layout.js`),
+ *   and the settings actions every control `setting.set` sets
+ *   (`SETTING_CONTROL_DOMAINS`). Null: the whole inventory.
+ */
+export function createUiControlSerializer({ sidebar, domains = null }) {
+  if (domains !== null && (!Array.isArray(domains) || domains.length === 0
+    || domains.some(domain => !CONTROL_DOMAIN_IDS.includes(domain)))) {
+    throw new TypeError(`A UI control inventory is selected by state domains (${CONTROL_DOMAIN_IDS.join(', ')}).`);
+  }
   getUiRoots(sidebar);
 
   function collectUIControls() {
     const controls = {};
-    const inventory = buildCurrentInventory(sidebar);
+    const inventory = buildCurrentInventory(sidebar, domains);
     for (const [id, { element, type }] of inventory) {
       if (type === 'checkbox') {
         controls[id] = { type, checked: element.checked };
       } else if (type === 'details') {
         controls[id] = { type, open: element.open };
-      } else if (type === 'pressed-group') {
-        controls[id] = {
-          type,
-          pressedId: pressedButtonId(pressedGroupButtons(element, id), id),
-        };
       } else {
         controls[id] = { type, value: holdsPreference(element) ? element.dataset.sessionPreference : element.value };
       }
@@ -608,7 +692,7 @@ export function createUiControlSerializer({ sidebar }) {
   }
 
   function validateUIControls(controls) {
-    const inventory = buildCurrentInventory(sidebar);
+    const inventory = buildCurrentInventory(sidebar, domains);
     validateCompleteControls(
       controls,
       inventory,
@@ -618,7 +702,7 @@ export function createUiControlSerializer({ sidebar }) {
 
   /** The ids of the controls whose choices follow the embedding, in order. */
   function embeddingDependentControlIds() {
-    return afterEmbeddingControlIds(buildCurrentInventory(sidebar));
+    return afterEmbeddingControlIds(buildCurrentInventory(sidebar, domains));
   }
 
   /**
@@ -636,7 +720,7 @@ export function createUiControlSerializer({ sidebar }) {
     const withheldIds = new Set(options.withholdControlIds ?? []);
     throwIfAborted(abortSignal);
 
-    const inventory = buildCurrentInventory(sidebar);
+    const inventory = buildCurrentInventory(sidebar, domains);
     const deferredIds = new Set([
       ...(options.deferControlIds ?? []),
       ...afterEmbeddingControlIds(inventory),
@@ -667,21 +751,8 @@ export function createUiControlSerializer({ sidebar }) {
       });
     }
 
-    // Pressed groups run last: switching the highlight toolbelt reads the
-    // viewer's unified selection state and republishes the tool flags, so it
-    // belongs after every value control has settled.
-    const restoreOrder = [
-      'details',
-      'checkbox',
-      'select',
-      'range',
-      'number',
-      'color',
-      'text',
-      'pressed-group',
-    ];
     function restoreMatchingControls(restoreDeferred) {
-      for (const type of restoreOrder) {
+      for (const type of RESTORE_ORDER) {
         for (const [id, staged] of stagedControls) {
           if (staged.entry.type !== type) continue;
           if (deferredIds.has(id) !== restoreDeferred) continue;
@@ -704,10 +775,219 @@ export function createUiControlSerializer({ sidebar }) {
     };
   }
 
+  /**
+   * The key of the control of this inventory a user event on `target`
+   * changes, or null when the target is none of its controls.
+   * @param {EventTarget|null} target
+   * @returns {string|null}
+   */
+  function settingKeyOf(target) {
+    if (target === null || typeof target !== 'object' || typeof target.closest !== 'function') return null;
+    const element = target;
+    if (typeof element.id !== 'string' || element.id.length === 0) return null;
+    const entry = buildCurrentInventory(sidebar, domains).get(element.id);
+    return entry !== undefined && entry.element === element ? element.id : null;
+  }
+
+  /** One control of this inventory described for a person or an agent (`describeSetting`). */
+  function readSetting(key) {
+    const entry = buildCurrentInventory(sidebar, domains).get(key);
+    if (entry === undefined) return null;
+    return describeSetting(key, entry);
+  }
+
+  /** Every control of this inventory described, in inventory order. */
+  function listSettings() {
+    return [...buildCurrentInventory(sidebar, domains)].map(([key, entry]) => describeSetting(key, entry));
+  }
+
+  /**
+   * Set one setting to `value` (the typed value `describeSetting` reports:
+   * a number for a slider, a boolean for a switch, an option value,
+   * `#rrggbb`), through the restore path: the
+   * control is set and its event dispatched, so its owner applies it as if
+   * a person had changed it. Returns the setting as it is afterwards.
+   * @param {string} key
+   * @param {string|number|boolean} value
+   */
+  function setSetting(key, value) {
+    const entry = buildCurrentInventory(sidebar, domains).get(key);
+    if (entry === undefined) throw new RangeError(`There is no setting "${key}"`);
+    const record = settingRecordOf(entry, value);
+    validateControlRecord(key, record, entry);
+    const before = describeSetting(key, entry).value;
+    try {
+      restoreValidatedControl(key, entry, record);
+    } catch (error) {
+      // Its owner put the old value back: what it needs is not there (a
+      // graph not read, a field not shown), so it cannot be changed now.
+      if (describeSetting(key, entry).value !== before) throw error;
+      throw new RangeError(`"${labelOf(entry.element)}" cannot be changed now: it keeps its value until what it needs is there`);
+    }
+    return describeSetting(key, entry);
+  }
+
   return {
     collectUIControls,
     embeddingDependentControlIds,
+    listSettings,
+    readSetting,
     restoreUIControls,
+    setSetting,
+    settingKeyOf,
     validateUIControls,
   };
+}
+
+/** Visible text of an element, whitespace collapsed. */
+function textOf(element) {
+  return typeof element?.textContent === 'string' ? element.textContent.replace(/\s+/g, ' ').trim() : '';
+}
+
+/**
+ * A control's name as a person reads it: its `<label>`, else what its
+ * `aria-labelledby` names, its `aria-label`, its title, else its id.
+ */
+function labelOf(element) {
+  const labels = element.labels ? [...element.labels] : [];
+  for (const label of labels) {
+    const text = textOf(label);
+    if (text.length > 0) return text;
+  }
+  const labelledBy = element.getAttribute?.('aria-labelledby');
+  if (typeof labelledBy === 'string' && labelledBy.length > 0) {
+    const text = labelledBy.split(/\s+/)
+      .map(id => textOf(element.ownerDocument?.getElementById(id))).filter(Boolean).join(' ');
+    if (text.length > 0) return text;
+  }
+  for (const attribute of ['aria-label', 'title']) {
+    const text = element.getAttribute?.(attribute)?.trim();
+    if (text) return text;
+  }
+  return element.id;
+}
+
+/** The sidebar section a control stands in, by its title. */
+function sectionOf(element) {
+  const details = element.closest?.('details.accordion-section') ?? null;
+  const summary = details?.querySelector?.(':scope > summary') ?? null;
+  const title = summary?.querySelector?.('.accordion-title') ?? summary;
+  return title === null ? null : (textOf(title) || null);
+}
+
+/**
+ * What a slider shows beside it (`aria-valuetext`, or the `.slider-value`
+ * of its row): a log-scaled slider's position is not the value it means.
+ */
+function shownOf(element) {
+  const valueText = element.getAttribute?.('aria-valuetext');
+  if (typeof valueText === 'string' && valueText.length > 0) return valueText;
+  const shown = element.closest?.('.slider-row')?.querySelector?.('.slider-value') ?? null;
+  const text = textOf(shown);
+  return text.length > 0 ? text : null;
+}
+
+function decimalsOf(step) {
+  const text = String(step);
+  const exponent = /e-(\d+)$/.exec(text);
+  if (exponent !== null) return Number(exponent[1]);
+  const dot = text.indexOf('.');
+  return dot < 0 ? 0 : text.length - dot - 1;
+}
+
+/**
+ * A setting as a person or an agent reads it: id, label, section, kind,
+ * the value (typed), what it shows, its range or choices, and whether it
+ * can be changed now.
+ */
+function describeSetting(key, { element, type }) {
+  const out = { id: key, label: labelOf(element), section: sectionOf(element) };
+  const disabled = element.disabled === true;
+  if (type === 'checkbox') {
+    Object.assign(out, { kind: 'switch', value: element.checked === true });
+  } else if (type === 'select') {
+    const options = Array.from(element.options);
+    const chosen = options.find(option => option.value === element.value);
+    Object.assign(out, {
+      kind: 'choice',
+      value: element.value,
+      options: options.map(option => ({ value: option.value, label: textOf(option) || option.value })),
+    });
+    if (chosen !== undefined) out.shown = textOf(chosen) || chosen.value;
+  } else if (type === 'range' || type === 'number') {
+    const preference = holdsPreference(element);
+    const raw = preference ? element.dataset.sessionPreference : element.value;
+    Object.assign(out, { kind: preference ? 'count' : 'number', value: Number(raw) });
+    if (!preference) {
+      for (const bound of ['min', 'max']) {
+        if (typeof element[bound] === 'string' && element[bound].length > 0) out[bound] = Number(element[bound]);
+      }
+      const step = element.step;
+      if (typeof step === 'string' && step.length > 0 && step !== 'any') out.step = Number(step);
+      const shown = shownOf(element);
+      if (shown !== null) out.shown = shown;
+    } else {
+      out.min = 1;
+    }
+  } else if (type === 'color') {
+    Object.assign(out, { kind: 'colour', value: element.value });
+  } else {
+    Object.assign(out, { kind: 'text', value: element.value });
+  }
+  out.available = !disabled;
+  return out;
+}
+
+/**
+ * The session record a typed setting value stands for, or a TypeError /
+ * RangeError naming what is wrong with the value in words a person reads.
+ */
+function settingRecordOf({ element, type }, value) {
+  const label = labelOf(element);
+  if (element.disabled === true) {
+    throw new RangeError(`"${label}" cannot be changed now: it is switched off by another setting`);
+  }
+  if (type === 'checkbox') {
+    if (typeof value !== 'boolean') throw new TypeError(`"${label}" is a switch: give true or false`);
+    return { type, checked: value };
+  }
+  if (type === 'select') {
+    const options = Array.from(element.options);
+    if (typeof value !== 'string' || !options.some(option => option.value === value)) {
+      throw new RangeError(`"${label}" has no choice ${JSON.stringify(value)}; its choices are ${
+        options.map(option => option.value).join(', ') || 'none now'}`);
+    }
+    return { type, value };
+  }
+  if (type === 'range' || type === 'number') {
+    if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`"${label}" takes a number`);
+    if (holdsPreference(element)) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`"${label}" takes a whole number of at least 1`);
+      return { type, value: String(value) };
+    }
+    const min = element.min === '' ? null : Number(element.min);
+    const max = element.max === '' ? null : Number(element.max);
+    if ((min !== null && value < min) || (max !== null && value > max)) {
+      throw new RangeError(`"${label}" goes from ${min ?? '−∞'} to ${max ?? '∞'}; ${value} is outside`);
+    }
+    const step = element.step === '' || element.step === 'any' ? null : Number(element.step);
+    if (step !== null && Number.isFinite(step) && step > 0) {
+      const base = min ?? 0;
+      const steps = (value - base) / step;
+      if (Math.abs(steps - Math.round(steps)) > 1e-6) {
+        throw new RangeError(`"${label}" moves in steps of ${step} from ${base}; ${value} is between two steps`);
+      }
+      const decimals = decimalsOf(step);
+      return { type, value: String(Number((base + Math.round(steps) * step).toFixed(decimals))) };
+    }
+    return { type, value: String(value) };
+  }
+  if (type === 'color') {
+    if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) {
+      throw new TypeError(`"${label}" takes a colour as #rrggbb`);
+    }
+    return { type, value: value.toLowerCase() };
+  }
+  if (typeof value !== 'string') throw new TypeError(`"${label}" takes text`);
+  return { type, value };
 }

@@ -24,6 +24,8 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 
 import { annData, countingStore, dataFrame, dense, mapping, sparse, strings } from './helpers/anndata-store.mjs';
 import { openZarr } from '../assets/js/formats/zarr/index.js';

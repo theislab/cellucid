@@ -11,6 +11,7 @@ import {
   annotationGestureType
 } from '../assets/js/app/ui/modules/highlight/annotation-cells.js';
 import { SELECTION_NOTICE } from '../assets/js/app/ui/modules/highlight/mode-copy.js';
+import { provideStubHighlightActions, settleActions, withHighlightPage } from './helpers/highlight-state-pages.mjs';
 
 const CATEGORY_CODES = Uint8Array.from([0, 0, 1, 1, 2, 2]);
 const CATEGORY_FIELD = Object.freeze({
@@ -126,7 +127,7 @@ function createState(field, paneFields = new Map()) {
   return {
     previews,
     lookups,
-    state: {
+    state: withHighlightPage({
       pointCount: CATEGORY_CODES.length,
       addHighlightDirect({ type, label, cellIndices }) {
         return {
@@ -178,7 +179,7 @@ function createState(field, paneFields = new Map()) {
       setPreviewHighlightFromIndices(indices) {
         previews.push([...indices].sort((left, right) => left - right));
       }
-    },
+    }),
     stateListeners,
     emit(eventName) {
       for (const listener of [...(stateListeners.get(eventName) ?? [])]) {
@@ -651,9 +652,10 @@ test('a proximity step centred on empty space still lands', () => {
   );
 });
 
-test('cancelling or confirming an annotation retracts it from the renderer', () => {
+test('cancelling or confirming an annotation retracts it from the renderer', async () => {
   for (const finish of ['cancel', 'confirm']) {
     const tool = buildAnnotationTool(CATEGORY_FIELD);
+    const removeActions = provideStubHighlightActions(tool.state);
     tool.run(() => {
       tool.annotation.handleAnnotationStep(
         stepEvent({ cellIndex: 0, mode: 'intersect' })
@@ -685,5 +687,14 @@ test('cancelling or confirming an annotation retracts it from the renderer', () 
     );
     assert.equal(tool.selectionState.annotationCandidateSet, null);
     assert.equal(tool.selectionState.annotationStepCount, 0);
+    // Confirm is one `highlight.cells` action: the group holds exactly the
+    // confirmed cells; Cancel adds nothing.
+    await settleActions();
+    const groups = tool.state.getActivePage().highlightedGroups;
+    assert.deepEqual(
+      groups.map(group => [...group.cellIndices]),
+      finish === 'confirm' ? [[0, 1]] : []
+    );
+    removeActions();
   }
 });

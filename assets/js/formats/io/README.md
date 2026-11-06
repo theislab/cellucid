@@ -43,6 +43,7 @@ picks a decoder per codec family by measuring them on the pool, kept by
 | `link.js` | The measured link and everything derived from it (see header). |
 | `hosts.js` | What this realm knows of each web host (by origin), shared across readers and tabs (`BroadcastChannel`). |
 | `mirrors.js`, `s3.js` | Other addresses of the same bytes (public S3 mirrors). |
+| `read-witness.js` | What was read, as checksums: when a host's validator moves, the bytes decide whether the file changed (a redeployed site gives every file new validators although its bytes are the same). Used by `byte-source.js` and `zarr/stores/http.js`. |
 | `kept-parts.js` | Bytes of remote files kept in the origin-private file system across visits, as journals filed under the file's identity and size; checked by `page-checks.js`, written through `sync-access.js`. Storage itself is `data/anndata/transcode/space.js`. |
 | `range-cache.js` | Worker side of the page's range cache (`data/byte-range-cache.js` is the page side). |
 | `activity.js` | `ReadActivity`: what one operation read (requests, bytes, chunks), for progress and the read activity log. |

@@ -400,7 +400,8 @@ test('colouring by a gene from elsewhere refuses, with the reason, a name the li
   await settleTurn();
   assert.deepEqual(loads.map(load => load.index), [0]);
   loads[0].resolve();
-  assert.equal((await shown).field.key, 'CD3E');
+  // The action's outcome names what is shown.
+  assert.deepEqual(await shown, { field: 'CD3E', source: 'var', kind: 'continuous' });
 });
 
 test('the analysis gene picker takes the gene typed on Enter, not None, and says when a name is no gene', async t => {

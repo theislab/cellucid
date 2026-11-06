@@ -12,8 +12,9 @@ import { app, docs, python, r, repository } from "../index.mjs";
 const message = `
 Cellucid — see every cell. Query any gene. Explore in 2D and 3D.
 
-This npm package is a name reservation. Cellucid is not published as a
-JavaScript library yet; there is nothing to run here.
+This npm package is a name reservation, released under the same version as
+each Cellucid release. Cellucid is not published as a JavaScript library yet;
+there is nothing to run here.
 
   Use the app        ${app}
   Documentation      ${docs}
@@ -27,7 +28,7 @@ JavaScript library yet; there is nothing to run here.
 
 Want an offline or self-hosted build (\`npx cellucid\` serving the app on
 localhost)? That is the use case this package name is held for — open an
-issue at ${repository}/issues
+issue at ${repository}/issues or write to hello@cellucid.com
 `;
 
 process.stdout.write(`${message.trim()}\n`);

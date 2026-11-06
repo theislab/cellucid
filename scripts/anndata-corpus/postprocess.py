@@ -306,6 +306,36 @@ def emulate(root: Path) -> list:
                  "anndata 0.7.8 CSR X relabelled the h5sparse way (h5sparse_format='csr', h5sparse_shape).",
                  ["emulated:h5sparse", "X:csr", "layout:0.7"], {"expect": "read"}))
 
+    # A sparse matrix kept in uns, as anndata 0.7 writes one (encoding-type csr_matrix in an
+    # undeclared uns group): an element of uns, never a mapping of uns values.
+    target = out_dir / "uns_csr_matrix_07.h5ad"
+    shutil.copyfile(w07 / "uns_basic.h5ad", target)
+    with h5py.File(target, "r+") as f:
+        group = f["uns"].create_group("graph")
+        group.attrs["encoding-type"] = "csr_matrix"
+        group.attrs["encoding-version"] = "0.1.0"
+        group.attrs["shape"] = np.array([3, 4], dtype=np.int64)
+        group.create_dataset("data", data=np.array([1.5, 2.5, 3.5], dtype=np.float32))
+        group.create_dataset("indices", data=np.array([0, 3, 1], dtype=np.int32))
+        group.create_dataset("indptr", data=np.array([0, 2, 2, 3], dtype=np.int32))
+    made.append((target, w07 / "uns_basic.h5ad",
+                 "anndata 0.7.8 file with a 3 x 4 csr_matrix (encoding-type csr_matrix) in uns['graph'].",
+                 ["emulated:uns-sparse", "uns:csr", "layout:0.7"], {"expect": "read"}))
+
+    # An h5sparse group in uns (h5sparse_format / h5sparse_shape, no encoding), as anndata 0.6 wrote one.
+    target = out_dir / "uns_h5sparse_06.h5ad"
+    shutil.copyfile(w06 / "uns_basic.h5ad", target)
+    with h5py.File(target, "r+") as f:
+        group = f["uns"].create_group("graph")
+        group.attrs["h5sparse_format"] = "csr"
+        group.attrs["h5sparse_shape"] = np.array([3, 4], dtype=np.int64)
+        group.create_dataset("data", data=np.array([1.5, 2.5, 3.5], dtype=np.float32))
+        group.create_dataset("indices", data=np.array([0, 3, 1], dtype=np.int32))
+        group.create_dataset("indptr", data=np.array([0, 2, 2, 3], dtype=np.int32))
+    made.append((target, w06 / "uns_basic.h5ad",
+                 "anndata 0.6.22 file with a 3 x 4 h5sparse CSR group (h5sparse_format='csr') in uns['graph'].",
+                 ["emulated:uns-sparse", "uns:h5sparse", "layout:0.6"], {"expect": "read"}))
+
     # anndata before 0.6.20: obsm as one compound dataset with a member per embedding.
     target = out_dir / "obsm_compound_06.h5ad"
     shutil.copyfile(w06 / "obsm_plain.h5ad", target)

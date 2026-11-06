@@ -80,18 +80,18 @@ test('Pull and Publish acquire and release syncBusy inside one try/finally', () 
   );
   assert.match(
     controlsSource,
-    /async function pushToGitHub\(\{ signal = null \} = \{\}\) \{\s*return runExclusiveSync\(/
+    /async function pushToGitHub\(\{ signal = null, only = null, interactive = true \} = \{\}\) \{\s*const outcome = await runExclusiveSync\(/
   );
   const publish = controlsSource.slice(
     controlsSource.indexOf('async function publishExclusive')
   );
   assert.match(
     publish,
-    /await handlePublishResult\(result\);\s*return \{ status: 'done' \};/
+    /await handlePublishResult\(result\);\s*return \{\s*status: 'done',/
   );
   assert.match(
     publish,
-    /notifications\.fail\(trackerId, msg\);\s*return \{ status: 'failed', error: syncError \|\| msg \};\s*\}\s*\}/
+    /notifications\.fail\(trackerId, msg\);\s*return \{\s*status: 'failed',\s*error: syncError \|\| msg,/
   );
 });
 

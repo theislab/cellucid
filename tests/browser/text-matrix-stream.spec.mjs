@@ -181,7 +181,7 @@ for (const opening of ['at once', 'progressively']) test.describe(`opened ${open
     // The share arrives (every cell fits this device): genes are read for every open cell.
     await expect.poll(() => page.evaluate(() => window._cellucidState.getGeneSample()), { timeout: 60_000 }).toBeNull();
     await chooseGene(page, `g${GENE}`);
-    await expect.poll(() => shownGene(page), { timeout: 30_000 }).toEqual({ ...expected, notRead: 0 });
+    await expect.poll(() => shownGene(page)).toEqual({ ...expected, notRead: 0 });
     // One pass over the matrix, for every cell, however the cells opened.
     expect(await matrixPasses(page)).toEqual([`matrix.mtx: genes of ${CELLS.toLocaleString('en-US')} cells`]);
     // The map and the matrix share, each kept once.
@@ -202,7 +202,7 @@ for (const opening of ['at once', 'progressively']) test.describe(`opened ${open
       expect(await keptStoreDirectories(later)).toEqual(kept);
     }
     await chooseGene(later, `g${GENE}`);
-    await expect.poll(() => shownGene(later), { timeout: 30_000 }).toEqual({ ...expected, notRead: 0 });
+    await expect.poll(() => shownGene(later)).toEqual({ ...expected, notRead: 0 });
     expect(laterErrors).toEqual([]);
   });
 });

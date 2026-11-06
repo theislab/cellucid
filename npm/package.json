@@ -1,7 +1,8 @@
 {
   "name": "cellucid",
-  "version": "0.0.1",
-  "description": "Name reservation for Cellucid — a browser-first, GPU-accelerated workspace for exploring large single-cell datasets. The application runs at https://www.cellucid.com",
+  "version": "0.9.7",
+  "config": { "cellucid-version-marker": "CELLUCID_VERSION" },
+  "description": "Name reservation for Cellucid — a browser-first, GPU-accelerated workspace for exploring large single-cell datasets, released with each Cellucid version. The application runs at https://www.cellucid.com",
   "keywords": [
     "single-cell",
     "visualization",
@@ -40,7 +41,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.15"
   },
   "publishConfig": {
     "access": "public"

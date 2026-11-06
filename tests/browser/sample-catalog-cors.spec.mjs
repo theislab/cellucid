@@ -1,5 +1,6 @@
 import { expect, test } from './helpers/test.mjs';
 import { sampleUrl } from './helpers/origins.mjs';
+import { expectWelcomeShown } from './helpers/welcome.mjs';
 
 const CORS_SAMPLE_ROOT = sampleUrl('/tests/browser/fixtures/catalog/');
 const CORS_SAMPLE_SELECTION =
@@ -38,6 +39,7 @@ test('direct CORS catalog startup adopts its explicit default sample', async ({ 
     launchUrl(CORS_SAMPLE_ROOT, 'sample-cors-catalog'),
     { waitUntil: 'domcontentloaded' },
   );
+  await expectWelcomeShown(page);
   await page.getByRole('button', { name: /Start exploring/ }).click();
   await expect(page.locator('#welcome-modal')).toBeHidden();
 
@@ -105,6 +107,7 @@ test('a failed direct CORS catalog is explained inline and stays recoverable', a
     launchUrl(missingRoot, 'sample-cors-failure'),
     { waitUntil: 'domcontentloaded' },
   );
+  await expectWelcomeShown(page);
   await page.getByRole('button', { name: /Start exploring/ }).click();
   await expect(page.locator('#welcome-modal')).toBeHidden();
 

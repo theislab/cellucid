@@ -1,15 +1,15 @@
 /**
  * @fileoverview Gene sets and per-cell scores the viewer holds besides its
- * fields: the sets a notebook pushed (`setGeneSet`), the markers of the shown
- * marker genes result, the sets and scores of the shown gene signature
- * result.
+ * fields: the sets a notebook pushed (the `gene-set.save` action), the
+ * markers of the shown marker genes result, the sets and scores of the shown
+ * gene signature result.
  *
  * Each entry has an owner: `notebook` for a pushed set, which stays until it
  * is replaced or the dataset closes (and is saved in sessions), and
  * `markers` or `signature` for what an analysis result shows, which its
  * analysis replaces whole each time its result changes (`replaceOwned`) and
  * clears when the result goes. The viewer channel publishes every entry as a
- * result (`app/viewer-host-results.js`); the gene set editor offers the sets.
+ * result (`app/viewer-host/results.js`); the gene set editor offers the sets.
  *
  * Scores are in subset positions (the cells open now), as every per-cell
  * array inside the app is.

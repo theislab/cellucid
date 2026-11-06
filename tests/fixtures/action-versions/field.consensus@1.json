@@ -1,0 +1,89 @@
+{
+  "examples": [
+    {
+      "categories": [
+        "x"
+      ],
+      "cells": [
+        0
+      ],
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "key": "x",
+      "n_obs": 0,
+      "values": [
+        0
+      ]
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "categories": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "cells": {
+        "items": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": [
+          "array",
+          "null"
+        ],
+        "x-cells": true
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "key": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "n_obs": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "values": {
+        "items": {
+          "type": "number"
+        },
+        "type": "array",
+        "x-values": true
+      }
+    },
+    "required": [
+      "key",
+      "field",
+      "categories",
+      "n_obs",
+      "cells",
+      "values"
+    ],
+    "type": "object"
+  },
+  "type": "field.consensus",
+  "version": 1
+}

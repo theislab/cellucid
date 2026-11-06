@@ -19,6 +19,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -350,13 +351,13 @@ test('a 3-column array in 2D and a 2-column one in 1D: views, highlight, figure 
     layouts: [...window._cellucidState.viewContexts.keys()].map(id => window._cellucidState.getViewLayoutKey(id)),
   }));
   const sessionDownload = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const sessionPath = testInfo.outputPath('narrow-arrays.cellucid-session');
   await (await sessionDownload).saveAs(sessionPath);
 
   await openCrowded(page);
   const chooser = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooser).setFiles(sessionPath);
   await expect(page.locator('.split-badge')).toHaveCount(2);
   await expect.poll(() => page.evaluate(() => ({

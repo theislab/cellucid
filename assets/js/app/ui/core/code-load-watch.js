@@ -13,6 +13,12 @@
  * `cellucid-code-load-failed` event. Without this watch the page shows its
  * "Starting Cellucid" status forever.
  *
+ * The page's stylesheet is the same case: the boot script does not start the
+ * code in a page whose stylesheet did not load (index.html,
+ * CELLUCID_STYLE_GATE), and hands that here as the same event, marked
+ * `stylesheet`. The failure screen is then plain markup, and still says what
+ * happened and offers the reload.
+ *
  * This file is loaded directly from `index.html` (not bundled) and has no
  * dependencies, so it cannot share the failure of the graph it watches. A
  * file that did not download is told apart from code that could not run by
@@ -128,7 +134,11 @@
   }
 
   window.addEventListener('cellucid-code-load-failed', event => {
-    const { entry, error } = event.detail ?? {};
+    const { entry, error, stylesheet } = event.detail ?? {};
+    if (stylesheet === true) {
+      fail('download', `Cellucid's stylesheet (${entry} or one it imports) did not download.`);
+      return;
+    }
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     if (error instanceof TypeError && FETCH_FAILURE.test(error.message)) {
       fail('download', `A file of Cellucid's code (${entry} or one it imports) did not download. ${message}`);

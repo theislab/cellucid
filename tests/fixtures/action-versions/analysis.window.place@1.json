@@ -1,0 +1,44 @@
+{
+  "examples": [
+    {
+      "height": 1,
+      "left": 0,
+      "top": 0,
+      "width": 1,
+      "window": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "height": {
+        "exclusiveMinimum": 0,
+        "type": "number"
+      },
+      "left": {
+        "type": "number"
+      },
+      "top": {
+        "type": "number"
+      },
+      "width": {
+        "exclusiveMinimum": 0,
+        "type": "number"
+      },
+      "window": {
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "window",
+      "left",
+      "top",
+      "width",
+      "height"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.window.place",
+  "version": 1
+}

@@ -39,7 +39,11 @@ export function workerScriptPath(name, origin = APP_ORIGIN) {
 
 /**
  * A pattern matching exactly the URL of that script (no query: worker scripts
- * are not in the import map).
+ * are not in the import map), with or without a fragment: a thread hands what
+ * it holds of the machine to the workers it starts in the fragment of their
+ * address (`handToWorkers` in `assets/js/workers/worker-script.js`), which
+ * names the same script. A request for the script never carries the fragment,
+ * so a route on this pattern matches as before; a worker's own `url()` does.
  *
  * @param {string} name
  * @param {string} [origin]
@@ -47,5 +51,5 @@ export function workerScriptPath(name, origin = APP_ORIGIN) {
  */
 export function workerScriptPattern(name, origin = APP_ORIGIN) {
   const path = workerScriptPath(name, origin).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
-  return new RegExp(`${path}$`);
+  return new RegExp(`${path}(?:#.*)?$`);
 }

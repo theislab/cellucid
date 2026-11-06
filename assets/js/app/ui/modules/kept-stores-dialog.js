@@ -9,13 +9,16 @@
  * whether an open tab uses it and, where known, what it spares the next
  * opening. The person ticks rows and removes them, removes one dataset's
  * whole, or everything no tab uses (`removeKeptStores`). A row an open tab
- * uses cannot be ticked, and says so. Under the datasets, the drafts of
- * unsaved highlights (`app/highlight-draft.js`, in IndexedDB: one row per
- * dataset, its size and when it was last saved, chosen and removed like the
- * others), the files and folders of this computer kept to reopen
- * (`app/local-file-handles.js`, in IndexedDB: one row per file, whether it
- * is a file or a folder and when it was last opened, chosen and forgotten
- * like the others), then the connection
+ * uses cannot be ticked, and says so. Under the datasets, the saved states
+ * (`app/history/autosave.js`: the histories this browser autosaved and the
+ * named saves, in IndexedDB: one row per saved state, its dataset, steps,
+ * size and when it was last written, chosen and removed like the others),
+ * then My datasets (`app/library/my-datasets.js`: the datasets opened in this
+ * browser and the handles of the files and folders of this computer among
+ * them, `app/library/local-file-handles.js`) as one row: how many, Show…,
+ * which opens its own dialog where each is listed (each dataset is listed
+ * there and only there), and Remove, which forgets the list and the handles;
+ * then the connection
  * speeds remembered per host (`data/host-link-memory.js`: an origin and its
  * measured round trip and rate, no dataset) are one row with its own Remove,
  * and the decoders measured fastest in this browser
@@ -29,6 +32,10 @@
  * asked only on the person's click). A window that gives the site no
  * storage says it keeps data only until the tab closes.
  *
+ * An agent, a notebook and a replay list and remove the same rows with
+ * `stored.list` and `stored.remove` (`app/actions/definitions/stored.js`),
+ * provided here on the same listing and the same removal as the buttons.
+ *
  * A native `<dialog>` (`components/app-dialog.js`): focus trap, Escape and
  * the return of focus come from the browser.
  *
@@ -40,12 +47,16 @@ import {
 } from '../../../data/anndata/transcode/space.js';
 import { forgetHostLinks, rememberedHosts } from '../../../data/host-link-memory.js';
 import { countDecoderDecisions, forgetDecoderDecisions } from '../../../formats/io/decoder-memory.js';
-import { listHighlightDrafts, onHighlightDraftsChange, removeHighlightDrafts } from '../../highlight-draft.js';
-import { forgetLocalFiles, listLocalFiles, localHandlesAvailable, onLocalFilesChange } from '../../local-file-handles.js';
+import { listSavedStates, onSavedStatesChange, removeSavedStates } from '../../history/autosave.js';
+import { listLocalFiles, localHandlesAvailable, onLocalFilesChange } from '../../library/local-file-handles.js';
+import { forgetMyDatasets, listMyDatasets, onMyDatasetsChange } from '../../library/my-datasets.js';
+import { PLACES } from '../place-names.js';
 import { describeSubsampleMethod } from '../../../data/subsample.js';
 import { formatBytes, formatCountOf, formatDuration } from '../../../utils/format-units.js';
 import { createSelectItem, renderFactList } from '../components/controls.js';
 import { wireAppDialog } from '../components/app-dialog.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
+import { listNames, quoteName } from '../../actions/targets/names.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -119,40 +130,50 @@ export function describeKeptItem(item, now = Date.now()) {
   };
 }
 
-/** The id a draft's row carries (`draft:` and its dataset's key), apart from kept items' ids. */
-const DRAFT_ID = 'draft:';
+/** The id a saved state's row carries (`saved:` and its id), apart from kept items' ids. */
+const SAVED_ID = 'saved:';
 
 /**
- * A draft of unsaved highlights as a row: its dataset, its size, and what it
- * is, how many highlights it holds and when it was last saved.
+ * A saved state as a row: its dataset, its size, and what it is (the
+ * history this browser kept, or a save under its name), how many steps it
+ * holds and when it was last written.
  *
- * @param {{key: string, name: string|null, highlights: number, bytes: number, savedAt: number}} draft - `listHighlightDrafts`
+ * @param {{kind: 'autosave'|'named', name: string|null, dataset: {name: string|null}, steps: number,
+ *   bytes: number, updatedAt: number, openable: boolean}} saved - `listSavedStates`
  * @param {number} [now]
  * @returns {{name: string, size: string, meta: string}}
  */
-export function describeHighlightDraft(draft, now = Date.now()) {
+export function describeSavedState(saved, now = Date.now()) {
   return {
-    name: draft.name ?? 'Unnamed dataset',
-    size: formatBytes(draft.bytes),
-    meta: ['Unsaved highlights draft', formatCountOf(draft.highlights, 'highlight'), describeWhen('saved', draft.savedAt, now)].filter(Boolean).join(' · '),
+    name: saved.dataset.name ?? 'Unnamed dataset',
+    size: formatBytes(saved.bytes),
+    meta: [
+      saved.kind === 'named' ? `Saved as "${saved.name}"` : 'History kept in this browser',
+      formatCountOf(saved.steps, 'step'),
+      describeWhen('saved', saved.updatedAt, now),
+      saved.openable ? '' : 'kept by another version',
+    ].filter(Boolean).join(' · '),
   };
 }
 
-/** The id a kept handle's row carries (`local:` and its dataset's key), apart from the other rows' ids. */
-const LOCAL_ID = 'local:';
-
 /**
- * A file or folder of this computer kept to reopen as a row: its name, and
- * what it is and when it was last opened.
+ * My datasets as the dialog's row: its name, how many datasets it lists
+ * and, where the browser gives handles, how many of them are files or
+ * folders of this computer it keeps the handle of. Null when it holds
+ * nothing.
  *
- * @param {{key: string, name: string, kind: 'file'|'folder', openedAt: number}} file - `listLocalFiles`
- * @param {number} [now]
- * @returns {{name: string, meta: string}}
+ * @param {number} datasets - `listMyDatasets`
+ * @param {number} [files] - `listLocalFiles`: the handles kept
+ * @returns {{name: string, facts: string}|null}
  */
-export function describeLocalFile(file, now = Date.now()) {
+export function describeMyDatasets(datasets, files = 0) {
+  if (!(datasets > 0) && !(files > 0)) return null;
   return {
-    name: file.name,
-    meta: [file.kind === 'folder' ? 'Folder to reopen' : 'File to reopen', describeWhen('opened', file.openedAt, now)].filter(Boolean).join(' · '),
+    name: PLACES.myDatasets.name,
+    facts: [
+      `${formatCountOf(datasets, 'dataset')} opened in this browser`,
+      files > 0 ? formatCountOf(files, 'file to reopen', 'files to reopen') : null,
+    ].filter(Boolean).join(' · '),
   };
 }
 
@@ -222,10 +243,10 @@ export function whereFacts(place, { asked = null, handles = false } = {}) {
     },
     {
       label: 'Holds',
-      value: handles ? 'files, highlight drafts, files to reopen, connection speeds' : 'files, highlight drafts, connection speeds',
+      value: `files, saved states, ${PLACES.myDatasets.name}, connection speeds`,
       title: handles
-        ? 'Files in its private file system, unsaved highlight drafts, the browser\'s handles of files to reopen and the decoder choices in its IndexedDB, connection speeds in its localStorage: all of them this site\'s storage in this browser.'
-        : 'Files in its private file system, unsaved highlight drafts and the decoder choices in its IndexedDB, connection speeds in its localStorage: all of them this site\'s storage in this browser.',
+        ? `Files in its private file system, the saved states of histories, ${PLACES.myDatasets.name} with the browser's handles of files to reopen and the decoder choices in its IndexedDB, connection speeds in its localStorage: all of them this site's storage in this browser.`
+        : `Files in its private file system, the saved states of histories, ${PLACES.myDatasets.name} and the decoder choices in its IndexedDB, connection speeds in its localStorage: all of them this site's storage in this browser.`,
     },
     { label: 'Removed by', value: 'this dialog, or the browser\'s Clear site data' },
   ];
@@ -297,14 +318,15 @@ export function describeDecoderDecisions(count) {
 /**
  * What a removal did, as the dialog's status line.
  *
- * @param {{removed: number, held: number, hosts?: number, decoders?: number}} result - `removeKeptStores` (with
- *   the drafts removed counted as items), the hosts whose connection speed was forgotten, and
- *   the decoder choices forgotten
+ * @param {{removed: number, held: number, hosts?: number, decoders?: number, datasets?: number}} result -
+ *   `removeKeptStores` (with the saved states removed counted as items), the hosts whose connection speed
+ *   was forgotten, the decoder choices forgotten, and the datasets My datasets forgot
  * @returns {string}
  */
-export function describeRemoval({ removed, held, hosts = 0, decoders = 0 }) {
+export function describeRemoval({ removed, held, hosts = 0, decoders = 0, datasets = 0 }) {
   const parts = [];
   if (removed > 0) parts.push(`Removed ${formatCountOf(removed, 'item')}.`);
+  if (datasets > 0) parts.push(`Forgot ${formatCountOf(datasets, 'dataset')} of ${PLACES.myDatasets.name}.`);
   if (hosts > 0) parts.push(`Forgot the connection speeds of ${formatCountOf(hosts, 'host')}.`);
   if (decoders > 0) parts.push('Forgot the decoder choices.');
   if (held > 0) parts.push(`${formatCountOf(held, 'item')} in use by an open tab ${held === 1 ? 'stays' : 'stay'} until that tab closes.`);
@@ -318,26 +340,35 @@ export function describeRemoval({ removed, held, hosts = 0, decoders = 0 }) {
  *   changes?: (listener: () => void) => (() => void), now?: () => number,
  *   place?: () => Promise<Object>, persist?: () => Promise<boolean>,
  *   hosts?: () => Array<{origin: string, latencyMs: number, bytesPerMs: number}>, forgetHosts?: () => void,
- *   drafts?: () => Promise<Array>, removeDrafts?: (keys: string[]|null) => Promise<number>,
- *   draftChanges?: (listener: () => void) => (() => void),
- *   localFiles?: () => Promise<Array>, forgetLocal?: (keys: string[]|null) => Promise<number>,
- *   localChanges?: (listener: () => void) => (() => void),
+ *   savedStates?: () => Promise<Array>, removeSaved?: (ids: string[]|null) => Promise<number>,
+ *   savedChanges?: (listener: () => void) => (() => void),
+ *   library?: () => Promise<Array>, forgetLibrary?: () => Promise<{datasets: number, handles: number}>,
+ *   libraryChanges?: (listener: () => void) => (() => void),
+ *   localFiles?: () => Promise<Array>, localChanges?: (listener: () => void) => (() => void),
+ *   onShowLibrary?: ((opener: HTMLElement) => void)|null,
  *   decoders?: () => Promise<number>, forgetDecoders?: () => Promise<boolean>,
- *   onRemoved?: () => void}} [options] - `hosts`/`forgetHosts`: the connection speeds
+ *   onRemoved?: () => void,
+ *   actions?: {provide: (type: string, handler: Function) => () => void}|null}} [options] - `hosts`/`forgetHosts`: the connection speeds
  *   remembered per host; `decoders`/`forgetDecoders`: the decoder choices kept;
- *   `drafts`/`removeDrafts`/`draftChanges`: the highlight drafts;
- *   `localFiles`/`forgetLocal`/`localChanges`: the files of this computer kept to reopen;
- *   `onRemoved`: after anything was removed (the Stored row follows)
- * @returns {{open: (opener?: HTMLElement|null) => Promise<void>, refresh: () => Promise<void>, destroy: () => void}}
+ *   `savedStates`/`removeSaved`/`savedChanges`: the saved states of histories;
+ *   `library`/`forgetLibrary`/`libraryChanges`: My datasets (forgotten whole, with the handles of its files);
+ *   `localFiles`/`localChanges`: the files of this computer whose handle is kept (counted in its row);
+ *   `onShowLibrary`: open My datasets' own dialog (its row's Show…);
+ *   `onRemoved`: after anything was removed (the Stored row follows);
+ *   `actions`: the page's dispatcher, on which the dialog provides `stored.list` and `stored.remove`
+ *   (what it lists, and its buttons' removal, for an agent, a notebook and a replay)
+ * @returns {{open: (opener?: HTMLElement|null) => Promise<void>, refresh: () => Promise<void>, close: () => void,
+ *   destroy: () => void}}
  */
 export function initKeptStoresDialog(dom, {
   list = listKeptStores, remove = removeKeptStores, changes = onKeptStoresChange, now = Date.now,
   place = keptStoragePlace, persist = keepKeptStoresWhenSpaceIsLow,
   hosts = rememberedHosts, forgetHosts = forgetHostLinks,
-  drafts = listHighlightDrafts, removeDrafts = removeHighlightDrafts, draftChanges = onHighlightDraftsChange,
-  localFiles = listLocalFiles, forgetLocal = forgetLocalFiles, localChanges = onLocalFilesChange,
+  savedStates = listSavedStates, removeSaved = removeSavedStates, savedChanges = onSavedStatesChange,
+  library = listMyDatasets, forgetLibrary = () => forgetMyDatasets(null), libraryChanges = onMyDatasetsChange,
+  localFiles = listLocalFiles, localChanges = onLocalFilesChange, onShowLibrary = null,
   decoders = countDecoderDecisions, forgetDecoders = forgetDecoderDecisions,
-  onRemoved = () => {},
+  onRemoved = () => {}, actions = null,
 } = {}) {
   for (const key of ['dialog', 'list', 'empty', 'status', 'removeSelected', 'removeAll', 'where', 'persist']) {
     if (!dom?.[key]) throw new TypeError(`The Stored dialog needs its ${key}.`);
@@ -351,10 +382,14 @@ export function initKeptStoresDialog(dom, {
   let items = [];
   /** The hosts whose connection speed is remembered (`rememberedHosts`). */
   let remembered = [];
-  /** The highlight drafts (`listHighlightDrafts`). */
-  let draftList = [];
+  /** The saved states of histories (`listSavedStates`). */
+  let savedList = [];
   /** The files of this computer kept to reopen (`listLocalFiles`). */
   let localList = [];
+  /** The datasets of My datasets (`listMyDatasets`). */
+  let libraryList = [];
+  /** What opened the dialog: My datasets' dialog, opened from it, gives the focus back there. */
+  let openedBy = null;
   /** The decoder choices kept (`countDecoderDecisions`). */
   let decoderCount = 0;
   let busy = false;
@@ -364,16 +399,15 @@ export function initKeptStoresDialog(dom, {
   let asked = null;
 
   const removableIds = within => within.filter(item => item.held === 'none').map(item => item.id);
-  const draftIds = () => draftList.map(draft => DRAFT_ID + draft.key);
-  const localIds = () => localList.map(file => LOCAL_ID + file.key);
+  const savedIds = () => savedList.map(saved => SAVED_ID + saved.id);
 
   function syncButtons() {
     dom.removeSelected.disabled = busy || chosen.size === 0;
-    dom.removeAll.disabled = busy || (removableIds(items).length === 0 && remembered.length === 0 && draftList.length === 0 && localList.length === 0 && decoderCount === 0);
+    dom.removeAll.disabled = busy || (removableIds(items).length === 0 && remembered.length === 0 && savedList.length === 0 && libraryList.length === 0 && localList.length === 0 && decoderCount === 0);
     for (const button of dom.list.querySelectorAll('[data-dataset-remove]')) {
       button.disabled = busy || button.dataset.removable !== 'true';
     }
-    for (const button of dom.list.querySelectorAll('[data-hosts-remove], [data-decoders-remove], [data-drafts-remove], [data-local-remove]')) button.disabled = busy;
+    for (const button of dom.list.querySelectorAll('[data-hosts-remove], [data-decoders-remove], [data-saved-remove], [data-library-remove], [data-library-show]')) button.disabled = busy;
   }
 
   /** A dataset's or the hosts' head: its name, the facts under it, and Remove. */
@@ -424,48 +458,54 @@ export function initKeptStoresDialog(dom, {
     return section;
   }
 
-  /** The highlight drafts: a row per dataset, chosen like kept items, and Remove for all of them. */
-  function draftsSection() {
+  /** The saved states of histories: a row per saved state, chosen like kept items, and Remove for all of them. */
+  function savedSection() {
     const section = doc.createElement('div');
-    section.className = 'kept-dataset kept-drafts';
+    section.className = 'kept-dataset kept-saved-states';
     section.setAttribute('role', 'group');
-    section.setAttribute('aria-labelledby', 'kept-drafts-title');
+    section.setAttribute('aria-labelledby', 'kept-saved-title');
     const removeButton = doc.createElement('button');
-    removeButton.dataset.draftsRemove = 'true';
-    removeButton.setAttribute('aria-label', `Remove ${formatCountOf(draftList.length, 'highlights draft')}`);
-    const total = draftList.reduce((sum, draft) => sum + draft.bytes, 0);
-    section.appendChild(sectionHead('kept-drafts-title', 'Unsaved highlights', `not saved in a session · ${formatBytes(total)}`, removeButton).head);
-    for (const draft of draftList) {
-      const words = describeHighlightDraft(draft, now());
-      const id = DRAFT_ID + draft.key;
+    removeButton.dataset.savedRemove = 'true';
+    removeButton.setAttribute('aria-label', `Remove ${formatCountOf(savedList.length, 'saved state')}`);
+    const total = savedList.reduce((sum, saved) => sum + saved.bytes, 0);
+    section.appendChild(sectionHead('kept-saved-title', 'Saved states', `histories of this browser · ${formatBytes(total)}`, removeButton).head);
+    for (const saved of savedList) {
+      const words = describeSavedState(saved, now());
+      const id = SAVED_ID + saved.id;
       const { root, checkbox } = createSelectItem({ name: words.name, size: words.size, meta: words.meta });
       root.dataset.itemId = id;
       checkbox.checked = chosen.has(id);
-      checkbox.setAttribute('aria-label', `Highlights draft of ${words.name}, ${words.size}, ${words.meta}`);
+      checkbox.setAttribute('aria-label', `Saved state of ${words.name}, ${words.size}, ${words.meta}`);
       section.appendChild(root);
     }
     return section;
   }
 
-  /** The files of this computer kept to reopen: a row per file, chosen like kept items, and Remove for all of them. */
-  function localSection() {
+  /**
+   * My datasets: one row, how many it lists (each is listed in its own
+   * dialog, never here), Show… (that dialog) and Remove (the list, with the
+   * handles of its files).
+   */
+  function librarySection(words) {
     const section = doc.createElement('div');
-    section.className = 'kept-dataset kept-local-files';
+    section.className = 'kept-dataset kept-library';
     section.setAttribute('role', 'group');
-    section.setAttribute('aria-labelledby', 'kept-local-title');
+    section.setAttribute('aria-labelledby', 'kept-library-title');
     const removeButton = doc.createElement('button');
-    removeButton.dataset.localRemove = 'true';
-    removeButton.setAttribute('aria-label', `Forget ${formatCountOf(localList.length, 'file to reopen', 'files to reopen')}`);
-    section.appendChild(sectionHead('kept-local-title', 'Files to reopen', 'on this computer · reopened with one click', removeButton).head);
-    for (const file of localList) {
-      const words = describeLocalFile(file, now());
-      const id = LOCAL_ID + file.key;
-      const { root, checkbox } = createSelectItem({ name: words.name, meta: words.meta });
-      root.dataset.itemId = id;
-      checkbox.checked = chosen.has(id);
-      checkbox.setAttribute('aria-label', `${words.name}, ${words.meta}`);
-      section.appendChild(root);
+    removeButton.dataset.libraryRemove = 'true';
+    removeButton.setAttribute('aria-label', `Forget every dataset of ${words.name}`);
+    const { head } = sectionHead('kept-library-title', words.name, words.facts, removeButton);
+    if (onShowLibrary !== null) {
+      const show = doc.createElement('button');
+      show.type = 'button';
+      show.className = 'btn btn-compact';
+      show.dataset.libraryShow = 'true';
+      show.textContent = 'Show…';
+      show.setAttribute('aria-label', `Show ${words.name}`);
+      show.setAttribute('aria-haspopup', 'dialog');
+      head.insertBefore(show, removeButton);
     }
+    section.appendChild(head);
     return section;
   }
 
@@ -501,8 +541,9 @@ export function initKeptStoresDialog(dom, {
 
   function render() {
     const sections = groupKeptItems(items).map(datasetSection);
-    if (draftList.length > 0) sections.push(draftsSection());
-    if (localList.length > 0) sections.push(localSection());
+    if (savedList.length > 0) sections.push(savedSection());
+    const libraryWords = describeMyDatasets(libraryList.length, localList.length);
+    if (libraryWords !== null) sections.push(librarySection(libraryWords));
     const hostWords = describeRememberedHosts(remembered);
     if (hostWords !== null) sections.push(hostsSection(hostWords));
     const decoderWords = describeDecoderDecisions(decoderCount);
@@ -520,46 +561,68 @@ export function initKeptStoresDialog(dom, {
     dom.persist.hidden = !(where.canPersist && where.persisted !== true && asked !== true);
   }
 
+  /** Everything the dialog lists, read once (its rows, and `stored.list`). */
+  async function readStored() {
+    const [kept, nextPlace, saved, local, listed, decoderTotal] = await Promise.all([list(), place(), savedStates(), localFiles(), library(), decoders()]);
+    return { kept, place: nextPlace, saved, local, listed, decoders: decoderTotal, hosts: hosts() };
+  }
+
   async function refresh() {
     const mine = ++generation;
-    const [next, nextPlace, nextDrafts, nextLocal, nextDecoders] = await Promise.all([list(), place(), drafts(), localFiles(), decoders()]);
+    const read = await readStored();
     if (mine !== generation) return;
-    items = next;
-    decoderCount = nextDecoders;
-    draftList = nextDrafts;
-    localList = nextLocal;
-    remembered = hosts();
-    where = nextPlace;
+    items = read.kept;
+    decoderCount = read.decoders;
+    savedList = read.saved;
+    localList = read.local;
+    libraryList = read.listed;
+    remembered = read.hosts;
+    where = read.place;
     renderWhere();
-    const live = new Set([...removableIds(items), ...draftIds(), ...localIds()]);
+    const live = new Set([...removableIds(items), ...savedIds()]);
     for (const id of [...chosen]) if (!live.has(id)) chosen.delete(id);
     render();
   }
 
   /**
-   * Remove the rows `ids` -- kept items, highlight drafts and files to
-   * reopen (null: every kept item no tab uses, every draft and every file)
-   * -- and, with `forgetSpeeds`, the connection speeds remembered, with
-   * `forgetDecoderChoices` the decoder choices kept.
+   * Remove the rows `ids` -- kept items and saved states (null: every kept
+   * item no tab uses, every saved state, and My datasets with the handles of
+   * its files) -- and, with `forgetSpeeds`, the connection speeds
+   * remembered, with `forgetDecoderChoices` the decoder choices kept, with
+   * `forgetList` My datasets. Every button's removal and `stored.remove`'s:
+   * resolves to what went and the sentence the dialog says of it (undefined
+   * while another removal runs).
    */
-  async function removeChosen(ids, { forgetSpeeds = false, forgetDecoderChoices = false } = {}) {
-    if (busy) return;
+  async function removeChosen(ids, { forgetSpeeds = false, forgetDecoderChoices = false, forgetList = false } = {}) {
+    if (busy) return undefined;
     busy = true;
     syncButtons();
     try {
-      const forgotten = forgetSpeeds ? remembered.length : 0;
+      const speeds = forgetSpeeds ? hosts().length : 0;
       if (forgetSpeeds) forgetHosts();
-      const decodersForgotten = forgetDecoderChoices && decoderCount > 0 && await forgetDecoders() ? decoderCount : 0;
-      const keptIds = ids === null ? null : ids.filter(id => !id.startsWith(DRAFT_ID) && !id.startsWith(LOCAL_ID));
-      const draftKeys = ids === null ? null : ids.filter(id => id.startsWith(DRAFT_ID)).map(id => id.slice(DRAFT_ID.length));
-      const localKeys = ids === null ? null : ids.filter(id => id.startsWith(LOCAL_ID)).map(id => id.slice(LOCAL_ID.length));
+      const decoderTotal = forgetDecoderChoices ? await decoders() : 0;
+      const decodersForgotten = decoderTotal > 0 && await forgetDecoders() ? decoderTotal : 0;
+      const keptIds = ids === null ? null : ids.filter(id => !id.startsWith(SAVED_ID));
+      const savedKeys = ids === null ? null : ids.filter(id => id.startsWith(SAVED_ID)).map(id => id.slice(SAVED_ID.length));
       const result = keptIds === null || keptIds.length > 0 ? await remove(keptIds) : { removed: 0, held: 0 };
-      const draftsRemoved = draftKeys === null || draftKeys.length > 0 ? await removeDrafts(draftKeys) : 0;
-      const localForgotten = localKeys === null || localKeys.length > 0 ? await forgetLocal(localKeys) : 0;
-      dom.status.textContent = describeRemoval({ ...result, removed: result.removed + draftsRemoved + localForgotten, hosts: forgotten, decoders: decodersForgotten });
+      const savedRemoved = savedKeys === null || savedKeys.length > 0 ? await removeSaved(savedKeys) : 0;
+      // My datasets goes whole (its saved states are rows above): the list and the handles of its files.
+      const listForgotten = ids === null || forgetList ? await forgetLibrary() : { datasets: 0, handles: 0 };
+      const said = describeRemoval({
+        ...result,
+        removed: result.removed + savedRemoved,
+        hosts: speeds,
+        decoders: decodersForgotten,
+        datasets: listForgotten.datasets,
+      });
+      dom.status.textContent = said;
       dom.status.hidden = false;
       if (ids === null) chosen.clear();
       else for (const id of ids) chosen.delete(id);
+      return {
+        removed: result.removed, held: result.held, savedStates: savedRemoved, datasets: listForgotten.datasets,
+        hosts: speeds, decoders: decodersForgotten, said,
+      };
     } finally {
       busy = false;
       await refresh();
@@ -587,12 +650,20 @@ export function initKeptStoresDialog(dom, {
       void removeChosen([], { forgetDecoderChoices: true });
       return;
     }
-    if (event.target?.closest?.('[data-drafts-remove]')?.disabled === false) {
-      void removeChosen(draftIds());
+    if (event.target?.closest?.('[data-saved-remove]')?.disabled === false) {
+      void removeChosen(savedIds());
       return;
     }
-    if (event.target?.closest?.('[data-local-remove]')?.disabled === false) {
-      void removeChosen(localIds());
+    if (event.target?.closest?.('[data-library-remove]')?.disabled === false) {
+      void removeChosen([], { forgetList: true });
+      return;
+    }
+    const show = event.target?.closest?.('[data-library-show]');
+    if (show?.disabled === false && onShowLibrary !== null) {
+      // Its own dialog, in place of this one; closing it gives the focus back to what opened this one.
+      const opener = openedBy;
+      owner.close();
+      onShowLibrary(opener);
       return;
     }
     const button = event.target?.closest?.('[data-dataset-remove]');
@@ -611,26 +682,117 @@ export function initKeptStoresDialog(dom, {
     });
   }, { signal });
   dom.removeAll.addEventListener('click', () => { void removeChosen(null, { forgetSpeeds: true, forgetDecoderChoices: true }); }, { signal });
+  // ------------------------------------------------ as actions (`stored.list`, `stored.remove`)
+
+  /** `stored.list`: what the dialog lists, as data. */
+  async function storedList() {
+    const read = await readStored();
+    const savedBytes = read.saved.reduce((sum, saved) => sum + saved.bytes, 0);
+    const keptBytes = read.kept.reduce((sum, item) => sum + item.bytes, 0);
+    return {
+      datasets: groupKeptItems(read.kept).map(group => ({
+        name: group.name,
+        host: group.host,
+        bytes: group.bytes,
+        items: group.items.map(item => ({
+          id: item.id,
+          kind: item.kind,
+          what: describeKeptKind(item),
+          bytes: item.bytes,
+          last_used: item.used > 0 ? new Date(item.used).toISOString() : null,
+          in_use: item.held,
+          saves: Number.isSafeInteger(item.saves) ? item.saves : null,
+        })),
+      })),
+      saved_states: { count: read.saved.length, bytes: savedBytes },
+      my_datasets: { count: read.listed.length, files: read.local.length },
+      connection_speeds: read.hosts.length,
+      decoder_choices: read.decoders,
+      bytes: keptBytes + savedBytes,
+      room: {
+        usage: read.place?.estimate?.usage ?? null,
+        quota: read.place?.estimate?.quota ?? null,
+        kept_when_space_is_low: read.place?.persisted ?? null,
+      },
+    };
+  }
+
+  /** `stored.remove`: the rows its parameters name, removed as the dialog's buttons remove them. */
+  async function storedRemove(params) {
+    const type = 'stored.remove';
+    const { items: itemIds, dataset, everything } = params;
+    const flags = ['saved_states', 'my_datasets', 'connection_speeds', 'decoder_choices'].filter(key => params[key] === true);
+    if (itemIds === undefined && dataset === undefined && flags.length === 0 && everything !== true) {
+      throw new ActionRefused('Name what to remove: items, a dataset, saved_states, my_datasets, connection_speeds, decoder_choices or everything (stored_list lists what there is).', { code: 'bad-value', type });
+    }
+    const read = await readStored();
+    let ids = [];
+    if (everything === true) {
+      ids = null;
+    } else {
+      if (itemIds !== undefined) {
+        const known = new Map(read.kept.map(item => [item.id, item]));
+        const unknown = itemIds.filter(id => !known.has(id));
+        if (unknown.length > 0) {
+          throw new ActionRefused(`Nothing kept has the id ${listNames(unknown)}; ${read.kept.length === 0 ? 'nothing is kept' : `the ids are ${listNames(read.kept.map(item => item.id))}`} (stored_list).`, { code: 'no-target', type });
+        }
+        ids.push(...itemIds);
+      }
+      if (dataset !== undefined) {
+        const groups = groupKeptItems(read.kept);
+        const group = groups.find(entry => entry.name === dataset);
+        if (group === undefined) {
+          throw new ActionRefused(`Nothing is kept of a dataset ${quoteName(dataset)}; ${groups.length === 0 ? 'nothing is kept' : `kept are ${listNames(groups.map(entry => entry.name))}`} (stored_list).`, { code: 'no-target', type });
+        }
+        ids.push(...group.items.map(item => item.id));
+      }
+      if (params.saved_states === true) ids.push(...read.saved.map(saved => SAVED_ID + saved.id));
+      ids = [...new Set(ids)];
+    }
+    const done = await removeChosen(ids, {
+      forgetSpeeds: everything === true || params.connection_speeds === true,
+      forgetDecoderChoices: everything === true || params.decoder_choices === true,
+      forgetList: params.my_datasets === true,
+    });
+    if (done === undefined) {
+      throw new ActionRefused('The Stored dialog is removing something now; try again once it has finished.', { code: 'busy', type });
+    }
+    return {
+      removed: done.removed, held: done.held, saved_states: done.savedStates, my_datasets: done.datasets,
+      connection_speeds: done.hosts, decoder_choices: done.decoders, said: done.said,
+    };
+  }
+
+  const unprovide = actions === null ? [] : [
+    actions.provide('stored.list', () => storedList()),
+    actions.provide('stored.remove', params => storedRemove(params)),
+  ];
+
   const whileOpen = () => {
     if (dom.dialog.open) void refresh();
   };
   const stopChanges = changes(whileOpen);
-  const stopDraftChanges = draftChanges(whileOpen);
+  const stopSavedChanges = savedChanges(whileOpen);
   const stopLocalChanges = localChanges(whileOpen);
+  const stopLibraryChanges = libraryChanges(whileOpen);
 
   return {
     async open(opener = null) {
       dom.status.textContent = '';
       dom.status.hidden = true;
       chosen.clear();
+      openedBy = opener ?? doc.activeElement;
       await refresh();
       owner.open(opener);
     },
     refresh,
+    close: () => owner.close(),
     destroy() {
+      for (const remove of unprovide) remove();
       stopChanges();
-      stopDraftChanges();
+      stopSavedChanges();
       stopLocalChanges();
+      stopLibraryChanges();
       lifecycle.abort();
       owner.destroy();
     },

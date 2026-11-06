@@ -50,6 +50,18 @@ function releaseExactModalDocumentLayer(release) {
  * action that removes or overwrites something, drawn as `.btn-danger`;
  * 'primary' for one that only adds, combines or connects, drawn as
  * `.btn-primary`.
+ *
+ * `alternativeText` adds a second way to go on, between Cancel and the
+ * confirm button (`onAlternative`): a choice of two (undo only an agent's
+ * steps, or everything since its turn began).
+ *
+ * What will happen can be said as a sentence and a list (`details`); an
+ * `option` is one checkbox, and `describe(checked)` words the sentence and
+ * the list again when it changes (delete a branch with its sub-branches).
+ * `inputKind: 'line'` asks for a name on one line (Enter confirms) instead
+ * of a note; `inputMaxLength: null` sets no length limit; `validate(value)`
+ * says why a value cannot be taken, and the dialog stays open. Both answers
+ * get `(value, optionChecked)`.
  */
 export function showConfirmDialog({
   title,
@@ -60,11 +72,21 @@ export function showConfirmDialog({
   inputPlaceholder = null,
   inputDefaultValue = '',
   inputMaxLength = 512,
+  inputKind = 'text',
+  details = [],
+  option = null,
+  describe = null,
+  validate = null,
+  alternativeText = null,
   onConfirm,
+  onAlternative,
   onCancel
 }) {
   if (tone !== 'danger' && tone !== 'primary') {
     throw new TypeError(`Confirm dialog tone must be 'danger' or 'primary' (got ${String(tone)})`);
+  }
+  if (alternativeText !== null && typeof onAlternative !== 'function') {
+    throw new TypeError('A confirm dialog with an alternative needs onAlternative');
   }
   if (activeDialogCancel !== null) {
     activeDialogCancel();
@@ -86,7 +108,17 @@ export function showConfirmDialog({
   overlay.setAttribute('aria-labelledby', titleId);
 
   const wantsInput = Boolean(inputLabel || inputPlaceholder);
-  const inputBlock = wantsInput
+  const lengthLimit = inputMaxLength === null ? '' : `maxlength="${escapeHtml(String(inputMaxLength))}"`;
+  const inputBlock = wantsInput && inputKind === 'line'
+    ? `
+      <div class="confirm-dialog-input">
+        ${inputLabel ? `<label for="${escapeHtml(inputId)}">${escapeHtml(inputLabel)}</label>` : ''}
+        <input type="text" id="${escapeHtml(inputId)}" class="obs-select confirm-dialog-textarea" autocomplete="off" spellcheck="false" ${lengthLimit}
+          placeholder="${escapeHtml(inputPlaceholder || '')}" value="${escapeHtml(inputDefaultValue || '')}"
+          ${inputLabel ? '' : `aria-label="${escapeHtml(inputPlaceholder || 'Name')}"`} />
+      </div>
+    `
+    : wantsInput
     ? `
       <div class="confirm-dialog-input">
         ${inputLabel ? `<label for="${escapeHtml(inputId)}">${escapeHtml(inputLabel)}</label>` : ''}
@@ -95,7 +127,7 @@ export function showConfirmDialog({
             id="${escapeHtml(inputId)}"
             class="obs-select confirm-dialog-textarea"
             rows="3"
-            maxlength="${escapeHtml(String(inputMaxLength))}"
+            ${lengthLimit}
             placeholder="${escapeHtml(inputPlaceholder || '')}"
             ${inputLabel ? '' : `aria-label="${escapeHtml(inputPlaceholder || 'Note')}"`}
           >${escapeHtml(inputDefaultValue || '')}</textarea>
@@ -111,11 +143,15 @@ export function showConfirmDialog({
         <span class="confirm-dialog-title" id="${escapeHtml(titleId)}">${escapeHtml(title || 'Confirm')}</span>
       </div>
       <div class="confirm-dialog-body">
-        <p class="confirm-dialog-message">${escapeHtml(message || '')}</p>
+        <p class="confirm-dialog-message"></p>
+        <ul class="confirm-dialog-list" hidden></ul>
         ${inputBlock}
+        <p class="confirm-dialog-problem status-line" data-tone="danger" role="alert" hidden></p>
+        ${option === null ? '' : `<label class="checkbox-inline confirm-dialog-option"><input type="checkbox" ${option.checked ? 'checked' : ''} /> ${escapeHtml(option.label)}</label>`}
       </div>
       <div class="confirm-dialog-actions">
         <button type="button" class="btn confirm-dialog-cancel">Cancel</button>
+        ${alternativeText === null ? '' : `<button type="button" class="btn confirm-dialog-alternative">${escapeHtml(alternativeText)}</button>`}
         <button type="button" class="btn ${tone === 'danger' ? 'btn-danger' : 'btn-primary'} confirm-dialog-confirm">${escapeHtml(confirmText)}</button>
       </div>
     </div>
@@ -259,10 +295,41 @@ export function showConfirmDialog({
 
   const cancelBtn = overlay.querySelector('.confirm-dialog-cancel');
   const confirmBtn = overlay.querySelector('.confirm-dialog-confirm');
+  const alternativeBtn = overlay.querySelector('.confirm-dialog-alternative');
   const textarea = overlay.querySelector('.confirm-dialog-textarea');
   const charCounter = overlay.querySelector('.confirm-dialog-char-counter');
+  const optionBox = overlay.querySelector('.confirm-dialog-option input');
+  const problem = overlay.querySelector('.confirm-dialog-problem');
+  const messageEl = overlay.querySelector('.confirm-dialog-message');
+  const listEl = overlay.querySelector('.confirm-dialog-list');
+  const checked = () => optionBox?.checked === true;
+  // The sentence and the list, as text (never markup), worded again when the option changes.
+  const words = () => {
+    const said = typeof describe === 'function' ? describe(checked()) : { message, details };
+    messageEl.textContent = said.message || '';
+    listEl.replaceChildren(...(said.details ?? []).map(line => Object.assign(document.createElement('li'), { textContent: line })));
+    listEl.hidden = (said.details ?? []).length === 0;
+  };
+  words();
+  optionBox?.addEventListener('change', words);
+  /** Whether the value can be taken; else the reason stays under the field. */
+  const accepted = () => {
+    const why = wantsInput && typeof validate === 'function' ? validate(String(textarea?.value || '')) : null;
+    problem.hidden = why === null;
+    problem.textContent = why ?? '';
+    if (why !== null) textarea?.focus?.();
+    return why === null;
+  };
+  if (inputKind === 'line') {
+    textarea?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        confirmBtn?.click();
+      }
+    });
+  }
 
-  if (wantsInput && textarea && charCounter) {
+  if (wantsInput && textarea && charCounter && inputMaxLength !== null) {
     const maxLen = Number.parseInt(textarea.getAttribute('maxlength') || '', 10);
     const maxLabel = Number.isFinite(maxLen) && maxLen > 0 ? maxLen : null;
     const updateCounter = () => {
@@ -277,9 +344,16 @@ export function showConfirmDialog({
     cancel();
   });
   confirmBtn?.addEventListener('click', () => {
+    if (!accepted()) return;
     const note = wantsInput ? String(textarea?.value || '') : null;
+    const option = checked();
     close();
-    onConfirm?.(note);
+    onConfirm?.(note, option);
+  });
+  alternativeBtn?.addEventListener('click', () => {
+    const option = checked();
+    close();
+    onAlternative(option);
   });
 
   overlay.addEventListener('click', (e) => {
@@ -306,7 +380,10 @@ export function showConfirmDialog({
   try {
     releaseModalLayer = claimModalDocumentLayer(overlay);
     document.body.appendChild(overlay);
-    if (wantsInput) textarea?.focus?.();
+    if (wantsInput) {
+      textarea?.focus?.();
+      textarea?.select?.();
+    }
     else confirmBtn?.focus?.();
   } catch (primaryError) {
     const rollbackErrors = [primaryError];

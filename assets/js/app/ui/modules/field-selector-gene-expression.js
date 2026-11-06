@@ -26,6 +26,9 @@ import { isReported } from '../../../utils/errors.js';
 import { useOpenCells } from '../../../data/open-cells-work.js';
 import { PLACES, placePath } from '../place-names.js';
 import { describeUnshownField, unshownChoiceReason } from './field-interaction-owner.js';
+import { getActions } from '../../actions/index.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
+import { isQuietFailure } from '../../actions/control-dispatch.js';
 
 const INIT_KEYS = new Set([
   'state',
@@ -55,7 +58,9 @@ const CALLBACK_KEYS = new Set([
   'onBusyChanged',
   'onActivateField',
   'onAdoptDatasetGeneration',
-  'onChooseGeneNames'
+  'onChooseGeneNames',
+  'onDuplicateField',
+  'onClearColoring'
 ]);
 const RETURN_KEYS = new Set([
   'clearGeneSelection',
@@ -261,29 +266,6 @@ function requireFieldInfo(value, field) {
   return value;
 }
 
-function requireDuplicateResult(value, state) {
-  requireExactKeys(
-    value,
-    new Set(['newFieldIndex', 'newKey']),
-    'Gene duplicate result'
-  );
-  const index = requireIndex(
-    value.newFieldIndex,
-    'Gene duplicate result.newFieldIndex'
-  );
-  StateValidator.validateFieldKey(value.newKey);
-  const fields = requireVarInventory(state.getVarFields());
-  if (
-    index >= fields.length
-    || fields[index].key !== value.newKey
-  ) {
-    throw new Error(
-      'Gene duplicate result must identify the exact created field'
-    );
-  }
-  return value;
-}
-
 export function initGeneExpressionSelector(options) {
   requireExactKeys(options, INIT_KEYS, 'Gene expression selector options');
   const {
@@ -295,7 +277,6 @@ export function initGeneExpressionSelector(options) {
     noneFieldValue
   } = options;
   for (const methodName of [
-    'duplicateField',
     'ensureVarFieldLoaded',
     'getDatasetGeneration',
     'getVarFields',
@@ -384,6 +365,9 @@ export function initGeneExpressionSelector(options) {
   // is the latest choice, a refresh of the selector (the gene list
   // republished, another field's change) names it, not what is shown.
   let choosing = null;
+  // Gene choices dispatched and not ended (`chooseGene`): the field menus
+  // stay held while any is.
+  let queuedChoices = 0;
   let forceDisabled = false;
 
   /* The dropdown is rebuilt on every keystroke, so it cannot host the live
@@ -437,29 +421,6 @@ export function initGeneExpressionSelector(options) {
     }
   }
 
-  function reportTaskFailure(task, prefix, category) {
-    if (
-      task === null
-      || typeof task !== 'object'
-      || typeof task.then !== 'function'
-      || typeof task.catch !== 'function'
-    ) {
-      throw new TypeError('Gene selector UI task must be a Promise');
-    }
-    interactionOwner.track(task);
-    task.catch((error) => {
-      if (isCancellation(error)) {
-        return;
-      }
-      const exactError = requireError(error, 'Gene selector UI task');
-      console.error(exactError);
-      getNotificationCenter().error(
-        `${prefix}: ${exactError.message}`,
-        { category }
-      );
-    });
-  }
-
   /**
    * Report a gene that could not be shown, with the reason it could not be.
    *
@@ -468,6 +429,10 @@ export function initGeneExpressionSelector(options) {
    * else — not whether the payload never arrived or arrived unusable, not what
    * was wrong with it, and not what to do. `explainContinuousPayloadFailure`
    * knows all three, and the notification centre renders the newlines it uses.
+   *
+   * A refusal (the action's own sentence: a gene no longer on the list)
+   * is said as information. The task is the dispatch (`chooseGene`): the
+   * choice itself is owned by `interactionOwner` inside the action.
    *
    * @param {Promise<unknown>} task
    * @param {string} geneKey
@@ -484,11 +449,14 @@ export function initGeneExpressionSelector(options) {
     if (typeof geneKey !== 'string' || geneKey.length === 0) {
       throw new TypeError('Gene selection failure requires the gene key.');
     }
-    interactionOwner.track(task);
     task.catch((error) => {
-      // A cancellation is no failure; a failure the gene's own loading card
-      // already said (`announceLoadFailure`) is not said twice.
-      if (isCancellation(error) || isReported(error)) {
+      // A cancellation or a newer choice is no failure; a failure the gene's
+      // own loading card already said (`announceLoadFailure`) is not said twice.
+      if (isQuietFailure(error) || isReported(error)) {
+        return;
+      }
+      if (error instanceof ActionRefused) {
+        sayUnshown(error.message);
         return;
       }
       const exactError = requireError(error, 'Gene selector UI task');
@@ -742,10 +710,14 @@ export function initGeneExpressionSelector(options) {
    * shown, with nothing said.) Whatever keeps it from being shown is said,
    * except a newer choice, Cancel or another dataset.
    *
+   * It is the implementation of the action `color.by` for a gene (the
+   * field selector provides it): the controls dispatch the action.
+   *
    * @param {number} originalIdx
+   * @param {{signal?: AbortSignal|null}} [options] - The action's signal
    * @returns {Promise<Object|null>} The activation, or null when not shown
    */
-  function selectGene(originalIdx) {
+  function selectGene(originalIdx, { signal = null } = {}) {
     assertAlive();
     const chosen = findGeneEntry(originalIdx);
     if (interactionOwner.isSuspended()) {
@@ -879,6 +851,36 @@ export function initGeneExpressionSelector(options) {
           updateGeneActionButtons(false);
         }
       }
+    }, { signal });
+  }
+
+  /**
+   * Colour by the gene named `geneKey`, as a step (the action `color.by`):
+   * resolves with what was shown, or null when another choice replaced it.
+   *
+   * @param {string} geneKey
+   * @returns {Promise<Object|null>}
+   */
+  function chooseGene(geneKey) {
+    // The choice shows at once, as it is made, while the action waits its
+    // turn (a change of the open cells under way first: `cells.open`); the
+    // field menus are held until it ends, as while its gene is read.
+    hideGeneDropdown();
+    geneSearchStatus.textContent = '';
+    geneSearch.value = geneKey;
+    queuedChoices++;
+    callbacks.onBusyChanged(true);
+    return getActions().dispatch('color.by', { field: { source: FieldSource.VAR, key: geneKey } }).then(
+      ({ outcome }) => outcome,
+      error => {
+        if (isQuietFailure(error)) return null;
+        throw error;
+      }
+    ).finally(() => {
+      queuedChoices--;
+      if (destroyed || queuedChoices > 0 || choiceUnderWay() >= 0) return;
+      callbacks.onBusyChanged(false);
+      syncFromState();
     });
   }
 
@@ -898,7 +900,7 @@ export function initGeneExpressionSelector(options) {
    * with a `GeneUnavailableError` that says why.
    *
    * @param {string} geneKey
-   * @returns {Promise<Object|null>} As `selectGene`
+   * @returns {Promise<Object|null>} As `chooseGene`
    */
   function colorByGene(geneKey) {
     assertAlive();
@@ -913,7 +915,7 @@ export function initGeneExpressionSelector(options) {
     if (outcome.kind !== 'match') {
       return Promise.reject(new GeneUnavailableError(geneKey, outcome, list.failure));
     }
-    return selectGene(geneFieldList[outcome.position].originalIdx);
+    return chooseGene(geneFieldList[outcome.position].field.key);
   }
 
   async function clearGeneSelection() {
@@ -949,50 +951,10 @@ export function initGeneExpressionSelector(options) {
     updateGeneActionButtons();
   }
 
-  async function duplicateSelectedGene() {
-    if (selectedGeneOriginalIdx < 0) return;
-    const { field, originalIdx } = findGeneEntry(
-      selectedGeneOriginalIdx
-    );
-    const intent = interactionOwner.beginIntent();
-    const notifications = getNotificationCenter();
-    const notificationId = notifications.loading(
-      `Duplicating "${field.key}"…`,
-      { category: 'filter' }
-    );
-    try {
-      const result = requireDuplicateResult(
-        await state.duplicateField(FieldSource.VAR, originalIdx),
-        state
-      );
-      interactionOwner.assertIntentCurrent(intent);
-      initGeneExpressionDropdown();
-      await selectGene(result.newFieldIndex);
-      notifications.complete(
-        notificationId,
-        `Created "${result.newKey}"`,
-        { announce: true }
-      );
-    } catch (error) {
-      if (isCancellation(error)) {
-        notifications.dismiss(notificationId);
-        return;
-      }
-      const exactError = requireError(error, 'Gene duplication');
-      console.error(exactError);
-      notifications.fail(
-        notificationId,
-        `Duplicate failed: ${exactError.message}`
-      );
-    }
-  }
-
   geneCopyBtn.addEventListener('click', () => {
-    reportTaskFailure(
-      duplicateSelectedGene(),
-      'Gene duplicate action failed',
-      'filter'
-    );
+    if (selectedGeneOriginalIdx >= 0) {
+      callbacks.onDuplicateField(FieldSource.VAR, selectedGeneOriginalIdx);
+    }
   }, { signal: lifecycle.signal });
   geneRenameBtn.addEventListener('click', () => {
     if (selectedGeneOriginalIdx >= 0) {
@@ -1012,11 +974,7 @@ export function initGeneExpressionSelector(options) {
     }
   }, { signal: lifecycle.signal });
   geneClearBtn.addEventListener('click', () => {
-    reportTaskFailure(
-      clearGeneSelection(),
-      'Failed to clear gene selection',
-      'filter'
-    );
+    callbacks.onClearColoring();
   }, { signal: lifecycle.signal });
 
   geneDropdown.addEventListener('pointerover', (event) => {
@@ -1034,7 +992,7 @@ export function initGeneExpressionSelector(options) {
       : null;
     if (item === null || !geneDropdown.contains(item)) return;
     const entry = findGeneEntry(Number(item.dataset.originalIdx));
-    reportGeneSelectionFailure(selectGene(entry.originalIdx), entry.field.key);
+    reportGeneSelectionFailure(chooseGene(entry.field.key), entry.field.key);
   }, { signal: lifecycle.signal });
 
   geneSearch.addEventListener('focus', () => {
@@ -1065,7 +1023,7 @@ export function initGeneExpressionSelector(options) {
     const active = geneList.getActiveIndex();
     if (active >= 0 && geneResults[active] !== undefined) {
       const entry = geneResults[active];
-      reportGeneSelectionFailure(selectGene(entry.originalIdx), entry.field.key);
+      reportGeneSelectionFailure(chooseGene(entry.field.key), entry.field.key);
       return;
     }
     const query = geneSearch.value;
@@ -1078,7 +1036,7 @@ export function initGeneExpressionSelector(options) {
       return;
     }
     const entry = geneFieldList[outcome.position];
-    reportGeneSelectionFailure(selectGene(entry.originalIdx), entry.field.key);
+    reportGeneSelectionFailure(chooseGene(entry.field.key), entry.field.key);
   }, { signal: lifecycle.signal });
   geneSearch.addEventListener('blur', () => {
     if (selectedGeneOriginalIdx < 0 || geneSearch.value.length > 0) return;

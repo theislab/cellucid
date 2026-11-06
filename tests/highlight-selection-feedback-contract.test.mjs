@@ -42,6 +42,7 @@ import {
   selectionUnchanged
 } from '../assets/js/app/ui/modules/highlight/selection-state.js';
 import { createSelectModeDom } from './helpers/select-mode-dom.mjs';
+import { withHighlightPage } from './helpers/highlight-state-pages.mjs';
 
 // Cell 4 carries the uint8 missing code, so a gesture that lands on it resolves
 // to no cells at all — the exact case that used to `return` without a word.
@@ -168,7 +169,7 @@ function createState(field) {
     setField(next) {
       this.state.activeField = next;
     },
-    state: {
+    state: withHighlightPage({
       pointCount: CATEGORY_CODES.length,
       activeField: field,
       addHighlightDirect({ type, label, cellIndices }) {
@@ -214,7 +215,7 @@ function createState(field) {
       setPreviewHighlightFromIndices(indices) {
         previews.push([...indices].sort((left, right) => left - right));
       }
-    }
+    })
   };
 }
 

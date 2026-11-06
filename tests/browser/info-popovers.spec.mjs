@@ -144,7 +144,7 @@ test('compact information popovers are accessible, exclusive, and viewport-safe'
   // The close button in the tip's title row dismisses it as Escape does.
   await sessionButton.click();
   const sessionPopover = page.locator('#session-state-info-tooltip');
-  await expect(sessionPopover.locator('.info-tip-title')).toHaveText('Session file');
+  await expect(sessionPopover.locator('.info-tip-title')).toHaveText('Share and Load');
   await sessionPopover.locator('.info-tip-close').click();
   await expect(sessionPopover).toBeHidden();
   await expect(sessionButton).toBeFocused();

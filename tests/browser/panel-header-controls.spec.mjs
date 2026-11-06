@@ -23,9 +23,6 @@ const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
   + '&dataset=current-ui&acceptance=panel-header-controls-ci';
 
-const DOCKABLE_REGISTRY_URL = '/assets/js/app/dockable-accordions-registry.js';
-const DOCKABLE_CONTRIBUTOR_URL =
-  '/assets/js/app/session/contributors/dockable-layout.js';
 
 const PANEL = 'visualization-section';
 const OTHER_PANEL = 'coloring-filtering-section';
@@ -291,26 +288,28 @@ test('docking and undocking by button never toggles the panel, and focus follows
   expect(productErrors).toEqual([]);
 });
 
-test('the floating layout round-trips through the session contributor', async ({
+test('the floating layout round-trips through the layout state domain', async ({
   page,
 }) => {
   await openDataset(page);
+  const sidebarOrder = () => page.evaluate(() =>
+    [...document.querySelector('#sidebar .accordion').children]
+      .map(child => child.querySelector(':scope > details.accordion-section')?.id));
+  const slot = (await sidebarOrder()).indexOf(PANEL);
+  expect(slot).toBeGreaterThan(0);
   await control(page, PANEL, 'accordion-undock-btn').click();
   await control(page, OTHER_PANEL, 'accordion-undock-btn').click();
   await page.evaluate(id => { document.getElementById(id).open = false; }, OTHER_PANEL);
 
-  const capture = () => page.evaluate(async ({ registryUrl, contributorUrl }) => {
-    const { getDockableAccordions } = await import(registryUrl);
-    const contributor = await import(contributorUrl);
-    return contributor.capture({
-      dockableAccordions: getDockableAccordions(),
-    })[0].payload;
-  }, { registryUrl: DOCKABLE_REGISTRY_URL, contributorUrl: DOCKABLE_CONTRIBUTOR_URL });
+  // The `layout` domain's value (`app/state/domains/layout.js`), as the history and a session hold it.
+  const capture = () => page.evaluate(async () => {
+    const { getStateDomains } = await import('/assets/js/app/actions/index.js');
+    return getStateDomains().owner('layout').capture();
+  });
 
   const saved = await capture();
-  expect(saved.panels.map(panel => [panel.id, panel.open]).sort()).toEqual(
-    [[OTHER_PANEL, false], [PANEL, true]].sort(),
-  );
+  expect(saved.panels.map(panel => panel.id)).toEqual([OTHER_PANEL, PANEL].sort());
+  expect([saved.sections[PANEL], saved.sections[OTHER_PANEL]]).toEqual([true, false]);
 
   // Dock everything by its buttons, then restore.
   await control(page, PANEL, 'accordion-dock-btn').click();
@@ -319,19 +318,10 @@ test('the floating layout round-trips through the session contributor', async ({
     .toHaveCount(0);
   expect((await capture()).panels).toEqual([]);
 
-  await page.evaluate(async ({ registryUrl, contributorUrl, value }) => {
-    const { getDockableAccordions } = await import(registryUrl);
-    const contributor = await import(contributorUrl);
-    contributor.restore(
-      { dockableAccordions: getDockableAccordions() },
-      null,
-      value,
-    );
-  }, {
-    registryUrl: DOCKABLE_REGISTRY_URL,
-    contributorUrl: DOCKABLE_CONTRIBUTOR_URL,
-    value: saved,
-  });
+  await page.evaluate(async value => {
+    const { getStateDomains } = await import('/assets/js/app/actions/index.js');
+    await getStateDomains().owner('layout').restore(value, { signal: null });
+  }, saved);
 
   expect(await capture()).toEqual(saved);
   for (const id of [PANEL, OTHER_PANEL]) {
@@ -342,12 +332,12 @@ test('the floating layout round-trips through the session contributor', async ({
   await expect(page.locator(`#${OTHER_PANEL}`)).not.toHaveAttribute('open', '');
   expect(await nestedInteractive(page)).toEqual([]);
 
-  // The restored panels dock back by their buttons into their own slots.
-  await control(page, OTHER_PANEL, 'accordion-dock-btn').click();
+  // The restored panels dock back by their buttons into their own slots, the
+  // one in front first (which is in front is not part of the layout: a
+  // restore floats the panels it adds in the value's order, by id).
   await control(page, PANEL, 'accordion-dock-btn').click();
-  const order = await page.evaluate(() =>
-    [...document.querySelector('#sidebar .accordion').children]
-      .map(child => child.querySelector(':scope > details.accordion-section')?.id));
+  await control(page, OTHER_PANEL, 'accordion-dock-btn').click();
+  const order = await sidebarOrder();
   expect(order.indexOf(PANEL)).toBeLessThan(order.indexOf(OTHER_PANEL));
-  expect(order.indexOf(PANEL)).toBe(1);
+  expect(order.indexOf(PANEL)).toBe(slot);
 });

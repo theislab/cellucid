@@ -99,6 +99,7 @@ import { sortUint32 } from '../../utils/radix-order.js';
 import { noteRunsOf } from './views/cell-subset.js';
 import { REMOTE_POLICY } from '../../formats/io/byte-source.js';
 import { loadedRoundTripMs } from '../../formats/io/link.js';
+import { measureOf } from '../../utils/machine.js';
 
 /** Chunks of the dominant cell-major array one block of `blocks` spans (see `defaultBlockSize`). */
 const BLOCK_CHUNKS = 4;
@@ -1637,7 +1638,10 @@ async function geneSampleOf(root, nObs, placed, request, priority, { valuesOnDem
   // (`orderOpeningMs`), the chunks read being the same.
   const started = performance.now();
   const ordered = { ...opening, ...wholeInOrder(cellOrder, nObs, subsampleCache) };
-  const orderMs = orderOpeningMs(performance.now() - started);
+  // The machine's `orderMadeMs` (`utils/machine.js`): timed, it follows how
+  // busy the machine is (a pass of a few thousand cells stalled for tens of
+  // milliseconds outweighs a sample's priced saving of a tenth of a second).
+  const orderMs = orderOpeningMs(measureOf('orderMadeMs', () => performance.now() - started));
   // A sample fitted to the first gene's time pays for the order only when
   // it brings that gene sooner than every cell's by more than the order
   // costs (`orderPays`); else every cell opens in file order, as it always

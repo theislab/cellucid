@@ -19,6 +19,19 @@
  * publication that failed, a verdict reached before the spec watched, an
  * opening "at once" made progressive by the start sample's own record.
  *
+ * The same holds for what the reader plans from, in its worker: which
+ * cells genes are read for and in which order a share opens, from the
+ * link's round trip and rate and from how fast chunks decode
+ * (`data/anndata/subsample-plan.js` `geneSampleOf`); whether a kept gene
+ * index is read or built again, from how fast kept copies were read; which
+ * pass indexes a share, from what a pass's work cost. A loaded runner
+ * measures each otherwise, and plans otherwise: a share raised with Apply
+ * was read anew instead of shown in place because genes were read for 864
+ * of its 1,500 cells (`open-cells-in-place.spec.mjs`, WebKit in a run of six
+ * workers, 2026-11-06), where the same page at rest reads them for every
+ * cell; `held-machine.spec.mjs` shows it in every engine with the file's
+ * answers held back 370 ms.
+ *
  * The defaults are a fast device whose measures nothing moves:
  * - `gpu`: the GPU's time for every frame, given exactly through the GPU
  *   timer the page reads where a browser offers one
@@ -28,22 +41,52 @@
  *   another (`{frameMs, perThousandCellsMs, culledMs}`, below), at start or
  *   later (`setSimulatedGpu`). A spec whose subject is the real GPU's time
  *   (a benchmark of draws) says `'real'`.
- * - `openingMsPerCell`: what showing a cell costs, held
- *   (`holdShownCells`): null (nothing measured: an opening is priced by its
- *   reads alone), or milliseconds a cell; the page's own records leave it as
- *   it is. A spec about the record itself says `'measured'`.
- * - `hardwareConcurrency`: the cores the page sees (4, a hosted Linux
- *   runner's), so its pools have the same size everywhere. Workers read
- *   their own `navigator`, which an init script cannot reach: a pool a
- *   worker sizes (the reader worker's decode pool) still follows the
- *   machine; its results do not depend on its size.
+ * - `hardwareConcurrency`: the cores the page and every worker see (4, a
+ *   hosted Linux runner's), so their pools have the same size everywhere:
+ *   the page's `navigator` reports them, and the workers, whose own
+ *   `navigator` an init script cannot reach, are handed them (the
+ *   machine's `cores`, below).
  * - `deviceMemory`: the memory the page sees (8 GiB, what Chromium reports
- *   at most), only in an engine that reports any (Chromium).
+ *   at most), only in an engine that reports any (Chromium). The reader
+ *   worker's budgets are the page's (`data/memory-budget.js`
+ *   `connectMemoryWorker`).
+ * - The machine's measures (`assets/js/utils/machine.js`, the one place a
+ *   measured rate enters a plan), held on the page and handed to every
+ *   worker it starts, and to theirs (`holdMachine`). Each is a number, or
+ *   `'measured'` in a spec whose subject is that measurement:
+ *   - `link`: the link the reader plans on, `{latencyMs, bytesPerMs}`:
+ *     a round trip of 2 ms and 32 MB/s, a host on a fast local network
+ *     (below the rate a web host is read ahead at, `formats/io/link.js`
+ *     `READ_AHEAD_BYTES_PER_MS`: the fixtures are read on demand, as a link
+ *     opens). A host on this machine is priced as this machine at rest on
+ *     top of it, as in the app (`data/host-link-memory.js`
+ *     `thisMachinePricing`). The requests themselves are timed and shaped
+ *     by the link as it really is, on any runner: how many requests carry a
+ *     read is no part of what is held, and a spec asserts none of it. A
+ *     spec about a slow link gives its link here
+ *     (`{latencyMs: 200, bytesPerMs: 100}`) instead of delaying answers.
+ *   - `decodeBytesPerMs`: how fast chunks decode, every decoder together:
+ *     1 GB/s, which binds no plan.
+ *   - `orderMadeMs`: how long making every cell's order takes: 0.
+ *   - `keptReadBytesPerMs`: how fast kept gene indexes were read: null,
+ *     none measured (a kept index is read, never priced against building it
+ *     again).
+ *   - `indexPassMs`: what a gene index pass's work cost an entry: null,
+ *     none measured (each share's pass chosen as a reader's first).
+ *   - `openingMsPerCell`: what showing a cell costs (the machine's
+ *     `shownCellMs`): null (nothing measured: an opening is priced by its
+ *     reads alone), or milliseconds a cell; the page's own records are not
+ *     made.
  *
- * The link's speed and the decoding rate are measured too
- * (`formats/io/link.js`, `formats/io/decode-pool.js`) and left so: every
- * fixture is served from this machine, and its first views are far inside
- * the opening target on any runner.
+ * Measured on purpose, and why a slow runner is safe with each: developer
+ * doc 14 (Testing, CI and release process: "Every rate the app measures,
+ * and what a test does with it") lists every rate the app measures, with
+ * what holds it or why nothing needs to.
+ *
+ * The holds reach a page that runs its sources (this machine); a page
+ * opened as a deployed site (`DEPLOYED_BROWSER_TEST_HOST`) runs its bundle,
+ * whose module instances an init script cannot name, and measures
+ * everything: a spec opened there asserts nothing that follows from a plan.
  *
  * @module tests/browser/helpers/device
  */
@@ -56,8 +99,13 @@
  */
 
 /**
+ * @typedef {{latencyMs: number, bytesPerMs: number}} HeldLink
+ *
  * @typedef {{gpu?: SimulatedGpu|'real', openingMsPerCell?: number|null|'measured',
- *   hardwareConcurrency?: number, deviceMemory?: number}} Device
+ *   hardwareConcurrency?: number, deviceMemory?: number,
+ *   link?: HeldLink|'measured', decodeBytesPerMs?: number|'measured', orderMadeMs?: number|'measured',
+ *   keptReadBytesPerMs?: number|null|'measured',
+ *   indexPassMs?: {index?: number, view?: number, placeWhole?: number, placeOwn?: number}|null|'measured'}} Device
  */
 
 export const DEVICE_DEFAULTS = Object.freeze({
@@ -65,7 +113,41 @@ export const DEVICE_DEFAULTS = Object.freeze({
   openingMsPerCell: null,
   hardwareConcurrency: 4,
   deviceMemory: 8,
+  link: Object.freeze({ latencyMs: 2, bytesPerMs: 32_000 }),
+  decodeBytesPerMs: 1e6,
+  orderMadeMs: 0,
+  keptReadBytesPerMs: null,
+  indexPassMs: null,
 });
+
+/**
+ * The device's inputs held through the machine's measures
+ * (`assets/js/utils/machine.js`), each under the measure's name.
+ */
+const MACHINE_MEASURE_OF = Object.freeze({
+  link: 'link',
+  decodeBytesPerMs: 'decodeBytesPerMs',
+  orderMadeMs: 'orderMadeMs',
+  keptReadBytesPerMs: 'keptReadBytesPerMs',
+  indexPassMs: 'indexPassMs',
+  openingMsPerCell: 'shownCellMs',
+  hardwareConcurrency: 'cores',
+});
+
+/**
+ * What a device holds of the machine (`holdMachine`'s argument): every
+ * measure it does not leave `'measured'`.
+ *
+ * @param {Device} device - As `deviceOf` gives it
+ * @returns {Object<string, unknown>}
+ */
+export function machineOf(device) {
+  const held = {};
+  for (const [input, measure] of Object.entries(MACHINE_MEASURE_OF)) {
+    if (device[input] !== 'measured') held[measure] = device[input];
+  }
+  return held;
+}
 
 /**
  * The device a spec asked for, every input it left out at its default.
@@ -102,7 +184,8 @@ function simulatedGpuOf(gpu) {
 export async function installDevice(context, device) {
   if (fixedContexts.has(context)) return;
   fixedContexts.add(context);
-  await context.addInitScript(fixDevice, deviceOf(device));
+  const exact = deviceOf(device);
+  await context.addInitScript(fixDevice, { ...exact, machine: machineOf(exact) });
 }
 
 /** Contexts whose device is fixed already (once each: the init script patches prototypes). */
@@ -124,7 +207,7 @@ export async function setSimulatedGpu(page, gpu) {
 }
 
 /** The init script: runs in every document before any of its scripts. */
-function fixDevice({ gpu, openingMsPerCell, hardwareConcurrency, deviceMemory }) {
+function fixDevice({ gpu, hardwareConcurrency, deviceMemory, machine }) {
   Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { configurable: true, get: () => hardwareConcurrency });
   if ('deviceMemory' in Navigator.prototype) {
     Object.defineProperty(Navigator.prototype, 'deviceMemory', { configurable: true, get: () => deviceMemory });
@@ -204,19 +287,23 @@ function fixDevice({ gpu, openingMsPerCell, hardwareConcurrency, deviceMemory })
     };
   }
 
-  // The opening cost, held in the page's own module: once the page's import
-  // map is parsed (an import before it would load another instance), before
-  // the page's entry is imported (at DOMContentLoaded, CELLUCID_PAGE_BOOT in
-  // index.html), and only where the page runs its sources through that map
-  // (this machine; the page bundle runs anywhere else, and any other
-  // document loads nothing of it).
+  // The machine's measures, held in the page's own module
+  // (`assets/js/utils/machine.js`), which hands them to every worker the
+  // page starts: once the page's import map is parsed (an import before it
+  // would load another instance), before the page's entry is imported (at
+  // DOMContentLoaded, CELLUCID_PAGE_BOOT in index.html), and only where the
+  // page runs its sources through that map (this machine; the page bundle
+  // runs anywhere else, and any other document loads nothing of it).
   const sources = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
-  if (openingMsPerCell !== 'measured' && sources) {
+  if (sources) {
     const hold = () => {
       const map = document.querySelector('script[type="importmap"]');
-      if (map === null || !map.textContent.includes('"./assets/js/data/opening-cost.js"')) return;
-      import(new URL('./assets/js/data/opening-cost.js', document.baseURI).href)
-        .then(module => module.holdShownCells(openingMsPerCell));
+      if (map === null || !map.textContent.includes('"./assets/js/utils/machine.js"')) return;
+      window.__cellucidMachineHeld = import(new URL('./assets/js/utils/machine.js', document.baseURI).href)
+        .then(module => {
+          module.holdMachine(machine);
+          return module.heldMachine();
+        });
     };
     if (document.readyState === 'loading') {
       document.addEventListener('readystatechange', hold, { once: true });

@@ -402,7 +402,8 @@ function storageFull(error) {
  * browser's origin-private storage for each segment of about
  * `SPOOL_SEGMENT_BYTES` written, when the browser offers one to a page,
  * else memory. `finish()` returns the bytes as one Blob of those files
- * (read from disk as the download streams it). The files of an earlier
+ * (read from disk as the download streams it); `discard()` removes them
+ * (a copy of the dataset that failed or was cancelled). The files of an earlier
  * page's exports are removed when the next one starts: a download reads its
  * file after the export returns. When the site's storage is full (a private
  * window's is a few hundred MB; gene indexes kept for a revisit share it),
@@ -504,15 +505,28 @@ export async function createSpool(name, { segmentBytes = SPOOL_SEGMENT_BYTES } =
     parts.push(segment);
   };
   return {
-    async write(bytes) {
-      pending.push(new Blob([bytes]));
-      pendingBytes += bytes.byteLength;
+    /** One more part: bytes (copied into a Blob) or a Blob (a copy of a dataset's batch, `writeAnnDataCopy`). */
+    async write(part) {
+      const blob = part instanceof Blob ? part : new Blob([part]);
+      pending.push(blob);
+      pendingBytes += blob.size;
       if (pendingBytes >= segmentBytes) await flush();
     },
     async finish() {
       await flush();
       if (names.length > 0) finishedSpools.push({ createdAt, names });
       return new Blob(parts);
+    },
+    /**
+     * Drop what was written (a copy that failed or was cancelled): its
+     * files are removed from the private storage, nothing is downloaded.
+     */
+    async discard() {
+      pending = [];
+      pendingBytes = 0;
+      parts.length = 0;
+      const written = names.splice(0);
+      for (const fileName of written) await directory?.removeEntry(fileName).catch(() => {});
     },
   };
 }

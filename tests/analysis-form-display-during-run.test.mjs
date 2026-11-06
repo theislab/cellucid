@@ -75,7 +75,7 @@ test('a display option changed mid-run is applied when the run publishes, and th
   // The user changes a display option while the run computes.
   ui._options = { ...ui._requireOptions(), scale: 3 };
   ui._lastResult = { data: { size: 0 }, scale: 1 };
-  ui._resultInputs = { options: { size: 0, scale: 1 }, pages: [], highlightRevision: 0 };
+  ui._resultInputs = { options: { size: 0, scale: 1 }, provenance: ui._currentProvenance({ size: 0, scale: 1 }, [], null) };
   ui._handleOptionsChanged('scale');
   ui.gate.resolve();
   await run;

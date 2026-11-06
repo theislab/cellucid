@@ -37,6 +37,14 @@ import { excludeMissingCategoricalValues } from '../../data/data-layer.js';
 import { PLACES } from '../../../ui/place-names.js';
 import { analysisCostKind, runProgressively } from '../../shared/progressive-cells.js';
 import { failureText } from '../../../../utils/errors.js';
+import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
+
+/** A variable's kind in words, for a refusal. */
+const VARIABLE_WORDS = Object.freeze({
+  categorical_obs: 'categorical field',
+  continuous_obs: 'continuous field',
+  gene_expression: 'gene',
+});
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -314,20 +322,20 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._pageSelector = new PageSelectorComponent({
       dataLayer: this.dataLayer,
       container: this._pageSelectContainer,
-      onSelectionChange: this._handlePageChange,
+      onSelectionChange: pageIds => {
+        this._handlePageChange(pageIds);
+        this._recordPersonChange('pages', { pageIds: [...(pageIds || [])] });
+      },
       onColorChange: this._handlePageColorChange,
       showColorPicker: true,
       showCellCounts: true,
       showSelectAll: true,
-      initialSelection: this._selectedPages.length > 0
-        ? this._selectedPages
-        : undefined,
+      initialSelection: this._pageSelectionToShow(),
       includeDerivedPages: true,
       getCellCountForPageId: (pageId) => this.dataLayer.getCellCountForPageId(pageId),
       label: 'Compare pages'
     });
-    this._selectedPages = this._pageSelector.getSelectedPages();
-    this._currentConfig.pages = [...this._selectedPages];
+    this._adoptSelectorDefault();
   }
 
   /**
@@ -395,12 +403,28 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * @param {string} variable - Variable key
    */
   _handleVariableChange(type, variable) {
-    if (type && variable) {
-      this._currentConfig.dataSource.type = type;
-      this._currentConfig.dataSource.variable = variable;
+    const before = { ...this._currentConfig.dataSource };
+    this._applyVariable(type && variable ? { type, key: variable } : null);
+    // A person's choice of what to plot: a step (`analysis.detailed.set`).
+    const after = this._currentConfig.dataSource;
+    if (after.type !== before.type || after.variable !== before.variable) {
+      this._recordPersonChange('detailed', { variable: after.variable ? { type: after.type, key: after.variable } : null });
+    }
+  }
+
+  /**
+   * Plot `variable` (`{type, key}`), or nothing (null); the plot follows its
+   * data kind. A type chosen without a variable changes nothing downstream.
+   * @param {{type: string, key: string}|null} variable
+   * @private
+   */
+  _applyVariable(variable) {
+    if (variable !== null) {
+      this._currentConfig.dataSource.type = variable.type;
+      this._currentConfig.dataSource.variable = variable.key;
 
       // Update plot type based on data kind
-      const dataKind = type === 'categorical_obs' ? 'categorical' : 'continuous';
+      const dataKind = variable.type === 'categorical_obs' ? 'categorical' : 'continuous';
       this._updatePlotTypeForDataKind(dataKind);
 
       // Re-render so the plot type selector appears for the new data kind.
@@ -412,12 +436,62 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._renderControls();
       this._scheduleUpdate();
     }
-    // Type chosen without a variable: nothing downstream depends on it yet.
+  }
+
+  /**
+   * Set what the analysis plots (`analysis.detailed.set`), only the parts
+   * given: the variable (a field or a gene by name, or null), the plot (a
+   * plot type the variable's kind offers) and plot options of that plot.
+   * Everything is checked before anything changes; a name that does not
+   * resolve is refused with a RangeError naming what there is.
+   *
+   * @param {{variable?: {type: string, key: string}|null, plot?: string,
+   *   plotOptions?: Array<{option: string, value: unknown}>}} change
+   * @returns {boolean} whether anything changed
+   */
+  setPlot({ variable, plot, plotOptions }) {
+    if (variable !== undefined && variable !== null) {
+      const keys = (this.dataLayer.getAvailableVariables(variable.type) ?? []).map(entry => entry.key);
+      if (!keys.includes(variable.key)) {
+        throw namedError(RangeError, `There is no ${VARIABLE_WORDS[variable.type] ?? variable.type} ${quoteName(variable.key)} to plot; there are ${listNames(keys)}.`);
+      }
+    }
+    const kindOf = type => (type === 'categorical_obs' ? 'categorical' : 'continuous');
+    const nextType = variable === undefined ? this._currentConfig.dataSource.type : variable?.type ?? '';
+    if ((plot !== undefined || plotOptions !== undefined) && !nextType) {
+      throw new RangeError('Detailed has nothing to plot yet: choose its variable first.');
+    }
+    const compatible = nextType ? PlotRegistry.getForDataType(kindOf(nextType)).map(entry => entry.id) : [];
+    if (plot !== undefined && !compatible.includes(plot)) {
+      throw namedError(RangeError, `Detailed cannot draw ${quoteName(plot)} for this variable; it draws ${listNames(compatible)}.`);
+    }
+    const plotId = plot ?? (compatible.includes(this._currentConfig.plotType) ? this._currentConfig.plotType : compatible[0]);
+    const schema = plotId ? PlotRegistry.get(plotId)?.optionSchema ?? {} : {};
+    for (const { option } of plotOptions ?? []) {
+      if (!Object.hasOwn(schema, option)) {
+        throw namedError(RangeError, `The ${plotId} plot has no option ${quoteName(option)}; its options are ${listNames(Object.keys(schema))}.`);
+      }
+    }
+    const before = JSON.stringify(this._currentConfig);
+    if (variable !== undefined) {
+      const applied = () => {
+        const shown = this._currentConfig.dataSource;
+        return variable === null ? !shown.variable : shown.type === variable.type && shown.variable === variable.key;
+      };
+      // The selector shows it (and may apply it, as a person's choice does); applied once either way.
+      if (!applied()) this._variableSelector?.setSelectedVariable(variable?.type ?? '', variable?.key ?? '');
+      if (!applied()) this._applyVariable(variable);
+    }
+    if (plot !== undefined && plot !== this._currentConfig.plotType) {
+      this._handlePlotTypeChange(plot);
+      this._renderControls();
+    }
+    for (const { option, value } of plotOptions ?? []) this._handlePlotOptionChange(option, value);
+    return JSON.stringify(this._currentConfig) !== before;
   }
 
   _handlePageChange = (pageIds) => {
-    this._selectedPages = pageIds || [];
-    this._currentConfig.pages = this._selectedPages;
+    this._assignPages(pageIds || []);
     this._scheduleUpdate();
 
     if (this.onConfigChange) {
@@ -432,6 +506,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   };
 
   _handlePlotTypeChange(plotTypeId) {
+    if (plotTypeId !== this._currentConfig.plotType) this._recordPersonChange('detailed', { plot: plotTypeId });
     this._currentConfig.plotType = plotTypeId;
     this._currentConfig.plotOptions = this._getSavedOptionsForPlotType(plotTypeId);
     this._scheduleUpdate();
@@ -448,6 +523,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   }
 
   _handlePlotOptionChange(key, value) {
+    if (this._currentConfig.plotOptions[key] !== value) {
+      this._recordPersonChange('detailed', { plotOptions: [{ option: key, value }] });
+    }
     setOwnDataProperty(this._currentConfig.plotOptions, key, value);
     this._saveOptionsForPlotType(this._currentConfig.plotType, this._currentConfig.plotOptions);
     this._scheduleUpdate();
@@ -1157,6 +1235,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       }
       this._updateTimer = null;
     }
+    // The update that will not run now is settled, so nothing waits for it.
+    this._settleScheduledUpdate?.();
+    this._settleScheduledUpdate = null;
     for (const [label, owner] of [
       ['variable selector', this._variableSelector],
       ['page selector', this._pageSelector]

@@ -25,7 +25,6 @@ import { isCategoricalCodes } from '../../../../data/categorical-storage-contrac
 import { requireFields } from './overlay-internals.js';
 import { requireObjectKeys, requireObjectRecord } from '../../../../utils/exact-record.js';
 import { cancelled } from '../../../../utils/abort.js';
-import { forgetLabelsChecked } from '../../../utils/category-state.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -404,45 +403,50 @@ export class FieldOverlayPublicMethods {
 
     const originalFieldKey = requireOriginalKey(field);
     const originalLabel = field._originalCategories[categoryIndex];
-    const previousCategories = [...field.categories];
+    const previousCategories = field.categories;
     StateValidator.validateCategoryLabel(originalLabel);
 
-    // The list changes in place: checked again on its next use.
-    forgetLabelsChecked(field.categories);
-    if (newLabel === originalLabel) {
-      // Revert this category label to its original.
-      field.categories[categoryIndex] = originalLabel;
-      if (!isUserDefined) {
+    // A new list, never a write into this one: a kept view's copy of the
+    // field shares it (`_cloneFieldState`), and so do the user field's
+    // template and its other copies.
+    const categories = [...previousCategories];
+    categories[categoryIndex] = newLabel;
+    if (!isUserDefined) {
+      if (newLabel === originalLabel) {
         this._renameRegistry.revertCategoryRename(src, originalFieldKey, originalLabel);
-      }
-    } else {
-      field.categories[categoryIndex] = newLabel;
-      if (!isUserDefined) {
+      } else {
         this._renameRegistry.setCategoryRename(src, originalFieldKey, originalLabel, newLabel);
       }
     }
+    field.categories = categories;
+    // Centroid tables relabelled as new tables (`_syncCentroidCategoryLabels`).
+    this._syncCentroidCategoryLabels(field, previousCategories);
 
-    if (isUserDefined && Array.isArray(field._originalCategories)) {
+    if (isUserDefined) {
       const hasAnyRename = field.categories.some(
         (label, idx) => label !== field._originalCategories[idx]
       );
       if (!hasAnyRename) {
         delete field._originalCategories;
       }
+      // One definition for every copy: the registry's template and each
+      // view's copy take the new list and the relabelled tables.
       const updated = requireBoolean(
         this._userDefinedFields.updateField(
           field._userDefinedId,
-          { categories: [...field.categories] }
+          { categories: field.categories, centroidsByLayout: field.centroidsByLayout }
         ),
         'User-defined category rename result'
       );
       if (!updated) {
         throw new Error('User-defined category rename did not complete');
       }
+      for (const copy of this._userDefinedFieldCopies(field._userDefinedId, src)) {
+        copy.categories = field.categories;
+        copy.centroidsByLayout = field.centroidsByLayout;
+      }
     }
 
-    // Keep centroid labels consistent with the category list.
-    this._syncCentroidCategoryLabels(field, previousCategories);
     this._propagateRenameToViewContexts(src, field, {
       previousLabel: previousCategories[categoryIndex],
       newLabel: field.categories[categoryIndex]

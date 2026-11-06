@@ -77,6 +77,21 @@ function upstreamMutationResponse() {
   );
 }
 
+/**
+ * A user-file write is bound to its caller: the Worker asks GitHub who the
+ * token belongs to (`GET /user`) before it forwards the write. This answers
+ * that lookup as user 1, the owner of MUTATION_PATH, and hands every other
+ * request to `fetchImpl`.
+ */
+function asCaller(fetchImpl) {
+  return (url, options = {}) => {
+    if (String(url) === 'https://api.github.com/user') {
+      return Promise.resolve(new Response('{"id":1,"login":"owner"}', { status: 200 }));
+    }
+    return fetchImpl(url, options);
+  };
+}
+
 async function responseDocument(response) {
   return parseExactJson(await response.text(), {
     path: `Worker HTTP ${response.status} response`,
@@ -285,8 +300,19 @@ test('Wrangler enables only the exact incoming Request.signal flag and sets no p
   // deploy it on the Free plan the production Worker runs on.
   assert.equal(Object.hasOwn(config, 'limits'), false);
   // Every preview URL would serve the same secrets at another address; OAuth
-  // is registered only for the production workers.dev origin.
+  // is registered only for the production origin, the custom domain.
   assert.equal(config.preview_urls, false);
+  assert.equal(config.workers_dev, false);
+  assert.deepEqual(config.routes, [{ pattern: 'api.cellucid.com', custom_domain: true }]);
+  // The app talks to the Worker this configuration deploys.
+  const githubAuth = readFileSync(
+    new URL('../assets/js/app/community-annotations/github-auth.js', import.meta.url),
+    'utf8'
+  );
+  assert.ok(
+    githubAuth.includes(`const DEFAULT_WORKER_ORIGIN = 'https://${config.routes[0].pattern}';`),
+    'DEFAULT_WORKER_ORIGIN is the Worker\'s custom domain'
+  );
 });
 
 test('local Wrangler builds and Miniflare state are never committed', () => {
@@ -504,13 +530,13 @@ test('contents PUT owns the exact decoded annotation byte boundary rather than b
   );
 
   const seenDecodedBytes = [];
-  await withMockedFetch(async (_url, options = {}) => {
+  await withMockedFetch(asCaller(async (_url, options = {}) => {
     const document = parseExactJson(options.body, {
       path: 'forwarded GitHub contents mutation',
     });
     seenDecodedBytes.push(atob(document.content).length);
     return upstreamMutationResponse();
-  }, async () => {
+  }), async () => {
     const exactResponse = await worker.fetch(
       mutationRequest(
         JSON.stringify({
@@ -548,7 +574,7 @@ test('contents PUT owns the exact decoded annotation byte boundary rather than b
   ]);
 });
 
-test('accepted CRLF-folded GitHub base64 fits the response-byte owner', async () => {
+test('a CRLF-folded GitHub base64 file is relayed byte for byte, with no byte cut', async () => {
   const canonical = btoa(
     'a'.repeat(ANNOTATION_FILE_MAX_UTF8_BYTES)
   );
@@ -600,10 +626,10 @@ test('successful bounded body read releases ownership and its abort listener', a
   let upstreamCalls = 0;
 
   try {
-    await withMockedFetch(async () => {
+    await withMockedFetch(asCaller(async () => {
       upstreamCalls += 1;
       return upstreamMutationResponse();
-    }, async () => {
+    }), async () => {
       const response = await worker.fetch(request, ENV);
       const listenerAdditions = Array.from(
         listenerObserver.additions.values()

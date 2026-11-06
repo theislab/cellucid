@@ -1,0 +1,61 @@
+{
+  "examples": [
+    {
+      "category": "T cells",
+      "count": 0,
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "seed": 0
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "category": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "count": {
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "seed": {
+        "default": 0,
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "field",
+      "category",
+      "count"
+    ],
+    "type": "object"
+  },
+  "type": "filter.category.cell-count",
+  "version": 1
+}

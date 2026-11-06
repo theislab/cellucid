@@ -25,6 +25,8 @@ import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import { OPEN_ORDER_PRIORITY } from '../assets/js/data/cell-priority.js';
 import { readPositionBounds } from '../assets/js/rendering/position-layout.js';
 import { resizedCellArray } from '../assets/js/app/state/managers/open-cells.js';
+import { hasCategoryFilter } from '../assets/js/app/state/managers/filter-manager.js';
+import { describeOutcome } from '../assets/js/app/open-cells-resize.js';
 import { createMulberry32 } from '../assets/js/app/utils/random-utils.js';
 import { colorsOf, visibleListOf, visibleOf } from './helpers/category-state.mjs';
 
@@ -360,6 +362,38 @@ test('a range of which no cell is left is reset and said; a text column with new
   assert.deepEqual(result.released, []);
   assert.deepEqual(result.extended, ['label']);
   assert.deepEqual(grown.state._fieldDataCache.get('label')?.categories ?? grownLabels, grownLabels);
+});
+
+test('a field whose added rows were not read is released: every later pass goes on, and a filter it held is reset and said', async () => {
+  const scene = await sceneAt(30);
+  const { state, manager } = scene;
+  const cluster = state.obsData.fields.find(field => field.key === 'cluster');
+  const score = state.obsData.fields.find(field => field.key === 'score');
+  state.setActiveField(state.obsData.fields.indexOf(score));
+  state.ensureCategoryMetadata(cluster);
+  state.setVisibilityForCategory(cluster, 0, false);
+  assert.ok(state.filteredCount.shown < 30, 'the filter narrows the view');
+  const layouts = manager.resizeCells(60, new Map(Object.entries(LAYOUTS).map(([key, dimension]) => {
+    const positions = DATA[key].slice(30 * dimension, 60 * dimension);
+    return [key, { positions, bounds: readPositionBounds(positions, dimension), unplacedCount: 0, unplacedNames: [] }];
+  })));
+  // No added rows of cluster: it cannot be extended to the new cells.
+  const outcome = state.resizeOpenCells({
+    n: 60,
+    identity: createCellIdentity({ nObs: N, kept: Uint32Array.from({ length: 60 }, (_, i) => i) }),
+    priority: OPEN_ORDER_PRIORITY,
+    positions: layouts.get('X_umap_2d'),
+    obs: new Map([['score', { values: DATA.score.slice(30, 60) }]]),
+    var: new Map([['GENE1', { values: DATA.gene.slice(30, 60) }]]),
+  });
+  assert.deepEqual(outcome.released, ['field cluster']);
+  assert.deepEqual(outcome.resetFilters, ['cluster']);
+  assert.match(describeOutcome(outcome), /The filter of "cluster" could not be kept on the cells added/);
+  assert.equal(cluster.loaded, false);
+  assert.equal(hasCategoryFilter(cluster), false);
+  // The pass reads no codes of a released field that filters nothing, and shows every cell.
+  state.computeGlobalVisibility();
+  assert.deepEqual(state.filteredCount, { shown: 60, total: 60 });
 });
 
 test('a load under way when the cells change is superseded, and a resize keeps the live view alone', async () => {

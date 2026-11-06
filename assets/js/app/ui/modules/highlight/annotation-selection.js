@@ -43,11 +43,11 @@ import {
   requireHighlightSelectionState,
   requireViewerHostSource,
   requireMethods,
-  requireSavedHighlightGroup,
   requireUnifiedSelectionState,
 } from './exact-contract.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { createSelectionConfirmer } from './highlight-actions.js';
 
 /**
  * @param {object} options
@@ -71,8 +71,9 @@ export function initAnnotationSelection(options) {
     state,
     'Annotation selection state',
     [
-      'addHighlightDirect',
       'clearPreviewHighlight',
+      'ensureHighlightPage',
+      'getActivePage',
       'getActiveField',
       'getCellIndicesForCategory',
       'getCellIndicesForRange',
@@ -124,6 +125,8 @@ export function initAnnotationSelection(options) {
   const lifecycleController = new AbortController();
   const pendingDeliveries = new Set();
   let destroyed = false;
+  // Confirm makes one `highlight.cells` step (`highlight-actions.js`).
+  const confirmer = createSelectionConfirmer({ state, isDestroyed: () => destroyed });
   let destructionPromise = null;
   // Kind of the field the last gesture was read with: the field of the pane
   // it landed in, which need not be the focused view's. The step help text
@@ -272,18 +275,11 @@ export function initAnnotationSelection(options) {
     const cellIndices = selectionState.annotationCandidateSet.toUint32Array();
     const stepsLabel = selectionState.annotationStepCount > 1 ? ` (${formatCountOf(selectionState.annotationStepCount, 'step')})` : '';
 
-    const savedGroup = state.addHighlightDirect({
-      type: 'annotation',
+    void confirmer.confirm({
+      tool: 'annotation',
       label: `Annotation${stepsLabel} (${formatCountOf(cellIndices.length, 'cell')})`,
       cellIndices
     });
-    requireSavedHighlightGroup(
-      savedGroup,
-      'annotation',
-      cellIndices,
-      'Saved annotation highlight group',
-      state.pointCount
-    );
 
     trackDelivery(deliverSelectionToViewerHost({
       viewerHostSource,
@@ -299,7 +295,7 @@ export function initAnnotationSelection(options) {
     retireAnnotationCandidates();
     updateAnnotationUI(null);
 
-    state.clearPreviewHighlight();
+    confirmer.clearPreview();
     viewer.confirmAnnotationSelection();
   }
 

@@ -15,9 +15,10 @@
  *   `app/opening-progress-view.js`);
  * - the reads of a growing opening (the cells added to the open ones,
  *   `cells added`): the Dataset box, which says how many cells are open;
- * - a job's reads (an analysis's, outlier quantiles': `JOB_READ_KINDS`, and
- *   a read a job joined after something else started it): the job's own
- *   notification, which can cancel it (`jobs/cancellable-job.js`);
+ * - a job's reads (an analysis's, outlier quantiles': `JOB_READ_KINDS`; a
+ *   read a running job owns, a copy of the dataset's; and a read a job
+ *   joined after something else started it): the job's own notification,
+ *   which can cancel it (`jobs/cancellable-job.js`);
  * - work nobody waits for (`background`: an index built ahead of need).
  *
  * The reader's own words for each read (`obsm['X_umap'] columns 0, 1, open

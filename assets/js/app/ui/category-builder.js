@@ -5,7 +5,8 @@
  * - Lets users drag highlight pages into a "builder" list
  * - Resolves overlaps with a selectable strategy (first/last/new label/intersections)
  * - Optionally assigns an "uncovered" label for cells not present in any page
- * - Calls `state.createCategoricalFromPages(...)` to materialize the field
+ * - Dispatches the action `field.create-from-pages` (pages and the field by
+ *   name) to materialize the field
  *
  * The builder UI is intentionally excluded from state serialization via
  * `data-state-serializer-skip` on the container element.
@@ -37,6 +38,8 @@ import {
   getKeyboardMoveInstructionsId
 } from './keyboard-move.js';
 import { requireObjectRecord } from '../../utils/exact-record.js';
+import { getActions } from '../actions/index.js';
+import { dispatchFromControl, reportActionFailure } from '../actions/control-dispatch.js';
 
 const DROP_MIME = 'application/x-highlight-page';
 
@@ -219,12 +222,10 @@ export class CategoryBuilder {
       );
     }
     for (const methodName of [
-      'createCategoricalFromPages',
       'getFields',
       'getHighlightedCellCountForPage',
       'getHighlightPageColor',
-      'on',
-      'setHighlightPageColor'
+      'on'
     ]) {
       requireMethod(this._state, methodName, 'Category builder state');
     }
@@ -719,7 +720,15 @@ export class CategoryBuilder {
           'Highlight page color input'
         );
         StyleManager.setVariable(colorIndicator, '--swatch-color', newColor);
-        this._state.setHighlightPageColor(p.pageId, newColor);
+        // The page's colour everywhere: a highlight action (one history step
+        // per page for a drag), named by the page's name.
+        const name = this._getPage(p.pageId)?.name;
+        if (name === undefined) return;
+        void dispatchFromControl(
+          'highlight.page.recolor',
+          { page: name, color: newColor },
+          { failure: 'Recolouring the highlight page failed', category: 'highlight' }
+        );
       }, { signal });
       colorInput.addEventListener(
         'click',
@@ -1523,46 +1532,55 @@ export class CategoryBuilder {
       validationError === null ? '' : validationError;
   }
 
+  /**
+   * The draft as the action names it: pages by their names, each
+   * combination of pages (intersections) by the names of its pages.
+   */
+  _actionParams(draft) {
+    const nameOf = new Map((this._state.highlightPages ?? []).map(page => [page.id, page.name]));
+    const pages = draft.pages.map(entry => ({ page: nameOf.get(entry.pageId), label: entry.label }));
+    if (pages.some(entry => typeof entry.page !== 'string')) {
+      throw new Error('A page of the new column was removed; add the pages again.');
+    }
+    const intersectionLabels = Object.entries(draft.intersectionLabels).map(([mask, label]) => ({
+      pages: pages.filter((_entry, position) => (Number(mask) & (1 << position)) !== 0).map(entry => entry.page),
+      label,
+    }));
+    return {
+      key: draft.key,
+      pages,
+      uncovered_label: draft.uncoveredLabel,
+      overlap: draft.overlapStrategy,
+      overlap_label: draft.overlapLabel,
+      intersection_labels: intersectionLabels,
+    };
+  }
+
   _handleConfirm() {
     this._assertInitialized();
-    const notifyId = getNotificationCenter().loading('Creating categorical...', { category: 'data' });
-
+    const notifications = getNotificationCenter();
+    const notifyId = notifications.loading('Creating categorical...', { category: 'data' });
+    let params;
     try {
-      const draft = this._buildDraft();
-      const result = requireObjectRecord(
-        this._state.createCategoricalFromPages(draft),
-        'Create categorical result'
-      );
-      if (
-        typeof result.id !== 'string'
-        || result.id.length === 0
-        || result.field === null
-        || typeof result.field !== 'object'
-        || !Array.isArray(result.field.categories)
-        || result.field.categories.length === 0
-        || !Number.isSafeInteger(result.conflicts)
-        || result.conflicts < 0
-        || !Number.isSafeInteger(result.uncoveredCount)
-        || result.uncoveredCount < 0
-      ) {
-        throw new TypeError(
-          'Create categorical result does not match the exact current schema'
-        );
-      }
-      getNotificationCenter().complete(
-        notifyId,
-        `Created "${draft.key}" (${formatCountOf(result.field.categories.length, 'category', 'categories')})`,
-        { announce: true }
-      );
-      this._handleCancel();
+      params = this._actionParams(this._buildDraft());
     } catch (error) {
-      const exactError = requireError(
-        error,
-        'Create categorical action'
-      );
-      console.error(exactError);
-      getNotificationCenter().fail(notifyId, exactError.message);
+      notifications.fail(notifyId, requireError(error, 'Create categorical action').message);
+      return;
     }
+    void getActions().dispatch('field.create-from-pages', params).then(
+      ({ outcome }) => {
+        notifications.complete(
+          notifyId,
+          `Created "${params.key}" (${formatCountOf(outcome.categories, 'category', 'categories')})`,
+          { announce: true }
+        );
+        if (this._initialized) this._handleCancel();
+      },
+      error => {
+        notifications.dismiss(notifyId);
+        reportActionFailure(error, { failure: 'Could not create the column', category: 'data' });
+      }
+    );
   }
 
   _handleCancel() {

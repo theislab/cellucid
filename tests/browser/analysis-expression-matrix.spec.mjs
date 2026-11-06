@@ -107,8 +107,12 @@ async function openPanel(page, modeId) {
   const header = page.locator(`#analysis-header-${modeId}`);
   await header.scrollIntoViewIfNeeded();
   await header.click();
+  await expect(header).toHaveAttribute('aria-expanded', 'true');
   const panel = page.locator(`#analysis-panel-${modeId}`);
   await expect(panel).toBeVisible();
+  // A panel that fills in asynchronously is `aria-busy` until it settles;
+  // every header below it moves when it does.
+  await expect(panel).not.toHaveAttribute('aria-busy', 'true');
   return panel;
 }
 

@@ -37,6 +37,8 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// The plans asserted here weigh this machine's speed: held at rest (`helpers/machine-at-rest.mjs`).
+import './helpers/machine-at-rest.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { opfsOnDisk, createLocks } from './helpers/opfs-on-disk.mjs';
@@ -259,8 +261,9 @@ test('a file that changes on its host while open is refused with the reopen mess
   t.after(() => disk.cleanup());
   newVisit(disk);
   const large = new Uint8Array(4 << 20).map((_, i) => (i * 7) % 256);
+  const rewrittenLarge = new Uint8Array(4 << 20).map((_, i) => (i * 11) % 256);
   let tag = '"v1"';
-  host(t, { bytes: () => large, etag: () => tag });
+  host(t, { bytes: () => (tag === '"v1"' ? large : rewrittenLarge), etag: () => tag });
   const file = { ...remoteFile('census:1', { size: large.length }), etag: '"v1"' };
   // Another kind kept of the same file (a download), as an earlier visit leaves it.
   await keepDownload(file.identity, (async function* pieces() { yield large.subarray(0, 1000); })(), { name: file.name, url: file.url, environment: disk.environment });
@@ -609,13 +612,24 @@ test('a file whose earlier visits kept a hundred thousand ranges opens again in 
     journal.release();
   }
   newVisit(disk);
-  const started = performance.now();
+  // Inserted one by one into one sorted array (each a shift of every range
+  // after it), this took minutes: found and ordered at once shifts next to none.
+  let shifted = 0;
+  const splice = Array.prototype.splice;
+  // eslint-disable-next-line no-extend-native
+  Array.prototype.splice = function counted(start, ...rest) {
+    shifted += Math.max(0, this.length - start);
+    return splice.call(this, start, ...rest);
+  };
   const parts = keptPartsOf(file, { environment: disk.environment, tab: 'tab' });
-  await parts.open();
-  const openedMs = performance.now() - started;
+  try {
+    await parts.open();
+  } finally {
+    // eslint-disable-next-line no-extend-native
+    Array.prototype.splice = splice;
+  }
   assert.equal(parts.keptBytes(), journals * perJournal * 256, 'every range is found');
-  // Inserted one by one into one sorted array (each a shift of every range after it), this took minutes.
-  assert.ok(openedMs < 10_000, `found and ordered at once (${Math.round(openedMs)} ms)`);
+  assert.ok(shifted < journals * perJournal, `opening shifted ${shifted} ranges`);
   const sorted = [...starts].sort((a, b) => a - b);
   for (const start of [sorted[0], sorted[777], sorted.at(-1)]) {
     assert.deepEqual(await parts.read(start, 256), piece(start));

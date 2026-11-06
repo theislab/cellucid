@@ -18,6 +18,12 @@ The step-by-step read path is developer doc 20
 | `older-layouts.js` | Files written before anndata 0.8, presented in the current layout. |
 | `elements.js`, `dataframe.js`, `sparse.js`, `values.js` | The element rules and readers of dataframes, sparse groups and arrays (`readRowsInStoreOrder`, `readInSourceOrder`, exact integers). |
 
+## Writing (a copy of the open dataset)
+
+| Module | Owns |
+| --- | --- |
+| `write/` | The element layer the Zarr writers share (`element-writer.js`: the transcoders' and the copy's; the `.h5ad` cell export does not use it yet), the Cellucid-ready layout (`layout.js`), and the copy of the open dataset as a Cellucid-ready AnnData `.zarr.zip` (`copy.js`, `gene-major.js`, `ready-writer.js`), streamed from the reader worker to a file the page holds. See `write/README.md`. |
+
 ## Which cells are open (the share planner)
 
 | Module | Owns |
@@ -58,6 +64,7 @@ The step-by-step read path is developer doc 20
 
 `tests/anndata-*` (reader, corpus conformance, sparse columns),
 `tests/subsample-*`, `tests/gene-sample-*`, `tests/kept-column-index-*`,
+`tests/anndata-copy-*`, `tests/browser/anndata-copy.spec.mjs`,
 `tests/graph-lines-*`, `tests/edges-at-a-share-*`, `tests/text-matrix-*`,
 `tests/transcode-*`; find others with
 `grep -l "data/anndata/<module>" tests/*.test.mjs`.

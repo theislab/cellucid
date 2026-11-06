@@ -169,19 +169,21 @@ test(
       }
 
       const [
-        { encodeTypedJson, decodeTypedJson },
+        { splitValue, joinValue },
         { DataLayer },
         { memoryReport },
       ] = await Promise.all([
-        import('/assets/js/app/session/codecs/typed-json.js'),
+        import('/assets/js/app/history/value-parts.js'),
         import('/assets/js/app/analysis/data/data-layer.js'),
         import('/assets/js/data/memory-budget.js'),
       ]);
 
       const layers = new Set();
       try {
-        // Session typed JSON (analysis results) keeps every key as an own
-        // property, Object.prototype's names included.
+        // A stored history value (analysis results, as a session file and
+        // the autosave keep one: a JSON skeleton plus its arrays,
+        // `app/history/value-parts.js`) keeps every key as an own property,
+        // Object.prototype's names included.
         const codecCases = [
           {
             dtype: 'float32',
@@ -209,7 +211,9 @@ test(
               configurable: true,
             });
           });
-          const decoded = decodeTypedJson(encodeTypedJson({ columns: record }));
+          const arrays = new Map();
+          const skeleton = JSON.parse(JSON.stringify(await splitValue({ columns: record }, arrays)));
+          const decoded = joinValue(skeleton, digest => arrays.get(digest));
           assertOwnRecord(
             decoded.columns,
             exactNames,

@@ -108,6 +108,12 @@ async function serve(request, response) {
     send(response, 403, 'Forbidden', allowCors);
     return;
   }
+  // Developer secrets (`.env`: API keys for the live agent tests) and the
+  // repository's own metadata are never served, though they sit in the root.
+  if (relative.split(path.sep).some(segment => segment === '.git' || /^\.env(?:\.|$)/.test(segment))) {
+    send(response, 403, 'Forbidden', allowCors);
+    return;
+  }
 
   let metadata;
   try {
@@ -139,6 +145,30 @@ async function serve(request, response) {
     return;
   }
 
+  // The page as deployed names the published sample catalog. Here it names the
+  // suite's own: a spec's page never depends on the published site by opening
+  // the app (`tests/browser/helpers/outside-requests.mjs`), whatever its
+  // address, and a spec about another catalog still names it (`?sampleCatalog=`).
+  if (portableRelative === 'index.html') {
+    const html = await readFile(candidate, 'utf8');
+    const catalog = `http://${request.headers.host}/tests/browser/fixtures/catalog/`;
+    const page = html.replace(
+      /(<meta name="cellucid-sample-catalog" content=")[^"]*(")/,
+      (_, before, after) => before + catalog + after
+    );
+    if (page === html) throw new Error('index.html names no sample catalog to serve the suite\'s own in');
+    const bytes = Buffer.from(page);
+    response.writeHead(200, {
+      ...(allowCors ? { 'Access-Control-Allow-Origin': '*' } : {}),
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store',
+      'Content-Length': bytes.length,
+      'Content-Type': contentType,
+    });
+    response.end(request.method === 'HEAD' ? undefined : bytes);
+    return;
+  }
+
   // One `bytes=a-b` range, as the link source's in-place reads send, is
   // answered with 206 and that slice; anything else gets the whole file.
   const range = /^bytes=(\d+)-(\d+)$/.exec(request.headers.range ?? '');
@@ -162,7 +192,9 @@ async function serve(request, response) {
     'Content-Type': contentType,
     ...(range === null ? {} : { 'Content-Range': `bytes ${start}-${end}/${metadata.size}` }),
   });
-  if (request.method === 'HEAD') {
+  // An empty file (a shipped `.gitkeep`) has no byte to stream: a read
+  // stream refuses `end: -1`, and the connection would drop unanswered.
+  if (request.method === 'HEAD' || metadata.size === 0) {
     response.end();
     return;
   }

@@ -495,7 +495,7 @@ function rememberModalSizes(modal) {
     statsWidth: stats?.offsetWidth ?? 0
   };
   if (Object.values(size).some(value => !(value > 0))) return;
-  analysisViewSizes.rememberExpandedViewSize(key, size);
+  analysisViewSizes.personResizedExpandedView(key, size);
 }
 
 /**

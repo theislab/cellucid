@@ -1,0 +1,213 @@
+{
+  "examples": [
+    {
+      "analysis": "markers",
+      "in": "panel",
+      "view": {
+        "group": "x",
+        "groups": [
+          "groups"
+        ],
+        "heatmap": {
+          "clusterCols": false,
+          "clusterRows": false,
+          "colorscale": "RdBu",
+          "distance": "correlation",
+          "linkage": "average",
+          "transform": "zscore"
+        },
+        "more": false,
+        "plot": [
+          {
+            "option": "x",
+            "value": "x"
+          }
+        ],
+        "set": "x",
+        "show": "list"
+      }
+    },
+    {
+      "analysis": "markers",
+      "in": "panel",
+      "view": {
+        "group": "x",
+        "groups": [
+          "groups"
+        ],
+        "heatmap": {
+          "clusterCols": false,
+          "clusterRows": false,
+          "colorscale": "RdBu",
+          "distance": "correlation",
+          "linkage": "average",
+          "transform": "zscore"
+        },
+        "more": false,
+        "plot": [
+          {
+            "option": "x",
+            "value": "x"
+          }
+        ],
+        "set": "x",
+        "show": "list"
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "analysis": {
+        "enum": [
+          "markers",
+          "differential",
+          "dotplot",
+          "signature",
+          "composition",
+          "correlation"
+        ],
+        "type": "string"
+      },
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "view": {
+        "additionalProperties": false,
+        "properties": {
+          "group": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "groups": {
+            "items": {
+              "enum": [
+                "groups",
+                "test",
+                "filters",
+                "ranking",
+                "cells",
+                "labels",
+                "values",
+                "layout",
+                "scoring",
+                "display"
+              ],
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "heatmap": {
+            "additionalProperties": false,
+            "properties": {
+              "clusterCols": {
+                "type": "boolean"
+              },
+              "clusterRows": {
+                "type": "boolean"
+              },
+              "colorscale": {
+                "enum": [
+                  "RdBu",
+                  "Viridis",
+                  "Blues",
+                  "YlOrRd",
+                  "Greens"
+                ],
+                "type": "string"
+              },
+              "distance": {
+                "enum": [
+                  "correlation",
+                  "euclidean",
+                  "cosine"
+                ],
+                "type": "string"
+              },
+              "linkage": {
+                "enum": [
+                  "average",
+                  "complete",
+                  "single"
+                ],
+                "type": "string"
+              },
+              "transform": {
+                "enum": [
+                  "zscore",
+                  "log1p",
+                  "none"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "more": {
+            "type": "boolean"
+          },
+          "plot": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "option": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "value": {
+                  "type": [
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "option",
+                "value"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "set": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "show": {
+            "enum": [
+              "list",
+              "heatmap",
+              "clustered"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "required": [
+      "analysis",
+      "view"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.view.set",
+  "version": 1
+}

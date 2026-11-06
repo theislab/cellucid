@@ -12,7 +12,8 @@
  *   the store cellucid-python serves for the object;
  * - a share raised and lowered in place with Apply: the result shown goes
  *   "Stale · Run", saying the open cells changed with both counts; it is not
- *   exported, not saved in a session, and its run on the cells open now
+ *   exported, a session keeps it with the cells it was computed on (so it
+ *   is stale where it is restored), and its run on the cells open now
  *   equals the reference of those cells.
  *
  * Differential expression (Wilcoxon, `exact` convention: sizes, U and means
@@ -50,6 +51,7 @@ import { closeContextWithApplicationRetirement, expect, test } from './helpers/t
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { openCollapsedPanels, openSessionSectionsOnLoad } from './helpers/panels.mjs';
+import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 
 // Cells to open, Genes read for and the data mapping are in the Session
 // panel's sections, collapsed by default: open, as a viewer who opened them.
@@ -114,8 +116,13 @@ async function openMode(page, mode) {
   const header = page.locator(`#analysis-header-${mode}`);
   await header.scrollIntoViewIfNeeded();
   if (await header.getAttribute('aria-expanded') !== 'true') await header.click();
+  await expect(header).toHaveAttribute('aria-expanded', 'true');
   const panel = page.locator(`#analysis-panel-${mode}`);
   await expect(panel).toBeVisible();
+  // A panel that fills in asynchronously is `aria-busy` until it settles;
+  // every header below it moves when it does, so the next mode's header is
+  // clicked only once this one stands still.
+  await expect(panel).not.toHaveAttribute('aria-busy', 'true');
   return panel;
 }
 
@@ -262,16 +269,18 @@ test('raised and lowered in place: the result goes stale, is not passed on, and 
   const chip = panel.locator('.analysis-stale-chip');
   await expect(chip).toBeVisible();
   await expect(chip).toHaveAttribute('title', 'The open cells changed since this result (150 cells then, 300 cells now). Run again.');
-  const passedOn = await page.evaluate(() => {
+  const passedOn = await page.evaluate(async () => {
     const ui = window._comparisonModule.getUI('differential');
     const warnings = [];
     const warning = ui._notifications.warning.bind(ui._notifications);
     ui._notifications.warning = (text, options) => { warnings.push(text); return warning(text, options); };
-    const refused = ui._refuseStaleExport('CSV');
-    return { saved: ui.exportResult(), refused, warnings };
+    const refused = await ui._refuseStaleExport('CSV');
+    const stale = (await ui.getStaleReasons()).length > 0;
+    return { savedOn: ui.exportResult().provenance.cells.open, stale, refused, warnings };
   });
   expect(passedOn).toEqual({
-    saved: null,
+    savedOn: 150,
+    stale: true,
     refused: true,
     warnings: ['CSV not exported. The open cells changed since this result (150 cells then, 300 cells now). Run it again to export it.'],
   });
@@ -290,7 +299,7 @@ test('raised and lowered in place: the result goes stale, is not passed on, and 
 
 async function saveSession(page, testInfo, name) {
   const download = page.waitForEvent('download');
-  await page.locator('#save-state-btn').click();
+  await clickSaveSession(page);
   const path = testInfo.outputPath(name);
   await (await download).saveAs(path);
   return path;
@@ -308,12 +317,13 @@ test('a session saved on a subsample opens its cells again, and analyses on them
   // opened again (read again in place of the whole dataset).
   await open(page, OPENING['all-given']);
   const chooser = page.waitForEvent('filechooser');
-  await page.locator('#load-state-btn').click();
+  await clickLoadSession(page);
   await (await chooser).setFiles(session);
   await expect.poll(() => page.evaluate(() => window._cellucidState.pointCount), { timeout: 60_000 }).toBe(opening.kept.length);
   await expectOpenCells(page, opening);
   // The result saved with it is the one shown, current on these cells.
-  await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('differential')._lastResult !== null), { timeout: 30_000 }).toBe(true);
+  // The analysis is made by the session's restore, which may end after the cells are open.
+  await expect.poll(() => page.evaluate(() => (window._comparisonModule.getUI('differential')?._lastResult ?? null) !== null)).toBe(true);
   const restored = await page.evaluate(() => window._comparisonModule.getUI('differential')._lastResult.full.results.map(row => ({
     gene: row.gene, nA: row.nA, nB: row.nB, meanA: row.meanA, meanB: row.meanB, pctA: row.pctA, pctB: row.pctB, statistic: row.statistic, pValue: row.pValue,
   })));

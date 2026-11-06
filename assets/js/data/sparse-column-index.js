@@ -60,6 +60,7 @@ import { formatBytes, formatCountOf } from '../utils/format-units.js';
 import { matchesChecksum } from '../formats/io/page-checks.js';
 import { readWhole, requireHeld, writeAt } from '../formats/io/sync-access.js';
 import { cancelled, onAbort } from '../utils/abort.js';
+import { measureOf } from '../utils/machine.js';
 
 /**
  * How long one part of a background index's synchronous work runs before the
@@ -1241,8 +1242,15 @@ const KEPT_READ_GAP_BYTES = 1 << 20;
  */
 const keptLoads = { bytes: 0, ms: 0 };
 
-/** What reading `bytes` of a kept copy is priced at, in ms, from the reads measured in this thread; null until one is. */
+/**
+ * What reading `bytes` of a kept copy is priced at, in ms, from the reads
+ * measured in this thread; null until one is. The rate is the machine's
+ * `keptReadBytesPerMs` (`utils/machine.js`): held, it is the held rate
+ * (null: none measured, so a kept copy is read).
+ */
 function keptReadMs(bytes) {
+  const held = measureOf('keptReadBytesPerMs', () => undefined);
+  if (held !== undefined) return held === null ? null : bytes / held;
   return keptLoads.ms > 0 ? bytes * keptLoads.ms / keptLoads.bytes : null;
 }
 

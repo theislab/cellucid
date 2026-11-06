@@ -30,6 +30,7 @@ const STALE = [
   /in this tab only, until it is closed/i,
   /renews itself for 24 hours/i,
   /token is kept only for this tab/i,
+  /draft of the highlights/i,
 ];
 
 test('the privacy policy, the tips and the console never say what is read stays in memory only', async () => {
@@ -59,7 +60,9 @@ test('the privacy policy names everything kept, where, and how to remove it', as
     /the converted copy of a file it has to read whole/,
     /under the file's version, only when the source names one/,
     /none of a file's parts are kept when it is served from your own computer or a notebook/,
-    /a draft of the highlights you make on each dataset and how fast each data host answered/,
+    /the history of what you do with each dataset, step by step as you work/,
+    /the list of datasets you opened \(My datasets: each one's name, size and where it opens from, a link without any key or token it carried to grant access, never a file's path or content\)/,
+    /how fast each data host answered/,
     /the browser's reference to each file or folder you opened from your computer/,
     /Session › Open data › Stored › Manage…/,
     /clearing this site's data/,

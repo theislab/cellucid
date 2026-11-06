@@ -8,6 +8,14 @@ import {
 import {
   UserDefinedFieldsRegistry,
 } from '../assets/js/app/registries/user-defined-fields.js';
+import { RenameRegistry } from '../assets/js/app/registries/rename-registry.js';
+import { DeleteRegistry } from '../assets/js/app/registries/delete-registry.js';
+import {
+  captureFieldOverlays,
+  createFieldOverlaysDomain,
+} from '../assets/js/app/state/domains/field-overlays.js';
+import { DataState } from '../assets/js/app/state/core/data-state.js';
+import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import {
   DimensionManager,
 } from '../assets/js/data/dimension-manager.js';
@@ -76,6 +84,39 @@ function residentLayoutManager(positions) {
   );
   manager.normalizedPositionCache.set('X_umap_2d', positions);
   return manager;
+}
+
+/**
+ * The field-overlays state (what the history and a session file keep) of one
+ * user-defined field registry, over `count` cells all open.
+ */
+function overlaysOf(registry, count) {
+  return captureFieldOverlays({
+    cellIdentity: createCellIdentity({ nObs: count }),
+    getRenameRegistry: () => new RenameRegistry(),
+    getDeleteRegistry: () => new DeleteRegistry(),
+    getUserDefinedFieldsRegistry: () => registry,
+  });
+}
+
+/**
+ * A DataState of `count` open cells with no dataset field, over a viewer of
+ * one view and no GPU, drawing `dimensionManager`'s layouts.
+ */
+function headlessState(count, dimensionManager) {
+  const own = { getSnapshotViews: () => [], isDisposed: () => false };
+  const viewer = new Proxy(own, { get: (target, key) => (key in target ? target[key] : () => undefined) });
+  const state = new DataState(viewer, null);
+  state.pointCount = count;
+  state.cellIdentity = createCellIdentity({ nObs: count });
+  state.colorsArray = new Uint8Array(count * 4);
+  state.categoryTransparency = new Uint8Array(count).fill(1);
+  state.cellVisibilityMask = new Uint8Array(count).fill(1);
+  state.dimensionManager = dimensionManager;
+  state.obsData = { fields: [] };
+  state.varData = { fields: [] };
+  state._resetViewContexts();
+  return { state, viewer };
 }
 
 function exactContinuousField(values) {
@@ -1116,13 +1157,14 @@ test('highlight-page fields require exact labels and serialize the valid current
   assert.equal(created.conflicts, 0);
   assert.equal(created.uncoveredCount, 1);
 
-  const [metadata] = registry.toSessionMeta(state.dimensionManager);
-  assert.equal(metadata.id, created.id);
-  assert.equal(metadata.source, FieldSource.OBS);
-  assert.equal(metadata.kind, 'category');
-  assert.equal(metadata.codesType, 'Uint8Array');
-  assert.equal(metadata.codesLength, 4);
-  assert.deepEqual(metadata.sourcePages, [
+  const [item] = overlaysOf(registry, 4).userFields;
+  assert.equal(item.id, created.id);
+  assert.equal(item.source, FieldSource.OBS);
+  assert.equal(item.kind, 'category');
+  assert.ok(item.codes.values instanceof Uint8Array);
+  assert.equal(item.codes.cells, null, 'every cell of the dataset holds a code');
+  assert.deepEqual(Array.from(item.codes.values), [0, 1, 0, 2]);
+  assert.deepEqual(item.sourcePages, [
     { pageId: 'activated', label: 'Activated' },
     { pageId: 'resting', label: 'Resting' },
   ]);
@@ -1227,7 +1269,7 @@ test('highlight-page creation rejects duplicate visible field names before regis
   assert.equal(state.obsData.fields.length, 1);
 });
 
-test('user-defined categorical state preserves exact primitive category identity', () => {
+test('user-defined categorical state preserves exact primitive category identity', async () => {
   const registry = new UserDefinedFieldsRegistry();
   const state = {
     pointCount: 3,
@@ -1250,16 +1292,28 @@ test('user-defined categorical state preserves exact primitive category identity
     created.field.centroidsByLayout.get('X_umap_2d').map(centroid => centroid.category),
     categories,
   );
-  const metadata = registry.toSessionMeta();
-  assert.deepEqual(metadata[0].categories, categories);
-  // The session record carries codes, never centroids.
-  assert.equal(Object.hasOwn(metadata[0], 'centroidsByDim'), false);
-  assert.equal(Object.hasOwn(metadata[0], 'normalizedDims'), false);
+  const value = overlaysOf(registry, 3);
+  assert.deepEqual(value.userFields[0].categories, categories);
+  // The field-overlays state carries codes, never centroids.
+  for (const key of ['centroidsByLayout', 'centroidsByDim', 'normalizedLayouts', 'normalizedDims']) {
+    assert.equal(Object.hasOwn(value.userFields[0], key), false, key);
+  }
 
-  const restored = new UserDefinedFieldsRegistry();
-  restored.fromSessionMeta(JSON.parse(JSON.stringify(metadata)));
-  assert.deepEqual(restored.getField(created.id).categories, categories);
-  assert.equal(restored.getField(created.id).centroidsByLayout.size, 0);
+  // Put back on a page that never had it: the same labels, and centroids
+  // computed again from the codes, named by those labels.
+  const { state: restoredState, viewer } = headlessState(3, residentLayoutManager(Float32Array.from([
+    0, 0,
+    1, 0,
+    0, 1,
+  ])));
+  await createFieldOverlaysDomain({ state: restoredState, viewer, refreshUi: () => {} })
+    .restore(structuredClone(value));
+  const restored = restoredState.getUserDefinedFieldsRegistry().getField(created.id);
+  assert.deepEqual(restored.categories, categories);
+  assert.deepEqual(
+    restored.centroidsByLayout.get('X_umap_2d').map(centroid => centroid.category),
+    categories,
+  );
   assert.throws(
     () => registry.createFromCategoricalCodes({
       key: 'invalid_groups',

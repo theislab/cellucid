@@ -1,0 +1,22 @@
+{
+  "examples": [
+    {
+      "panel": "Visualization"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "panel": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "panel"
+    ],
+    "type": "object"
+  },
+  "type": "layout.panel.dock",
+  "version": 1
+}

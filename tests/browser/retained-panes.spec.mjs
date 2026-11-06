@@ -11,7 +11,7 @@ const DATASET_URL =
  * change keeps the pixels it drew, so dragging the camera of one pane of four
  * redraws one pane, and the image is exactly what a full redraw draws.
  */
-test('a camera drag in one pane redraws only that pane, and the image equals a full redraw', async ({ page }) => {
+test('a camera drag in one pane redraws only that pane, also when it pauses, and the image equals a full redraw', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
@@ -63,8 +63,7 @@ test('a camera drag in one pane redraws only that pane, and the image equals a f
   }), count);
   const settle = async () => {
     await expect.poll(
-      () => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().settled),
-      { timeout: 30_000 },
+      () => page.evaluate(() => window._cellucidViewer.getFrameScheduleState().settled)
     ).toBe(true);
     await frames(6);
   };
@@ -93,6 +92,18 @@ test('a camera drag in one pane redraws only that pane, and the image equals a f
     await frames(1);
   }
   const dragDraws = await page.evaluate(() => [...window.__pointDraws.values()]);
+
+  // A drag that pauses, as a person's does: the camera settles with the button
+  // still held (between two moves, on a GPU so slow that every move is a pause),
+  // and a settled camera is a new framing the render controls look at. Nothing
+  // on screen changes for it: looking at it redrew all four panes (hosted macOS
+  // Firefox, every nightly).
+  await page.evaluate(() => { window.__pointDraws.clear(); });
+  for (let step = 1; step <= 3; step++) {
+    await page.mouse.move(pane.x + 48 + step * 6, pane.y + 16 + step * 2);
+    await settle();
+  }
+  const pausedDraws = await page.evaluate(() => [...window.__pointDraws.values()]);
   await page.mouse.up();
   await settle();
 
@@ -100,6 +111,8 @@ test('a camera drag in one pane redraws only that pane, and the image equals a f
   // moved); never four.
   expect(dragDraws.length).toBeGreaterThan(0);
   expect(new Set(dragDraws)).toEqual(new Set([1]));
+  expect(pausedDraws.length).toBeGreaterThan(0);
+  expect(new Set(pausedDraws)).toEqual(new Set([1]));
 
   const capture = () => page.evaluate(() => {
     const gl = window._cellucidViewer.getGLContext();

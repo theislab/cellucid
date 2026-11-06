@@ -29,8 +29,13 @@ export function zipStore(archive, { name } = {}) {
   const map = prefix === '' ? all : entryMap(archive, prefix);
   const storeName = name ?? (prefix ? prefix.slice(0, -1) : archive.name.replace(/\.zip$/i, ''));
 
+  // Entry paths are held normalised (NFC, `zip/names.js` `entryPath`); a key
+  // the store's documents name in another form (an NFD column name, as macOS
+  // writes) is looked up in that form, so it finds its entry.
+  const entryOf = key => map.get(key) ?? map.get(key.normalize('NFC'));
+
   const get = async (key, options = {}) => {
-    const entry = map.get(key);
+    const entry = entryOf(key);
     return entry === undefined ? null : entry.read(options);
   };
 
@@ -40,7 +45,7 @@ export function zipStore(archive, { name } = {}) {
     get,
     getMany: (keys, options) => Promise.all(keys.map(key => get(key, options))),
     async getRanges(key, ranges, options = {}) {
-      const entry = map.get(key);
+      const entry = entryOf(key);
       if (entry === undefined) return null;
       const bounds = ranges.map(range => (range.suffix !== undefined
         ? [Math.max(0, entry.size - range.suffix), entry.size]
@@ -55,9 +60,9 @@ export function zipStore(archive, { name } = {}) {
         return entry.readRange(start, end - start, options);
       }));
     },
-    storedSize: key => map.get(key)?.compressedSize ?? 0,
+    storedSize: key => entryOf(key)?.compressedSize ?? 0,
     /** The bytes a read of `key` would fetch now (none for an absent key: `ZipEntry.bytesToFetch`). */
-    bytesToFetch: key => map.get(key)?.bytesToFetch() ?? 0,
+    bytesToFetch: key => entryOf(key)?.bytesToFetch() ?? 0,
     keptReady: archive.keptReady,
     /** What one more request costs on the archive's link, in bytes (its merge gap). */
     ...(archive.link == null ? {} : { mergeGapBytes: () => archive.link.mergeGapBytes }),

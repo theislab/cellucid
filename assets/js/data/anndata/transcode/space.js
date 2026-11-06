@@ -122,7 +122,7 @@ const JOURNAL = 'j.bin';
  * revision is removed, never read: raise it whenever a transcoder's output
  * changes (`tests/transcode-cache-contract.test.mjs` fails until it is).
  */
-export const KEPT_STORE_REVISION = 5;
+export const KEPT_STORE_REVISION = 13;
 
 /**
  * The revision of what a gene index kept in this browser holds
@@ -133,7 +133,7 @@ export const KEPT_STORE_REVISION = 5;
  * chunk decoders (`tests/kept-column-index-contract.test.mjs` pins the
  * digest of that code, comments aside, and fails until it is raised).
  */
-export const KEPT_INDEX_REVISION = 5;
+export const KEPT_INDEX_REVISION = 9;
 
 /**
  * The revision of the raw bytes of remote files kept in this browser: a
@@ -471,10 +471,15 @@ const pageChecked = manifest => manifest?.kind !== 'column-index';
 const keptLabel = manifest => (manifest?.kind === 'download' ? 'A file downloaded whole'
   : manifest?.kind === 'parts' ? 'The downloaded parts of a file' : 'The converted copy of a file');
 
-/** Record that a directory was opened now (for least-recently-used removal). Never throws. */
-async function touch(folder) {
+/**
+ * Record that a directory was opened now (for least-recently-used removal),
+ * once no read of its files runs (`rewritingFiles`): the Stored listing
+ * reads this file from the page while a reader's opening writes it. Never
+ * throws.
+ */
+async function touch(folder, locks) {
   try {
-    await writeSmallFile(folder, LAST_USED, new TextEncoder().encode(String(Date.now())));
+    await rewritingFiles(locks, folder.name, () => writeSmallFile(folder, LAST_USED, new TextEncoder().encode(String(Date.now()))));
   } catch {
     // Another tab writing it at the same moment: its time stands.
   }
@@ -501,18 +506,25 @@ async function whileUnheld(locks, name, remove) {
 }
 
 /**
- * The lock a kept directory's files are read and removed under: shared by
- * whoever reads them (the Stored listing, room making, a sweep, a reader
- * finding what is kept), exclusive for the removal of the directory or of
- * its manifest. A directory's own lock (`lockName`) says who uses it, and a
- * removal waits for nobody to: it is let go of while used. This one makes a
- * removal wait for the reads in flight, and a read for the removal: WebKit
- * logs a read of a file removed after the read began as a failed load
- * ("WebKitBlobResource error 1", whatever the caller does with the error),
- * and the Stored listing read directories a reader's opening removed (Web
- * contracts runs 41213981681 and 41255961977, macOS WebKit,
- * `kept-parts.spec.mjs`). Taken after the directory's own lock, never
- * before, and held only for the reads or the removal.
+ * The lock a kept directory's files are read, removed and rewritten under:
+ * shared by whoever reads them (the Stored listing, room making, a sweep, a
+ * reader finding what is kept), exclusive for the removal of the directory
+ * or of its manifest and for the rewrite of a file in place (its last-used
+ * time, `touch`). A directory's own lock (`lockName`) says who uses it, and
+ * a removal waits for nobody to: it is let go of while used. This one makes
+ * a removal or a rewrite wait for the reads in flight, and a read for them:
+ * WebKit logs a read of a file removed or rewritten after the read began as
+ * a failed load ("WebKitBlobResource error 1", whatever the caller does
+ * with the error). The Stored listing read directories a reader's opening
+ * removed (Web contracts runs 41213981681 and 41255961977, macOS WebKit,
+ * `kept-parts.spec.mjs`), and the last-used time a later visit's reader
+ * writes as it opens the directory (`kept-parts.spec.mjs`, WebKit: logged
+ * in one run of 120, 2026-11-06). Measured in WebKit on a file a worker
+ * rewrites through a synchronous access handle while the page reads it: 5
+ * of 2,645 reads refused and logged without a lock, none of 3,001 under
+ * this one; Chromium and Firefox refuse none either way. Taken after the
+ * directory's own lock, never before, and held only for the reads, the
+ * removal or the rewrite.
  */
 const filesOf = directory => `${directory}#files`;
 
@@ -526,6 +538,12 @@ function readingFiles(locks, name, read) {
 function removingFiles(locks, name, remove) {
   if (typeof locks?.request !== 'function') return remove();
   return locks.request(lockName(filesOf(name)), { mode: 'exclusive' }, remove);
+}
+
+/** Run `rewrite` (of one of a kept directory's files, in place) once no read of its files runs. */
+function rewritingFiles(locks, name, rewrite) {
+  if (typeof locks?.request !== 'function') return rewrite();
+  return locks.request(lockName(filesOf(name)), { mode: 'exclusive' }, rewrite);
 }
 
 /** Remove a kept directory, once no read of its files runs. Never throws. */
@@ -1230,7 +1248,7 @@ export async function findKeptStores(identity, environment = globalThis, { tab =
       continue;
     }
     if (blobs !== null && blobs !== 'other-tab') {
-      await touch(folder);
+      await touch(folder, locks);
       found.push({
         directory: name,
         manifest,
@@ -1429,7 +1447,7 @@ export async function keepDownload(identity, pieces, { name, url = null, size = 
     if (stored.size !== written) throw new Error(`${name}: ${formatCountOf(written, 'byte')} arrived, ${formatCountOf(stored.size, 'byte')} were kept.`);
     const sums = pageSums.finish();
     const checks = await writeChecks(folder, new Map([[DOWNLOADED, sums]]));
-    await touch(folder);
+    await touch(folder, locks);
     await writeSmallFile(folder, MANIFEST, new TextEncoder().encode(JSON.stringify({
       kind: 'download',
       whole: true,
@@ -1811,7 +1829,7 @@ async function opfsSpace(parent, identity, environment, onDirectory, tab, upTo) 
       } catch (error) {
         throw quotaError(error, written);
       }
-      await touch(folder);
+      await touch(folder, locks);
       // Last: the manifest makes the directory complete.
       const bytes = new TextEncoder().encode(JSON.stringify({
         ...manifest,
@@ -2124,7 +2142,7 @@ export async function openKeptJournal(identity, { environment = globalThis, tab 
     if (typeof dataHandle.createSyncAccessHandle !== 'function') throw new TypeError('No synchronous access handles.');
     data = await dataHandle.createSyncAccessHandle();
     records = await recordHandle.createSyncAccessHandle();
-    await touch(folder);
+    await touch(folder, locks);
     // First: the manifest keeps the directory; what it holds is what its records say.
     await writeSmallFile(folder, MANIFEST, utf8.encode(JSON.stringify({
       ...manifest,

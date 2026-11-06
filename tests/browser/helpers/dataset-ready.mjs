@@ -59,3 +59,35 @@ export async function waitForPageAtRest(page, { timeout } = {}) {
     return 'at rest';
   }), timeout === undefined ? undefined : { timeout }).toBe('at rest');
 }
+
+/**
+ * Wait until every action asked of the page so far is done: a control's
+ * change is dispatched as an action and applied when those before it have
+ * finished, with whatever it reads on the way (a field's values), so the
+ * state it leads to is there only then (`getActions().idle()`, the
+ * dispatcher's own promise). A spec that goes on through the page's
+ * internals (a domain restored directly, a pick, a selection gesture) waits
+ * for it first: through the interface the dispatcher keeps the order itself.
+ *
+ * @param {import('@playwright/test').Page} page
+ */
+export async function whenActionsDone(page) {
+  await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    await getActions().idle();
+  });
+}
+
+/**
+ * Wait until the code the page imports by itself as it starts is in: the
+ * analysis tools (`main.js`, `analysisCode`), hundreds of files that keep
+ * arriving long after the first view on a loaded machine. The page publishes
+ * `window._comparisonModule` in the continuation of that import, once every
+ * file of its graph has loaded and run; nothing else is imported without
+ * being asked for (a panel opened, a figure exported, a worker started).
+ * No time of its own bounds the wait: the files arrive as fast as the
+ * machine serves them, and the test's timeout is the fence.
+ */
+export async function whenStartupCodeLoaded(page) {
+  await page.waitForFunction(() => window._comparisonModule !== undefined, null, { timeout: 0 });
+}

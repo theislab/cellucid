@@ -297,8 +297,7 @@ test(
         })),
         productErrors: [...productErrors],
         requests: [...alternateRequests],
-      }),
-      { timeout: 15_000 },
+      })
     ).toEqual({
       activeId: 'live',
       datasetGeneration: beforePublication.datasetGeneration + 1,

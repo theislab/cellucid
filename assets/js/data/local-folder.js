@@ -7,7 +7,7 @@
  * entry (`FileSystemDirectoryEntry`, every engine: `readFolderEntry`) or a
  * folder's handle (`FileSystemDirectoryHandle`, Chromium: a folder chosen
  * with its folder picker, dropped, or reopened from this browser,
- * `app/local-file-handles.js`: `readFolderHandle`).
+ * `app/library/local-file-handles.js`: `readFolderHandle`).
  *
  * Each file, and each batch of a directory's entries, costs the browser a
  * round trip to its file system (`entry.file()`, `handle.getFile()`,

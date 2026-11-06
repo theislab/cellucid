@@ -10,6 +10,8 @@
  * @module shared/performance-config
  */
 
+import { reportedCores } from '../../../utils/machine.js';
+
 /**
  * Analysis workers to run: one per core, less one core for the page and one
  * for the AnnData reader worker that feeds them — the same rule the reader's
@@ -20,7 +22,5 @@
  * @returns {number}
  */
 export function analysisWorkerCount(environment = globalThis) {
-  const reported = environment?.navigator?.hardwareConcurrency;
-  const cores = Number.isSafeInteger(reported) && reported > 0 ? reported : 4;
-  return Math.max(1, cores - 2);
+  return Math.max(1, (reportedCores(environment) ?? 4) - 2);
 }

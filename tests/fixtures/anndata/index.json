@@ -8714,6 +8714,38 @@
    "covers": [
     "emulated:track-order"
    ]
+  },
+  {
+   "path": "emulated/uns_csr_matrix_07.h5ad",
+   "expected": "emulated/uns_csr_matrix_07.h5ad.expected.json",
+   "writer": "emulated",
+   "variant": "uns_csr_matrix_07",
+   "format": "h5ad",
+   "zarr_format": null,
+   "reader": {
+    "expect": "read"
+   },
+   "covers": [
+    "emulated:uns-sparse",
+    "uns:csr",
+    "layout:0.7"
+   ]
+  },
+  {
+   "path": "emulated/uns_h5sparse_06.h5ad",
+   "expected": "emulated/uns_h5sparse_06.h5ad.expected.json",
+   "writer": "emulated",
+   "variant": "uns_h5sparse_06",
+   "format": "h5ad",
+   "zarr_format": null,
+   "reader": {
+    "expect": "read"
+   },
+   "covers": [
+    "emulated:uns-sparse",
+    "uns:h5sparse",
+    "layout:0.6"
+   ]
   }
  ],
  "refused": [

@@ -159,8 +159,8 @@ test('session import rejects malformed or hostile camera paths atomically', () =
   assert.deepEqual(store.getAll().map(({ id }) => id), ['existing']);
 });
 
-test('Camera Path session state accepts only the exact current fields', async () => {
-  const { assertCameraPathSessionState } = await import(
+test('Camera Path state accepts only the exact current fields', async () => {
+  const { assertCameraPathState } = await import(
     '../assets/js/app/ui/modules/cinematic-camera/index.js'
   );
   const state = {
@@ -172,40 +172,40 @@ test('Camera Path session state accepts only the exact current fields', async ()
     positionMethod: 'linear',
     rotationMethod: 'linear',
     easing: 'linear',
-    defaultSpeed: '30',
-    navigationMode: 'orbit',
-    orbitKeySpeed: '40',
-    orbitReverse: true,
-    showOrbitAnchor: true,
-    planarPanSpeed: '100',
-    planarZoomToCursor: true,
-    planarInvertAxes: false,
-    lookSensitivity: '5',
-    moveSpeed: '100',
-    invertLook: false
+    defaultSpeed: '30'
   };
 
-  assert.equal(assertCameraPathSessionState(state), state);
+  assert.equal(assertCameraPathState(state), state);
   assert.throws(
-    () => assertCameraPathSessionState({ ...state, legacyPlayback: false }),
+    () => assertCameraPathState({ ...state, legacyPlayback: false }),
     /exactly/i
   );
   const { defaultSpeed: _defaultSpeed, ...missingDefaultSpeed } = state;
   assert.throws(
-    () => assertCameraPathSessionState(missingDefaultSpeed),
+    () => assertCameraPathState(missingDefaultSpeed),
     /exactly/i
   );
   assert.throws(
-    () => assertCameraPathSessionState({ ...state, defaultSpeed: '30 trailing' }),
+    () => assertCameraPathState({ ...state, defaultSpeed: '30 trailing' }),
     /default speed/i
   );
   assert.throws(
-    () => assertCameraPathSessionState({ ...state, autoplay: 1 }),
+    () => assertCameraPathState({ ...state, autoplay: 1 }),
     /autoplay/i
   );
+  // The navigation mode is the camera's and the navigation settings are
+  // settings: neither is part of a path.
   assert.throws(
-    () => assertCameraPathSessionState({ ...state, moveSpeed: '501' }),
-    /move speed/i
+    () => assertCameraPathState({ ...state, navigationMode: 'orbit' }),
+    /exactly/i
+  );
+  assert.throws(
+    () => assertCameraPathState({ ...state, moveSpeed: '100' }),
+    /exactly/i
+  );
+  assert.throws(
+    () => assertCameraPathState({ ...state, loopBackKeyframeId: 'one' }),
+    /final keyframe of a complete loop/
   );
 });
 
@@ -738,16 +738,21 @@ test('camera playback internals expose one explicit current control contract', (
   );
 });
 
-test('camera paths default to idle, restore autoplay transactionally, and reset with datasets', () => {
-  const restoreStart = cameraModuleSource.indexOf('function restoreSessionState');
-  const restoreEnd = cameraModuleSource.indexOf('\n  return {', restoreStart);
+test('camera paths default to idle, start autoplay only once a session is loaded, and reset with datasets', () => {
+  const restoreStart = cameraModuleSource.indexOf('function restorePath');
+  const restoreEnd = cameraModuleSource.indexOf('\n  function destroy', restoreStart);
   assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
 
   const restoreBody = cameraModuleSource.slice(restoreStart, restoreEnd);
   assert.doesNotMatch(
     restoreBody,
-    /playbackController\.play\s*\(/,
-    'raw path restoration must not bypass the session transaction'
+    /playbackController\.play\s*\(|startAutoplay\s*\(/,
+    'restoring a path (a history step, a session load) never starts playback'
+  );
+  assert.match(
+    mainSource,
+    /onLoaded: \(\) => \{ ui\?\.cinematicCamera\?\.startAutoplay\(\); \}/,
+    'a loaded session starts the path it was saved with Autoplay on'
   );
   assert.doesNotMatch(
     cameraModuleSource,
@@ -766,29 +771,27 @@ test('camera paths default to idle, restore autoplay transactionally, and reset 
   assert.match(cameraModuleSource, /function startAutoplay\(\)/);
 });
 
-test('dataset publication restores only an integrity-pinned static sample view', () => {
+test('dataset publication restores only an integrity-pinned starting view, with no camera path a person made', () => {
   assert.doesNotMatch(mainSource, /restoreLatestFromDatasetExports/);
   assert.match(mainSource, /restoreCurrentDatasetState\(\{/);
   assert.match(
     datasetStateSource,
     /restorePublishedDefaultState[\s\S]*new Blob\(\[stateBytes\]/
   );
-  // The refusal lives in `published-default.js`, which owns the accepted chunk
-  // profile for both the reader and the publish step, and the serializer's
-  // published-default validation is what runs it. Asserting both is what keeps
-  // "the rule exists" from drifting apart from "the restore path applies it".
+  // The profile lives in `published-default.js`, used by the starting-view
+  // restore and by the publish step: a camera path is content a person makes,
+  // so publishing refuses one the capture's steps recorded, and the restore
+  // checks the profile before it reads any chunk. Asserting both keeps "the
+  // rule exists" from drifting apart from "the restore path applies it".
   assert.match(
     publishedDefaultSource,
-    /Published default session must not contain cinematic camera data\./
+    /STARTING_VIEW_CONTENT_DOMAINS = Object\.freeze\(\[[^\]]*'camera-path'/
   );
   assert.match(
     sessionSerializerSource,
-    /function validatePublishedDefaultManifest[\s\S]*?assertPublishedDefaultChunkProfile\(/
+    /restorePublishedDefaultState\(blob, options\) \{[\s\S]*?assertPublishedDefaultProfile\(file\.manifest\)/
   );
-  assert.match(
-    sessionSerializerSource,
-    /manifestProfile:\s*'published-default'/
-  );
+  assert.match(sessionSerializerSource, /startingView: true/);
 });
 
 test('the Camera Path DOM cache exposes only controls consumed by the current module', () => {

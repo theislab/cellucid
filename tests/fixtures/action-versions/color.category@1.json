@@ -1,0 +1,51 @@
+{
+  "examples": [
+    {
+      "category": "T cells",
+      "color": "#e41a1c",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      }
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "category": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "color": {
+        "pattern": "^#[0-9a-fA-F]{6}$",
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "field",
+      "category",
+      "color"
+    ],
+    "type": "object"
+  },
+  "type": "color.category",
+  "version": 1
+}

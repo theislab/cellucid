@@ -1,0 +1,20 @@
+{
+  "examples": [
+    {
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "type": "highlight.page.clear",
+  "version": 1
+}

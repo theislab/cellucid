@@ -92,13 +92,21 @@ test('smoke mode followed by a dataset switch, repeated, leaves no GL state behi
     });
   }
 
-  for (const [round, leave] of [
+  const rounds = [
     'points after smoke',
     'during noise generation',
     'while smoke is shown',
     'points after smoke',
     'while smoke is shown',
-  ].entries()) {
+  ];
+  const started = Date.now();
+  for (const [round, leave] of rounds.entries()) {
+    if (round === 1) {
+      // Each round builds its volume on this machine's GPU (5 s on software GL,
+      // 45 s on hosted macOS Firefox), so the budget follows what the first one
+      // measured, with room: the rounds, not the time, are what is tested.
+      test.setTimeout(Math.max(test.info().timeout, 60_000 + 2 * rounds.length * (Date.now() - started)));
+    }
     await test.step(`round ${round}: switch ${leave}`, async () => {
       await openFile(page, LARGER, 300);
       await page.locator('#categorical-field').selectOption({ label: 'cell_type' });

@@ -92,14 +92,23 @@ const OPENED_FROM_STORAGE = { kept: 'opfs', persistent: 'true', reused: 'true' }
 const IN_MEMORY = { kept: 'memory', persistent: 'false', reused: 'false' };
 
 /**
- * Open Stored › Manage… and say what it lists: its items, how many of them
- * an open tab uses (they cannot be chosen), and how many can be removed. The dialog stays open (`closeStored`).
+ * The dialog's rows of what is kept of datasets (each dataset's section),
+ * never the saved states of histories: a tab's history saves its state on
+ * its own schedule (`app/history/autosave.js`), so whether one is listed yet
+ * depends on when the dialog opens, and these tests are about the files kept.
+ */
+const DATASET_ROWS = '#kept-stores-dialog .kept-dataset:not(.kept-saved-states):not(.kept-library) [data-item-id]';
+
+/**
+ * Open Stored › Manage… and say what it lists of datasets: its items, how
+ * many of them an open tab uses (they cannot be chosen), and how many can
+ * be removed. The dialog stays open (`closeStored`).
  */
 async function openStored(page) {
   await page.locator('#kept-stores-manage-btn').click();
   const dialog = page.locator('#kept-stores-dialog');
   await expect(dialog).toBeVisible();
-  const rows = dialog.locator('[data-item-id]');
+  const rows = page.locator(DATASET_ROWS);
   return {
     items: await rows.count(),
     inUse: await rows.locator('input[type="checkbox"]:disabled').count(),
@@ -354,7 +363,7 @@ test('a picked .rds opened again on a later visit opens from what the first kept
   await expect(third.locator('#kept-stores-line')).toBeVisible();
   expect(await openStored(third)).toEqual({ items: 1, inUse: 0, removable: 1 });
   await third.locator('#kept-stores-remove-all').click();
-  await expect(third.locator('#kept-stores-dialog [data-item-id]')).toHaveCount(0);
+  await expect(third.locator(DATASET_ROWS)).toHaveCount(0);
   await closeStored(third);
   await expect(third.locator('#kept-stores-text'), 'nothing kept for a later visit (the row may name the connection speeds remembered)').not.toContainText('dataset');
   expect(await keptStores(third)).toEqual([]);

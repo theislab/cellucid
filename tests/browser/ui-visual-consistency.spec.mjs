@@ -14,9 +14,10 @@
  * - An opened analysis row still cut its description off with an ellipsis,
  *   the only way to read it being a hover that touch screens do not have.
  */
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { dismissWelcome, expectWelcomeShown } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { settleStyleTransitions } from './helpers/style-transitions.mjs';
 import { H5AD_PATH } from './helpers/dataset-loading.mjs';
@@ -256,7 +257,7 @@ test('every dialog card is the same square card', async ({ page }) => {
   const productErrors = observeProductErrors(page);
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   const welcome = page.locator('#welcome-modal');
-  await expect(welcome).toBeVisible();
+  await expectWelcomeShown(page);
   const frame = selector => page.locator(selector).evaluate(element => {
     const style = getComputedStyle(element);
     return {
@@ -274,6 +275,8 @@ test('every dialog card is the same square card', async ({ page }) => {
   await page.keyboard.press('Escape');
   await expect(welcome).toBeHidden();
 
+  // The page has finished moving: a press and a release over different things is no click.
+  await waitForPageAtRest(page);
   await page.locator('#license-link').click();
   await expect(page.locator('#license-modal')).toBeVisible();
   expect(await frame('.license-content')).toEqual(reference);
@@ -601,6 +604,8 @@ test('an icon-only control shows on hover the words it announces', async ({
   const mismatches = await page.evaluate(() =>
     [...document.querySelectorAll('#sidebar button[title][aria-label]')]
       .filter(button => button.getClientRects().length > 0)
+      // Icon-only: a button that shows words of its own (a switch's state, a count) says them.
+      .filter(button => button.textContent.trim() === '')
       .filter(button => button.title !== button.getAttribute('aria-label'))
       .map(button => `${button.id || button.className}: title "${button.title}"`
         + ` vs label "${button.getAttribute('aria-label')}"`));
@@ -613,11 +618,13 @@ test('Select mode and its combine choice never look like a highlight tool', asyn
 }) => {
   await openDataset(page);
   await page.locator('#highlight-select-mode').click();
-  // Let the switch's colour transition settle before sampling it.
-  const trackColour = id => page.locator(`#${id} .switch-track`)
-    .evaluate(element => getComputedStyle(element).backgroundColor);
-  await expect.poll(() => trackColour('highlight-select-mode'))
-    .toBe(await trackColour('select-bar-mode'));
+  await expect(page.locator('#highlight-select-mode')).toHaveAttribute('aria-checked', 'true');
+  await expect(page.locator('#select-bar-mode')).toHaveAttribute('aria-checked', 'true');
+  // Both tracks' colour transitions are over before they are sampled: frame by
+  // frame until none runs, which also asks for the frames a transition
+  // advances on (a poll of the computed colour alone asks for none: Chromium
+  // once held a track at 99% of its transition for a minute).
+  await settleStyleTransitions(page);
   const looks = await page.evaluate(() => {
     const style = element => {
       const computed = getComputedStyle(element);

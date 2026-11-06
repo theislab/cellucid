@@ -1,0 +1,22 @@
+{
+  "examples": [
+    {
+      "window": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "window": {
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "window"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.window.copy",
+  "version": 1
+}
