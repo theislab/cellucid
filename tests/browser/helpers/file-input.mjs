@@ -1,7 +1,8 @@
 import { expect } from '@playwright/test';
 
 /**
- * Choose files in a file input, as a person can: once it is enabled.
+ * Choose files in a file input, or a folder in a `webkitdirectory` one, as
+ * a person can: once it is enabled.
  *
  * The data-source inputs ship `disabled` and are enabled when the listener
  * that opens what is chosen exists (`publishDataSourceReadiness` in

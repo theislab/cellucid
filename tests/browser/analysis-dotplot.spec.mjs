@@ -5,6 +5,7 @@
  * CSV, and "Score as signature".
  */
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -152,7 +153,7 @@ test('genes in sets, brackets, a not-found chip, display without reading, dendro
   const download = page.waitForEvent('download');
   await modal.getByRole('button', { name: /CSV/ }).click();
   const file = await download;
-  expect(file.suggestedFilename()).toBe('dot_plot.csv');
+  await expectDownloadNamed(file, 'dot_plot.csv');
   const text = await (await file.createReadStream()).toArray().then(chunks => Buffer.concat(chunks).toString('utf8'));
   const lines = text.trim().split('\n');
   expect(lines[0]).toBe('group,gene,gene_group,mean,fraction_expressing,n_cells,n_measured');

@@ -119,6 +119,34 @@ test('a browser without WebGL2 is told so, and no link setting is offered', asyn
   await expect(failure.getByRole('link', { name: 'Open Cellucid without this link' })).toHaveCount(0);
 });
 
+test('a browser whose graphics process hands back a lost context is told to reload, not shown a shader failure', async ({
+  page
+}) => {
+  // WebKit after a GPU reset gives every new context lost (WebKit bug
+  // 328185): the viewer's context is lost as it is made.
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.addInitScript(() => {
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (kind, ...rest) {
+      const context = getContext.call(this, kind, ...rest);
+      if (kind === 'webgl2' && context !== null && !context.isContextLost()) {
+        context.getExtension('WEBGL_lose_context').loseContext();
+      }
+      return context;
+    };
+  });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
+  const failure = page.locator('#cellucid-startup-failure');
+  await expect(failure).toBeVisible();
+  await expect(failure).toHaveAttribute('data-failure', 'graphics');
+  await expect(failure.locator('.welcome-title')).toHaveText('The browser\u2019s graphics stopped working');
+  await expect(failure).toContainText('Reload the page; if this happens again, restart the browser.');
+  await expect(failure).not.toContainText(/shader/i);
+  await expect(failure.getByRole('link', { name: 'Open Cellucid without this link' })).toHaveCount(0);
+  expect(errors.filter(message => /shader/i.test(message))).toEqual([]);
+});
+
 /**
  * Holds every startup step deadline (60 s, `STARTUP_STEP_DEADLINE_MS`) until
  * the test expires it. The deadline runs on an ordinary timer, so only a timer

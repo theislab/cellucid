@@ -11,6 +11,7 @@
  * value of a cell.
  */
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import {
   CELL_TYPE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat, queueReplies,
   resultJson, waitForTurnEnd,
@@ -101,7 +102,7 @@ test.describe('agent: what a person does', () => {
 
     const download = page.waitForEvent('download');
     const asFile = await callTool(page, 'history_report', { file: 'My report.html' }, { asks: 'writes-file' });
-    expect((await download).suggestedFilename()).toBe('My report.html');
+    await expectDownloadNamed(await download, 'My report.html');
     expect(resultJson(asFile.text)).toMatchObject({ as: 'file', file: 'My report.html', html: null, steps: tour.steps });
 
     const declined = await callTool(page, 'history_report', {}, { asks: 'writes-file', answer: 'deny' });
@@ -136,13 +137,13 @@ test.describe('agent: what a person does', () => {
 
     let download = page.waitForEvent('download');
     const cells = await callTool(page, 'cells_export', {}, { asks: 'writes-file' });
-    expect((await download).suggestedFilename()).toBe('Page_1_cells.csv');
+    await expectDownloadNamed(await download, 'Page_1_cells.csv');
     expect(resultJson(cells.text)).toMatchObject({ file: 'Page_1_cells.csv', format: 'csv', page: 'Page 1', cells: 10, renamed: [] });
 
     await setSummariesOnly(page, true);
     download = page.waitForEvent('download');
     const field = await callTool(page, 'field_export', { field: CELL_TYPE }, { asks: 'writes-file' });
-    expect((await download).suggestedFilename()).toBe('cell_type.csv');
+    await expectDownloadNamed(await download, 'cell_type.csv');
     const fieldResult = resultJson(field.text);
     expect(Object.keys(fieldResult).sort()).toEqual(['bytes', 'field', 'file', 'kind']);
     expect(fieldResult).toMatchObject({ field: 'cell_type', kind: 'categorical' });
@@ -151,9 +152,7 @@ test.describe('agent: what a person does', () => {
     const figure = await callTool(page, 'figure_export', {}, { asks: 'writes-file' });
     expect(figure.isError, figure.text).toBe(false);
     const written = resultJson(figure.text);
-    const name = (await download).suggestedFilename();
-    if (written.zip) expect(name).toMatch(/\.zip$/);
-    else expect(name).toBe(written.files[0].file);
+    await expectDownloadNamed(await download, written.zip ? /\.zip$/ : written.files[0].file);
     expect(written.files.length).toBeGreaterThan(0);
 
     const noPage = await callTool(page, 'cells_export', { page: 'Nowhere' }, { asks: 'writes-file' });

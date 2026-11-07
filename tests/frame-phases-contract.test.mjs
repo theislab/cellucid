@@ -104,11 +104,12 @@ test('without a running viewer each callback runs from a frame of its own, and a
 
 test('the viewer drains the phases around every frame, drawn or not', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  function renderSceneFrame() {'));
-  assert.match(render, /if \(isWebGLContextLostForAsyncCommit\(\)\) return;\n(\s*\/\/.*\n)*\s*drainBeforeFramePhase\(\);[\s\S]*nextFrameCause\(frameSize\)/);
+  const render = viewer.slice(viewer.indexOf('  function render(timestamp) {'), viewer.indexOf('  function renderSceneFrame() {'));
+  assert.match(render, /if \(isWebGLContextLostForAsyncCommit\(\)\) return;\n\s*ambientFramePacer\.frameStarted\(timestamp, timedFromLastFrame\);\n(\s*\/\/.*\n)*\s*drainBeforeFramePhase\(\);[\s\S]*nextFrameCause\(frameSize\)/);
   assert.match(render, /settleWindowElapsed\(\)\) \{[\s\S]*?drainAfterFramePhase\(\);\n\s*return;/);
   // Between them only the full-detail frame measurement (full-detail-frame-cost.js).
-  assert.match(render, /sceneMsaaTarget\.endFrameUnchanged\(\);\n\s*\}\n(\s*\/\/.*\n)*\s*if \(!sceneDrawn\) fullDetailFrameCost\.frameEnded\(false\);\n\s*\}\n\s*if \(sceneDrawn && fullDetailFrameCost\.isArmed\(\)\) \{\n[^}]*\}\n(\s*\/\/.*\n)*\s*drainAfterFramePhase\(\);/);
+  // and the fence the ambient pacer reads (ambient-frame-pacing.js).
+  assert.match(render, /sceneMsaaTarget\.endFrameUnchanged\(\);\n\s*\}\n(\s*\/\/.*\n)*\s*if \(!sceneDrawn\) fullDetailFrameCost\.frameEnded\(false\);\n\s*\}\n(\s*\/\/.*\n)*\s*if \(sceneDrawn\) fenceDrawnFrame\(\);\n\s*if \(sceneDrawn && fullDetailFrameCost\.isArmed\(\)\) \{\n[^}]*\}\n(\s*\/\/.*\n)*\s*drainAfterFramePhase\(\);/);
   // The measured frame opens before its first command (the GPU timer's query).
   assert.match(render, /if \(fullDetailFrameCost\.isArmed\(\)\) fullDetailFrameCost\.frameStarted\(frameStartedAt\);\n\s*let sceneDrawn = false;\n\s*try \{\n\s*renderSceneFrame\(\);/);
   for (const site of ['start()', 'pause()', 'resume()']) {
@@ -170,27 +171,36 @@ test('a frame that changed no pixel skips the resolve', () => {
 });
 
 
-test('a frame the highlight pulse alone asks for waits for the ambient pacer', () => {
+test('a frame an ambient animation alone asks for waits for the ambient pacer', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  /** The frame-phase driver'));
-  // Not yet due: no draw and no animation frame; the pacer's timer re-arms.
-  assert.match(render, /if \(frameCause === AMBIENT_FRAME_CAUSE && !ambientFramePacer\.isDue\(now\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.wakeWhenDue\(ensureFrameScheduled\);\n\s*drainAfterFramePhase\(\);\n\s*return;/);
-  // Every drawn frame is measured.
-  assert.match(render, /ambientFramePacer\.frameDrawn\(frameStartedAt\);\n(\s*\/\/.*\n)*\s*if \(fullDetailFrameCost\.isArmed\(\)\) fullDetailFrameCost\.frameStarted\(frameStartedAt\);\n\s*let sceneDrawn = false;\n\s*try \{\n\s*renderSceneFrame\(\);/);
-  // The pulse is the last cause named, so 'highlight' means nothing else asks.
+  const render = viewer.slice(viewer.indexOf('  function render(timestamp) {'), viewer.indexOf('  /** The frame-phase driver'));
+  // Every frame of the loop is timed from the one before, if that one armed it.
+  assert.match(render, /^  function render\(timestamp\) \{\n(\s*\/\/.*\n)*\s*const timedFromLastFrame = animationHandle !== null && animationHandle === frameArmedByLastFrame;\n\s*frameArmedByLastFrame = null;\n\s*animationHandle = null;/);
+  assert.match(render, /if \(isWebGLContextLostForAsyncCommit\(\)\) return;\n\s*ambientFramePacer\.frameStarted\(timestamp, timedFromLastFrame\);/);
+  // Not yet due: no draw. Held by the GPU rule alone, the next animation
+  // frame runs undrawn and is timed; otherwise no animation frame, and the
+  // pacer's timer re-arms.
+  assert.match(render, /const ambientFrame = AMBIENT_FRAME_CAUSES\.has\(frameCause\);\n\s*if \(ambientFrame && !ambientFramePacer\.isDue\(now\)\) \{\n\s*if \(ambientFramePacer\.watchesNextFrame\(now\)\) \{\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);\n\s*frameArmedByLastFrame = animationHandle;\n\s*\} else \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.wakeWhenDue\(ensureFrameScheduled\);\n\s*\}\n\s*drainAfterFramePhase\(\);\n\s*return;/);
+  // Every drawn frame is measured, and says whether it was an ambient one.
+  assert.match(render, /ambientFramePacer\.frameDrawn\(frameStartedAt, ambientFrame\);\n(\s*\/\/.*\n)*\s*if \(fullDetailFrameCost\.isArmed\(\)\) fullDetailFrameCost\.frameStarted\(frameStartedAt\);\n\s*let sceneDrawn = false;\n\s*try \{\n\s*renderSceneFrame\(\);/);
+  // The animations that never end are the last causes named, so one of them
+  // means nothing else asks; an overlay's frames that converge come first.
   const causes = viewer.slice(viewer.indexOf('  function sceneAnimationCause() {'), viewer.indexOf('  function nextFrameCause('));
-  assert.match(causes, /return AMBIENT_FRAME_CAUSE;\n\s*return null;\n\s*\}/);
-  assert.match(viewer, /^const AMBIENT_FRAME_CAUSE = 'highlight';$/m);
+  assert.match(causes, /if \(overlayManager\?\.needsOwedFrames\(\) === true\) return 'overlay';\n\s*if \(projectileSystem\.isAnimating\(\)\) return 'projectile';\n\s*if \(presentedCameraSettlement\.isPending\(\)\) return 'camera-settlement';\n\s*if \(lodConvergingInLastFrame\) return 'lod';\n(\s*\/\/.*\n)*\s*const backdropMotionCause = backdropLooks\.motionCause\(\);\n\s*if \(backdropMotionCause !== null\) return backdropMotionCause;\n\s*if \(renderMode === 'smoke' && smokeRenderer\.needsContinuousFrames\(\)\) return 'smoke';\n\s*if \(overlayManager\?\.needsContinuousFrames\(\) === true\) return 'overlay-flow';\n\s*if \(highlightTools !== null && highlightTools\.isHighlightAnimating\(\)\) return 'highlight';\n\s*return null;\n\s*\}/);
+  assert.match(viewer, /^const AMBIENT_FRAME_CAUSES = Object\.freeze\(new Set\(\[\n  'backdrop-motion',\n  'smoke',\n  'overlay-flow',\n  'highlight',\n\]\)\);$/m);
+  // The pacer reads the GPU through the fence after the last drawn frame.
+  assert.match(viewer, /createAmbientFramePacer\(\{ gpuBusy: drawnFrameOnGpu \}\)/);
 });
 
 
 test('the frame loop stops once the scene has settled and starts again on demand', () => {
   const viewer = readFileSync(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
-  const render = viewer.slice(viewer.indexOf('  function render() {'), viewer.indexOf('  /** The frame-phase driver'));
-  // The callback consumes its arming; only a drawn frame re-arms.
-  assert.match(render, /^  function render\(\) \{\n(\s*\/\/.*\n)*\s*animationHandle = null;/);
+  const render = viewer.slice(viewer.indexOf('  function render(timestamp) {'), viewer.indexOf('  /** The frame-phase driver'));
+  // The callback consumes its arming; only a drawn frame re-arms (or one
+  // the ambient pacer has timed, above).
+  assert.match(render, /^  function render\(timestamp\) \{\n(\s*\/\/.*\n)*(\s*const timedFromLastFrame = .*\n\s*frameArmedByLastFrame = null;\n)\s*animationHandle = null;/);
   assert.doesNotMatch(render, /animationHandle = requestAnimationFrame\(render\)/);
-  assert.match(render, /\}\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);\n\s*frameInvalidated = false;\n\s*framesDrawnSinceCause \+= 1;/);
+  assert.match(render, /\}\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);\n\s*frameArmedByLastFrame = animationHandle;\n\s*frameInvalidated = false;\n\s*framesDrawnSinceCause \+= 1;/);
   // The settled branch returns without arming, and leaves no pulse wake to
   // arm it later.
   assert.match(render, /settleWindowElapsed\(\)\) \{\n(\s*\/\/.*\n)*\s*ambientFramePacer\.cancelWake\(\);\n\s*lastFrameTime = now;\n\s*drainAfterFramePhase\(\);\n\s*return;/);

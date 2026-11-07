@@ -161,7 +161,7 @@ test('no summary in the app contains an interactive element, in any panel state'
   await page.locator('#analysis-header-genesPanel').click();
   await page
     .locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
-    .click({ force: true });
+    .click();
   const analysisWindow = page.locator(
     '#floating-panels-root > .accordion-panel.analysis-window-frame',
   );

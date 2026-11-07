@@ -79,7 +79,7 @@ const ALLOWED_SHORT = Object.freeze([
   {
     file: 'helpers/control-walk.mjs',
     line: 'const ACTION_TIMEOUT_MS = 5_000;',
-    reason: 'The control walk tells a covered control from an open one by a click that does not land in five seconds, and then presses it from the keyboard. A known guess at the machine\'s speed, left for the walk\'s own rework: it is not in the push matrix.',
+    reason: 'The least an action of the control walk waits (`actionTimeout`): it waits `ACTION_FRAMES` of the page\'s frames, as slowly as its last settle measured them, so a slower renderer is given longer; a click that does not land in that time is a covered control, pressed from the keyboard.',
   },
   {
     file: 'notebook-widget-jupyterlab.spec.mjs',

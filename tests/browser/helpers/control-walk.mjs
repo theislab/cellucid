@@ -50,12 +50,19 @@
  * showing the 3D embedding; with camera path keyframes. A control walked in
  * an earlier scene is not walked again. The walk is split into parts, a
  * test each (`PARTS`: a section of the sidebar each, then everything outside
- * them), spread over the spec files so `--shard` over them runs them side
- * by side; one part is walked alone with `--grep "<section id>"`. Another
+ * them), spread over the spec files, a share each. Playwright shards by test
+ * count, so in a shard of the whole suite these few long tests would fall
+ * together: CI runs the walk in a job of its own, a share a job
+ * (`CELLUCID_CONTROL_WALK=only` and `--shard=<k>/<n>`, a file each; the
+ * browser job's shards set it `apart`: `playwright.config.mjs`,
+ * `.github/workflows/test.yml`). One part is walked alone with
+ * `--grep "<section id>"`. Another
  * test walks the Visualization section of a dataset with neighbour graphs
- * and vector fields (their controls show only there). Each control has a budget (`CONTROL_BUDGET_MS`); the report
- * lists every control and what it did, a line each as it is walked, then
- * where the time went (by section and by phase).
+ * and vector fields (their controls show only there). A control is judged by
+ * what it does, never by how long it takes: the walk is bounded by its
+ * progress (`untilHung`, `keepPartAlive`). The report lists every control and
+ * what it did, a line each as it is walked, then where the time went (by
+ * section, the slowest controls, by phase).
  */
 
 import fs from 'node:fs';
@@ -83,14 +90,36 @@ function sectionOf(control) {
   return SECTIONS.find(id => control.places.includes(id)) ?? OUTSIDE_SECTIONS;
 }
 
-/** The time one control may take: showing it, operating it, the checks and putting the state back. */
-const CONTROL_BUDGET_MS = 20_000;
-/** Budgets an over-budget control's work is waited for before the part ends (`withBudget`). */
-const BUDGET_GRACE = 5;
-/** The time one part of the walk may take (the largest, the Analysis section, takes about 10 minutes here). */
-const PART_TIMEOUT_MS = 30 * 60_000;
-/** How long one Playwright action on a control may wait for it. */
+/*
+ * Time. The walk asserts what a control does (one step per change, exact
+ * undo), never how fast it does it: a control that ends, however slowly, is
+ * judged like any other, and its time is in the report (each control's line
+ * in `control-walk.json`, the slowest in the time report). Most of a
+ * control's time is the page's own frames (`settle` waits for frames to agree,
+ * a Playwright action for its element to stand still), so it follows the
+ * renderer: under the CI runners' software GL a frame with the velocity
+ * overlay flowing or smoke animating took about half a second, and each such
+ * control 15 to 25 s where a GPU takes under one (Web contracts runs
+ * 42334173086 and 42334181105, against a fixed budget of 20 s a control).
+ *
+ * What bounds the walk is progress, measured on the page it walks: a wait of
+ * the walk (`timed`) that has not ended after `HANG_FACTOR` times the slowest
+ * wait this part has seen end, and at least `HANG_FLOOR_MS`, is a hang
+ * (`untilHung`): the control is named and the part ends, since its page is no
+ * longer the one the next control expects. The part's test timeout moves
+ * with each wait that ends (`keepPartAlive`), so a part takes as long as its
+ * controls do. A Playwright action waits for its element for
+ * `ACTION_FRAMES` of the page's frames, as slowly as the last settle measured
+ * them, and at least `ACTION_TIMEOUT_MS` (`actionTimeout`).
+ */
+/** The least time a wait of the walk is left before it is a hang (`untilHung`). */
+const HANG_FLOOR_MS = 120_000;
+/** A wait is a hang after this many times the slowest wait the part has seen end. */
+const HANG_FACTOR = 10;
+/** The least time one Playwright action on a control may wait for it. */
 const ACTION_TIMEOUT_MS = 5_000;
+/** The page's frames one Playwright action may wait for (actionability: stable over frames, retried hit tests). */
+const ACTION_FRAMES = 20;
 /**
  * How deep the walk follows what a control opens: a menu (1), a dialog it
  * opens (2), a control of that dialog (3). Deeper surfaces of this app are
@@ -100,16 +129,63 @@ const MAX_DEPTH = 3;
 
 /** Where the walk's time goes, by phase: phase → {ms, count}; printed with the report. */
 const PHASES = new Map();
-async function timed(phase, task) {
+/**
+ * The walk's progress (`timed`, read by `untilHung` and `keepPartAlive`): when
+ * a wait last ended, the slowest wait seen to end, and the slowest frame the
+ * last settle waited for (ms).
+ */
+const PROGRESS = { lastAt: 0, slowestMs: 0, frameMs: 0, onProgress: null };
+/**
+ * Time a wait of the walk (`phase`), and count its end as progress. A phase
+ * that holds other timed waits (`inclusive`) is reported, but is not a wait
+ * of its own: its length is the sum of theirs.
+ */
+async function timed(phase, task, { inclusive = false } = {}) {
   const start = performance.now();
   try {
     return await task();
   } finally {
+    const end = performance.now();
     const entry = PHASES.get(phase) ?? { ms: 0, count: 0 };
-    entry.ms += performance.now() - start;
+    entry.ms += end - start;
     entry.count += 1;
     PHASES.set(phase, entry);
+    if (!inclusive) PROGRESS.slowestMs = Math.max(PROGRESS.slowestMs, end - start);
+    PROGRESS.lastAt = end;
+    PROGRESS.onProgress?.();
   }
+}
+
+/** How long a wait of the walk may go on before it is a hang. */
+function hangAfterMs() {
+  return Math.max(HANG_FLOOR_MS, HANG_FACTOR * PROGRESS.slowestMs);
+}
+
+/** How long one Playwright action may wait for its element, at the page's measured frame rate. */
+function actionTimeout() {
+  return Math.max(ACTION_TIMEOUT_MS, Math.ceil(ACTION_FRAMES * PROGRESS.frameMs));
+}
+
+/**
+ * Keep the running test's timeout (`testInfo`) a hang's allowance and as
+ * much again ahead of the walk's last progress, so the walk's own bound
+ * (`untilHung`) names a hung control before the test times out, and a part
+ * that keeps making progress never does.
+ */
+function keepPartAlive(testInfo) {
+  // A test's progress is its own (the tests of a worker share the module).
+  Object.assign(PROGRESS, { lastAt: performance.now(), slowestMs: 0, frameMs: 0 });
+  let extendedAt = PROGRESS.lastAt;
+  let headroom = 2 * hangAfterMs();
+  testInfo.setTimeout(headroom);
+  PROGRESS.onProgress = () => {
+    const now = performance.now();
+    const next = 2 * hangAfterMs();
+    if (now - extendedAt < 1_000 && next === headroom) return;
+    testInfo.setTimeout(Math.ceil(testInfo.timeout + (now - extendedAt) + (next - headroom)));
+    extendedAt = now;
+    headroom = next;
+  };
 }
 
 /**
@@ -284,6 +360,10 @@ async function installWalker(page) {
         name: nameOf(element) || element.id,
         places: placesOf(element),
         enabled: enabled(element),
+        // The control just operated (`mark`), whatever it is called now: a
+        // control that renames itself as it answers ("Copy" -> "Copied", back
+        // a moment later) is not a control it opened.
+        walked: element.hasAttribute('data-walk-target'),
       }));
     }
 
@@ -350,6 +430,8 @@ async function installWalker(page) {
     async function settle() {
       let last = null;
       let agreed = 0;
+      // The slowest frame waited for: how fast the page draws now (the walk's `actionTimeout`).
+      let frameMs = 0;
       window.__walk.stats.settles += 1;
       for (let round = 0; round < 600; round++) {
         window.__walk.stats.rounds += 1;
@@ -359,8 +441,11 @@ async function installWalker(page) {
         window.__walk.stats.idleMs += performance.now() - start;
         start = performance.now();
         await frame();
+        const between = performance.now();
         await frame();
-        window.__walk.stats.framesMs += performance.now() - start;
+        const framed = performance.now();
+        frameMs = Math.max(frameMs, between - start, framed - between);
+        window.__walk.stats.framesMs += framed - start;
         start = performance.now();
         const now = await facts();
         window.__walk.stats.factsMs += performance.now() - start;
@@ -369,7 +454,7 @@ async function installWalker(page) {
           || document.querySelector('[aria-busy="true"]') !== null;
         const key = JSON.stringify([now.fingerprint.digest, now.tree, now.shown]);
         agreed = !moving && key === last ? agreed + 1 : 0;
-        if (agreed >= 2) return now;
+        if (agreed >= 2) return { ...now, frameMs };
         last = key;
       }
       throw new Error('the state never settled');
@@ -536,7 +621,7 @@ function otherGene(page) {
 /** Operate a marked control the way its role is operated; says what was done. */
 async function operate(page, control) {
   const target = page.locator('[data-walk-target]');
-  const options = { timeout: ACTION_TIMEOUT_MS };
+  const options = { timeout: actionTimeout() };
   switch (control.role) {
     case 'canvas': {
       const box = await target.boundingBox();
@@ -626,14 +711,14 @@ async function operate(page, control) {
  */
 async function press(page, target) {
   try {
-    await target.click({ timeout: ACTION_TIMEOUT_MS });
+    await target.click({ timeout: actionTimeout() });
     return 'clicked';
   } catch (error) {
     const cover = String(error?.message ?? '').split('\n').find(line => /intercepts pointer events/.test(line));
     if (cover === undefined) throw error;
     const what = cover.trim().replace(/\s+intercepts pointer events$/, '').slice(0, 160);
     COVERED.push(what);
-    await target.focus({ timeout: ACTION_TIMEOUT_MS });
+    await target.focus({ timeout: actionTimeout() });
     await page.keyboard.press('Enter');
     return `pressed Enter on it (covered by ${what})`;
   }
@@ -669,7 +754,7 @@ function controlValue(page, control) {
  */
 async function undoOperation(page, control, memo) {
   const target = page.locator('[data-walk-target]');
-  const options = { timeout: ACTION_TIMEOUT_MS };
+  const options = { timeout: actionTimeout() };
   switch (control.role) {
     case 'canvas':
       return;
@@ -730,31 +815,31 @@ async function closeTransient(page, scene) {
 }
 
 /**
- * Run one control's walk within `ms`. Over budget, its work is still under
- * way, and is waited for before the walk goes on: left running beside the
- * next control, it would operate, restore and close on that control's page,
- * and write this control's line late (a "failed" turned "no change" after
- * the report printed it). A walk still running `BUDGET_GRACE` budgets on
- * ends the part: the page is no longer the one the next control expects.
+ * Run one control's walk (`task`) for as long as it makes progress: until it
+ * ends, however long that takes, unless one of its waits stalls, no wait of
+ * the walk having ended for `hangAfterMs()` (`HANG_FACTOR` times the slowest
+ * wait the part has seen end, at least `HANG_FLOOR_MS`). A stalled walk ends
+ * the part, naming the control: left running beside the next control, its
+ * work would operate, restore and close on that control's page.
  */
-async function withBudget(task, ms, what) {
+async function untilHung(task, what) {
+  PROGRESS.lastAt = performance.now();
   let timer;
-  let over = false;
+  const stalled = new Promise(resolve => {
+    const check = () => {
+      const quiet = performance.now() - PROGRESS.lastAt;
+      const allowed = hangAfterMs();
+      if (quiet >= allowed) resolve(quiet);
+      else timer = setTimeout(check, allowed - quiet + 1);
+    };
+    timer = setTimeout(check, hangAfterMs());
+  });
   const work = task();
-  const budget = new Promise(resolve => { timer = setTimeout(() => { over = true; resolve(); }, ms); });
-  await Promise.race([work.then(() => {}, () => {}), budget]);
+  const quiet = await Promise.race([work.then(() => null, () => null), stalled]);
   clearTimeout(timer);
-  if (!over) return work;
-  let grace;
-  const ended = await Promise.race([
-    work.then(() => 'ended', () => 'ended'),
-    new Promise(resolve => { grace = setTimeout(() => resolve('running'), BUDGET_GRACE * ms); }),
-  ]);
-  clearTimeout(grace);
-  if (ended === 'running') {
-    throw Object.assign(new Error(`${what} was still under way ${BUDGET_GRACE + 1} budgets after it began; the walk cannot go on beside it`), { fatal: true });
-  }
-  throw new Error(`${what} took longer than its budget of ${ms / 1000} s`);
+  if (quiet === null) return work;
+  const seconds = ms => `${(ms / 1000).toFixed(1)} s`;
+  throw Object.assign(new Error(`${what} made no progress for ${seconds(quiet)} (no wait of its walk ended; the slowest wait seen to end took ${seconds(PROGRESS.slowestMs)}): the walk cannot go on beside it`), { fatal: true });
 }
 
 /**
@@ -783,7 +868,11 @@ async function scrollGraphTo(page, id, key) {
 const mark = async (page, key) => (await timed('mark', () => page.evaluate(name => window.__walk.mark(name), key))) === 'marked';
 /** Why a control could not be marked: 'not shown' or 'disabled' ('marked' when it could). */
 const markState = (page, key) => page.evaluate(name => window.__walk.mark(name), key);
-const settle = page => timed('settle', () => page.evaluate(() => window.__walk.settle()));
+const settle = page => timed('settle', async () => {
+  const facts = await page.evaluate(() => window.__walk.settle());
+  PROGRESS.frameMs = facts.frameMs;
+  return facts;
+});
 const discover = page => timed('discover', () => page.evaluate(() => window.__walk.discover()));
 
 /**
@@ -871,13 +960,17 @@ function createWalk(page) {
     if (errors.length > errorsBefore) problems.push(`page errors: ${errors.slice(errorsBefore).join(' | ').slice(0, 400)}`);
     const changed = differing(before.fingerprint, after.fingerprint);
     const newSteps = after.tree.ids.filter(id => !before.tree.ids.includes(id));
-    // Steps taken out with the new one (a squash), or a new step on another branch that does not
-    // follow the step shown (Clear history keeping the state starts one from the opening), are an
-    // edit of the history, judged as a history control, not a step made. A change made after going
-    // back follows the step shown: a step, checked as every step is.
+    // Steps taken out with the new one (a squash), or new steps on another branch none of which
+    // follows the step shown, are an edit of the history, judged as a history control, not a step
+    // made: Clear history keeping the state starts one from the opening, and Branch without this
+    // step replays every step after the one left out on a branch from the step before it (as many
+    // steps as followed it on the way to the step shown: 11 on CI, where the walk met it on step 1,
+    // Web contracts run 42334181105; none on the last step). A change made after going back
+    // follows the step shown: a step, checked as every step is.
     const removedSteps = before.tree.ids.filter(id => !after.tree.ids.includes(id));
-    const otherBranch = after.tree.branch !== before.tree.branch && newSteps.length === 1
-      && (await page.evaluate(id => window.__walk.step(id), newSteps[0]))?.parent !== before.tree.head;
+    const newParents = after.tree.branch === before.tree.branch || newSteps.length === 0 ? []
+      : await page.evaluate(ids => ids.map(id => window.__walk.step(id)?.parent ?? null), newSteps);
+    const otherBranch = newParents.length > 0 && !newParents.includes(before.tree.head);
     const sameTrackers = after.tree.tracker === before.tree.tracker && after.tree.trackers.join() === before.tree.trackers.join();
     entry.detail = how;
     if (newSteps.length > 0 && sameTrackers && removedSteps.length === 0 && !otherBranch) {
@@ -900,7 +993,7 @@ function createWalk(page) {
       const what = !sameTrackers ? 'changed its trackers'
         : after.tree.ids.length < before.tree.ids.length ? 'lost a step'
           : removedSteps.length > 0 ? `replaced ${removedSteps.length} step(s) with ${newSteps.length}`
-            : otherBranch ? `shows branch ${after.tree.branch}`
+            : otherBranch ? `shows branch ${after.tree.branch} (${newSteps.length} new step${newSteps.length === 1 ? '' : 's'})`
             : after.tree.head !== before.tree.head ? `shows ${after.tree.head}`
               : after.tree.notes !== before.tree.notes ? 'changed its notes'
                 : after.tree.bookmarks !== before.tree.bookmarks ? 'changed its bookmarks'
@@ -948,8 +1041,8 @@ function createWalk(page) {
     // and a sibling is reached without operating them again.
     let home = scene;
     try {
-      await withBudget(async () => {
-        if (!await mark(page, control.key) && !await timed('reach (inclusive)', () => reach(control, path, scene))) {
+      await untilHung(async () => {
+        if (!await mark(page, control.key) && !await timed('reach (inclusive)', () => reach(control, path, scene), { inclusive: true })) {
           const state = await markState(page, control.key);
           if (path.length > 0) {
             // It was shown once (a draft of the panel that opened it, which the
@@ -995,6 +1088,18 @@ function createWalk(page) {
         const memo = await controlValue(page, control);
         const how = await timed('operate', () => operate(page, control));
         const after = await settle(page);
+        // A control that takes the pointer (Capture pointer, in Free-fly) has
+        // the browser lock it to the plot: every later click goes to the
+        // canvas, for a person until they press Escape. It is released as
+        // they would release it. Linux Chromium grants the lock to the click;
+        // macOS headless Chromium does not, so a walk there never met it, and
+        // on Linux the next control's click waited for the button to take it
+        // (Web contracts run 42334173086, `#pointer-lock-info-btn`).
+        if (await page.evaluate(() => document.pointerLockElement !== null)) {
+          external.push('the pointer captured');
+          await page.evaluate(() => document.exitPointerLock());
+          await page.waitForFunction(() => document.pointerLockElement === null);
+        }
         // What it opened, made or enabled (read before its step is undone).
         const opened = path.length < MAX_DEPTH ? await discover(page) : [];
         external.push(...BLOCKED.map(origin => `a request to ${origin} (outside the test servers, refused)`));
@@ -1005,7 +1110,7 @@ function createWalk(page) {
         if (entry.outcome !== 'history') {
           const inHistoryPanel = item => item.places.includes('state-section') && !control.places.includes('state-section')
             && control.key !== '#state-section';
-          children = opened.filter(item => item.enabled && !seen.has(item.key) && !visited.has(item.key) && !inHistoryPanel(item));
+          children = opened.filter(item => item.enabled && !item.walked && !seen.has(item.key) && !visited.has(item.key) && !inHistoryPanel(item));
         }
         // Its home is put back, unless it moved neither the state nor the history.
         const moved = after.fingerprint.digest !== before.fingerprint.digest || JSON.stringify(after.tree) !== JSON.stringify(before.tree);
@@ -1029,7 +1134,7 @@ function createWalk(page) {
         if (left.length > 0) {
           throw new Error(`the walk could not put ${left.join(', ')} back after this control (the history's load of where it began did not)`);
         }
-      }, CONTROL_BUDGET_MS, control.key);
+      }, control.key);
     } catch (error) {
       entry.outcome = 'failed';
       entry.detail = `${entry.detail ? `${entry.detail}: ` : ''}${errorWords(error)}`;
@@ -1135,7 +1240,13 @@ function turnedCamera(page, degrees) {
   }, degrees);
 }
 
-/** Where the walk's time went: by section, by phase, and the page's settling. */
+/** How many of the slowest controls the time report names. */
+const SLOWEST_SHOWN = 10;
+
+/**
+ * Where the walk's time went: by section, the slowest controls (slow is
+ * reported, never failed), by phase, and the page's settling.
+ */
 async function timeReport(page, report) {
   const seconds = ms => `${(ms / 1000).toFixed(1)} s`;
   const bySection = new Map();
@@ -1150,6 +1261,9 @@ async function timeReport(page, report) {
   return [
     'Time by section:',
     ...[...bySection].sort((a, b) => b[1].ms - a[1].ms).map(([section, { ms, count }]) => `  ${section}: ${seconds(ms)} (${count} controls)`),
+    'Slowest controls:',
+    ...report.filter(entry => entry.ms !== undefined).sort((a, b) => b.ms - a.ms).slice(0, SLOWEST_SHOWN)
+      .map(entry => `  ${seconds(entry.ms)} ${entry.scene} ${entry.key}`),
     'Time by phase:',
     ...[...PHASES].sort((a, b) => b[1].ms - a[1].ms).map(([phase, { ms, count }]) => `  ${phase}: ${seconds(ms)} (${count} calls)`),
     stats === null ? '' : `Page settling: ${stats.settles} settles, ${stats.rounds} rounds; idle ${seconds(stats.idleMs)}, frames ${seconds(stats.framesMs)}, facts ${seconds(stats.factsMs)}`,
@@ -1165,7 +1279,7 @@ function line(entry) {
 function declarePartTest(test, part) {
   const where = part === OUTSIDE_SECTIONS ? 'outside the sidebar sections' : `of ${part}`;
   test(`every control ${where} that changes state makes exactly one step, and undo puts the state back exactly`, async ({ page }, testInfo) => {
-    test.setTimeout(PART_TIMEOUT_MS);
+    keepPartAlive(testInfo);
     await openFixture(page);
     await takeSteps(page, [
       ['color.by', { field: { source: 'obs', key: 'cell_type' } }],
@@ -1228,6 +1342,7 @@ function declarePartTest(test, part) {
       if (COVERED.length > 0) console.log(`Covered when clicked (pressed from the keyboard):\n${[...new Set(COVERED)].join('\n')}`);
       console.log(await timeReport(page, walk.report));
       await testInfo.attach('control-walk.json', { body: JSON.stringify(report, null, 1), contentType: 'application/json' });
+      PROGRESS.onProgress = null;
     }
 
     expect(walk.report.length, `the page shows controls ${where}`).toBeGreaterThan(0);
@@ -1245,7 +1360,7 @@ function declarePartTest(test, part) {
  */
 function declareGraphAndVectorsTest(test) {
   test('a neighbour graph\'s and a vector field\'s controls make one undoable step each', async ({ page }, testInfo) => {
-    test.setTimeout(PART_TIMEOUT_MS);
+    keepPartAlive(testInfo);
     await openFixture(page);
     await chooseFiles(page.locator('#user-data-file-input'), GRAPH_AND_VECTORS);
     await waitForDatasetReady(page, 300);
@@ -1260,6 +1375,7 @@ function declareGraphAndVectorsTest(test) {
     } finally {
       console.log(await timeReport(page, walk.report));
       await testInfo.attach('control-walk-graph-vectors.json', { body: JSON.stringify(walk.report, null, 1), contentType: 'application/json' });
+      PROGRESS.onProgress = null;
     }
     const settings = (await page.evaluate(() => window.__walk.settings()))
       .filter(setting => /^(toggle-connectivity|connectivity-|velocity-)/.test(setting.id));
@@ -1278,7 +1394,8 @@ const WALK_TESTS = [...PARTS.map(part => test => declarePartTest(test, part)), d
  * Declare the share of the walk's tests that the spec file `specUrl` holds:
  * `control-walk-<k>-of-<n>.spec.mjs` holds every n-th test from the k-th
  * (`WALK_TESTS`), so the n files hold each test exactly once and `--shard`
- * (which splits a run by file) runs them side by side. The n files must all
+ * over the walk alone (`CELLUCID_CONTROL_WALK=only`, CI's `control-walk`
+ * job) runs them side by side, a file a shard. The n files must all
  * be there, and no others, or no test is declared. The walk runs on Chromium
  * only.
  *

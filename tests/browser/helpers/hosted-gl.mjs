@@ -24,6 +24,8 @@
  *   differ (`pixelParityVerdict`, `lod-rank-order-resize`,
  *   `segmented-point-stores`). The bound still fails on what moves whole
  *   points: a wrong order, colour or camera, cells missing or drawn twice.
+ *   A context the browser restores holds every store and texture in a new
+ *   GPU object (`graphics-context-restore`), and is compared so too.
  *   It cannot show a difference of fewer pixels than that which only this
  *   renderer would draw; the submissions above are what stands against one.
  * - The figure export's point pass drawn in a worker and on the page is not

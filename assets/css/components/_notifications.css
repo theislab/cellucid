@@ -75,6 +75,16 @@
 .notification-exit {
   transform: translateX(100%) translateZ(0);
   opacity: 0;
+  /* It has left: a press on it reaches what is behind it. */
+  pointer-events: none;
+}
+
+/* The place of a card that has left, kept while the pointer is over the
+   stack so the cards above it do not move under the pointer
+   (notification-center.js `_holdStackUnderPointer`). */
+.notification-spacer {
+  flex: none;
+  max-inline-size: 100%;
 }
 
 /* Notification icon */

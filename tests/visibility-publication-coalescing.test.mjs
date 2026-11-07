@@ -86,6 +86,10 @@ function makePublicationHarness(viewId) {
       return DataStateColorMethods.prototype
         ._writeCategoryColors.call(this, field, writeTransparency);
     },
+    // A continuous field's columns are checked before the active field
+    // changes (a column with nothing to draw is refused there); the check
+    // publishes nothing.
+    ensureContinuousMetadata() {},
     updateColorsContinuous(_field, options) {
       // Coloring never writes visibility: computeGlobalVisibility owns it.
       assert.equal(options, undefined);

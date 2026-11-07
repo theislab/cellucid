@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.cellucid/cellucid",
+  "title": "Cellucid",
+  "description": "Explore single-cell data in your open Cellucid tab: color, filter, compare and export views.",
+  "version": "0.9.7",
+  "websiteUrl": "https://www.cellucid.com/",
+  "repository": {
+    "url": "https://github.com/theislab/cellucid",
+    "source": "github",
+    "subfolder": "relay"
+  },
+  "icons": [
+    {
+      "src": "https://www.cellucid.com/assets/img/favicon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    },
+    {
+      "src": "https://www.cellucid.com/assets/img/android-chrome-512x512.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.cellucid.com"
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "cellucid-version-marker": "CELLUCID_VERSION"
+    }
+  }
+}

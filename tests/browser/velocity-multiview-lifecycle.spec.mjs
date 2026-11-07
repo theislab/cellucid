@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { isFirefoxSafeResolveReorderingWarning } from './helpers/engine-console.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -171,6 +172,7 @@ test(
     const productErrors = [];
     const browserDiagnostics = [];
     page.on('console', message => {
+      if (isFirefoxSafeResolveReorderingWarning(message)) return;
       if (
         message.type() === 'warning' &&
         /GL Driver Message .*GPU stall due to ReadPixels/.test(
@@ -223,8 +225,19 @@ test(
     await expectVelocityBuilt(page);
 
     await resetAudit(page);
-    // Two consecutive frames are the complete ping-pong ownership cycle.
-    await advanceFrames(page, 2);
+    // Two drawn overlay frames are the complete ping-pong ownership cycle.
+    // Flowing particles are an ambient animation, whose frames are paced to
+    // what frames cost the machine (`rendering/ambient-frame-pacing.js`): an
+    // animation frame need not draw one, so frames are accumulated until two
+    // have, never counted.
+    await expect.poll(async () => {
+      await advanceFrames(page, 1);
+      const records = await readAudit(page);
+      return Math.min(
+        records.filter(record => record.role === 'simulate').length,
+        records.filter(record => record.role === 'particles').length,
+      );
+    }).toBeGreaterThanOrEqual(2);
     const singleRecords = await readAudit(page);
     const singleSimulation = singleRecords.filter(
       record => record.role === 'simulate',
@@ -381,6 +394,7 @@ test(
   async ({ page }) => {
     const productErrors = [];
     page.on('console', message => {
+      if (isFirefoxSafeResolveReorderingWarning(message)) return;
       if (
         message.type() === 'warning' &&
         /GL Driver Message .*GPU stall due to ReadPixels/.test(
@@ -471,6 +485,7 @@ test(
   async ({ page }) => {
     const productErrors = [];
     page.on('console', message => {
+      if (isFirefoxSafeResolveReorderingWarning(message)) return;
       if (
         message.type() === 'warning' &&
         /GL Driver Message .*GPU stall due to ReadPixels/.test(

@@ -1,1 +1,0 @@
-import{a as s}from"./chunk.BLB2Q6XA.js";function i(e,t=globalThis){let o=typeof e?.message=="string"?e.message.trim():"";return o.length>0?o:t.navigator?.onLine===!1?"its code could not be loaded: this browser is offline":"its code could not be loaded"}s(i,"workerFailureReason");export{i as a};

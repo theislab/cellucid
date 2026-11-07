@@ -123,8 +123,11 @@ function isWebGL2Available() {
     const canvas = document.createElement('canvas');
     const gl = canvas.getContext('webgl2');
 
-    if (!gl) {
+    // A context lost as it is made (a browser whose graphics process was
+    // reset) draws nothing either.
+    if (!gl || gl.isContextLost()) {
       _webgl2Available = false;
+      gl?.getExtension('WEBGL_lose_context')?.loseContext();
       return false;
     }
 

@@ -812,6 +812,23 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     return swapOntoShare(share, stop);
   };
   /**
+   * Before a read of the genes of `element`: when it is the matrix read
+   * after its map and the open dataset holds the matrix rows of no open cell
+   * yet (the map's X has no entry: every gene would answer "not read" on
+   * every cell), the read waits for the pass the opening began
+   * (`ensureMatrixShare`, the share sized to this device; a progressive
+   * step's opening goes on with it) and reads from the reader it swaps onto
+   * (each handler takes `reader` after this). A gene asked for meanwhile is
+   * thus read with its values, never refused as having none. A modality's
+   * matrix is read with its map; `signal` stops this wait only, never the
+   * pass, which others share.
+   */
+  const awaitHeldGenes = async (element, signal) => {
+    while (matrixShare !== null && reader !== null && !String(element).startsWith('mod/') && reader.heldOpenCells() === 0) {
+      if (!(await ensureMatrixShare(null, { signal }))) return;
+    }
+  };
+  /**
    * The newest opening asked for: only it may become the open dataset. A
    * newer one stops it (its reads end), and one that completes all the same
    * (a read that did not stop) is closed, never kept.
@@ -1109,27 +1126,32 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     // column, cells}`), before the reply. `rows`: only open cells
     // `[start, end)` of each gene.
     getMatrixColumn: async ({ signal, partial }, element, index, owner = null, keys = null, progressive = false, rows = null) =>
-      withForm(await reader.getMatrixColumn(element, index, {
+      withForm(await awaitHeldGenes(element, signal).then(() => reader.getMatrixColumn(element, index, {
         signal,
         owner,
         keys,
         rows,
         onPartial: progressive ? (values, cells) => partial({ position: 0, column: partialColumn(values, cells), cells }) : null,
-      })),
+      }))),
     getMatrixColumns: async ({ signal, partial }, element, genes, owner = null, keys = null, progressive = false, rows = null) =>
-      (await reader.getMatrixColumns(element, genes, {
+      (await awaitHeldGenes(element, signal).then(() => reader.getMatrixColumns(element, genes, {
         signal,
         owner,
         keys,
         rows,
         onPartial: progressive ? (position, values, cells) => partial({ position, column: partialColumn(values, cells), cells }) : null,
-      })).map(withForm),
-    getMatrixColumnsSparse: ({ signal }, element, genes, owner = null) =>
-      reader.getMatrixColumnsSparse(element, genes, { signal, owner }),
+      }))).map(withForm),
+    getMatrixColumnsSparse: async ({ signal }, element, genes, owner = null) => {
+      await awaitHeldGenes(element, signal);
+      return reader.getMatrixColumnsSparse(element, genes, { signal, owner });
+    },
     // Rows of many cells, part by part (`{event: 'partial', id, first, count,
     // pointers, genes, values}`, each part's arrays transferred), then
     // `{cells, entries}`.
-    readMatrixRows: ({ signal, partial }, element, cells) => reader.readMatrixRows(element, cells, { signal, onPart: part => partial(part) }),
+    readMatrixRows: async ({ signal, partial }, element, cells) => {
+      await awaitHeldGenes(element, signal);
+      return reader.readMatrixRows(element, cells, { signal, onPart: part => partial(part) });
+    },
     matrixRowsCost: (_context, element, cells) => reader.matrixRowsCost(element, cells),
     // A copy of the whole dataset as a Cellucid-ready AnnData `.zarr.zip`
     // (`anndata/write/copy.js`), its bytes posted to the page in batches the
@@ -1191,8 +1213,10 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
         setWorkingSet(workingPart, 0);
       }
     },
-    getMatrixCellSubset: ({ signal }, element, cells, genes, owner = null, runGenes = null) =>
-      reader.getMatrixCellSubset(element, cells, genes, { signal, owner, runGenes }),
+    getMatrixCellSubset: async ({ signal }, element, cells, genes, owner = null, runGenes = null) => {
+      await awaitHeldGenes(element, signal);
+      return reader.getMatrixCellSubset(element, cells, genes, { signal, owner, runGenes });
+    },
     openRoute(_context, id, ports) {
       if (typeof id !== 'string' || id.length === 0 || routes.has(id)) {
         throw new TypeError(`A gene route needs a new id; '${String(id)}' is not one.`);
@@ -1220,6 +1244,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     async deliverColumns({ signal }, element, genes, owner, delivery) {
       requireColumnDelivery(delivery, genes.length);
       const route = requireRoute(delivery.route);
+      await awaitHeldGenes(element, signal);
       const columns = await reader.getMatrixColumnsSparse(element, genes, { signal, owner });
       const bytes = columns.map(column => column.indices.byteLength + column.values.byteLength);
       if (delivery.split === undefined) {
@@ -1244,6 +1269,7 @@ export function createAnnDataReaderHandler({ post = () => {} } = {}) {
     async deliverCellSubset({ signal }, element, cells, genes, owner, delivery, runGenes = null) {
       requireRunDelivery(delivery, genes.length);
       const route = requireRoute(delivery.route);
+      await awaitHeldGenes(element, signal);
       const block = await reader.getMatrixCellSubset(element, cells, genes, { signal, owner, runGenes });
       for (const run of delivery.runs) {
         deliverTo(route, run.worker, run.generation, {

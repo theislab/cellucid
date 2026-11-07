@@ -18,6 +18,7 @@ import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { workerScriptPattern } from './helpers/worker-scripts.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { lodLadder } from '../../assets/js/rendering/high-perf/draw-order.js';
 import { adaptiveMinimumLevel } from '../../assets/js/rendering/high-perf/lod-levels.js';
 
@@ -54,19 +55,6 @@ const PROCESS_INTENSIVE = Object.freeze({
 const SMOKE_WARMUP_FRAMES = 10;
 const SMOKE_MEASURE_FRAMES = 60;
 
-async function publishSyntheticDataset(page, pointCount, pattern) {
-  await page.locator('#benchmark-section > summary').click();
-  await expect(page.locator('#benchmark-section')).toHaveAttribute('open', '');
-  await page.locator('#benchmark-count').fill(String(pointCount));
-  await page.locator('#benchmark-pattern').selectOption(pattern);
-  await page.locator('#benchmark-run').click();
-  await expect
-    .poll(() => page.evaluate(() => window._cellucidState.pointCount), {
-      timeout: 120_000
-    })
-    .toBe(pointCount);
-}
-
 test('the harness observes LOD, culling and uploads under scripted motion', PROCESS_INTENSIVE, async ({
   page
 }, testInfo) => {
@@ -83,10 +71,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
 
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await expect(page.locator('#filter-count')).toHaveText(
-    'Showing all 120 cells'
-  );
-  await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
+  await loadSyntheticDataset(page, { pointCount: SMOKE_POINT_COUNT, pattern: 'atlas' });
 
   const outcome = await page.evaluate(
     async ({ moduleUrl, warmupFrames, measureFrames, adaptiveFloor, fullDetail }) => {
@@ -302,7 +287,7 @@ test('the view-count axis publishes real views, any number of them', PROCESS_INT
 
   await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await publishSyntheticDataset(page, SMOKE_POINT_COUNT, 'atlas');
+  await loadSyntheticDataset(page, { pointCount: SMOKE_POINT_COUNT, pattern: 'atlas' });
 
   const measured = await page.evaluate(
     async ({ moduleUrl }) => {

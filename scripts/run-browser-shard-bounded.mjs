@@ -173,7 +173,11 @@ function describeFailedProcess(result, operation) {
     : `${operation} failed with ${termination}:\n${output}`;
 }
 
-function listShard(project, shard, headed, environment) {
+/**
+ * Playwright's JSON listing of what `selection` (`--shard=k/n`, or the files
+ * of one batch) selects in `project`.
+ */
+function listTests(project, selection, headed, environment) {
   const result = spawnSync(
     process.execPath,
     [
@@ -182,8 +186,8 @@ function listShard(project, shard, headed, environment) {
       '--list',
       '--reporter=json',
       `--project=${project}`,
-      `--shard=${shard}`,
       ...(headed ? ['--headed'] : []),
+      ...selection,
     ],
     {
       cwd: REPOSITORY_ROOT,
@@ -205,12 +209,12 @@ function listShard(project, shard, headed, environment) {
   }
 }
 
-function collectSuiteSpecs(suites, specs) {
+function collectSuiteSpecs(suites, owner, specs) {
   for (const suite of suites ?? []) {
     for (const spec of suite.specs ?? []) {
-      specs.push(spec);
+      specs.push({ owner, spec });
     }
-    collectSuiteSpecs(suite.suites, specs);
+    collectSuiteSpecs(suite.suites, owner, specs);
   }
 }
 
@@ -234,6 +238,13 @@ function repositoryRelativeTestFile(testDirectory, file) {
  * `fullyParallel` is false, so files are the indivisible shard owners and can
  * be replayed independently without dropping or duplicating a test. Test count
  * is retained because file count alone does not bound browser-process lifetime.
+ *
+ * A test's file is the top-level suite of Playwright's JSON report, never the
+ * `file` of its spec: that is the source location of the `test()` call, which
+ * is a helper module when a spec file declares its tests through one
+ * (`control-walk-<k>-of-<n>.spec.mjs` through `helpers/control-walk.mjs`).
+ * Replaying that location as a file filter matches no test file, so Playwright
+ * runs the batch's other files and drops those tests without a failure.
  *
  * @param {object} report
  * @param {string} project
@@ -261,25 +272,35 @@ export function extractBoundedShardInventory(report, project) {
   }
 
   const listedSpecs = [];
-  collectSuiteSpecs(report.suites, listedSpecs);
+  for (const fileSuite of report.suites ?? []) {
+    if (
+      fileSuite === null ||
+      typeof fileSuite !== 'object' ||
+      typeof fileSuite.file !== 'string' ||
+      fileSuite.file === ''
+    ) {
+      throw new TypeError(
+        'Every top-level Playwright shard suite must name its test file.'
+      );
+    }
+    collectSuiteSpecs([fileSuite], fileSuite.file, listedSpecs);
+  }
   if (listedSpecs.length === 0) {
     throw new Error(`Playwright assigned no files to ${project} shard.`);
   }
 
   const inventoryByFile = new Map();
-  for (const spec of listedSpecs) {
+  for (const { owner, spec } of listedSpecs) {
     if (
       spec === null ||
       typeof spec !== 'object' ||
-      typeof spec.file !== 'string' ||
-      spec.file === '' ||
       !Array.isArray(spec.tags) ||
       spec.tags.some(tag => typeof tag !== 'string') ||
       !Array.isArray(spec.tests) ||
       spec.tests.length === 0
     ) {
       throw new TypeError(
-        'Every Playwright shard spec must publish string tags, a file, and at least one test.'
+        'Every Playwright shard spec must publish string tags and at least one test.'
       );
     }
     if (
@@ -293,10 +314,7 @@ export function extractBoundedShardInventory(report, project) {
         `Playwright shard discovery mixed projects inside ${project}.`
       );
     }
-    const file = repositoryRelativeTestFile(
-      projectConfig.testDir,
-      spec.file
-    );
+    const file = repositoryRelativeTestFile(projectConfig.testDir, owner);
     const previous = inventoryByFile.get(file) ?? {
       hostTerminal: false,
       intensive: false,
@@ -436,6 +454,43 @@ function assertBrowserShardLimits(limits) {
       'Browser shard limits must contain positive safe file, test, ordinary-process, and absolute-process bounds.',
     );
   }
+}
+
+/**
+ * Why the files a batch hands Playwright do not select exactly that batch's
+ * share of the shard inventory, or `null` when they do.
+ *
+ * A file argument is a filter, not a name: one that matches no test file
+ * selects nothing without an error while the batch's other files still run,
+ * and one that matches more files than its own runs tests twice. Either way the
+ * shard would report tests it never ran, or ran twice, as completed, so each
+ * batch's selection is listed and compared before the batch runs.
+ *
+ * @param {ReadonlyArray<Readonly<{ file: string, tests: number }>>} planned
+ * @param {ReadonlyArray<Readonly<{ file: string, tests: number }>>} listed
+ * @returns {string | null}
+ */
+export function describeBatchSelectionMismatch(planned, listed) {
+  const count = items => new Map(items.map(item => [item.file, item.tests]));
+  const plannedCounts = count(planned);
+  const listedCounts = count(listed);
+  const differences = [];
+  for (const [file, tests] of plannedCounts) {
+    const selected = listedCounts.get(file) ?? 0;
+    if (selected !== tests) {
+      differences.push(`${file}: planned ${tests} tests, selected ${selected}`);
+    }
+  }
+  for (const [file, tests] of listedCounts) {
+    if (!plannedCounts.has(file)) {
+      differences.push(`${file}: planned 0 tests, selected ${tests}`);
+    }
+  }
+  return differences.length === 0
+    ? null
+    : `The batch's file arguments do not select its planned tests:\n${
+      differences.map(line => `  - ${line}`).join('\n')
+    }`;
 }
 
 /**
@@ -799,7 +854,7 @@ export function runBoundedBrowserShard(
   { project, shard, headed },
   environment
 ) {
-  const report = listShard(project, shard, headed, environment);
+  const report = listTests(project, [`--shard=${shard}`], headed, environment);
   const inventory = extractBoundedShardInventory(report, project);
   const limits = resolveBrowserShardLimits(environment);
   const isolateProcessIntensiveFiles =
@@ -832,6 +887,14 @@ export function runBoundedBrowserShard(
         `${batch.testCount} tests]\n` +
         batch.files.map(file => `  ${file}`).join('\n'),
     );
+    const mismatch = describeBatchSelectionMismatch(
+      inventory.filter(item => batch.files.includes(item.file)),
+      extractBoundedShardInventory(
+        listTests(project, batch.files, headed, environment),
+        project,
+      ),
+    );
+    if (mismatch !== null) throw new Error(mismatch);
     const result = runBatch(
       project,
       batch.files,

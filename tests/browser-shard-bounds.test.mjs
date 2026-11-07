@@ -13,6 +13,7 @@ import {
   WINDOWS_MAX_BROWSER_PROCESSES_PER_SHARD,
   WINDOWS_MAX_FILES_PER_BROWSER_PROCESS,
   WINDOWS_MAX_TESTS_PER_BROWSER_PROCESS,
+  describeBatchSelectionMismatch,
   extractBoundedShardInventory,
   parseBoundedShardArguments,
   partitionBrowserShardInventory,
@@ -84,8 +85,8 @@ test('bounded browser shard arguments accept both CLI forms exactly once', () =>
 
 test('bounded shard discovery preserves a unique repository-local file inventory', () => {
   const testDirectory = fileURLToPath(new URL('./browser/', import.meta.url));
-  const absoluteAlpha = fileURLToPath(
-    new URL('./browser/alpha.spec.mjs', import.meta.url),
+  const absoluteGamma = fileURLToPath(
+    new URL('./browser/gamma.spec.mjs', import.meta.url),
   );
   const spec = (file, projectName = 'firefox', tags = []) => ({
     file,
@@ -97,16 +98,25 @@ test('bounded shard discovery preserves a unique repository-local file inventory
       projects: [{ name: 'firefox', testDir: testDirectory }],
     },
     errors: [],
+    // A file's suite names the file; a spec's own `file` is where its
+    // `test()` call stands, a helper module when the file declares its tests
+    // through one. Each test belongs to the file whose suite holds it.
     suites: [
       {
+        file: 'alpha.spec.mjs',
         specs: [spec(
           'alpha.spec.mjs',
           'firefox',
           [HOST_GPU_TERMINAL_REPORT_TAG],
         )],
-        suites: [{ specs: [spec(absoluteAlpha)], suites: [] }],
+        suites: [{ specs: [spec('helpers/declared.mjs')], suites: [] }],
       },
-      { specs: [spec('nested/beta.spec.mjs')], suites: [] },
+      {
+        file: 'nested/beta.spec.mjs',
+        specs: [spec('helpers/declared.mjs')],
+        suites: [],
+      },
+      { file: absoluteGamma, specs: [spec(absoluteGamma)], suites: [] },
     ],
   };
 
@@ -120,6 +130,12 @@ test('bounded shard discovery preserves a unique repository-local file inventory
     },
     {
       file: 'tests/browser/nested/beta.spec.mjs',
+      hostTerminal: false,
+      intensive: false,
+      tests: 1,
+    },
+    {
+      file: 'tests/browser/gamma.spec.mjs',
       hostTerminal: false,
       intensive: false,
       tests: 1,
@@ -138,19 +154,61 @@ test('bounded shard discovery preserves a unique repository-local file inventory
   assert.throws(
     () => extractBoundedShardInventory({
       ...report,
-      suites: [{ specs: [spec('alpha.spec.mjs', 'chromium')], suites: [] }],
+      suites: [{
+        file: 'alpha.spec.mjs',
+        specs: [spec('alpha.spec.mjs', 'chromium')],
+        suites: [],
+      }],
     }, 'firefox'),
     /mixed projects/,
   );
   assert.throws(
     () => extractBoundedShardInventory({
       ...report,
+      suites: [{ specs: [spec('alpha.spec.mjs')], suites: [] }],
+    }, 'firefox'),
+    /must name its test file/,
+  );
+  assert.throws(
+    () => extractBoundedShardInventory({
+      ...report,
       suites: [{
+        file: 'alpha.spec.mjs',
         specs: [{ ...spec('alpha.spec.mjs'), tags: [42] }],
         suites: [],
       }],
     }, 'firefox'),
     /publish string tags/,
+  );
+});
+
+test('a batch runs only when its file arguments select exactly its planned tests', () => {
+  const planned = [
+    inventoryItem('tests/browser/alpha.spec.mjs', 3),
+    inventoryItem('tests/browser/beta.spec.mjs', 2),
+  ];
+  assert.equal(describeBatchSelectionMismatch(planned, [...planned].reverse()), null);
+  // A file argument that matches no test file selects nothing, silently.
+  assert.equal(
+    describeBatchSelectionMismatch(planned, [planned[0]]),
+    "The batch's file arguments do not select its planned tests:\n" +
+      '  - tests/browser/beta.spec.mjs: planned 2 tests, selected 0',
+  );
+  // One that matches another file as well runs that file's tests too.
+  assert.equal(
+    describeBatchSelectionMismatch(planned, [
+      ...planned,
+      inventoryItem('tests/browser/alpha.spec.mjs.extra.spec.mjs', 1),
+    ]),
+    "The batch's file arguments do not select its planned tests:\n" +
+      '  - tests/browser/alpha.spec.mjs.extra.spec.mjs: planned 0 tests, selected 1',
+  );
+  assert.match(
+    describeBatchSelectionMismatch(planned, [
+      inventoryItem('tests/browser/alpha.spec.mjs', 4),
+      planned[1],
+    ]),
+    /alpha\.spec\.mjs: planned 3 tests, selected 4/,
   );
 });
 

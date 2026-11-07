@@ -25,7 +25,7 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { recordSubmissions } from './helpers/gl-submissions.mjs';
+import { labelProgramsBySource, recordSubmissions } from './helpers/gl-submissions.mjs';
 import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
 import { ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX } from './helpers/pixel-parity.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -44,6 +44,7 @@ for (const dimension of [3, 2]) {
       test.setTimeout(300_000);
       const pageErrors = [];
       page.on('pageerror', error => pageErrors.push(error.message));
+      await page.addInitScript(labelProgramsBySource);
       await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
       await dismissWelcome(page);
       // A dataset of the dimension asked for, so the live view shows it.
@@ -128,10 +129,17 @@ for (const dimension of [3, 2]) {
         const reducedLevel = 4;
         const capture = async camera => {
           viewer.setCameraState(camera);
+          // Full detail is the tree's last level, forced: with adaptive LOD
+          // on, no forced level (-1) is the level the camera distance picks,
+          // a reduced one (as `segmented-point-stores` found on hosted macOS
+          // Firefox, full-matrix run 42320991390).
+          const levels = renderer.spatialIndices.get(dimension).lodLevels;
+          const fullDetail = levels.length - 1;
+          if (levels[fullDetail].isFullDetail !== true) throw new Error('The tree\'s last level is not full detail.');
           const frames_ = {};
           for (const [name, cull, forced] of [
-            ['full detail', false, -1],
-            ['full detail, culled', true, -1],
+            ['full detail', false, fullDetail],
+            ['full detail, culled', true, fullDetail],
             ['reduced level', false, reducedLevel],
             ['reduced level, culled', true, reducedLevel],
           ]) {
@@ -227,6 +235,7 @@ for (const dimension of [3, 2]) {
       }, { dimension, from, to, largest: LARGEST, segmentPoints: SEGMENT_POINTS });
 
       expect(result.atOnce.level, 'a reduced level draws right after the Apply').toBe(4);
+      expect(result.frames['full detail'].inputs[0][0], 'full detail draws every cell').toBe(to);
       expect(result.cameras[1]).toEqual(result.cameras[0]);
       expect(result.segments[0]).toBe(Math.ceil(to / SEGMENT_POINTS));
       expect(result.segments[1]).toBe(result.segments[0]);

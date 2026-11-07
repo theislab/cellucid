@@ -323,7 +323,7 @@ test('a copied analysis window owns its own controls', async ({ page }) => {
 
   await page
     .locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
-    .click({ force: true });
+    .click();
   const floating = page.locator('#floating-panels-root .analysis-window-panel');
   await expect(floating).toHaveCount(1);
   await expect(floating.locator('select[name="groupBy"]')).toBeVisible();

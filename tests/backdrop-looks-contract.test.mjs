@@ -124,6 +124,11 @@ test('idle costs nothing: no animation frame, ambient motion capped and gated', 
   assert.match(renderer, /document\.visibilityState !== 'hidden'/);
   assert.match(renderer, /!prefersReducedMotion\(\)/);
   assert.match(renderer, /let ambientEnabled = false;/);
+  // A step of the motion asks for an ambient frame, which the viewer paces
+  // (ambient-frame-pacing.js), never for an invalidation drawn at once.
+  const tick = renderer.slice(renderer.indexOf('function tickAmbient()'), renderer.indexOf('function syncAmbient()'));
+  assert.match(tick, /motionOwed = true;\n\s*requestFrame\(\);/);
+  assert.doesNotMatch(tick, /invalidate\(\)/);
   // The viewer wakes for a look only through its fade, never for idle.
   const viewer = await read('assets/js/rendering/viewer.js');
   assert.match(viewer, /const backdropLookCause = backdropLooks\.frameCause\(\);/);

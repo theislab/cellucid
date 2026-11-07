@@ -56,7 +56,7 @@ async function openDataset(page) {
 /** Copy one analysis row into a window and wait for its lift to settle. */
 async function copyWindow(page, mode = 'simple') {
   const before = await page.locator(WINDOW).count();
-  await page.locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`).click({ force: true });
+  await page.locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`).click();
   await expect(page.locator(WINDOW)).toHaveCount(before + 1);
   const frame = page.locator(WINDOW).nth(before);
   await expectFloatingSettled(frame);

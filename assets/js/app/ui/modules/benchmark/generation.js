@@ -15,7 +15,7 @@ import {
 } from './generation-contract.js';
 import { benchmarkGenerationWorkerScript } from '../../../../../workers/scripts.js';
 import { startWorker } from '../../../../workers/worker-script.js';
-import { workerFailureReason } from '../../../../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript } from '../../../../workers/worker-failure.js';
 import { PieceReceiver } from '../../../../utils/large-arrays.js';
 import { cancelled, onAbort } from '../../../../utils/abort.js';
 
@@ -82,7 +82,7 @@ export function generateSyntheticDataOffThread(options = {}) {
   if (signal?.aborted) return Promise.reject(stopped());
 
   return new Promise((resolve, reject) => {
-    const worker = startWorker(benchmarkGenerationWorkerScript(), { type: 'module' });
+    const worker = noteWorkerScript(startWorker(benchmarkGenerationWorkerScript(), { type: 'module' }), benchmarkGenerationWorkerScript());
     let settled = false;
     let stopListening = () => {};
     const finish = (settle, value) => {
@@ -138,11 +138,13 @@ export function generateSyntheticDataOffThread(options = {}) {
       });
     });
     worker.addEventListener('error', event => {
+      // Ended at once; it fails saying why once that is found
+      // (`explainWorkerFailure`: for a script that did not load the
+      // browser says nothing).
+      const reason = explainWorkerFailure(worker, event);
       finish(
-        reject,
-        new Error(
-          `Synthetic generation worker failed: ${workerFailureReason(event)}`
-        )
+        failure => void reason.then(said => failure(new Error(`Synthetic generation worker failed: ${said}`))),
+        reject
       );
     });
     worker.addEventListener('messageerror', () => {

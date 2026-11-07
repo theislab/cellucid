@@ -6,9 +6,13 @@ import {
 } from '@playwright/test';
 
 import { installDevice } from './device.mjs';
+import { guardFirefoxAriaReflection } from './firefox-aria-reflection.mjs';
+import { watchDownloadNames } from './downloads.mjs';
+import { ignoreEmulatedFileChooserCancel } from './file-chooser-cancel.mjs';
 import { setAsideLeavingReports } from './leaving-document.mjs';
 import { expectNoOutsideRequests, watchOutsideRequests } from './outside-requests.mjs';
 import { expectNoSplitClicks, forgetSplitClicks, watchSplitClicks } from './split-clicks.mjs';
+import { annotateNonFinitePointerEvents, watchNonFinitePointerEvents } from './non-finite-pointer-events.mjs';
 
 export async function retirePageApplication(page) {
   if (page.isClosed()) return;
@@ -115,6 +119,47 @@ export async function closeContextWithApplicationRetirement(context) {
   }
 }
 
+/** Contexts watched already (`watchContextsLostAtCreation`). */
+const contextsWatchedForLoss = new WeakSet();
+
+/**
+ * Note every WebGL context a page of `context` is handed already lost. A
+ * browser whose graphics process was reset gives every later context lost
+ * (WebKit after a GPU reset on a hosted macOS runner: WebKit bug 328185, run
+ * 42274413675), and the test that asked for one then failed on a shader that
+ * does not compile, naming nothing of the cause. A failed test names it
+ * (`annotateContextsLostAtCreation`). Only what the browser itself handed
+ * back is noted: a spec that loses a context on purpose does so after.
+ */
+async function watchContextsLostAtCreation(context) {
+  // Once a context: the fixture meets a test's own context twice (through
+  // `browser.newContext` and as `context`), and a second wrapper of
+  // `getContext` would count every lost context twice.
+  if (contextsWatchedForLoss.has(context)) return;
+  contextsWatchedForLoss.add(context);
+  await context.addInitScript(() => {
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (kind, ...rest) {
+      const made = getContext.call(this, kind, ...rest);
+      if ((kind === 'webgl2' || kind === 'webgl') && made !== null && made.isContextLost()) {
+        window.__cellucidContextsLostAtCreation = (window.__cellucidContextsLostAtCreation ?? 0) + 1;
+      }
+      return made;
+    };
+  });
+}
+
+async function annotateContextsLostAtCreation(context, testInfo) {
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    const lost = await page.evaluate(() => window.__cellucidContextsLostAtCreation ?? 0).catch(() => 0);
+    if (lost === 0) continue;
+    const description = `${page.url()}: the browser handed ${lost} WebGL context(s) already lost: its graphics process was reset or stopped before this test drew (not this test's code; WebKit bug 328185)`;
+    testInfo.annotations.push({ type: 'webgl-lost-at-creation', description });
+    console.log(`[webgl-lost-at-creation] ${testInfo.title} -> ${description}`);
+  }
+}
+
 async function annotateStartupPhases(context, testInfo) {
   for (const page of context.pages()) {
     if (page.isClosed()) continue;
@@ -132,32 +177,39 @@ async function annotateStartupPhases(context, testInfo) {
  * origin-private file system, IndexedDB databases and local storage. From
  * an empty page of the origin (answered by a route, never by the server).
  * An engine that gives pages no Storage API keeps no origin-private file
- * system to remove: Playwright 1.62's Linux WebKit (r2336) has no
- * `navigator.storage` in any context, persistent ones included (Playwright's
+ * system to remove: Playwright's Linux WebKit had no `navigator.storage` in
+ * any context, persistent ones included, through 1.62 (r2336; Playwright's
  * own suite expects it, microsoft/playwright#18235).
+ *
+ * The empty page is the one the persistent context opened with, which no
+ * test uses (the `page` fixture opens its own), and it stays open until the
+ * context closes. It is not a page opened and closed here: on macOS WebKit,
+ * closing a page moments after it reached an http(s) address can end the
+ * browser process (the Screen Time observer of `-[WKWebView dealloc]`,
+ * `helpers/downloads.mjs`), and every test sharing that browser then fails
+ * with "Target page, context or browser has been closed".
  */
 async function clearOriginStorage(context, origin) {
-  const page = await context.newPage();
+  const [page] = context.pages();
+  if (page === undefined) throw new Error('The persistent context has no page of its own to clear storage from.');
   const address = new URL('/__clear-origin-storage__', origin).href;
-  try {
+  if (page.url() !== address) {
     await page.route(address, route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>storage</title>' }));
     await page.goto(address);
-    await page.evaluate(async () => {
-      if (navigator.storage !== undefined) {
-        const root = await navigator.storage.getDirectory();
-        for await (const name of root.keys()) await root.removeEntry(name, { recursive: true });
-      }
-      for (const { name } of await indexedDB.databases()) {
-        await new Promise(resolve => {
-          const request = indexedDB.deleteDatabase(name);
-          request.onsuccess = request.onerror = request.onblocked = () => resolve();
-        });
-      }
-      localStorage.clear();
-    });
-  } finally {
-    await page.close();
   }
+  await page.evaluate(async () => {
+    if (navigator.storage !== undefined) {
+      const root = await navigator.storage.getDirectory();
+      for await (const name of root.keys()) await root.removeEntry(name, { recursive: true });
+    }
+    for (const { name } of await indexedDB.databases()) {
+      await new Promise(resolve => {
+        const request = indexedDB.deleteDatabase(name);
+        request.onsuccess = request.onerror = request.onblocked = () => resolve();
+      });
+    }
+    localStorage.clear();
+  });
 }
 
 /**
@@ -211,10 +263,15 @@ export const test = playwrightTest.extend({
     const newContext = browser.newContext;
     browser.newContext = async function newContextOnDevice({ device: own, ...options } = {}) {
       const context = await newContext.call(this, options);
+      await guardFirefoxAriaReflection(context, browserName);
       await installDevice(context, own ?? device);
+      await ignoreEmulatedFileChooserCancel(context, browserName);
       setAsideLeavingReports(context);
       watchOutsideRequests(context);
       await watchSplitClicks(context);
+      await watchDownloadNames(context);
+      await watchContextsLostAtCreation(context);
+      await watchNonFinitePointerEvents(context);
       throttleCpu(context, browserName);
       return context;
     };
@@ -230,10 +287,15 @@ export const test = playwrightTest.extend({
   }, { auto: true }],
   context: async ({ context, browserName, persistentStorage, device, playwright }, use, testInfo) => {
     if (!persistentStorage || browserName !== 'webkit') {
+      await guardFirefoxAriaReflection(context, browserName);
       await installDevice(context, device);
+      await ignoreEmulatedFileChooserCancel(context, browserName);
       setAsideLeavingReports(context);
       watchOutsideRequests(context);
       await watchSplitClicks(context);
+      await watchDownloadNames(context);
+      await watchContextsLostAtCreation(context);
+      await watchNonFinitePointerEvents(context);
       await use(context);
       await expectNoOutsideRequests();
       return;
@@ -256,6 +318,9 @@ export const test = playwrightTest.extend({
       setAsideLeavingReports(persistent);
       watchOutsideRequests(persistent);
       await watchSplitClicks(persistent);
+      await watchDownloadNames(persistent);
+      await watchContextsLostAtCreation(persistent);
+      await watchNonFinitePointerEvents(persistent);
       throttleCpu(persistent, browserName);
       await use(persistent);
       await expectNoOutsideRequests();
@@ -294,6 +359,8 @@ export const test = playwrightTest.extend({
       try {
         if (testInfo.status !== testInfo.expectedStatus) {
           await annotateStartupPhases(context, testInfo);
+          await annotateContextsLostAtCreation(context, testInfo);
+          await annotateNonFinitePointerEvents(context, testInfo);
         }
       } finally {
         await retireContextApplications(context);

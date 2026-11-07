@@ -58,7 +58,9 @@
  *    for every cell, the gene-major X with prefix counts every transcoded
  *    store has. The store opened is then the map with this X
  *    (`composite`); the reader worker swaps its reader onto it and the
- *    page reads its genes (`anndata-reader-worker.js`).
+ *    page reads its genes (`anndata-reader-worker.js`). A gene read before
+ *    any open cell's rows are held waits for that swap (`awaitHeldGenes`)
+ *    rather than answer every cell "not read".
  *
  * `G` is the cells whose gene index fits this device (`shareFit`, the
  * `columnIndex` share of memory: what a gene sample of a matrix stored by

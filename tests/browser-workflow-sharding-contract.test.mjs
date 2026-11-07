@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 test('browser CI shards every engine with bounded process generations', async () => {
@@ -48,8 +48,8 @@ test('browser CI shards every engine with bounded process generations', async ()
   ) ?? [];
   assert.equal(
     shardArguments.length,
-    2,
-    'the headed Linux-Firefox and headless browser partitions must both shard',
+    3,
+    'the headed Linux-Firefox and headless browser partitions and the control walk must all shard',
   );
   assert.match(
     workflow,
@@ -101,4 +101,64 @@ test('browser CI shards every engine with bounded process generations', async ()
     /run: npm run test:browser -- --project=/,
     'no unsharded full browser suite may remain',
   );
+});
+
+/** The text of the job `id` of the workflow: from its key to the next job's. */
+function jobOf(workflow, id) {
+  const job = new RegExp(`\\n  ${id}:\\n([\\s\\S]*?)(?=\\n  [a-z][a-z-]*:\\n|$)`).exec(workflow)?.[1];
+  assert.ok(job, `the workflow has the job ${id}`);
+  return job;
+}
+
+test('the control walk runs in a job of its own, a share a job, and not in the browser shards', async () => {
+  const [workflow, walkFiles] = await Promise.all([
+    readFile(new URL('../.github/workflows/test.yml', import.meta.url), 'utf8'),
+    readdir(new URL('./browser/', import.meta.url)),
+  ]);
+  const browsers = jobOf(workflow, 'browsers');
+  const walk = jobOf(workflow, 'control-walk');
+  const shares = walkFiles.filter(file => /^control-walk-\d+-of-\d+\.spec\.mjs$/.test(file)).length;
+  assert.ok(shares > 0, 'the walk has spec files');
+
+  // The browser shards leave the walk out; the walk job runs it alone
+  // (`playwright.config.mjs`), one shard a spec file, on Chromium.
+  assert.match(browsers, /\n    env:\n      CELLUCID_CONTROL_WALK: apart\n/);
+  assert.match(walk, /\n    env:\n      CELLUCID_CONTROL_WALK: only\n/);
+  assert.match(walk, /name: \$\{\{ matrix\.os \}\} \/ \$\{\{ matrix\.browser \}\} \/ control walk \$\{\{ matrix\.shard \}\}/);
+  assert.match(walk, /\n\s+browser: \[chromium\]\n/);
+  const walkShards = JSON.parse(/\n\s+shard: (\[[^\]\n]+\])\n/.exec(walk)?.[1] ?? 'null');
+  assert.deepEqual(
+    walkShards,
+    Array.from({ length: shares }, (_, index) => `${index + 1}/${shares}`),
+    'the walk job runs a shard for each of the walk\'s spec files',
+  );
+  // The same operating systems as the browser job's, for every event.
+  const osOf = job => /\n\s+os: (\$\{\{ fromJSON\(.*\) \}\})\n/.exec(job)?.[1];
+  assert.ok(osOf(browsers));
+  assert.equal(osOf(walk), osOf(browsers));
+  assert.match(walk, /timeout-minutes: 75\n\s+strategy:\n\s+fail-fast: false/);
+  assert.match(
+    walk,
+    /\n\s+run: >-\n\s+npm run test:browser:bounded --\n\s+--project=\$\{\{ matrix\.browser \}\}\n\s+--shard=\$\{\{ matrix\.shard \}\}\n/,
+  );
+
+  // Its setup and evidence steps are the browser job's own, by alias, in
+  // the browser job's order.
+  const anchors = [...browsers.matchAll(/^ {6}- &([a-z-]+)$/gm)].map(match => match[1]);
+  assert.deepEqual(anchors, [
+    'check-out',
+    'install-node',
+    'install-dependencies',
+    'widen-windows-ports',
+    'install-linux-libraries',
+    'install-engine',
+    'record-linux-host',
+    'record-windows-host',
+    'record-macos-host',
+    'upload-failure-evidence',
+  ]);
+  const aliases = [...walk.matchAll(/^ {6}- \*([a-z-]+)$/gm)].map(match => match[1]);
+  assert.deepEqual(aliases, anchors);
+  // An artifact name is unique in a run: both jobs' evidence names its job.
+  assert.match(browsers, /name: playwright-failure-\$\{\{ github\.job \}\}-\$\{\{ strategy\.job-index \}\}-/);
 });

@@ -346,7 +346,17 @@ export function initFieldSelector(options) {
   const interactionOwner = createFieldInteractionOwner();
   let destroyed = false;
   let destroyPromise = null;
-  let forceDisableFieldSelects = false;
+  // The obs choice under way -- `field` null for no colouring -- from the
+  // person's pick in a menu (`token` null while its action waits its turn:
+  // `pickObsField`) or an action's start (`activateField`, with its choice's
+  // token) until it ends. While it is the latest choice the menus name it and
+  // are held: they render from it, not from what is shown, so a refresh under
+  // way (the gene list read after the first view, an annotation change, a
+  // field event) never puts back what the person just replaced. A gene
+  // choice under way (`geneSelector.isChoosing`) shows no obs field.
+  let obsChoice = null;
+  // Session saves and restores holding the menus (`acquireSessionOperation`).
+  let sessionHolds = 0;
   let hasCategoricalFields = false;
   let hasContinuousFields = false;
   let geneSelector;
@@ -457,7 +467,7 @@ export function initFieldSelector(options) {
       closeTransientInteractions();
       interactionOwner.invalidate();
       adoptedDatasetGeneration = generation;
-      forceDisableFieldSelects = false;
+      obsChoice = null;
     }
     return generation;
   }
@@ -595,16 +605,43 @@ export function initFieldSelector(options) {
     continuousClearBtn.disabled = contDisabled;
   }
 
+  /**
+   * The obs choice under way while it is the latest (`obsChoice`), or null.
+   * A pick waiting its turn is not shown while choices are refused (a
+   * session being saved or restored refuses it when its turn comes), and a
+   * choice whose field the menus no longer list is not shown.
+   * @returns {{field: object|null, token: object|null}|null}
+   */
+  function obsChoiceUnderWay() {
+    if (obsChoice === null) return null;
+    const live = obsChoice.token === null
+      ? !interactionOwner.isSuspended()
+      : interactionOwner.isCurrent(obsChoice.token);
+    if (!live) return null;
+    if (obsChoice.field === null) return obsChoice;
+    const listed = state.getVisibleFields(FieldSource.OBS)
+      .some(({ field }) => field === obsChoice.field);
+    return listed ? obsChoice : null;
+  }
+
+  function endObsChoice(token) {
+    if (obsChoice !== null && obsChoice.token === token) obsChoice = null;
+  }
+
+  /** The menus are held while a session operation or any choice is under way. */
+  function menusHeld() {
+    return sessionHolds > 0
+      || obsChoiceUnderWay() !== null
+      || geneSelector.isChoosing();
+  }
+
   function updateFieldSelectDisabledStates() {
     assertAlive();
-    categoricalSelect.disabled = (
-      forceDisableFieldSelects || !hasCategoricalFields
-    );
-    continuousSelect.disabled = (
-      forceDisableFieldSelects || !hasContinuousFields
-    );
+    const held = menusHeld();
+    categoricalSelect.disabled = held || !hasCategoricalFields;
+    continuousSelect.disabled = held || !hasContinuousFields;
     updateFieldActionButtons();
-    geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
+    geneSelector.updateGeneActionButtons(held);
   }
 
   function validateUniqueFieldName(nextValue, fields, fieldIndex) {
@@ -817,19 +854,37 @@ export function initFieldSelector(options) {
   function syncFromState() {
     assertAlive();
     synchronizeDatasetGeneration();
+    renderChoices();
+  }
+
+  /**
+   * Name, in the menus and the gene search, the latest choice under way, or
+   * else what is shown; hold them while a choice or a session operation is
+   * under way. Every refresh of the menus ends here.
+   */
+  function renderChoices() {
+    assertAlive();
     const { source, obsIdx } = requireActiveState();
-    if (source === FieldSource.OBS) {
+    const choice = obsChoiceUnderWay();
+    if (choice !== null) {
+      geneSelector.clearLocalSelectionUI();
+      if (choice.field === null) clearFieldSelections();
+      else syncSelectsForField(readObsFields().indexOf(choice.field));
+    } else if (geneSelector.isChoosing()) {
+      clearFieldSelections();
+      geneSelector.syncFromState();
+    } else if (source === FieldSource.OBS) {
       geneSelector.clearLocalSelectionUI();
       syncSelectsForField(obsIdx);
+      geneSelector.syncFromState();
     } else {
       clearFieldSelections();
       if (source === null) {
         geneSelector.clearLocalSelectionUI();
       }
+      geneSelector.syncFromState();
     }
-    updateFieldActionButtons();
-    geneSelector.syncFromState();
-    geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
+    updateFieldSelectDisabledStates();
   }
 
   function renderFieldSelects() {
@@ -886,7 +941,6 @@ export function initFieldSelector(options) {
       continuousFields,
       '(no continuous obs fields)'
     );
-    updateFieldSelectDisabledStates();
     syncFromState();
 
     if (fields.length === 0) {
@@ -928,10 +982,26 @@ export function initFieldSelector(options) {
       return Promise.resolve(null);
     }
     synchronizeDatasetGeneration();
-    return interactionOwner.run(token => useOpenCells(
-      () => activateFieldOnOpenCells(index, token),
-      token.signal
-    ), { signal });
+    return interactionOwner.run(async token => {
+      // The choice is named and the menus held at once, while the cells it
+      // is read on settle and while it is read.
+      obsChoice = {
+        field: index === -1 ? null : getFieldForSource(FieldSource.OBS, index).field,
+        token
+      };
+      renderChoices();
+      try {
+        return await useOpenCells(
+          () => activateFieldOnOpenCells(index, token),
+          token.signal
+        );
+      } finally {
+        // Ended, however (shown, failed, a newer choice, Stop, a session
+        // restore): the menus name the choices under way now, or what is shown.
+        endObsChoice(token);
+        if (!destroyed) renderChoices();
+      }
+    }, { signal });
   }
 
   async function activateFieldOnOpenCells(index, token) {
@@ -945,20 +1015,13 @@ export function initFieldSelector(options) {
         null,
         'Clear active field result'
       );
-      forceDisableFieldSelects = false;
-      clearFieldSelections();
-      geneSelector.clearLocalSelectionUI();
-      geneSelector.updateGeneActionButtons(false);
-      updateFieldSelectDisabledStates();
+      endObsChoice(token);
+      renderChoices();
       callbacks.onActiveFieldChanged(cleared);
       return cleared;
     }
 
     const { field } = getFieldForSource(FieldSource.OBS, index);
-    geneSelector.clearLocalSelectionUI();
-    geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
-    forceDisableFieldSelects = true;
-    updateFieldSelectDisabledStates();
     try {
       await state.ensureFieldLoaded(index, {
         signal: token.signal
@@ -988,10 +1051,13 @@ export function initFieldSelector(options) {
         field,
         'Activate obs field result'
       );
-      syncSelectsForField(index);
+      endObsChoice(token);
+      renderChoices();
       callbacks.onActiveFieldChanged(info);
       return info;
     } catch (error) {
+      // Ended unshown: the menus name what is shown again.
+      endObsChoice(token);
       if (isCancellation(error)) {
         const reason = unshownChoiceReason(
           interactionOwner,
@@ -1022,11 +1088,6 @@ export function initFieldSelector(options) {
         );
       }
       throw activationError;
-    } finally {
-      if (interactionOwner.isCurrent(token)) {
-        forceDisableFieldSelects = false;
-        updateFieldSelectDisabledStates();
-      }
     }
   }
 
@@ -1060,15 +1121,28 @@ export function initFieldSelector(options) {
     );
   }
 
-  /** Colour the view in focus by `field` (`{source, key}`), or by nothing (null), as a step. */
-  function dispatchColorBy(field) {
+  /**
+   * Colour the view in focus by the obs field `field` (null: by nothing) as the person picked
+   * it in a menu or cleared it: the pick is the choice under way the menus
+   * name and hold from now on, while its action waits its turn (a change of
+   * the open cells under way first: `cells.open`) and runs.
+   *
+   * @param {object|null} field
+   */
+  function pickObsField(field) {
+    const pick = { field, token: null };
+    obsChoice = pick;
+    renderChoices();
     void dispatchFromControl(
       'color.by',
-      { field },
+      { field: field === null ? null : { source: FieldSource.OBS, key: field.key } },
       field === null
         ? { failure: 'Failed to clear field', category: 'filter' }
         : { failure: 'Failed to load field', category: 'data' }
-    );
+    ).finally(() => {
+      if (obsChoice === pick) obsChoice = null;
+      if (!destroyed) renderChoices();
+    });
   }
 
   /**
@@ -1172,17 +1246,21 @@ export function initFieldSelector(options) {
       onStartFieldRename: startFieldRename,
       onStartFieldDelete: startFieldDelete,
       onBusyChanged: (busy) => {
-        forceDisableFieldSelects = requireBoolean(
-          busy,
-          'Gene selector busy state'
-        );
-        updateFieldSelectDisabledStates();
+        // A gene choice started is the latest: an obs pick still waiting its
+        // turn is replaced by it (its action is superseded).
+        if (destroyed) return;
+        if (requireBoolean(busy, 'Gene selector busy state')) {
+          obsChoice = null;
+          updateFieldSelectDisabledStates();
+        } else {
+          renderChoices();
+        }
       },
       onActivateField: idx => activateField(idx),
       onAdoptDatasetGeneration: adoptDatasetGeneration,
       onChooseGeneNames: callbacks.onChooseGeneNames,
       onDuplicateField: duplicateFieldAt,
-      onClearColoring: () => dispatchColorBy(null)
+      onClearColoring: () => pickObsField(null)
     }
   });
   requireExactKeys(
@@ -1193,6 +1271,7 @@ export function initFieldSelector(options) {
       'colorByGene',
       'destroy',
       'initGeneExpressionDropdown',
+      'isChoosing',
       'selectGene',
       'syncFromState',
       'updateGeneActionButtons'
@@ -1285,10 +1364,9 @@ export function initFieldSelector(options) {
       'Categorical field selection'
     );
     if (index >= 0) {
-      continuousSelect.value = NONE_FIELD_VALUE;
-      dispatchColorBy({ source: FieldSource.OBS, key: getFieldForSource(FieldSource.OBS, index).field.key });
+      pickObsField(getFieldForSource(FieldSource.OBS, index).field);
     } else if (continuousSelect.value === NONE_FIELD_VALUE) {
-      dispatchColorBy(null);
+      pickObsField(null);
     }
   }, { signal: lifecycle.signal });
 
@@ -1298,10 +1376,9 @@ export function initFieldSelector(options) {
       'Continuous field selection'
     );
     if (index >= 0) {
-      categoricalSelect.value = NONE_FIELD_VALUE;
-      dispatchColorBy({ source: FieldSource.OBS, key: getFieldForSource(FieldSource.OBS, index).field.key });
+      pickObsField(getFieldForSource(FieldSource.OBS, index).field);
     } else if (categoricalSelect.value === NONE_FIELD_VALUE) {
-      dispatchColorBy(null);
+      pickObsField(null);
     }
   }, { signal: lifecycle.signal });
 
@@ -1326,7 +1403,7 @@ export function initFieldSelector(options) {
     if (index >= 0) startFieldDelete(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
   categoricalClearBtn.addEventListener('click', () => {
-    dispatchColorBy(null);
+    pickObsField(null);
   }, { signal: lifecycle.signal });
 
   continuousCopyBtn.addEventListener('click', () => {
@@ -1350,7 +1427,7 @@ export function initFieldSelector(options) {
     if (index >= 0) startFieldDelete(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
   continuousClearBtn.addEventListener('click', () => {
-    dispatchColorBy(null);
+    pickObsField(null);
   }, { signal: lifecycle.signal });
 
   const rerenderForExternalState = () => renderFieldSelects();
@@ -1461,7 +1538,7 @@ export function initFieldSelector(options) {
     assertAlive();
     closeTransientInteractions();
     interactionOwner.invalidate();
-    forceDisableFieldSelects = false;
+    obsChoice = null;
   }
 
   function settleCurrentInteraction() {
@@ -1484,14 +1561,16 @@ export function initFieldSelector(options) {
     const releaseOwner = retireCurrent
       ? interactionOwner.acquireRetiringSuspension('a saved view is being restored')
       : interactionOwner.acquireSuspension('the view is being saved');
+    // A restore retires the choice under way, a pick waiting its turn too.
+    if (retireCurrent) obsChoice = null;
+    sessionHolds++;
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
       releaseOwner();
+      sessionHolds--;
       if (destroyed) return;
-      forceDisableFieldSelects = false;
-      geneSelector.updateGeneActionButtons(false);
       // A restore replaces the field inventory without a field event (a
       // user-defined field it brings back is new to the page), so the
       // selectors are rebuilt from the restored inventory before the active
@@ -1501,12 +1580,9 @@ export function initFieldSelector(options) {
       } else {
         syncFromState();
       }
-      updateFieldSelectDisabledStates();
     };
     try {
       closeTransientInteractions();
-      forceDisableFieldSelects = true;
-      geneSelector.updateGeneActionButtons(true);
       updateFieldSelectDisabledStates();
       await interactionOwner.settleAll();
       return release;
@@ -1534,7 +1610,7 @@ export function initFieldSelector(options) {
   function initGeneExpressionDropdown() {
     assertAlive();
     geneSelector.initGeneExpressionDropdown();
-    geneSelector.updateGeneActionButtons(forceDisableFieldSelects);
+    geneSelector.updateGeneActionButtons(menusHeld());
   }
 
   async function colorByGene(geneKey) {

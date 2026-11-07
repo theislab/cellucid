@@ -6,6 +6,7 @@
  * all-genes CSV with scanpy's column names; Recompute after a cached run.
  */
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -198,7 +199,7 @@ test('the all-genes CSV uses scanpy names; a cached run offers Recompute', async
   const download = page.waitForEvent('download');
   await modal.getByRole('button', { name: 'All genes CSV' }).click();
   const file = await download;
-  expect(file.suggestedFilename()).toMatch(/^marker_genes_all.*\.csv$/);
+  await expectDownloadNamed(file, /^marker_genes_all.*\.csv$/);
   const text = await (await file.createReadStream()).toArray().then(chunks => Buffer.concat(chunks).toString('utf8'));
   const lines = text.trim().split('\n');
   expect(lines[0]).toBe('group,names,scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,small_group,tested');

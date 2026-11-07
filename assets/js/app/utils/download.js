@@ -8,6 +8,14 @@
  * URL after `click()` returns, so releasing it in the same task can cancel the
  * download those engines were about to start.
  *
+ * The name is the one the app asks for; the browser may save the file under
+ * another. WebKitGTK and WPE parse an `<a download>` name as a
+ * Content-Disposition filename with libsoup, and libsoup 3.6.6 (Ubuntu 26.04)
+ * turns each whitespace character into `_` (GNOME/libsoup 9e1570c9; spaces
+ * are kept again from 3.7.1, GNOME/libsoup#503): `My report.html` is saved
+ * as `My_report.html` there, and unchanged in Safari, Chrome and Firefox. Specs hold
+ * the app to the asked name (`tests/browser/helpers/downloads.mjs`).
+ *
  * @module utils/download
  */
 

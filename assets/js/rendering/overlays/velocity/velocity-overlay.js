@@ -1249,6 +1249,33 @@ export class VelocityOverlay extends OverlayBase {
     return false;
   }
 
+  /**
+   * Of the frames `needsContinuousFrames` asks for, the owed ones: a
+   * presented view's particle state owed the update that settles it (none
+   * flows: a table emptied by a filter disposes it there), or its spawn
+   * table being built, to rebuild, or published and not yet taken up by its
+   * particles (none made, another count, an earlier generation). Particles
+   * flowing from the table of every presented view that wants them owe
+   * nothing: their frames animate without end and are paced
+   * (`rendering/ambient-frame-pacing.js`).
+   * @returns {boolean}
+   */
+  needsOwedFrames() {
+    if (!this.needsContinuousFrames()) return false;
+    for (const viewId of this._presentedViewIds) {
+      const particles = this._particleByView.get(viewId);
+      if (particles !== undefined && !(particles.activeParticleCount > 0)) return true;
+      const spawn = this._spawnByView.get(viewId);
+      if (spawn === undefined || !(spawn.targetCount > 0)) continue;
+      if (spawn.building || spawn.dirty) return true;
+      if (!spawn.ready || !(spawn.tableSize > 0)) continue;
+      if (particles === undefined
+        || particles.activeParticleCount !== spawn.targetCount
+        || particles.readyGeneration !== spawn.generation) return true;
+    }
+    return false;
+  }
+
   handleContextLost() {
     if (this._contextLost) return;
     if (this._disposed) return;

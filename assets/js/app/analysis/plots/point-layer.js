@@ -24,7 +24,7 @@
 import { analysisWorkerCount } from '../shared/performance-config.js';
 import { pointRasterWorkerScript } from '../../../../workers/scripts.js';
 import { startWorker } from '../../../workers/worker-script.js';
-import { workerFailureReason } from '../../../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript } from '../../../workers/worker-failure.js';
 import { registerIdleWorkers } from '../../../workers/idle-retirement.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -45,15 +45,26 @@ const idleRasters = registerIdleWorkers(() => {
   }
 });
 
-function retireWorker(slot, error) {
+/**
+ * End a raster worker at once; every raster waiting on it fails with what
+ * `failure` resolves to (`explainWorkerFailure` finds why it failed).
+ *
+ * @param {{worker: Worker, pending: number}} slot
+ * @param {Promise<Error>} failure
+ */
+function retireWorker(slot, failure) {
   const index = rasterWorkers.indexOf(slot);
   if (index >= 0) rasterWorkers.splice(index, 1);
   slot.worker.terminate();
+  const waiting = [];
   for (const [id, pending] of pendingRasters) {
     if (pending.slot !== slot) continue;
     pendingRasters.delete(id);
-    pending.reject(error);
+    waiting.push(pending);
   }
+  void failure.then(error => {
+    for (const pending of waiting) pending.reject(error);
+  });
 }
 
 /**
@@ -63,7 +74,7 @@ function retireWorker(slot, error) {
 function rasterWorker() {
   let slot = rasterWorkers.reduce((best, s) => (best === null || s.pending < best.pending ? s : best), null);
   if (slot === null || (slot.pending > 0 && rasterWorkers.length < analysisWorkerCount())) {
-    const worker = startWorker(pointRasterWorkerScript(), { type: 'module' });
+    const worker = noteWorkerScript(startWorker(pointRasterWorkerScript(), { type: 'module' }), pointRasterWorkerScript());
     const created = { worker, pending: 0 };
     worker.onmessage = ({ data }) => {
       const pending = pendingRasters.get(data.id);
@@ -76,7 +87,7 @@ function rasterWorker() {
     };
     worker.onerror = event => {
       event.preventDefault?.();
-      retireWorker(created, new Error(`The point raster worker failed: ${workerFailureReason(event)}`));
+      retireWorker(created, explainWorkerFailure(worker, event).then(reason => new Error(`The point raster worker failed: ${reason}`)));
     };
     rasterWorkers.push(created);
     slot = created;

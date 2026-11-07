@@ -155,11 +155,14 @@ test('a worker whose code does not load fails its builds once, saying so, and th
   const worker = FakeWorker.made.at(-1);
   // Its script did not load (offline, say): a plain Event, no message.
   worker.onerror(new Event('error'));
-  assert.deepEqual(errors, ['Background spatial index worker failed: its code could not be loaded']);
-  // Retired: kept, every later build was posted to it and never answered.
+  // Retired at once: kept, every later build was posted to it and never answered.
   assert.equal(worker.terminated, true);
   assert.equal(renderer._spatialTreeWorker, null);
   assert.equal(renderer._spatialTreeActive, null);
+  // Its builds fail once why is found (`explainWorkerFailure`; a module
+  // file here, which no server is asked for).
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(errors, ['Background spatial index worker failed: its code could not be loaded']);
   // An error of the retired worker arriving late fails nothing more.
   build(renderer, positions);
   const next = FakeWorker.made.at(-1);
@@ -177,4 +180,39 @@ test('a worker failure is said as what it is: the worker\'s own error, or code t
   assert.equal(workerFailureReason(new Event('error'), { navigator: { onLine: false } }), 'its code could not be loaded: this browser is offline');
   assert.equal(workerFailureReason(null, {}), 'its code could not be loaded');
   assert.equal(workerFailureReason({ message: '  ' }, {}), 'its code could not be loaded');
+});
+
+test('code that could not be loaded is explained by asking for the worker\'s script again', async () => {
+  const { explainWorkerFailure, noteWorkerScript } = await import('../assets/js/workers/worker-failure.js');
+  const script = 'https://www.cellucid.com/assets/workers/spatial-tree-worker.0123456789ab.js#handed=%7B%7D';
+  const asked = [];
+  const answering = answer => ({
+    navigator: { onLine: true },
+    fetch: async (address, init) => {
+      asked.push([address, init.cache]);
+      if (answer instanceof Error) throw answer;
+      return { ok: answer.status === 200, status: answer.status, headers: new Headers({ 'content-type': answer.type }), body: null };
+    },
+  });
+  const worker = noteWorkerScript({}, script);
+  const loadFailure = new Event('error');
+  const name = '/assets/workers/spatial-tree-worker.0123456789ab.js';
+  // The address without what the worker was handed, never from a cache.
+  assert.equal(await explainWorkerFailure(worker, loadFailure, answering({ status: 404, type: 'text/plain' })),
+    `its code could not be loaded: the server answered 404 for ${name}`);
+  assert.deepEqual(asked[0], [`https://www.cellucid.com${name}`, 'no-store']);
+  assert.equal(await explainWorkerFailure(worker, loadFailure, answering(new TypeError('Failed to fetch'))),
+    `its code could not be loaded: ${name} could not be fetched (Failed to fetch)`);
+  assert.equal(await explainWorkerFailure(worker, loadFailure, answering({ status: 200, type: 'text/html; charset=utf-8' })),
+    `its code could not be loaded: ${name} is served as text/html; charset=utf-8, not as a script`);
+  assert.equal(await explainWorkerFailure(worker, loadFailure, answering({ status: 200, type: 'text/javascript; charset=utf-8' })),
+    `its code could not be loaded, though ${name} is served: a module it imports did not load, or this browser could not start another worker`);
+  // What the browser said, offline, a worker whose address is not known, or a script no server serves: nothing is asked.
+  asked.length = 0;
+  assert.equal(await explainWorkerFailure(worker, { message: 'RangeError: too many cells' }, answering({ status: 404, type: '' })), 'RangeError: too many cells');
+  assert.equal(await explainWorkerFailure(worker, loadFailure, { ...answering({ status: 404, type: '' }), navigator: { onLine: false } }),
+    'its code could not be loaded: this browser is offline');
+  assert.equal(await explainWorkerFailure({}, loadFailure, answering({ status: 404, type: '' })), 'its code could not be loaded');
+  assert.equal(await explainWorkerFailure(noteWorkerScript({}, 'file:///worker.js'), loadFailure, answering({ status: 404, type: '' })), 'its code could not be loaded');
+  assert.deepEqual(asked, []);
 });

@@ -8,6 +8,7 @@ import {
 } from './ui/onboarding/welcome-modal.js';
 import { DataSourceError, isExplainedFailure } from '../data/data-source.js';
 import { STARTUP_STALL_CODE } from './startup-phase.js';
+import { isContextLostError } from '../rendering/gl-errors.js';
 import { failureText } from '../utils/errors.js';
 
 /**
@@ -113,6 +114,8 @@ function explainedReason(error) {
  *
  * - `browser`: no WebGL2, or a browser older than `BROWSER_FLOOR`, so
  *   Cellucid cannot run in this browser at all;
+ * - `graphics`: the browser's graphics stopped working while Cellucid
+ *   started (its WebGL2 context was lost, as it was made or after);
  * - `data`: the server the page itself is served from could not be read;
  * - `stall`: a server startup waited on never answered (the page's own
  *   server, the sample catalog, a published default view);
@@ -121,7 +124,7 @@ function explainedReason(error) {
  * @param {Error} error
  * @param {{ webgl2Available: boolean, hasLaunchSettings: boolean }} context
  * @returns {{
- *   kind: 'browser'|'data'|'stall'|'app',
+ *   kind: 'browser'|'graphics'|'data'|'stall'|'app',
  *   title: string,
  *   sentence: string,
  *   offerWithoutSettings: boolean,
@@ -149,6 +152,17 @@ export function describeStartupFailure(error, { webgl2Available, hasLaunchSettin
         'Update the browser or turn on hardware acceleration, then try again.',
       offerWithoutSettings: false,
       links: [[STARTUP_REQUIREMENTS_URL, 'System requirements']]
+    };
+  }
+  if (isContextLostError(error)) {
+    return {
+      kind: 'graphics',
+      title: 'The browser\u2019s graphics stopped working',
+      sentence:
+        'The browser could not give Cellucid a working graphics context: its graphics process was reset or stopped. ' +
+        'Reload the page; if this happens again, restart the browser.',
+      offerWithoutSettings: false,
+      links: [[STARTUP_TROUBLESHOOTING_INDEX_URL, 'Troubleshooting']]
     };
   }
   if (error instanceof DataSourceError || isExplainedFailure(error)) {
@@ -192,7 +206,8 @@ export function describeStartupFailure(error, { webgl2Available, hasLaunchSettin
 
 /**
  * Whether this browser can create a WebGL2 context. The probe's context is
- * released at once, so it never counts against the browser's context limit.
+ * lost at once (`loseContext`), which lets its GPU resources go; WebKit still
+ * counts it among the page's contexts until it is collected.
  *
  * @param {Document} documentOwner
  * @returns {boolean}

@@ -9,6 +9,7 @@ import {
   ENCODED_SAMPLE_CATALOG_URL,
 } from './helpers/origins.mjs';
 import { sceneQuietness } from './helpers/frame-scheduling.mjs';
+import { waitForPageAtRest, whenActionsShown } from './helpers/dataset-ready.mjs';
 import { expectWelcomeShown } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
@@ -64,6 +65,20 @@ async function waitForViewerPaint(page) {
 }
 
 /**
+ * Before the next click in the sidebar: the opening over, and the page
+ * showing the spec's last step (`whenActionsShown`). Every Camera Path control
+ * is a recorded step, and the History panel above the Camera Path draws its
+ * row on a later frame, moving every control below it. Web contracts run
+ * 42293355104, Linux WebKit r2388: Apply aimed at y 627 with its box at
+ * 617-637, released with it at 641-661 on the "End with a return to the
+ * first keyframe" row.
+ */
+async function settle(page) {
+  await waitForPageAtRest(page);
+  await whenActionsShown(page);
+}
+
+/**
  * Build a two-keyframe path with a known duration, then park the camera away
  * from both keyframes so "reached the end" is distinguishable from "stayed put".
  */
@@ -83,6 +98,8 @@ async function preparePath(page) {
     element.open = true;
   });
 
+  // The opening is over and the section's opening is a step in the History.
+  await settle(page);
   await page.locator('#cinematic-save-btn').click();
   await page.evaluate(() => {
     const viewer = window._cellucidViewer;
@@ -93,8 +110,10 @@ async function preparePath(page) {
     state.orbit.targetRadius = state.orbit.radius;
     viewer.setCameraState(state);
   });
+  await settle(page);
   await page.locator('#cinematic-save-btn').click();
   await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
+  await settle(page);
 
   // Compare playback with the actual state captured by the production store,
   // rather than merely comparing the two preference modes with one another.

@@ -16,6 +16,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels, openPhoneSheet } from './helpers/panels.mjs';
 import { armSelection } from './helpers/selection-gesture.mjs';
+import { whenActionsShown } from './helpers/dataset-ready.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -57,9 +58,20 @@ async function colourByCellType(page) {
   ).toBe('category');
 }
 
+/**
+ * Close the full-screen sidebar, and wait until the page shows the plot.
+ * Closed, the sidebar lets the selection bar show; the agents' dock above it
+ * is placed from the bar's height, which a ResizeObserver publishes in the
+ * next rendering update, before that frame is painted
+ * (`select-bar-placement.js`). Until then the layout still has the dock where
+ * it stood with no bar, over the bar's switch, in a state no frame shows: a
+ * point read and pressed in between reaches the dock (`select-bar.spec.mjs`,
+ * hosted macOS Firefox, full-matrix run 42320991390).
+ */
 async function closeSidebar(page) {
   await page.locator('#sidebar-toggle').tap();
   await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
+  await whenActionsShown(page);
 }
 
 async function openSidebar(page) {

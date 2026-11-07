@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { isFirefoxSafeResolveReorderingWarning } from './helpers/engine-console.mjs';
 
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -15,6 +16,7 @@ test('a pane\'s shown edges follow only its accepted transparency, through failu
   page.on('pageerror', error => pageErrors.push(error.message));
   page.on('console', message => {
     if (message.type() !== 'error' && message.type() !== 'warning') return;
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     const text = `${message.type()}: ${message.text()}`;
     if (!/GPU stall due to ReadPixels/i.test(text)) {
       consoleDiagnostics.push(text);

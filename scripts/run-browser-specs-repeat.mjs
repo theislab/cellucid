@@ -232,12 +232,17 @@ export function chooseSpecs(paths) {
   return { named, specs, unmapped };
 }
 
-function collectSpecs(suites, titles, found) {
+function collectSpecs(suites, titles, found, testFile) {
   for (const suite of suites ?? []) {
     // A file's suite is titled by its path; describe blocks by their titles.
     const path_ = suite.title === suite.file ? titles : [...titles, suite.title];
-    for (const spec of suite.specs ?? []) found.push({ spec, titles: path_ });
-    collectSpecs(suite.suites, path_, found);
+    // The top-level suite is the test file. A spec's own `file` is where its
+    // `test()` call stands: a helper module when the file declares its tests
+    // through one (`control-walk-<k>-of-<n>.spec.mjs`), which names no file to
+    // run and is shared by every file that declares through it.
+    const file = testFile ?? suite.file;
+    for (const spec of suite.specs ?? []) found.push({ spec, titles: path_, file });
+    collectSpecs(suite.suites, path_, found, file);
   }
 }
 
@@ -254,8 +259,9 @@ export function summarizeRepeatReport(report) {
   collectSpecs(report?.suites, [], found);
   const byTest = new Map();
   const totals = { passed: 0, failed: 0, skipped: 0 };
-  for (const { spec, titles } of found) {
-    const id = `${BROWSER_TESTS}${spec.file}:${spec.line} › ${[...titles, spec.title].join(' › ')}`;
+  for (const { spec, titles, file } of found) {
+    const where = spec.file === file ? `${file}:${spec.line}` : `${file} (${spec.file}:${spec.line})`;
+    const id = `${BROWSER_TESTS}${where} › ${[...titles, spec.title].join(' › ')}`;
     const counts = byTest.get(id) ?? { failed: 0, runs: 0 };
     for (const run of spec.tests ?? []) {
       counts.runs += 1;

@@ -13,5 +13,5 @@
 @import 'utilities/_index.css?v=bdce32509232' layer(utilities);
 
 /* Component modules. */
-@import 'components/_index.css?v=d5ea13d9379b' layer(components);
+@import 'components/_index.css?v=11deae0748b7' layer(components);
 @import 'layouts/_index.css?v=6e49b153eac7' layer(layouts);

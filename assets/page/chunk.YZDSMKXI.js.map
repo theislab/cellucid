@@ -1,6 +1,0 @@
-{
-  "version": 3,
-  "sources": ["../js/workers/worker-failure.js"],
-  "mappings": "wCA0BO,SAASA,EAAoBC,EAAOC,EAAQ,WAAY,CAC7D,IAAMC,EAAU,OAAOF,GAAO,SAAY,SAAWA,EAAM,QAAQ,KAAK,EAAI,GAC5E,OAAIE,EAAQ,OAAS,EAAUA,EACxBD,EAAM,WAAW,SAAW,GAC/B,wDACA,8BACN,CANgBE,EAAAJ,EAAA",
-  "names": ["workerFailureReason", "event", "scope", "message", "__name"]
-}

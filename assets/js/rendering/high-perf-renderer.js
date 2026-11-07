@@ -79,7 +79,7 @@ import {
 import { spatialTreeWorkerScript } from '../../workers/scripts.js';
 import { DEFAULT_CELL_PRIORITY, requireCellPriority } from '../data/cell-priority.js';
 import { startWorker } from '../workers/worker-script.js';
-import { workerFailureReason } from '../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript } from '../workers/worker-failure.js';
 import {
   allocateLinearTexture,
   planLinearTextureFor,
@@ -7860,7 +7860,7 @@ export class HighPerfRenderer {
    */
   _ensureSpatialTreeWorker() {
     if (this._spatialTreeWorker) return;
-    this._spatialTreeWorker = startWorker(spatialTreeWorkerScript(), { type: 'module' });
+    this._spatialTreeWorker = noteWorkerScript(startWorker(spatialTreeWorkerScript(), { type: 'module' }), spatialTreeWorkerScript());
     this._spatialTreeRequests = new Map();
     this._spatialTreeQueue = [];
     this._spatialTreeActive = null;
@@ -7880,17 +7880,21 @@ export class HighPerfRenderer {
     worker.onerror = event => {
       event.preventDefault?.();
       if (this._spatialTreeWorker !== worker) return;
-      const error = new Error(`Background spatial index worker failed: ${workerFailureReason(event)}`);
       // It answers nothing more (its code did not load, or it stopped): it
-      // is retired, and the next build starts a new one. Kept, every later
-      // build was posted to it and never answered.
+      // is retired at once, and the next build starts a new one. Kept,
+      // every later build was posted to it and never answered. The builds
+      // waiting on it fail saying why, once that is found
+      // (`explainWorkerFailure`).
       worker.terminate();
       this._spatialTreeWorker = null;
       const pending = [...this._spatialTreeRequests.values()];
       this._spatialTreeRequests.clear();
       this._spatialTreeQueue = [];
       this._spatialTreeActive = null;
-      for (const entry of pending) entry.onError(error);
+      void explainWorkerFailure(worker, event).then(reason => {
+        const error = new Error(`Background spatial index worker failed: ${reason}`);
+        for (const entry of pending) entry.onError(error);
+      });
     };
   }
 

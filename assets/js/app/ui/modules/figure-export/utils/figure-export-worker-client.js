@@ -31,14 +31,14 @@ import { yieldToMacrotask } from '../../../../../utils/yield-macrotask.js';
 import { loadAppCode } from '../../../../app-code.js';
 import { figureExportWorkerScript } from '../../../../../../workers/scripts.js';
 import { startWorker } from '../../../../../workers/worker-script.js';
-import { workerFailureReason } from '../../../../../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript } from '../../../../../workers/worker-failure.js';
 import { PieceSender, placeArrays } from '../../../../../utils/large-arrays.js';
 import { registerIdleWorkers } from '../../../../../workers/idle-retirement.js';
 import { fromWire } from '../../../../../utils/error-wire.js';
 import { abortReason, awaitWithSignal, onAbort } from '../../../../../utils/abort.js';
 
 function createDefaultWorker() {
-  return startWorker(figureExportWorkerScript(), { type: 'module' });
+  return noteWorkerScript(startWorker(figureExportWorkerScript(), { type: 'module' }), figureExportWorkerScript());
 }
 
 /** The operations that draw with WebGL2, run where a WebGL2 context exists. */
@@ -139,12 +139,23 @@ function receive(data) {
   else entry.resolve(data.result);
 }
 
+/**
+ * End the worker at once; every request waiting on it fails with `reason`,
+ * or with what `reason` resolves to (a failure whose cause is still being
+ * found, `explainWorkerFailure`).
+ *
+ * @param {Error|Promise<Error>} reason
+ */
 function retireWorker(reason) {
   const retired = worker;
   worker = null;
   const waiting = [...pending.values()];
   pending.clear();
-  for (const entry of waiting) entry.reject(reason);
+  const fail = error => {
+    for (const entry of waiting) entry.reject(error);
+  };
+  if (reason instanceof Error) fail(reason);
+  else void reason.then(fail);
   retired?.terminate();
 }
 
@@ -154,9 +165,9 @@ function ensureWorker() {
   created.onmessage = ({ data }) => receive(data);
   created.onerror = (event) => {
     event.preventDefault?.();
-    retireWorker(new Error(
-      `Figure-export worker failed: ${workerFailureReason(event)}`
-    ));
+    retireWorker(explainWorkerFailure(created, event).then(reason => new Error(
+      `Figure-export worker failed: ${reason}`
+    )));
   };
   created.onmessageerror = () => {
     retireWorker(new Error('Figure-export worker sent a message that could not be read.'));

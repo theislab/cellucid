@@ -5,7 +5,8 @@
  * host serves only whole) and gene indexes are kept in the origin-private
  * file system by the reader worker, for later visits. A browser without one
  * keeps them in memory for the tab: a Safari or Firefox private window, and
- * Playwright 1.62's Linux WebKit, which has no `navigator.storage` at all.
+ * Playwright's Linux WebKit through 1.62 (r2336), which had no
+ * `navigator.storage` at all.
  * A spec asks the page which it is (`workersKeepFiles`), never the engine's
  * name, and holds the app to the behaviour of that case.
  */

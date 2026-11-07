@@ -146,8 +146,12 @@ test('a file opened after a 3D dataset with a close-up preset opens on its own e
   expect(after.camera).toEqual(fresh.camera);
   expect(after.pointSize).toBe(fresh.pointSize);
 
-  // Scanpy's colours: `cell_type` opens in the palette its file stores.
-  await page.locator('#categorical-field').selectOption('cell_type', { force: true });
+  // Scanpy's colours: `cell_type` opens in the palette its file stores. The
+  // fresh page opened with its panels folded, so the field's panel is opened
+  // first, as a person would (a forced choice skipped every check that the
+  // control could be used).
+  await openCollapsedPanels(page);
+  await page.locator('#categorical-field').selectOption('cell_type');
   await expect.poll(() => page.evaluate(() => {
     const state = window._cellucidState;
     const field = state.getActiveField();

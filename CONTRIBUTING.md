@@ -256,7 +256,12 @@ Cellucid" text, `robots.txt`, `sitemap.xml`, `404.html`, the reading pages
 
 `npm test` runs `scripts/run-web-tests.mjs`, which discovers every
 `tests/*.test.mjs` file and runs them under the Node.js test runner — so a new
-contract file is picked up by adding it, with nothing to register. These are
+contract file is picked up by adding it, with nothing to register. A file that
+hangs is stopped once it has finished no test for 5 minutes and fails naming the
+last test it finished; a slower machine that is still finishing tests never
+fails for its speed. Each file runs in a process group of its own, so an
+interrupted run (Ctrl-C, a cancelled CI job) stops every file it started
+before it ends. These are
 the same commands `.github/workflows/test.yml` runs, so a green local run is the
 same check CI applies:
 
@@ -266,9 +271,18 @@ same check CI applies:
   `cellucid-python` and `cellucid-r` (the notebook widget's front end each
   ships) so the widget contract runs against both copies.
 - On every push and pull request the browser suite runs chromium, firefox, and
-  webkit on Ubuntu, plus webkit on macOS. Every engine on every operating
-  system runs nightly and on manual dispatch (**Actions → Web contracts → Run
-  workflow**).
+  webkit on Ubuntu, plus webkit on macOS, in eight shards each. Every engine on
+  every operating system runs nightly and on manual dispatch (**Actions → Web
+  contracts → Run workflow**).
+- The control walk (`tests/browser/control-walk-<k>-of-<n>.spec.mjs`, Chromium
+  only, minutes a test) runs in a job of its own, a share a job, on the
+  operating systems the browser suite runs Chromium on: Playwright shards by
+  test count, so in the suite's shards its few long tests would all fall into
+  one. `CELLUCID_CONTROL_WALK` (`playwright.config.mjs`) selects: `apart`
+  leaves the walk out (the browser shards), `only` runs it alone (the walk
+  job, `--shard=k/4`, a file each), unset runs every spec. Run a share as CI
+  does with
+  `CELLUCID_CONTROL_WALK=only npm run test:browser:bounded -- --project=chromium --shard=1/4`.
 - A failed browser job uploads its Playwright screenshots and error context as
   a workflow artifact.
 

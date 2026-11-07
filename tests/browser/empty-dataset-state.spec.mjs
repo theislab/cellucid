@@ -203,7 +203,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   for (const mode of GENE_MODES) {
     await page
       .locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`)
-      .click({ force: true });
+      .click();
     await expectInfo(page, 'Requires gene expression data.');
   }
   await expect(
@@ -259,7 +259,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   await closeMode(page, 'differential');
   await page
     .locator('.analysis-mode[data-mode="differential"] .analysis-mode-copy-btn')
-    .click({ force: true });
+    .click();
   await expect(
     page.locator('#floating-panels-root .analysis-window-panel'),
   ).toHaveCount(1);

@@ -15,6 +15,7 @@
  *   session file is refused saying what it is and where it goes.
  */
 import { closeContextWithApplicationRetirement, expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import {
   START, TRAJECTORY, expectAnnouncedOnce, expectNoFailureAnnounced, expectSettledOn, openStarted,
 } from './helpers/dataset-loading.mjs';
@@ -106,7 +107,7 @@ test('Export… writes the datasets and saved states ticked; Import… in anothe
   await exportPanel(page).locator('[data-export-action="confirm"]').click();
   const file = await download;
   expect(await file.failure()).toBeNull();
-  expect(file.suggestedFilename()).toMatch(/^cellucid-library-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d\.cellucid-library$/);
+  await expectDownloadNamed(file, /^cellucid-library-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d\.cellucid-library$/);
   const path = testInfo.outputPath('my.cellucid-library');
   await file.saveAs(path);
   await expect(status(page)).toHaveText(`Exported 2 datasets and ${plural(kept)}.`);

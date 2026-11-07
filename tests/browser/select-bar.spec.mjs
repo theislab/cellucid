@@ -13,6 +13,7 @@ import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openPhoneSheet } from './helpers/panels.mjs';
 import { readyForGesture } from './helpers/selection-gesture.mjs';
+import { whenActionsShown } from './helpers/dataset-ready.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -94,6 +95,27 @@ async function tapToSelect(page, point) {
   await expect(page.locator('#select-bar-steps')).toBeVisible();
 }
 
+/**
+ * Turn Select mode on from the bar, and wait until the page shows it.
+ *
+ * The card grows to its rows at once, but the agents' dock above it is placed
+ * from the bar's height, which a ResizeObserver publishes in the next
+ * rendering update, before that frame is painted (`select-bar-placement.js`,
+ * `--select-bar-block-size`). Until then the layout still has the dock where
+ * it stood above the switch alone: over the card's new hint row, in a state
+ * no frame ever shows. A person taps what was painted; a spec that read the
+ * hint's box and tapped its coordinates in between reached the dock's chat
+ * button instead (hosted macOS Firefox, where one rendering update can take
+ * seconds; full-matrix run 42320991390). So every point is read once the
+ * page has shown the switch's action.
+ */
+async function turnOnSelectModeFromBar(page) {
+  const toggle = page.locator('#select-bar-mode');
+  await toggle.tap();
+  await expect(toggle).toHaveAttribute('aria-checked', 'true');
+  await whenActionsShown(page);
+}
+
 const groupsOf = page => page.evaluate(
   () => window._cellucidState.getHighlightedGroups().length,
 );
@@ -121,8 +143,7 @@ test.describe('on a phone', () => {
 
     const bar = page.locator('#select-bar');
     const barSwitch = page.locator('#select-bar-mode');
-    await barSwitch.tap();
-    await expect(barSwitch).toHaveAttribute('aria-checked', 'true');
+    await turnOnSelectModeFromBar(page);
     await expect(page.locator('#select-bar-hint'))
       .toHaveText('Annotation: tap or click a cell to select its group.');
     await expect(page.locator('#select-bar-combine')).toBeVisible();
@@ -174,7 +195,7 @@ test.describe('on a phone', () => {
     const productErrors = observeProductErrors(page);
     await openDataset(page);
     await page.locator('#sidebar-toggle').tap();
-    await page.locator('#select-bar-mode').tap();
+    await turnOnSelectModeFromBar(page);
     const empty = await findEmptyPoint(page);
     const notice = page.locator('#select-bar-notice');
     await expect(notice).toBeHidden();
@@ -193,7 +214,7 @@ test.describe('on a phone', () => {
     const productErrors = observeProductErrors(page);
     await openDataset(page);
     await page.locator('#sidebar-toggle').tap();
-    await page.locator('#select-bar-mode').tap();
+    await turnOnSelectModeFromBar(page);
     const card = await page.locator('.select-bar-card').boundingBox();
     const hint = await page.locator('#select-bar-hint').boundingBox();
     const start = { x: hint.x + hint.width / 2, y: hint.y + hint.height / 2 };
@@ -242,7 +263,7 @@ test.describe('on a phone', () => {
   test('notifications stack above the bar instead of covering it', async ({ page }) => {
     await openDataset(page);
     await page.locator('#sidebar-toggle').tap();
-    await page.locator('#select-bar-mode').tap();
+    await turnOnSelectModeFromBar(page);
     await expect(page.locator('.select-bar-card')).toBeVisible();
     // The notifications are published here, with the bar up, rather than
     // borrowed from startup: those dismiss themselves after four seconds,

@@ -51,7 +51,7 @@ import { onAbort, abortReason, cancelled } from '../../../utils/abort.js';
 import { requireClonedRecord, requireKeys } from '../../../utils/exact-record.js';
 import { dataWorkerScript } from '../../../../workers/scripts.js';
 import { startWorker } from '../../../workers/worker-script.js';
-import { workerFailureReason } from '../../../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript, workerFailureReason } from '../../../workers/worker-failure.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { fromWire } from '../../../utils/error-wire.js';
 
@@ -332,12 +332,18 @@ export class WorkerPool {
    * @private
    */
   _spawnWorker(index) {
-    const worker = startWorker(dataWorkerScript(), { type: 'module' });
+    const worker = noteWorkerScript(startWorker(dataWorkerScript(), { type: 'module' }), dataWorkerScript());
     worker.onmessage = event => {
       if (this.workers[index] === worker) this._handleMessage(index, event);
     };
-    worker.onerror = error => {
-      if (this.workers[index] === worker) this._handleError(index, error);
+    // The pool fails saying why the worker failed, once that is found
+    // (`explainWorkerFailure`: for a script that did not load the browser
+    // says nothing). A task posted to it meanwhile fails with the pool.
+    worker.onerror = event => {
+      if (this.workers[index] !== worker) return;
+      void explainWorkerFailure(worker, event).then(reason => {
+        if (this.workers[index] === worker) this._handleError(index, { message: reason });
+      });
     };
     worker.onmessageerror = error => {
       if (this.workers[index] === worker) this._fail(toWorkerFailure(index, error));

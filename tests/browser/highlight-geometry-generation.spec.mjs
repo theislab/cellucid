@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { isFirefoxSafeResolveReorderingWarning } from './helpers/engine-console.mjs';
 
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -135,6 +136,7 @@ test('highlight upload follows exact same-reference geometry generations', async
   });
   page.on('console', message => {
     if (message.type() !== 'error' && message.type() !== 'warning') return;
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     const diagnostic = `${message.type()}: ${message.text()}`;
     if (!/GPU stall due to ReadPixels/i.test(diagnostic)) {
       consoleDiagnostics.push(diagnostic);
@@ -398,6 +400,7 @@ test('highlight OOM is report-once, pane-local, and recovers on a semantic gener
   });
   page.on('console', message => {
     if (message.type() !== 'error' && message.type() !== 'warning') return;
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     const diagnostic = `${message.type()}: ${message.text()}`;
     if (!/GPU stall due to ReadPixels/i.test(diagnostic)) {
       consoleDiagnostics.push(diagnostic);

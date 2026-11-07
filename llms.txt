@@ -1,15 +1,27 @@
 # Cellucid
 
-> Cellucid is a free, open-source, GPU-accelerated web app for interactive single-cell data visualization. It shows millions of cells in the browser, in 1D, 2D and 3D embeddings such as UMAP, colored by gene expression or cell metadata, with filtering, selection, RNA-velocity overlays, figure export and community annotation.
+> Cellucid is a free, open-source web app for interactive single-cell data visualization. It renders millions of cells on the GPU in the browser, in 1D, 2D and 3D embeddings such as UMAP, colored by gene expression or cell metadata, and reads single-cell files in place, without uploading them. The `cellucid` Python package (Scanpy/AnnData, Jupyter) and the `cellucid` R package (Seurat, SingleCellExperiment) prepare data for it and show data in it.
 
-The app runs at https://www.cellucid.com/ and needs a WebGL2 browser. It reads AnnData directly: `.h5ad` files, Zarr store folders and `.zarr.zip` archives, including the Cellucid-ready AnnData the `cellucid` Python package (Scanpy/AnnData) and the `cellucid` R package (Seurat, SingleCellExperiment) write.
+The app runs at https://www.cellucid.com/ in any browser with WebGL2; there is nothing to install. It is for biologists and bioinformaticians exploring single-cell atlases: color by genes or metadata, filter and highlight populations, compare embeddings side by side, find marker genes and run differential expression, overlay RNA velocity, annotate cell types with a community, keep an undoable history of every step, and export SVG or PNG figures. It is licensed BSD 3-Clause.
+
+It opens AnnData (`.h5ad`, Zarr store folders, `.zarr.zip`), MuData (`.h5mu`, MuData Zarr), Loom (`.loom`), 10x Cell Ranger HDF5 (`.h5`) and `outs/` folders, MatrixMarket folders, and Seurat or SingleCellExperiment objects saved from R (`.rds`, `.rda`), from your computer, a link, a dataset catalog, a server, a Jupyter notebook or an R session.
+
+AI agents can use Cellucid under the person's permissions: a chat bar in the app with the person's own Anthropic or OpenAI key, Claude or ChatGPT connected to the remote MCP server `https://mcp.cellucid.com`, or a local MCP server started with `cellucid mcp` (Python) or `cellucid_mcp()` (R).
 
 ## Documentation
 
 - [Cellucid documentation](https://docs.cellucid.com/en/latest/): the web app, the Python package and the R package
-- [Web app guide](https://docs.cellucid.com/en/latest/user_guide/web_app/index.html)
-- [Python package guide](https://docs.cellucid.com/en/latest/user_guide/python_package/index.html)
-- [R package guide](https://docs.cellucid.com/en/latest/user_guide/r_package/index.html)
+- [What is Cellucid?](https://docs.cellucid.com/en/latest/user_guide/web_app/a_orientation/01_what_is_cellucid.html)
+- [Quick tour in 60 seconds](https://docs.cellucid.com/en/latest/user_guide/web_app/a_orientation/03_quick_tour_60_seconds.html)
+- [System requirements](https://docs.cellucid.com/en/latest/user_guide/web_app/a_orientation/02_system_requirements.html)
+- [File formats Cellucid reads](https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/07_file_format_expectations.html)
+- [Open a dataset from a link](https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/14_open_from_link.html)
+- [Open R objects (.rds, .rda)](https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/17_open_r_objects.html)
+- [Connect Claude and ChatGPT](https://docs.cellucid.com/en/latest/user_guide/web_app/g_agents/02_connect_claude_and_chatgpt.html)
+- [Privacy model](https://docs.cellucid.com/en/latest/user_guide/web_app/o_accessibility_privacy_security/02_privacy_model.html)
+- [Python package guide](https://docs.cellucid.com/en/latest/user_guide/python_package/index.html) and [installation](https://docs.cellucid.com/en/latest/user_guide/python_package/installation.html)
+- [R package guide](https://docs.cellucid.com/en/latest/user_guide/r_package/index.html) and [installation](https://docs.cellucid.com/en/latest/user_guide/r_package/installation.html)
+- [Cellucid-ready AnnData specification](https://docs.cellucid.com/en/latest/user_guide/python_package/c_data_preparation_api/09_cellucid_ready_anndata_specification.html)
 - [Citing Cellucid](https://docs.cellucid.com/en/latest/citing.html)
 
 ## Source code
@@ -17,3 +29,11 @@ The app runs at https://www.cellucid.com/ and needs a WebGL2 browser. It reads A
 - [Web app](https://github.com/theislab/cellucid)
 - [Python package](https://github.com/theislab/cellucid-python), on PyPI as [cellucid](https://pypi.org/project/cellucid/)
 - [R package](https://github.com/theislab/cellucid-r)
+
+## Optional
+
+- [Documentation index for LLMs](https://docs.cellucid.com/en/latest/llms.txt): every documentation page, each with its Markdown source
+- [Full documentation text](https://docs.cellucid.com/en/latest/llms-full.txt): every documentation page in one file
+- [Built-in sample datasets and their studies](https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/12_sample_dataset_provenance.html)
+- [Subsampled loading](https://docs.cellucid.com/en/latest/user_guide/web_app/b_data_loading/21_subsampled_loading.html)
+- [Changelog](https://docs.cellucid.com/en/latest/changelog.html)

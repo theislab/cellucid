@@ -70,7 +70,7 @@ test('a changed helper runs every spec that imports it, through other helpers to
 });
 
 test('the summary counts every run of every repetition and names the failing tests', () => {
-  // The shape Playwright 1.62's JSON reporter writes for `--repeat-each=3`:
+  // The shape Playwright's JSON reporter writes (1.62 through 1.65) for `--repeat-each=3`:
   // one spec entry per repetition, describe blocks as nested suites.
   const report = {
     suites: [{
@@ -100,6 +100,18 @@ test('the summary counts every run of every repetition and names the failing tes
     failures: [{ id: 'tests/browser/shape.spec.mjs:4 › group › flips', failed: 1, runs: 3 }],
     errors: [],
   });
+  // Tests a spec file declares through a helper carry the helper as their
+  // `file`; each is named by the file that runs it, and two files declaring
+  // the same title through one helper stay two tests.
+  const declared = file => ({
+    title: file,
+    file,
+    specs: [{ title: 'walks', file: 'helpers/walk.mjs', line: 9, tests: [{ status: 'unexpected' }] }],
+  });
+  assert.deepEqual(summarizeRepeatReport({ suites: [declared('walk-1.spec.mjs'), declared('walk-2.spec.mjs')], errors: [] }).failures, [
+    { id: 'tests/browser/walk-1.spec.mjs (helpers/walk.mjs:9) › walks', failed: 1, runs: 1 },
+    { id: 'tests/browser/walk-2.spec.mjs (helpers/walk.mjs:9) › walks', failed: 1, runs: 1 },
+  ]);
   assert.deepEqual(summarizeRepeatReport({ suites: [], errors: [{ message: 'Error: No tests found.' }] }).errors, [
     'Error: No tests found.',
   ]);

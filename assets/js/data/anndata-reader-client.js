@@ -45,7 +45,7 @@ import { DataMappingError } from './data-mapping.js';
 import { confirmSourceUnreadable, confirmSourceVersion, onSourceAccessRevoked, resolveSourceAccess } from './sources/access.js';
 import { annDataReaderWorkerScript } from '../../workers/scripts.js';
 import { startWorker } from '../workers/worker-script.js';
-import { workerFailureReason } from '../workers/worker-failure.js';
+import { explainWorkerFailure, noteWorkerScript } from '../workers/worker-failure.js';
 import { hostRequesterPort } from '../formats/io/host-fetch.js';
 import { byteRangeCachePort } from './byte-range-cache.js';
 import { connectMemoryWorker } from './memory-budget.js';
@@ -66,7 +66,7 @@ function plainDetails(details) {
 }
 
 function createDefaultWorker() {
-  return startWorker(annDataReaderWorkerScript(), { type: 'module' });
+  return noteWorkerScript(startWorker(annDataReaderWorkerScript(), { type: 'module' }), annDataReaderWorkerScript());
 }
 
 let workerFactory = createDefaultWorker;
@@ -385,12 +385,14 @@ export class AnnDataReaderClient {
       if (!heard) {
         // Its script failed to load (a page that outlived its deploy, a
         // module this browser cannot run): nothing posted to it will be
-        // answered. It is retired, every call waiting on it fails saying
-        // so, and the next call starts a new worker.
-        this._retireWorker(new Error(
-          `The AnnData reader could not start (${workerFailureReason(event)}). ` +
+        // answered. It is retired now, every call waiting on it fails
+        // saying why once that is found (`explainWorkerFailure`: the
+        // browser itself says nothing), and the next call starts a new
+        // worker.
+        this._retireWorker(explainWorkerFailure(worker, event).then(reason => new Error(
+          `The AnnData reader could not start (${reason}). ` +
           'Reload the page; if Cellucid was just updated, the reload loads the new version.'
-        ));
+        )));
         return;
       }
       // A stray error in a live worker (a timer, a port's handler): it goes
@@ -647,16 +649,22 @@ export class AnnDataReaderClient {
 
   /**
    * Retire a worker that cannot answer (its script failed to load): ended
-   * from outside, every call waiting on it failed with `error`, and the next
-   * call starts a new one (reopening the file, `_callWith`).
+   * from outside at once, every call waiting on it failed with `failure`
+   * once that is known, and the next call starts a new one (reopening the
+   * file, `_callWith`).
+   * @param {Promise<Error>} failure
    * @private
    */
-  _retireWorker(error) {
+  _retireWorker(failure) {
     const worker = this._worker;
     if (worker === null) return;
     this._worker = null;
     this._reopening = null;
-    this._failAll(error);
+    const waiting = [...this._pending.values()];
+    this._pending.clear();
+    void failure.then(error => {
+      for (const entry of waiting) entry.reject(error);
+    });
     worker.terminate?.();
     this._takeRangeCacheClose()?.();
     this._releaseMemoryChannel();

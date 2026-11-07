@@ -12,6 +12,7 @@ import { applyUndoRedo, takeSteps, waitForHistory } from './helpers/state-histor
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
+import { whenActionsShown } from './helpers/dataset-ready.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=actions-camera-path`;
@@ -36,6 +37,8 @@ async function openCameraPath(page) {
   await page.locator('#cinematic-camera-section > summary').click();
   // A change recorded by observation is a step only once the history records.
   await waitForHistory(page);
+  // The section's opening is a step: its History row is drawn before a click below it.
+  await whenActionsShown(page);
   // Every dispatch, in order, as {type, params}; a failed one with its
   // message; a camera path setting a control made and the history recorded
   // from its event (no dispatch: the control is the setting) with `observed`.
@@ -67,6 +70,9 @@ async function takeDispatched(page) {
     const { getActions } = await import('/assets/js/app/actions/index.js');
     await new Promise(resolve => setTimeout(resolve, 0));
     await getActions().idle();
+    // And shown: the History panel above draws the step's row on a later
+    // frame, moving the controls the next click aims at (`whenActionsShown`).
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     const taken = window.__dispatched;
     window.__dispatched = [];
     return taken;

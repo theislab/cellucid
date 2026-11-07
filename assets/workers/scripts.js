@@ -5,7 +5,7 @@
 import { workerScript } from '../js/workers/worker-script.js';
 
 /** @returns {URL} assets/js/data/anndata-reader-worker.js */
-export const annDataReaderWorkerScript = () => workerScript(import.meta.url, '../js/data/anndata-reader-worker.js', './anndata-reader-worker.867234dcdc72.js');
+export const annDataReaderWorkerScript = () => workerScript(import.meta.url, '../js/data/anndata-reader-worker.js', './anndata-reader-worker.0c1c38f8455c.js');
 /** @returns {URL} assets/js/app/ui/modules/benchmark/generation-worker.js */
 export const benchmarkGenerationWorkerScript = () => workerScript(import.meta.url, '../js/app/ui/modules/benchmark/generation-worker.js', './generation-worker.ae77b6362e8e.js');
 /** @returns {URL} assets/js/app/analysis/compute/data-worker.js */

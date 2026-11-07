@@ -7,7 +7,7 @@
  */
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { chooseDirectory } from './directory-upload.mjs';
+import { chooseFiles } from './file-input.mjs';
 
 export async function filePayload(filePath, name = path.basename(filePath)) {
   return { name, base64: (await readFile(filePath)).toString('base64') };
@@ -143,5 +143,5 @@ export async function openZarrFolder(page, browserName, directory) {
     await dragAndDrop(page, drag);
     return;
   }
-  await chooseDirectory(page.locator('#user-data-folder-input'), directory);
+  await chooseFiles(page.locator('#user-data-folder-input'), directory);
 }

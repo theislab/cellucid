@@ -23,6 +23,16 @@
  * asked for before any setter gave it (or all at once, `primeGlState`, where
  * the context is made); every later read is a property read.
  *
+ * A context the browser loses and restores is the same object with every
+ * value back at its initial one, as a new context has them. The wrapped
+ * setters survive the loss; what the shadow knew does not: `primeGlState` on
+ * the restored context forgets it and reads every value again. Without that
+ * the shadow went on answering the values from before the loss while the
+ * context had its initial ones (measured in Firefox 159 after
+ * `WEBGL_lose_context`: the shadow's clear colour was the background, the
+ * context's own transparent black, and the pulse's sample reset drew the
+ * former where whole frames cleared to the latter).
+ *
  * What it does not do: validate. A setter given a value WebGL refuses (an
  * unknown enum, which records an error and changes nothing) is recorded as if
  * it had been accepted; the renderers pass only valid values.
@@ -44,6 +54,9 @@ const CAPABILITY_NAMES = Object.freeze([
   'STENCIL_TEST',
 ]);
 
+/** The shadow's own reset, reachable only from this module. */
+const FORGET = Symbol('forget');
+
 /** @type {WeakMap<object, ReturnType<typeof createShadow>>} */
 const shadows = new WeakMap();
 
@@ -57,6 +70,11 @@ function createShadow(gl) {
     if (Number.isInteger(gl[name])) tracked.add(gl[name]);
   }
   const known = new Map();
+  /** Forget every value: the next read of each asks the context again. */
+  const forget = () => {
+    capabilities.clear();
+    known.clear();
+  };
   const read = (key, query) => {
     if (!known.has(key)) known.set(key, query());
     return known.get(key);
@@ -116,6 +134,8 @@ function createShadow(gl) {
   });
 
   const shadow = Object.freeze({
+    /** @private Used by `primeGlState` only. */
+    [FORGET]: forget,
     /** Whether a tracked capability is on, as `gl.isEnabled` answers. */
     isEnabled(capability) {
       if (!tracked.has(capability)) {
@@ -174,16 +194,19 @@ function createShadow(gl) {
 }
 
 /**
- * Read every value of `gl`'s shadow now (`glStateOf`), where the context is
- * made and nothing is queued yet, instead of the first time a pass asks for
- * one: a first read during a frame of a large view waits for that whole
- * frame (0.2 s for `colorMask`, first read by the GPU permute's source draw
- * during a 100M-point adoption).
+ * Read every value of `gl`'s shadow from the context now (`glStateOf`),
+ * forgetting what it knew: where the context is made and nothing is queued
+ * yet, instead of the first time a pass asks for one (a first read during a
+ * frame of a large view waits for that whole frame: 0.2 s for `colorMask`,
+ * first read by the GPU permute's source draw during a 100M-point adoption),
+ * and again where the browser restores a lost context, whose every value is
+ * back at its initial one.
  *
  * @param {WebGL2RenderingContext} gl
  */
 export function primeGlState(gl) {
   const shadow = glStateOf(gl);
+  shadow[FORGET]();
   for (const name of CAPABILITY_NAMES) {
     if (Number.isInteger(gl[name])) shadow.isEnabled(gl[name]);
   }

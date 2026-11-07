@@ -197,6 +197,36 @@ card's resource, a call after the pairing has been idle (hibernated), refresh-to
 reuse, ChatGPT's and Claude Code's client metadata documents, and Forget ending every
 connection. It prints PASS or FAIL per check and no token.
 
+## Listing in MCP directories (owner)
+
+`server.json` here is the relay's entry for the official MCP Registry
+(registry.modelcontextprotocol.io, schema `2025-12-11`), which other directories (GitHub's
+MCP registry, VS Code, PulseMCP, Glama) read from. It names the remote
+(`streamable-http`, `https://mcp.cellucid.com`) and the release; nothing is installed.
+Its name is in the domain namespace `com.cellucid/`, proven by a DNS TXT record on the apex
+`cellucid.com` (the registry's HTTP proof follows no redirect, and the apex redirects to
+`www`). A published version cannot be changed: publish once per release, after the release's
+deploy.
+
+```text
+brew install mcp-publisher            # or a release binary of modelcontextprotocol/registry
+openssl genpkey -algorithm Ed25519 -out mcp-registry.pem   # OpenSSL 3, not macOS LibreSSL; keep it secret
+openssl pkey -in mcp-registry.pem -pubout -outform DER | tail -c 32 | base64
+# DNS (Cloudflare, zone cellucid.com): TXT on cellucid.com
+#   v=MCPv1; k=ed25519; p=<the base64 line above>
+mcp-publisher login dns --domain cellucid.com --private-key "$(openssl pkey -in mcp-registry.pem -noout -text | grep -A3 'priv:' | tail -n +2 | tr -d ' :\n')"
+mcp-publisher validate relay/server.json
+mcp-publisher publish relay/server.json
+```
+
+`tests/mcp-registry-contract.test.mjs` keeps the file in the registry's shape, its remote the
+deployed address and its version the release. The Claude connector directory
+(claude.ai/directory/manage) and ChatGPT's (platform.openai.com) take a submission with the
+privacy policy (`https://www.cellucid.com/privacy.html`), the documentation
+(`https://docs.cellucid.com/en/latest/user_guide/web_app/g_agents/02_connect_claude_and_chatgpt.html`),
+a support contact and reviewer instructions; every tool already carries a title and
+`readOnlyHint`, `destructiveHint` and `openWorldHint` (`mcp-tools.js`).
+
 **Tests:** `tests/relay-oauth.test.mjs`, `tests/relay-mcp.test.mjs` (the Worker on an
 in-memory Workers runtime, `tests/helpers/relay-runtime.mjs`),
 `tests/relay-bundle-contract.test.mjs`, `tests/agent-relay-client.test.mjs`,

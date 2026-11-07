@@ -294,6 +294,14 @@ class NotificationCenter {
     this._overflowExpanded = false;
     this.initialized = false;
     this._releaseModalAuxiliary = null;
+    // The places of cards that have left, kept while the pointer is over the
+    // stack (`_retire`), and whether it is (`_followPointer`).
+    /** @type {Set<HTMLElement>} */
+    this._keptPlaces = new Set();
+    this._pointerOverStack = false;
+    this._followingPointer = false;
+    this._overflowWaiting = false;
+    this._followPointer = this._followPointer.bind(this);
 
     // Track active downloads for speed calculation
     this.downloadTrackers = new Map();
@@ -332,6 +340,7 @@ class NotificationCenter {
 
     document.body.appendChild(this.container);
     this._publishStackBlockSize();
+    this._holdStackUnderPointer();
     // The phone layout (layouts/_responsive.css: the sidebar a full-screen
     // sheet below 721 px) keeps two cards on screen.
     const phone = document.defaultView?.matchMedia?.('(max-width: 720px)') ?? null;
@@ -385,6 +394,87 @@ class NotificationCenter {
       );
     };
     new View.ResizeObserver(publish).observe(container);
+  }
+
+  /**
+   * Keep the cards still on screen where they are while the pointer is over
+   * the stack. The stack stands on the bottom edge, so a card leaving lets
+   * every card above it fall by its height: a person aiming at a card's
+   * Dismiss as another card left (an expiry, a dismissal, a card retired to
+   * make room) had the button move from under the pointer between press and
+   * release, and the click landed on the plot behind it (Web app tests run
+   * 42385814622, WebKit, `empty-dataset-state.spec.mjs`: the button fell
+   * 40 px). A card that has left keeps its place, empty, until the pointer
+   * leaves the stack's area, gaps between cards included; then the stack
+   * closes up at once. A tap holds it until the next press elsewhere. The
+   * earlier-messages control under the stack waits the same way
+   * (`_evictNonActiveUntil`).
+   */
+  _holdStackUnderPointer() {
+    this.container.addEventListener('pointerenter', () => {
+      this._pointerOverStack = true;
+      this._stopFollowingPointer();
+    });
+    // The stack lets the pointer through between its cards (pointer-events:
+    // none), so leaving a card is not yet leaving the stack.
+    this.container.addEventListener('pointerleave', event => {
+      this._pointerOverStack = false;
+      this._followPointer(event);
+    });
+  }
+
+  /** Whether `event`'s point is in the stack's area; the kept places go once it is not. */
+  _followPointer(event) {
+    if (this._pointerOverStack) return;
+    const box = this.container.getBoundingClientRect();
+    const inside = event.type !== 'blur'
+      && event.clientX >= box.left && event.clientX <= box.right
+      && event.clientY >= box.top && event.clientY <= box.bottom;
+    if (inside) {
+      if (!this._followingPointer) {
+        this._followingPointer = true;
+        for (const type of ['pointermove', 'pointerdown']) {
+          document.addEventListener(type, this._followPointer, { capture: true, passive: true });
+        }
+        document.defaultView?.addEventListener('blur', this._followPointer);
+      }
+      return;
+    }
+    this._stopFollowingPointer();
+    for (const spacer of this._keptPlaces) spacer.remove();
+    this._keptPlaces.clear();
+    if (this._overflowWaiting) this._renderOverflow();
+  }
+
+  _stopFollowingPointer() {
+    if (!this._followingPointer) return;
+    this._followingPointer = false;
+    for (const type of ['pointermove', 'pointerdown']) {
+      document.removeEventListener(type, this._followPointer, { capture: true });
+    }
+    document.defaultView?.removeEventListener('blur', this._followPointer);
+  }
+
+  /**
+   * Take a card that has finished leaving off the stack. While the pointer is
+   * over the stack an empty spacer of the card's size takes its place
+   * (`_holdStackUnderPointer`): its size too, since the stack is as wide as
+   * its widest card and a narrower stack would reflow the others.
+   */
+  _retire(element) {
+    if (element.parentNode === null) return;
+    if (this._pointerOverStack || this._followingPointer) {
+      const { width, height } = element.getBoundingClientRect();
+      const spacer = document.createElement('div');
+      spacer.className = 'notification-spacer';
+      spacer.setAttribute('aria-hidden', 'true');
+      spacer.style.inlineSize = `${width}px`;
+      spacer.style.blockSize = `${height}px`;
+      element.replaceWith(spacer);
+      this._keptPlaces.add(spacer);
+      return;
+    }
+    element.remove();
   }
 
   /**
@@ -953,7 +1043,11 @@ class NotificationCenter {
         message: typeof options.message === 'string' ? options.message : null,
       });
       this.dismiss(candidateId);
-      this._renderOverflow();
+      // The control sits under the stack, so it appearing or its open list
+      // growing lifts every card: it waits while the pointer is over the
+      // stack (`_holdStackUnderPointer`).
+      if (this._pointerOverStack || this._followingPointer) this._overflowWaiting = true;
+      else this._renderOverflow();
     }
   }
 
@@ -963,6 +1057,7 @@ class NotificationCenter {
    */
   _renderOverflow() {
     if (!this.initialized || this.container === null) return;
+    this._overflowWaiting = false;
     const count = this.overflowMessages.length;
     if (count === 0) {
       this._overflowElement?.remove();
@@ -1107,11 +1202,7 @@ class NotificationCenter {
     element.classList.add('notification-exit');
 
     // Remove after animation
-    setTimeout(() => {
-      if (element.parentNode) {
-        element.parentNode.removeChild(element);
-      }
-    }, 300);
+    setTimeout(() => this._retire(element), 300);
     return true;
   }
 

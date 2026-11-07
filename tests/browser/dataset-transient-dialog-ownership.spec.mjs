@@ -1,11 +1,26 @@
+/**
+ * A dataset replaced under an open category editor or confirmation retires
+ * it: what it would have done is never applied to the dataset shown after,
+ * even one with the same fields at the same indices.
+ *
+ * - The inline category editor is no dialog: the person replaces the dataset
+ *   from the picker beside it.
+ * - A confirmation is modal: the rest of the page is inert while it is open,
+ *   so the person answers or closes it first. The dataset changes under it
+ *   when an agent opens one (`dataset.open`), here the same file again as a
+ *   link: the confirmation closes, and its stale button does nothing.
+ */
 import { expect, test } from './helpers/test.mjs';
+import { openDatasetAsAgent } from './helpers/agent-dataset-open.mjs';
 import { dispatchAppDrag } from './helpers/app-drag.mjs';
-import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=dataset-transient-ownership-ci`;
 const DATASET_OPTION = 'dataset:local-demo:current-ui';
+// The catalog's own file, opened as a link: a new dataset with the same fields.
+const SAME_FILE_LINK = `${SAMPLE_ORIGIN}/tests/browser/fixtures/catalog/current-ui.h5ad`;
 
 function observeProductErrors(page) {
   const errors = [];
@@ -33,13 +48,46 @@ async function openPreparedDataset(page) {
   );
 }
 
-async function replaceWithFreshPreparedDataset(page) {
+/** The person closes the dataset and opens it again from the picker. */
+async function replaceFromPicker(page) {
   await page.locator('#dataset-select').selectOption('__none__');
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await page.locator('#dataset-select').selectOption(DATASET_OPTION);
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture',
   );
+}
+
+/**
+ * An agent opens the same file as a link while a confirmation is open; the
+ * confirmation closes, so the page is the person's again.
+ */
+async function replaceUnderConfirmation(page) {
+  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(1);
+  // The premise: the picker is out of the person's reach under the dialog.
+  expect(await isInert(page.locator('#dataset-select'))).toBe(true);
+  const priorGeneration = await page.evaluate(
+    () => window._cellucidState.getDatasetGeneration(),
+  );
+  const opened = await openDatasetAsAgent(page, { name: SAME_FILE_LINK });
+  expect(opened.outcome).toMatchObject({
+    name: 'Current UI fixture',
+    kind: 'link',
+    already_open: false,
+  });
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI fixture',
+  );
+  expect(await page.evaluate(
+    () => window._cellucidState.getDatasetGeneration(),
+  )).toBeGreaterThan(priorGeneration);
+  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+  expect(await isInert(page.locator('#dataset-select'))).toBe(false);
+}
+
+/** Whether an element is inside an inert subtree (out of a person's reach). */
+function isInert(locator) {
+  return locator.evaluate(element => element.closest('[inert]') !== null);
 }
 
 async function selectCellType(page) {
@@ -79,7 +127,7 @@ test('dataset replacement retires a category editor before same-index reuse', as
     () => window._cellucidState.getDatasetGeneration(),
   );
 
-  await replaceWithFreshPreparedDataset(page);
+  await replaceFromPicker(page);
   await selectCellType(page);
   const before = await readObsFieldContract(page);
   expect(before.generation).toBeGreaterThan(priorGeneration);
@@ -112,7 +160,7 @@ test('dataset replacement retires category deletion confirmation ownership', asy
     .elementHandle();
   expect(staleConfirm).not.toBeNull();
 
-  await replaceWithFreshPreparedDataset(page);
+  await replaceUnderConfirmation(page);
   await selectCellType(page);
   const before = await readObsFieldContract(page);
   await staleConfirm.evaluate(button => button.click());
@@ -150,7 +198,7 @@ test('dataset replacement retires category merge confirmation ownership', async 
     .elementHandle();
   expect(staleConfirm).not.toBeNull();
 
-  await replaceWithFreshPreparedDataset(page);
+  await replaceUnderConfirmation(page);
   await selectCellType(page);
   const before = await readObsFieldContract(page);
   await staleConfirm.evaluate(button => button.click());
@@ -186,9 +234,7 @@ test('dataset replacement retires deleted-field purge confirmation ownership', a
     .elementHandle();
   expect(staleConfirm).not.toBeNull();
 
-  await replaceWithFreshPreparedDataset(page);
-  await page.keyboard.press('Escape');
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+  await replaceUnderConfirmation(page);
   await page.locator('#continuous-field').selectOption({ label: 'score' });
   await page.locator('#delete-continuous-field').click();
   await page.locator('.confirm-dialog-confirm').click();

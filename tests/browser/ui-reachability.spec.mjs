@@ -230,6 +230,12 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await openingDone(page);
+  // A phone opens on the plot with the panel closed, and a closed panel is
+  // `inert` (`sidebar-controls.js`): its field is chosen, as a person does,
+  // once the panel is open. Playwright 1.65 waits on an inert target
+  // ("now times out if the element stays inert", release notes), where
+  // earlier versions drove it through the closed panel.
+  await setSheetOpen(page, true);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await dismissNotifications(page);
@@ -385,8 +391,13 @@ for (const layout of LAYOUTS) {
       await page.locator('#analysis-header-genesPanel').click();
       // The window is sized from the row: copied once the row has filled in.
       await expect(page.locator('#analysis-panel-genesPanel')).not.toHaveAttribute('aria-busy', 'true');
+      // Clicked as a person does: Playwright presses it only once it is
+      // still, enabled, not inert and what the press lands on. A forced
+      // click skipped every one of those and once opened no window, on a
+      // phone in WebKit (1 run in 750, 2026-11-07 audit), with nothing to
+      // say what took the press.
       await page.locator('.analysis-mode[data-mode="genesPanel"] .analysis-mode-copy-btn')
-        .click({ force: true });
+        .click();
       const analysisWindow = page.locator('#floating-panels-root .analysis-window-frame');
       await expect(analysisWindow).toHaveCount(1);
       // Its copy of the analysis fills in too (`aria-busy` until it has).

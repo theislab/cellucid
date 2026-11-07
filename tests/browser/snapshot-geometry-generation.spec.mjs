@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { isFirefoxSafeResolveReorderingWarning } from './helpers/engine-console.mjs';
 
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -9,6 +10,7 @@ test('same-reference live publication preserves immutable kept-view geometry', a
   const responseFailures = [];
   page.on('pageerror', error => browserErrors.push(error.message));
   page.on('console', message => {
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     if (message.type() === 'error' || message.type() === 'warning') {
       const diagnostic = `${message.type()}: ${message.text()}`;
       if (!/GPU stall due to ReadPixels/i.test(diagnostic)) {
