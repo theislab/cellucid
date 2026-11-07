@@ -30,6 +30,7 @@ import {
 } from '../assets/js/app/ui/modules/field-interaction-owner.js';
 import { beginCellsChange, beginCellsChangeOnceSettled } from '../assets/js/data/open-cells-work.js';
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { getActions } from '../assets/js/app/actions/index.js';
 import { abortReason, cancelled } from '../assets/js/utils/abort.js';
 import {
   createFakeDocument,
@@ -258,6 +259,49 @@ test('a gene chosen while the open cells change is shown on the cells after the 
   assert.equal(state.activeVarFieldIndex, 1);
   (await nextChange)();
   assert.equal(changeBegan, true);
+  await owner.destroy();
+});
+
+test('a gene chosen is named and holds the field menus through every refresh until its choice ends', async t => {
+  // Found in CI (the obs menus' twin, `h5ad-ui-smoke.spec.mjs`): a refresh
+  // of the selector while a choice was under way (the gene list read after
+  // the first view, an annotation change) put back what was shown and
+  // erased the choice. The choice under way is what a refresh names.
+  recordNotifications(t);
+  const { loads, onLoad } = heldLoads();
+  const owner = createFieldInteractionOwner();
+  const { api, dom, shown } = mountGeneSelector(exportedGenes('CD3E', 'AC058791.1'), {
+    onLoad,
+    interactionOwner: owner,
+  });
+  // The action waits its turn (as behind a change of the open cells, or a
+  // history move): the dispatcher's gate is held.
+  let openGate;
+  getActions().setGate(() => new Promise(resolve => { openGate = resolve; }));
+  t.after(() => getActions().setGate(() => undefined));
+
+  search(dom, 'AC058791.1');
+  press(dom, 'Enter');
+  await settleTurn();
+  assert.deepEqual(loads, [], 'the action waits its turn');
+  assert.equal(api.isChoosing(), true);
+  api.syncFromState();
+  assert.equal(dom.geneSearch.value, 'AC058791.1', 'a refresh names the choice waiting its turn');
+
+  openGate();
+  await settleTurn();
+  assert.deepEqual(loads.map(load => load.index), [1]);
+  assert.equal(api.isChoosing(), true);
+  api.initGeneExpressionDropdown();
+  api.syncFromState();
+  assert.equal(dom.geneSearch.value, 'AC058791.1', 'a refresh names the choice being read');
+
+  loads[0].resolve();
+  await settleTurn();
+  assert.deepEqual(shown, ['AC058791.1']);
+  assert.equal(api.isChoosing(), false);
+  api.syncFromState();
+  assert.equal(dom.geneSearch.value, 'AC058791.1');
   await owner.destroy();
 });
 

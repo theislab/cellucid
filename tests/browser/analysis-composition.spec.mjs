@@ -5,6 +5,7 @@
  * and the "cells as replicates" notice without samples.
  */
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
 import { appUrl } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -152,10 +153,10 @@ test('finds its fields, counts without a condition, then tests across samples', 
   await expect(modal.locator('.analysis-modal-plot .js-plotly-plot .boxlayer')).toHaveCount(1);
   const results = page.waitForEvent('download');
   await modal.getByRole('button', { name: /^CSV/ }).click();
-  expect((await results).suggestedFilename()).toBe('composition_results.csv');
+  await expectDownloadNamed(await results, 'composition_results.csv');
   const counts = page.waitForEvent('download');
   await modal.getByRole('button', { name: 'Counts CSV' }).click();
-  expect((await counts).suggestedFilename()).toBe('composition_counts.csv');
+  await expectDownloadNamed(await counts, 'composition_counts.csv');
   expect(errors).toEqual([]);
 });
 

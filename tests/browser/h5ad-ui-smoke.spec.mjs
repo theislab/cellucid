@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
+import { isFirefoxSafeResolveReorderingWarning } from './helpers/engine-console.mjs';
+import { whenActionsShown } from './helpers/dataset-ready.mjs';
 import { openZarrFolder } from './helpers/dataset-drop.mjs';
 import { shownDomainValue, startingViewBytes } from './helpers/session-files.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, appUrl } from './helpers/origins.mjs';
@@ -519,6 +521,99 @@ test(
   },
 );
 
+test(
+  'the field menus name and hold the choice under way through every refresh of them',
+  async ({ page }) => {
+    const browserErrors = [];
+    page.on('console', message => {
+      if (message.type() === 'error') {
+        browserErrors.push(`console: ${message.text()}`);
+      }
+    });
+    page.on('pageerror', error => {
+      browserErrors.push(`page: ${error.stack || error.message}`);
+    });
+    /** Every request for `url` waits until `release()`. */
+    const holdRequests = async url => {
+      let release;
+      const gate = new Promise(resolve => {
+        release = resolve;
+      });
+      const held = { requests: 0, release };
+      await page.route(url, async route => {
+        held.requests++;
+        await gate;
+        await route.continue();
+      });
+      return held;
+    };
+    // A refresh of the menus that is no field change: the community
+    // annotation connection changing (`connection-events.js`). Its listeners
+    // run before `dispatchEvent` returns.
+    const refreshMenus = () => page.evaluate(() => {
+      window.dispatchEvent(new CustomEvent('cellucid:annotation-connection-changed', { detail: null }));
+    });
+
+    // The gene list of a dataset just shown is read after its first view
+    // (`DataState.listPublishedGenes`), and its arrival refreshes the menus
+    // (`genes:listed`). Found in CI: it landed while a categorical choice was
+    // read, and the menu said None until the read ended.
+    const geneNames = await holdRequests(`${FORMS_CATALOG_URL}forms-zarr.zarr/var/_index/0`);
+    await page.goto(
+      `/?sampleCatalog=${encodeURIComponent(FORMS_CATALOG_URL)}&dataset=forms-zarr&acceptance=session-field-owner-ci`,
+      { waitUntil: 'domcontentloaded' },
+    );
+    await dismissWelcome(page);
+    await openCollapsedPanels(page);
+    await expect(page.locator('#dataset-cells')).toHaveText('48');
+    await expect.poll(() => geneNames.requests).toBeGreaterThan(0);
+    const search = page.locator('#gene-expression-search');
+    await expect(search).toHaveAttribute('placeholder', 'Reading gene names…');
+
+    const codes = await holdRequests(`${FORMS_CATALOG_URL}forms-zarr.zarr/obs/stage/codes/0`);
+    const categorical = page.locator('#categorical-field');
+    const continuous = page.locator('#continuous-field');
+    await categorical.selectOption({ label: 'stage' });
+    await expect.poll(() => codes.requests).toBe(1);
+    await expect(categorical.locator('option:checked')).toHaveText('stage');
+    await expect(categorical).toBeDisabled();
+
+    // The gene list arrives while the choice is read: the refresh it makes
+    // has ended once the search offers the genes.
+    geneNames.release();
+    await expect(search).toHaveAttribute('placeholder', 'Search genes…');
+    await expect(categorical.locator('option:checked')).toHaveText('stage');
+    await expect(categorical).toBeDisabled();
+    await expect(continuous).toBeDisabled();
+    await refreshMenus();
+    await expect(categorical.locator('option:checked')).toHaveText('stage');
+    await expect(categorical).toBeDisabled();
+
+    codes.release();
+    await expect(categorical).toBeEnabled();
+    await expect(categorical.locator('option:checked')).toHaveText('stage');
+
+    // A gene chosen while "stage" is shown: the menus show no obs field and
+    // stay held while it is read, whatever refreshes them.
+    const gene = await page.evaluate(() => window._cellucidState.getVarFields()[0].key);
+    const expression = await holdRequests(`${FORMS_CATALOG_URL}forms-zarr.zarr/X/**`);
+    await search.fill(gene);
+    await search.press('Enter');
+    await expect.poll(() => expression.requests).toBeGreaterThan(0);
+    await expect(categorical.locator('option:checked')).toHaveText('None');
+    await refreshMenus();
+    await expect(search).toHaveValue(gene);
+    await expect(categorical.locator('option:checked')).toHaveText('None');
+    await expect(categorical).toBeDisabled();
+
+    expression.release();
+    await expect(categorical).toBeEnabled();
+    await expect(search).toHaveValue(gene);
+    await expect(categorical.locator('option:checked')).toHaveText('None');
+    expect(browserErrors).toEqual([]);
+  },
+);
+
 test('an advertised sample applies one verified static state without camera motion', async ({ page }, testInfo) => {
   const browserErrors = [];
   page.on('console', message => {
@@ -611,6 +706,7 @@ test('a published no-vector sample replaces a prior vector-field select generati
   const browserErrors = [];
   const browserDiagnostics = [];
   page.on('console', message => {
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     if (
       message.type() === 'warning'
       && /GL Driver Message .*GPU stall due to ReadPixels/.test(message.text())
@@ -744,12 +840,18 @@ test('camera path state round-trips every owned control and commits autoplay', a
   await openCollapsedPanels(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await page.locator('#cinematic-camera-section > summary').click();
+  // Each is a step whose History row moves the controls below it.
+  await whenActionsShown(page);
   await page.locator('#cinematic-save-btn').click();
+  await whenActionsShown(page);
   await page.locator('#cinematic-save-btn').click();
   await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
+  await whenActionsShown(page);
 
   await page.locator('.cinematic-duration-input').first().fill('10');
   await page.locator('.cinematic-duration-input').first().dispatchEvent('change');
+  // Each change below is a step too: shown before the next click in the sidebar.
+  await whenActionsShown(page);
   await page.locator('.cinematic-loopback-list-toggle').check();
   await page.locator('#cinematic-position-interp').selectOption('linear');
   await page.locator('#cinematic-rotation-interp').selectOption('linear');
@@ -776,7 +878,9 @@ test('camera path state round-trips every owned control and commits autoplay', a
     setRange('move-speed', '234');
     setCheckbox('invert-look', true);
   });
+  await whenActionsShown(page);
   await page.locator('#cinematic-loop').check();
+  await whenActionsShown(page);
   await page.locator('#cinematic-autoplay').check();
   await expect(page.locator('.cinematic-play-btn')).toHaveAttribute('title', 'Pause');
 
@@ -787,8 +891,11 @@ test('camera path state round-trips every owned control and commits autoplay', a
   await download.saveAs(sessionPath);
 
   await page.locator('[data-action="stop"]').click();
+  await whenActionsShown(page);
   await page.locator('#cinematic-clear-btn').click();
+  await whenActionsShown(page);
   await page.locator('#cinematic-loop').uncheck();
+  await whenActionsShown(page);
   await page.locator('#cinematic-autoplay').uncheck();
   await page.locator('#navigation-mode').selectOption('free');
   await page.locator('#cinematic-position-interp').selectOption('catmull-rom');

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -86,6 +87,50 @@ function send(response, statusCode, message, allowCors) {
   response.end(body);
 }
 
+function sendBytes(request, response, bytes, contentType, allowCors) {
+  response.writeHead(200, {
+    ...(allowCors ? { 'Access-Control-Allow-Origin': '*' } : {}),
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+    'Content-Length': bytes.length,
+    'Content-Type': contentType,
+  });
+  response.end(request.method === 'HEAD' ? undefined : bytes);
+}
+
+// The page as deployed names the published sample catalog. Here it names the
+// suite's own: a spec's page never depends on the published site by opening
+// the app (`tests/browser/helpers/outside-requests.mjs`), whatever its
+// address, and a spec about another catalog still names it (`?sampleCatalog=`).
+async function servedIndexPage(request) {
+  const html = await readFile(path.join(repositoryRoot, 'index.html'), 'utf8');
+  const catalog = `http://${request.headers.host}/tests/browser/fixtures/catalog/`;
+  const page = html.replace(
+    /(<meta name="cellucid-sample-catalog" content=")[^"]*(")/,
+    (_, before, after) => before + catalog + after
+  );
+  if (page === html) throw new Error('index.html names no sample catalog to serve the suite\'s own in');
+  return Buffer.from(page);
+}
+
+// The web asset inventory this server publishes describes the bytes it serves.
+// Its `index.html` is the rewritten page above, not the file on disk, so that
+// entry's SHA-256 and size are the served page's: a client that verifies the
+// site against its inventory (the Python and R packages' web cache, given
+// `--web-source-url` this server, the documented way to run a local build)
+// accepts the page it is actually given.
+async function servedInventory(request) {
+  const published = JSON.parse(
+    await readFile(path.join(repositoryRoot, 'cellucid-web-assets.json'), 'utf8')
+  );
+  const page = await servedIndexPage(request);
+  const entry = published.assets?.find(asset => asset?.path === 'index.html');
+  if (entry === undefined) throw new Error('The web asset inventory declares no index.html');
+  entry.sha256 = createHash('sha256').update(page).digest('hex');
+  entry.bytes = page.length;
+  return Buffer.from(`${JSON.stringify(published, null, 2)}\n`);
+}
+
 async function serve(request, response) {
   const allowCors = request.socket.localPort === samplePort;
   if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -145,27 +190,12 @@ async function serve(request, response) {
     return;
   }
 
-  // The page as deployed names the published sample catalog. Here it names the
-  // suite's own: a spec's page never depends on the published site by opening
-  // the app (`tests/browser/helpers/outside-requests.mjs`), whatever its
-  // address, and a spec about another catalog still names it (`?sampleCatalog=`).
   if (portableRelative === 'index.html') {
-    const html = await readFile(candidate, 'utf8');
-    const catalog = `http://${request.headers.host}/tests/browser/fixtures/catalog/`;
-    const page = html.replace(
-      /(<meta name="cellucid-sample-catalog" content=")[^"]*(")/,
-      (_, before, after) => before + catalog + after
-    );
-    if (page === html) throw new Error('index.html names no sample catalog to serve the suite\'s own in');
-    const bytes = Buffer.from(page);
-    response.writeHead(200, {
-      ...(allowCors ? { 'Access-Control-Allow-Origin': '*' } : {}),
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'no-store',
-      'Content-Length': bytes.length,
-      'Content-Type': contentType,
-    });
-    response.end(request.method === 'HEAD' ? undefined : bytes);
+    sendBytes(request, response, await servedIndexPage(request), contentType, allowCors);
+    return;
+  }
+  if (portableRelative === 'cellucid-web-assets.json') {
+    sendBytes(request, response, await servedInventory(request), contentType, allowCors);
     return;
   }
 

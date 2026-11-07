@@ -130,15 +130,24 @@ const INTERACTIVE_SPATIAL_INDEX_POINT_THRESHOLD = 250_000;
 // API mutation, viewer input, a canvas resize, or a time-driven animation.
 // Drawing continues after the last such cause until FRAME_SETTLE_MIN_FRAMES
 // frames have been drawn, and then stops. Every multi-frame convergence is a
-// named cause of its own (camera settlement, LOD hysteresis, fades, smoke),
-// so the floor only has to cover the frame that shows a change. There is no
-// wall-clock window on top: it kept a fast display drawing 60–120 identical
-// frames after every change, and a slow renderer never reached its second
-// frame inside it anyway.
+// named cause of its own (camera settlement, LOD hysteresis, fades, a
+// particle table being built), so the floor only has to cover the frame that
+// shows a change. There is no wall-clock window on top: it kept a fast
+// display drawing 60–120 identical frames after every change, and a slow
+// renderer never reached its second frame inside it anyway.
 const FRAME_SETTLE_MIN_FRAMES = 2;
-// The frame cause of the highlight pulse when nothing else asks for a frame:
-// the ambient frame `ambient-frame-pacing.js` paces to the measured frame cost.
-const AMBIENT_FRAME_CAUSE = 'highlight';
+// The frame causes of the animations that never end and converge on nothing
+// (a backdrop's ambient motion, smoke that animates, velocity particles
+// flowing, the highlight pulse), when nothing else asks for a frame: the
+// ambient frames `ambient-frame-pacing.js` paces to what frames cost the main
+// thread and how late they leave the page's frames. They are the last causes
+// `sceneAnimationCause` names, so one of them means nothing else asks.
+const AMBIENT_FRAME_CAUSES = Object.freeze(new Set([
+  'backdrop-motion',
+  'smoke',
+  'overlay-flow',
+  'highlight',
+]));
 // The raw GL getter and guarded renderer facade remain available so cleanup
 // diagnostics can inspect exact owners. Renderer methods and property writes
 // are actively fenced at either terminal boundary; the raw GL object is
@@ -412,6 +421,13 @@ export function createViewer({
   if (!gl) {
     throw new Error('WebGL2 is required but not supported in this browser.');
   }
+  // A browser whose graphics process was reset or stopped hands back a
+  // context already lost (WebKit after a GPU reset: every later context of
+  // its GPU process, WebKit bug 328185). Nothing drawn on it can work, and
+  // every renderer below would fail on it with a reason of its own (a shader
+  // that does not compile): refused here, as the loss it is
+  // (`startup-failure.js` says what to do).
+  requireLiveContext(gl, 'The viewer');
   // Installed before anything changes the state, and read whole now, while
   // nothing is queued: every renderer sharing this context reads its
   // fixed-function state from here instead of asking the GPU.
@@ -650,6 +666,7 @@ export function createViewer({
   function createBackdropLooksOwner() {
     return createBackdropLookRenderer(gl, {
       invalidate: () => invalidateFrame(),
+      requestFrame: () => ensureFrameScheduled(),
       prefersReducedMotion: () => prefersReducedMotion(),
       readViewSource: (viewId) => {
         const record = viewPositionsCache.get(viewId);
@@ -988,9 +1005,34 @@ export function createViewer({
   ]);
 
   // === GL State ===
-  gl.enable(gl.DEPTH_TEST);
-  gl.depthFunc(gl.LEQUAL);
-  configureStraightAlphaBlending(gl);
+  // What the viewer sets on the context itself rather than per pass. A
+  // context the browser restores has every value back at its initial one,
+  // so this is set again there (`restoreLostGraphics`): the clear colour
+  // was not, and a restored page cleared every frame to transparent black
+  // under a black, white or grid background. The clear colour is the
+  // background's (`setBackground`); until one is set, the context's own
+  // initial transparent black.
+  let backgroundClearColor = [0, 0, 0, 0];
+  function applyViewerGlState() {
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    configureStraightAlphaBlending(gl);
+    gl.clearColor(
+      backgroundClearColor[0],
+      backgroundClearColor[1],
+      backgroundClearColor[2],
+      backgroundClearColor[3]
+    );
+  }
+  applyViewerGlState();
+  function setBackgroundClearColor(red, green, blue) {
+    backgroundClearColor = [red, green, blue, 1];
+    gl.clearColor(red, green, blue, 1);
+  }
+  // The backdrop look shown and whether it moves by itself: the look's owner
+  // is made again on a restored context, and takes both from here.
+  let backdropLookId = null;
+  let backdropAmbientMotion = false;
 
   // === Scene Variables ===
   let pointCount = 0;
@@ -2270,9 +2312,29 @@ export function createViewer({
   // What last started a settle window: 'invalidated', 'resize', or the
   // time-driven effect's name (see sceneAnimationCause). Diagnostics only.
   let lastFrameCause = null;
-  // Holds back pulse-only frames until what the last frames held is measured
-  // and the main thread has been free as long (ambient-frame-pacing.js).
-  const ambientFramePacer = createAmbientFramePacer();
+  // A fence after the last drawn frame's commands, so the ambient pacer can
+  // read whether the GPU still runs them (ambient-frame-pacing.js). Dropped
+  // with the context, whose objects go with it.
+  let lastDrawnFrameFence = null;
+  function fenceDrawnFrame() {
+    if (webglContextLost || gl.isContextLost()) return;
+    if (lastDrawnFrameFence !== null) gl.deleteSync(lastDrawnFrameFence);
+    lastDrawnFrameFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+  }
+  function drawnFrameOnGpu() {
+    if (lastDrawnFrameFence === null || webglContextLost || gl.isContextLost()) return false;
+    if (!fenceHasPassed(gl, lastDrawnFrameFence)) return true;
+    gl.deleteSync(lastDrawnFrameFence);
+    lastDrawnFrameFence = null;
+    return false;
+  }
+  // Holds back ambient frames (AMBIENT_FRAME_CAUSES) until what the last
+  // frames held is measured and the main thread has been free as long, and
+  // while the page's frames run late behind the GPU (ambient-frame-pacing.js).
+  const ambientFramePacer = createAmbientFramePacer({ gpuBusy: drawnFrameOnGpu });
+  // The animation frame the last frame of the loop armed itself (drawn, or
+  // run only to be timed), or null: only the frame it armed is timed from it.
+  let frameArmedByLastFrame = null;
   // Opt-in tracing of what invalidates frames (setFrameInvalidationTracing).
   let frameInvalidationTracing = false;
   let lastFrameInvalidationTrace = null;
@@ -2801,6 +2863,7 @@ export function createViewer({
     lostGraphicsSettings = captureGraphicsSettings();
     pausedBeforeContextLoss = renderPaused;
     webglContextLost = true;
+    lastDrawnFrameFence = null;
     renderPaused = true;
     contextLossTransitioning = true;
     if (disposed && !disposalSettled) {
@@ -2935,7 +2998,10 @@ export function createViewer({
    */
   function restoreLostGraphics() {
     const settings = lostGraphicsSettings;
+    // Every value of the restored context is at its initial one: the shadow
+    // reads them afresh, and the viewer's own are set again.
     primeGlState(gl);
+    applyViewerGlState();
     sceneMsaaTarget = createSceneMsaaTarget(gl);
     sceneMsaaTarget.setEnabled(settings.antialiasing);
     pulseBaseRecords.clear();
@@ -2945,6 +3011,8 @@ export function createViewer({
     pulseSampleMask.prepare();
     rebuildViewerGlResources();
     backdropLooks = createBackdropLooksOwner();
+    backdropLooks.setAmbientMotion(backdropAmbientMotion);
+    backdropLooks.setLook(backdropLookId);
     orbitAnchorRenderer = new OrbitAnchorRenderer(gl, canvas);
     orbitAnchorRenderer.setShowAnchor(settings.showOrbitAnchor);
 
@@ -6039,6 +6107,7 @@ export function createViewer({
       || projectileSystem.isAnimating()
       || lodConvergingInLastFrame
       || backdropLooks.frameCause() !== null
+      || backdropLooks.motionCause() !== null
     );
   }
 
@@ -6089,14 +6158,20 @@ export function createViewer({
     if (studioSurfaceInTransition) return 'studio-surface';
     const backdropLookCause = backdropLooks.frameCause();
     if (backdropLookCause !== null) return backdropLookCause;
-    if (renderMode === 'smoke' && smokeRenderer.needsContinuousFrames()) return 'smoke';
-    if (overlayManager?.needsContinuousFrames() === true) return 'overlay';
+    // An overlay owed frames that converge (a particle table being built, or
+    // published and owed its particles).
+    if (overlayManager?.needsOwedFrames() === true) return 'overlay';
     if (projectileSystem.isAnimating()) return 'projectile';
     if (presentedCameraSettlement.isPending()) return 'camera-settlement';
     if (lodConvergingInLastFrame) return 'lod';
-    // Last, so 'highlight' names a frame the pulse alone asks for: the one
-    // kind of frame the ambient pacer may hold back.
-    if (highlightTools !== null && highlightTools.isHighlightAnimating()) return AMBIENT_FRAME_CAUSE;
+    // Last, the animations that never end (AMBIENT_FRAME_CAUSES), so each
+    // names a frame they alone ask for: the frames the ambient pacer may
+    // hold back.
+    const backdropMotionCause = backdropLooks.motionCause();
+    if (backdropMotionCause !== null) return backdropMotionCause;
+    if (renderMode === 'smoke' && smokeRenderer.needsContinuousFrames()) return 'smoke';
+    if (overlayManager?.needsContinuousFrames() === true) return 'overlay-flow';
+    if (highlightTools !== null && highlightTools.isHighlightAnimating()) return 'highlight';
     return null;
   }
 
@@ -6123,8 +6198,12 @@ export function createViewer({
     return framesDrawnSinceCause >= FRAME_SETTLE_MIN_FRAMES;
   }
 
-  function render() {
+  function render(timestamp) {
     // This callback is the armed frame; it re-arms only while drawing goes on.
+    // Whether the frame before armed it, so it is timed from that frame (the
+    // ambient pacer's GPU rule); one armed otherwise starts the chain afresh.
+    const timedFromLastFrame = animationHandle !== null && animationHandle === frameArmedByLastFrame;
+    frameArmedByLastFrame = null;
     animationHandle = null;
     const frameStartedAt = performance.now();
     if (disposed || webglContextLost || renderPaused) {
@@ -6139,17 +6218,28 @@ export function createViewer({
     // context by design; the refusal is terminal, the event that follows owns
     // the cleanup, and there is nothing to draw either way.
     if (isWebGLContextLostForAsyncCommit()) return;
+    ambientFramePacer.frameStarted(timestamp, timedFromLastFrame);
     // Coalesced input first, so what it changes is drawn in this frame.
     drainBeforeFramePhase();
     const frameSize = canvasResizeObserver.getSize();
     const now = performance.now();
     const frameCause = nextFrameCause(frameSize);
-    if (frameCause === AMBIENT_FRAME_CAUSE && !ambientFramePacer.isDue(now)) {
-      // The pulse alone asks for this frame, and the main thread has not yet
-      // been free for as long as the last frame held it (or what it held is
-      // still being measured): leave the loop unarmed, so the measuring task
-      // runs, and come back when the frame is due.
-      ambientFramePacer.wakeWhenDue(ensureFrameScheduled);
+    const ambientFrame = AMBIENT_FRAME_CAUSES.has(frameCause);
+    if (ambientFrame && !ambientFramePacer.isDue(now)) {
+      if (ambientFramePacer.watchesNextFrame(now)) {
+        // The page's frames ran late behind the GPU (or the display interval
+        // is still being measured): run the next animation frame without
+        // drawing, so it is timed, until they have run on as long.
+        ensureFrameScheduled();
+        frameArmedByLastFrame = animationHandle;
+      } else {
+        // An ambient animation alone asks for this frame, and the main
+        // thread has not yet been free for as long as the last frame held
+        // it (or what it held is still being measured): leave the loop
+        // unarmed, so the measuring task runs, and come back when the frame
+        // is due.
+        ambientFramePacer.wakeWhenDue(ensureFrameScheduled);
+      }
       drainAfterFramePhase();
       return;
     }
@@ -6170,6 +6260,7 @@ export function createViewer({
     // effects. Armed before drawing, as the always-running loop was, so a
     // callback requested during the frame still runs behind the viewer's.
     ensureFrameScheduled();
+    frameArmedByLastFrame = animationHandle;
     frameInvalidated = false;
     framesDrawnSinceCause += 1;
     lastDrawnCanvasWidth = frameSize.width;
@@ -6192,7 +6283,7 @@ export function createViewer({
     sceneTargetChangedThisFrame = true;
     sceneMsaaTarget.beginFrame(frameSize.width, frameSize.height);
     lodConvergingInLastFrame = false;
-    ambientFramePacer.frameDrawn(frameStartedAt);
+    ambientFramePacer.frameDrawn(frameStartedAt, ambientFrame);
     // The opening's frame-cost measurement opens the frame before its first
     // command (the GPU timer's query begins here).
     if (fullDetailFrameCost.isArmed()) fullDetailFrameCost.frameStarted(frameStartedAt);
@@ -6232,6 +6323,9 @@ export function createViewer({
       // A frame that failed or lost its context is no sample.
       if (!sceneDrawn) fullDetailFrameCost.frameEnded(false);
     }
+    // Its last command issued: whether the GPU still runs it, the ambient
+    // pacer reads once a frame comes late.
+    if (sceneDrawn) fenceDrawnFrame();
     if (sceneDrawn && fullDetailFrameCost.isArmed()) {
       sampleFullDetailFrameCost();
     }
@@ -7295,12 +7389,13 @@ export function createViewer({
     const exactMode = assertViewerBackground(mode);
     showGrid = false;
     showStudio = false;
-    backdropLooks.setLook(isBackdropLook(exactMode) ? exactMode : null);
+    backdropLookId = isBackdropLook(exactMode) ? exactMode : null;
+    backdropLooks.setLook(backdropLookId);
     if (isBackdropLook(exactMode)) {
       // A baked look: the clear colour is its surface (and the CSS page
       // colour), shown until its bake lands and the look fades in.
       const surface = backdropLookSurface01(exactMode);
-      gl.clearColor(surface[0], surface[1], surface[2], 1);
+      setBackgroundClearColor(surface[0], surface[1], surface[2]);
       bgColor = surface;
       fogColor = [...surface];
       gridBgColor = [...surface];
@@ -7312,7 +7407,7 @@ export function createViewer({
         // line contrast on LCD/OLED screens. Mirrors dark grid design principles.
         targetGridOpacity = 0.85;
         // Subtle warm gray tint instead of pure white
-        gl.clearColor(0.965, 0.965, 0.970, 1);
+        setBackgroundClearColor(0.965, 0.965, 0.970);
         bgColor = [0.965, 0.965, 0.970];
         fogColor = [0.965, 0.965, 0.970];
 	        // Light grid lines - subtle but visible on light background
@@ -7328,7 +7423,7 @@ export function createViewer({
 	      case 'grid-dark':
         showGrid = true;
         targetGridOpacity = 0.75;
-        gl.clearColor(0.08, 0.09, 0.1, 1);
+        setBackgroundClearColor(0.08, 0.09, 0.1);
         bgColor = [0.08, 0.09, 0.1];
         fogColor = [0.08, 0.09, 0.1];
 	        gridColor = [0.38, 0.38, 0.42];   // Subtle gray lines
@@ -7349,7 +7444,7 @@ export function createViewer({
         const surface = studioColor01(studioPalette.surface);
         studioGlowColor = studioColor01(studioPalette.glow);
         studioInkColor = studioColor01(studioPalette.ink);
-        gl.clearColor(surface[0], surface[1], surface[2], 1);
+        setBackgroundClearColor(surface[0], surface[1], surface[2]);
         bgColor = surface;
         fogColor = [...surface];
         // Keep a fading box grid on the new surface.
@@ -7357,7 +7452,7 @@ export function createViewer({
         break;
       }
       case 'black':
-        gl.clearColor(0, 0, 0, 1);
+        setBackgroundClearColor(0, 0, 0);
         bgColor = [0, 0, 0];
         fogColor = [0.05, 0.05, 0.08];
         // Match grid bg to main bg for clean fade-out
@@ -7365,7 +7460,7 @@ export function createViewer({
         gridColor = [0.3, 0.3, 0.3];
         break;
       case 'white':
-        gl.clearColor(1, 1, 1, 1);
+        setBackgroundClearColor(1, 1, 1);
         bgColor = [1, 1, 1];
         fogColor = [1, 1, 1];
         // Match grid bg to main bg for clean fade-out
@@ -8731,10 +8826,14 @@ export function createViewer({
         // Whether a frame callback is requested: false once the loop has
         // stopped on a settled scene, until something asks for a frame.
         frameArmed: animationHandle !== null,
-        // The pulse's pacing: what the last drawn frames held the main
-        // thread, whether that is still being measured, how long until a
-        // pulse-only frame is due again (null while measuring), and whether
-        // a wake will bring the loop back for one.
+        // The pacing of ambient frames (ambient-frame-pacing.js): what the
+        // last drawn frames held the main thread, whether that is still
+        // being measured, how long until the main thread lets an ambient
+        // frame be drawn (null while measuring), whether a wake will bring
+        // the loop back for one; the display interval measured (null before
+        // it is) and whether it is being measured, how late the last late
+        // frame ran, and how long until the page's frames have run on as
+        // long since.
         ambientPacing: ambientFramePacer.snapshot(),
         // With tracing on: the call stack of the last invalidation, so a
         // frame that should not have been drawn names who asked for it.
@@ -9217,7 +9316,10 @@ export function createViewer({
      * Star twinkle and mote drift: off by default; when on, at most 30 Hz, and
      * never while the tab is hidden or the user prefers reduced motion.
      */
-    setBackdropAmbientMotion: (enabled) => backdropLooks.setAmbientMotion(enabled),
+    setBackdropAmbientMotion: (enabled) => {
+      backdropAmbientMotion = enabled === true;
+      backdropLooks.setAmbientMotion(backdropAmbientMotion);
+    },
     setViewportLeftOcclusionRatio(value) {
       const exactRatio = assertFiniteNumberInRange(
         value,

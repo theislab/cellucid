@@ -20,7 +20,9 @@
  * `{ version, plans: { "<project> <k>/<n>": report } }`, each report shaped
  * as Playwright's JSON reporter's for that shard where
  * `extractBoundedShardInventory` (`scripts/run-browser-shard-bounded.mjs`)
- * reads it (`config.projects[].testDir`, `suites[].specs[]` with `file`,
+ * reads it (`config.projects[].testDir`, one `suites[]` entry a test file
+ * naming that `file`, its `specs[]` with `file` (the `test()` call's own
+ * location, a helper module when the file declares its tests through one),
  * `tags` without their `@`, and one test naming its project).
  *
  * @module tests/helpers/shard-plan-reporter
@@ -30,11 +32,14 @@ import { writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 /** The Playwright whose sharding this replicates. */
-export const PINNED_PLAYWRIGHT_VERSION = '1.62.0';
+export const PINNED_PLAYWRIGHT_VERSION = '1.65.0';
 
 const installedVersion = createRequire(import.meta.url)('playwright/package.json').version;
 
-/** `createTestGroups(projectSuite, expectedParallelism)`, Playwright 1.62.0. */
+/**
+ * `createTestGroups(projectSuite, expectedParallelism)`, Playwright 1.65.0
+ * (its groups' `locks`, which only the dispatcher reads, left out).
+ */
 function createTestGroups(projectSuite, expectedParallelism) {
   const groups = new Map();
   const createGroup = test => ({
@@ -98,12 +103,17 @@ function createTestGroups(projectSuite, expectedParallelism) {
   return result;
 }
 
-/** `filterForShard(shard, weights, testGroups)`, Playwright 1.62.0, equal weights. */
+/**
+ * `filterForShard(shard, weights, testGroups)`, Playwright 1.65.0, equal
+ * weights: a group weighs its tests not expected to be skipped (every test,
+ * when no group has one), and a group of none is placed with the test before it.
+ */
 function filterForShard(shard, testGroups) {
   const weights = Array.from({ length: shard.total }, () => 1);
   const totalWeight = weights.reduce((a, b) => a + b, 0);
-  let shardableTotal = 0;
-  for (const group of testGroups) shardableTotal += group.tests.length;
+  const activeSizes = testGroups.map(group => group.tests.filter(test => test.expectedStatus !== 'skipped').length);
+  const groupSizes = activeSizes.some(Boolean) ? activeSizes : testGroups.map(group => group.tests.length);
+  const shardableTotal = groupSizes.reduce((a, b) => a + b, 0);
   const shardSizes = weights.map(w => Math.floor(w * shardableTotal / totalWeight));
   const remainder = shardableTotal - shardSizes.reduce((a, b) => a + b, 0);
   for (let i = 0; i < remainder; i++) shardSizes[i % shardSizes.length]++;
@@ -112,11 +122,41 @@ function filterForShard(shard, testGroups) {
   const to = from + shardSizes[shard.current - 1];
   let current = 0;
   const result = new Set();
-  for (const group of testGroups) {
-    if (current >= from && current < to) result.add(group);
-    current += group.tests.length;
-  }
+  testGroups.forEach((group, index) => {
+    const position = groupSizes[index] ? current : Math.max(current - 1, 0);
+    if (position >= from && position < to) result.add(group);
+    current += groupSizes[index];
+  });
   return result;
+}
+
+/** The test file whose loading declared `test`: its `file` suite's location. */
+function testFileOf(test) {
+  for (let suite = test.parent; suite; suite = suite.parent) {
+    if (suite.type === 'file') {
+      const file = suite.location?.file;
+      if (typeof file !== 'string' || file === '') throw new Error(`The file suite of "${test.title}" names no file.`);
+      return file;
+    }
+  }
+  throw new Error(`"${test.title}" belongs to no file suite.`);
+}
+
+/** The JSON reporter's suites for `tests`: one a test file, in order. */
+function fileSuites(tests, projectName) {
+  const byFile = new Map();
+  for (const test of tests) {
+    const file = testFileOf(test);
+    const suite = byFile.get(file) ?? { title: file, file, specs: [] };
+    suite.specs.push({
+      title: test.title,
+      file: test.location.file,
+      tags: test.tags.map(tag => tag.substring(1)),
+      tests: [{ projectName }],
+    });
+    byFile.set(file, suite);
+  }
+  return [...byFile.values()];
 }
 
 export default class ShardPlanReporter {
@@ -153,14 +193,7 @@ export default class ShardPlanReporter {
         plans[`${project.name} ${current}/${this.total}`] = {
           errors: this.errors ?? [],
           config: { projects: [{ name: project.name, testDir: project.testDir }] },
-          suites: [{
-            specs: tests.map(test => ({
-              title: test.title,
-              file: test.location.file,
-              tags: test.tags.map(tag => tag.substring(1)),
-              tests: [{ projectName: project.name }],
-            })),
-          }],
+          suites: fileSuites(tests, project.name),
         };
       }
     }

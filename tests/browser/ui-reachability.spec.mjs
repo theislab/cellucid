@@ -230,6 +230,12 @@ async function openDataset(page) {
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   await openingDone(page);
+  // A phone opens on the plot with the panel closed, and a closed panel is
+  // `inert` (`sidebar-controls.js`): its field is chosen, as a person does,
+  // once the panel is open. Playwright 1.65 waits on an inert target
+  // ("now times out if the element stays inert", release notes), where
+  // earlier versions drove it through the closed panel.
+  await setSheetOpen(page, true);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await dismissNotifications(page);

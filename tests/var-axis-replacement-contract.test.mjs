@@ -269,3 +269,23 @@ test('a gene field of a replaced list is located on the list in use: by position
   // A field of the list in use is where it is.
   assert.equal(state.locateVarField(state.varData.fields[1]), 1);
 });
+
+test('a gene or a field with nothing to draw is refused before the active field changes: the view stays what it shows', async () => {
+  // Refused after the active gene was set, the refused gene stayed chosen:
+  // the selector showed it, and a later fill of its values drew it after an
+  // error had said it could not be shown.
+  const { state } = await makeState();
+  const empty = state.varData.fields[0];
+  empty.values = new Float32Array(N).fill(Number.NaN);
+  empty.loaded = true;
+  const shown = { gene: state.activeVarFieldIndex, field: state.activeFieldIndex, source: state.activeFieldSource };
+  const colours = state.colorsArray.slice();
+  assert.throws(() => state.setActiveVarField(0), /no value|cannot be shown|not measured/i);
+  assert.deepEqual({ gene: state.activeVarFieldIndex, field: state.activeFieldIndex, source: state.activeFieldSource }, shown);
+  assert.deepEqual(state.colorsArray, colours);
+
+  state.obsData.fields.push({ key: 'score', kind: 'continuous', values: new Float32Array(N).fill(Number.NaN), loaded: true });
+  assert.throws(() => state.setActiveField(1), /no value|cannot be shown|not measured/i);
+  assert.deepEqual({ gene: state.activeVarFieldIndex, field: state.activeFieldIndex, source: state.activeFieldSource }, shown);
+  assert.deepEqual(state.colorsArray, colours);
+});

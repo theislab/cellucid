@@ -1601,7 +1601,7 @@ test('disable retires every derived view texture exactly and retries failed dele
 });
 
 test('viewer settles velocity preparation and context construction failures, including non-rendering branches', () => {
-  const renderStart = viewerSource.indexOf('  function render() {');
+  const renderStart = viewerSource.indexOf('  function render(timestamp) {');
   const renderEnd = viewerSource.indexOf(
     '\n  function renderSingleView(',
     renderStart,

@@ -24,7 +24,7 @@
  */
 
 import { expect, test } from './helpers/test.mjs';
-import { recordSubmissions } from './helpers/gl-submissions.mjs';
+import { labelProgramsBySource, recordSubmissions } from './helpers/gl-submissions.mjs';
 import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
 import { ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX } from './helpers/pixel-parity.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -85,6 +85,13 @@ function captureScene(page, { pointCount, segmentPoints, camera }) {
     // crosses a segment boundary, as full detail does.
     const level = tree.lodLevels.findIndex(candidate => candidate.pointCount > segmentPoints && candidate.isFullDetail !== true);
     if (level < 0) throw new Error(`No reduced level of ${pointCount} points spans a segment of ${segmentPoints}.`);
+    // Full detail is the tree's last level, forced: with adaptive LOD on, no
+    // forced level (-1) is whatever level the camera distance picks, and at
+    // 12,000 cells that was level 5, 3,050 cells inside the first segment of
+    // 4,096, drawn in one call a pass on either side (hosted macOS Firefox,
+    // full-matrix run 42320991390).
+    const fullDetail = tree.lodLevels.length - 1;
+    if (tree.lodLevels[fullDetail].isFullDetail !== true) throw new Error('The tree\'s last level is not full detail.');
     const read = () => {
       const width = gl.drawingBufferWidth;
       const height = gl.drawingBufferHeight;
@@ -95,8 +102,8 @@ function captureScene(page, { pointCount, segmentPoints, camera }) {
     };
     const captures = {};
     for (const [name, cull, forced] of [
-      ['full detail', false, -1],
-      ['full detail, culled', true, -1],
+      ['full detail', false, fullDetail],
+      ['full detail, culled', true, fullDetail],
       ['reduced level', false, level],
       ['reduced level, culled', true, level],
     ]) {
@@ -221,6 +228,7 @@ for (const pattern of ['atlas', 'flatumap']) {
     test.setTimeout(600_000);
     const pageErrors = [];
     page.on('pageerror', error => pageErrors.push(error.message));
+    await page.addInitScript(labelProgramsBySource);
     await page.goto(FIXTURE_URL, { waitUntil: 'domcontentloaded' });
     await dismissWelcome(page);
     await openCollapsedPanels(page);
@@ -288,6 +296,8 @@ for (const pattern of ['atlas', 'flatumap']) {
     for (const [name, frame] of Object.entries(split.frames)) {
       expect(frame.inputs[1], `${name}: size, points drawn, level`).toEqual(frame.inputs[0]);
       expect(frame.lit, `${name}: lit pixels`).toBeGreaterThan(1_000);
+      // What the call count below rests on: the frame draws across a segment boundary.
+      expect(frame.inputs[0][2], `${name}: cells drawn, more than one segment holds`).toBeGreaterThan(SEGMENT_POINTS);
       // The same draws with the same uniforms, in more calls: one a segment.
       expect(frame.submittedDifference, `${name}: what the two frames submitted`).toBeNull();
       expect(frame.calls[1], `${name}: the segmented frame takes more draw calls`).toBeGreaterThan(frame.calls[0]);

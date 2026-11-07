@@ -1,6 +1,7 @@
 import { goOffline } from './helpers/offline.mjs';
 import { expect, test } from './helpers/test.mjs';
 
+import { openDatasetAsAgent } from './helpers/agent-dataset-open.mjs';
 import { currentUiLike, listCatalogDatasets } from './helpers/catalog-datasets.mjs';
 import { APP_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
@@ -1283,9 +1284,20 @@ test(
       path: '/auth/installations',
       method: 'GET',
     });
-    await page.locator('#dataset-select').selectOption(
-      SECOND_DATASET_OPTION,
-    );
+    // GitHub setup is modal: the picker is out of the person's reach, so the
+    // dataset changes under it the way it really can, by an agent opening one.
+    expect(await page.locator('#dataset-select').evaluate(
+      element => element.closest('[inert]') !== null,
+    )).toBe(true);
+    const opened = await openDatasetAsAgent(page, {
+      name: SECOND_DATASET_NAME,
+      kind: 'sample',
+    });
+    expect(opened.outcome).toMatchObject({
+      name: SECOND_DATASET_NAME,
+      kind: 'sample',
+      already_open: false,
+    });
     await expect(page.locator('#dataset-name')).toHaveText(
       SECOND_DATASET_NAME,
     );

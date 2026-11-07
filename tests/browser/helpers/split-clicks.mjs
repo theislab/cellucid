@@ -50,13 +50,42 @@ export async function watchSplitClicks(context) {
         : '';
       return `${element.tagName.toLowerCase()}${id}${classes}`;
     };
+    // What can move an element without the element itself changing: the
+    // height of everything laid out before it in each of its ancestors, and
+    // the scroll of each ancestor. Taken at the press, compared at a split
+    // release, so a report names what moved (a row added to a list above, a
+    // scrolled panel) instead of only that something did.
+    const layoutAbove = target => {
+      const boxes = new Map();
+      const scrolls = new Map();
+      for (let node = target; node instanceof Element && node !== document.body; node = node.parentElement) {
+        for (let sibling = node.previousElementSibling; sibling !== null; sibling = sibling.previousElementSibling) {
+          boxes.set(sibling, Math.round(sibling.getBoundingClientRect().height));
+        }
+        const parent = node.parentElement;
+        if (parent !== null && (parent.scrollTop !== 0 || parent.scrollHeight > parent.clientHeight)) scrolls.set(parent, Math.round(parent.scrollTop));
+      }
+      return { boxes, scrolls };
+    };
+    const movedAbove = before => {
+      const moved = [];
+      for (const [element, height] of before.boxes) {
+        const now = element.isConnected ? Math.round(element.getBoundingClientRect().height) : null;
+        if (now !== height) moved.push(`${describe(element)} ${height}→${now ?? 'removed'}`);
+      }
+      for (const [element, top] of before.scrolls) {
+        const now = Math.round(element.scrollTop);
+        if (now !== top) moved.push(`${describe(element)} scrolled ${top}→${now}`);
+      }
+      return moved;
+    };
     // Kept in the page too, so a helper reads them the moment its click returns.
     window.__cellucidSplitClicks = [];
     let reports = 0;
     let press = null;
     window.addEventListener('pointerdown', event => {
       press = event.isTrusted && event.pointerType === 'mouse'
-        ? { target: event.target, x: event.clientX, y: event.clientY }
+        ? { target: event.target, x: event.clientX, y: event.clientY, above: layoutAbove(event.target) }
         : null;
     }, true);
     window.addEventListener('pointerup', event => {
@@ -81,6 +110,7 @@ export async function watchSplitClicks(context) {
         released: describe(event.target),
         at: [pressed.x, pressed.y],
         pressedNow: [Math.round(box.left), Math.round(box.top), Math.round(box.right), Math.round(box.bottom)],
+        moved: movedAbove(pressed.above),
         page: location.pathname,
       };
       window.__cellucidSplitClicks.push(report);

@@ -126,11 +126,17 @@ test('Learn more leaves the dropdown inactive before and after closing', async (
   context,
 }) => {
   const errors = observeProductErrors(page);
-  await context.route(`${DOCS_ORIGIN}/**`, route => route.fulfill({
-    status: 200,
-    contentType: 'text/html',
-    body: '<!doctype html><title>Docs</title>',
-  }));
+  // The window asks for the documentation and is refused, so it never shows
+  // an http(s) page: macOS WebKit can end its browser process when a window
+  // is closed moments after it showed one (its Screen Time observer,
+  // `helpers/downloads.mjs`). Measured on macOS WebKit r2388: a fulfilled
+  // Docs page started that observer in 1 of 3 runs, 19 ms before this close;
+  // a refused one never does.
+  const asked = [];
+  await context.route(`${DOCS_ORIGIN}/**`, route => {
+    asked.push(route.request().url());
+    return route.abort();
+  });
   await openPlainStart(page);
 
   const popupPromise = page.waitForEvent('popup');
@@ -142,6 +148,7 @@ test('Learn more leaves the dropdown inactive before and after closing', async (
   await page.bringToFront();
 
   // The link opens the documentation beside the app; the dialog stays.
+  expect(asked).toEqual([`${DOCS_ORIGIN}/en/latest/`]);
   await expectWelcomeShown(page);
   await expect(page.locator('#dataset-select')).not.toBeFocused();
   await page.keyboard.press('Escape');

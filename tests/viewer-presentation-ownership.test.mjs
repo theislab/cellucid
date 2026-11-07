@@ -669,7 +669,7 @@ test('presented-state observers stay semantic and allocation-bounded at frame ca
 
   const renderSource = extractSourceRange(
     source,
-    'function render()',
+    'function render(timestamp)',
     'function renderSingleView(',
   );
   const guardedTracking = renderSource.match(

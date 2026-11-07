@@ -13,12 +13,62 @@ const firefoxWebGLPreferences = Object.freeze({
   'webgl.force-enabled': true,
 });
 
+// Firefox never opens its own file picker in a run: a picker it would open
+// answers `cancel` at once (`widget.disable_file_pickers`,
+// `nsBaseFilePicker::MaybeBlockFilePicker`), as Playwright's replacement picker
+// answers one whose chooser a spec intercepts (`helpers/file-chooser-cancel.mjs`).
+//
+// Playwright's Firefox (r1572, Playwright 1.65) decides twice whether a
+// chooser is intercepted: in the page, when `HTMLInputElement::InitFilePicker`
+// announces the picker ("file-input-picker-opening": the `filechooser` event),
+// and in the parent process, when the picker is created (juggler
+// `FilePickerOverride.init`, the replacement only if interception is still on).
+// Between the two Firefox looks up the input's last upload folder
+// (`UploadLastDir::FetchDirectoryAndDisplayPicker`, a content-preference read
+// from the parent process), on every pick of an input holding no files. A
+// `page.waitForEvent('filechooser')` removes its listener once the event comes,
+// and Playwright then turns interception off; when that reaches the parent
+// before the lookup ends, Firefox's own picker is created: on Linux under xvfb
+// (headed) a GTK dialog nobody closes, on Linux headless none at all
+// (`nsFilePicker::Open` refuses, and `FilePickerParent::RecvOpen` never
+// answers), on macOS an open panel nobody closes. The input's picker then never
+// closes (`mPickerRunning` stays set), and that input's next click returns at
+// "Just one nsIFilePicker is allowed" before any `filechooser` event: My
+// datasets' Import…, clicked a second time, waited 240 s for nothing (CI run
+// 42317705277). Measured on macOS, headless, one input emptied and picked 3
+// times in each of 40 pages: Firefox's own picker in 10 of 120 picks, and the
+// pick after one had no chooser; with this preference, every picker answered.
+// A fresh input per click still left those 10 pickers open: the input is not
+// the defect, and a person's Firefox closes its picker when they do. With this
+// preference both decisions end the same way.
+const firefoxFilePickerPreferences = Object.freeze({
+  'widget.disable_file_pickers': true,
+});
+
+// The control walk's spec files (`tests/browser/helpers/control-walk.mjs`).
+// Its tests take minutes each, and Playwright shards by test count, so in the
+// browser job's shards its few long tests would all fall into one shard
+// (Chromium 3/8 ran about 50 of its 75 minutes in CI run 42334173086). CI
+// runs them in a job of their own instead, a share a job: the browser job
+// sets `CELLUCID_CONTROL_WALK=apart` (every spec but the walk), the walk job
+// `only` (the walk's files alone, `--shard=k/<files>` a file each). Unset, a
+// run holds every spec.
+const CONTROL_WALK_FILES = /[\\/]control-walk-\d+-of-\d+\.spec\.mjs$/;
+const controlWalk = process.env.CELLUCID_CONTROL_WALK ?? '';
+if (!['', 'apart', 'only'].includes(controlWalk)) {
+  throw new Error(`CELLUCID_CONTROL_WALK is "apart", "only" or unset, not "${controlWalk}".`);
+}
+
 export default defineConfig({
   testDir: './tests/browser',
+  ...(controlWalk === 'only' ? { testMatch: CONTROL_WALK_FILES } : {}),
   // The live agent specs call the real Anthropic and OpenAI APIs with the
   // owner's keys: they are never in a CI run or a plain local run, only in
   // `npm run test:live-agents` (tests/browser/live-agents/live-harness.mjs).
-  testIgnore: process.env.CELLUCID_LIVE_AGENTS === '1' ? [] : ['**/live-agents/**'],
+  testIgnore: [
+    ...(process.env.CELLUCID_LIVE_AGENTS === '1' ? [] : ['**/live-agents/**']),
+    ...(controlWalk === 'apart' ? [CONTROL_WALK_FILES] : []),
+  ],
   fullyParallel: false,
   forbidOnly: true,
   // Deliberately zero, in CI as well as locally, matching the policy stated in
@@ -28,9 +78,10 @@ export default defineConfig({
   // renderer defect and the published site, and a failure it absorbed is a
   // failure nobody read.
   //
-  // The cost is real and worth naming: a push runs this suite 27 times — three
-  // engines, three operating systems, three shards — and a single stall on a
-  // shared runner marks the whole gate red. When that happens the failure is a
+  // The cost is real and worth naming: a push runs this suite in 36 jobs —
+  // eight shards of every engine on Linux and of WebKit on macOS, and the
+  // control walk's four shares — and a single stall on a shared runner marks
+  // the whole gate red. When that happens the failure is a
   // timeout in a spec unrelated to the change, on a different engine and shard
   // each time. Re-run the job and read what it says the second time; if the
   // same spec fails twice, it is the code.
@@ -75,7 +126,7 @@ export default defineConfig({
       use: {
         ...devices['Desktop Firefox'],
         launchOptions: {
-          firefoxUserPrefs: firefoxWebGLPreferences,
+          firefoxUserPrefs: { ...firefoxWebGLPreferences, ...firefoxFilePickerPreferences },
         },
       },
     },

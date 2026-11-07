@@ -19,7 +19,6 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from './helpers/test.mjs';
-import { chooseDirectory } from './helpers/directory-upload.mjs';
 import { fulfillFile, zipEntryData } from './helpers/anndata-zarr-zip.mjs';
 import { demoFile, observePage, onWorkerClose, readRecord } from './helpers/dataset-loading.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
@@ -785,7 +784,7 @@ test('a Zarr store folder chosen one level too high fails bounded', async ({
 
   // Picking the folder that holds a store instead of the store itself is the
   // mistake a first-time user makes with a folder picker.
-  await chooseDirectory(
+  await chooseFiles(
     page.locator('#user-data-folder-input'),
     path.join(fixturesDirectory, 'forms-catalog'),
   );

@@ -273,7 +273,7 @@ test('the scene target is bound for the frame and resolved in a finally', () => 
   // early. Binding at each would be four chances to miss one; resolving outside
   // a `finally` would leave a thrown pane showing the frame before it.
   const render = viewerSource.slice(
-    viewerSource.indexOf('  function render() {'),
+    viewerSource.indexOf('  function render(timestamp) {'),
     viewerSource.indexOf('  function renderSceneFrame() {')
   );
   assert.match(render, /sceneMsaaTarget\.beginFrame\(/);

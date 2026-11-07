@@ -79,6 +79,27 @@ export async function whenActionsDone(page) {
 }
 
 /**
+ * Wait until the page shows every action asked of it so far: done
+ * (`whenActionsDone`; the dispatcher's `idle` includes recording the step)
+ * and drawn. The History panel draws a new step on a later frame, at most
+ * once a frame (`ui/modules/state/index.js`), as do the controls that
+ * follow a store; the History sits above every other panel of the sidebar,
+ * so its new row moves each control below it. A spec that clicks again in
+ * the sidebar right after a step (Save position, twice) clicks once the page
+ * shows that step, or the press and the release land on either side of the
+ * row (`split-clicks.mjs`; measured on macOS WebKit: a Camera Path step's row
+ * one to two frames after its click returned).
+ *
+ * @param {import('@playwright/test').Page} page
+ */
+export async function whenActionsShown(page) {
+  await whenActionsDone(page);
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+}
+
+/**
  * Wait until the code the page imports by itself as it starts is in: the
  * analysis tools (`main.js`, `analysisCode`), hundreds of files that keep
  * arriving long after the first view on a loaded machine. The page publishes

@@ -77,10 +77,33 @@ export class FieldGeneSampleMethods {
    * @returns {Readonly<{cells: number, of: number, fit: Object|null}>|null}
    */
   getGeneSample() {
+    // The matrix's own answer (`noteGeneSample`), while it was given for the
+    // var loader and the open cells of now.
+    const noted = this._geneSampleNoted ?? null;
     const sample = this._geneSample ?? null;
-    // The open cells changed in place since it was asked (a growth step):
-    // only a sample of the cells now open stands.
-    return sample !== null && sample.of === this.pointCount ? sample : null;
+    if (noted !== null && noted.loader === (this.varFieldLoader ?? null) && noted.of === this.pointCount && (sample === null || sample.of === this.pointCount)) {
+      return sample;
+    }
+    // Asked again, not answered yet (a new loader, the open cells changed in
+    // place: an opening, a progressive step, Apply): the opening's sample,
+    // known to the loader at once, stands for it -- never "every cell", which
+    // a matrix read after its map does not have (its genes not read for any
+    // cell yet: a gene picked then was refused as having no value).
+    return this._openingGeneSample();
+  }
+
+  /**
+   * The gene sample of the opening the var loader reads (`loader.geneSample`,
+   * the reader's `cellSubset.genes`, current as soon as the open cells are)
+   * when it is of the cells open now, else null. @private
+   */
+  _openingGeneSample() {
+    const sample = this.varFieldLoader?.geneSample?.() ?? null;
+    if (sample === null || sample.of !== this.pointCount) return null;
+    const opening = this._openingSample ?? null;
+    if (opening !== null && opening.cells === sample.cells && opening.of === sample.of && opening.fit === (sample.fit ?? null)) return opening;
+    this._openingSample = requireSample(sample);
+    return this._openingSample;
   }
 
   /**
@@ -94,8 +117,16 @@ export class FieldGeneSampleMethods {
   async refreshGeneSample() {
     const loader = this.varFieldLoader ?? null;
     const descriptor = this._varFieldDescriptors?.[0] ?? null;
-    if (loader === null || descriptor === null || typeof loader.geneSampleOf !== 'function') {
+    if (loader === null || typeof loader.geneSampleOf !== 'function') {
       return this.noteGeneSample(null);
+    }
+    if (descriptor === null) {
+      // The gene list not read yet: nothing to ask the matrix about, and
+      // nothing it has answered stands for these cells. The opening's
+      // sample stands meanwhile (`getGeneSample`), never "every cell"; the
+      // list's own refresh asks (`initVarData`).
+      this._geneSampleNoted = null;
+      return this.getGeneSample();
     }
     let of;
     try {
@@ -126,7 +157,12 @@ export class FieldGeneSampleMethods {
     const fitOf = sample => this.varFieldLoader?.geneSample?.()?.fit ?? (toppedUp !== null && toppedUp.of === sample.of ? toppedUp.fit : null);
     const sample = of === null || of === undefined ? null : requireSample({ ...of, fit: fitOf(of) });
     const before = this._geneSample ?? null;
-    if (before?.cells === sample?.cells && before?.of === sample?.of && before?.fit === sample?.fit) return sample;
+    // Whose answer it is: the var loader's, for the cells open now.
+    this._geneSampleNoted = { loader: this.varFieldLoader ?? null, of: this.pointCount };
+    if (before?.cells === sample?.cells && before?.of === sample?.of && before?.fit === sample?.fit) {
+      this._geneSample = before;
+      return before;
+    }
     this._geneSample = sample;
     this.emit?.('gene-sample:changed', { sample });
     return sample;

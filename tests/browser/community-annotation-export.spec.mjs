@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { readFile } from 'node:fs/promises';
 
 import { SAMPLE_CATALOG_URL as FIXTURE_ROOT } from './helpers/origins.mjs';
@@ -67,7 +68,7 @@ test('consensus snapshot downloads once and reports the exact success', async ({
   await expect.poll(() => page.evaluate(() => window.__noticeTexts)).toContain(
     'Downloaded cellucid-consensus.json',
   );
-  expect(download.suggestedFilename()).toBe('cellucid-consensus.json');
+  await expectDownloadNamed(download, 'cellucid-consensus.json');
   const path = await download.path();
   expect(path).not.toBeNull();
   const document = JSON.parse(await readFile(path, 'utf8'));

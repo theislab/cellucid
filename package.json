@@ -20,7 +20,7 @@
     "node": ">=22.15"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.0",
+    "@playwright/test": "1.65.0",
     "esbuild": "0.28.2",
     "h5wasm": "0.10.3"
   }

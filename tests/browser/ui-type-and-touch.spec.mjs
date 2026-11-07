@@ -39,6 +39,13 @@ async function openDataset(page) {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  // A phone opens on the plot with the panel closed, and a closed panel is
+  // `inert` (`sidebar-controls.js`): it is opened from its bar, as a person
+  // does, before its field is chosen, and the controls measured are then the
+  // open panel's, once it has finished rising. Playwright 1.65 waits on an
+  // inert target ("now times out if the element stays inert", release
+  // notes), where earlier versions drove it through the closed panel.
+  await openPhoneSheet(page);
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await page.evaluate(async () => {
@@ -107,9 +114,6 @@ test.describe('phone 390×844', () => {
   }) => {
     test.setTimeout(120_000);
     await openDataset(page);
-    // A phone opens on the plot: the controls measured are the panel's, so
-    // it is opened from its bar first (and has finished rising).
-    await openPhoneSheet(page);
     const report = await page.evaluate(async () => {
       const CONTROLS = [
         '.btn', '.icon-btn:not(.legend-item .icon-btn)', '.segmented-btn',

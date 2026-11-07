@@ -16,6 +16,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { START, TRAJECTORY, expectSettledOn, startUrl } from './helpers/dataset-loading.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import {
@@ -312,7 +313,7 @@ test.describe('agent chat features', () => {
     const downloadPromise = page.waitForEvent('download');
     await page.locator('#agent-chat-export').click();
     const download = await downloadPromise;
-    expect(download.suggestedFilename()).toMatch(/^cellucid-chat-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.md$/);
+    await expectDownloadNamed(download, /^cellucid-chat-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.md$/);
     const markdown = await readFile(await download.path(), 'utf8');
     expect(markdown).toContain('# Cellucid chat: Current UI fixture');
     expect(markdown).toContain('**You**\n\n> Colour by cell type');

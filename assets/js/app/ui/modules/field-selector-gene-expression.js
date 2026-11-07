@@ -68,6 +68,7 @@ const RETURN_KEYS = new Set([
   'clearLocalSelectionUI',
   'destroy',
   'initGeneExpressionDropdown',
+  'isChoosing',
   'selectGene',
   'syncFromState',
   'updateGeneActionButtons'
@@ -366,8 +367,10 @@ export function initGeneExpressionSelector(options) {
   // republished, another field's change) names it, not what is shown.
   let choosing = null;
   // Gene choices dispatched and not ended (`chooseGene`): the field menus
-  // stay held while any is.
+  // stay held while any is, and a refresh names the latest one's gene
+  // (`queuedKey`) while its action waits its turn.
   let queuedChoices = 0;
+  let queuedKey = null;
   let forceDisabled = false;
 
   /* The dropdown is rebuilt on every keystroke, so it cannot host the live
@@ -664,6 +667,9 @@ export function initGeneExpressionSelector(options) {
     if (chosenAt >= 0) {
       selectedGeneOriginalIdx = chosenAt;
       geneSearch.value = readVarInventory()[chosenAt].key;
+    } else if (queuedKey !== null) {
+      selectedGeneOriginalIdx = -1;
+      geneSearch.value = queuedKey;
     } else if (source === FieldSource.VAR) {
       const inventory = readVarInventory();
       if (varIdx >= inventory.length) {
@@ -688,6 +694,17 @@ export function initGeneExpressionSelector(options) {
   function choiceUnderWay() {
     if (choosing === null || !interactionOwner.isCurrent(choosing.token)) return -1;
     return state.locateVarField(choosing.field);
+  }
+
+  /**
+   * Whether a gene choice is under way: dispatched and waiting its turn
+   * (`chooseGene`), or the latest choice and being read (`selectGene`). The
+   * field selector holds its menus and shows no obs field while it is.
+   * @returns {boolean}
+   */
+  function isChoosing() {
+    return queuedChoices > 0
+      || (choosing !== null && interactionOwner.isCurrent(choosing.token));
   }
 
   /**
@@ -737,8 +754,10 @@ export function initGeneExpressionSelector(options) {
       continuousSelect.value = noneFieldValue;
       geneSearch.value = field.key;
       updateGeneActionButtons();
-      callbacks.onBusyChanged(true);
+      // Named before the field selector is told, so the menus it renders
+      // from the choices under way see this one.
       choosing = { token, field };
+      callbacks.onBusyChanged(true);
       let datasetGeneration = null;
       // The gene list in use came to have no such gene.
       let gone = false;
@@ -846,10 +865,11 @@ export function initGeneExpressionSelector(options) {
         throw selectionError;
       } finally {
         if (choosing?.token === token) choosing = null;
-        if (interactionOwner.isCurrent(token)) {
-          callbacks.onBusyChanged(false);
-          updateGeneActionButtons(false);
-        }
+        if (interactionOwner.isCurrent(token)) updateGeneActionButtons(false);
+        // Ended, however (shown, failed, a newer choice, Stop, a session
+        // restore): the field selector names and holds its menus from the
+        // choices under way now.
+        if (!destroyed) callbacks.onBusyChanged(false);
       }
     }, { signal });
   }
@@ -869,6 +889,7 @@ export function initGeneExpressionSelector(options) {
     geneSearchStatus.textContent = '';
     geneSearch.value = geneKey;
     queuedChoices++;
+    queuedKey = geneKey;
     callbacks.onBusyChanged(true);
     return getActions().dispatch('color.by', { field: { source: FieldSource.VAR, key: geneKey } }).then(
       ({ outcome }) => outcome,
@@ -878,9 +899,10 @@ export function initGeneExpressionSelector(options) {
       }
     ).finally(() => {
       queuedChoices--;
+      if (queuedChoices === 0) queuedKey = null;
       if (destroyed || queuedChoices > 0 || choiceUnderWay() >= 0) return;
-      callbacks.onBusyChanged(false);
       syncFromState();
+      callbacks.onBusyChanged(false);
     });
   }
 
@@ -1070,6 +1092,7 @@ export function initGeneExpressionSelector(options) {
     colorByGene,
     clearGeneSelection,
     clearLocalSelectionUI,
+    isChoosing,
     syncFromState,
     updateGeneActionButtons,
     destroy

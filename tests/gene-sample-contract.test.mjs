@@ -1470,3 +1470,69 @@ test('a gene asked for never waits behind the top-up: its step stops at once, ke
   const { state: idle } = await toppingState();
   idle.yieldGeneSampleTopUp()();
 });
+
+test('while the matrix answers for cells newly open, the gene sample is the opening\'s, never every cell', async () => {
+  // A matrix read after its map (`transcode/matrix-market.js`): its genes
+  // are read for no cell until the share arrives. Each time the open cells
+  // change (the opening, every progressive step), the matrix's own answer
+  // (`geneSampleOf`, a round trip to the reader worker) comes later; meanwhile
+  // the page said null -- every cell read -- and a gene picked then was
+  // refused as having no value in any cell (Web contracts run 42280096732,
+  // Linux Firefox, `text-matrix-stream.spec.mjs`).
+  const { DataState } = await import('../assets/js/app/state/core/data-state.js');
+  const state = new DataState(null, null);
+  state._varFieldDescriptors = [{ key: 'g0', path: 'var/0' }];
+  const stream = { limit: 'stream' };
+  let opening = { cells: 0, of: 498, fit: stream };
+  const answers = [];
+  const loaderOf = () => ({
+    geneSample: () => opening,
+    geneSampleOf: () => new Promise(resolve => answers.push(resolve)),
+  });
+  const shown = () => {
+    const sample = state.getGeneSample();
+    return sample === null ? null : { cells: sample.cells, of: sample.of };
+  };
+  state.pointCount = 498;
+  state.setVarFieldLoader(loaderOf());
+  assert.deepEqual(shown(), { cells: 0, of: 498 }, 'the opening, before the matrix answers');
+  answers.shift()({ cells: 0, of: 498 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(shown(), { cells: 0, of: 498 });
+
+  // A progressive step: the open cells grow in place before the resized loader is set.
+  opening = { cells: 0, of: 997, fit: stream };
+  state.pointCount = 997;
+  assert.deepEqual(shown(), { cells: 0, of: 997 }, 'the cells grown, the loader not yet replaced');
+  state.setVarFieldLoader(loaderOf());
+  assert.deepEqual(shown(), { cells: 0, of: 997 }, 'the resized loader set, its answer not in');
+  answers.shift()({ cells: 0, of: 997 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(shown(), { cells: 0, of: 997 });
+
+  // The share read: every open cell's genes, once the matrix says so.
+  opening = null;
+  void state.refreshGeneSample();
+  assert.deepEqual(shown(), { cells: 0, of: 997 }, 'what the matrix last said stands until it answers');
+  answers.shift()(null);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.getGeneSample(), null);
+});
+
+test('a var loader set before its gene list is read: the opening\'s gene sample stands, never every cell', async () => {
+  // `refreshGeneSample` with no gene to ask about noted null -- every cell
+  // read -- for the cells now open, over the opening's sample of none.
+  const { DataState } = await import('../assets/js/app/state/core/data-state.js');
+  const state = new DataState(null, null);
+  const answers = [];
+  const opening = { cells: 0, of: 500, fit: { limit: 'stream' } };
+  state.pointCount = 500;
+  state.setVarFieldLoader({ geneSample: () => opening, geneSampleOf: () => new Promise(resolve => answers.push(resolve)) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.getGeneSample()?.cells, 0, 'before the gene list');
+  state.initVarData({ fields: [{ key: 'g0', kind: 'continuous', path: 'var/0' }] });
+  assert.equal(state.getGeneSample()?.cells, 0, 'the gene list read, the matrix not answered yet');
+  answers.shift()({ cells: 0, of: 500 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual({ cells: state.getGeneSample().cells, of: state.getGeneSample().of }, { cells: 0, of: 500 });
+});

@@ -41,7 +41,7 @@ const PINNED = `sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&`;
 // an ordinary browser window does (`helpers/test.mjs` `persistentStorage`:
 // on WebKit a persistent context; Playwright's ephemeral WebKit contexts
 // have none, as a Safari private window has none). Where the page still has
-// none (Playwright 1.62's Linux WebKit has no `navigator.storage`), a test
+// none (Playwright's Linux WebKit had no `navigator.storage` through 1.62), a test
 // asks the page (`helpers/origin-storage.mjs`) and holds the app to what it
 // does there: each opening's store in memory for its tab, nothing kept for
 // a later visit, which reads the file again.

@@ -143,9 +143,11 @@ changes state with no step, keeps a "Changed outside the history" step, makes mo
 or a step without a label, or whose step undo does not put back exactly (the state fingerprint);
 a control that changes nothing is recognised by that. It is a test per part (each sidebar
 section, then everything outside them) spread over the spec files
-`tests/browser/control-walk-<k>-of-<n>.spec.mjs`, so `--shard` over those files runs them side by
-side and `--grep "<section id>"` runs one part; each prints where its time went (by section and
-phase). The keyboard and chrome walk (`tests/browser/history-keyboard-chrome.spec.mjs`) presses
+`tests/browser/control-walk-<k>-of-<n>.spec.mjs`, a share each. CI runs each share in a job of its
+own (the `control-walk` job of `.github/workflows/test.yml`: `CELLUCID_CONTROL_WALK=only` and
+`--shard=<k>/<n>`; the browser job's shards leave the walk out with `CELLUCID_CONTROL_WALK=apart`,
+`playwright.config.mjs`), and `--grep "<section id>"` runs one part; each prints where its time
+went (by section and phase). The keyboard and chrome walk (`tests/browser/history-keyboard-chrome.spec.mjs`) presses
 every global key shortcut, the movement keys, keys no shortcut uses and chords, and fails on a key
 that changes state with more or fewer than one step or keeps an outside change; it proves a
 keyboard camera gesture is one step, and that the phone sheet changes nothing in the history.

@@ -941,6 +941,7 @@ test('overlay retirement detaches before cleanup and remains retryable', () => {
     update() {},
     render() {},
     needsContinuousFrames() { return false; },
+    needsOwedFrames() { return false; },
     dispose() {
       disposeAttempts += 1;
       if (disposeAttempts === 1) {
@@ -992,6 +993,7 @@ test('overlay manager disposal attempts every owner and retries only failures', 
       update() {},
       render() {},
       needsContinuousFrames() { return false; },
+      needsOwedFrames() { return false; },
       dispose() {
         const attempt = (attempts.get(id) ?? 0) + 1;
         attempts.set(id, attempt);

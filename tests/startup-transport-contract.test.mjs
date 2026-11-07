@@ -21,6 +21,7 @@ import {
 } from '../assets/js/app/startup-failure.js';
 import { DataSourceError } from '../assets/js/data/data-source.js';
 import { STARTUP_STALL_CODE } from '../assets/js/app/startup-phase.js';
+import { contextLostError } from '../assets/js/rendering/gl-errors.js';
 import {
   DataSourceManager
 } from '../assets/js/data/data-source-manager.js';
@@ -403,12 +404,22 @@ test('a failed start is described by what failed, never by its technical message
   assert.equal(browser.offerWithoutSettings, false);
   assert.deepEqual(browser.links, [[STARTUP_REQUIREMENTS_URL, 'System requirements']]);
 
+  // The browser's graphics stopped working (its context lost as it was made,
+  // or later while starting): reload, else restart the browser; a link
+  // cannot help, and no shader or other inner reason is said.
+  const graphics = describeStartupFailure(contextLostError('The viewer'), withLink);
+  assert.equal(graphics.kind, 'graphics');
+  assert.equal(graphics.title, 'The browser\u2019s graphics stopped working');
+  assert.match(graphics.sentence, /Reload the page; if this happens again, restart the browser\./);
+  assert.equal(graphics.offerWithoutSettings, false);
+  assert.deepEqual(graphics.links, [[STARTUP_TROUBLESHOOTING_INDEX_URL, 'Troubleshooting']]);
+
   const plain = describeStartupFailure(new Error('x'), { webgl2Available: true, hasLaunchSettings: false });
   assert.equal(plain.kind, 'app');
   assert.equal(plain.offerWithoutSettings, false);
   assert.equal(plain.sentence, 'Something went wrong while starting. Try again in a moment.');
 
-  for (const described of [dataFailure, browser, plain]) {
+  for (const described of [dataFailure, browser, graphics, plain]) {
     assert.doesNotMatch(`${described.title} ${described.sentence}`, /https?:|HTTP \d|10\.6084/);
   }
   for (const url of [STARTUP_TROUBLESHOOTING_URL, STARTUP_REQUIREMENTS_URL, STARTUP_TROUBLESHOOTING_INDEX_URL]) {

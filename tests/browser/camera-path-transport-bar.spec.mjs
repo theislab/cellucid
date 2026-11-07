@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { whenActionsShown } from './helpers/dataset-ready.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -42,10 +43,15 @@ async function openCameraPathWithTwoKeyframes(page) {
     'Current UI fixture'
   );
   await page.locator('#cinematic-camera-section > summary').click();
+  // Each is a step whose History row moves the controls below it.
+  await whenActionsShown(page);
   await page.locator('#cinematic-save-btn').click();
+  await whenActionsShown(page);
   await page.locator('#cinematic-save-btn').click();
   await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
   await expect(page.locator('.cinematic-transport-bar')).toHaveCount(1);
+  // The second keyframe's row too: a test clicks in the sidebar next.
+  await whenActionsShown(page);
 }
 
 test('the transport bar occupies a bounded strip and leaves the rest of the viewport clickable', async ({
@@ -203,13 +209,20 @@ test('navigation lives in its own panel, and Camera Path follows it', async ({
   }
 
   // A keyframe saved in one mode brings the panel back to that mode on Go to.
+  // The mode chosen is a step: its History row moves the Camera Path below it
+  // (measured under SwiftShader: drawn after the action was done).
   await page.locator('#navigation-mode').selectOption('free');
+  await whenActionsShown(page);
   await page.locator('#cinematic-camera-section > summary').click();
+  await whenActionsShown(page);
   await page.locator('#cinematic-save-btn').click();
   await page.locator('#navigation-mode').selectOption('planar');
+  await whenActionsShown(page);
   await page.locator('#cinematic-keyframe-list [data-action="goto"]').first().click();
   await expect(page.locator('#navigation-mode')).toHaveValue('free');
   await expect(page.locator('#freefly-controls')).toBeVisible();
+  // Go to set the mode, a step: shown before the next click below the History.
+  await whenActionsShown(page);
 
   // The camera-path tip explains keyframes and points at the docs.
   await page.locator('#camera-path-info-btn').click();
@@ -255,6 +268,8 @@ test('keyframe list editing is keyboard operable, rejects bad durations, and kee
 
   const setAll = page.locator('#cinematic-set-all-duration');
   await setAll.fill('0');
+  // Each duration stored above is a step: its History row is drawn first.
+  await whenActionsShown(page);
   await page.locator('#cinematic-set-all-btn').click();
   await expect(setAll).toHaveValue('');
   expect(await setAll.evaluate(input => input.validationMessage))

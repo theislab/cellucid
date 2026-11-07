@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
@@ -158,9 +159,7 @@ async function exportOne({
     type: extension === 'png' ? 'image/png' : 'image/svg+xml',
     size: bytes.length,
   });
-  expect(download.suggestedFilename()).toMatch(
-    new RegExp(`^[A-Za-z0-9._-]+\\.${extension}$`),
-  );
+  await expectDownloadNamed(download, new RegExp(`^[A-Za-z0-9._-]+\\.${extension}$`));
 
   return { bytes, events, outputPath };
 }
@@ -597,7 +596,7 @@ test('teardown during the download click cannot roll back a committed export', a
     })
   ).toHaveCount(0);
   expect(await download.failure()).toBeNull();
-  expect(path.extname(download.suggestedFilename())).toBe('.svg');
+  await expectDownloadNamed(download, /\.svg$/);
   expect(
     await page.evaluate(() => window.__figureExportCommitAbortCount)
   ).toBe(1);
@@ -1013,10 +1012,7 @@ test('delivers the staged SVG and PNG batch as one atomic ZIP', async ({
   const download = await downloadPromise;
   await expect(page.locator('#figure-export-btn')).toHaveText('Export');
   expect(await download.failure()).toBeNull();
-  expect(path.extname(download.suggestedFilename())).toBe('.zip');
-  expect(download.suggestedFilename()).toMatch(
-    /^[A-Za-z0-9._-]+_batch_[0-9]{8}_[0-9]{6}\.zip$/,
-  );
+  await expectDownloadNamed(download, /^[A-Za-z0-9._-]+_batch_[0-9]{8}_[0-9]{6}\.zip$/);
   const outputPath = testInfo.outputPath(
     `${testInfo.project.name}-figure-export-batch.zip`,
   );

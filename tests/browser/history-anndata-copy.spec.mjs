@@ -28,6 +28,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openPhoneSheet, openCollapsedPanels } from './helpers/panels.mjs';
@@ -187,7 +188,7 @@ test('saved from the History menu: labels, a field, a highlight and a gene set i
     }));
   } else {
     const download = await downloaded;
-    name = download.suggestedFilename();
+    name = await expectDownloadNamed(download, / with this state\.zarr\.zip$/);
     base64 = (await readFile(await download.path())).toString('base64');
   }
   expect(name).toMatch(/ with this state\.zarr\.zip$/);

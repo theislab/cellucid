@@ -6,6 +6,37 @@
   <title>Cellucid — Interactive Single-Cell Data Visualization</title>
 
   <!--
+    What a search result and a link preview show, first in the head: a preview
+    fetcher reads only the start of the page (Slack asks for the first 32 KB,
+    others less), and the import map below is over 100 KB.
+  -->
+  <meta name="description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
+  <meta name="keywords" content="single-cell, scRNA-seq, single-cell visualization, UMAP, 3D UMAP, AnnData, h5ad, Scanpy, Seurat, gene expression, cell atlas, WebGL, bioinformatics" />
+  <meta name="author" content="Kemal Inecik" />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://www.cellucid.com/" />
+
+  <!-- Open Graph / Social Media -->
+  <meta property="og:title" content="Cellucid — Interactive Single-Cell Data Visualization" />
+  <meta property="og:description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Cellucid" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:url" content="https://www.cellucid.com/" />
+  <meta property="og:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:type" content="image/jpeg" />
+  <meta property="og:image:alt" content="A 3D view of a single-cell atlas in Cellucid: thousands of cells drawn as spheres, colored by cell type, receding into depth." />
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Cellucid — Interactive Single-Cell Data Visualization" />
+  <meta name="twitter:description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
+  <meta name="twitter:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
+  <meta name="twitter:image:alt" content="A 3D view of a single-cell atlas in Cellucid: thousands of cells drawn as spheres, colored by cell type, receding into depth." />
+
+  <!--
     CELLUCID_WEB_BUILD_ID
     --------------------
     This stamp is used by `cellucid-python`'s hosted-asset proxy cache to decide
@@ -14,7 +45,7 @@
     Release validation owns this immutable value and changes it only together
     with the exact web-asset inventory after the complete build is accepted.
   -->
-  <meta name="cellucid-web-build-id" content="2026-11-06.150e67eb" />
+  <meta name="cellucid-web-build-id" content="2026-11-07.de6e0b99" />
   <!--
     The release version the web app shares with the Python and R packages. A
     deployment is still identified by the build id above; the version names
@@ -66,7 +97,7 @@
     base-uri 'none';
     object-src 'none';
     form-action 'none';
-    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com/gtag/ https://accounts.google.com/gsi/ https://apis.google.com/js/api.js https://apis.google.com/_/scs/ 'sha256-+wJUme4UEDa6meTPgOmJbBNb6/H3GCmP9Ob1DBZ/kiY=' 'sha256-9hPQVHB1cjbFBg7jKW0VwagdfeWVneDqQ/ZrMMZ+sSw=' 'sha256-05DKWpucUHQFPuGSkvDzqWi96CsJ4S/hrBmf6W/PAT0=' 'sha256-UOEHgN4fdMfmwdl/Aa/vEENTTxrMdgE2HHOJc/J/eQQ=';
+    script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com/gtag/ https://accounts.google.com/gsi/ https://apis.google.com/js/api.js https://apis.google.com/_/scs/ 'sha256-h8LUni5VIgdj9HZwOD4VQa4caruxE19EQoR6yl7SuOE=' 'sha256-izk8KgTm1e0WupXj9fIc+NbfoXIVVCbOpLJae8qKVhw=' 'sha256-7o0ZVqJo4O8jYlYztjZDGP3xlW3N7JH0SHUI+vn30jw=' 'sha256-UOEHgN4fdMfmwdl/Aa/vEENTTxrMdgE2HHOJc/J/eQQ=';
     frame-src 'self' https://accounts.google.com https://docs.google.com https://drive.google.com;
     style-src 'self' 'unsafe-inline';
     img-src 'self' data: https: blob:;
@@ -209,7 +240,7 @@
     "./assets/js/app/analysis/plots/plotly-box-statistics.js": "./assets/js/app/analysis/plots/plotly-box-statistics.js?v=8702d18e5a8f",
     "./assets/js/app/analysis/plots/plotly-hints.js": "./assets/js/app/analysis/plots/plotly-hints.js?v=b50ce71100a3",
     "./assets/js/app/analysis/plots/plotly-histogram-bins.js": "./assets/js/app/analysis/plots/plotly-histogram-bins.js?v=bb54aa417b47",
-    "./assets/js/app/analysis/plots/plotly-loader.js": "./assets/js/app/analysis/plots/plotly-loader.js?v=63d6986567f5",
+    "./assets/js/app/analysis/plots/plotly-loader.js": "./assets/js/app/analysis/plots/plotly-loader.js?v=a77a6423179a",
     "./assets/js/app/analysis/plots/plotly-violin-density.js": "./assets/js/app/analysis/plots/plotly-violin-density.js?v=fa31884a3a0f",
     "./assets/js/app/analysis/plots/point-layer.js": "./assets/js/app/analysis/plots/point-layer.js?v=4950fc421984",
     "./assets/js/app/analysis/plots/point-layout.js": "./assets/js/app/analysis/plots/point-layout.js?v=1c693307f938",
@@ -359,7 +390,7 @@
     "./assets/js/app/library/local-file-handles.js": "./assets/js/app/library/local-file-handles.js?v=5c15c040ecaf",
     "./assets/js/app/library/my-datasets.js": "./assets/js/app/library/my-datasets.js?v=502b72704969",
     "./assets/js/app/main.js": "./assets/js/app/main.js?v=6571a886255b",
-    "./assets/js/app/matrix-share-notices.js": "./assets/js/app/matrix-share-notices.js?v=d2aca7a601c0",
+    "./assets/js/app/matrix-share-notices.js": "./assets/js/app/matrix-share-notices.js?v=148faf518ef0",
     "./assets/js/app/notification-center.js": "./assets/js/app/notification-center.js?v=b5647478268f",
     "./assets/js/app/notification-center/benchmark-notifications.js": "./assets/js/app/notification-center/benchmark-notifications.js?v=406b645fbb0e",
     "./assets/js/app/notification-center/constants.js": "./assets/js/app/notification-center/constants.js?v=df1c62f3862f",
@@ -399,7 +430,7 @@
     "./assets/js/app/session/view-carry.js": "./assets/js/app/session/view-carry.js?v=0a55887ad85b",
     "./assets/js/app/sidebar-metrics.js": "./assets/js/app/sidebar-metrics.js?v=aaf24d3f9f8b",
     "./assets/js/app/source-sign-in-view.js": "./assets/js/app/source-sign-in-view.js?v=a2f05c4a7ff9",
-    "./assets/js/app/startup-failure.js": "./assets/js/app/startup-failure.js?v=4b956923ba10",
+    "./assets/js/app/startup-failure.js": "./assets/js/app/startup-failure.js?v=9674144faf15",
     "./assets/js/app/startup-phase.js": "./assets/js/app/startup-phase.js?v=ebc2a9302489",
     "./assets/js/app/startup-url-intent.js": "./assets/js/app/startup-url-intent.js?v=d160bda7021e",
     "./assets/js/app/state-serializer/ui-controls.js": "./assets/js/app/state-serializer/ui-controls.js?v=20bf605fa69d",
@@ -438,8 +469,8 @@
     "./assets/js/app/state/managers/field/category-growth.js": "./assets/js/app/state/managers/field/category-growth.js?v=b6a4f295eadb",
     "./assets/js/app/state/managers/field/category-ops.js": "./assets/js/app/state/managers/field/category-ops.js?v=1c067f32a805",
     "./assets/js/app/state/managers/field/descriptor-ownership.js": "./assets/js/app/state/managers/field/descriptor-ownership.js?v=b2872d083d8a",
-    "./assets/js/app/state/managers/field/gene-sample.js": "./assets/js/app/state/managers/field/gene-sample.js?v=9789beb353b7",
-    "./assets/js/app/state/managers/field/loading.js": "./assets/js/app/state/managers/field/loading.js?v=4543cf0f7569",
+    "./assets/js/app/state/managers/field/gene-sample.js": "./assets/js/app/state/managers/field/gene-sample.js?v=2247e1e18cd6",
+    "./assets/js/app/state/managers/field/loading.js": "./assets/js/app/state/managers/field/loading.js?v=db26c87d6a99",
     "./assets/js/app/state/managers/field/overlay-internals.js": "./assets/js/app/state/managers/field/overlay-internals.js?v=debf3ef026ee",
     "./assets/js/app/state/managers/field/overlay-public.js": "./assets/js/app/state/managers/field/overlay-public.js?v=e9590e85fb8e",
     "./assets/js/app/state/managers/field/pending-categories.js": "./assets/js/app/state/managers/field/pending-categories.js?v=0b87960dcc78",
@@ -546,8 +577,8 @@
     "./assets/js/app/ui/modules/dataset-open-action.js": "./assets/js/app/ui/modules/dataset-open-action.js?v=f500838a95ec",
     "./assets/js/app/ui/modules/field-interaction-owner.js": "./assets/js/app/ui/modules/field-interaction-owner.js?v=e5d16ddcfce1",
     "./assets/js/app/ui/modules/field-selector-deleted-fields.js": "./assets/js/app/ui/modules/field-selector-deleted-fields.js?v=6bef40b26374",
-    "./assets/js/app/ui/modules/field-selector-gene-expression.js": "./assets/js/app/ui/modules/field-selector-gene-expression.js?v=8b96fdc01616",
-    "./assets/js/app/ui/modules/field-selector.js": "./assets/js/app/ui/modules/field-selector.js?v=6afffb6fe4e1",
+    "./assets/js/app/ui/modules/field-selector-gene-expression.js": "./assets/js/app/ui/modules/field-selector-gene-expression.js?v=cfad2ad74aae",
+    "./assets/js/app/ui/modules/field-selector.js": "./assets/js/app/ui/modules/field-selector.js?v=fd95e0662871",
     "./assets/js/app/ui/modules/figure-export/components/axes-builder.js": "./assets/js/app/ui/modules/figure-export/components/axes-builder.js?v=ddcd9412bdf4",
     "./assets/js/app/ui/modules/figure-export/components/backdrop-look-export.js": "./assets/js/app/ui/modules/figure-export/components/backdrop-look-export.js?v=de58019454ff",
     "./assets/js/app/ui/modules/figure-export/components/centroid-overlay.js": "./assets/js/app/ui/modules/figure-export/components/centroid-overlay.js?v=b653f103d45b",
@@ -678,7 +709,7 @@
     "./assets/js/app/utils/category-state.js": "./assets/js/app/utils/category-state.js?v=8b80fb68abf4",
     "./assets/js/app/utils/cell-set.js": "./assets/js/app/utils/cell-set.js?v=4924a5ad3854",
     "./assets/js/app/utils/dom-utils.js": "./assets/js/app/utils/dom-utils.js?v=ade5b99619ed",
-    "./assets/js/app/utils/download.js": "./assets/js/app/utils/download.js?v=f40ffdb5f4d9",
+    "./assets/js/app/utils/download.js": "./assets/js/app/utils/download.js?v=47fcdfc26148",
     "./assets/js/app/utils/event-emitter.js": "./assets/js/app/utils/event-emitter.js?v=17895d256d69",
     "./assets/js/app/utils/field-constants.js": "./assets/js/app/utils/field-constants.js?v=0d41fa0e0bbc",
     "./assets/js/app/utils/field-registry.js": "./assets/js/app/utils/field-registry.js?v=856391ef0c8d",
@@ -706,7 +737,7 @@
     "./assets/js/data/anndata-file-source.js": "./assets/js/data/anndata-file-source.js?v=9241a6debb60",
     "./assets/js/data/anndata-provider.js": "./assets/js/data/anndata-provider.js?v=244ffdbbabde",
     "./assets/js/data/anndata-reader-client.js": "./assets/js/data/anndata-reader-client.js?v=91cee337a294",
-    "./assets/js/data/anndata-reader-worker.js": "./assets/js/data/anndata-reader-worker.js?v=46d43cc91176",
+    "./assets/js/data/anndata-reader-worker.js": "./assets/js/data/anndata-reader-worker.js?v=1cfd866a8805",
     "./assets/js/data/anndata-storage.js": "./assets/js/data/anndata-storage.js?v=a3cb3ad3ea29",
     "./assets/js/data/anndata-value-kinds.js": "./assets/js/data/anndata-value-kinds.js?v=21087cb11011",
     "./assets/js/data/anndata/dataframe.js": "./assets/js/data/anndata/dataframe.js?v=e073e7856dbb",
@@ -728,7 +759,7 @@
     "./assets/js/data/anndata/transcode/entries.js": "./assets/js/data/anndata/transcode/entries.js?v=3ba75b6d7c61",
     "./assets/js/data/anndata/transcode/index.js": "./assets/js/data/anndata/transcode/index.js?v=3ca558dc8064",
     "./assets/js/data/anndata/transcode/kept-store.js": "./assets/js/data/anndata/transcode/kept-store.js?v=fcf723626879",
-    "./assets/js/data/anndata/transcode/matrix-market.js": "./assets/js/data/anndata/transcode/matrix-market.js?v=6cdabe5d6f3e",
+    "./assets/js/data/anndata/transcode/matrix-market.js": "./assets/js/data/anndata/transcode/matrix-market.js?v=7ae3aaa696d7",
     "./assets/js/data/anndata/transcode/priority.js": "./assets/js/data/anndata/transcode/priority.js?v=674f0d7a9b25",
     "./assets/js/data/anndata/transcode/r-matrices.js": "./assets/js/data/anndata/transcode/r-matrices.js?v=c26d124f3b5d",
     "./assets/js/data/anndata/transcode/r-object.js": "./assets/js/data/anndata/transcode/r-object.js?v=447aa65323ef",
@@ -844,7 +875,7 @@
     "./assets/js/data/viewer-protocol.js": "./assets/js/data/viewer-protocol.js?v=4b3d3660d987",
     "./assets/js/data/whole-download.js": "./assets/js/data/whole-download.js?v=8598c34218d8",
     "./assets/js/data/whole-read-notice.js": "./assets/js/data/whole-read-notice.js?v=6e544c4c0588",
-    "./assets/js/dev/benchmark.js": "./assets/js/dev/benchmark.js?v=c348c394932b",
+    "./assets/js/dev/benchmark.js": "./assets/js/dev/benchmark.js?v=9573712fe732",
     "./assets/js/formats/hdf5/binary.js": "./assets/js/formats/hdf5/binary.js?v=e6a9c1045fbf",
     "./assets/js/formats/hdf5/btree-v1.js": "./assets/js/formats/hdf5/btree-v1.js?v=fa78c6a3d05b",
     "./assets/js/formats/hdf5/btree-v2.js": "./assets/js/formats/hdf5/btree-v2.js?v=d18806ad49c3",
@@ -940,9 +971,9 @@
     "./assets/js/formats/zip/names.js": "./assets/js/formats/zip/names.js?v=6e048343c736",
     "./assets/js/formats/zip/writer.js": "./assets/js/formats/zip/writer.js?v=b3134f278800",
     "./assets/js/rendering/alpha-visibility.js": "./assets/js/rendering/alpha-visibility.js?v=80467d13cb5b",
-    "./assets/js/rendering/ambient-frame-pacing.js": "./assets/js/rendering/ambient-frame-pacing.js?v=23a157fe1906",
+    "./assets/js/rendering/ambient-frame-pacing.js": "./assets/js/rendering/ambient-frame-pacing.js?v=b51400c209b8",
     "./assets/js/rendering/backdrops/backdrop-look-raster.js": "./assets/js/rendering/backdrops/backdrop-look-raster.js?v=a944e0d5f1cc",
-    "./assets/js/rendering/backdrops/backdrop-look-renderer.js": "./assets/js/rendering/backdrops/backdrop-look-renderer.js?v=7d823e61b8f2",
+    "./assets/js/rendering/backdrops/backdrop-look-renderer.js": "./assets/js/rendering/backdrops/backdrop-look-renderer.js?v=554a38a988ac",
     "./assets/js/rendering/backdrops/backdrop-look-shaders.js": "./assets/js/rendering/backdrops/backdrop-look-shaders.js?v=8452b1f0b47f",
     "./assets/js/rendering/backdrops/backdrop-looks.js": "./assets/js/rendering/backdrops/backdrop-looks.js?v=4e3295cf4364",
     "./assets/js/rendering/camera-state-contract.js": "./assets/js/rendering/camera-state-contract.js?v=fc7afd6e1e39",
@@ -951,7 +982,7 @@
     "./assets/js/rendering/frame-phases.js": "./assets/js/rendering/frame-phases.js?v=aa722e90fe4c",
     "./assets/js/rendering/full-detail-frame-cost.js": "./assets/js/rendering/full-detail-frame-cost.js?v=277f1d1fbcde",
     "./assets/js/rendering/gl-errors.js": "./assets/js/rendering/gl-errors.js?v=f427f65c056a",
-    "./assets/js/rendering/gl-state-shadow.js": "./assets/js/rendering/gl-state-shadow.js?v=d5b04bef454d",
+    "./assets/js/rendering/gl-state-shadow.js": "./assets/js/rendering/gl-state-shadow.js?v=e4d1798f883d",
     "./assets/js/rendering/gl-utils.js": "./assets/js/rendering/gl-utils.js?v=490cb35d5fac",
     "./assets/js/rendering/high-perf-renderer.js": "./assets/js/rendering/high-perf-renderer.js?v=fce6f58b6d90",
     "./assets/js/rendering/high-perf/calculation-notifications.js": "./assets/js/rendering/high-perf/calculation-notifications.js?v=da00cbea5aa4",
@@ -970,11 +1001,11 @@
     "./assets/js/rendering/highlight-renderer.js": "./assets/js/rendering/highlight-renderer.js?v=176ac05c29f8",
     "./assets/js/rendering/linear-texture.js": "./assets/js/rendering/linear-texture.js?v=cf18b058434e",
     "./assets/js/rendering/orbit-anchor.js": "./assets/js/rendering/orbit-anchor.js?v=996178a6b4b9",
-    "./assets/js/rendering/overlays/overlay-base.js": "./assets/js/rendering/overlays/overlay-base.js?v=9f08f570938e",
+    "./assets/js/rendering/overlays/overlay-base.js": "./assets/js/rendering/overlays/overlay-base.js?v=f288804f5b6c",
     "./assets/js/rendering/overlays/overlay-context.js": "./assets/js/rendering/overlays/overlay-context.js?v=c05e4de0155a",
-    "./assets/js/rendering/overlays/overlay-manager.js": "./assets/js/rendering/overlays/overlay-manager.js?v=48643faee31c",
+    "./assets/js/rendering/overlays/overlay-manager.js": "./assets/js/rendering/overlays/overlay-manager.js?v=341c3c7a0e0e",
     "./assets/js/rendering/overlays/shared/packed-texture.js": "./assets/js/rendering/overlays/shared/packed-texture.js?v=8e43434586df",
-    "./assets/js/rendering/overlays/velocity/velocity-overlay.js": "./assets/js/rendering/overlays/velocity/velocity-overlay.js?v=c2a53ecabb4e",
+    "./assets/js/rendering/overlays/velocity/velocity-overlay.js": "./assets/js/rendering/overlays/velocity/velocity-overlay.js?v=9d0e7a65007c",
     "./assets/js/rendering/overlays/velocity/velocity-shaders.js": "./assets/js/rendering/overlays/velocity/velocity-shaders.js?v=a836e777e64f",
     "./assets/js/rendering/picking.js": "./assets/js/rendering/picking.js?v=9c47782c5b03",
     "./assets/js/rendering/point-size-scale.js": "./assets/js/rendering/point-size-scale.js?v=865f3d996bbc",
@@ -1006,7 +1037,7 @@
     "./assets/js/rendering/studio-backdrop.js": "./assets/js/rendering/studio-backdrop.js?v=5c5955ba6337",
     "./assets/js/rendering/unplaced-positions.js": "./assets/js/rendering/unplaced-positions.js?v=44e2ea964df7",
     "./assets/js/rendering/viewer-backgrounds.js": "./assets/js/rendering/viewer-backgrounds.js?v=7562ef2f60c3",
-    "./assets/js/rendering/viewer.js": "./assets/js/rendering/viewer.js?v=e52a04851105",
+    "./assets/js/rendering/viewer.js": "./assets/js/rendering/viewer.js?v=1773728e3907",
     "./assets/js/rendering/viewer/field-of-view.js": "./assets/js/rendering/viewer/field-of-view.js?v=f4a8fc37e96a",
     "./assets/js/rendering/viewer/presented-view-layout.js": "./assets/js/rendering/viewer/presented-view-layout.js?v=34d57cbdd98b",
     "./assets/js/rendering/viewer/renderer-facade.js": "./assets/js/rendering/viewer/renderer-facade.js?v=9f77547d9016",
@@ -1034,7 +1065,7 @@
     "./assets/js/workers/idle-retirement.js": "./assets/js/workers/idle-retirement.js?v=3fbed04871a5",
     "./assets/js/workers/worker-failure.js": "./assets/js/workers/worker-failure.js?v=f48b038501a8",
     "./assets/js/workers/worker-script.js": "./assets/js/workers/worker-script.js?v=b974cb881d06",
-    "./assets/workers/scripts.js": "./assets/workers/scripts.js?v=cf638af03877"
+    "./assets/workers/scripts.js": "./assets/workers/scripts.js?v=f00d79819636"
   }
   }
   </script>
@@ -1058,7 +1089,7 @@
     (() => {
       const thisMachine = ["localhost","127.0.0.1","[::1]"].includes(location.hostname);
       const bundle = [
-      "assets/page/main.XT5EIOU3.js",
+      "assets/page/main.A4OQJ4YU.js",
       "assets/page/chunk.2E6VLGIT.js",
       "assets/page/chunk.4RO35XQH.js",
       "assets/page/chunk.4RPXNZAP.js",
@@ -1070,12 +1101,12 @@
       "assets/page/chunk.BLB2Q6XA.js",
       "assets/page/chunk.D535WAAR.js",
       "assets/page/chunk.DWZ76IIX.js",
+      "assets/page/chunk.EWIAGHOY.js",
       "assets/page/chunk.I7JMCGHG.js",
       "assets/page/chunk.IXWWWMZH.js",
       "assets/page/chunk.J6VZ5QYM.js",
       "assets/page/chunk.N6JFCHRH.js",
-      "assets/page/chunk.O6BW4YRR.js",
-      "assets/page/chunk.PWXV232R.js",
+      "assets/page/chunk.PD66N63N.js",
       "assets/page/chunk.R3A3K4UN.js",
       "assets/page/chunk.U3MXMPY4.js",
       "assets/page/chunk.XB45ER7C.js",
@@ -1127,84 +1158,74 @@
     })();
   </script>
 
-  <!-- SEO Meta Tags -->
-  <meta name="description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
-  <meta name="keywords" content="single-cell, scRNA-seq, single-cell visualization, UMAP, 3D UMAP, AnnData, h5ad, Scanpy, Seurat, gene expression, cell atlas, WebGL, bioinformatics" />
-  <meta name="author" content="Kemal Inecik" />
-  <meta name="robots" content="index, follow" />
-  <link rel="canonical" href="https://www.cellucid.com/" />
-
   <!-- Preconnect to the sample-catalog origin, unless the page was told another one -->
   <script src="assets/js/app/ui/core/preconnect-init.js?v=4fc6c204c0ba"></script>
-
-  <!-- Open Graph / Social Media -->
-  <meta property="og:title" content="Cellucid — Interactive Single-Cell Data Visualization" />
-  <meta property="og:description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
-  <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="Cellucid" />
-  <meta property="og:locale" content="en_US" />
-  <meta property="og:url" content="https://www.cellucid.com/" />
-  <meta property="og:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
-  <meta property="og:image:width" content="1200" />
-  <meta property="og:image:height" content="630" />
-  <meta property="og:image:type" content="image/jpeg" />
-  <meta property="og:image:alt" content="A 3D view of a single-cell atlas in Cellucid: thousands of cells drawn as spheres, colored by cell type, receding into depth." />
-
-  <!-- Twitter Card -->
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Cellucid — Interactive Single-Cell Data Visualization" />
-  <meta name="twitter:description" content="Interactive single-cell data visualization in your browser: explore millions of cells in 2D and 3D UMAP, from Scanpy/AnnData or Seurat. Free and open source." />
-  <meta name="twitter:image" content="https://www.cellucid.com/assets/img/og-preview.jpg" />
-  <meta name="twitter:image:alt" content="A 3D view of a single-cell atlas in Cellucid: thousands of cells drawn as spheres, colored by cell type, receding into depth." />
 
   <!-- Structured Data for Search Engines -->
   <script type="application/ld+json">{
     "@context": "https://schema.org",
-    "@type": "WebApplication",
-    "name": "Cellucid",
-    "alternateName": "cellucid",
-    "description": "Free, open-source web app for interactive single-cell data visualization: millions of cells in 1D, 2D and 3D embeddings such as UMAP, gene expression and metadata coloring, filtering, RNA-velocity overlays, figure export and community annotation. Opens AnnData (.h5ad, Zarr), MuData, Loom, 10x Cell Ranger, MatrixMarket and Seurat or SingleCellExperiment (.rds) files directly, including files prepared with the Python package (Scanpy/AnnData) or the R package.",
-    "url": "https://www.cellucid.com/",
-    "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
-    "applicationCategory": "ScientificApplication",
-    "applicationSubCategory": "Single-cell data visualization",
-    "operatingSystem": "Web browser",
-    "softwareVersion": "0.9.7",
-    "browserRequirements": "Requires WebGL2",
-    "isAccessibleForFree": true,
-    "license": "https://opensource.org/licenses/BSD-3-Clause",
-    "inLanguage": "en",
-    "offers": {
-      "@type": "Offer",
-      "price": "0",
-      "priceCurrency": "USD"
-    },
-    "author": {
-      "@type": "Person",
-      "name": "Kemal Inecik",
-      "url": "https://kemalinecik.com"
-    },
-    "softwareHelp": {
-      "@type": "CreativeWork",
-      "url": "https://docs.cellucid.com/en/latest/"
-    },
-    "sameAs": [
-      "https://github.com/theislab/cellucid",
-      "https://docs.cellucid.com/en/latest/",
-      "https://pypi.org/project/cellucid/",
-      "https://github.com/theislab/cellucid-python",
-      "https://github.com/theislab/cellucid-r",
-      "https://theislab.github.io/cellucid-r/"
-    ],
-    "featureList": [
-      "Real-time rendering of millions of cells with adaptive level of detail (LOD)",
-      "1D, 2D and 3D embeddings such as UMAP, several per dataset",
-      "Gene expression overlays with efficient sparse matrix handling",
-      "Categorical and continuous cell metadata coloring, filtering, and selection",
-      "Animated vector field overlays (RNA velocity / drift) with GPU particle flow",
-      "KNN connectivity edge visualization",
-      "Publication export: SVG (vector) + PNG (high-DPI)",
-      "Collaborative community annotation voting with optional GitHub sync"
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "@id": "https://www.cellucid.com/#website",
+        "name": "Cellucid",
+        "alternateName": ["cellucid", "cellucid.com"],
+        "url": "https://www.cellucid.com/",
+        "inLanguage": "en"
+      },
+      {
+        "@type": "WebApplication",
+        "@id": "https://www.cellucid.com/#app",
+        "name": "Cellucid",
+        "alternateName": "cellucid",
+        "description": "Cellucid is a free, open-source web app for interactive single-cell data visualization. It renders millions of cells on the GPU in the browser, in 1D, 2D and 3D embeddings such as UMAP, colored by gene expression or cell metadata, and reads AnnData, MuData, Loom, 10x Cell Ranger, MatrixMarket and Seurat or SingleCellExperiment files in place, without uploading them. The cellucid Python package (Scanpy/AnnData, Jupyter) and R package (Seurat, SingleCellExperiment) prepare data for it and show data in it.",
+        "url": "https://www.cellucid.com/",
+        "isPartOf": { "@id": "https://www.cellucid.com/#website" },
+        "image": "https://www.cellucid.com/assets/img/og-preview.jpg",
+        "applicationCategory": "ScientificApplication",
+        "applicationSubCategory": "Single-cell data visualization",
+        "operatingSystem": "Web browser",
+        "softwareVersion": "0.9.7",
+        "browserRequirements": "Requires WebGL2",
+        "isAccessibleForFree": true,
+        "license": "https://opensource.org/licenses/BSD-3-Clause",
+        "inLanguage": "en",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "author": {
+          "@type": "Person",
+          "name": "Kemal Inecik",
+          "url": "https://kemalinecik.com"
+        },
+        "softwareHelp": {
+          "@type": "CreativeWork",
+          "url": "https://docs.cellucid.com/en/latest/"
+        },
+        "sameAs": [
+          "https://github.com/theislab/cellucid",
+          "https://docs.cellucid.com/en/latest/",
+          "https://pypi.org/project/cellucid/",
+          "https://github.com/theislab/cellucid-python",
+          "https://github.com/theislab/cellucid-r",
+          "https://theislab.github.io/cellucid-r/"
+        ],
+        "featureList": [
+          "Real-time GPU (WebGL2) rendering of millions of cells with adaptive level of detail",
+          "1D, 2D and 3D embeddings such as UMAP, several per dataset, in independent side-by-side views",
+          "Gene expression and cell metadata coloring, filtering, selection and highlighting",
+          "Marker genes, differential expression, dot plots, gene signatures and cell-type composition",
+          "Subsampled reading: a seeded share of the cells, downloading only the parts of the file that hold them",
+          "Animated RNA velocity and drift overlays and KNN connectivity edges",
+          "An undoable, branching history of every step, shareable sessions and dataset links",
+          "Publication export: SVG (vector) and high-DPI PNG",
+          "Community annotation voting with optional GitHub sync",
+          "AI agents under your permissions: a chat bar with your own key, Claude or ChatGPT as an MCP connector, or a local MCP server",
+          "Opens AnnData (.h5ad, Zarr, .zarr.zip), MuData (.h5mu, MuData Zarr), Loom, 10x Cell Ranger (.h5, outs/), MatrixMarket folders and Seurat or SingleCellExperiment objects (.rds, .rda) in the browser"
+        ]
+      }
     ]
   }</script>
 
@@ -1361,9 +1382,11 @@
       <li>Community annotation voting with optional GitHub sync</li>
     </ul>
     <h2>Data sources</h2>
-    <p>Open an AnnData <code>.h5ad</code> file, a Zarr store or a <code>.zarr.zip</code> archive directly in the browser. The <code>cellucid</code> Python package prepares one from Scanpy/AnnData, and the <code>cellucid</code> R package from Seurat and SingleCellExperiment. Data can also be served from a Python server or a Jupyter notebook.</p>
-    <h2>Use cases</h2>
-    <p>Explore scRNA-seq atlases, query marker genes, compare embeddings, visualize trajectories, and build consensus community annotations.</p>
+    <p>Cellucid reads these files in the browser, in place, without uploading them: AnnData (<code>.h5ad</code>, Zarr store folders and <code>.zarr.zip</code> archives), MuData (<code>.h5mu</code> and MuData Zarr), Loom (<code>.loom</code>), 10x Cell Ranger HDF5 (<code>.h5</code>) and <code>outs/</code> folders, MatrixMarket folders, and Seurat or SingleCellExperiment objects saved from R (<code>.rds</code>, <code>.rda</code>). Open one from your computer, a link, a dataset catalog or a server. The <code>cellucid</code> Python package (Scanpy/AnnData) and the <code>cellucid</code> R package (Seurat, SingleCellExperiment) prepare data for it and show data in it from a script, a Jupyter notebook or an R session.</p>
+    <h2>Who it is for</h2>
+    <p>Biologists and bioinformaticians who want to explore a single-cell atlas without installing anything: explore scRNA-seq atlases, query marker genes, compare embeddings side by side, visualize trajectories and RNA velocity, and build consensus community annotations.</p>
+    <h2>Citing</h2>
+    <p>Cellucid is free and open source under the BSD 3-Clause license. To cite it, use the reference on the Citing Cellucid page of the documentation.</p>
     <h2>Learn more</h2>
     <ul>
       <li><a href="https://docs.cellucid.com/en/latest/" tabindex="-1">Cellucid documentation</a></li>

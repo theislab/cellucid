@@ -1,4 +1,12 @@
-name: Web contracts
+name: Web app tests
+# Each run says what it is in the Actions list: the nightly and manual runs
+# test every engine on every operating system, a push or pull request Linux
+# (every engine) plus WebKit on macOS.
+run-name: >-
+  ${{ github.event_name == 'schedule' && 'Nightly: every engine on Linux, macOS and Windows'
+  || github.event_name == 'workflow_dispatch' && 'Manual full matrix: every engine on Linux, macOS and Windows'
+  || github.event_name == 'pull_request' && format('Pull request: {0}', github.event.pull_request.title)
+  || format('Push: {0}', github.event.head_commit.message) }}
 
 on:
   push:
@@ -160,19 +168,30 @@ jobs:
             browser: webkit
             shard: "8/8"
 
+    # The control walk runs in the `control-walk` job below, not in these
+    # shards (`playwright.config.mjs`, `CELLUCID_CONTROL_WALK`).
+    env:
+      CELLUCID_CONTROL_WALK: apart
+
+    # The steps the `control-walk` job runs too are anchored here (`&name`)
+    # and repeated there by alias (`*name`), so the two jobs set up their
+    # runners and keep their evidence the same way.
     steps:
-      - name: Check out the exact source
+      - &check-out
+        name: Check out the exact source
         timeout-minutes: 5
         uses: actions/checkout@v7
 
-      - name: Install Node.js
+      - &install-node
+        name: Install Node.js
         timeout-minutes: 5
         uses: actions/setup-node@v7
         with:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Install exact dependencies
+      - &install-dependencies
+        name: Install exact dependencies
         timeout-minutes: 10
         run: npm ci
 
@@ -183,7 +202,8 @@ jobs:
       # fails as `ERR_NO_BUFFER_SPACE` (Chromium) or "Could not connect to
       # server" (WebKit) in a spec that has nothing to do with the cause. Give
       # the host the whole unprivileged range.
-      - name: Widen the Windows ephemeral port range
+      - &widen-windows-ports
+        name: Widen the Windows ephemeral port range
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -193,33 +213,25 @@ jobs:
 
       # What the shard runs on is downloaded here, and each download has a
       # bound of its own: the Linux libraries come from the runner's apt
-      # mirror, the engine from Playwright's CDN. One runner's mirror
-      # delivered them at 35.8 kB/s (130 MB in 1 h 0 min 35 s, while another
-      # runner of the same run got 139 MB in 7 s), so its shard began 61
-      # minutes into the job and was cancelled, green so far, at the job's 75
-      # (run 42180485733, Linux WebKit shard 7/8); a second runner's mirror
-      # was as slow the same day (run 42262565061, Linux Firefox shard 6/8,
-      # the 10-minute bound). The slowness is a runner's own apt mirror
-      # (`azure.archive.ubuntu.com` through its mirror list), so the
-      # libraries are fetched by the runner's apt with every package tried
-      # at most a few times and a connection that idles for 30 s given up,
-      # under a bound that fails within minutes under the name of the step it
-      # is; the job is then run again, and the shard's own time is never
-      # spent waiting for a mirror.
-      - name: Install the Linux libraries the selected engine needs
+      # mirror, the engine from Playwright's CDN. apt cannot leave a mirror
+      # connection that trickles (its timeout fires only on silence), and
+      # about one runner in two dozen gets one: 30-50 kB/s from the package
+      # pool while the same runner read the index from the same mirror at
+      # 13 MB/s, so a run of 48 Linux browser jobs lost one to the step bound
+      # (runs 42274413675 and 42275099689; 42180485733 and 42262565061
+      # before). The script takes the download from apt: Playwright names the
+      # missing packages, each is fetched under a speed floor and, when it
+      # falls under it, again from the next mirror of the runner's own mirror
+      # list, its hash checked, and apt installs from those files only
+      # (`scripts/install-linux-engine-libraries.mjs`).
+      - &install-linux-libraries
+        name: Install the Linux libraries the selected engine needs
         if: runner.os == 'Linux'
-        timeout-minutes: 10
-        env:
-          # Playwright runs `apt-get install` for the engine's library list;
-          # apt reads these from the environment: no package is retried
-          # forever, and a connection that sends nothing for 30 s is dropped
-          # and the next mirror of the list tried.
-          APT_CONFIG: /tmp/cellucid-apt.conf
-        run: |
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > "$APT_CONFIG"
-          npx playwright install-deps ${{ matrix.browser }}
+        timeout-minutes: 15
+        run: node scripts/install-linux-engine-libraries.mjs ${{ matrix.browser }}
 
-      - name: Install the selected browser engine
+      - &install-engine
+        name: Install the selected browser engine
         timeout-minutes: 10
         run: npx playwright install ${{ matrix.browser }}
 
@@ -296,7 +308,8 @@ jobs:
       # memory or a graphics driver faulted, the host's kernel log says so: a
       # red Linux job keeps the tail of it, with the memory picture, beside the
       # Playwright evidence.
-      - name: Record the host kernel log and memory
+      - &record-linux-host
+        name: Record the host kernel log and memory
         if: failure() && runner.os == 'Linux'
         run: |
           mkdir -p test-results
@@ -310,7 +323,8 @@ jobs:
       # loading a module from the loopback server) has run out of a host
       # resource, not of the server: keep the dynamic port range, the number
       # of sockets in each TCP state, and what holds the memory and handles.
-      - name: Record the host memory and sockets
+      - &record-windows-host
+        name: Record the host memory and sockets
         if: failure() && runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -324,21 +338,78 @@ jobs:
           } *> test-results/host-windows.log
 
       # A macOS job that fails on a timing contract keeps its memory, swap
-      # and graphics device beside the Playwright evidence.
-      - name: Record the host memory and graphics
+      # and graphics device beside the Playwright evidence; one that failed on
+      # a WebGL context handed lost (a test annotated `webgl-lost-at-creation`:
+      # the browser's GPU process was reset, WebKit bug 328185) keeps what
+      # says why: the accelerator's state, the GPU processes' log of the last
+      # half hour, and any browser crash report. `system_profiler` prints no
+      # display on a hosted runner, so it is not asked. The step's shell is
+      # `bash -e`: a `grep` that matches nothing exits 1 and would end the
+      # step there, before the GPU log and the crash reports are kept, so a
+      # host that lists no such accelerator key records that and goes on.
+      - &record-macos-host
+        name: Record the host memory and graphics
         if: failure() && runner.os == 'macOS'
         run: |
-          mkdir -p test-results
-          { vm_stat; echo; sysctl vm.swapusage; echo; system_profiler SPDisplaysDataType; echo; top -l 1 -o mem -n 15 | tail -n 22; } > test-results/host-macos.log 2>&1
+          mkdir -p test-results/host-crash-reports
+          { vm_stat; echo; sysctl vm.swapusage; echo; ioreg -r -c IOAccelerator -l -w0 | grep -E 'PerformanceStatistics|IOClass|model' || echo 'ioreg lists no IOAccelerator key'; echo; top -l 1 -o mem -n 15 | tail -n 22; } > test-results/host-macos.log 2>&1
+          log show --last 30m --style compact --predicate 'process BEGINSWITH "com.apple.WebKit.GPU" OR process CONTAINS "MiniBrowser" OR eventMessage CONTAINS[c] "command buffer" OR eventMessage CONTAINS[c] "GPU reset"' > test-results/host-macos-gpu.log 2>&1 || true
+          find ~/Library/Logs/DiagnosticReports -mmin -90 \( -iname '*WebKit*' -o -iname '*Playwright*' -o -iname '*firefox*' -o -iname '*Chrom*' \) -exec cp {} test-results/host-crash-reports/ \; 2>/dev/null || true
 
       # Playwright writes a screenshot and an error-context page snapshot for
       # every failed test under `test-results/<port>/`; a red job publishes
-      # them so the failure can be read without re-running it.
-      - name: Upload the failure evidence
+      # them so the failure can be read without re-running it. The job's id
+      # keeps the names of both jobs' artifacts apart (an artifact name is
+      # unique in a run).
+      - &upload-failure-evidence
+        name: Upload the failure evidence
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-failure-${{ strategy.job-index }}-${{ matrix.os }}-${{ matrix.browser }}
+          name: playwright-failure-${{ github.job }}-${{ strategy.job-index }}-${{ matrix.os }}-${{ matrix.browser }}
           path: test-results/
           if-no-files-found: ignore
           retention-days: 14
+
+  # The control walk (`tests/browser/helpers/control-walk.mjs`): a test per
+  # part of the page, each minutes long, declared by the files
+  # `tests/browser/control-walk-<k>-of-<n>.spec.mjs`, a share each, and
+  # Chromium only. Playwright shards by test count, so in the browser job its
+  # few long tests fell into one shard together (Chromium 3/8: a batch of 36
+  # tests took 40.8 minutes in run 42334173086, against about 9 minutes for
+  # the whole shard without them). Here each share is a job of its own
+  # (`CELLUCID_CONTROL_WALK=only`, one shard a file), on the operating
+  # systems the browser job runs Chromium on, through the same bounded
+  # runner and with the same setup and evidence steps.
+  control-walk:
+    name: ${{ matrix.os }} / ${{ matrix.browser }} / control walk ${{ matrix.shard }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["ubuntu-latest"]') }}
+        browser: [chromium]
+        shard: ["1/4", "2/4", "3/4", "4/4"]
+
+    env:
+      CELLUCID_CONTROL_WALK: only
+
+    steps:
+      - *check-out
+      - *install-node
+      - *install-dependencies
+      - *widen-windows-ports
+      - *install-linux-libraries
+      - *install-engine
+
+      - name: Run the selected control-walk share in bounded processes
+        run: >-
+          npm run test:browser:bounded --
+          --project=${{ matrix.browser }}
+          --shard=${{ matrix.shard }}
+
+      - *record-linux-host
+      - *record-windows-host
+      - *record-macos-host
+      - *upload-failure-evidence

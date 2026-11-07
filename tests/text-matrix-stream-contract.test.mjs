@@ -354,6 +354,40 @@ test('opened from this computer: the first view has no gene value, the share arr
   }
 });
 
+test('a gene asked for before the share arrives waits for it and is read with its values, never as "not read" on every cell', async () => {
+  // The map's X holds no entry: read then, every gene was NaN on every
+  // cell and the page refused it as having no value (Web contracts run
+  // 42280096732, Linux Firefox, `tests/browser/text-matrix-stream.spec.mjs`).
+  const nCells = 4000;
+  const { source, byCell } = folder(nCells, 40);
+  const fileSource = new AnnDataFileSource();
+  try {
+    const files = [...source.files].map(([path, file]) => {
+      Object.defineProperty(file, 'webkitRelativePath', { value: path });
+      return file;
+    });
+    const { onMatrixShare } = await import('../assets/js/data/anndata-reader-client.js');
+    const events = [];
+    const stop = onMatrixShare(message => events.push(message.event));
+    await fileSource.loadFolder(files);
+    const loader = fileSource.getAdapter()._loader;
+    assert.equal(loader.geneSample?.cells, 0, 'the first view: genes read for no cell');
+    assert.equal(loader.geneSample?.fit?.limit, 'stream');
+    assert.ok(!events.includes('genes-arrived'), `asked before the share arrived (${events.join(', ')})`);
+    const [column] = await loader.getMatrixColumns('X', [3]);
+    stop();
+    assert.ok(events.includes('genes-arrived'), 'the read waited for the share');
+    assert.equal(loader.geneSample, null, 'every cell of a small matrix fits: genes for every open cell');
+    const order = loader.cellSubset?.openOrder ?? Uint32Array.from({ length: nCells }, (_, i) => i);
+    for (let i = 0; i < nCells; i++) {
+      const expected = byCell[order[i]].find(([gene]) => gene === 3)?.[1] ?? 0;
+      assert.equal(column[i], expected, `open cell ${i}`);
+    }
+  } finally {
+    fileSource.clear();
+  }
+});
+
 test('kept for later visits: the map and the share open again without reading the matrix', async t => {
   const disk = opfsOnDisk();
   t.after(disk.cleanup);

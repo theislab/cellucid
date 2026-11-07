@@ -1238,6 +1238,10 @@ export class FieldLoadingMethods {
     if (!field.loaded) {
       throw new Error(`Field "${field.key}" not loaded yet.`);
     }
+    // A column with nothing to draw is refused here too, before the active
+    // field changes (`ensureContinuousMetadata`): not after, leaving the
+    // refused field chosen.
+    if (field.kind === 'continuous') this.ensureContinuousMetadata(field);
     this.activeFieldIndex = fieldIndex;
     this.activeVarFieldIndex = -1;
     this.activeFieldSource = 'obs';
@@ -1289,6 +1293,10 @@ export class FieldLoadingMethods {
     if (!field.loaded) {
       throw new Error(`Var field "${field.key}" not loaded yet.`);
     }
+    // A gene with nothing to draw is refused here too, before the active
+    // gene changes (`ensureContinuousMetadata`): not after, leaving the
+    // refused gene chosen.
+    this.ensureContinuousMetadata(field);
     this.activeVarFieldIndex = fieldIndex;
     this.activeFieldIndex = -1;
     this.activeFieldSource = 'var';

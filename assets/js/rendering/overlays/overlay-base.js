@@ -78,6 +78,19 @@ export class OverlayBase {
   }
 
   /**
+   * Whether some of the frames `needsContinuousFrames` asks for are owed:
+   * work that converges and that the next frame starts, adopts or finishes,
+   * drawn at once. Frames that are not owed animate what never ends, and
+   * the viewer paces them to the measured frame cost
+   * (`rendering/ambient-frame-pacing.js`). An overlay that only animates
+   * owes none.
+   * @returns {boolean}
+   */
+  needsOwedFrames() {
+    return false;
+  }
+
+  /**
    * @param {object} context
    */
   render(context) {

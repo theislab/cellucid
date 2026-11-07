@@ -4,8 +4,11 @@
  * it while it runs (one notification: for how many cells, how many bytes,
  * how far), and once the open cells were read again on the store it made,
  * reads every loaded gene on the cells it holds
- * (`DataState.readGenesForMoreCells`), so a gene picked meanwhile is drawn
- * with its values.
+ * (`DataState.readGenesForMoreCells`). A gene picked before any cell's
+ * matrix rows are held waits for the share in the reader worker
+ * (`anndata-reader-worker.js` `awaitHeldGenes`) and is drawn with its
+ * values; meanwhile the page states the opening's gene sample, no cell read
+ * (`DataState.getGeneSample`), never every cell.
  *
  * @module matrix-share-notices
  */

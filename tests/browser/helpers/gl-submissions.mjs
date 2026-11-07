@@ -5,7 +5,8 @@
  * inputs. A spec that compares the pixels of two ways of drawing one scene
  * (one store or many segments, cells added in place or opened directly)
  * asserts those inputs first: the bytes of the stores, the cameras, and, with
- * this recorder, every draw call of the frame it read: its program, mode,
+ * this recorder, every draw call of the frame it read: its program (named by
+ * its shaders' sources, `labelProgramsBySource`), mode,
  * vertex count, viewport, whether it rasterizes, and the value of every
  * uniform of its program at the call. Calls that follow one another under
  * the same state count as one of their summed count, so a store drawn one
@@ -39,19 +40,68 @@
  */
 
 /**
+ * Name every WebGL program of the page by its shaders' sources, from the
+ * page's start: `page.addInitScript(labelProgramsBySource)` before the page
+ * opens, which `recordSubmissions` requires. A draw's program is recorded by
+ * that name, so two programs linked from the same code are the same program
+ * and two of different code are not, whichever objects they are: a context
+ * the browser restores makes every program again as a new object
+ * (`restoreLostGraphics`, rendering/viewer.js), and the frames before and
+ * after are compared draw by draw (`graphics-context-restore.spec.mjs`).
+ * The sources are taken at link time: the renderers delete their shaders
+ * once a program is linked (`rendering/gl-utils.js`).
+ */
+export function labelProgramsBySource() {
+  const prototype = WebGL2RenderingContext.prototype;
+  const sources = new WeakMap();
+  const attached = new WeakMap();
+  const labels = new WeakMap();
+  window.__programLabels = labels;
+  const { shaderSource, attachShader, detachShader, linkProgram } = prototype;
+  prototype.shaderSource = function (shader, source) {
+    sources.set(shader, source);
+    return shaderSource.call(this, shader, source);
+  };
+  prototype.attachShader = function (program, shader) {
+    attached.set(program, [...(attached.get(program) ?? []), shader]);
+    return attachShader.call(this, program, shader);
+  };
+  prototype.detachShader = function (program, shader) {
+    attached.set(program, (attached.get(program) ?? []).filter(other => other !== shader));
+    return detachShader.call(this, program, shader);
+  };
+  prototype.linkProgram = function (program) {
+    const text = (attached.get(program) ?? []).map(shader => sources.get(shader) ?? '').sort().join('\0');
+    // FNV-1a over the sources, one name per program's code.
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index++) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    labels.set(program, `program ${(hash >>> 0).toString(16).padStart(8, '0')}`);
+    return linkProgram.call(this, program);
+  };
+}
+
+/**
  * Start recording, in the page (`page.evaluate(recordSubmissions)`): once a
- * page, before the frames a spec reads. `window.__submissions` then holds
+ * page, before the frames a spec reads, on a page that named its programs
+ * from its start (`labelProgramsBySource`). `window.__submissions` then holds
  * `frames` (how many frames with draws were drawn since), `last` (the draws
  * of the last such frame) and `previous` (of the one before it).
  */
 export function recordSubmissions() {
   if (window.__submissions !== undefined) return;
+  const labels = window.__programLabels;
+  if (!(labels instanceof WeakMap)) {
+    throw new Error('recordSubmissions names programs by their sources: add labelProgramsBySource as an init script before the page opens.');
+  }
   const gl = window._cellucidViewer.getGLContext();
-  const ids = new Map();
-  const idOf = object => {
-    if (object === null) return null;
-    if (!ids.has(object)) ids.set(object, ids.size);
-    return ids.get(object);
+  const idOf = program => {
+    if (program === null) return null;
+    const label = labels.get(program);
+    if (label === undefined) throw new Error('A draw used a program linked before labelProgramsBySource was installed.');
+    return label;
   };
   // The active uniforms of a program: name and location, each element of an array on its own.
   const uniformsByProgram = new Map();

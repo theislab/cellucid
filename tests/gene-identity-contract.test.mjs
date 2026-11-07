@@ -77,11 +77,11 @@ test('gene sets and the gene the viewer colours by go out by identifier', async 
   // By identifier, with the name the viewer shows beside it (protocol `color_by.symbol`).
   assert.deepEqual(sent.find(item => item.colorBy)?.colorBy, { field: 'ENSG00000168484', source: 'var', symbol: 'SFTPC', cells_read: null });
   // A gene read for a sample of the open cells (the first 2 of 4): how many (`color_by.cells_read`).
-  state._geneSample = Object.freeze({ cells: 2, of: 4, fit: null });
+  state.noteGeneSample({ cells: 2, of: 4 });
   sent.length = 0;
   await results.resync();
   assert.deepEqual(sent.find(item => item.colorBy)?.colorBy, { field: 'ENSG00000168484', source: 'var', symbol: 'SFTPC', cells_read: 2 });
-  state._geneSample = null;
+  state.noteGeneSample(null);
   results.dispose();
 });
 

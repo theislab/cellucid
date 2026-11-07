@@ -19,10 +19,12 @@
  *
  * COST WHILE STILL
  * Zero: no frame callback, no timers. Ambient motion (star twinkle, mote
- * drift) is off by default; when enabled it wakes the viewer through
- * `invalidate()` at most `BACKDROP_AMBIENT_MAX_HZ` times a second, and never
- * while the tab is hidden or the user prefers reduced motion (a change of
- * that setting takes effect at once).
+ * drift) is off by default; when enabled it asks the viewer for a frame
+ * (`requestFrame`, `motionCause`) at most `BACKDROP_AMBIENT_MAX_HZ` times a
+ * second, and never while the tab is hidden or the user prefers reduced
+ * motion (a change of that setting takes effect at once). Such a frame is an
+ * ambient one, which the viewer paces like every animation that never ends
+ * (`rendering/ambient-frame-pacing.js`).
  *
  * DRAW CONTRACT
  * `draw()` is a pure function of (look state, `version`, the pane's camera,
@@ -184,12 +186,14 @@ function visibilitySignature(visibility) {
  * @param {WebGL2RenderingContext} gl
  * @param {object} options
  * @param {() => void} options.invalidate - asks the viewer for one frame
+ * @param {() => void} options.requestFrame - asks the viewer for a frame
+ *   without changing the scene: the viewer reads `motionCause()`
  * @param {() => boolean} options.prefersReducedMotion
  * @param {(viewId: string) => null | {
  *   positions: Float32Array; dimension: number; colors: Uint8Array|null;
  *   visibility: Uint8Array|null; generation: number }} options.readViewSource
  */
-export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotion, readViewSource }) {
+export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefersReducedMotion, readViewSource }) {
   const now = () => performance.now();
   const parallelCompile = gl.getExtension('KHR_parallel_shader_compile');
   const maxPointSize = Math.min(64, gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 64);
@@ -202,6 +206,8 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
   let ambientTimer = null;
   let ambientClock = 0;
   let ambientLastWall = 0;
+  // A step of the ambient motion not drawn yet.
+  let motionOwed = false;
   let textureBytes = 0;
 
   /** program key -> { program, shaders, ready, failed, uniforms: Map } */
@@ -1080,7 +1086,8 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
     ambientClock += Math.min(0.1, (wall - ambientLastWall) / 1000);
     ambientLastWall = wall;
     version += 1;
-    invalidate();
+    motionOwed = true;
+    requestFrame();
     ambientTimer = setTimeout(tickAmbient, 1000 / BACKDROP_AMBIENT_MAX_HZ);
   }
 
@@ -1146,6 +1153,8 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
 
   /** Advance the fade-in by `dt` seconds (at once under reduced motion). */
   function advance(dt) {
+    // The frame being drawn shows the motion's latest step.
+    motionOwed = false;
     if (activeId === null) return;
     if (isLookReady() && opacity < 1) {
       opacity = prefersReducedMotion() ? 1 : Math.min(1, opacity + dt / BACKDROP_LOOK_FADE_SECONDS);
@@ -1158,6 +1167,14 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
     if (activeId === null) return null;
     if (isLookReady() && opacity < 1) return 'backdrop-fade';
     return null;
+  }
+
+  /**
+   * 'backdrop-motion' while a step of the ambient motion is not drawn yet,
+   * else null: an animation that never ends, whose frames the viewer paces.
+   */
+  function motionCause() {
+    return motionOwed && ambientTimer !== null ? 'backdrop-motion' : null;
   }
 
   function setUniform3(program, name, value) {
@@ -1467,6 +1484,7 @@ export function createBackdropLookRenderer(gl, { invalidate, prefersReducedMotio
     getExportState,
     whenReady,
     frameCause,
+    motionCause,
     draw,
     forgetView,
     dispose: () => teardown(true),

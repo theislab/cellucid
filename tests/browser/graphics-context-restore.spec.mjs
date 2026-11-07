@@ -1,10 +1,14 @@
 import { expect, test } from './helpers/test.mjs';
+import { expectDownloadNamed } from './helpers/downloads.mjs';
 
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 import { expectPerformance, recordFrameCost } from './helpers/frame-cost-log.mjs';
+import { labelProgramsBySource, recordSubmissions } from './helpers/gl-submissions.mjs';
+import { isHostedMacosFirefox } from './helpers/hosted-gl.mjs';
+import { ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX } from './helpers/pixel-parity.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=graphics-context-restore-ci`;
@@ -13,7 +17,18 @@ const DATASET_URL =
  * A browser that takes the WebGL context away (GPU process crash or reset,
  * driver timeout, memory pressure) and gives it back: the viewer makes every
  * GPU object again from what it holds on the CPU (`restoreLostGraphics`,
- * rendering/viewer.js). WEBGL_lose_context stands in for the browser.
+ * rendering/viewer.js), and sets again what it had set on the context itself,
+ * whose every value is back at its initial one: the clear colour of the
+ * background, the backdrop look. WEBGL_lose_context stands in for the
+ * browser.
+ *
+ * The frames compared are steady frames of the highlight's pulse on both
+ * sides, and what each submitted to the GPU is asserted equal before their
+ * pixels (`helpers/gl-submissions.mjs`): the frame right after a restore is
+ * drawn whole, a later pulse frame of a multisampled scene draws again only
+ * under the rings (`pulse-sample-mask.js`), and the frame read once stood on
+ * one side for the other (hosted macOS Firefox, full-matrix run
+ * 42320991390: one pixel off by one, green 214 against 213).
  */
 
 async function openWithKeptViewAndHighlights(page) {
@@ -56,11 +71,16 @@ async function settle(page) {
   ).toBe(true);
 }
 
-/** What the canvas shows, with each pane's camera, kept in the page. */
+/**
+ * What the canvas shows in a steady frame of the pulse, with each pane's
+ * camera and what the frame submitted, kept in the page.
+ */
 function capture(page, name) {
-  return page.evaluate(key => {
+  return page.evaluate(async key => {
     const viewer = window._cellucidViewer;
     const gl = viewer.getGLContext();
+    const submissions = window.__submissions;
+    await submissions.steadyPulseFrame(submissions.frames);
     const width = gl.drawingBufferWidth;
     const height = gl.drawingBufferHeight;
     const pixels = new Uint8Array(width * height * 4);
@@ -71,6 +91,7 @@ function capture(page, name) {
       width,
       height,
       pixels,
+      submitted: submissions.last,
       panes: viewer.getPresentedLayout().panes.map(pane => ({
         viewId: pane.viewId,
         rect: [pane.viewportX, pane.viewportY, pane.viewportWidth, pane.viewportHeight],
@@ -95,6 +116,29 @@ function capture(page, name) {
   }, name);
 }
 
+/** The first difference between what two captures' frames submitted, or null. */
+function submittedDifference(page, left, right) {
+  return page.evaluate(([a, b]) => window.__submissions.difference(
+    window.__restoreCaptures[a].submitted,
+    window.__restoreCaptures[b].submitted,
+  ), [left, right]);
+}
+
+/** Lit pixels (alpha not zero) of a capture, over its panes. */
+function litPixels(page, name) {
+  return page.evaluate(key => {
+    const { pixels, width, panes } = window.__restoreCaptures[key];
+    let lit = 0;
+    for (const pane of panes) {
+      const [x0, y0, paneWidth, paneHeight] = pane.rect;
+      for (let y = y0; y < y0 + paneHeight; y++) {
+        for (let x = x0; x < x0 + paneWidth; x++) if (pixels[(y * width + x) * 4 + 3] !== 0) lit += 1;
+      }
+    }
+    return lit;
+  }, name);
+}
+
 /** Where two captures differ, pane by pane (the first few pixels named). */
 function differences(page, left, right) {
   return page.evaluate(([a, b]) => {
@@ -103,7 +147,8 @@ function differences(page, left, right) {
     if (before.width !== after.width || before.height !== after.height) {
       return [{ canvas: [before.width, before.height, after.width, after.height] }];
     }
-    if (JSON.stringify(before.panes) !== JSON.stringify(after.panes)) {
+    const layout = capture => capture.panes;
+    if (JSON.stringify(layout(before)) !== JSON.stringify(layout(after))) {
       return [{ layout: [before.panes, after.panes] }];
     }
     const found = [];
@@ -154,12 +199,18 @@ function notice(page) {
   });
 }
 
-test('a lost context is restored in place: the same pixels, kept views, highlights and filters', async ({ page }) => {
+for (const background of ['studio', 'black']) {
+test(`a lost context is restored in place: the same pixels, kept views, highlights and filters (${background} background)`, async ({ page, browserName }) => {
   test.setTimeout(180_000);
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
+  await page.addInitScript(labelProgramsBySource);
   await openWithKeptViewAndHighlights(page);
+  // Black has nothing drawn over the clear colour: the background is the
+  // context's clear colour itself.
+  await page.locator('#background-select').selectOption(background);
   await settle(page);
+  await page.evaluate(recordSubmissions);
   const before = await capture(page, 'before');
   expect(before.views).toHaveLength(1);
   expect(before.highlighted).toBe(40);
@@ -182,12 +233,60 @@ test('a lost context is restored in place: the same pixels, kept views, highligh
   await settle(page);
   const after = await capture(page, 'after');
   expect(after).toEqual(before);
-  expect(await differences(page, 'before', 'after')).toEqual([]);
+  // The same draws with the same programs, ranges, viewports and uniforms.
+  expect(await submittedDifference(page, 'before', 'after'), 'what the two frames submitted').toBeNull();
+  const differing = await differences(page, 'before', 'after');
+  if (isHostedMacosFirefox(browserName)) {
+    // Every GPU object of the restored context is new, holding the same
+    // bytes: hosted macOS Firefox has drawn such pairs a few pixels apart
+    // (`helpers/hosted-gl.mjs`). Everything above is held there exactly; of
+    // the pixels, that no more than rounding's share differs.
+    const count = differing.reduce((sum, pane) => sum + (pane.count ?? Infinity), 0);
+    expect(count, `pixels that differ ${JSON.stringify(differing)}`)
+      .toBeLessThanOrEqual((await litPixels(page, 'before')) * ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX);
+  } else {
+    expect(differing).toEqual([]);
+  }
 
   // The restored renderer works on: a click picks a cell, a new kept view is drawn.
   await page.evaluate(() => document.getElementById('split-keep-view-btn').click());
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length)).toBe(2);
   await settle(page);
+  expect(pageErrors).toEqual([]);
+});
+}
+
+test('a restored context shows the backdrop look it had, moving by itself as before', async ({ page }) => {
+  test.setTimeout(180_000);
+  const pageErrors = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  await openWithKeptViewAndHighlights(page);
+  const look = 'nebula';
+  await page.locator('#background-select').selectOption(look);
+  const shown = () => page.evaluate(() => {
+    const viewer = window._cellucidViewer;
+    const diagnostics = viewer.getBackdropLookDiagnostics();
+    const clear = Array.from(viewer.getGLContext().getParameter(WebGL2RenderingContext.COLOR_CLEAR_VALUE), value => Math.round(value * 255));
+    return { activeId: diagnostics.activeId, opacity: diagnostics.opacity, queued: diagnostics.jobsQueued, clear };
+  });
+  await expect.poll(shown, { timeout: 60_000 }).toEqual(expect.objectContaining({ activeId: look, opacity: 1, queued: 0 }));
+  const before = await shown();
+  // The look moves by itself once asked to (no reduced motion here).
+  await page.evaluate(() => window._cellucidViewer.setBackdropAmbientMotion(true));
+  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getBackdropLookDiagnostics().ambient)).toBe(true);
+
+  await loseContext(page);
+  await restoreContext(page);
+  // The motion the page asked for comes back with the context.
+  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getBackdropLookDiagnostics().ambient)).toBe(true);
+  // The look bakes again on the restored context and is shown as before, over
+  // the same clear colour. Waited for still, as before the loss: moving, every
+  // frame draws the look again, and on hosted macOS Firefox a frame of it takes
+  // about a minute (`helpers/hosted-gl.mjs`: 55 to 69 s a 1024² pass), so its
+  // fade-in (0.35 s of frames) outlasted any wait there (nightly run
+  // 42334181105). What is restored is the same either way.
+  await page.evaluate(() => window._cellucidViewer.setBackdropAmbientMotion(false));
+  await expect.poll(shown, { timeout: 60_000 }).toEqual(before);
   expect(pageErrors).toEqual([]);
 });
 
@@ -272,7 +371,7 @@ test('a context that cannot be restored leaves the session saved and offers Relo
     prototype.createVertexArray = create;
   });
   const saved = await download;
-  expect(saved.suggestedFilename()).toMatch(/^cellucid-session-.*\.cellucid-session$/);
+  await expectDownloadNamed(saved, /^cellucid-session-.*\.cellucid-session$/);
   await expect.poll(() => notice(page)).toEqual(expect.objectContaining({ buttons: ['Save session', 'Reload'] }));
   expect((await notice(page)).text).toMatch(/could not be restored/);
   expect(await page.evaluate(() => window._cellucidViewer.isContextLost())).toBe(true);

@@ -492,11 +492,11 @@ test('a Microsoft sign-in window closed without signing in ends the attempt, and
   const context = page.context();
   await useTestConfig(context);
   // The person closes Microsoft's window: it never returns to the callback.
-  await context.route('https://login.microsoftonline.com/common/oauth2/v2.0/authorize?**', route => route.fulfill({
-    status: 200,
-    contentType: 'text/html',
-    body: '<!doctype html><title>Sign in</title>',
-  }));
+  // Its sign-in page is refused, so the window never shows an http(s) page:
+  // macOS WebKit can end its browser process when a window is closed moments
+  // after it showed one (its Screen Time observer, `helpers/downloads.mjs`).
+  // What this page does is the same either way: it only watches the window close.
+  await context.route('https://login.microsoftonline.com/common/oauth2/v2.0/authorize?**', route => route.abort());
   const errors = watchErrors(page);
   await page.goto(`/?${PINNED}data=${encodeURIComponent('https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc')}`, { waitUntil: 'domcontentloaded' });
   await openPanels(page);

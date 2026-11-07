@@ -233,6 +233,19 @@ test('the viewer clears to the studio surface it publishes', async () => {
   );
   assert.match(studioCase, /case 'studio-dark': \{/);
   assert.match(studioCase, /studioPalette = STUDIO_PALETTES\[exactMode\];/);
-  assert.match(studioCase, /gl\.clearColor\(surface\[0\], surface\[1\], surface\[2\], 1\);/);
+  assert.match(studioCase, /setBackgroundClearColor\(surface\[0\], surface\[1\], surface\[2\]\);/);
   assert.match(studioCase, /bgColor = surface;/);
+  // The background's clear colour is the context's, opaque, and is set again
+  // on a context the browser restores (whose every value is back at its
+  // initial one, transparent black for the clear colour).
+  const setter = viewerSource.slice(
+    viewerSource.indexOf('function setBackgroundClearColor('),
+    viewerSource.indexOf('let backdropLookId')
+  );
+  assert.match(setter, /backgroundClearColor = \[red, green, blue, 1\];\s+gl\.clearColor\(red, green, blue, 1\);/);
+  const restore = viewerSource.slice(
+    viewerSource.indexOf('function restoreLostGraphics()'),
+    viewerSource.indexOf('sceneMsaaTarget = createSceneMsaaTarget(gl);', viewerSource.indexOf('function restoreLostGraphics()'))
+  );
+  assert.match(restore, /primeGlState\(gl\);\s+applyViewerGlState\(\);/);
 });

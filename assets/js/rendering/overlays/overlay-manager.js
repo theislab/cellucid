@@ -30,10 +30,10 @@ export class OverlayManager {
     if (typeof overlay.id !== 'string' || overlay.id.length === 0) {
       throw new TypeError('OverlayManager.register requires a non-empty string id.');
     }
-    for (const method of ['init', 'update', 'render', 'dispose', 'needsContinuousFrames']) {
+    for (const method of ['init', 'update', 'render', 'dispose', 'needsContinuousFrames', 'needsOwedFrames']) {
       if (typeof overlay[method] !== 'function') {
         throw new TypeError(
-          'OverlayManager.register requires the complete init, update, render, dispose, and needsContinuousFrames lifecycle.'
+          'OverlayManager.register requires the complete init, update, render, dispose, needsContinuousFrames, and needsOwedFrames lifecycle.'
         );
       }
     }
@@ -144,6 +144,18 @@ export class OverlayManager {
   needsContinuousFrames() {
     for (const overlay of this._overlays.values()) {
       if (overlay.enabled && overlay.needsContinuousFrames()) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Whether any overlay is owed frames that converge (`needsOwedFrames`),
+   * which the viewer draws at once; the rest of what `needsContinuousFrames`
+   * asks for animates without end, and is paced.
+   */
+  needsOwedFrames() {
+    for (const overlay of this._overlays.values()) {
+      if (overlay.enabled && overlay.needsContinuousFrames() && overlay.needsOwedFrames()) return true;
     }
     return false;
   }

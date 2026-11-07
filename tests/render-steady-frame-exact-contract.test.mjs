@@ -238,7 +238,7 @@ test('viewer steady-frame shell reuses viewport, flags, titles, axes, and scisso
   );
   const renderSource = extractSourceRange(
     source,
-    'function render()',
+    'function render(timestamp)',
     'function renderSingleView(',
   );
   const singleView = extractSourceRange(
@@ -311,7 +311,7 @@ test('unchanged titles and centroid labels skip redundant CSSOM publication', as
   const labelPositions = extractSourceRange(
     source,
     'function updateCentroidLabelPositions(',
-    'function render()',
+    'function render(timestamp)',
   );
 
   assert.match(
@@ -386,7 +386,7 @@ test('multiview lookup and connectivity draws avoid pane-cadence callbacks and r
   );
   const renderSource = extractSourceRange(
     source,
-    'function render()',
+    'function render(timestamp)',
     'function renderSingleView(',
   );
   const singleView = extractSourceRange(

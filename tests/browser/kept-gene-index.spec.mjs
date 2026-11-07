@@ -57,8 +57,8 @@ test.beforeEach(async ({ page }) => {
 // A context that keeps an origin-private file system, as an ordinary
 // browser window does (`helpers/test.mjs` `persistentStorage`: on WebKit a
 // persistent context, where its reader worker has synchronous access
-// handles as Safari's has). Where the page still has none (Playwright
-// 1.62's Linux WebKit has no `navigator.storage`), the test asks the page
+// handles as Safari's has). Where the page still has none (Playwright's
+// Linux WebKit had no `navigator.storage` through 1.62), the test asks the page
 // (`helpers/origin-storage.mjs`) and holds the app to what it does there:
 // nothing kept, and a later visit indexes the matrix again.
 test.use({ persistentStorage: true });

@@ -19,14 +19,26 @@
  * - A title and description written for the searches that should find the app
  *   (interactive single-cell data visualization, UMAP, 3D, AnnData/Scanpy,
  *   Seurat), short enough to be shown whole in a result.
+ * - The description, canonical, Open Graph and Twitter tags at the very start
+ *   of the head. A link preview reads only a prefix of the page: Slack requests
+ *   the first 32 KB with a Range header, Teams and Telegram have been seen to
+ *   read less, and the import map alone is over 100 KB. Before 2026-11-07 the
+ *   tags sat after it, at byte 121,167, and a 32 KB fetch of the live page held
+ *   the title and nothing else.
  * - Structured data that parses, describes the app truthfully, and is the exact
- *   block the Content-Security-Policy hash allows.
+ *   block the Content-Security-Policy hash allows: a WebSite node (the site name
+ *   Google shows) and the WebApplication. A citation appears in it only once
+ *   CITATION.cff carries the paper's DOI, and then names exactly that DOI.
  * - Crawlable text: the body is app UI, so a visually hidden <main> carries one
  *   <h1> and a description, with links to the docs, GitHub and citing that stay
- *   out of the Tab order (the plot is the first Tab stop).
- * - A custom 404 page in the site's design, an llms.txt, and a
- *   /.well-known/security.txt (RFC 9116) that names SECURITY.md's contact and
- *   expires a year after the build, renewed by the generator.
+ *   out of the Tab order (the plot is the first Tab stop). It, the JSON-LD and
+ *   llms.txt name every format the input-format registry opens.
+ * - Every crawler is let in, AI crawlers and AI assistants' fetchers included:
+ *   the pages are public, and the privacy model concerns users' data, which is
+ *   never on this host.
+ * - A custom 404 page in the site's design, an llms.txt (llmstxt.org shape),
+ *   and a /.well-known/security.txt (RFC 9116) that names SECURITY.md's contact
+ *   and expires a year after the build, renewed by the generator.
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -37,6 +49,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { renderSecurityTxt } from '../scripts/generate-web-asset-inventory.mjs';
+import { INPUT_FORMATS } from '../assets/js/data/input-formats.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = name => readFile(path.join(ROOT, name), 'utf8');
@@ -68,12 +81,41 @@ const meta = (attribute, name) => only(
 
 const JSON_LD_TEXT = only(/^[ \t]*<script type="application\/ld\+json">([\s\S]*?)<\/script>/gm, INDEX, 'JSON-LD block');
 const JSON_LD = JSON.parse(JSON_LD_TEXT);
+const node = type => {
+  const nodes = JSON_LD['@graph'].filter(entry => entry['@type'] === type);
+  assert.equal(nodes.length, 1, `exactly one ${type} node`);
+  return nodes[0];
+};
+const APP = node('WebApplication');
+const WEBSITE = node('WebSite');
+
+// The paper's DOI, once CITATION.cff's preferred-citation carries one (written
+// there first, by hand, then copied everywhere by sync_citation.py).
+const CITATION_CFF = await read('CITATION.cff');
+const PREFERRED_CITATION = only(/# BEGIN cellucid preferred-citation\n([\s\S]*?)# END cellucid preferred-citation/g, CITATION_CFF, 'preferred-citation block');
+const PAPER_DOI = /^\s+doi:\s*"?([^"\s]+)"?\s*$/m.exec(PREFERRED_CITATION)?.[1] ?? null;
+
+// What the crawlable text calls each format the app opens: every format of the
+// registry it does not refuse, so a new reader fails here until the text names it.
+const FORMAT_TERMS = {
+  h5ad: ['.h5ad'],
+  zarr: ['Zarr', '.zarr.zip'],
+  loom: ['Loom'],
+  'tenx-h5': ['10x Cell Ranger', '.h5'],
+  'tenx-outs': ['outs/'],
+  h5mu: ['.h5mu'],
+  'mudata-zarr': ['MuData Zarr'],
+  rds: ['.rds', 'Seurat', 'SingleCellExperiment'],
+  rda: ['.rda'],
+  mtx: ['MatrixMarket'],
+};
 
 test('one canonical address everywhere', () => {
   const canonical = only(/<link rel="canonical" href="([^"]+)" \/>/g, INDEX, 'canonical link');
   assert.equal(canonical, SITE);
   assert.equal(meta('property', 'og:url'), canonical);
-  assert.equal(JSON_LD.url, canonical);
+  assert.equal(APP.url, canonical);
+  assert.equal(WEBSITE.url, canonical);
   assert.deepEqual([...SITEMAP.matchAll(/<loc>([^<]+)<\/loc>/g)].map(match => match[1]), [canonical]);
 });
 
@@ -91,6 +133,33 @@ test('the sitemap is dated by the build and carries nothing Google ignores', () 
 test('robots.txt lets every crawler in and names the sitemap of this host only', () => {
   const lines = ROBOTS.split('\n').map(line => line.trim()).filter(Boolean);
   assert.deepEqual(lines, ['User-agent: *', 'Allow: /', `Sitemap: ${SITE}sitemap.xml`]);
+  // No group names a crawler, so the wildcard group is the one every crawler
+  // obeys (RFC 9309 section 2.2.1): search engines, and the crawlers and
+  // fetchers of AI assistants, which should read and cite the public pages.
+  for (const agent of [
+    'Googlebot', 'Bingbot', 'Google-Extended', 'GPTBot', 'OAI-SearchBot', 'ChatGPT-User', 'ClaudeBot',
+    'Claude-SearchBot', 'Claude-User', 'anthropic-ai', 'PerplexityBot', 'Perplexity-User', 'CCBot',
+    'Applebot-Extended', 'Bytespider', 'meta-externalagent', 'DuckAssistBot', 'MistralAI-User',
+  ]) {
+    assert.ok(!new RegExp(`^user-agent:\\s*${agent}\\s*$`, 'im').test(ROBOTS), `${agent} has no group of its own`);
+  }
+  assert.doesNotMatch(ROBOTS, /^Disallow:\s*\S/m);
+});
+
+test('a link preview finds the description, canonical, Open Graph and Twitter tags in the first 16 KiB', async () => {
+  const tags = [...INDEX.matchAll(/<meta (?:name|property)="(?:description|og:[^"]+|twitter:[^"]+)" content="[^"]*" \/>|<link rel="canonical" href="[^"]+" \/>/g)];
+  assert.ok(tags.length >= 18, `${tags.length} tags`);
+  for (const match of tags) {
+    const end = Buffer.byteLength(INDEX.slice(0, match.index + match[0].length), 'utf8');
+    assert.ok(end <= 16 * 1024, `${match[0].slice(0, 60)}... ends at byte ${end}`);
+  }
+  // All of them precede the import map, whatever its size.
+  assert.ok(tags.at(-1).index < INDEX.indexOf('<script type="importmap">'));
+  for (const name of [...READING_PAGES, '404.html']) {
+    const page = await read(name);
+    const end = Buffer.byteLength(page.slice(0, page.indexOf('<meta name="description"')), 'utf8');
+    assert.ok(end > 0 && end < 16 * 1024, `${name}'s description is near the top`);
+  }
 });
 
 test('title and description name what the app is, and fit a search result', () => {
@@ -136,26 +205,48 @@ test('the link preview image exists at the size it declares and is described', a
   assert.equal(meta('property', 'og:site_name'), 'Cellucid');
 });
 
-test('the structured data describes the web app truthfully', () => {
+test('the structured data describes the site and the web app truthfully', () => {
   assert.equal(JSON_LD['@context'], 'https://schema.org');
-  assert.equal(JSON_LD['@type'], 'WebApplication');
-  assert.equal(JSON_LD.name, 'Cellucid');
-  assert.equal(JSON_LD.operatingSystem, 'Web browser');
-  assert.ok(JSON_LD.applicationCategory);
-  assert.deepEqual(JSON_LD.offers, { '@type': 'Offer', price: '0', priceCurrency: 'USD' });
-  assert.equal(JSON_LD.isAccessibleForFree, true);
-  assert.equal(JSON_LD.license, 'https://opensource.org/licenses/BSD-3-Clause');
-  assert.equal(JSON_LD.softwareHelp.url, DOCS);
+  assert.deepEqual(JSON_LD['@graph'].map(entry => entry['@type']).sort(), ['WebApplication', 'WebSite']);
+  // The site name Google shows beside a result comes from the home page's
+  // WebSite node (developers.google.com/search/docs/appearance/site-names).
+  assert.equal(WEBSITE.name, 'Cellucid');
+  assert.equal(WEBSITE['@id'], `${SITE}#website`);
+  assert.deepEqual(APP.isPartOf, { '@id': WEBSITE['@id'] });
+  assert.equal(APP.name, 'Cellucid');
+  assert.equal(APP.operatingSystem, 'Web browser');
+  assert.ok(APP.applicationCategory);
+  assert.deepEqual(APP.offers, { '@type': 'Offer', price: '0', priceCurrency: 'USD' });
+  assert.equal(APP.isAccessibleForFree, true);
+  assert.equal(APP.license, 'https://opensource.org/licenses/BSD-3-Clause');
+  assert.equal(APP.softwareHelp.url, DOCS);
   for (const url of [GITHUB, DOCS, 'https://pypi.org/project/cellucid/', 'https://github.com/theislab/cellucid-r']) {
-    assert.ok(JSON_LD.sameAs.includes(url), `sameAs names ${url}`);
+    assert.ok(APP.sameAs.includes(url), `sameAs names ${url}`);
   }
+  // A sameAs must resolve: CRAN joins it once the package is on CRAN. No
+  // rating or review is declared: there is none to declare.
+  for (const key of ['aggregateRating', 'review']) assert.equal(key in APP, false, key);
   // The version is the release the web app shares with the Python and R
-  // packages, declared once in the head; the preprint has no DOI yet, so no
-  // citation may be invented.
+  // packages, declared once in the head.
   const version = only(/<meta name="cellucid-version" content="([^"]+)" \/> <!-- CELLUCID_VERSION -->/g, INDEX, 'version meta');
   assert.match(version, /^\d+\.\d+\.\d+$/);
-  assert.equal(JSON_LD.softwareVersion, version);
-  assert.equal('citation' in JSON_LD, false);
+  assert.equal(APP.softwareVersion, version);
+});
+
+test('a citation appears in the structured data and llms.txt only with the paper\'s DOI from CITATION.cff', () => {
+  // The slot for the paper: empty while CITATION.cff has no `doi:` (no DOI may
+  // be invented). Once it has one, this fails until the WebApplication carries
+  // "citation": {"@type": "ScholarlyArticle", "@id": "https://doi.org/<doi>",
+  // "url": "https://doi.org/<doi>", "name": "<title>"} and llms.txt links it.
+  if (PAPER_DOI === null) {
+    assert.equal('citation' in APP, false);
+    assert.doesNotMatch(JSON_LD_TEXT + LLMS, /doi\.org/);
+    return;
+  }
+  const doiUrl = `https://doi.org/${PAPER_DOI}`;
+  assert.equal(APP.citation['@type'], 'ScholarlyArticle');
+  assert.equal(APP.citation['@id'], doiUrl);
+  assert.ok(LLMS.includes(doiUrl), 'llms.txt links the paper');
 });
 
 test('the Content-Security-Policy allows exactly the import map, the boot script, the JSON-LD block and the style gate', () => {
@@ -219,6 +310,20 @@ test('crawlable text says what Cellucid is and links out without taking Tab stop
   for (const term of [/interactive single-cell data visualization/i, /UMAP/, /3D/, /AnnData/, /Scanpy/, /Seurat/]) {
     assert.match(main, term);
   }
+  const text = main.replace(/<[^>]+>/g, '');
+  const features = APP.featureList.join('\n');
+  for (const [id, terms] of Object.entries(FORMAT_TERMS)) {
+    for (const term of terms) {
+      assert.ok(text.includes(term), `the about region names ${term} (${id})`);
+      assert.ok(LLMS.includes(term), `llms.txt names ${term} (${id})`);
+      assert.ok(features.includes(term), `the JSON-LD feature list names ${term} (${id})`);
+    }
+  }
+  assert.deepEqual(
+    Object.keys(FORMAT_TERMS).sort(),
+    INPUT_FORMATS.filter(format => !format.refusal).map(format => format.id).sort(),
+    'every format the app opens, and only those, is named'
+  );
   const links = [...main.matchAll(/<a href="([^"]+)"([^>]*)>/g)];
   assert.deepEqual(links.map(match => match[1]).sort(), [CITING, DOCS, GITHUB].sort());
   for (const [, href, rest] of links) assert.match(rest, /tabindex="-1"/, `${href} stays out of the Tab order`);
@@ -306,10 +411,39 @@ test('the 404 page is the site design, links home, to the docs, GitHub and citin
   assert.match(await read('assets/css/page.css'), /@import 'layouts\/_page\.css\?v=[0-9a-f]{12}' layer\(layouts\);/);
 });
 
-test('llms.txt introduces the project and links to the documentation', () => {
-  assert.match(LLMS, /^# Cellucid\n\n> /);
+test('llms.txt has the llmstxt.org shape, introduces the project and links to pages that exist', async t => {
+  // llmstxt.org: an H1 name, a blockquote summary, prose, then H2 sections of
+  // `- [name](url)` lists; a section called Optional may be skipped.
+  assert.match(LLMS, /^# Cellucid\n\n> [^\n]+\n\n/);
+  assert.deepEqual([...LLMS.matchAll(/^## (.+)$/gm)].map(match => match[1]), ['Documentation', 'Source code', 'Optional']);
+  for (const line of LLMS.slice(LLMS.indexOf('## Documentation')).split('\n')) {
+    if (!line.trim() || line.startsWith('## ')) continue;
+    assert.match(line, /^- \[[^\]]+\]\(https:\/\/[^)]+\)/, line);
+  }
   assert.ok(LLMS.includes(`(${DOCS})`));
   assert.ok(LLMS.includes(`(${CITING})`));
+  assert.ok(LLMS.includes(SITE));
+  // Each documentation link is a page the docs build makes from a source file
+  // in cellucid-python/docs (beside this checkout, or CELLUCID_PYTHON_ROOT).
+  const docsRoot = path.join(process.env.CELLUCID_PYTHON_ROOT ?? path.resolve(ROOT, '..', 'cellucid-python'), 'docs');
+  try {
+    await stat(path.join(docsRoot, 'conf.py'));
+  } catch {
+    t.skip(`no cellucid-python docs at ${docsRoot}`);
+    return;
+  }
+  const pages = [...LLMS.matchAll(/\((https:\/\/docs\.cellucid\.com\/en\/latest\/(?:[^)]*\.html)?)\)/g)].map(match => match[1]);
+  assert.ok(pages.length >= 10);
+  // The docs' own llms.txt and llms-full.txt are written by sphinx-llms-txt.
+  for (const name of ['llms.txt', 'llms-full.txt']) {
+    assert.ok(LLMS.includes(`(${DOCS}${name})`), `links the docs' ${name}`);
+  }
+  assert.match(await readFile(path.join(docsRoot, 'conf.py'), 'utf8'), /"sphinx_llms_txt",/, 'the docs build writes llms.txt');
+  for (const url of pages) {
+    const page = url.slice(DOCS.length).replace(/\.html$/, '') || 'index';
+    const sources = await Promise.all(['.md', '.ipynb', '.rst'].map(suffix => stat(path.join(docsRoot, page + suffix)).then(() => true, () => false)));
+    assert.ok(sources.includes(true), `${url} has a source page in cellucid-python/docs`);
+  }
 });
 
 test('the web app manifest names the app and its icons exist at their sizes', async () => {

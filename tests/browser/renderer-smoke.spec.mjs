@@ -1,4 +1,5 @@
 import { expect, test } from './helpers/test.mjs';
+import { isFirefoxSafeResolveReorderingWarning } from './helpers/engine-console.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
@@ -2105,6 +2106,7 @@ test('smoke owns an empty filtered view without errors or stale density', async 
   const productErrors = [];
   const browserDiagnostics = [];
   page.on('console', message => {
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     if (
       message.type() === 'warning' &&
       /GL Driver Message .*GPU stall due to ReadPixels/.test(message.text())
@@ -2212,6 +2214,7 @@ test('every visible velocity slider endpoint reaches the GPU unchanged', async (
   const browserErrors = [];
   const browserDiagnostics = [];
   page.on('console', message => {
+    if (isFirefoxSafeResolveReorderingWarning(message)) return;
     if (
       message.type() === 'warning' &&
       /GL Driver Message .*GPU stall due to ReadPixels/.test(message.text())

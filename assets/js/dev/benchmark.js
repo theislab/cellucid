@@ -3870,8 +3870,7 @@ export class BenchmarkReporter {
         webWorker: typeof Worker !== 'undefined',
         sharedWorker: typeof SharedWorker !== 'undefined',
         webAssembly: typeof WebAssembly !== 'undefined',
-        webGL: this._checkWebGLSupport(),
-        webGL2: this._checkWebGL2Support(),
+        webGL2: this._webGL2Usable(),
         webGPU: 'gpu' in nav,
         indexedDB: 'indexedDB' in (typeof window !== 'undefined' ? window : {}),
         localStorage: this._checkLocalStorage(),
@@ -3952,28 +3951,14 @@ export class BenchmarkReporter {
   }
 
   /**
-   * Check WebGL support
+   * Whether the viewer's WebGL2 context draws: asked of that context
+   * (`_getGL`), never of a new one -- a context made for each report and
+   * never released counted against the page's limit, and after eight
+   * reports WebKit lost the oldest context alive, the viewer's.
    */
-  _checkWebGLSupport() {
-    try {
-      const canvas = document.createElement('canvas');
-      // Cellucid requires WebGL2; do not treat WebGL1 as supported.
-      return !!canvas.getContext('webgl2');
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Check WebGL2 support
-   */
-  _checkWebGL2Support() {
-    try {
-      const canvas = document.createElement('canvas');
-      return !!canvas.getContext('webgl2');
-    } catch {
-      return false;
-    }
+  _webGL2Usable() {
+    const gl = this._getGL();
+    return gl !== null && !gl.isContextLost();
   }
 
   /**

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { expect, test } from './helpers/test.mjs';
 
 test('web origin serves every declared MIME family exactly', async ({
@@ -35,4 +37,19 @@ test('web origin serves every declared MIME family exactly', async ({
       String(asset.bytes)
     );
   }
+});
+
+// The suite's server rewrites the page it serves (it names the suite's own
+// sample catalog), and a web cache given this origin as its source (the Python
+// and R packages' `--web-source-url`) verifies every byte it fetches against
+// the inventory fetched from the same origin: the page must be what the
+// inventory says.
+test('the page this origin serves is the one its inventory declares', async ({
+  request,
+}) => {
+  const inventory = await (await request.get('/cellucid-web-assets.json')).json();
+  const declared = inventory.assets.find(asset => asset.path === 'index.html');
+  const page = await (await request.get('/index.html')).body();
+  expect(page.length).toBe(declared.bytes);
+  expect(createHash('sha256').update(page).digest('hex')).toBe(declared.sha256);
 });

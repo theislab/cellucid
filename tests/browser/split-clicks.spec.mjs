@@ -30,7 +30,8 @@ test('a press and a release with the page moved in between is reported, with wha
   await page.evaluate(() => { document.getElementById('above').style.height = '60px'; });
   await page.mouse.up();
   expect(await page.evaluate(() => window.clicked)).not.toContain('label');
-  expect(() => expectNoSplitClicks()).toThrow(/pressed on one element and released on another[\s\S]*"within":\["label","pressed"\]/);
+  // It names what moved the pressed button: the content above it, grown.
+  expect(() => expectNoSplitClicks()).toThrow(/pressed on one element and released on another[\s\S]*"within":\["label","pressed"\][\s\S]*"moved":\["div#above 0→60"\]/);
   // Reported once: the test itself ends clean.
   expect(() => expectNoSplitClicks()).not.toThrow();
 
